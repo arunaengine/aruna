@@ -496,6 +496,29 @@ pub enum MetadataTransportMessage {
         expected: Ulid,
         current: Ulid,
     },
+    /// One vault change a non-holder forwards to a holder of the user's vault. The holder
+    /// checks the bearer token again and appends for the user the token names.
+    ForwardVaultChange {
+        auth_token: Option<AuthToken>,
+        record_id: Ulid,
+        change: Box<crate::users::vault_write::VaultChange>,
+        created_at_ms: u64,
+    },
+    ForwardedVaultChange {
+        result: Result<
+            crate::users::vault_write::VaultAppended,
+            crate::users::vault_route::VaultRefusal,
+        >,
+    },
+    /// One user's vault heads or key records asked of a holder.
+    FetchVaultRecords {
+        user_id: aruna_core::UserId,
+        query: aruna_core::effects::VaultQuery,
+    },
+    /// An empty answer means this holder has no records, never that the vault is absent.
+    FetchedVaultRecords {
+        result: Result<aruna_core::structs::identity::user::vault::VaultRecords, MetadataReadError>,
+    },
 }
 
 /// One document as a holder serves it to a device.

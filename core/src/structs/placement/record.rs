@@ -124,6 +124,7 @@ pub enum DocumentClass {
     MetadataRegistry,
     JobControl,
     PlacementPolicy,
+    UserVault,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]

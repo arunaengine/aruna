@@ -822,6 +822,19 @@ impl MetadataHandle {
                 })
                 .await
             }
+            forward @ MetadataTransportMessage::ForwardVaultChange { .. } => {
+                Box::pin(async {
+                    crate::users::vault_route::apply_forwarded_vault(context, peer, forward).await
+                })
+                .await
+            }
+            MetadataTransportMessage::FetchVaultRecords { user_id, query } => {
+                Box::pin(async {
+                    crate::users::vault_route::serve_vault_fetch(context, peer, user_id, query)
+                        .await
+                })
+                .await
+            }
             record @ (MetadataTransportMessage::ForwardJobRecord { .. }
             | MetadataTransportMessage::ForwardRecordPage { .. }) => {
                 Box::pin(async {
@@ -1010,6 +1023,8 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardTokenRevocation { .. }
             | MetadataTransportMessage::ForwardPersistentId { .. }
             | MetadataTransportMessage::ForwardPlacementPolicy { .. }
+            | MetadataTransportMessage::ForwardVaultChange { .. }
+            | MetadataTransportMessage::FetchVaultRecords { .. }
             | MetadataTransportMessage::ForwardJobRecord { .. }
             | MetadataTransportMessage::ForwardRecordPage { .. }
             | MetadataTransportMessage::ForwardLaunchOffer { .. }

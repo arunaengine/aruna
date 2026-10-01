@@ -176,6 +176,9 @@ pub fn document_class(target: &DocumentTarget) -> DocumentClass {
         | DocumentTarget::PersistentIdMapping { .. }
         | DocumentTarget::RepositoryLink { .. } => DocumentClass::Metadata,
         DocumentTarget::PlacementPolicy { .. } => DocumentClass::PlacementPolicy,
+        DocumentTarget::VaultRevision { .. } | DocumentTarget::UserKey { .. } => {
+            DocumentClass::UserVault
+        }
         DocumentTarget::RealmAuthorization { .. }
         | DocumentTarget::RealmConfig { .. }
         | DocumentTarget::NodeUsage { .. }
@@ -193,7 +196,10 @@ pub fn subject_bytes(target: &DocumentTarget) -> Vec<u8> {
         DocumentTarget::Group { group_id } | DocumentTarget::GroupAuthorization { group_id } => {
             group_id.to_bytes().to_vec()
         }
-        DocumentTarget::User { user_id } => user_id.to_bytes(),
+        // Every record of one user shares the user's shard, so one holder set serves them all.
+        DocumentTarget::User { user_id }
+        | DocumentTarget::VaultRevision { user_id, .. }
+        | DocumentTarget::UserKey { user_id, .. } => user_id.to_bytes(),
         DocumentTarget::MetadataRegistry { document_id, .. }
         | DocumentTarget::MetadataCreateEvent { document_id, .. }
         | DocumentTarget::GitRecord { document_id, .. }
@@ -1265,6 +1271,20 @@ mod pure_tests {
                 DocumentClass::PlacementPolicy,
             ),
             (
+                DocumentTarget::VaultRevision {
+                    user_id,
+                    revision_id: sid(6),
+                },
+                DocumentClass::UserVault,
+            ),
+            (
+                DocumentTarget::UserKey {
+                    user_id,
+                    record_id: sid(7),
+                },
+                DocumentClass::UserVault,
+            ),
+            (
                 DocumentTarget::NodeInfo {
                     realm_id,
                     node_id: node_id(1),
@@ -1276,6 +1296,22 @@ mod pure_tests {
         for (target, expected) in targets {
             assert_eq!(document_class(&target), expected, "{target:?}");
         }
+    }
+
+    #[test]
+    fn vault_shares_subject() {
+        // Every vault and key record of a user rides one shard, so one holder set serves them.
+        let user_id = UserId::local(sid(8), RealmId::from_bytes([4; 32]));
+        let revision = DocumentTarget::VaultRevision {
+            user_id,
+            revision_id: sid(1),
+        };
+        let key = DocumentTarget::UserKey {
+            user_id,
+            record_id: sid(2),
+        };
+        assert_eq!(subject_bytes(&revision), user_id.to_bytes());
+        assert_eq!(subject_bytes(&key), user_id.to_bytes());
     }
 
     proptest! {

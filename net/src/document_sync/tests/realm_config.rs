@@ -776,7 +776,7 @@ async fn accepts_onboarded_origin() {
         1,
         AdminDocumentOperation::ConfigTokenRevoked {
             token_hash: aruna_core::auth::bearer_token_hash("long-token"),
-            expires_at: unix_timestamp_secs() + MAX_TOKEN_LIFETIME + REVOCATION_GRACE_SECS + 1,
+            expires_at: unix_timestamp_secs() + MAX_TOKEN_LIFETIME + REVOCATION_GRACE_SECS + 3_600,
             token_owner: attacker.user_id,
         },
     );

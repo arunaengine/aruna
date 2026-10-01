@@ -18,6 +18,7 @@ use aruna_core::repository::RepositoryLink;
 use aruna_core::storage_entries::lifecycle_revision_change;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::user::vault::{UserKeyRecord, VaultRevision};
 use aruna_core::structs::persistent_id_change;
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, placement_policy_change,
@@ -399,6 +400,26 @@ impl AnnounceTopicOperation {
                     )));
                 }
                 Ok(link.sync_change(self.placement))
+            }
+            DocumentTarget::VaultRevision { .. } => {
+                let revision = VaultRevision::from_bytes(bytes)
+                    .map_err(AnnounceTopicError::ConversionError)?;
+                if revision.target() != *document {
+                    return Err(AnnounceTopicError::DocumentSync(
+                        "vault revision target does not match its payload".to_string(),
+                    ));
+                }
+                Ok(revision.sync_change())
+            }
+            DocumentTarget::UserKey { .. } => {
+                let record = UserKeyRecord::from_bytes(bytes)
+                    .map_err(AnnounceTopicError::ConversionError)?;
+                if record.target() != *document {
+                    return Err(AnnounceTopicError::DocumentSync(
+                        "user key target does not match its payload".to_string(),
+                    ));
+                }
+                Ok(record.sync_change())
             }
             // Single-writer upserts need only this node's monotonic wall-clock generation.
             DocumentTarget::NodeUsage { .. }

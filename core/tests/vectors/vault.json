@@ -1,0 +1,28 @@
+{
+  "description": "Shared vault and HPKE test vectors for the portal and the Rust vault format",
+  "vault": {
+    "passphrase": "correct horse battery staple",
+    "recovery_code": "P7HF-W12T-SWFZ-0JTS-R8FG-WS93-QWVR-205G-TP5R-23AW-EPQG-Y560-ZDBG",
+    "recovery_bytes": "b1e2fe045acf1ff04b59c21f0e6523bf378100b0d58b810d5c75af0f14c0fb57",
+    "master_key": "a0f9749e9ca13c0ddc860d9691e7228cf5002a5ac695ee31ca421e31650bfcb9",
+    "data": "{\"providers\":[{\"id\":\"p1\",\"name\":\"Test\",\"key\":\"sk-test\"}]}",
+    "payload": "{\"version\":1,\"kdf\":{\"name\":\"pbkdf2-sha256\",\"iterations\":1000,\"salt\":\"XaGvK+1McJRNX+agVfElbQ==\"},\"master\":{\"nonce\":\"Xe815eGt4FecnkZ+\",\"wrapped\":\"UmcgGrpUklOQkmKF+ZSkbKCNwBZhF+KISkMdYaMM6l/xZKi3lL4rrkuXKqiBf1WD\"},\"recovery\":{\"salt\":\"LHB85jdF5a/bB/8qAOrIWg==\",\"nonce\":\"19hV0go3z4Yq+eJe\",\"wrapped\":\"s5j1cWU/jlsAVZjAAOQgCfzQcEpayG+zcQcOX8V9QmUDZcOrGbTwnEzL/ngn1mtE\"},\"keys\":[{\"id\":\"01J0000000000000000000KEY1\",\"kind\":\"x25519\",\"public\":\"QbWI3I/mMrzR8xszbFcmYXXS4SZkv4ydJx3RY+oBPC0=\",\"nonce\":\"Dv/a08B0De0QziXB\",\"wrapped_private\":\"m3V4yqA9joioyB0wE9kHzlKBztouAhxhoN+ixVjKlPedvI4TWi3jKXTBIXZVY/yY\",\"created_at\":\"2026-10-01T00:00:00Z\",\"retired_at\":null}],\"data\":{\"nonce\":\"ViUV2WUFz4RUwI24\",\"sealed\":\"nKaD1Lvt0RtPZidypZ5mpjzv9Y7Ni0f5ah8zYETEiTqyI4J6V02WJvJ9BcmCRlCr5XKkD3eHJVM7ErS1SyYMHuGb2jFonOlpdw==\"}}"
+  },
+  "keypair": {
+    "private": "3ec17a33432faf84bad4286c70904c097240368770f9784400d60bb28c2bc9b1",
+    "public": "41b588dc8fe632bcd1f31b336c57266175d2e12664bf8c9d271dd163ea013c2d",
+    "fingerprint": "456f80c355bf8260b386f056e6159cd4be744ebda5720819cd15d0f17a688baa"
+  },
+  "hpke": {
+    "suite": "DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-256-GCM, base mode",
+    "recipient_private": "3ec17a33432faf84bad4286c70904c097240368770f9784400d60bb28c2bc9b1",
+    "recipient_public": "41b588dc8fe632bcd1f31b336c57266175d2e12664bf8c9d271dd163ea013c2d",
+    "ephemeral_ikm": "40202ff64663d074277dd97e77ceb213971512f41f23cc014dadc75563feb439",
+    "ephemeral_private": "3ebac261fa9043215b5cf01b11c00e3aa9c542d53b5f4030d946abd8f8461745",
+    "enc": "44e7390b4a297d56653d46cdfaa4b5872f54c1e823f46df86de4c254c78b3356",
+    "info": "6172756e61206275636b6574206b6579207631",
+    "aad": "6275636b65742030314a303030303030303030303030303030304255434b4554",
+    "plaintext": "334a9a9b4efb44e8eb558062c91e3c1607cc4784f9d06dc14f2e0d30926b0a84",
+    "ciphertext": "21fcbb028fa98fdee771148579de1d257939bddde82bf24f9c8859681ab04c4b30fc27dc6fdb809f7154fd8049998ec5"
+  }
+}

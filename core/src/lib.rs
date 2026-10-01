@@ -21,6 +21,7 @@ pub mod handle;
 pub mod id;
 pub mod jobs;
 pub mod join_request;
+pub mod key_seal;
 pub mod keys;
 pub mod keyspaces;
 pub mod metadata;
@@ -29,6 +30,7 @@ pub mod node_vault;
 pub mod onboarding;
 pub mod operation;
 pub mod permission_path;
+pub mod recovery_code;
 pub mod reducer;
 pub mod repo_layout;
 pub mod repository;
@@ -45,6 +47,7 @@ pub mod time;
 pub mod trace_context;
 pub mod types;
 pub mod user;
+pub mod vault_format;
 
 #[cfg(test)]
 mod tests;

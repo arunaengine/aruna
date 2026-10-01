@@ -14,14 +14,15 @@ use crate::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, GIT_PACK_KEYSPACE,
     GIT_RECORD_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, GROUP_KEYSPACE, ID_MAPPING_KEYSPACE,
     METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, REPOSITORY_LINK_KEYSPACE, USER_KEYSPACE, WATCH_INTEREST_KEYSPACE,
-    WATCH_SUBSCRIPTIONS_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, REPOSITORY_LINK_KEYSPACE, USER_KEY_KEYSPACE, USER_KEYSPACE,
+    VAULT_REVISION_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
 use crate::repository::link_key;
 use crate::storage_entries::{document_lifecycle_key, event_log_key, graph_lifecycle_key};
 use crate::structs::execution::notification_watch::{interest_node_key, watch_subscription_key};
 use crate::structs::identity::realm::RealmId;
+use crate::structs::identity::user::vault::user_record_key;
 use crate::structs::persistent_id_key;
 use crate::structs::placement::policy::document::placement_policy_key;
 use crate::structs::placement::record::{PLACEMENT_EPOCH_PAD, PlacementRef};
@@ -103,6 +104,16 @@ pub enum DocumentTarget {
     GitPack {
         document_id: Ulid,
         sha256: [u8; 32],
+    },
+    /// One immutable save of a user's vault, placed by the user id.
+    VaultRevision {
+        user_id: UserId,
+        revision_id: Ulid,
+    },
+    /// One public key record of a user, placed with the user's vault.
+    UserKey {
+        user_id: UserId,
+        record_id: Ulid,
     },
 }
 
@@ -391,7 +402,9 @@ impl DocumentTarget {
             Self::RealmAuthorization { realm_id } | Self::RealmConfig { realm_id } => {
                 TopicId::realm(*realm_id)
             }
-            Self::User { user_id } => TopicId::users(user_id.realm_id),
+            Self::User { user_id }
+            | Self::VaultRevision { user_id, .. }
+            | Self::UserKey { user_id, .. } => TopicId::users(user_id.realm_id),
             Self::MetadataRegistry { document_id, .. }
             | Self::MetadataCreateEvent { document_id, .. }
             | Self::GitRecord { document_id, .. }
@@ -429,6 +442,8 @@ impl DocumentTarget {
             Self::NodeInfo { .. } => NODE_INFO_KEYSPACE,
             Self::PlacementPolicy { .. } => PLACEMENT_POLICY_KEYSPACE,
             Self::RepositoryLink { .. } => REPOSITORY_LINK_KEYSPACE,
+            Self::VaultRevision { .. } => VAULT_REVISION_KEYSPACE,
+            Self::UserKey { .. } => USER_KEY_KEYSPACE,
         }
     }
 
@@ -485,6 +500,11 @@ impl DocumentTarget {
                 document_id,
                 link_id,
             } => ByteView::from(link_key(*document_id, *link_id)),
+            Self::VaultRevision {
+                user_id,
+                revision_id,
+            } => user_record_key(*user_id, *revision_id),
+            Self::UserKey { user_id, record_id } => user_record_key(*user_id, *record_id),
         }
     }
 
@@ -506,6 +526,8 @@ impl DocumentTarget {
                 | Self::PersistentIdMapping { .. }
                 | Self::PlacementPolicy { .. }
                 | Self::RepositoryLink { .. }
+                | Self::VaultRevision { .. }
+                | Self::UserKey { .. }
         )
     }
 

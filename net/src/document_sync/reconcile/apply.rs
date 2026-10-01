@@ -66,6 +66,12 @@ impl DocumentSyncService {
                 "Git records must be applied through document reconcile".to_string(),
             ));
         }
+        if let DocumentTarget::VaultRevision { .. } | DocumentTarget::UserKey { .. } = target {
+            // Vault records check their author, which only the reconcile loop knows.
+            return Err(NetError::Bootstrap(
+                "vault records must be applied through document reconcile".to_string(),
+            ));
+        }
         if let DocumentTarget::MetadataDocumentLifecycle { document_id } = target {
             let record: MetadataLifecycleRecord = postcard::from_bytes(&bytes)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;

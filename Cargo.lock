@@ -291,7 +291,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.100"
+version = "3.0.0-alpha.101"
 dependencies = [
  "aruna-api",
  "aruna-blob",
@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.100"
+version = "3.0.0-alpha.101"
 dependencies = [
  "ahash 0.8.12",
  "aruna-blob",
@@ -399,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.100"
+version = "3.0.0-alpha.101"
 dependencies = [
  "aruna-core",
  "aruna-net",
@@ -439,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute"
-version = "3.0.0-alpha.100"
+version = "3.0.0-alpha.101"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute-helper"
-version = "3.0.0-alpha.100"
+version = "3.0.0-alpha.101"
 dependencies = [
  "rustix",
  "serde_json",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.100"
+version = "3.0.0-alpha.101"
 dependencies = [
  "aes-gcm 0.11.1",
  "async-trait",
@@ -497,12 +497,14 @@ dependencies = [
  "getrandom 0.4.3",
  "globset",
  "hex",
+ "hpke",
  "ipnet",
  "iroh",
  "irokle",
  "nix",
  "opentelemetry",
  "oxrdf",
+ "pbkdf2 0.13.0",
  "percent-encoding",
  "postcard",
  "prometheus-client",
@@ -519,12 +521,13 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "ulid 3.0.0",
+ "x25519-dalek",
  "zeroize",
 ]
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.100"
+version = "3.0.0-alpha.101"
 dependencies = [
  "ahash 0.8.12",
  "aruna",
@@ -566,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-net"
-version = "3.0.0-alpha.100"
+version = "3.0.0-alpha.101"
 dependencies = [
  "aruna-core",
  "aruna-storage",
@@ -594,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-operations"
-version = "3.0.0-alpha.100"
+version = "3.0.0-alpha.101"
 dependencies = [
  "aruna-blob",
  "aruna-compute",
@@ -652,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.100"
+version = "3.0.0-alpha.101"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -669,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-tasks"
-version = "3.0.0-alpha.100"
+version = "3.0.0-alpha.101"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -2765,7 +2768,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
- "hkdf",
+ "hkdf 0.12.4",
  "pem-rfc7468 0.7.0",
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
@@ -3495,6 +3498,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac 0.13.0",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3530,6 +3542,24 @@ dependencies = [
  "cfg-if",
  "libc",
  "windows-link",
+]
+
+[[package]]
+name = "hpke"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5324110b02044183df000f0bd7d2d7e61f1000631508627e77f63983b6fdffb"
+dependencies = [
+ "aead 0.6.1",
+ "aes-gcm 0.11.1",
+ "getrandom 0.4.3",
+ "hkdf 0.13.0",
+ "hybrid-array",
+ "rand_core 0.10.1",
+ "sha2 0.11.0",
+ "subtle",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -6058,6 +6088,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pbkdf2"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
+dependencies = [
+ "digest 0.11.3",
+ "hmac 0.13.0",
+]
+
+[[package]]
 name = "peg"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6255,7 +6295,7 @@ dependencies = [
  "aes 0.8.4",
  "cbc",
  "der 0.7.10",
- "pbkdf2",
+ "pbkdf2 0.12.2",
  "scrypt",
  "sha2 0.10.9",
  "spki 0.7.3",
@@ -7800,7 +7840,7 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0516a385866c09368f0b5bcd1caff3366aace790fcd46e2bb032697bb172fd1f"
 dependencies = [
- "pbkdf2",
+ "pbkdf2 0.12.2",
  "salsa20",
  "sha2 0.10.9",
 ]
@@ -10107,6 +10147,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
 dependencies = [
  "tap",
+]
+
+[[package]]
+name = "x25519-dalek"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
+dependencies = [
+ "curve25519-dalek 5.0.0",
+ "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]

@@ -57,6 +57,7 @@ mod restart;
 mod role_assignments;
 mod shard;
 mod validation;
+mod vault;
 
 use crate::tests::document_sync_support::*;
 

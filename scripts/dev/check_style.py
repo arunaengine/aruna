@@ -61,6 +61,7 @@ SMALL_DOMAINS = {
     "operations/src/shard": "coherent ownership scope",
     "operations/src/tasks": "coherent ownership scope",
     "operations/src/users/service_account": "grouped shared-prefix domain",
+    "operations/src/users/vault": "grouped shared-prefix domain",
 }
 FOLDER_MIN = 5
 TERM_MAX = 3

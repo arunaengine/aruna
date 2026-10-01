@@ -12,7 +12,7 @@ use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{
     DhtEntry, DhtEvent, JobControlEvent, JobRecordEvent, LaunchOfferEvent, NetEvent,
-    PolicyFetchEvent, PolicySignEvent, StreamEvent,
+    PolicyFetchEvent, PolicySignEvent, StreamEvent, VaultFetchEvent,
 };
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
 use aruna_core::structs::identity::realm::RealmId;
@@ -227,6 +227,9 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         )),
         NetEffect::PolicySign(_) => NetEvent::PolicySign(PolicySignEvent::Unavailable(
             "policy publication signing must be dispatched by the operations runner".to_string(),
+        )),
+        NetEffect::VaultFetch(_) => NetEvent::VaultFetch(VaultFetchEvent::Unavailable(
+            "vault fetch must be dispatched by the operations runner".to_string(),
         )),
     }
 }
@@ -499,6 +502,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::JobRecord(_) => "job_record",
         NetEffect::LaunchOffer(_) => "launch_offer",
         NetEffect::PolicySign(_) => "policy_sign",
+        NetEffect::VaultFetch(_) => "vault_fetch",
     }
 }
 

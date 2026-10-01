@@ -801,7 +801,7 @@ mod test {
             Some(seeded_strategies[0].strategy_id)
         );
         assert_eq!(family_strategy_id, seeded_strategies[2].strategy_id);
-        assert_eq!(seeded_bindings.len(), 5);
+        assert_eq!(seeded_bindings.len(), 6);
         assert_eq!(seeded_placements.len(), 2);
         assert_eq!(
             config_state.materialized_default_strategy(),
@@ -812,14 +812,14 @@ mod test {
             config_state.materialized_family_strategy(),
             Some(family_strategy_id)
         );
-        assert_eq!(config_state.materialized_strategy_bindings().len(), 5);
+        assert_eq!(config_state.materialized_strategy_bindings().len(), 6);
         assert_eq!(config_state.materialized_placement_bindings().len(), 2);
 
         let outbox_records = write_values(writes, SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(outbox_records.len(), 25);
+        assert_eq!(outbox_records.len(), 26);
         assert!(outbox_records.iter().any(|record| {
             record.target == DocumentTarget::RealmAuthorization { realm_id }
                 && matches!(
@@ -972,6 +972,12 @@ mod test {
                 ),
                 (
                     20,
+                    AdminDocumentOperation::StrategyBindingSet {
+                        binding: seeded_bindings[5].clone(),
+                    },
+                ),
+                (
+                    21,
                     AdminDocumentOperation::NodePlacementSet {
                         entry: NodePlacementEntry {
                             node_id: actor.node_id,
@@ -984,27 +990,27 @@ mod test {
                     },
                 ),
                 (
-                    21,
+                    22,
                     AdminDocumentOperation::CandidateMapPublished {
                         map: config_doc.candidate_maps[0].clone(),
                     },
                 ),
                 (
-                    22,
+                    23,
                     AdminDocumentOperation::ConfigActivationsInitialized {
                         strategy_id: seeded_strategies[0].strategy_id,
                         candidate_map_epoch: 1,
                     },
                 ),
                 (
-                    23,
+                    24,
                     AdminDocumentOperation::ConfigActivationsInitialized {
                         strategy_id: seeded_strategies[1].strategy_id,
                         candidate_map_epoch: 1,
                     },
                 ),
                 (
-                    24,
+                    25,
                     AdminDocumentOperation::ConfigActivationsInitialized {
                         strategy_id: seeded_strategies[2].strategy_id,
                         candidate_map_epoch: 1,
@@ -1098,7 +1104,7 @@ mod test {
             .filter(|binding| binding.strategy_id == everywhere.strategy_id)
             .map(|binding| binding.scope.clone())
             .collect::<Vec<_>>();
-        assert_eq!(config_doc.strategy_bindings.len(), 5);
+        assert_eq!(config_doc.strategy_bindings.len(), 6);
         assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::MetadataRegistry)));
         assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::Admin)));
         // Group (which covers group authorization documents) and user documents
@@ -1114,6 +1120,12 @@ mod test {
             .find(|binding| binding.scope == BindingScope::Class(DocumentClass::PlacementPolicy))
             .expect("policy class is bound");
         assert_eq!(policy_binding.strategy_id, default.strategy_id);
+        let vault_binding = config_doc
+            .strategy_bindings
+            .iter()
+            .find(|binding| binding.scope == BindingScope::Class(DocumentClass::UserVault))
+            .expect("vault class is bound");
+        assert_eq!(vault_binding.strategy_id, default.strategy_id);
     }
 
     #[test]
