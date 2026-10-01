@@ -166,6 +166,14 @@ impl UserKeyRecord {
     }
 }
 
+/// Keeps the bounded newest key records in API order.
+pub fn retain_newest_keys(keys: &mut Vec<UserKeyRecord>) {
+    keys.sort_by(|left, right| {
+        (right.created_at_ms, right.record_id).cmp(&(left.created_at_ms, left.record_id))
+    });
+    keys.truncate(MAX_KEY_RECORDS);
+}
+
 fn record_change(
     event_id: Ulid,
     actor: NodeId,

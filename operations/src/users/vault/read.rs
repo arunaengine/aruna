@@ -7,14 +7,16 @@ use std::time::Duration;
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{
-    Effect, HolderList, MAX_FETCH_HOLDERS, NetEffect, StorageEffect, VaultFetchEffect, VaultQuery,
+    Effect, HolderList, IterStart, MAX_FETCH_HOLDERS, NetEffect, StorageEffect, VaultFetchEffect,
+    VaultQuery,
 };
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, StorageEvent, VaultFetchEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::vault::{
-    MAX_KEY_RECORDS, MAX_VAULT_HEADS, VaultRecords, user_record_prefix,
+    MAX_KEY_RECORDS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecords, retain_newest_keys,
+    user_record_prefix,
 };
 use aruna_core::types::{Effects, Key, Value};
 use aruna_core::{NodeId, UserId};
@@ -81,6 +83,7 @@ pub struct ReadVaultOperation {
     config: ReadVaultConfig,
     state: ReadState,
     output: Option<Result<VaultRecords, ReadVaultError>>,
+    keys: Vec<UserKeyRecord>,
 }
 
 impl ReadVaultOperation {
@@ -89,6 +92,7 @@ impl ReadVaultOperation {
             config,
             state: ReadState::Init,
             output: None,
+            keys: Vec::new(),
         }
     }
 
@@ -225,10 +229,30 @@ impl Operation for ReadVaultOperation {
                     Err(error) => self.finish(Err(error)),
                 }
             }
-            (ReadState::ReadLocal, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                let output = self.local(values);
-                self.finish(output)
-            }
+            (
+                ReadState::ReadLocal,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => match self.local(values) {
+                Ok(VaultRecords::Keys(keys)) => {
+                    self.keys.extend(keys);
+                    retain_newest_keys(&mut self.keys);
+                    if let Some(start) = next_start_after {
+                        return smallvec![Effect::Storage(StorageEffect::Iter {
+                            key_space: aruna_core::keyspaces::USER_KEY_KEYSPACE.to_string(),
+                            prefix: Some(user_record_prefix(self.config.user_id)),
+                            start: Some(IterStart::After(start)),
+                            limit: MAX_KEY_RECORDS,
+                            txn_id: None,
+                        })];
+                    }
+                    let keys = std::mem::take(&mut self.keys);
+                    self.finish(Ok(VaultRecords::Keys(keys)))
+                }
+                output => self.finish(output),
+            },
             (ReadState::Fetch, Event::Net(NetEvent::VaultFetch(event))) => {
                 let output = self.fetched(event);
                 self.finish(output)
@@ -343,6 +367,55 @@ mod tests {
             Some(Effect::Storage(StorageEffect::Iter { prefix: Some(prefix), .. }))
                 if *prefix == user_record_prefix(user(7))
         ));
+    }
+
+    #[test]
+    fn reads_newest_keys() {
+        let (mut operation, _, _) = started(true, VaultQuery::Keys);
+        let rows: Vec<_> = (1..=65)
+            .map(|id| {
+                let record = UserKeyRecord {
+                    user_id: user(7),
+                    record_id: Ulid::from_bytes([id; 16]),
+                    key_id: format!("key-{id}"),
+                    public_key: [1; 32],
+                    fingerprint: aruna_core::vault_format::key_fingerprint(&[1; 32]),
+                    has_recovery: false,
+                    node_id: node(1),
+                    placement: PlacementRef::NIL,
+                    created_at_ms: if id == 1 || id == 65 { 2 } else { 1 },
+                };
+                (
+                    record.target().storage_key(),
+                    record.to_bytes().unwrap().into(),
+                )
+            })
+            .collect();
+        let cursor = rows[63].0.clone();
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: rows[..64].to_vec(),
+            next_start_after: Some(cursor.clone()),
+        }));
+        assert!(!operation.is_complete());
+        assert!(matches!(effects.first(),
+            Some(Effect::Storage(StorageEffect::Iter {
+                start: Some(IterStart::After(start)), limit: MAX_KEY_RECORDS, ..
+            })) if start == &cursor));
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: rows[64..].to_vec(),
+            next_start_after: None,
+        }));
+        let VaultRecords::Keys(keys) = operation.finalize().unwrap() else {
+            panic!("expected keys");
+        };
+        assert_eq!(keys.len(), MAX_KEY_RECORDS);
+        assert_eq!(keys[0].record_id, Ulid::from_bytes([65; 16]));
+        assert_eq!(keys[1].record_id, Ulid::from_bytes([1; 16]));
+        assert!(
+            !keys
+                .iter()
+                .any(|key| key.record_id == Ulid::from_bytes([2; 16]))
+        );
     }
 
     #[test]
