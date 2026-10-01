@@ -85,6 +85,7 @@ pub enum JobRunOutcome {
 /// payloads never reach here: the runtime routes them to the fenced external path
 /// before this seam.
 pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunOutcome {
+    // Each payload is boxed, so this future and every future that holds it stay small.
     match payload {
         JobPayload::Probe {
             steps,
@@ -93,45 +94,59 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             panic_at,
             cleanup_marker,
         } => {
-            run_probe(
+            Box::pin(run_probe(
                 ctx,
                 *steps,
                 *step_sleep_ms,
                 *fail_at,
                 *panic_at,
                 cleanup_marker.as_deref(),
-            )
+            ))
             .await
         }
         JobPayload::WriteRunCrate { for_job } => {
-            crate::jobs::workflow::run_crate::write_run_crate(ctx, *for_job).await
+            Box::pin(crate::jobs::workflow::run_crate::write_run_crate(
+                ctx, *for_job,
+            ))
+            .await
         }
         JobPayload::TerminalCleanup {
             for_job,
             attempt,
             access_key,
         } => {
-            crate::jobs::workflow::cleanup::run_terminal_cleanup(
+            Box::pin(crate::jobs::workflow::cleanup::run_terminal_cleanup(
                 ctx,
                 *for_job,
                 attempt.as_ref(),
                 access_key,
-            )
+            ))
             .await
         }
-        JobPayload::Staging(spec) => crate::jobs::staging::run_staging_job(ctx, spec).await,
-        JobPayload::ExportRoCrate(spec) => crate::jobs::export::run_export_job(ctx, spec).await,
-        JobPayload::ImportRoCrate(spec) => crate::jobs::import::run_rocrate_import(ctx, spec).await,
-        JobPayload::Harvest(spec) => crate::jobs::harvest::run_harvest_job(ctx, spec).await,
+        JobPayload::Staging(spec) => {
+            Box::pin(crate::jobs::staging::run_staging_job(ctx, spec)).await
+        }
+        JobPayload::ExportRoCrate(spec) => {
+            Box::pin(crate::jobs::export::run_export_job(ctx, spec)).await
+        }
+        JobPayload::ImportRoCrate(spec) => {
+            Box::pin(crate::jobs::import::run_rocrate_import(ctx, spec)).await
+        }
+        JobPayload::Harvest(spec) => {
+            Box::pin(crate::jobs::harvest::run_harvest_job(ctx, spec)).await
+        }
         JobPayload::MintPersistentId(spec) => {
-            crate::jobs::persistent_id::run_mint_pid(ctx, spec).await
+            Box::pin(crate::jobs::persistent_id::run_mint_pid(ctx, spec)).await
         }
         JobPayload::StoragePurge(spec) => {
-            crate::jobs::workflow::purge::run_storage_purge(ctx, spec).await
+            Box::pin(crate::jobs::workflow::purge::run_storage_purge(ctx, spec)).await
         }
-        JobPayload::CopyObject(spec) => crate::jobs::copy::run_copy_job(ctx, spec).await,
+        JobPayload::CopyObject(spec) => Box::pin(crate::jobs::copy::run_copy_job(ctx, spec)).await,
         JobPayload::RegisterIdentifiers(spec) => {
-            crate::jobs::persistent_id::run_register_identifiers(ctx, spec).await
+            Box::pin(crate::jobs::persistent_id::run_register_identifiers(
+                ctx, spec,
+            ))
+            .await
         }
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
