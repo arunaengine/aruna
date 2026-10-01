@@ -32,6 +32,7 @@ use std::task::{Context, Poll};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Duration, Instant, interval, timeout};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use ulid::Ulid;
 
 // Bounds concurrent transfers so overload queues instead of exhausting fds.
@@ -223,7 +224,7 @@ impl BlobHandle {
         let (class, kind) = classify_effect(&effect);
         // Register a mutation before any await so a concurrent close either
         // rejects it or drains it; the guard lives for the whole effect.
-        let _write = if blob_effect_mutates(&effect) {
+        let write = if blob_effect_mutates(&effect) {
             let _close_guard = self
                 .handler
                 .close_lock
@@ -288,8 +289,17 @@ impl BlobHandle {
 
         let in_flight = self.handler.inflight.fetch_add(1, Ordering::Relaxed) + 1;
         let started = Instant::now();
-        // Boxed so the large per-effect future never inflates caller stacks.
-        let blob_event = Box::pin(self.handler.execute_effect(effect)).await;
+        // Its own task, so the effect starts on a fresh stack instead of under the caller's frames.
+        let handler = self.handler.clone();
+        let task = AbortOnDropHandle::new(tokio::spawn(async move {
+            let _write = write;
+            handler.execute_effect(effect).await
+        }));
+        let blob_event = match task.await {
+            Ok(event) => event,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(_) => BlobEvent::Error(BlobError::Closed),
+        };
         self.handler.inflight.fetch_sub(1, Ordering::Relaxed);
         // Read events carry a lazy stream, so the slot follows the stream.
         let blob_event = if class == EffectClass::Read {
