@@ -73,17 +73,46 @@ async fn pool_settled(
     before: &aruna_net::PoolCounts,
 ) -> TestResult<aruna_net::PoolCounts> {
     // Hang guard only; the pool answers within its connect timeout.
-    let cap = tokio::time::Instant::now() + Duration::from_secs(60);
+    handled(seed, peer, before, Duration::from_secs(60))
+        .await?
+        .ok_or_else(|| std::io::Error::other("the pool never handled the query").into())
+}
+
+async fn handled(
+    seed: &shared::SeedNode,
+    peer: iroh::PublicKey,
+    before: &aruna_net::PoolCounts,
+    wait: Duration,
+) -> TestResult<Option<aruna_net::PoolCounts>> {
+    let cap = tokio::time::Instant::now() + wait;
     loop {
         let counts = metadata_counts(seed, peer);
         if counts.dials > before.dials || counts.cooldown_hits > before.cooldown_hits {
-            return Ok(counts);
+            return Ok(Some(counts));
         }
         if tokio::time::Instant::now() >= cap {
-            return Err(std::io::Error::other("the pool never handled the query").into());
+            return Ok(None);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Queries the stopped peer until the pool handles a query. A query can fail on the
+/// peer's closed connection before the pool noticed the close, or end at its deadline
+/// before its request reached the pool; neither dials nor hits the cooldown.
+async fn outage_query(
+    seed: &shared::SeedNode,
+    peer: iroh::PublicKey,
+    token: &str,
+    before: &aruna_net::PoolCounts,
+) -> TestResult<(Value, aruna_net::PoolCounts)> {
+    for _ in 0..6 {
+        let query = metadata_query(&seed.base_url, token).await?;
+        if let Some(counts) = handled(seed, peer, before, Duration::from_secs(10)).await? {
+            return Ok((query, counts));
+        }
+    }
+    Err(std::io::Error::other("the pool never handled a query").into())
 }
 
 async fn rejoin_peer(
@@ -187,7 +216,7 @@ async fn check_outage(
 ) -> TestResult<()> {
     let before = metadata_counts(seed, joiner.config.node_id);
     joiner.net.shutdown().await;
-    let partial = metadata_query(&seed.base_url, token).await?;
+    let (partial, after) = outage_query(seed, joiner.config.node_id, token, &before).await?;
     assert_eq!(partial["complete"], false);
     assert_eq!(partial["nodes_queried"], 2);
     assert_eq!(partial["nodes_failed"], 1);
@@ -198,14 +227,12 @@ async fn check_outage(
                 .iter()
                 .any(|node| node == &json!(joiner.config.node_id.to_string())))
     );
-    let after = pool_settled(seed, joiner.config.node_id, &before).await?;
     assert_eq!(after.dials - before.dials, 1);
 
-    let retry = metadata_query(&seed.base_url, token).await?;
+    let (retry, retried) = outage_query(seed, joiner.config.node_id, token, &after).await?;
     assert_eq!(retry["complete"], false);
     assert_eq!(retry["nodes_queried"], 2);
     assert_eq!(retry["nodes_failed"], 1);
-    let retried = pool_settled(seed, joiner.config.node_id, &after).await?;
     // A request may cross the five-second cooldown; then one re-probe is valid.
     let retry_dials = retried.dials - after.dials;
     assert!(retry_dials <= 1);
