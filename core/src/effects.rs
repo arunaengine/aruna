@@ -11,7 +11,7 @@ use crate::compute::{ExecutionTargetId, SecretBytes};
 use crate::document::DocumentEffect;
 use crate::id::{DhtKeyId, NodeId};
 use crate::jobs::JobRequest;
-use crate::metadata::MetadataEffect;
+use crate::metadata::{AuthToken, MetadataEffect};
 use crate::node_vault::VaultEntry;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
@@ -393,6 +393,7 @@ pub enum NetEffect {
     /// Signs one policy publication claim with this node's key, after the
     /// operation checked the authorizing user's realm-admin permission.
     PolicySign(Box<PolicyPublicationClaim>),
+    VaultFetch(Box<VaultFetchEffect>),
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its
@@ -637,6 +638,25 @@ pub struct PolicyFetchEffect {
     pub realm_id: RealmId,
     pub holders: HolderList<MAX_FETCH_HOLDERS>,
     pub policy_ref: PlacementPolicyRef,
+    pub deadline: Duration,
+}
+
+/// What a vault fetch asks the holders of one user's vault for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VaultQuery {
+    /// The caller's own heads; each holder checks the forwarded token again.
+    Heads { auth_token: Option<AuthToken> },
+    /// Public key records, served to realm infrastructure nodes.
+    Keys,
+}
+
+/// Fetch of one user's vault heads or key records from the holders the
+/// operation resolved. The adapter tries them in order and never routes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VaultFetchEffect {
+    pub holders: HolderList<MAX_FETCH_HOLDERS>,
+    pub user_id: UserId,
+    pub query: VaultQuery,
     pub deadline: Duration,
 }
 

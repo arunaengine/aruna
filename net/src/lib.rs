@@ -965,6 +965,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::JobRecord(_)) => "job_record",
         Effect::Net(NetEffect::LaunchOffer(_)) => "launch_offer",
         Effect::Net(NetEffect::PolicySign(_)) => "policy_sign",
+        Effect::Net(NetEffect::VaultFetch(_)) => "vault_fetch",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::LocalFile(_) => "local_file",

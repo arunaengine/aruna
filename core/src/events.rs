@@ -16,6 +16,7 @@ use crate::structs::execution::source_access::{
     ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
 };
 use crate::structs::identity::realm::RealmId;
+use crate::structs::identity::user::vault::VaultRecords;
 use crate::structs::placement::policy::document::{PlacementPolicyDocument, PolicyPublication};
 use crate::structs::placement::policy::{MAX_REF_INPUT, PlacementDecision};
 use crate::structs::storage::blob::{BackendLocation, HiddenBlobEntry};
@@ -270,6 +271,7 @@ pub enum NetEvent {
     JobRecord(JobRecordEvent),
     LaunchOffer(LaunchOfferEvent),
     PolicySign(PolicySignEvent),
+    VaultFetch(VaultFetchEvent),
     Error(NetError),
 }
 
@@ -292,6 +294,21 @@ pub enum PolicyFetchEvent {
     },
     /// Every reached holder answered without the document.
     NotFound,
+    /// No holder answered, so the miss is an availability hint, never a denial.
+    Unavailable(String),
+}
+
+/// Reply to a [`crate::effects::VaultFetchEffect`].
+#[derive(Debug, PartialEq)]
+pub enum VaultFetchEvent {
+    Fetched {
+        holder: NodeId,
+        records: VaultRecords,
+    },
+    /// Every reached holder answered without records.
+    NotFound,
+    /// A holder refused the forwarded caller.
+    Denied,
     /// No holder answered, so the miss is an availability hint, never a denial.
     Unavailable(String),
 }
