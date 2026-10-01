@@ -1035,8 +1035,24 @@ async fn spawn_optional_s3(
         return Ok((None, None));
     }
 
-    let (s3, task) = spawn_s3_server(context, realm_id, node_id, metrics).await?;
+    let (s3, task) = spawn_s3_server(context, realm_id, node_id, metrics, TEST_S3_TIMEOUTS).await?;
     Ok((Some(s3), Some(task)))
+}
+
+/// A second S3 listener on the seed's storage, for tests of the listener's own timeouts.
+pub(crate) async fn spawn_s3_with(
+    seed: &SeedNode,
+    timeouts: S3ServerTimeouts,
+) -> TestResult<(S3Endpoint, S3ServerHandle)> {
+    let metrics = Arc::new(NodeMetrics::new());
+    spawn_s3_server(
+        seed.context.clone(),
+        seed.realm_id,
+        seed.net.node_id(),
+        metrics,
+        timeouts,
+    )
+    .await
 }
 
 async fn spawn_s3_server(
@@ -1044,6 +1060,7 @@ async fn spawn_s3_server(
     realm_id: RealmId,
     node_id: iroh::PublicKey,
     metrics: Arc<NodeMetrics>,
+    timeouts: S3ServerTimeouts,
 ) -> TestResult<(S3Endpoint, S3ServerHandle)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let bind_addr = listener.local_addr()?;
@@ -1067,7 +1084,7 @@ async fn spawn_s3_server(
     )
     .await?;
     let (_addr, task) = s3_server
-        .with_timeouts(TEST_S3_TIMEOUTS)
+        .with_timeouts(timeouts)
         .run_with_listener(listener, tokio_util::sync::CancellationToken::new())?;
     Ok((
         S3Endpoint {
