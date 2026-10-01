@@ -32,7 +32,7 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork, BlobTimeoutConfig,
     HiddenBlobKey, ResolvedBackend, WriteOwner,
 };
-use aruna_core::structs::storage::format::StoredFormat;
+use aruna_core::structs::storage::format::{Compression, StoredFormat};
 use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
@@ -1988,7 +1988,7 @@ async fn compose_part_sizes() {
             };
             let (operator, sizes) = failing_close::operator_with_sizes();
             let event = handler
-                .compose_parts(target, operator, parts.clone(), None)
+                .compose_parts(target, operator, parts.clone(), None, Compression::Off)
                 .await;
             assert!(matches!(
                 event,
@@ -2031,7 +2031,13 @@ async fn compose_streams_chunks() {
     let (operator, sizes) = failing_close::operator_with_sizes();
 
     handler
-        .compose_parts(make_test_location(), operator, parts, Some(chunk))
+        .compose_parts(
+            make_test_location(),
+            operator,
+            parts,
+            Some(chunk),
+            Compression::Off,
+        )
         .await;
 
     let sizes = sizes.lock().unwrap();
@@ -2042,13 +2048,13 @@ async fn compose_streams_chunks() {
 #[test]
 fn compose_chunk_limits() {
     let tib = 1024u64.pow(4);
-    assert_eq!(compose_chunk(&Backend::S3, 5 * tib), None);
+    assert_eq!(compose_chunk(&Backend::S3, 5 * tib, false), None);
     assert_eq!(
-        compose_chunk(&Backend::Group(GroupBackendKind::S3), tib),
+        compose_chunk(&Backend::Group(GroupBackendKind::S3), tib, false),
         None
     );
     assert_eq!(
-        compose_chunk(&Backend::FileSystem, 1024),
+        compose_chunk(&Backend::FileSystem, 1024, false),
         Some(GROUP_WRITE_CHUNK)
     );
     for (backend, limit) in [
@@ -2056,10 +2062,17 @@ fn compose_chunk_limits() {
         (Backend::Group(GroupBackendKind::Gcs), 10_000),
         (Backend::Group(GroupBackendKind::Azblob), 50_000),
     ] {
-        let chunk = compose_chunk(&backend, 5 * tib).unwrap() as u64;
+        let chunk = compose_chunk(&backend, 5 * tib, false).unwrap() as u64;
         assert!((5 * tib).div_ceil(chunk) <= limit);
         assert!(chunk < 1024 * 1024 * 1024);
     }
+    // Frames do not follow the input parts, so S3 streams them in chunks.
+    let chunk = compose_chunk(&Backend::S3, 5 * tib, true).unwrap() as u64;
+    assert!((5 * tib + 5 * tib / 1024).div_ceil(chunk) <= 10_000);
+    assert_eq!(
+        compose_chunk(&Backend::S3, 1024, true),
+        Some(GROUP_WRITE_CHUNK)
+    );
 }
 
 #[tokio::test]
@@ -2088,7 +2101,13 @@ async fn compose_timeout_deletes() {
     let (operator, delete_calls, writer) = failing_cleanup::pending_operator();
 
     let event = handler
-        .compose_parts(make_test_location(), operator, vec![part], None)
+        .compose_parts(
+            make_test_location(),
+            operator,
+            vec![part],
+            None,
+            Compression::Off,
+        )
         .await;
 
     assert!(matches!(
@@ -2136,7 +2155,7 @@ async fn compose_close_fails() {
 
     let (operator, aborts) = failing_close::operator_with_aborts();
     let event = handler
-        .compose_parts(target.clone(), operator, vec![part], None)
+        .compose_parts(target.clone(), operator, vec![part], None, Compression::Off)
         .await;
 
     assert!(
@@ -2191,7 +2210,7 @@ async fn compose_cleanup_error() {
     let event = context
         .blob_handle
         .handler
-        .compose_parts(target.clone(), operator, Vec::new(), None)
+        .compose_parts(target.clone(), operator, Vec::new(), None, Compression::Off)
         .await;
 
     let BlobEvent::Error(BlobError::WriteCleanup { location, .. }) = event else {

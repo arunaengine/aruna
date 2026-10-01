@@ -9,6 +9,7 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::structs::storage::blob::{BackendLocation, ResolvedBackend};
 use aruna_core::structs::storage::format::{Compression, StoredLayout};
+use aruna_core::structs::storage::multipart::MultipartPartKey;
 use futures::TryStreamExt;
 
 /// Text frames, then seeded random frames that stay raw.
@@ -29,13 +30,16 @@ fn sample() -> Vec<u8> {
     data
 }
 
+fn zstd_backend() -> ResolvedBackend {
+    ResolvedBackend::node_default().with_compression(Compression::Zstd { level: 3 })
+}
+
 async fn write(handler: &BlobHandler, data: &[u8]) -> BackendLocation {
-    let resolved = ResolvedBackend::node_default().with_compression(Compression::Zstd { level: 3 });
     let event = handler
         .write_blob(
             "bucket",
             "framed.bin",
-            resolved,
+            zstd_backend(),
             test_user_id(),
             stream_from_bytes(data),
         )
@@ -122,4 +126,44 @@ async fn tampered_frame_fails() {
     assert!(result.is_err());
     let range = read_range(&handler, location, 0..10).await;
     assert!(range.is_err());
+}
+
+#[tokio::test]
+async fn compose_writes_frames() {
+    // Parts stay raw; only the composed object is framed, hashed over original bytes.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let data = sample();
+    let (first, second) = data.split_at(FRAME_SIZE as usize + 3);
+    let upload = ulid::Ulid::generate();
+    let mut parts = Vec::new();
+    for (number, bytes) in [(1, first), (2, second)] {
+        let event = handler
+            .write_blob_part(
+                MultipartPartKey::new(upload, number),
+                zstd_backend(),
+                test_user_id(),
+                stream_from_bytes(bytes),
+            )
+            .await;
+        let BlobEvent::WriteFinished { location } = event else {
+            panic!("part write failed: {event:?}")
+        };
+        assert_eq!(location.format.layout, StoredLayout::Raw);
+        parts.push(location);
+    }
+
+    let event = handler
+        .compose_blob("bucket", "parts.bin", zstd_backend(), test_user_id(), parts)
+        .await;
+    let BlobEvent::WriteFinished { location } = event else {
+        panic!("compose failed: {event:?}")
+    };
+
+    assert!(matches!(location.format.layout, StoredLayout::Frames(_)));
+    assert_eq!(
+        location.get_blake3(),
+        Some(blake3::hash(&data).as_bytes().as_slice())
+    );
+    assert_eq!(read_back(&handler, location).await, data);
 }

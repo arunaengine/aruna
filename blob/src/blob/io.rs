@@ -23,7 +23,7 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendLocation, BackendRef, BlobLocationKey, HIDDEN_BLOB_PREFIX, HiddenBlobEntry,
     HiddenBlobKey, ResolvedBackend,
 };
-use aruna_core::structs::storage::format::{Compression, StoredFormat, StoredLayout};
+use aruna_core::structs::storage::format::{Compression, FrameLayout, StoredFormat, StoredLayout};
 use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use aruna_core::structs::storage::multipart::MultipartPartKey;
 use bytes::Bytes;
@@ -100,15 +100,23 @@ async fn open_writer(
 }
 
 /// Writer chunk for a composition. `None` keeps each input part as one S3 part; other kinds
-/// stream in chunks only as large as their provider's part limit requires.
-pub(super) fn compose_chunk(backend: &Backend, total: u64) -> Option<usize> {
+/// stream in chunks only as large as their provider's part limit requires. Frames do not
+/// follow the input parts, so a framed composition streams in chunks on S3 too.
+pub(super) fn compose_chunk(backend: &Backend, total: u64, framed: bool) -> Option<usize> {
     const MIB: u64 = 1024 * 1024;
     let limit: u64 = match backend {
-        Backend::S3 | Backend::Group(GroupBackendKind::S3) => return None,
+        Backend::S3 | Backend::Group(GroupBackendKind::S3) if !framed => return None,
+        Backend::S3 | Backend::Group(GroupBackendKind::S3) => 10_000,
         Backend::Group(GroupBackendKind::Azblob | GroupBackendKind::Azdls) => 50_000,
         Backend::FileSystem | Backend::Group(GroupBackendKind::Gcs | GroupBackendKind::B2) => {
             10_000
         }
+    };
+    // Raw frames and the frame entries can store a little more than the input.
+    let total = if framed {
+        total.saturating_add(total / 1024).saturating_add(MIB)
+    } else {
+        total
     };
     let needed = total.div_ceil(limit).div_ceil(MIB) * MIB;
     Some(
@@ -1082,11 +1090,16 @@ impl BlobHandler {
             }
         };
         let total = parts.iter().map(|part| part.blob_size).sum();
-        let chunk = compose_chunk(&backend_type, total);
-        match self
-            .compose_parts(location.clone(), operator, parts, chunk)
-            .await
-        {
+        let framed = resolved.compression != Compression::Off;
+        let chunk = compose_chunk(&backend_type, total, framed);
+        let composed = self.compose_parts(
+            location.clone(),
+            operator,
+            parts,
+            chunk,
+            resolved.compression,
+        );
+        match Box::pin(composed).await {
             BlobEvent::WriteFinished { location } => {
                 reservation.retain();
                 match self.finalize_reservation(&location).await {
@@ -1114,7 +1127,12 @@ impl BlobHandler {
         operator: Operator,
         parts: Vec<BackendLocation>,
         chunk: Option<usize>,
+        compression: Compression,
     ) -> BlobEvent {
+        let mut encoder = match compression {
+            Compression::Off => None,
+            Compression::Zstd { level } => Some(FrameEncoder::new(level)),
+        };
         let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
@@ -1150,7 +1168,7 @@ impl BlobHandler {
         let mut ambiguous = false;
         // A timeout drops the writer future mid-poll, which leaves the writer unusable.
         let mut abandoned = false;
-        let compose_result: Result<u64, BlobError> = async {
+        let compose_result: Result<(u64, Option<FrameLayout>), BlobError> = async {
             let mut bytes_written = 0u64;
             for part in parts {
                 let part_operator = self.operator_from_location(&part)?;
@@ -1184,6 +1202,12 @@ impl BlobHandler {
                     let bytes = next.map_err(|err| BlobError::ReadError(err.to_string()))?;
                     hasher.update(&bytes);
                     part_size += bytes.len() as u64;
+                    if let Some(encoder) = encoder.as_mut() {
+                        let pieces = encoder.push(&bytes).await?;
+                        self.compose_write(&mut writer, pieces, &mut abandoned)
+                            .await?;
+                        continue;
+                    }
                     part_chunks.push(bytes);
                     if chunk.is_some() {
                         let buffered = std::mem::take(&mut part_chunks);
@@ -1191,11 +1215,18 @@ impl BlobHandler {
                             .await?;
                     }
                 }
-                if chunk.is_none() {
+                if !part_chunks.is_empty() {
                     self.compose_write(&mut writer, part_chunks, &mut abandoned)
                         .await?;
                 }
                 bytes_written += part_size;
+            }
+            let mut layout = None;
+            if let Some(encoder) = encoder.take() {
+                let (pieces, framed) = encoder.finish().await?;
+                self.compose_write(&mut writer, pieces, &mut abandoned)
+                    .await?;
+                layout = Some(framed);
             }
             timeout(self.transfer_idle_timeout(), writer.close())
                 .await
@@ -1208,13 +1239,13 @@ impl BlobHandler {
                     ambiguous = true;
                     BlobError::WriteError(err.to_string())
                 })?;
-            Ok(bytes_written)
+            Ok((bytes_written, layout))
         }
         .await;
         ambiguous |= abandoned;
 
-        let bytes_written = match compose_result {
-            Ok(bytes_written) => bytes_written,
+        let (bytes_written, layout) = match compose_result {
+            Ok(composed) => composed,
             Err(err) => {
                 let cleanup = if abandoned {
                     match self.delete_path(&operator, &storage_path).await {
@@ -1245,6 +1276,9 @@ impl BlobHandler {
 
         location.blob_size = bytes_written;
         location.hashes = hasher.to_map();
+        if let Some(layout) = layout {
+            location.format.layout = StoredLayout::Frames(layout);
+        }
         BlobEvent::WriteFinished { location }
     }
 
