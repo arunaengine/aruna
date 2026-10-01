@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::checksum::checksum_mismatch_error;
-use aruna_core::errors::{SourceResolutionError, StagingSourceError};
+use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use aruna_core::structs::storage::routing::RoutingError;
 use aruna_operations::blob::managed_copy::ManagedCopyError;
 use aruna_operations::driver::{GateContextError, RoutingInputsError};
@@ -233,6 +233,28 @@ fn write_failed_error(message: &str, operation: &'static str) -> S3Error {
     checksum_mismatch_error()
 }
 
+/// Names the failed step without backend paths; the parts stay, so the client may retry.
+fn compose_failed_error(error: &dyn Display, reading: bool) -> S3Error {
+    warn!(%error, "Assembling a multipart object failed");
+    let step = if reading {
+        "reading a stored part"
+    } else {
+        "writing the assembled object"
+    };
+    s3_error!(
+        InternalError,
+        "The storage backend failed while {step}. The uploaded parts are kept, so the completion can be retried."
+    )
+}
+
+fn part_store_error(error: &dyn Display) -> S3Error {
+    warn!(%error, "Storing a multipart part failed");
+    s3_error!(
+        InternalError,
+        "The storage backend failed to store this part. The part can be uploaded again."
+    )
+}
+
 pub(crate) trait IntoS3Error {
     fn into_s3_error(self) -> S3Error;
 }
@@ -330,6 +352,7 @@ impl IntoS3Error for UploadPartError {
             UploadPartError::WriteFailed(message) => write_failed_error(&message, "UploadPart"),
             UploadPartError::PolicyGateError(ref error) => policy_gate_error(error, "UploadPart"),
             UploadPartError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
+            UploadPartError::BlobWriteFailed(ref message) => part_store_error(message),
             err => internal_error(err),
         }
     }
@@ -406,6 +429,12 @@ impl IntoS3Error for CompleteUploadError {
             }
             CompleteUploadError::ManagedCopyError(ref error) => managed_copy_error(error),
             CompleteUploadError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
+            CompleteUploadError::BlobError(ref error) => {
+                compose_failed_error(error, matches!(error, BlobError::ReadError(_)))
+            }
+            CompleteUploadError::CompleteUploadFailed => {
+                compose_failed_error(&CompleteUploadError::CompleteUploadFailed, false)
+            }
             err => internal_error(err),
         }
     }
@@ -661,6 +690,25 @@ mod tests {
             UploadPartError::BlobWriteFailed("No space left on device".to_string()).into_s3_error(),
         ] {
             assert_eq!(*error.code(), S3ErrorCode::InternalError);
+        }
+    }
+
+    #[test]
+    fn explains_backend_failure() {
+        // The client learns the failed step and that a retry is safe, never backend addresses.
+        let leaked = "s3://ceph.internal/bucket/part timed out";
+        let read = CompleteUploadError::BlobError(BlobError::ReadError(leaked.to_string()));
+        let write = CompleteUploadError::BlobError(BlobError::WriteError(leaked.to_string()));
+        let part = UploadPartError::BlobWriteFailed(leaked.to_string());
+        for (error, expected) in [
+            (read.into_s3_error(), "reading a stored part"),
+            (write.into_s3_error(), "writing the assembled object"),
+            (part.into_s3_error(), "uploaded again"),
+        ] {
+            assert_eq!(*error.code(), S3ErrorCode::InternalError);
+            let message = error.message().unwrap_or_default();
+            assert!(message.contains(expected), "{message}");
+            assert!(!message.contains("ceph.internal"), "{message}");
         }
     }
 
