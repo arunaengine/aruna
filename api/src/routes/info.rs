@@ -514,6 +514,7 @@ pub enum RealmPlacementClass {
     MetadataRegistry,
     JobControl,
     PlacementPolicy,
+    UserVault,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -744,6 +745,7 @@ impl From<aruna_core::structs::placement::record::DocumentClass> for RealmPlacem
             aruna_core::structs::placement::record::DocumentClass::PlacementPolicy => {
                 Self::PlacementPolicy
             }
+            aruna_core::structs::placement::record::DocumentClass::UserVault => Self::UserVault,
         }
     }
 }
@@ -758,6 +760,7 @@ impl From<RealmPlacementClass> for aruna_core::structs::placement::record::Docum
             RealmPlacementClass::MetadataRegistry => Self::MetadataRegistry,
             RealmPlacementClass::JobControl => Self::JobControl,
             RealmPlacementClass::PlacementPolicy => Self::PlacementPolicy,
+            RealmPlacementClass::UserVault => Self::UserVault,
         }
     }
 }

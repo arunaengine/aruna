@@ -560,6 +560,11 @@ impl RealmConfigDocument {
             scope: BindingScope::Class(DocumentClass::PlacementPolicy),
             strategy_id: default_strategy.strategy_id,
         });
+        // User vaults follow the metadata replication factor; a realm admin may rebind them.
+        self.strategy_bindings.push(StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::UserVault),
+            strategy_id: default_strategy.strategy_id,
+        });
         // Reserve the low-band Metadata binding before grants begin. JobControl
         // bindings are per node band and appended at onboarding, never seeded.
         self.placement_bindings = vec![PlacementBinding {
@@ -2002,6 +2007,20 @@ mod test {
             .expect("a strategy is bound");
         assert_eq!(Some(bound.strategy_id), config.default_strategy_id);
         assert_eq!(bound.replica_count, Some(2));
+    }
+
+    #[test]
+    fn seeds_vault_binding() {
+        // An explicit binding lets a realm admin give vaults their own strategy.
+        let mut config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 2);
+        config.seed_default_placement();
+        let vault_class = BindingScope::Class(DocumentClass::UserVault);
+        let binding = config
+            .strategy_bindings
+            .iter()
+            .find(|binding| binding.scope == vault_class)
+            .expect("vault class binding is seeded");
+        assert_eq!(Some(binding.strategy_id), config.default_strategy_id);
     }
 
     #[test]
