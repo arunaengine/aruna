@@ -21,6 +21,7 @@ use std::time::SystemTime;
 async fn preflight_discloses_cleanup() {
     let storage_dir = tempfile::tempdir().unwrap();
     let storage = FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
     let realm_id = RealmId::from_bytes(
         ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
             .verifying_key()

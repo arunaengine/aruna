@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::UserId;
+use crate::compute::SecretBytes;
 use crate::errors::ConversionError;
+use crate::node_vault::{VaultEntry, VaultPurpose};
 use crate::structs::storage::cleanup::CleanupStrategy;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
@@ -111,6 +113,15 @@ impl fmt::Debug for GroupStorageSecret {
 }
 
 impl GroupStorageSecret {
+    /// The node vault record that holds the secret of `backend_id`.
+    pub fn vault_entry(backend_id: Ulid) -> VaultEntry {
+        VaultEntry::new(VaultPurpose::GroupBackend, backend_id)
+    }
+
+    pub fn to_secret(&self) -> Result<SecretBytes, ConversionError> {
+        Ok(SecretBytes::new(self.to_bytes()?))
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }

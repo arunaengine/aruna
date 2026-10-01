@@ -43,8 +43,10 @@ pub(super) struct Fixture {
 }
 
 pub(super) fn context(path: &std::path::Path) -> DriverContext {
+    let storage_handle = aruna_storage::FjallStorage::open(path.to_str().unwrap()).unwrap();
+    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
     DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(path.to_str().unwrap()).unwrap(),
+        storage_handle,
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,

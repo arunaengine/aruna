@@ -132,7 +132,7 @@ impl ResolveConnectorOperation {
     }
 
     fn handle_secret_read(&mut self, event: Event) -> Effects {
-        let secret = match parse_secret_read(event) {
+        let secret = match parse_secret_read(event, self.input.connector_id) {
             Ok(secret) => secret,
             Err(error) => return self.emit_error(error.into()),
         };
@@ -626,7 +626,10 @@ pub(crate) fn resolve_binding_access(
     source: &VersionSourceBinding,
     event: Event,
 ) -> Result<ResolvedSourceAccess, SourceResolutionError> {
-    let secret = parse_secret_read(event).map_err(SourceResolutionError::from)?;
+    let Some(connector_id) = source.connector_id else {
+        return Err(SourceResolutionError::ResolveFailed);
+    };
+    let secret = parse_secret_read(event, connector_id).map_err(SourceResolutionError::from)?;
 
     build_binding_access(source, secret.map(|secret| secret.secret_config))
 }
@@ -674,6 +677,7 @@ mod tests {
     async fn merges_public_secret() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -850,6 +854,7 @@ mod tests {
     async fn uses_stored_descriptor() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,

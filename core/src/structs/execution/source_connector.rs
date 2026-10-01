@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::UserId;
+use crate::compute::SecretBytes;
 use crate::errors::ConversionError;
+use crate::node_vault::{VaultEntry, VaultPurpose};
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -123,6 +125,15 @@ impl SourceConnectorSecret {
             secret_config,
             updated_at,
         })
+    }
+
+    /// The node vault record that holds the secret config of `connector_id`.
+    pub fn vault_entry(connector_id: Ulid) -> VaultEntry {
+        VaultEntry::new(VaultPurpose::SourceConnector, connector_id)
+    }
+
+    pub fn to_secret(&self) -> Result<SecretBytes, ConversionError> {
+        Ok(SecretBytes::new(self.to_bytes()?))
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {

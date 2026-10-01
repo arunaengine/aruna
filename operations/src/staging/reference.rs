@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
-use crate::connectors::repository::{connector_secret_key, source_connector_key};
+use crate::connectors::repository::{
+    StorageReadError, parse_secret_read, read_secret_effect, source_connector_key,
+};
 use crate::connectors::resolver::secret_fingerprint;
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish};
@@ -19,10 +21,9 @@ use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE,
-    SOURCE_SECRET_KEYSPACE,
 };
 use aruna_core::structs::execution::source_access::SourceMetadata;
-use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
+use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
@@ -508,21 +509,15 @@ async fn guard_connector_unchanged(
         return Err(StorageError::TransactionConflict.into());
     }
 
-    let current_secret = match context
+    let connector_id = resolved_connector.connector_id;
+    let event = context
         .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: SOURCE_SECRET_KEYSPACE.to_string(),
-            key: connector_secret_key(resolved_connector.connector_id),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .as_ref()
-            .map(|value| SourceConnectorSecret::from_bytes(value.as_ref()))
-            .transpose()?,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        _ => return Err(StorageError::ReadError("unexpected event".to_string()).into()),
+        .send_effect(read_secret_effect(connector_id, Some(txn_id)))
+        .await;
+    let current_secret = match parse_secret_read(event, connector_id) {
+        Ok(secret) => secret,
+        Err(StorageReadError::Storage(error)) => return Err(error.into()),
+        Err(StorageReadError::Conversion(error)) => return Err(error.into()),
     };
 
     let current_secret_fingerprint = current_secret.as_ref().map(secret_fingerprint);
@@ -576,14 +571,16 @@ async fn guard_expected_bucket(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectors::repository::{delete_secret_effect, write_secret_effect};
     use crate::driver::drive;
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE,
-        SOURCE_INDEX_KEYSPACE, SOURCE_SECRET_KEYSPACE, USAGE_STATS_KEYSPACE,
+        SOURCE_INDEX_KEYSPACE, USAGE_STATS_KEYSPACE,
     };
+    use aruna_core::node_vault::NodeVaultKey;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::execution::job::JobId;
     use aruna_core::structs::execution::source_connector::{
@@ -605,6 +602,7 @@ mod tests {
     fn test_context() -> (TempDir, DriverContext) {
         let tempdir = tempdir().expect("tempdir must be created");
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -660,12 +658,7 @@ mod tests {
     async fn write_secret(context: &DriverContext, secret: &SourceConnectorSecret) {
         let event = context
             .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: SOURCE_SECRET_KEYSPACE.to_string(),
-                key: connector_secret_key(secret.connector_id),
-                value: secret.to_bytes().unwrap().into(),
-                txn_id: None,
-            })
+            .send_effect(write_secret_effect(secret, None).unwrap())
             .await;
         assert!(matches!(
             event,
@@ -691,11 +684,7 @@ mod tests {
     async fn delete_secret(context: &DriverContext, connector_id: Ulid) {
         let event = context
             .storage_handle
-            .send_storage_effect(StorageEffect::Delete {
-                key_space: SOURCE_SECRET_KEYSPACE.to_string(),
-                key: connector_secret_key(connector_id),
-                txn_id: None,
-            })
+            .send_effect(delete_secret_effect(connector_id, None))
             .await;
         assert!(matches!(
             event,

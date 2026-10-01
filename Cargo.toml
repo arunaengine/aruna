@@ -21,7 +21,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.99"
+version = "3.0.0-alpha.100"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -40,6 +40,7 @@ aruna-storage = { path = "storage" }
 aruna-tasks = { path = "tasks" }
 
 # Third-party crates
+aes-gcm = "0.11.1"
 ahash = "0.8.12"
 async-compression = { version = "0.4.46", default-features = false, features = [
     "tokio",
@@ -173,6 +174,7 @@ sha1 = "0.11.0"
 sha2 = "0.11.0"
 smallvec = "1.15.2"
 spargebra = "0.4.7"
+subtle = "2.6.1"
 sysinfo = { version = "0.39.6", default-features = false, features = [
     "system",
 ] }

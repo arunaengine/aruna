@@ -2,9 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::compute::SecretBytes;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::GROUP_DELETE_KEYSPACE;
+use aruna_core::node_vault::VaultEntry;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::group_delete::{GroupWriteError, check_group_write};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -20,6 +22,19 @@ pub fn group_fence_key(group_id: GroupId) -> (String, Key) {
 pub fn write_group_records(group_id: GroupId, writes: Vec<(String, Key, Value)>) -> Effect {
     Effect::SubOperation(boxed_suboperation(
         GroupWriteOperation::new(group_id, writes),
+        |result| Event::SubOperation(SubOperationEvent::GroupWritten { result }),
+    ))
+}
+
+/// Like [`write_group_records`], and seals `secret` into the node vault in the same transaction.
+pub fn write_group_secret(
+    group_id: GroupId,
+    writes: Vec<(String, Key, Value)>,
+    entry: VaultEntry,
+    secret: SecretBytes,
+) -> Effect {
+    Effect::SubOperation(boxed_suboperation(
+        GroupWriteOperation::new(group_id, writes).with_secret(entry, secret),
         |result| Event::SubOperation(SubOperationEvent::GroupWritten { result }),
     ))
 }
@@ -56,6 +71,7 @@ enum State {
     Start,
     Read,
     Write,
+    Secret,
     Commit,
     Finish,
 }
@@ -64,6 +80,7 @@ enum State {
 pub struct GroupWriteOperation {
     group_id: GroupId,
     writes: Vec<(String, Key, Value)>,
+    secret: Option<(VaultEntry, SecretBytes)>,
     txn_id: Option<TxnId>,
     state: State,
     output: Option<Result<(), GroupWriteError>>,
@@ -74,10 +91,17 @@ impl GroupWriteOperation {
         Self {
             group_id,
             writes,
+            secret: None,
             txn_id: None,
             state: State::Init,
             output: None,
         }
+    }
+
+    /// Seals `secret` into the node vault after the record writes, before the commit.
+    pub fn with_secret(mut self, entry: VaultEntry, secret: SecretBytes) -> Self {
+        self.secret = Some((entry, secret));
+        self
     }
 
     fn fail(&mut self, error: GroupWriteError) -> Effects {
@@ -123,7 +147,17 @@ impl Operation for GroupWriteOperation {
                     txn_id: self.txn_id,
                 })]
             }
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
+                if self.secret.is_some() =>
+            {
+                let Some((entry, secret)) = self.secret.take() else {
+                    return self.fail(GroupWriteError::Unexpected);
+                };
+                self.state = State::Secret;
+                smallvec![crate::node_vault::write_secret(entry, secret, self.txn_id)]
+            }
+            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
+            | (State::Secret, Event::Storage(StorageEvent::WriteResult { .. })) => {
                 let Some(txn_id) = self.txn_id else {
                     return self.fail(GroupWriteError::Unexpected);
                 };

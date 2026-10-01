@@ -49,17 +49,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35f0f96ce78e38c3dc6d8948aa8163d06385be74000f3c7a95bf1eef35d3ea32"
+dependencies = [
+ "cipher 0.5.2",
+ "cpubits",
+ "cpufeatures 0.3.1",
+]
+
+[[package]]
 name = "aes-gcm"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "831010a0f742e1209b3bcea8fab6a8e149051ba6099432c8cb2cc117dec3ead1"
 dependencies = [
  "aead 0.5.2",
- "aes",
+ "aes 0.8.4",
  "cipher 0.4.4",
- "ctr",
- "ghash",
+ "ctr 0.9.2",
+ "ghash 0.5.1",
  "subtle",
+]
+
+[[package]]
+name = "aes-gcm"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f2b8006a0c83f52b62ba44a97b58bf76fe2f70a329e588f67f89691d93d498f"
+dependencies = [
+ "aead 0.6.1",
+ "aes 0.9.3",
+ "cipher 0.5.2",
+ "ctr 0.10.1",
+ "ctutils",
+ "ghash 0.6.0",
 ]
 
 [[package]]
@@ -266,7 +291,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.99"
+version = "3.0.0-alpha.100"
 dependencies = [
  "aruna-api",
  "aruna-blob",
@@ -316,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.99"
+version = "3.0.0-alpha.100"
 dependencies = [
  "ahash 0.8.12",
  "aruna-blob",
@@ -374,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.99"
+version = "3.0.0-alpha.100"
 dependencies = [
  "aruna-core",
  "aruna-net",
@@ -414,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute"
-version = "3.0.0-alpha.99"
+version = "3.0.0-alpha.100"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -444,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute-helper"
-version = "3.0.0-alpha.99"
+version = "3.0.0-alpha.100"
 dependencies = [
  "rustix",
  "serde_json",
@@ -454,8 +479,9 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.99"
+version = "3.0.0-alpha.100"
 dependencies = [
+ "aes-gcm 0.11.1",
  "async-trait",
  "base64 0.23.1",
  "blake3",
@@ -485,6 +511,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "smallvec",
+ "subtle",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
@@ -497,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.99"
+version = "3.0.0-alpha.100"
 dependencies = [
  "ahash 0.8.12",
  "aruna",
@@ -539,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-net"
-version = "3.0.0-alpha.99"
+version = "3.0.0-alpha.100"
 dependencies = [
  "aruna-core",
  "aruna-storage",
@@ -567,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-operations"
-version = "3.0.0-alpha.99"
+version = "3.0.0-alpha.100"
 dependencies = [
  "aruna-blob",
  "aruna-compute",
@@ -625,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.99"
+version = "3.0.0-alpha.100"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -642,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-tasks"
-version = "3.0.0-alpha.99"
+version = "3.0.0-alpha.100"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -2014,6 +2041,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cpubits"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15b85f9c39137c3a891689859392b1bd49812121d0d61c9caf00d46ed5ce06ae"
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2263,6 +2296,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctr"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baaca1c4b237092596f64d571e9db6ce4109c4ef9742e27590f1709594461f21"
+dependencies = [
+ "cipher 0.5.2",
+]
+
+[[package]]
 name = "ctutils"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2387,7 +2429,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -3246,7 +3288,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
- "polyval",
+ "polyval 0.6.2",
+]
+
+[[package]]
+name = "ghash"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2eecf2d5dc9b66b732b97707a0210906b1d30523eb773193ab777c0c84b3e8d5"
+dependencies = [
+ "polyval 0.7.3",
 ]
 
 [[package]]
@@ -5135,7 +5186,7 @@ version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c1e5b6fe668491eca022f745a0a9402585626c73a7b839b3424ace15d6a9c8f"
 dependencies = [
- "aes-gcm",
+ "aes-gcm 0.10.3",
  "bytes",
  "derive_more",
  "enum-assoc",
@@ -5796,14 +5847,13 @@ dependencies = [
  "oxrdf",
  "oxrdfio",
  "oxsdatatypes",
- "rand 0.8.8",
  "rand 0.9.5",
  "rustc-hash",
  "siphasher",
  "sparesults",
  "spareval",
  "spargebra",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5840,7 +5890,7 @@ dependencies = [
  "oxiri 0.2.11",
  "oxrdf",
  "ryu-js",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5853,10 +5903,10 @@ dependencies = [
  "oxilangtag",
  "oxiri 0.2.11",
  "oxsdatatypes",
- "rand 0.8.8",
+ "rand 0.9.5",
  "serde",
  "sha2 0.11.0",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5869,7 +5919,7 @@ dependencies = [
  "oxrdf",
  "oxrdfxml",
  "oxttl",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5882,7 +5932,7 @@ dependencies = [
  "oxiri 0.2.11",
  "oxrdf",
  "quick-xml 0.37.5",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5891,7 +5941,7 @@ version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c17c2ae62ac34fda465f6331105906c0e17b4e088dac3249e1f229b962062503"
 dependencies = [
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5904,7 +5954,7 @@ dependencies = [
  "oxilangtag",
  "oxiri 0.2.11",
  "oxrdf",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -6202,7 +6252,7 @@ version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e847e2c91a18bfa887dd028ec33f2fe6f25db77db3619024764914affe8b69a6"
 dependencies = [
- "aes",
+ "aes 0.8.4",
  "cbc",
  "der 0.7.10",
  "pbkdf2",
@@ -6289,6 +6339,17 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash 0.5.1",
+]
+
+[[package]]
+name = "polyval"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0fa31d631f2b2cb2a544d0aa321ce847a94764d701ca2becc411138b93d49cd"
+dependencies = [
+ "cpubits",
+ "cpufeatures 0.3.1",
+ "universal-hash 0.6.1",
 ]
 
 [[package]]
@@ -8192,7 +8253,7 @@ dependencies = [
  "memchr",
  "oxrdf",
  "quick-xml 0.37.5",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -8207,7 +8268,7 @@ dependencies = [
  "oxiri 0.2.11",
  "oxrdf",
  "oxsdatatypes",
- "rand 0.8.8",
+ "rand 0.9.5",
  "regex",
  "rustc-hash",
  "sha1 0.11.0",
@@ -8215,7 +8276,7 @@ dependencies = [
  "sparesults",
  "spargebra",
  "sparopt",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -8228,8 +8289,8 @@ dependencies = [
  "oxiri 0.2.11",
  "oxrdf",
  "peg",
- "rand 0.8.8",
- "thiserror 1.0.69",
+ "rand 0.9.5",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -8239,7 +8300,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "973ee503ab3d6c3de66b4b459233cd5b22b44dad0fb7b8d0931daf73d2ede935"
 dependencies = [
  "oxrdf",
- "rand 0.8.8",
+ "rand 0.9.5",
  "spargebra",
 ]
 

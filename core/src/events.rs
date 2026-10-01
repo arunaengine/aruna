@@ -3,12 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::audit::AuditPageBatch;
+use crate::compute::SecretBytes;
 use crate::effects::{
     FetchCursor, FrameBoundsError, JOB_PAGE_BYTES, JobRecordFrame, MAX_RECORD_PAGE, ReceiptFrame,
     encoded_len,
 };
 use crate::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use crate::metadata::MetadataEvent;
+use crate::node_vault::VaultEntry;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::execution::source_access::{
     ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
@@ -246,6 +248,11 @@ pub enum StorageEvent {
     IterResult {
         values: Vec<(Key, Value)>,
         next_start_after: Option<Key>,
+    },
+    /// The opened node vault record of `entry`, if it exists.
+    VaultResult {
+        entry: VaultEntry,
+        secret: Option<SecretBytes>,
     },
     Error {
         error: StorageError,

@@ -50,7 +50,7 @@ impl HasConfigOperation {
     }
 
     fn handle_secret_read(&mut self, event: Event) -> Effects {
-        match parse_secret_read(event) {
+        match parse_secret_read(event, self.connector_id) {
             Ok(secret) => {
                 self.state = HasConfigState::Finish;
                 self.output = Some(Ok(secret.is_some()));

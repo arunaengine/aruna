@@ -3,12 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::validation::{GroupBackendError, validate_backend_input};
-use super::{RecordReadError, backend_key, record_writes};
+use super::{RecordReadError, record_writes};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
-use aruna_core::keyspaces::BACKEND_SECRET_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::group_backend::{
@@ -172,24 +171,21 @@ impl CreateBackendOperation {
         let (Some(record), Some(secret)) = (self.record.as_ref(), self.secret.as_ref()) else {
             return self.fail(CreateBackendError::Failed);
         };
-        let mut writes = match record_writes(record) {
+        let writes = match record_writes(record) {
             Ok(writes) => writes,
             Err(error) => return self.fail(error.into()),
         };
-        let secret_bytes = match secret.to_bytes() {
+        let secret_bytes = match secret.to_secret() {
             Ok(bytes) => bytes,
             Err(error) => return self.fail(error.into()),
         };
-        writes.push((
-            BACKEND_SECRET_KEYSPACE.to_string(),
-            backend_key(record.backend_id),
-            secret_bytes.into(),
-        ));
 
         self.state = CreateState::WriteRecords;
-        smallvec![crate::groups::fence::write_group_records(
+        smallvec![crate::groups::fence::write_group_secret(
             self.input.group_id,
-            writes
+            writes,
+            GroupStorageSecret::vault_entry(record.backend_id),
+            secret_bytes,
         )]
     }
 
@@ -245,12 +241,12 @@ mod pure_tests {
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::errors::BlobError;
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
-    use aruna_core::keyspaces::{
-        BACKEND_INDEX_KEYSPACE, BACKEND_SECRET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
-    };
+    use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
-    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
+    use aruna_core::structs::storage::group_backend::{
+        GroupBackendKind, GroupStorage, GroupStorageSecret,
+    };
     use std::collections::HashMap;
     use ulid::Ulid;
 
@@ -266,7 +262,7 @@ mod pure_tests {
             ]),
             secret_config: HashMap::from([
                 ("access_key_id".to_string(), "id".to_string()),
-                ("secret_access_key".to_string(), "key".to_string()),
+                ("secret_access_key".to_string(), "canary-2f9b".to_string()),
             ]),
             cleanup: CleanupStrategy::Retain,
         }
@@ -278,6 +274,7 @@ mod pure_tests {
         let mut operation = CreateBackendOperation::new(input());
 
         let effects = operation.start();
+        let mut formatted = vec![format!("{effects:?} {operation:?}")];
 
         assert!(matches!(
             effects.as_slice(),
@@ -285,6 +282,7 @@ mod pure_tests {
         ));
 
         let mut effects = operation.step(Event::Blob(BlobEvent::GroupBackendChecked));
+        formatted.push(format!("{effects:?} {operation:?}"));
         let [Effect::SubOperation(write)] = effects.as_mut_slice() else {
             panic!("expected a guarded group write");
         };
@@ -304,15 +302,25 @@ mod pure_tests {
                 .iter()
                 .map(|(key_space, ..)| key_space.as_str())
                 .collect::<Vec<_>>(),
-            [
-                STORAGE_BACKEND_KEYSPACE,
-                BACKEND_INDEX_KEYSPACE,
-                BACKEND_SECRET_KEYSPACE
-            ]
+            [STORAGE_BACKEND_KEYSPACE, BACKEND_INDEX_KEYSPACE]
         );
-        assert_eq!(writes[0].1, writes[2].1);
         let stored = GroupStorage::from_bytes(writes[0].2.as_ref()).unwrap();
         assert!(!stored.public_config.contains_key("access_key_id"));
+
+        // The secret goes into the node vault inside the same transaction.
+        let effects = write.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: vec![],
+        }));
+        let [Effect::Storage(StorageEffect::VaultWrite { entry, txn_id, .. })] = effects.as_slice()
+        else {
+            panic!("expected a vault write, got {effects:?}")
+        };
+        assert_eq!(*entry, GroupStorageSecret::vault_entry(stored.backend_id));
+        assert_eq!(*txn_id, Some(Ulid::from_bytes([7; 16])));
+        formatted.push(format!("{effects:?} {write:?}"));
+        for text in formatted {
+            assert!(!text.contains("canary"), "{text}");
+        }
     }
 
     #[test]

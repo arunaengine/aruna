@@ -222,7 +222,7 @@ impl Default for BlobTimeoutConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BackendConfig {
     pub backend_type: Backend,
     pub root: String,
@@ -231,6 +231,24 @@ pub struct BackendConfig {
     pub max_bucket_size: Option<u64>,
     pub multipart_bucket: Option<String>,
     pub timeouts: BlobTimeoutConfig,
+}
+
+/// Shows only the service config keys; the values include backend credentials.
+impl std::fmt::Debug for BackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendConfig")
+            .field("backend_type", &self.backend_type)
+            .field("root", &self.root)
+            .field(
+                "service_keys",
+                &self.service_config.keys().collect::<Vec<_>>(),
+            )
+            .field("bucket_prefix", &self.bucket_prefix)
+            .field("max_bucket_size", &self.max_bucket_size)
+            .field("multipart_bucket", &self.multipart_bucket)
+            .field("timeouts", &self.timeouts)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]

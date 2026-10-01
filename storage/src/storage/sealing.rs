@@ -6,17 +6,11 @@ use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, sea
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
-use aruna_core::keyspaces::{
-    BACKEND_SECRET_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, SOURCE_SECRET_KEYSPACE,
-};
+use aruna_core::keyspaces::CONNECTOR_SECRET_KEYSPACE;
 use aruna_core::types::{Key, Value};
 
-/// Keyspaces whose rows hold plain connector or backend credentials.
-pub const SEALED_KEYSPACES: [&str; 3] = [
-    BACKEND_SECRET_KEYSPACE,
-    SOURCE_SECRET_KEYSPACE,
-    CONNECTOR_SECRET_KEYSPACE,
-];
+/// Keyspaces whose rows hold plain repository connector credentials.
+pub const SEALED_KEYSPACES: [&str; 1] = [CONNECTOR_SECRET_KEYSPACE];
 
 /// Which sealed rows a read returns, captured before its effect is dispatched.
 pub(super) enum Opening {
@@ -145,7 +139,7 @@ mod tests {
 
     fn write(key: &[u8]) -> StorageEffect {
         StorageEffect::Write {
-            key_space: SOURCE_SECRET_KEYSPACE.to_string(),
+            key_space: CONNECTOR_SECRET_KEYSPACE.to_string(),
             key: key.to_vec().into(),
             value: CANARY.to_vec().into(),
             txn_id: None,
@@ -169,7 +163,7 @@ mod tests {
         let read = |key: &[u8], secret_key: &CredentialEncryptionKey| {
             open_event(
                 secret_key,
-                Opening::Rows(vec![SOURCE_SECRET_KEYSPACE.to_string()]),
+                Opening::Rows(vec![CONNECTOR_SECRET_KEYSPACE.to_string()]),
                 StorageEvent::ReadResult {
                     key: key.to_vec().into(),
                     value: Some(value.clone()),
@@ -196,16 +190,19 @@ mod tests {
         handle.send_storage_effect(write(b"row-a")).await;
         let reads = [
             StorageEffect::Read {
-                key_space: SOURCE_SECRET_KEYSPACE.to_string(),
+                key_space: CONNECTOR_SECRET_KEYSPACE.to_string(),
                 key: b"row-a".to_vec().into(),
                 txn_id: None,
             },
             StorageEffect::BatchRead {
-                reads: vec![(SOURCE_SECRET_KEYSPACE.to_string(), b"row-a".to_vec().into())],
+                reads: vec![(
+                    CONNECTOR_SECRET_KEYSPACE.to_string(),
+                    b"row-a".to_vec().into(),
+                )],
                 txn_id: None,
             },
             StorageEffect::Iter {
-                key_space: SOURCE_SECRET_KEYSPACE.to_string(),
+                key_space: CONNECTOR_SECRET_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
                 limit: 10,

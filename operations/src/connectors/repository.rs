@@ -3,16 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
-use aruna_core::keyspaces::{
-    BLOB_VERSIONS_KEYSPACE, SOURCE_INDEX_KEYSPACE, SOURCE_SECRET_KEYSPACE,
-};
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, SOURCE_INDEX_KEYSPACE};
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState};
 use aruna_core::types::{GroupId, Key, TxnId};
 use byteview::ByteView;
 use ulid::Ulid;
 
+use crate::node_vault::{delete_secret, parse_secret, read_secret, write_secret};
 use crate::storage_read::{parse_storage_iter, parse_storage_read};
 
 pub use crate::storage_read::StorageReadError;
@@ -31,10 +31,6 @@ pub fn source_connector_prefix(group_id: GroupId) -> Key {
     ByteView::from(group_id.to_bytes().to_vec())
 }
 
-pub fn connector_secret_key(connector_id: Ulid) -> Key {
-    ByteView::from(connector_id.to_bytes().to_vec())
-}
-
 pub fn read_connector_effect(
     group_id: GroupId,
     connector_id: Ulid,
@@ -48,11 +44,15 @@ pub fn read_connector_effect(
 }
 
 pub fn read_secret_effect(connector_id: Ulid, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: SOURCE_SECRET_KEYSPACE.to_string(),
-        key: connector_secret_key(connector_id),
-        txn_id,
-    })
+    read_secret(SourceConnectorSecret::vault_entry(connector_id), txn_id)
+}
+
+pub fn write_secret_effect(
+    secret: &SourceConnectorSecret,
+    txn_id: Option<TxnId>,
+) -> Result<Effect, ConversionError> {
+    let entry = SourceConnectorSecret::vault_entry(secret.connector_id);
+    Ok(write_secret(entry, secret.to_secret()?, txn_id))
 }
 
 pub fn delete_connector_effect(
@@ -68,11 +68,7 @@ pub fn delete_connector_effect(
 }
 
 pub fn delete_secret_effect(connector_id: Ulid, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Delete {
-        key_space: SOURCE_SECRET_KEYSPACE.to_string(),
-        key: connector_secret_key(connector_id),
-        txn_id,
-    })
+    delete_secret(SourceConnectorSecret::vault_entry(connector_id), txn_id)
 }
 
 pub fn iter_connectors_effect(
@@ -103,8 +99,15 @@ pub fn parse_connector_read(event: Event) -> Result<Option<SourceConnector>, Sto
     parse_storage_read(event, SourceConnector::from_bytes)
 }
 
-pub fn parse_secret_read(event: Event) -> Result<Option<SourceConnectorSecret>, StorageReadError> {
-    parse_storage_read(event, SourceConnectorSecret::from_bytes)
+pub fn parse_secret_read(
+    event: Event,
+    connector_id: Ulid,
+) -> Result<Option<SourceConnectorSecret>, StorageReadError> {
+    parse_secret(
+        event,
+        SourceConnectorSecret::vault_entry(connector_id),
+        SourceConnectorSecret::from_bytes,
+    )
 }
 
 pub fn parse_connector_iter(
@@ -159,14 +162,6 @@ mod pure_tests {
 
         assert!(key.as_ref().starts_with(prefix.as_ref()));
         assert_eq!(key.as_ref().len(), 32);
-    }
-
-    #[test]
-    fn secret_key_encoding() {
-        let record = sample_record();
-        let key = connector_secret_key(record.connector_id);
-
-        assert_eq!(key.as_ref(), record.connector_id.to_bytes().as_slice());
     }
 
     #[test]

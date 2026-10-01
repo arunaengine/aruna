@@ -7,12 +7,12 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_INDEX_KEYSPACE, BACKEND_SECRET_KEYSPACE, BLOB_CLEANUP_KEYSPACE,
-    BLOB_LOCATIONS_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
+    BACKEND_INDEX_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork, BlobLocationKey};
-use aruna_core::structs::storage::group_backend::GroupStorage;
+use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
@@ -198,6 +198,7 @@ enum RemoveState {
     StartTransaction,
     ReadRecord,
     DeleteRecords,
+    DeleteSecret,
     CommitTransaction,
     AbortTransaction,
     Finish,
@@ -295,10 +296,6 @@ impl RemoveBackendOperation {
                     BACKEND_INDEX_KEYSPACE.to_string(),
                     index_key(record.group_id, record.backend_id),
                 ),
-                (
-                    BACKEND_SECRET_KEYSPACE.to_string(),
-                    backend_key(record.backend_id),
-                ),
             ],
             txn_id: self.txn_id,
         })]
@@ -307,6 +304,24 @@ impl RemoveBackendOperation {
     fn handle_deleted(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
+                self.state = RemoveState::DeleteSecret;
+                smallvec![crate::node_vault::delete_secret(
+                    GroupStorageSecret::vault_entry(self.backend_id),
+                    self.txn_id,
+                )]
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+            received => self.fail(RemoveBackendError::InvalidStateEvent {
+                state: "DeleteRecords",
+                expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
+                received,
+            }),
+        }
+    }
+
+    fn handle_secret_deleted(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::DeleteResult { .. }) => {
                 let Some(txn_id) = self.txn_id else {
                     return self.fail(RemoveBackendError::Failed);
                 };
@@ -316,8 +331,8 @@ impl RemoveBackendOperation {
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
             received => self.fail(RemoveBackendError::InvalidStateEvent {
-                state: "DeleteRecords",
-                expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
+                state: "DeleteSecret",
+                expected: "Event::Storage(StorageEvent::DeleteResult)",
                 received,
             }),
         }
@@ -372,6 +387,7 @@ impl Operation for RemoveBackendOperation {
             RemoveState::StartTransaction => self.handle_txn_started(event),
             RemoveState::ReadRecord => self.handle_record(event),
             RemoveState::DeleteRecords => self.handle_deleted(event),
+            RemoveState::DeleteSecret => self.handle_secret_deleted(event),
             RemoveState::CommitTransaction => self.handle_committed(event),
             RemoveState::AbortTransaction => self.handle_aborted(event),
             RemoveState::Finish | RemoveState::Error => {
@@ -410,9 +426,10 @@ impl Operation for RemoveBackendOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::handle::Handle;
     use aruna_core::structs::storage::blob::BackendLocation;
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
-    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorageSecret};
+    use aruna_core::structs::storage::group_backend::GroupBackendKind;
     use aruna_core::structs::storage::multipart::MultipartUploadStatus;
     use aruna_core::types::Key;
     use std::collections::HashMap;
@@ -420,8 +437,10 @@ mod tests {
     use tempfile::tempdir;
 
     fn context(root: &str) -> DriverContext {
+        let storage_handle = aruna_storage::FjallStorage::open(root).unwrap();
+        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
         DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
+            storage_handle,
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
@@ -466,19 +485,26 @@ mod tests {
         for (key_space, key, value) in super::super::record_writes(&stored).unwrap() {
             write(context, &key_space, key, value.to_vec()).await;
         }
-        write(
-            context,
-            BACKEND_SECRET_KEYSPACE,
-            backend_key(backend_id),
-            GroupStorageSecret {
-                backend_id,
-                secret_config: HashMap::new(),
-                updated_at: SystemTime::UNIX_EPOCH,
-            }
-            .to_bytes()
-            .unwrap(),
-        )
-        .await;
+        let secret = GroupStorageSecret {
+            backend_id,
+            secret_config: HashMap::new(),
+            updated_at: SystemTime::UNIX_EPOCH,
+        };
+        let entry = GroupStorageSecret::vault_entry(backend_id);
+        let effect = crate::node_vault::write_secret(entry, secret.to_secret().unwrap(), None);
+        context.storage_handle.send_effect(effect).await;
+    }
+
+    async fn stored_secret(
+        context: &DriverContext,
+        backend_id: Ulid,
+    ) -> Option<GroupStorageSecret> {
+        let entry = GroupStorageSecret::vault_entry(backend_id);
+        let event = context
+            .storage_handle
+            .send_effect(crate::node_vault::read_secret(entry, None))
+            .await;
+        crate::node_vault::parse_secret(event, entry, GroupStorageSecret::from_bytes).unwrap()
     }
 
     async fn read(context: &DriverContext, key_space: &str, key: Key) -> Option<Vec<u8>> {
@@ -508,13 +534,12 @@ mod tests {
 
         assert_eq!(remove_drained_backends(&ctx).await.unwrap(), 1);
 
-        for key_space in [STORAGE_BACKEND_KEYSPACE, BACKEND_SECRET_KEYSPACE] {
-            assert!(
-                read(&ctx, key_space, backend_key(backend_id))
-                    .await
-                    .is_none()
-            );
-        }
+        assert!(
+            read(&ctx, STORAGE_BACKEND_KEYSPACE, backend_key(backend_id))
+                .await
+                .is_none()
+        );
+        assert!(stored_secret(&ctx, backend_id).await.is_none());
         assert!(
             read(
                 &ctx,
@@ -539,6 +564,7 @@ mod tests {
                 .await
                 .is_some()
         );
+        assert!(stored_secret(&ctx, backend_id).await.is_some());
     }
 
     #[tokio::test]

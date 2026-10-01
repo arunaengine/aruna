@@ -16,7 +16,7 @@ use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::connectors::repository::{connector_secret_key, source_connector_key};
+use crate::connectors::repository::source_connector_key;
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -135,30 +135,26 @@ impl SourceConnectorOperation {
             Ok(bytes) => bytes,
             Err(error) => return self.emit_error(error.into()),
         };
-        let mut writes = vec![(
+        let writes = vec![(
             aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE.to_string(),
             source_connector_key(connector.group_id, connector.connector_id),
             connector_bytes.into(),
         )];
-        if let Some(secret) = secret.as_ref() {
-            let secret_bytes = match secret.to_bytes() {
-                Ok(bytes) => bytes,
-                Err(error) => return self.emit_error(error.into()),
-            };
-            writes.push((
-                aruna_core::keyspaces::SOURCE_SECRET_KEYSPACE.to_string(),
-                connector_secret_key(secret.connector_id),
-                secret_bytes.into(),
-            ));
-        }
+        let effect = match secret.as_ref().map(SourceConnectorSecret::to_secret) {
+            Some(Ok(bytes)) => crate::groups::fence::write_group_secret(
+                self.input.group_id,
+                writes,
+                SourceConnectorSecret::vault_entry(connector_id),
+                bytes,
+            ),
+            Some(Err(error)) => return self.emit_error(error.into()),
+            None => crate::groups::fence::write_group_records(self.input.group_id, writes),
+        };
 
         self.connector = Some(connector);
         self.secret = secret;
         self.state = SourceConnectorState::WriteRecords;
-        smallvec![crate::groups::fence::write_group_records(
-            self.input.group_id,
-            writes
-        )]
+        smallvec![effect]
     }
 
     fn handle_records_written(&mut self, event: Event) -> Effects {
@@ -233,6 +229,7 @@ mod tests {
     async fn persists_connector_secret() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,

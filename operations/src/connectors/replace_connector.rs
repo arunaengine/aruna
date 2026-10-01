@@ -19,9 +19,9 @@ use ulid::Ulid;
 
 use crate::connectors::reference_scan::{ScanStep, parse_scan_page};
 use crate::connectors::repository::{
-    StorageReadError, connector_secret_key, delete_secret_effect, parse_connector_read,
-    parse_secret_read, read_connector_effect, read_secret_effect, reference_scan_effect,
-    source_connector_key,
+    StorageReadError, delete_secret_effect, parse_connector_read, parse_secret_read,
+    read_connector_effect, read_secret_effect, reference_scan_effect, source_connector_key,
+    write_secret_effect,
 };
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 
@@ -66,7 +66,7 @@ pub enum ReplaceSourceState {
     StartTransaction,
     ScanReferenceVersions,
     WriteRecords,
-    DeleteSecret,
+    WriteSecret,
     CommitTransaction,
     AbortTransaction,
     Finish,
@@ -174,7 +174,7 @@ impl ReplaceSourceOperation {
     }
 
     fn handle_secret_read(&mut self, event: Event) -> Effects {
-        let current_secret = match parse_secret_read(event) {
+        let current_secret = match parse_secret_read(event, self.input.connector_id) {
             Ok(secret) => secret,
             Err(error) => return self.fail_or_abort(error.into()),
         };
@@ -289,69 +289,21 @@ impl ReplaceSourceOperation {
         };
 
         self.state = ReplaceSourceState::WriteRecords;
-
-        if let Some(secret) = self.replacement_secret.as_ref() {
-            let connector_bytes = match replacement.to_bytes() {
-                Ok(bytes) => bytes,
-                Err(error) => return self.fail_or_abort(error.into()),
-            };
-            let secret_bytes = match secret.to_bytes() {
-                Ok(bytes) => bytes,
-                Err(error) => return self.fail_or_abort(error.into()),
-            };
-            smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                writes: vec![
-                    (
-                        aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE.to_string(),
-                        source_connector_key(replacement.group_id, replacement.connector_id),
-                        connector_bytes.into(),
-                    ),
-                    (
-                        aruna_core::keyspaces::SOURCE_SECRET_KEYSPACE.to_string(),
-                        connector_secret_key(secret.connector_id),
-                        secret_bytes.into(),
-                    ),
-                ],
-                txn_id: self.txn_id,
-            })]
-        } else {
-            let connector_bytes = match replacement.to_bytes() {
-                Ok(bytes) => bytes,
-                Err(error) => return self.fail_or_abort(error.into()),
-            };
-            smallvec![Effect::Storage(StorageEffect::Write {
-                key_space: aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE.to_string(),
-                key: source_connector_key(replacement.group_id, replacement.connector_id),
-                value: connector_bytes.into(),
-                txn_id: self.txn_id,
-            })]
-        }
+        let connector_bytes = match replacement.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => return self.fail_or_abort(error.into()),
+        };
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE.to_string(),
+            key: source_connector_key(replacement.group_id, replacement.connector_id),
+            value: connector_bytes.into(),
+            txn_id: self.txn_id,
+        })]
     }
 
     fn handle_records_written(&mut self, event: Event) -> Effects {
-        match (&self.replacement_secret, event) {
-            (Some(_), Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.commit_or_finish()
-            }
-            (None, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.state = ReplaceSourceState::DeleteSecret;
-                smallvec![delete_secret_effect(self.input.connector_id, self.txn_id,)]
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) if self.txn_id.is_some() => {
-                self.abort_with_error(error.into())
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => self.emit_error(error.into()),
-            (_, received) => self.fail_or_abort(ReplaceSourceError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchWriteResult | WriteResult)",
-                received,
-            }),
-        }
-    }
-
-    fn handle_secret_deleted(&mut self, event: Event) -> Effects {
         match event {
-            Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
             Event::Storage(StorageEvent::Error { error }) if self.txn_id.is_some() => {
                 return self.abort_with_error(error.into());
             }
@@ -359,7 +311,38 @@ impl ReplaceSourceOperation {
             received => {
                 return self.fail_or_abort(ReplaceSourceError::InvalidStateEvent {
                     state: self.state.clone(),
-                    expected: "Event::Storage(StorageEvent::DeleteResult)",
+                    expected: "Event::Storage(StorageEvent::WriteResult)",
+                    received,
+                });
+            }
+        }
+
+        self.state = ReplaceSourceState::WriteSecret;
+        let effect = match self.replacement_secret.as_ref() {
+            Some(secret) => match write_secret_effect(secret, self.txn_id) {
+                Ok(effect) => effect,
+                Err(error) => return self.fail_or_abort(error.into()),
+            },
+            None => delete_secret_effect(self.input.connector_id, self.txn_id),
+        };
+        smallvec![effect]
+    }
+
+    /// A replacement with secrets writes them; one without removes the old record.
+    fn handle_secret_written(&mut self, event: Event) -> Effects {
+        match (&self.replacement_secret, event) {
+            (Some(_), Event::Storage(StorageEvent::WriteResult { .. }))
+            | (None, Event::Storage(StorageEvent::DeleteResult { .. })) => {}
+            (_, Event::Storage(StorageEvent::Error { error })) if self.txn_id.is_some() => {
+                return self.abort_with_error(error.into());
+            }
+            (_, Event::Storage(StorageEvent::Error { error })) => {
+                return self.emit_error(error.into());
+            }
+            (_, received) => {
+                return self.fail_or_abort(ReplaceSourceError::InvalidStateEvent {
+                    state: self.state.clone(),
+                    expected: "Event::Storage(StorageEvent::WriteResult | DeleteResult)",
                     received,
                 });
             }
@@ -414,7 +397,7 @@ impl Operation for ReplaceSourceOperation {
             ReplaceSourceState::StartTransaction => self.handle_transaction_started(event),
             ReplaceSourceState::ScanReferenceVersions => self.handle_scan_page(event),
             ReplaceSourceState::WriteRecords => self.handle_records_written(event),
-            ReplaceSourceState::DeleteSecret => self.handle_secret_deleted(event),
+            ReplaceSourceState::WriteSecret => self.handle_secret_written(event),
             ReplaceSourceState::CommitTransaction => self.handle_transaction_committed(event),
             ReplaceSourceState::AbortTransaction => self.handle_transaction_aborted(event),
             ReplaceSourceState::Finish => smallvec![],
@@ -468,6 +451,7 @@ mod tests {
     fn test_context() -> (TempDir, DriverContext) {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -611,14 +595,9 @@ mod tests {
         operation.replacement = Some(replacement_connector(group_id, connector_id));
         operation.replacement_secret = Some(connector_secret(connector_id, "bob"));
 
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![].into(),
-            value: Some(
-                connector_secret(connector_id, "alice")
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            ),
+        let effects = operation.step(Event::Storage(StorageEvent::VaultResult {
+            entry: SourceConnectorSecret::vault_entry(connector_id),
+            secret: Some(connector_secret(connector_id, "alice").to_secret().unwrap()),
         }));
         assert!(matches!(
             effects.as_slice(),
@@ -632,12 +611,23 @@ mod tests {
         }));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchWrite { txn_id: Some(write_txn), .. })]
+            [Effect::Storage(StorageEffect::Write { txn_id: Some(write_txn), .. })]
                 if *write_txn == txn_id
         ));
 
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: vec![],
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: vec![].into(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::VaultWrite { entry, txn_id: Some(write_txn), .. })]
+                if entry.id == connector_id && *write_txn == txn_id
+        ));
+        let rendered = format!("{effects:?} {operation:?}");
+        assert!(!rendered.contains("bob"), "{rendered}");
+
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: vec![].into(),
         }));
         assert!(matches!(
             effects.as_slice(),
@@ -897,6 +887,7 @@ mod tests {
     async fn removes_secret_config() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,
