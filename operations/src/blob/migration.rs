@@ -1,6 +1,5 @@
-//! Re-encodes one local version with its bucket's compression. The new copy is written first and
-//! published only if the bucket setting and the version are unchanged; the old copy is queued
-//! for reclaim, which keeps it while any other version still names it.
+//! Re-encodes one local version with its bucket's compression. The new copy is published only if
+//! the setting and version are unchanged; reclaim keeps the old copy while another version uses it.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

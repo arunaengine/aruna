@@ -1,6 +1,5 @@
-//! Stores blobs as 1 MiB frames, each zstd compressed or raw, with a BLAKE3 digest per frame.
-//! Frames form groups; each group ends with its frame entries, and the object ends with a tail
-//! that lists every group. The location record keeps the tail hash.
+//! Stores blobs as 1 MiB frames, zstd or raw, with a BLAKE3 digest each. Each group of frames
+//! ends with its frame entries; a tail lists every group, and the location record keeps its hash.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
