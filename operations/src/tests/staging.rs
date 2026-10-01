@@ -28,6 +28,7 @@ pub(crate) async fn setup_driver_context() -> StagingTestContext {
     std::fs::create_dir_all(&blob_root).expect("blob root must be created");
 
     let storage_handle = storage::FjallStorage::open(temp_root).expect("storage must open");
+    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
         .await
         .expect("net handle must initialize");

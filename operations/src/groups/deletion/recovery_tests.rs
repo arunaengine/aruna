@@ -72,8 +72,12 @@ async fn realm_admin_deletes() {
             .is_none()
     );
 }
+use crate::connectors::repository::read_secret_effect;
 use crate::driver::drive;
 use crate::groups::fence::GroupWriteOperation;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
 
 #[tokio::test]
 async fn prepared_restart_survives() {
@@ -240,33 +244,35 @@ async fn missing_vote_refuses() {
 async fn frozen_write_atomic() {
     let fixture = Fixture::new(&[1]).await;
     fixture.prepare(1).await.unwrap();
-    let writes = vec![
-        (
-            SOURCE_INDEX_KEYSPACE.to_string(),
-            b"connector".to_vec().into(),
-            b"record".to_vec().into(),
-        ),
-        (
-            SOURCE_SECRET_KEYSPACE.to_string(),
-            b"connector".to_vec().into(),
-            b"secret".to_vec().into(),
-        ),
-    ];
+    let writes = vec![(
+        SOURCE_INDEX_KEYSPACE.to_string(),
+        b"connector".to_vec().into(),
+        b"record".to_vec().into(),
+    )];
+    let connector_id = Ulid::from_bytes([9; 16]);
+    let secret = aruna_core::compute::SecretBytes::new(b"secret".to_vec());
+    let operation = GroupWriteOperation::new(fixture.plan.group_id, writes)
+        .with_secret(SourceConnectorSecret::vault_entry(connector_id), secret);
     assert_eq!(
-        drive(
-            GroupWriteOperation::new(fixture.plan.group_id, writes),
-            &fixture.context
-        )
-        .await,
+        drive(operation, &fixture.context).await,
         Err(GroupWriteError::Frozen)
     );
-    for space in [SOURCE_INDEX_KEYSPACE, SOURCE_SECRET_KEYSPACE] {
-        assert!(
-            read(&fixture.context, space, b"connector".to_vec())
-                .await
-                .is_none()
-        );
-    }
+    let record = read(
+        &fixture.context,
+        SOURCE_INDEX_KEYSPACE,
+        b"connector".to_vec(),
+    )
+    .await;
+    assert!(record.is_none());
+    let secret = fixture
+        .context
+        .storage_handle
+        .send_effect(read_secret_effect(connector_id, None))
+        .await;
+    assert!(matches!(
+        secret,
+        Event::Storage(StorageEvent::VaultResult { secret: None, .. })
+    ));
 }
 
 #[tokio::test]

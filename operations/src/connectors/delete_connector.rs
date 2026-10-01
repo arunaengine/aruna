@@ -13,7 +13,7 @@ use ulid::Ulid;
 
 use crate::connectors::reference_scan::{ScanStep, parse_scan_page};
 use crate::connectors::repository::{
-    StorageReadError, connector_secret_key, parse_connector_read, parse_secret_read,
+    StorageReadError, delete_secret_effect, parse_connector_read, parse_secret_read,
     read_connector_effect, read_secret_effect, reference_scan_effect, source_connector_key,
 };
 
@@ -34,6 +34,7 @@ pub enum DeleteSourceState {
     StartTransaction,
     ScanReferenceVersions,
     DeleteRecords,
+    DeleteSecret,
     CommitTransaction,
     AbortTransaction,
     Finish,
@@ -108,7 +109,7 @@ impl DeleteSourceOperation {
     }
 
     fn handle_secret_read(&mut self, event: Event) -> Effects {
-        let secret = match parse_secret_read(event) {
+        let secret = match parse_secret_read(event, self.input.connector_id) {
             Ok(secret) => secret,
             Err(error) => return self.emit_error(error.into()),
         };
@@ -218,16 +219,10 @@ impl DeleteSourceOperation {
     }
 
     fn delete_records(&mut self) -> Effects {
-        let deletes = vec![
-            (
-                aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE.to_string(),
-                source_connector_key(self.input.group_id, self.input.connector_id),
-            ),
-            (
-                aruna_core::keyspaces::SOURCE_SECRET_KEYSPACE.to_string(),
-                connector_secret_key(self.input.connector_id),
-            ),
-        ];
+        let deletes = vec![(
+            aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE.to_string(),
+            source_connector_key(self.input.group_id, self.input.connector_id),
+        )];
 
         self.state = DeleteSourceState::DeleteRecords;
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
@@ -239,6 +234,24 @@ impl DeleteSourceOperation {
     fn handle_records_deleted(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
+                self.state = DeleteSourceState::DeleteSecret;
+                smallvec![delete_secret_effect(self.input.connector_id, self.txn_id)]
+            }
+            Event::Storage(StorageEvent::Error { error }) if self.txn_id.is_some() => {
+                self.abort_with_error(error.into())
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
+            received => self.fail_or_abort(DeleteSourceError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
+                received,
+            }),
+        }
+    }
+
+    fn handle_secret_deleted(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::DeleteResult { .. }) => {
                 if let Some(txn_id) = self.txn_id {
                     self.state = DeleteSourceState::CommitTransaction;
                     return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
@@ -251,7 +264,7 @@ impl DeleteSourceOperation {
             received => {
                 return self.fail_or_abort(DeleteSourceError::InvalidStateEvent {
                     state: self.state.clone(),
-                    expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
+                    expected: "Event::Storage(StorageEvent::DeleteResult)",
                     received,
                 });
             }
@@ -279,6 +292,7 @@ impl Operation for DeleteSourceOperation {
             DeleteSourceState::StartTransaction => self.handle_transaction_started(event),
             DeleteSourceState::ScanReferenceVersions => self.handle_scan_page(event),
             DeleteSourceState::DeleteRecords => self.handle_records_deleted(event),
+            DeleteSourceState::DeleteSecret => self.handle_secret_deleted(event),
             DeleteSourceState::CommitTransaction => self.handle_transaction_committed(event),
             DeleteSourceState::AbortTransaction => self.handle_transaction_aborted(event),
             DeleteSourceState::Finish => smallvec![],
@@ -339,6 +353,7 @@ mod tests {
     fn test_context() -> (TempDir, DriverContext) {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -485,9 +500,9 @@ mod tests {
         });
         operation.state = DeleteSourceState::ReadSecret;
 
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![].into(),
-            value: Some(connector_secret(connector_id).to_bytes().unwrap().into()),
+        let effects = operation.step(Event::Storage(StorageEvent::VaultResult {
+            entry: SourceConnectorSecret::vault_entry(connector_id),
+            secret: Some(connector_secret(connector_id).to_secret().unwrap()),
         }));
         assert!(matches!(
             effects.as_slice(),
@@ -515,6 +530,15 @@ mod tests {
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
             entries: vec![],
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::VaultDelete { entry, txn_id: Some(delete_txn) })]
+                if entry.id == connector_id && *delete_txn == txn_id
+        ));
+
+        let effects = operation.step(Event::Storage(StorageEvent::DeleteResult {
+            key: vec![].into(),
         }));
         assert!(matches!(
             effects.as_slice(),
@@ -829,6 +853,10 @@ mod tests {
             .storage_handle
             .send_effect(read_secret_effect(connector.connector_id, None))
             .await;
-        assert!(parse_secret_read(secret_event).unwrap().is_none());
+        assert!(
+            parse_secret_read(secret_event, connector.connector_id)
+                .unwrap()
+                .is_none()
+        );
     }
 }

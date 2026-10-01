@@ -226,8 +226,11 @@ async fn replacement_cannot_reopen() {
     use crate::connectors::replace_connector::{
         ReplaceSourceError, ReplaceSourceInput, ReplaceSourceOperation,
     };
-    use crate::connectors::repository::{connector_secret_key, source_connector_key};
-    use aruna_core::keyspaces::{SOURCE_INDEX_KEYSPACE, SOURCE_SECRET_KEYSPACE};
+    use crate::connectors::repository::{
+        parse_secret_read, read_secret_effect, source_connector_key,
+    };
+    use aruna_core::handle::Handle;
+    use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use std::collections::HashMap;
 
@@ -266,9 +269,7 @@ async fn replacement_cannot_reopen() {
             else {
                 panic!("unexpected replacement effect");
             };
-            if !deleted
-                && matches!(&effect, StorageEffect::Read { key_space, .. } if key_space == SOURCE_SECRET_KEYSPACE)
-            {
+            if !deleted && matches!(&effect, StorageEffect::VaultRead { .. }) {
                 drive(
                     DeleteSourceOperation::new(DeleteSourceInput {
                         group_id: fixture.plan.group_id,
@@ -296,14 +297,14 @@ async fn replacement_cannot_reopen() {
                 StorageError::TransactionConflict
             ))
         ));
-        for (space, key) in [
-            (
-                SOURCE_INDEX_KEYSPACE,
-                source_connector_key(fixture.plan.group_id, connector_id),
-            ),
-            (SOURCE_SECRET_KEYSPACE, connector_secret_key(connector_id)),
-        ] {
-            assert!(read(&fixture.context, space, key.to_vec()).await.is_none());
-        }
+        let key = source_connector_key(fixture.plan.group_id, connector_id);
+        let record = read(&fixture.context, SOURCE_INDEX_KEYSPACE, key.to_vec()).await;
+        assert!(record.is_none());
+        let secret = fixture
+            .context
+            .storage_handle
+            .send_effect(read_secret_effect(connector_id, None))
+            .await;
+        assert!(parse_secret_read(secret, connector_id).unwrap().is_none());
     }
 }
