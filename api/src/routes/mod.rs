@@ -51,6 +51,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(onboarding::router())
         .merge(storage::blobs::router())
         .merge(storage::bucket_usage::router())
+        .merge(storage::compression::router())
         .merge(drs::router())
         .merge(staging::router())
         .merge(storage::deletion::router())
@@ -227,6 +228,7 @@ pub(crate) mod tests {
         ("GET", "/data/buckets/{bucket}/placement"),
         ("GET", "/data/buckets/{bucket}/placement/coverage"),
         ("GET", "/data/buckets/{bucket}/placement/objects"),
+        ("GET", "/data/buckets/{bucket}/storage/compression"),
         ("GET", "/data/buckets/{bucket}/storage/routing"),
         ("GET", "/data/buckets/{bucket}/usage"),
         ("GET", "/data/sync/relationships"),
@@ -477,6 +479,7 @@ pub(crate) mod tests {
         ("PUT", "/access/users/{id}/status"),
         ("PUT", "/compute/config"),
         ("PUT", "/data/buckets/{bucket}/placement"),
+        ("PUT", "/data/buckets/{bucket}/storage/compression"),
         ("PUT", "/data/buckets/{bucket}/storage/routing"),
         ("PUT", "/device/documents/{document_id}/selection"),
         ("PUT", "/data/groups/{group_id}/connectors/{connector_id}"),
