@@ -788,6 +788,20 @@ impl OperationsTaskHandler {
             TaskKey::DrainReclaimQueue => Box::pin(async move {
                 self.drain_blob_reclaim().await;
             }),
+            TaskKey::MigrateCompression => Box::pin(async move {
+                let after = match crate::blob::migration::process_migrations(&self.context).await {
+                    Ok(true) => Some(crate::blob::migration::MIGRATION_CONTINUE),
+                    Ok(false) => None,
+                    Err(message) => {
+                        warn!(message = %message, "Compression migration run failed");
+                        Some(RECLAIM_SWEEP_RETRY)
+                    }
+                };
+                if let Some(after) = after {
+                    self.reschedule_timer(TaskKey::MigrateCompression, after)
+                        .await;
+                }
+            }),
             TaskKey::RefreshBlobHolders => Box::pin(async move {
                 self.refresh_blob_holders().await;
             }),

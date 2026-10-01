@@ -121,6 +121,42 @@ impl EncodingClass {
     }
 }
 
+/// This node's progress re-encoding one bucket's versions to `target`.
+/// Keyed by bucket name; a later setting change replaces it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompressionMigration {
+    pub target: Compression,
+    /// Last version key handled; the next batch resumes after it.
+    pub cursor: Option<Vec<u8>>,
+    pub migrated: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub started_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+}
+
+impl CompressionMigration {
+    pub fn new(target: Compression, started_at_ms: u64) -> Self {
+        Self {
+            target,
+            cursor: None,
+            migrated: 0,
+            skipped: 0,
+            failed: 0,
+            started_at_ms,
+            finished_at_ms: None,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Compression, EncodingClass, StoredFormat};

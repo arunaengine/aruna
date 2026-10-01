@@ -494,6 +494,130 @@ impl Operation for MigrateVersionOperation {
     }
 }
 
+/// Versions one task run handles before it yields to other timers.
+const MIGRATION_PAGE: usize = 64;
+/// Delay between task runs while a migration still has versions left.
+pub const MIGRATION_CONTINUE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Advances every unfinished migration by one page. Returns whether work is left.
+pub async fn process_migrations(context: &crate::driver::DriverContext) -> Result<bool, String> {
+    use aruna_core::keyspaces::COMPRESSION_MIGRATION_KEYSPACE;
+    use aruna_core::structs::storage::format::CompressionMigration;
+    let (rows, _) = crate::jobs::store::iter_prefix_page(
+        &context.storage_handle,
+        COMPRESSION_MIGRATION_KEYSPACE,
+        None,
+        None,
+        usize::MAX,
+        None,
+    )
+    .await?;
+    let mut pending = false;
+    for (key, value) in rows {
+        let record = CompressionMigration::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
+        if record.finished_at_ms.is_some() {
+            continue;
+        }
+        let bucket = String::from_utf8(key.to_vec()).map_err(|error| error.to_string())?;
+        pending |= migrate_page(context, &bucket, record).await?;
+    }
+    Ok(pending)
+}
+
+/// Migrates one page of a bucket's versions and stores the progress, unless a
+/// newer setting replaced the record meanwhile.
+async fn migrate_page(
+    context: &crate::driver::DriverContext,
+    bucket: &str,
+    mut record: aruna_core::structs::storage::format::CompressionMigration,
+) -> Result<bool, String> {
+    let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
+    let (versions, next) = crate::jobs::store::iter_prefix_page(
+        &context.storage_handle,
+        BLOB_VERSIONS_KEYSPACE,
+        Some(prefix.into()),
+        record.cursor.clone().map(Into::into),
+        MIGRATION_PAGE,
+        None,
+    )
+    .await?;
+    for (key, _) in &versions {
+        let version_key = VersionKey::from_bytes(key.as_ref()).map_err(|e| e.to_string())?;
+        let operation = MigrateVersionOperation::new(version_key, record.target, SystemTime::now());
+        match crate::driver::drive(operation, context).await {
+            Ok(MigrateOutcome::Migrated) => record.migrated += 1,
+            Ok(MigrateOutcome::Skipped) => record.skipped += 1,
+            Err(error) => {
+                record.failed += 1;
+                tracing::warn!(bucket, %error, "Failed to re-encode a version");
+            }
+        }
+        record.cursor = Some(key.to_vec());
+    }
+    let done = next.is_none();
+    if done {
+        record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
+    }
+    store_progress(context, bucket, &record).await?;
+    Ok(!done)
+}
+
+async fn store_progress(
+    context: &crate::driver::DriverContext,
+    bucket: &str,
+    record: &aruna_core::structs::storage::format::CompressionMigration,
+) -> Result<(), String> {
+    use aruna_core::keyspaces::COMPRESSION_MIGRATION_KEYSPACE;
+    use aruna_core::structs::storage::format::CompressionMigration;
+    let storage = &context.storage_handle;
+    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    else {
+        return Err("could not start a progress transaction".to_string());
+    };
+    let key: Key = bucket.as_bytes().to_vec().into();
+    let current = storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
+            key: key.clone(),
+            txn_id: Some(txn_id),
+        })
+        .await;
+    let replaced = match current {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => CompressionMigration::from_bytes(value.as_ref())
+            .map(|stored| {
+                stored.started_at_ms != record.started_at_ms || stored.target != record.target
+            })
+            .unwrap_or(true),
+        _ => true,
+    };
+    if replaced {
+        storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+        return Ok(());
+    }
+    let value = record.to_bytes().map_err(|error| error.to_string())?;
+    storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
+            key,
+            value: value.into(),
+            txn_id: Some(txn_id),
+        })
+        .await;
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        other => Err(format!("migration progress was not stored: {other:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

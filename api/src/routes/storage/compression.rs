@@ -8,9 +8,11 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
-use aruna_core::structs::storage::format::Compression;
-use aruna_operations::driver::drive;
-use aruna_operations::s3::bucket::compression::{PutCompressionError, PutCompressionOperation};
+use aruna_core::structs::storage::format::{Compression, CompressionMigration};
+use aruna_operations::driver::{drive, now_ms};
+use aruna_operations::s3::bucket::compression::{
+    MigrationStatusOperation, PutCompressionError, PutCompressionOperation,
+};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
@@ -53,10 +55,42 @@ pub struct BucketCompressionResponse {
     pub mode: CompressionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
+    /// This node's re-encoding of stored objects after the last change; absent before any change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<MigrationProgress>,
+}
+
+/// Progress of re-encoding this node's stored versions to the current setting.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct MigrationProgress {
+    pub migrated: u64,
+    /// Versions that needed no change, were governed, or changed while they were read.
+    pub skipped: u64,
+    pub failed: u64,
+    pub started_at_ms: u64,
+    /// Set once every version was visited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<u64>,
+}
+
+impl From<CompressionMigration> for MigrationProgress {
+    fn from(migration: CompressionMigration) -> Self {
+        Self {
+            migrated: migration.migrated,
+            skipped: migration.skipped,
+            failed: migration.failed,
+            started_at_ms: migration.started_at_ms,
+            finished_at_ms: migration.finished_at_ms,
+        }
+    }
 }
 
 impl BucketCompressionResponse {
-    fn new(bucket: String, compression: Compression) -> Self {
+    fn new(
+        bucket: String,
+        compression: Compression,
+        migration: Option<CompressionMigration>,
+    ) -> Self {
         let (mode, level) = match compression {
             Compression::Off => (CompressionMode::Off, None),
             Compression::Zstd { level } => (CompressionMode::Zstd, Some(level)),
@@ -65,6 +99,7 @@ impl BucketCompressionResponse {
             bucket,
             mode,
             level,
+            migration: migration.map(Into::into),
         }
     }
 }
@@ -99,6 +134,8 @@ impl TryFrom<BucketCompressionRequest> for Compression {
 **Behavior**
 - Node-local read of the replicated bucket record.
 - `mode` is `off` or `zstd`; `level` is present only for `zstd`.
+- `migration` reports this node's re-encoding of stored objects after the last change. Other nodes
+  re-encode their own copies and report their own progress.
 - S3 clients see no difference: sizes, ranges and checksums always refer to the original bytes."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     responses(
@@ -106,7 +143,18 @@ impl TryFrom<BucketCompressionRequest> for Compression {
             status = 200,
             description = "The stored compression setting",
             body = BucketCompressionResponse,
-            example = json!({ "bucket": "research-raw", "mode": "zstd", "level": 3 })
+            example = json!({
+                "bucket": "research-raw",
+                "mode": "zstd",
+                "level": 3,
+                "migration": {
+                    "migrated": 120,
+                    "skipped": 4,
+                    "failed": 0,
+                    "started_at_ms": 1790000000000_u64,
+                    "finished_at_ms": 1790000060000_u64
+                }
+            })
         ),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
@@ -138,9 +186,17 @@ pub async fn get_bucket_compression(
         Permission::READ,
     )
     .await?;
+    let migration = drive(
+        MigrationStatusOperation::new(bucket.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let migration = migration.filter(|migration| migration.target == info.compression);
     Ok(Json(BucketCompressionResponse::new(
         bucket,
         info.compression,
+        migration,
     )))
 }
 
@@ -198,8 +254,9 @@ pub async fn put_bucket_compression(
         })?
         .group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
-    drive(
-        PutCompressionOperation::new(bucket.clone(), group_id, compression),
+    let started_at_ms = now_ms();
+    let previous = drive(
+        PutCompressionOperation::new(bucket.clone(), group_id, compression, started_at_ms),
         &state.get_ctx(),
     )
     .await
@@ -212,7 +269,13 @@ pub async fn put_bucket_compression(
         }
         other => ServerError::InternalError(other.to_string()),
     })?;
-    Ok(Json(BucketCompressionResponse::new(bucket, compression)))
+    let migration =
+        (previous != compression).then(|| CompressionMigration::new(compression, started_at_ms));
+    Ok(Json(BucketCompressionResponse::new(
+        bucket,
+        compression,
+        migration,
+    )))
 }
 
 #[cfg(test)]
