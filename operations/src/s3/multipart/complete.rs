@@ -104,6 +104,8 @@ pub enum CompleteUploadError {
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
+    BlobError(#[from] BlobError),
+    #[error(transparent)]
     BackendFenceError(#[from] BackendFenceError),
     #[error("Invalid operation state")]
     InvalidOperationState,
@@ -865,6 +867,7 @@ impl CompleteUploadOperation {
                 self.delete_location = Some(location);
                 return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
             }
+            Event::Blob(BlobEvent::Error(error)) => return self.schedule_error(error.into()),
             _ => return self.schedule_error(CompleteUploadError::InvalidOperationState),
         };
         self.composed_location = Some(location.clone());

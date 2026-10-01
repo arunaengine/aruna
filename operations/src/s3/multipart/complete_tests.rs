@@ -1229,6 +1229,32 @@ fn unknown_mark_resets() {
 }
 
 #[test]
+fn compose_keeps_cause() {
+    let input = finalize_input();
+    let mut operation = CompleteUploadOperation::new(input);
+    operation.upload_record = Some(open_upload_record(&operation.input));
+    operation.state = CompleteUploadState::ComposeBlob;
+
+    let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::WriteError(
+        "part limit exceeded".to_string(),
+    ))));
+
+    assert_eq!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    );
+    assert_eq!(operation.state, CompleteUploadState::ResetUploadTransaction);
+    assert_eq!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::BlobError(BlobError::WriteError(
+            "part limit exceeded".to_string()
+        )))
+    );
+}
+
+#[test]
 fn conflict_mark_aborts() {
     let input = finalize_input();
     let mut operation = CompleteUploadOperation::new(input);
