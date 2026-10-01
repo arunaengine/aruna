@@ -79,7 +79,6 @@ pub const SUBJECT_INDEX_KEYSPACE: &str = "user_subject_index";
 pub const SUBJECT_CLAIMS_KEYSPACE: &str = "user_subject_claims";
 pub const USER_SESSION_KEYSPACE: &str = "user_sessions";
 pub const USER_OWNER_KEYSPACE: &str = "user_session_owner";
-pub const USER_VAULT_KEYSPACE: &str = "user_vaults";
 /// Current vault heads a holder keeps, keyed by user and revision id.
 pub const VAULT_REVISION_KEYSPACE: &str = "vault_revisions";
 /// Revision ids a later save replaced, so a replayed old save never returns as a head.
@@ -340,7 +339,6 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SUBJECT_CLAIMS_KEYSPACE,
     USER_SESSION_KEYSPACE,
     USER_OWNER_KEYSPACE,
-    USER_VAULT_KEYSPACE,
     VAULT_REVISION_KEYSPACE,
     VAULT_RETIRED_KEYSPACE,
     USER_KEY_KEYSPACE,
