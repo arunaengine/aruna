@@ -21,9 +21,7 @@ use tokio::time::timeout_at;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::vault_write::{
-    AppendVaultConfig, AppendVaultError, AppendVaultOperation, VaultAppended,
-};
+use super::write::{AppendVaultConfig, AppendVaultError, AppendVaultOperation, VaultAppended};
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{is_sync_eligible, peer_acts_for};
 use crate::forward::transport::{MetadataWriteError, forward_to_holders};

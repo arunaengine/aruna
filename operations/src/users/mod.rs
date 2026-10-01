@@ -13,6 +13,6 @@ pub mod search_users;
 pub mod service_account;
 pub mod subject_index;
 pub mod update_user;
-pub mod vault_read;
-pub mod vault_route;
-pub mod vault_write;
+mod vault;
+
+pub use vault::{read as vault_read, route as vault_route, write as vault_write};

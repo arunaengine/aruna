@@ -22,7 +22,7 @@ pub(super) async fn apply_vault_event(
     let reject = |reason: &str| {
         warn!(%topic_id, reason, "Rejecting a replicated vault record");
         Ok(MetadataOutcome::Rejected(SyncRejection::new(
-            identity.clone(),
+            identity,
             event.clone(),
             reason,
         )))

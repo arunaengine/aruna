@@ -25,7 +25,7 @@ pub const MAX_VAULT_HEADS: usize = 32;
 /// Public key records one user may publish.
 pub const MAX_KEY_RECORDS: usize = 64;
 /// Bytes a key id may hold.
-pub const MAX_KEY_ID_BYTES: usize = 128;
+pub const KEY_ID_BYTES: usize = 128;
 
 /// Why a vault or key record is not admissible.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -36,7 +36,7 @@ pub enum VaultRecordError {
     Predecessors,
     #[error("the key fingerprint does not match the public key")]
     Fingerprint,
-    #[error("a key id holds 1 to {MAX_KEY_ID_BYTES} bytes")]
+    #[error("a key id holds 1 to {KEY_ID_BYTES} bytes")]
     KeyId,
 }
 
@@ -142,7 +142,7 @@ impl UserKeyRecord {
         if key_fingerprint(&self.public_key) != self.fingerprint {
             return Err(VaultRecordError::Fingerprint);
         }
-        if self.key_id.is_empty() || self.key_id.len() > MAX_KEY_ID_BYTES {
+        if self.key_id.is_empty() || self.key_id.len() > KEY_ID_BYTES {
             return Err(VaultRecordError::KeyId);
         }
         Ok(())
@@ -235,12 +235,11 @@ pub fn record_rows(
     Ok(rows)
 }
 
+pub type HeadRows = (Vec<(KeySpace, Key, Value)>, Vec<(KeySpace, Key)>);
+
 /// Writes and deletes that make `revision` a head. Every predecessor loses its
 /// row and gains a retired marker, so a replaced save that arrives late stays retired.
-pub fn head_rows(
-    revision: &VaultRevision,
-    bytes: &[u8],
-) -> Result<(Vec<(KeySpace, Key, Value)>, Vec<(KeySpace, Key)>), ConversionError> {
+pub fn head_rows(revision: &VaultRevision, bytes: &[u8]) -> Result<HeadRows, ConversionError> {
     let mut writes = record_rows(&revision.target(), bytes, &revision.sync_change())?;
     let mut deletes = Vec::with_capacity(revision.predecessors.len());
     for predecessor in &revision.predecessors {

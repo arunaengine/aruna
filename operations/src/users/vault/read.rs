@@ -236,7 +236,7 @@ impl Operation for ReadVaultOperation {
             (state, event) => self.finish(Err(ReadVaultError::UnexpectedEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                got: super::vault_write::event_label(&event).to_string(),
+                got: super::write::event_label(&event).to_string(),
             })),
         }
     }

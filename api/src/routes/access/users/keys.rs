@@ -12,7 +12,7 @@ use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::VaultQuery;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::user::vault::{MAX_KEY_ID_BYTES, UserKeyRecord, VaultRecords};
+use aruna_core::structs::identity::user::vault::{KEY_ID_BYTES, UserKeyRecord, VaultRecords};
 use aruna_operations::users::vault_write::{VaultAppended, VaultChange};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -126,7 +126,7 @@ pub async fn publish_key(
     Json(request): Json<PublishKeyRequest>,
 ) -> ServerResult<(StatusCode, Json<UserKeyResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    if request.key_id.is_empty() || request.key_id.len() > MAX_KEY_ID_BYTES {
+    if request.key_id.is_empty() || request.key_id.len() > KEY_ID_BYTES {
         return Err(ServerError::BadRequestReason(
             "key_id must hold 1 to 128 bytes".to_string(),
         ));

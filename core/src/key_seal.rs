@@ -170,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn binds_info_and_aad() {
+    fn binds_seal_context() {
         let vector = vector();
         let sealed = seal_to(&vector.public, b"purpose a", b"object a", b"secret").unwrap();
         assert_eq!(
