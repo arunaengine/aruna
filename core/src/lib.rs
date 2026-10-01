@@ -47,6 +47,7 @@ pub mod time;
 pub mod trace_context;
 pub mod types;
 pub mod user;
+pub mod vault_format;
 
 #[cfg(test)]
 mod tests;
