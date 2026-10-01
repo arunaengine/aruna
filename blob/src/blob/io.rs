@@ -970,12 +970,8 @@ impl BlobHandler {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
-        let mut writer = match timeout(
-            self.io_timeout(),
-            open_writer(&operator, &storage_path, &location.backend),
-        )
-        .await
-        {
+        // Without a fixed chunk, each write of at least the backend minimum is one backend part.
+        let mut writer = match timeout(self.io_timeout(), operator.writer(&storage_path)).await {
             Ok(Ok(writer)) => writer,
             Ok(Err(error)) => {
                 return BlobEvent::Error(BlobError::OperatorCreationFailed(error.to_string()));
@@ -1009,6 +1005,9 @@ impl BlobHandler {
                     .map_err(|err| BlobError::ReadError(err.to_string()))?;
 
                 let mut reader = BackendStream::new(reader);
+                // The whole part is written at once so it keeps its own boundary.
+                let mut part_chunks = Vec::new();
+                let mut part_size = 0u64;
                 loop {
                     let chunk = timeout(self.transfer_idle_timeout(), reader.next())
                         .await
@@ -1020,15 +1019,17 @@ impl BlobHandler {
                     };
                     let bytes = chunk.map_err(|err| BlobError::ReadError(err.to_string()))?;
                     hasher.update(&bytes);
-                    timeout(self.transfer_idle_timeout(), writer.write(bytes.to_vec()))
-                        .await
-                        .map_err(|_| {
-                            ambiguous = true;
-                            BlobError::WriteError("compose writer idle timeout".to_string())
-                        })?
-                        .map_err(|err| BlobError::WriteError(err.to_string()))?;
-                    bytes_written += bytes.len() as u64;
+                    part_size += bytes.len() as u64;
+                    part_chunks.push(bytes);
                 }
+                timeout(self.transfer_idle_timeout(), writer.write(part_chunks))
+                    .await
+                    .map_err(|_| {
+                        ambiguous = true;
+                        BlobError::WriteError("compose writer idle timeout".to_string())
+                    })?
+                    .map_err(|err| BlobError::WriteError(err.to_string()))?;
+                bytes_written += part_size;
             }
             timeout(self.transfer_idle_timeout(), writer.close())
                 .await

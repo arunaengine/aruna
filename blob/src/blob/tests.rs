@@ -49,12 +49,13 @@ mod failing_close {
     use opendal::raw::oio;
     use opendal::raw::{Access, AccessorInfo, OpWrite, RpWrite};
     use opendal::{Buffer, Builder, Capability, Error, ErrorKind, Metadata, Operator};
-    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Default)]
     pub(super) struct CloseFailsBuilder {
         aborts: Arc<AtomicUsize>,
+        sizes: Arc<Mutex<Vec<usize>>>,
     }
 
     impl Builder for CloseFailsBuilder {
@@ -63,6 +64,7 @@ mod failing_close {
         fn build(self) -> opendal::Result<impl Access> {
             Ok(CloseFailsBackend {
                 aborts: self.aborts,
+                sizes: self.sizes,
             })
         }
     }
@@ -70,6 +72,7 @@ mod failing_close {
     #[derive(Debug)]
     pub(super) struct CloseFailsBackend {
         aborts: Arc<AtomicUsize>,
+        sizes: Arc<Mutex<Vec<usize>>>,
     }
 
     impl Access for CloseFailsBackend {
@@ -87,6 +90,7 @@ mod failing_close {
                     write: true,
                     write_can_empty: true,
                     write_can_multi: true,
+                    write_multi_min_size: Some(5 * 1024 * 1024),
                     ..Default::default()
                 });
             info
@@ -101,6 +105,7 @@ mod failing_close {
                 RpWrite::new(),
                 CloseFailsWriter {
                     aborts: self.aborts.clone(),
+                    sizes: self.sizes.clone(),
                 },
             ))
         }
@@ -108,10 +113,12 @@ mod failing_close {
 
     pub(super) struct CloseFailsWriter {
         aborts: Arc<AtomicUsize>,
+        sizes: Arc<Mutex<Vec<usize>>>,
     }
 
     impl oio::Write for CloseFailsWriter {
-        async fn write(&mut self, _bs: Buffer) -> opendal::Result<()> {
+        async fn write(&mut self, bs: Buffer) -> opendal::Result<()> {
+            self.sizes.lock().unwrap().push(bs.len());
             Ok(())
         }
 
@@ -133,10 +140,22 @@ mod failing_close {
         let aborts = Arc::new(AtomicUsize::new(0));
         let operator = Operator::new(CloseFailsBuilder {
             aborts: aborts.clone(),
+            ..Default::default()
         })
         .unwrap()
         .finish();
         (operator, aborts)
+    }
+
+    pub(super) fn operator_with_sizes() -> (Operator, Arc<Mutex<Vec<usize>>>) {
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let operator = Operator::new(CloseFailsBuilder {
+            sizes: sizes.clone(),
+            ..Default::default()
+        })
+        .unwrap()
+        .finish();
+        (operator, sizes)
     }
 }
 
@@ -1890,6 +1909,65 @@ async fn failed_write_cleans() {
         !std::path::Path::new(&location.get_full_path().unwrap()).exists(),
         "partial filesystem target remains"
     );
+}
+
+#[tokio::test]
+async fn compose_part_sizes() {
+    // Each input part, whatever its size, must become exactly one backend part.
+    let context = setup_blob_handle(128 * 1024 * 1024).await;
+    let handler = context.blob_handle.handler.clone();
+
+    for (input, output) in [
+        (vec![16, 16, 7], vec![16, 16, 7]),
+        (vec![5, 5, 1], vec![5, 5, 1]),
+        (vec![5, 16, 8], vec![5, 16, 8]),
+        (vec![9, 6, 12, 2], vec![9, 6, 12, 2]),
+        (vec![0], Vec::new()),
+        (Vec::new(), Vec::new()),
+    ] {
+        let upload_id = Ulid::generate();
+        let mut parts = Vec::new();
+        for (index, size) in input.into_iter().enumerate() {
+            let payload = vec![index as u8; size * 1024 * 1024];
+            let BlobEvent::WriteFinished { location } = handler
+                .write_blob_part(
+                    MultipartPartKey::new(upload_id, (index + 1) as u16),
+                    ResolvedBackend::node_default(),
+                    test_user_id(),
+                    false,
+                    false,
+                    stream_from_bytes(&payload),
+                )
+                .await
+            else {
+                panic!("part write failed")
+            };
+            parts.push(location);
+        }
+
+        for backend in [
+            BackendRef::node_default(),
+            BackendRef::Group(Ulid::generate()),
+        ] {
+            let target = BackendLocation {
+                backend,
+                ..make_test_location()
+            };
+            let (operator, sizes) = failing_close::operator_with_sizes();
+            let event = handler.compose_parts(target, operator, parts.clone()).await;
+            assert!(matches!(
+                event,
+                BlobEvent::Error(BlobError::WriteCleanup { .. })
+            ));
+            assert_eq!(
+                *sizes.lock().unwrap(),
+                output
+                    .iter()
+                    .map(|size| size * 1024 * 1024)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }
 
 #[tokio::test]
