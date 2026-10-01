@@ -47,7 +47,6 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::format::Compression;
-use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
 use aruna_core::structs::storage::replication::{
     ReplicationItemKind, ReplicationNegotiationResult,
