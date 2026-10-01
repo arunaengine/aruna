@@ -223,6 +223,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
 zeroize = "1.9.0"
 zip = { version = "8.6.0", default-features = false }
+zstd = "0.13.3"
 
 [profile.release]
 panic = "abort"

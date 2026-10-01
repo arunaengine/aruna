@@ -7,6 +7,7 @@ use super::backend::{
     build_backend_path, build_hidden_path, build_part_path, intent_key, intent_value,
 };
 use super::group::GROUP_WRITE_CHUNK;
+use crate::codec::FrameEncoder;
 use crate::hash::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
 use crate::s3::NativeMultipart;
@@ -22,7 +23,7 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendLocation, BackendRef, BlobLocationKey, HIDDEN_BLOB_PREFIX, HiddenBlobEntry,
     HiddenBlobKey, ResolvedBackend,
 };
-use aruna_core::structs::storage::format::StoredFormat;
+use aruna_core::structs::storage::format::{Compression, StoredFormat, StoredLayout};
 use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use aruna_core::structs::storage::multipart::MultipartPartKey;
 use bytes::Bytes;
@@ -38,6 +39,13 @@ use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 use tokio::time::{Instant, timeout, timeout_at};
 use ulid::Ulid;
+
+/// Size and time limits of a hidden spool; other writes have none.
+#[derive(Default)]
+struct WriteLimits {
+    max_bytes: Option<u64>,
+    deadline: Option<StdInstant>,
+}
 
 const HIDDEN_LIST_PAGE: usize = 128;
 const HIDDEN_BACKEND_LIMIT: usize = 256;
@@ -337,7 +345,61 @@ impl BlobHandler {
         operator: Operator,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
-        Box::pin(self.write_stream_limit(location, operator, blob, None, None, None)).await
+        let limits = WriteLimits::default();
+        Box::pin(self.write_stream_limit(location, operator, blob, limits, None, None)).await
+    }
+
+    /// Writes the original bytes as frames compressed with `compression`.
+    async fn write_encoded(
+        &self,
+        location: BackendLocation,
+        operator: Operator,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+        compression: Compression,
+    ) -> BlobEvent {
+        let encoder = match compression {
+            Compression::Off => None,
+            Compression::Zstd { level } => Some(FrameEncoder::new(level)),
+        };
+        let limits = WriteLimits::default();
+        Box::pin(self.write_stream_limit(location, operator, blob, limits, encoder, None)).await
+    }
+
+    /// Appends one piece to the open writer, failing the reservation on error.
+    async fn write_piece(
+        &self,
+        reservation: &mut HiddenReservation,
+        deadline: Option<StdInstant>,
+        bytes: Bytes,
+    ) -> Result<(), BlobEvent> {
+        // Stays set if the caller drops this future before the write returns.
+        reservation.mark_abandoned();
+        let write = match reservation.writer_mut() {
+            Some(writer) => match deadline {
+                Some(deadline) => with_deadline(Some(deadline), writer.write(bytes)).await,
+                None => timeout(self.transfer_idle_timeout(), writer.write(bytes))
+                    .await
+                    .map_err(|_| ()),
+            },
+            None => {
+                let error = BlobError::WriteError("hidden writer is missing".to_string());
+                return Err(reservation.fail(error).await);
+            }
+        };
+        if write.is_ok() {
+            reservation.mark_settled();
+        }
+        match write {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(reservation
+                .fail(BlobError::WriteError(err.to_string()))
+                .await),
+            Err(()) => {
+                reservation.mark_abandoned();
+                let error = BlobError::WriteError("blob write deadline expired".to_string());
+                Err(reservation.fail(error).await)
+            }
+        }
     }
 
     async fn write_stream_limit(
@@ -345,10 +407,14 @@ impl BlobHandler {
         mut location: BackendLocation,
         operator: Operator,
         mut blob: BackendStream<Result<Bytes, StreamError>>,
-        max_bytes: Option<u64>,
-        deadline: Option<StdInstant>,
+        limits: WriteLimits,
+        mut encoder: Option<FrameEncoder>,
         reservation: Option<&mut HiddenReservation>,
     ) -> BlobEvent {
+        let WriteLimits {
+            max_bytes,
+            deadline,
+        } = limits;
         let mut plain = HiddenReservation::new(self.clone());
         let reservation = reservation.unwrap_or(&mut plain);
         reservation.set_location(location.clone());
@@ -433,45 +499,31 @@ impl BlobHandler {
                     .await;
             }
             hasher.update(&bytes);
-            // Stays set if the caller drops this future before the write returns.
-            reservation.mark_abandoned();
-            let write = match reservation.writer_mut() {
-                Some(writer) => match deadline {
-                    Some(deadline) => {
-                        with_deadline(Some(deadline), writer.write(bytes.to_vec())).await
-                    }
-                    None => timeout(self.transfer_idle_timeout(), writer.write(bytes.to_vec()))
-                        .await
-                        .map_err(|_| ()),
+            let pieces = match encoder.as_mut() {
+                Some(encoder) => match encoder.push(&bytes).await {
+                    Ok(pieces) => pieces,
+                    Err(error) => return reservation.fail(error).await,
                 },
-                None => {
-                    return reservation
-                        .fail(BlobError::WriteError(
-                            "hidden writer is missing".to_string(),
-                        ))
-                        .await;
-                }
+                None => vec![bytes],
             };
-            if write.is_ok() {
-                reservation.mark_settled();
-            }
-            match write {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    return reservation
-                        .fail(BlobError::WriteError(err.to_string()))
-                        .await;
-                }
-                Err(()) => {
-                    reservation.mark_abandoned();
-                    return reservation
-                        .fail(BlobError::WriteError(
-                            "blob write deadline expired".to_string(),
-                        ))
-                        .await;
+            for piece in pieces {
+                if let Err(event) = self.write_piece(reservation, deadline, piece).await {
+                    return event;
                 }
             }
             bytes_written = next_size;
+        }
+        if let Some(encoder) = encoder {
+            let (pieces, layout) = match encoder.finish().await {
+                Ok(finished) => finished,
+                Err(error) => return reservation.fail(error).await,
+            };
+            for piece in pieces {
+                if let Err(event) = self.write_piece(reservation, deadline, piece).await {
+                    return event;
+                }
+            }
+            location.format.layout = StoredLayout::Frames(layout);
         }
 
         reservation.mark_abandoned();
@@ -588,8 +640,11 @@ impl BlobHandler {
                 location,
                 operator,
                 blob,
-                max_bytes,
-                deadline,
+                WriteLimits {
+                    max_bytes,
+                    deadline,
+                },
+                None,
                 Some(&mut reservation),
             )
             .await
@@ -863,7 +918,9 @@ impl BlobHandler {
                 return BlobEvent::Error(err);
             }
         };
-        match self.write_stream(location.clone(), operator, blob).await {
+        match Box::pin(self.write_encoded(location.clone(), operator, blob, resolved.compression))
+            .await
+        {
             BlobEvent::WriteFinished { location } => {
                 reservation.retain();
                 match self.finalize_reservation(&location).await {

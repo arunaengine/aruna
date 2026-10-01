@@ -6,6 +6,7 @@ use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::storage::blob::{BackendRef, ResolvedBackend};
 use crate::structs::storage::cleanup::CleanupStrategy;
+use crate::structs::storage::format::Compression;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -390,6 +391,8 @@ pub struct RoutingSnapshot {
     pub catalog: BackendCatalog,
     pub group_default: Option<RoutingTarget>,
     pub bucket_rules: Vec<StorageRoutingRule>,
+    /// The bucket's compression, stamped on every backend this snapshot resolves.
+    pub compression: Compression,
 }
 
 impl RoutingSnapshot {
@@ -400,7 +403,13 @@ impl RoutingSnapshot {
             catalog,
             group_default: None,
             bucket_rules: Vec::new(),
+            compression: Compression::Off,
         }
+    }
+
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
     }
 
     /// Snapshot of a node with only the implicit default backend.
@@ -507,7 +516,7 @@ pub fn resolve_backend(
             .resolve_target(candidate.target, candidate.source)?
         {
             warn_missed(&missed, &resolved);
-            return Ok(resolved);
+            return Ok(resolved.with_compression(snapshot.compression));
         }
         if let RoutingTarget::Class(class) = candidate.target {
             missed.push(class.as_str());
@@ -516,7 +525,7 @@ pub fn resolve_backend(
 
     let resolved = snapshot.catalog.default_backend()?;
     warn_missed(&missed, &resolved);
-    Ok(resolved)
+    Ok(resolved.with_compression(snapshot.compression))
 }
 
 /// Rejects two rules in one scope sharing `(exact, key_prefix)`, so the

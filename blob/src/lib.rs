@@ -9,6 +9,7 @@ pub mod arc;
 mod autoindex;
 pub mod bao_tree;
 pub mod blob;
+mod codec;
 pub mod egress;
 pub mod error;
 mod framing;

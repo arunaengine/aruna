@@ -440,6 +440,7 @@ dependencies = [
  "tracing",
  "ulid 3.0.0",
  "windows-sys 0.61.2",
+ "zstd",
 ]
 
 [[package]]

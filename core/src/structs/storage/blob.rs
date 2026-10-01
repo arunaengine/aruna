@@ -15,7 +15,7 @@ use crate::structs::execution::staging::VersionSourceBinding;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
-use crate::structs::storage::format::{EncodingClass, StoredFormat, StoredLayout};
+use crate::structs::storage::format::{Compression, EncodingClass, StoredFormat, StoredLayout};
 use crate::structs::storage::group_backend::GroupBackendKind;
 use crate::structs::storage::routing::StorageRoutingRule;
 use crate::types::GroupId;
@@ -191,6 +191,8 @@ impl Display for BackendRef {
 pub struct ResolvedBackend {
     pub backend: BackendRef,
     pub storage_class: Option<String>,
+    /// The bucket's compression at resolution time; parts and hidden blobs ignore it.
+    pub compression: Compression,
 }
 
 impl ResolvedBackend {
@@ -198,7 +200,13 @@ impl ResolvedBackend {
         Self {
             backend,
             storage_class,
+            compression: Compression::Off,
         }
+    }
+
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
     }
 
     pub fn node_default() -> Self {
@@ -430,8 +438,9 @@ impl BackendLocation {
 
     /// Bytes this copy occupies on its backend.
     pub fn stored_size(&self) -> u64 {
-        match self.format.layout {
+        match &self.format.layout {
             StoredLayout::Raw => self.blob_size,
+            StoredLayout::Frames(layout) => layout.stored_size,
         }
     }
 
