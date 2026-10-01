@@ -129,6 +129,13 @@ pub(super) fn record_effect_fields(span: &Span, effect: &StorageEffect) {
                 span.record("txn_id", field::display(txn_id));
             }
         }
+        StorageEffect::VaultWrite { txn_id, .. }
+        | StorageEffect::VaultRead { txn_id, .. }
+        | StorageEffect::VaultDelete { txn_id, .. } => {
+            if let Some(txn_id) = txn_id {
+                span.record("txn_id", field::display(txn_id));
+            }
+        }
         StorageEffect::SyncAll => {}
     }
 }
@@ -148,6 +155,9 @@ pub(super) fn storage_effect_kind(effect: &StorageEffect) -> &'static str {
         StorageEffect::SyncAll => "sync_all",
         StorageEffect::Iter { .. } => "iter",
         StorageEffect::Last { .. } => "last",
+        StorageEffect::VaultWrite { .. } => "vault_write",
+        StorageEffect::VaultRead { .. } => "vault_read",
+        StorageEffect::VaultDelete { .. } => "vault_delete",
     }
 }
 
@@ -179,6 +189,7 @@ pub(super) fn storage_event_kind(event: &StorageEvent) -> &'static str {
         StorageEvent::BatchDeleteResult { .. } => "batch_delete_result",
         StorageEvent::SyncAllFinished => "sync_all_finished",
         StorageEvent::IterResult { .. } => "iter_result",
+        StorageEvent::VaultResult { .. } => "vault_result",
         StorageEvent::Error { .. } => "error",
     }
 }

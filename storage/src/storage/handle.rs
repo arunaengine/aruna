@@ -14,6 +14,7 @@ use aruna_core::effects::{Effect, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::telemetry::record_stage;
 use async_trait::async_trait;
 use crossfire::{TrySendError, mpsc};
@@ -25,6 +26,7 @@ use super::metrics::{InFlightGuard, StorageMetrics, StorageMetricsSnapshot};
 use super::owner::TransactionOwner;
 use super::sealing::{open_event, seal_effect};
 use super::telemetry::{effect_kind, storage_effect_kind, storage_effect_span, storage_event_kind};
+use super::vault::{vault_effect, vault_event};
 
 pub type EffectHandle = (StorageEffect, ResponseSender, Span, Instant, InFlightGuard);
 pub type EffectSender = crossfire::MTx<mpsc::Array<EffectHandle>>;
@@ -89,6 +91,7 @@ pub struct StorageHandle {
     pub(super) transaction_cleanup: Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
     pub(super) worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     pub(super) secret_key: Arc<OnceLock<CredentialEncryptionKey>>,
+    pub(super) vault_key: Arc<OnceLock<NodeVaultKey>>,
 }
 
 #[derive(Debug)]
@@ -144,6 +147,7 @@ impl StorageHandle {
                 transaction_cleanup: Arc::new(Mutex::new(BTreeMap::new())),
                 worker: Arc::new(Mutex::new(None)),
                 secret_key: Arc::new(OnceLock::new()),
+                vault_key: Arc::new(OnceLock::new()),
             },
             StorageReceivers { foreground, bulk },
         )
@@ -153,6 +157,12 @@ impl StorageHandle {
     /// handle and all its clones. Set once at startup; a later key is ignored.
     pub fn seal_secrets(&self, key: CredentialEncryptionKey) {
         let _ = self.secret_key.set(key);
+    }
+
+    /// Opens the node vault with `key` for this handle and all its clones. Set once
+    /// at startup; vault effects fail until then, and a later key is ignored.
+    pub fn open_vault(&self, key: NodeVaultKey) {
+        let _ = self.vault_key.set(key);
     }
 
     /// A handle whose effects dispatch on the bulk lane, served only when the
@@ -318,6 +328,10 @@ impl StorageHandle {
     pub(super) async fn dispatch_storage_effect(&self, effect: StorageEffect) -> StorageEvent {
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
+        let (effect, vault_entry) = match vault_effect(self.vault_key.get(), effect) {
+            Ok(translated) => translated,
+            Err(error) => return self.observe_storage_event(StorageEvent::Error { error }),
+        };
         let (effect, opening) = match self.secret_key.get() {
             Some(key) => match seal_effect(key, effect) {
                 Ok(sealed) => sealed,
@@ -328,6 +342,10 @@ impl StorageHandle {
         let mut event = self.dispatch_queued(effect).await;
         if let (Some(key), Some(opening)) = (self.secret_key.get(), opening) {
             event = open_event(key, opening, event)
+                .unwrap_or_else(|error| self.observe_storage_event(StorageEvent::Error { error }));
+        }
+        if let Some(entry) = vault_entry {
+            event = vault_event(self.vault_key.get(), entry, event)
                 .unwrap_or_else(|error| self.observe_storage_event(StorageEvent::Error { error }));
         }
         record_stage("storage", started.elapsed());
@@ -617,12 +635,15 @@ pub(super) fn storage_effect_mutates(effect: &StorageEffect) -> bool {
         | StorageEffect::AddUsage { .. }
         | StorageEffect::Delete { .. }
         | StorageEffect::BatchDelete { .. }
+        | StorageEffect::VaultWrite { .. }
+        | StorageEffect::VaultDelete { .. }
         | StorageEffect::CommitTransaction { .. } => true,
         StorageEffect::StartTransaction { read } => !read,
         StorageEffect::Read { .. }
         | StorageEffect::BatchRead { .. }
         | StorageEffect::Iter { .. }
         | StorageEffect::Last { .. }
+        | StorageEffect::VaultRead { .. }
         | StorageEffect::AbortTransaction { .. }
         | StorageEffect::SyncAll => false,
     }
@@ -662,6 +683,18 @@ pub(super) fn effect_txn_id(effect: &StorageEffect) -> Option<Ulid> {
             txn_id: Some(txn_id),
             ..
         }
+        | StorageEffect::VaultWrite {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::VaultRead {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::VaultDelete {
+            txn_id: Some(txn_id),
+            ..
+        }
         | StorageEffect::AddUsage { txn_id, .. }
         | StorageEffect::CommitTransaction { txn_id }
         | StorageEffect::AbortTransaction { txn_id } => Some(*txn_id),
@@ -674,7 +707,10 @@ pub(super) fn effect_txn_id(effect: &StorageEffect) -> Option<Ulid> {
         | StorageEffect::Delete { txn_id: None, .. }
         | StorageEffect::BatchDelete { txn_id: None, .. }
         | StorageEffect::Iter { txn_id: None, .. }
-        | StorageEffect::Last { txn_id: None, .. } => None,
+        | StorageEffect::Last { txn_id: None, .. }
+        | StorageEffect::VaultWrite { txn_id: None, .. }
+        | StorageEffect::VaultRead { txn_id: None, .. }
+        | StorageEffect::VaultDelete { txn_id: None, .. } => None,
     }
 }
 

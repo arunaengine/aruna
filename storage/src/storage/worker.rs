@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use aruna_core::effects::{IterStart, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
-use aruna_core::keyspaces::prefix_upper_bound;
+use aruna_core::keyspaces::{NODE_VAULT_KEYSPACE, prefix_upper_bound};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::telemetry::duration_ms;
 use byteview::ByteView;
@@ -44,6 +44,9 @@ pub(super) fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
         | StorageEffect::Delete { key_space, .. }
         | StorageEffect::Iter { key_space, .. }
         | StorageEffect::Last { key_space, .. } => Some(key_space),
+        StorageEffect::VaultWrite { .. }
+        | StorageEffect::VaultRead { .. }
+        | StorageEffect::VaultDelete { .. } => Some(NODE_VAULT_KEYSPACE),
         StorageEffect::BatchRead { reads, .. } => {
             reads.first().map(|(key_space, _)| key_space.as_str())
         }
@@ -215,6 +218,12 @@ impl FjallStorage {
                 prefix,
                 txn_id,
             } => self.last(key_space, prefix, txn_id),
+            // The handle turns vault effects into row effects before they are queued.
+            StorageEffect::VaultWrite { .. }
+            | StorageEffect::VaultRead { .. }
+            | StorageEffect::VaultDelete { .. } => StorageEvent::Error {
+                error: StorageError::InvalidEffect,
+            },
         }
     }
 

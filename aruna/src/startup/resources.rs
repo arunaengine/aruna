@@ -340,6 +340,11 @@ async fn fill(
             &config.node_state.net_secret_key,
         ),
     );
+    acquired
+        .storage_handle
+        .open_vault(aruna_core::node_vault::NodeVaultKey::derive(
+            &config.node_state.net_secret_key,
+        ));
     if matches!(
         config.startup_mode,
         crate::config::StartupMode::JoinRealm {

@@ -16,6 +16,7 @@ mod tests;
 #[cfg(test)]
 mod tests_persistence;
 mod transactions;
+mod vault;
 mod worker;
 
 pub use handle::{

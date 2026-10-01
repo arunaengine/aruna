@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 use crate::UserId;
 use crate::alpn::Alpn;
 use crate::audit::AuditPageRequest;
-use crate::compute::ExecutionTargetId;
+use crate::compute::{ExecutionTargetId, SecretBytes};
 use crate::document::DocumentEffect;
 use crate::id::{DhtKeyId, NodeId};
 use crate::jobs::JobRequest;
 use crate::metadata::MetadataEffect;
+use crate::node_vault::VaultEntry;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::WriteGuard;
@@ -333,6 +334,22 @@ pub enum StorageEffect {
     Last {
         key_space: KeySpace,
         prefix: Option<Key>,
+        txn_id: Option<TxnId>,
+    },
+    /// Seals `secret` into the node vault under `entry`. Answers `WriteResult`.
+    VaultWrite {
+        entry: VaultEntry,
+        secret: SecretBytes,
+        txn_id: Option<TxnId>,
+    },
+    /// Opens the node vault record of `entry`. Answers `VaultResult`.
+    VaultRead {
+        entry: VaultEntry,
+        txn_id: Option<TxnId>,
+    },
+    /// Removes the node vault record of `entry`. Answers `DeleteResult`.
+    VaultDelete {
+        entry: VaultEntry,
         txn_id: Option<TxnId>,
     },
 }

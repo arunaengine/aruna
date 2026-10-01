@@ -23,6 +23,7 @@ pub mod harvest;
 pub mod jobs;
 pub mod metadata;
 pub mod node;
+pub mod node_vault;
 pub mod notifications;
 pub mod onboarding;
 mod owner_index;
