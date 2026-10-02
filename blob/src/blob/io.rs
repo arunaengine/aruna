@@ -9,6 +9,7 @@ use super::backend::{
 use super::group::GROUP_WRITE_CHUNK;
 use crate::hash::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
+use crate::s3::NativeMultipart;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
@@ -235,6 +236,7 @@ impl HiddenReservation {
                     abandoned,
                     operator.as_ref(),
                     storage_path.as_deref(),
+                    self.location.as_ref(),
                 )
                 .await;
             if cleanup.is_ok() {
@@ -243,7 +245,13 @@ impl HiddenReservation {
             cleanup
         } else if !self.uncertain {
             handler
-                .clean_partial(None, abandoned, operator.as_ref(), storage_path.as_deref())
+                .clean_partial(
+                    None,
+                    abandoned,
+                    operator.as_ref(),
+                    storage_path.as_deref(),
+                    self.location.as_ref(),
+                )
                 .await
         } else {
             Ok(())
@@ -292,6 +300,7 @@ impl Drop for HiddenReservation {
         let mut writer = self.writer.take();
         let operator = self.operator.clone();
         let storage_path = self.storage_path.clone();
+        let location = self.location.clone();
         let abandoned = self.abandoned;
         let uncertain = self.uncertain;
         runtime.spawn(async move {
@@ -303,6 +312,7 @@ impl Drop for HiddenReservation {
                     abandoned,
                     operator.as_ref(),
                     storage_path.as_deref(),
+                    location.as_ref(),
                 )
                 .await
             {
@@ -614,6 +624,7 @@ impl BlobHandler {
         abandoned: bool,
         operator: Option<&Operator>,
         storage_path: Option<&str>,
+        location: Option<&BackendLocation>,
     ) -> Result<(), BlobError> {
         if let Some(writer) = writer
             && !abandoned
@@ -626,8 +637,52 @@ impl BlobHandler {
             }
         }
         match (operator, storage_path) {
-            (Some(operator), Some(path)) => self.delete_path(operator, path).await,
+            (Some(operator), Some(path)) => {
+                self.delete_path(operator, path).await?;
+                match location {
+                    Some(location) if abandoned => self.abort_uploads(location, path).await,
+                    _ => Ok(()),
+                }
+            }
             _ => Ok(()),
+        }
+    }
+
+    /// The native multipart client for a location on an S3 backend; `None` for other kinds.
+    pub(super) fn native_for(
+        &self,
+        location: &BackendLocation,
+    ) -> Result<Option<NativeMultipart>, BlobError> {
+        let entry = self.registry.backend(&location.backend)?;
+        let config = &entry.config.service_config;
+        let (bucket, guard) = match entry.config.backend_type {
+            Backend::S3 => (location.storage_bucket.as_str(), None),
+            Backend::Group(GroupBackendKind::S3) => {
+                let bucket = config.get("bucket").ok_or_else(|| {
+                    BlobError::OperatorCreationFailed("group backend has no bucket".to_string())
+                })?;
+                (bucket.as_str(), Some(&self.egress))
+            }
+            _ => return Ok(None),
+        };
+        NativeMultipart::from_config(config, bucket, &location.root, guard).map(Some)
+    }
+
+    /// An abandoned writer took its provider upload id along, so deleting the path leaves the
+    /// uploaded parts behind. The path is unique to one blob, so its uploads are aborted.
+    pub(super) async fn abort_uploads(
+        &self,
+        location: &BackendLocation,
+        storage_path: &str,
+    ) -> Result<(), BlobError> {
+        let Some(native) = self.native_for(location)? else {
+            return Ok(());
+        };
+        match timeout(self.io_timeout(), native.abort_path(storage_path)).await {
+            Ok(result) => result.map(|_| ()),
+            Err(_) => Err(BlobError::DeleteError(
+                "timed out aborting unfinished multipart uploads".to_string(),
+            )),
         }
     }
 
@@ -1101,7 +1156,10 @@ impl BlobHandler {
             Ok(bytes_written) => bytes_written,
             Err(err) => {
                 let cleanup = if abandoned {
-                    self.delete_path(&operator, &storage_path).await
+                    match self.delete_path(&operator, &storage_path).await {
+                        Ok(()) => self.abort_uploads(&location, &storage_path).await,
+                        Err(error) => Err(error),
+                    }
                 } else {
                     abort_partial_writer(&mut writer, self.io_timeout()).await
                 };

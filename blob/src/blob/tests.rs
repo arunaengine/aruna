@@ -2222,6 +2222,7 @@ async fn abandoned_writer_deletes() {
             false,
             Some(&operator),
             Some("obj/aborted"),
+            None,
         )
         .await
         .unwrap_err();
@@ -2237,6 +2238,7 @@ async fn abandoned_writer_deletes() {
             true,
             Some(&operator),
             Some("obj/abandoned"),
+            None,
         )
         .await
         .unwrap_err();
@@ -2300,7 +2302,8 @@ async fn unsupported_abort_deletes() {
                 Some(&mut writer),
                 false,
                 Some(&operator),
-                Some("obj/partial")
+                Some("obj/partial"),
+                None,
             )
             .await,
         Ok(())
@@ -2741,6 +2744,51 @@ async fn s3_abort_path() {
     assert_eq!(native.abort_path("blob").await.unwrap(), 0);
     assert_eq!(native.abort_path("blob-other").await.unwrap(), 1);
     native.abort("blob", &kept).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_abandoned_cleanup() {
+    // Cleaning an abandoned write also aborts the provider upload its writer took along.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob(
+            "bucket",
+            "abandoned.bin",
+            cold_backend(),
+            test_user_id(),
+            stream_from_bytes(b"data"),
+        )
+        .await
+    else {
+        panic!("s3 write failed")
+    };
+    let path = location.get_storage_path().unwrap();
+    let native = handler.native_for(&location).unwrap().unwrap();
+    let left = native.create(&path).await.unwrap();
+    native
+        .upload_part(&path, &left, 1, 4, stream_from_bytes(b"part"))
+        .await
+        .unwrap();
+    let operator = handler
+        .registry
+        .operator_for(
+            &location.backend,
+            &location.root,
+            &location.storage_bucket,
+            &handler.egress,
+        )
+        .unwrap();
+
+    handler
+        .clean_partial(None, true, Some(&operator), Some(&path), Some(&location))
+        .await
+        .unwrap();
+
+    assert_eq!(native.abort_path(&path).await.unwrap(), 0);
+    assert!(operator.stat(&path).await.is_err());
 }
 
 #[tokio::test]
