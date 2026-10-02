@@ -11,12 +11,12 @@ use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, sea
 use aruna_core::document::DocumentTarget;
 use aruna_core::git::GitRecord;
 use aruna_core::keyspaces::{
-    CONNECTOR_SECRET_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
-    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-    GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY,
-    NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_SESSION_KEYSPACE,
-    SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
-    UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE,
+    FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
+    FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, JOB_KEYSPACE,
+    JOB_STATE_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
+    SESSION_OWNER_KEYSPACE, SYNC_OUTBOX_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
@@ -91,6 +91,8 @@ pub struct MigrateOutput {
     pub uploads_scanned: usize,
     pub uploads_deleted: usize,
     pub upload_parts_deleted: usize,
+    /// Stored blobs of deleted parts, queued for the cleanup drain.
+    pub upload_blobs_queued: usize,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -125,6 +127,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let owner_rows = db.keyspace(SESSION_OWNER_KEYSPACE, KeyspaceCreateOptions::default)?;
     let upload_rows = db.keyspace(UPLOAD_KEYSPACE, KeyspaceCreateOptions::default)?;
     let part_rows = db.keyspace(UPLOAD_PART_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let cleanup_rows = db.keyspace(BLOB_CLEANUP_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -203,6 +206,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         (&job_rows, &jobs.rows),
         (&state_rows, &checkpoints.rows),
         (&owner_rows, &stale.owner_writes),
+        (&cleanup_rows, &old_uploads.blob_deletes),
     ]
     .into_iter()
     .chain(
@@ -277,6 +281,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         uploads_scanned: old_uploads.scanned,
         uploads_deleted: old_uploads.uploads.len(),
         upload_parts_deleted: old_uploads.parts.len(),
+        upload_blobs_queued: old_uploads.blob_deletes.len(),
     })
 }
 
