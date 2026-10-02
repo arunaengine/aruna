@@ -19,6 +19,7 @@ pub mod hash;
 pub mod invenio;
 mod messages;
 pub mod opendal;
+mod part_chain;
 pub mod repo;
 pub mod rocrate;
 pub mod s3;
