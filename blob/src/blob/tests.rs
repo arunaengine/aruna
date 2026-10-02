@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::backend::{build_backend_path, build_part_path, rebuild_backend_path};
+use super::group::GROUP_WRITE_CHUNK;
+use super::io::compose_chunk;
 use super::{
     BackendRegistry, BlobHandle, BlobHandler, ControlPlaneKind, NodeBackend,
     control_plane::timeout_event,
@@ -1964,7 +1966,9 @@ async fn compose_part_sizes() {
                 ..make_test_location()
             };
             let (operator, sizes) = failing_close::operator_with_sizes();
-            let event = handler.compose_parts(target, operator, parts.clone()).await;
+            let event = handler
+                .compose_parts(target, operator, parts.clone(), None)
+                .await;
             assert!(matches!(
                 event,
                 BlobEvent::Error(BlobError::WriteCleanup { .. })
@@ -1977,6 +1981,65 @@ async fn compose_part_sizes() {
                     .collect::<Vec<_>>()
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn compose_streams_chunks() {
+    // A chunked composition never holds more than one chunk, whatever the part sizes are.
+    let context = setup_blob_handle(128 * 1024 * 1024).await;
+    let handler = context.blob_handle.handler.clone();
+    let upload_id = Ulid::generate();
+    let mut parts = Vec::new();
+    for (index, size) in [9usize, 6, 3].into_iter().enumerate() {
+        let payload = vec![index as u8; size * 1024 * 1024];
+        let BlobEvent::WriteFinished { location } = handler
+            .write_blob_part(
+                MultipartPartKey::new(upload_id, (index + 1) as u16),
+                ResolvedBackend::node_default(),
+                test_user_id(),
+                false,
+                false,
+                stream_from_bytes(&payload),
+            )
+            .await
+        else {
+            panic!("part write failed")
+        };
+        parts.push(location);
+    }
+    let chunk = 8 * 1024 * 1024;
+    let (operator, sizes) = failing_close::operator_with_sizes();
+
+    handler
+        .compose_parts(make_test_location(), operator, parts, Some(chunk))
+        .await;
+
+    let sizes = sizes.lock().unwrap();
+    assert!(sizes.iter().all(|size| *size <= chunk), "{sizes:?}");
+    assert_eq!(sizes.iter().sum::<usize>(), 18 * 1024 * 1024);
+}
+
+#[test]
+fn compose_chunk_limits() {
+    let tib = 1024u64.pow(4);
+    assert_eq!(compose_chunk(&Backend::S3, 5 * tib), None);
+    assert_eq!(
+        compose_chunk(&Backend::Group(GroupBackendKind::S3), tib),
+        None
+    );
+    assert_eq!(
+        compose_chunk(&Backend::FileSystem, 1024),
+        Some(GROUP_WRITE_CHUNK)
+    );
+    for (backend, limit) in [
+        (Backend::Group(GroupBackendKind::B2), 10_000),
+        (Backend::Group(GroupBackendKind::Gcs), 10_000),
+        (Backend::Group(GroupBackendKind::Azblob), 50_000),
+    ] {
+        let chunk = compose_chunk(&backend, 5 * tib).unwrap() as u64;
+        assert!((5 * tib).div_ceil(chunk) <= limit);
+        assert!(chunk < 1024 * 1024 * 1024);
     }
 }
 
@@ -2008,7 +2071,7 @@ async fn compose_timeout_deletes() {
     let (operator, delete_calls, writer) = failing_cleanup::pending_operator();
 
     let event = handler
-        .compose_parts(make_test_location(), operator, vec![part])
+        .compose_parts(make_test_location(), operator, vec![part], None)
         .await;
 
     assert!(matches!(
@@ -2057,7 +2120,7 @@ async fn compose_close_fails() {
 
     let (operator, aborts) = failing_close::operator_with_aborts();
     let event = handler
-        .compose_parts(target.clone(), operator, vec![part])
+        .compose_parts(target.clone(), operator, vec![part], None)
         .await;
 
     assert!(
@@ -2112,7 +2175,7 @@ async fn compose_cleanup_error() {
     let event = context
         .blob_handle
         .handler
-        .compose_parts(target.clone(), operator, Vec::new())
+        .compose_parts(target.clone(), operator, Vec::new(), None)
         .await;
 
     let BlobEvent::Error(BlobError::WriteCleanup { location, .. }) = event else {

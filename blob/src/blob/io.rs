@@ -18,16 +18,17 @@ use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BackendRef, BlobLocationKey, HIDDEN_BLOB_PREFIX, HiddenBlobEntry,
+    Backend, BackendLocation, BackendRef, BlobLocationKey, HIDDEN_BLOB_PREFIX, HiddenBlobEntry,
     HiddenBlobKey, ResolvedBackend,
 };
+use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use aruna_core::structs::storage::multipart::MultipartPartKey;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use opendal::{EntryMode, ErrorKind, Operator};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::ops::{Bound, RangeBounds};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -79,6 +80,25 @@ async fn open_writer(
         BackendRef::Group(_) => operator.writer_with(path).chunk(GROUP_WRITE_CHUNK).await,
         BackendRef::Node(_) => operator.writer(path).await,
     }
+}
+
+/// Writer chunk for a composition. `None` keeps each input part as one S3 part; other kinds
+/// stream in chunks only as large as their provider's part limit requires.
+pub(super) fn compose_chunk(backend: &Backend, total: u64) -> Option<usize> {
+    const MIB: u64 = 1024 * 1024;
+    let limit: u64 = match backend {
+        Backend::S3 | Backend::Group(GroupBackendKind::S3) => return None,
+        Backend::Group(GroupBackendKind::Azblob | GroupBackendKind::Azdls) => 50_000,
+        Backend::FileSystem | Backend::Group(GroupBackendKind::Gcs | GroupBackendKind::B2) => {
+            10_000
+        }
+    };
+    let needed = total.div_ceil(limit).div_ceil(MIB) * MIB;
+    Some(
+        usize::try_from(needed)
+            .unwrap_or(usize::MAX)
+            .max(GROUP_WRITE_CHUNK),
+    )
 }
 
 async fn with_deadline<F, T>(deadline: Option<StdInstant>, future: F) -> Result<T, ()>
@@ -938,7 +958,19 @@ impl BlobHandler {
                 return BlobEvent::Error(err);
             }
         };
-        match self.compose_parts(location.clone(), operator, parts).await {
+        let backend_type = match self.registry.config_for(&resolved.backend) {
+            Ok(config) => config.backend_type,
+            Err(err) => {
+                _ = self.release_reservation(&location).await;
+                return BlobEvent::Error(err);
+            }
+        };
+        let total = parts.iter().map(|part| part.blob_size).sum();
+        let chunk = compose_chunk(&backend_type, total);
+        match self
+            .compose_parts(location.clone(), operator, parts, chunk)
+            .await
+        {
             BlobEvent::WriteFinished { location } => {
                 reservation.retain();
                 match self.finalize_reservation(&location).await {
@@ -965,13 +997,27 @@ impl BlobHandler {
         mut location: BackendLocation,
         operator: Operator,
         parts: Vec<BackendLocation>,
+        chunk: Option<usize>,
     ) -> BlobEvent {
         let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
         // Without a fixed chunk, each write of at least the backend minimum is one backend part.
-        let mut writer = match timeout(self.io_timeout(), operator.writer(&storage_path)).await {
+        let opened = match chunk {
+            Some(chunk) => {
+                timeout(
+                    self.io_timeout(),
+                    operator
+                        .writer_with(&storage_path)
+                        .chunk(chunk)
+                        .into_future(),
+                )
+                .await
+            }
+            None => timeout(self.io_timeout(), operator.writer(&storage_path)).await,
+        };
+        let mut writer = match opened {
             Ok(Ok(writer)) => writer,
             Ok(Err(error)) => {
                 return BlobEvent::Error(BlobError::OperatorCreationFailed(error.to_string()));
@@ -1007,31 +1053,32 @@ impl BlobHandler {
                     .map_err(|err| BlobError::ReadError(err.to_string()))?;
 
                 let mut reader = BackendStream::new(reader);
-                // The whole part is written at once so it keeps its own boundary.
+                // Without a chunk the whole part is written at once so it keeps its own boundary.
                 let mut part_chunks = Vec::new();
                 let mut part_size = 0u64;
                 loop {
-                    let chunk = timeout(self.transfer_idle_timeout(), reader.next())
+                    let next = timeout(self.transfer_idle_timeout(), reader.next())
                         .await
                         .map_err(|_| {
                             BlobError::ReadError("compose reader idle timeout".to_string())
                         })?;
-                    let Some(chunk) = chunk else {
+                    let Some(next) = next else {
                         break;
                     };
-                    let bytes = chunk.map_err(|err| BlobError::ReadError(err.to_string()))?;
+                    let bytes = next.map_err(|err| BlobError::ReadError(err.to_string()))?;
                     hasher.update(&bytes);
                     part_size += bytes.len() as u64;
                     part_chunks.push(bytes);
+                    if chunk.is_some() {
+                        let buffered = std::mem::take(&mut part_chunks);
+                        self.compose_write(&mut writer, buffered, &mut abandoned)
+                            .await?;
+                    }
                 }
-                timeout(self.transfer_idle_timeout(), writer.write(part_chunks))
-                    .await
-                    .map_err(|_| {
-                        ambiguous = true;
-                        abandoned = true;
-                        BlobError::WriteError("compose writer idle timeout".to_string())
-                    })?
-                    .map_err(|err| BlobError::WriteError(err.to_string()))?;
+                if chunk.is_none() {
+                    self.compose_write(&mut writer, part_chunks, &mut abandoned)
+                        .await?;
+                }
                 bytes_written += part_size;
             }
             timeout(self.transfer_idle_timeout(), writer.close())
@@ -1048,6 +1095,7 @@ impl BlobHandler {
             Ok(bytes_written)
         }
         .await;
+        ambiguous |= abandoned;
 
         let bytes_written = match compose_result {
             Ok(bytes_written) => bytes_written,
@@ -1079,6 +1127,22 @@ impl BlobHandler {
         location.blob_size = bytes_written;
         location.hashes = hasher.to_map();
         BlobEvent::WriteFinished { location }
+    }
+
+    /// A timeout drops the write mid-poll, so the writer is marked abandoned.
+    async fn compose_write(
+        &self,
+        writer: &mut opendal::Writer,
+        buffer: Vec<Bytes>,
+        abandoned: &mut bool,
+    ) -> Result<(), BlobError> {
+        timeout(self.transfer_idle_timeout(), writer.write(buffer))
+            .await
+            .map_err(|_| {
+                *abandoned = true;
+                BlobError::WriteError("compose writer idle timeout".to_string())
+            })?
+            .map_err(|err| BlobError::WriteError(err.to_string()))
     }
 
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
