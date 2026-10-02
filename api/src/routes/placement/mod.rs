@@ -969,8 +969,8 @@ pub struct PolicyRefQuery {
 ids.
 
 **Behavior**
-- This is a node-local read of the replicated bucket record: a default written on another node can
-  be missing until it arrives here.
+- This is a node-local read of this node's bucket record. A bucket with the same name on another
+  node is separate and keeps its own default.
 - The `generation` is the counter every default change advances, and it is what a bulk run captures and
   what a compare-and-set update must present.
 - A bucket that has never been given a default returns an empty list at its current generation."#,

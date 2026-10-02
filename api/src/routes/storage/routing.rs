@@ -232,8 +232,8 @@ pub(crate) async fn ensure_group_admin(
 is part of describing the bucket; changing the rules still takes group admin write.
 
 **Behavior**
-- Node-local read of the replicated bucket record: rules written on another node can be missing
-  until they arrive here.
+- Node-local read of this node's bucket record. A bucket with the same name on another node is
+  separate and keeps its own rules.
 - `warnings` is advisory and is recomputed per request from the storage classes this node offers to
   tenants plus the backends the group registered, so the same rules can warn here and not on
   another node."#,
