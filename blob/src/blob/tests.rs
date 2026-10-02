@@ -3266,6 +3266,70 @@ async fn s3_overlapping_writes() {
 }
 
 #[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_delayed_write() {
+    // A write admitted before another attempt's commit must not overwrite the acknowledged part.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "delayed.bin",
+            cold_backend(),
+            test_user_id(),
+        )
+        .await
+    else {
+        panic!("s3 upload did not open")
+    };
+    let size = 5 * 1024 * 1024;
+    let acknowledged = vec![1u8; size];
+    let accepted = in_place_part(&handler, &upload, 1, &acknowledged).await;
+    // The accepted attempt's operation commits and releases its reservation.
+    assert!(matches!(
+        context
+            .blob_handle
+            .send_blob_effect(BlobEffect::ReleaseReservation {
+                id: accepted.location.ulid,
+            })
+            .await,
+        Event::Blob(BlobEvent::ReservationReleased { .. })
+    ));
+
+    let BlobEvent::WriteFinished { location } = handler
+        .write_part(
+            upload.clone(),
+            MultipartPartKey::new(upload.record_id, 1),
+            cold_backend(),
+            test_user_id(),
+            false,
+            false,
+            Some(size as u64),
+            stream_from_bytes(&vec![9u8; size]),
+        )
+        .await
+    else {
+        panic!("the delayed write was not staged")
+    };
+    assert!(!location.partial);
+
+    let last = in_place_part(&handler, &upload, 2, b"tail").await;
+    let BlobEvent::WriteFinished { location } =
+        handler.complete_upload(upload, vec![accepted, last]).await
+    else {
+        panic!("completion of the acknowledged parts failed")
+    };
+    assert_eq!(
+        read_back(&handler, location).await,
+        [acknowledged.as_slice(), b"tail"].concat()
+    );
+}
+
+#[tokio::test]
 async fn filesystem_keeps_parts() {
     // Without a provider upload, parts stay blobs of their own.
     let context = setup_blob_handle(5).await;
