@@ -12,7 +12,7 @@ use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    COMPRESSION_MIGRATION_KEYSPACE,
+    COMPRESSION_MIGRATION_KEYSPACE, TASK_TIMER_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::realm::RealmId;
@@ -247,6 +247,31 @@ async fn migrates_bucket_copies() {
     assert!(!process_migrations(&context.driver).await.unwrap());
 }
 
+async fn clear_timers(context: &TestContext) {
+    let storage = &context.driver.storage_handle;
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: TASK_TIMER_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: usize::MAX,
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("timer scan failed")
+    };
+    for (key, _) in values {
+        storage
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: TASK_TIMER_KEYSPACE.to_string(),
+                key,
+                txn_id: None,
+            })
+            .await;
+    }
+}
+
 #[tokio::test]
 async fn restart_resumes_migration() {
     // The setting change committed but no timer survived, as after a crash between the
@@ -257,6 +282,8 @@ async fn restart_resumes_migration() {
     let operation = PutCompressionOperation::new(BUCKET.to_string(), context.group_id, zstd, 1);
     drive(operation, &context.driver).await.unwrap();
     assert!(progress(&context).await.finished_at_ms.is_none());
+    // The run consumed its timer, so no stored timer can resume the migration.
+    clear_timers(&context).await;
 
     let task_handle = aruna_tasks::TaskHandle::new();
     let restarted = Arc::new(DriverContext {
