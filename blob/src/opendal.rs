@@ -367,9 +367,30 @@ where
     })
 }
 
+/// The signing region every S3 client of a backend uses: the configured one, else the region
+/// variables opendal itself reads. `None` makes both clients refuse the backend alike.
+pub(crate) fn s3_region(
+    config: &HashMap<String, String>,
+    variable: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    config
+        .get("region")
+        .filter(|region| !region.trim().is_empty())
+        .cloned()
+        .or_else(|| variable("AWS_REGION"))
+        .or_else(|| variable("AWS_DEFAULT_REGION"))
+}
+
+pub(crate) fn environment_variable(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
 // reqsign resolves lazily, so the switches live in the config; sso, web
 // identity, process and ecs stay in the chain, gated by the credentials.
 fn s3_operator_config(mut config: HashMap<String, String>) -> HashMap<String, String> {
+    if let Some(region) = s3_region(&config, environment_variable) {
+        config.insert("region".to_string(), region);
+    }
     config.insert("disable_config_load".to_string(), "true".to_string());
     config.insert("disable_ec2_metadata".to_string(), "true".to_string());
     // `force_path_style` is our key; opendal speaks `enable_virtual_host_style`.

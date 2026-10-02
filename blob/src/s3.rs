@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::egress::EgressGuard;
+use crate::opendal::{environment_variable, s3_region};
 use aruna_core::errors::BlobError;
 use aruna_core::stream::{BackendStream, BoxStream, StreamError};
 use aws_sdk_s3::Client;
@@ -143,10 +144,10 @@ impl NativeMultipart {
             None,
             "Aruna_v3",
         );
-        let region = config
-            .get("region")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_REGION.to_string());
+        // The same region the backend's opendal operator signs with.
+        let region = s3_region(config, environment_variable).ok_or_else(|| {
+            BlobError::OperatorCreationFailed("the S3 backend names no region".to_string())
+        })?;
         let path_style = config
             .get("force_path_style")
             .is_none_or(|value| value.trim().parse::<bool>().unwrap_or(true));
@@ -170,6 +171,11 @@ impl NativeMultipart {
             bucket: bucket.to_string(),
             root: root.to_string(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn region(&self) -> Option<String> {
+        self.client.config().region().map(ToString::to_string)
     }
 
     /// The object key OpenDAL uses for `path` under this backend's root.
