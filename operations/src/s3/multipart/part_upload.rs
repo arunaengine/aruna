@@ -239,6 +239,8 @@ impl UploadPartOperation {
             created_by: self.input.created_by,
             compressed: self.input.compressed,
             encrypted: self.input.encrypted,
+            backend_upload: record.backend_upload,
+            size: self.input.content_length,
             blob,
         })]
     }

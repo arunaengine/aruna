@@ -26,6 +26,16 @@ pub(crate) struct PartChain {
     active: Option<(u16, Ulid)>,
 }
 
+impl std::fmt::Debug for PartChain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PartChain")
+            .field("links", &self.links.len())
+            .field("active", &self.active)
+            .finish()
+    }
+}
+
 impl PartChain {
     /// The state to feed this part's bytes into, if it is next in order. A repeated part
     /// number drops every state from that part on.

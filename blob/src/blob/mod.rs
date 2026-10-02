@@ -18,6 +18,7 @@ use ulid::Ulid;
 mod backend;
 mod control_plane;
 mod group;
+mod in_place;
 mod io;
 mod registry;
 mod replication;
@@ -67,6 +68,9 @@ pub struct BlobHandler {
     /// operation still holds would leave that work unable to roll back.
     group_effects: Arc<StdMutex<HashMap<Ulid, group::GroupBackendUse>>>,
     reservation_active: Arc<StdMutex<HashSet<Ulid>>>,
+    /// Hash states of in-place uploads, by provider upload id. Lost on restart, which only costs
+    /// a longer read at completion.
+    part_chains: Arc<StdMutex<HashMap<String, crate::part_chain::PartChain>>>,
     /// Shutdown close for the blob write path, mirroring the storage close so a
     /// mutation cannot land on a backend behind the final storage sync.
     closed: Arc<AtomicBool>,

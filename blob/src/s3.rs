@@ -4,7 +4,7 @@
 
 use crate::egress::EgressGuard;
 use aruna_core::errors::BlobError;
-use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::stream::{BackendStream, BoxStream, StreamError};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{
     BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
@@ -16,11 +16,9 @@ use aws_sdk_s3::types::{
 };
 use bytes::Bytes;
 use futures::StreamExt;
-use futures::stream::BoxStream;
 use http_body::{Frame, SizeHint};
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Mutex, PoisonError};
 use std::task::{Context, Poll};
 
 const DEFAULT_REGION: &str = "eu-central-1";
@@ -202,7 +200,7 @@ impl NativeMultipart {
         let length = i64::try_from(size)
             .map_err(|_| BlobError::WriteError("part is too large".to_string()))?;
         let body = PartBody {
-            stream: Mutex::new(body.0),
+            stream: body.0,
             size,
         };
         let output = self
@@ -334,9 +332,9 @@ where
     ))
 }
 
-/// A part body the SDK sends without buffering. The mutex only makes the stream `Sync`.
+/// A part body the SDK sends as it arrives, without buffering it.
 struct PartBody {
-    stream: Mutex<BoxStream<'static, Result<Bytes, StreamError>>>,
+    stream: BoxStream<'static, Result<Bytes, StreamError>>,
     size: u64,
 }
 
@@ -348,12 +346,8 @@ impl http_body::Body for PartBody {
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, StreamError>>> {
-        let stream = self
-            .get_mut()
+        self.get_mut()
             .stream
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner);
-        stream
             .poll_next_unpin(context)
             .map(|item| item.map(|chunk| chunk.map(Frame::data)))
     }

@@ -1690,6 +1690,10 @@ impl BlobHandler {
 
     pub async fn delete_blob(&self, location: BackendLocation) -> BlobEvent {
         self.clear_active(location.ulid);
+        // An in-place part is no object: its provider upload holds the bytes until it settles.
+        if location.partial {
+            return BlobEvent::DeleteFinished;
+        }
         let operator = match self.operator_from_location(&location) {
             Ok(op) => op,
             Err(err) => return BlobEvent::Error(err),

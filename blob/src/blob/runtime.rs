@@ -70,6 +70,9 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::Write { .. } => (EffectClass::Transfer, "write"),
         BlobEffect::WritePart { .. } => (EffectClass::Transfer, "write_part"),
         BlobEffect::Compose { .. } => (EffectClass::Transfer, "compose"),
+        BlobEffect::OpenUpload { .. } => (EffectClass::Control, "open_upload"),
+        BlobEffect::CompleteUpload { .. } => (EffectClass::Transfer, "complete_upload"),
+        BlobEffect::AbortUpload { .. } => (EffectClass::Control, "abort_upload"),
         BlobEffect::SpoolHidden { .. } => (EffectClass::Spool, "spool_hidden"),
         BlobEffect::Replicate { .. } => (EffectClass::Transfer, "replicate"),
         BlobEffect::HandleReplication { .. } => (EffectClass::Transfer, "handle_replication"),
@@ -99,6 +102,9 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
         BlobEffect::Write { .. }
             | BlobEffect::WritePart { .. }
             | BlobEffect::Compose { .. }
+            | BlobEffect::OpenUpload { .. }
+            | BlobEffect::CompleteUpload { .. }
+            | BlobEffect::AbortUpload { .. }
             | BlobEffect::SpoolHidden { .. }
             | BlobEffect::Replicate { .. }
             | BlobEffect::HandleReplication { .. }
@@ -507,6 +513,7 @@ impl BlobHandler {
             inflight: Arc::new(AtomicUsize::new(0)),
             group_effects: Arc::new(std::sync::Mutex::new(HashMap::new())),
             reservation_active: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            part_chains: Arc::default(),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             close_lock: Arc::new(std::sync::RwLock::new(())),
             rejected_writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -600,6 +607,16 @@ impl BlobHandler {
                 blob,
             } => Box::pin(self.write_blob(&bucket, &key, resolved, created_by, blob)).await,
             BlobEffect::WritePart {
+                part_number,
+                created_by,
+                backend_upload: Some(upload),
+                size,
+                blob,
+                ..
+            } => {
+                Box::pin(self.write_upload_part(upload, part_number, size, created_by, blob)).await
+            }
+            BlobEffect::WritePart {
                 upload_id,
                 part_number,
                 resolved,
@@ -607,6 +624,7 @@ impl BlobHandler {
                 compressed,
                 encrypted,
                 blob,
+                ..
             } => {
                 Box::pin(self.write_blob_part(
                     MultipartPartKey::new(upload_id, part_number),
@@ -625,6 +643,19 @@ impl BlobHandler {
                 created_by,
                 parts,
             } => Box::pin(self.compose_blob(&bucket, &key, resolved, created_by, parts)).await,
+            BlobEffect::OpenUpload {
+                bucket,
+                key,
+                resolved,
+                created_by,
+            } => Box::pin(self.open_upload(&bucket, &key, resolved, created_by)).await,
+            BlobEffect::CompleteUpload {
+                backend_upload,
+                parts,
+            } => Box::pin(self.complete_upload(backend_upload, parts)).await,
+            BlobEffect::AbortUpload { backend_upload } => {
+                Box::pin(self.abort_upload(backend_upload)).await
+            }
             BlobEffect::Read { location } => Box::pin(self.read_blob(location)).await,
             BlobEffect::ReadRange { location, range } => {
                 Box::pin(self.read_blob_range(location, range)).await

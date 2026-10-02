@@ -1122,6 +1122,8 @@ async fn excludes_part_bucket() {
             created_by: test_user_id(),
             compressed: false,
             encrypted: false,
+            backend_upload: None,
+            size: None,
             blob: stream_from_bytes(b"part"),
         })
         .await
