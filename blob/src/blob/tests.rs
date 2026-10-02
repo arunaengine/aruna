@@ -2929,6 +2929,62 @@ async fn s3_provider_abort() {
 
 #[tokio::test]
 #[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_staged_replacement() {
+    // A replacement waits in a blob of its own; completion copies it over the acknowledged part.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "staged.bin",
+            cold_backend(),
+            test_user_id(),
+        )
+        .await
+    else {
+        panic!("s3 upload did not open")
+    };
+    let mib = 1024 * 1024;
+    in_place_part(&handler, &upload, 1, &vec![1u8; 5 * mib]).await;
+    let last = in_place_part(&handler, &upload, 2, b"tail").await;
+    let replacement = vec![9u8; 5 * mib + 1];
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob_part(
+            MultipartPartKey::new(upload.record_id, 1),
+            cold_backend(),
+            test_user_id(),
+            false,
+            false,
+            stream_from_bytes(&replacement),
+        )
+        .await
+    else {
+        panic!("staged part write failed")
+    };
+    let staged = MultipartPart {
+        part_number: 1,
+        location,
+        created_at: SystemTime::now(),
+        backend_etag: None,
+    };
+
+    let BlobEvent::WriteFinished { location } =
+        handler.complete_upload(upload, vec![staged, last]).await
+    else {
+        panic!("completion with a staged part failed")
+    };
+
+    let expected = [replacement.as_slice(), b"tail"].concat();
+    assert_eq!(location.hashes, Hasher::new_with_bytes(&expected).to_map());
+    assert_eq!(read_back(&handler, location).await, expected);
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
 async fn s3_abort_streaming() {
     // A part still streaming during an abort aborts again when it settles.
     let env = s3_env();

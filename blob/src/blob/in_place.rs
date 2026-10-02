@@ -14,6 +14,7 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle as _;
 use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, ResolvedBackend, WriteOwner,
 };
@@ -339,11 +340,24 @@ impl BlobHandler {
         let mut listed = Vec::with_capacity(parts.len());
         let mut etags = Vec::with_capacity(parts.len());
         for part in parts {
-            let Some(etag) = part.backend_etag.clone().filter(|_| part.location.partial) else {
-                return Err(BlobError::WriteError(format!(
-                    "part {} was not written into the provider upload",
-                    part.part_number
-                )));
+            // A staged replacement gets the ETag of its bytes once completion copies it in.
+            let etag = match (&part.backend_etag, part.location.partial) {
+                (Some(etag), true) => etag.clone(),
+                (_, false) => match part.location.hashes.get(HASH_MD5) {
+                    Some(md5) => format!("\"{}\"", hex::encode(md5)),
+                    None => {
+                        return Err(BlobError::WriteError(format!(
+                            "staged part {} has no MD5",
+                            part.part_number
+                        )));
+                    }
+                },
+                (None, true) => {
+                    return Err(BlobError::WriteError(format!(
+                        "part {} has no provider ETag",
+                        part.part_number
+                    )));
+                }
             };
             etags.push((part.part_number, etag));
             listed.push(PartAttempt {
@@ -356,7 +370,10 @@ impl BlobHandler {
         let native = self.native_upload(&upload.location)?;
         let path = upload.location.get_storage_path()?;
         let operator = self.operator_from_location(&upload.location)?;
-        if let Err(error) = native.complete(&path, &upload.upload_id, &etags).await {
+        if let Err(error) = self
+            .assemble(&native, &path, upload, parts, etags.clone())
+            .await
+        {
             // A completion whose answer was lost leaves the object. Only the ETag of exactly
             // these parts proves it is this selection, not an earlier one of the same size.
             let expected = multipart_etag(&etags);
@@ -406,6 +423,34 @@ impl BlobHandler {
             hashes: state.to_map(),
             ..upload.location.clone()
         })
+    }
+
+    /// Copies staged replacements into the provider upload, then completes it.
+    async fn assemble(
+        &self,
+        native: &NativeMultipart,
+        path: &str,
+        upload: &BackendUpload,
+        parts: &[MultipartPart],
+        mut etags: Vec<(u16, String)>,
+    ) -> Result<(), BlobError> {
+        for (slot, part) in etags.iter_mut().zip(parts) {
+            if part.location.partial {
+                continue;
+            }
+            let source = self.native_upload(&part.location)?;
+            let source_path = part.location.get_storage_path()?;
+            slot.1 = native
+                .copy_part(
+                    path,
+                    &upload.upload_id,
+                    part.part_number,
+                    &source,
+                    &source_path,
+                )
+                .await?;
+        }
+        native.complete(path, &upload.upload_id, &etags).await
     }
 
     /// Frees the provider's parts and any object a lost completion left at the target. Parts

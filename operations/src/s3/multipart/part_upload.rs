@@ -177,8 +177,13 @@ impl UploadPartOperation {
         if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
             return self.emit_error(error.into());
         }
-        // One round trip answers both "does this upload exist" and "does the
-        // subject that admitted it still hold".
+        // One round trip answers "does this upload exist", "does the subject that
+        // admitted it still hold" and "is this part number already acknowledged".
+        let part_key =
+            match MultipartPartKey::new(self.input.upload_id, self.input.part_number).to_bytes() {
+                Ok(key) => key,
+                Err(err) => return self.emit_error(err.into()),
+            };
         self.state = UploadPartState::ReadUpload;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![
@@ -190,6 +195,7 @@ impl UploadPartOperation {
                     NODE_SUBJECT_KEYSPACE.to_string(),
                     Key::from(NODE_SUBJECT_KEY.to_vec()),
                 ),
+                (UPLOAD_PART_KEYSPACE.to_string(), part_key.into()),
             ],
             txn_id: None,
         })]
@@ -210,6 +216,9 @@ impl UploadPartOperation {
             },
             Some((_, None)) => None,
             None => return self.emit_error(UploadPartError::InvalidOperationState),
+        };
+        let Some((_, acknowledged)) = values.next() else {
+            return self.emit_error(UploadPartError::InvalidOperationState);
         };
 
         let Some(value) = value else {
@@ -248,7 +257,12 @@ impl UploadPartOperation {
             created_by: self.input.created_by,
             compressed: self.input.compressed,
             encrypted: self.input.encrypted,
-            backend_upload: record.backend_upload.map(Box::new),
+            // A replacement waits in a blob of its own: a rejected one must leave the
+            // acknowledged provider part intact, and completion copies it in.
+            backend_upload: record
+                .backend_upload
+                .filter(|_| acknowledged.is_none())
+                .map(Box::new),
             size: self.input.content_length,
             blob,
         })]
@@ -867,6 +881,7 @@ mod test {
                     Some(record.to_bytes().unwrap().into()),
                 ),
                 (NODE_SUBJECT_KEY.to_vec().into(), None),
+                (b"part".to_vec().into(), None),
             ],
         }));
 
@@ -910,7 +925,8 @@ mod test {
         (op, record)
     }
 
-    fn read_record(record: &MultipartUpload) -> Event {
+    /// Answers the first read; `acknowledged` is the part record already stored, if any.
+    fn read_record(record: &MultipartUpload, acknowledged: Option<Vec<u8>>) -> Event {
         Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (
@@ -918,15 +934,30 @@ mod test {
                     Some(record.to_bytes().unwrap().into()),
                 ),
                 (NODE_SUBJECT_KEY.to_vec().into(), None),
+                (b"part".to_vec().into(), acknowledged.map(Into::into)),
             ],
         })
+    }
+
+    #[test]
+    fn replacement_waits_staged() {
+        // A replaced part must not touch the acknowledged provider part before completion.
+        let (mut op, record) = in_place_op(Some(4));
+
+        let effects = op.step(read_record(&record, Some(b"acknowledged".to_vec())));
+
+        let [Effect::Blob(BlobEffect::WritePart { backend_upload, .. })] = effects.as_slice()
+        else {
+            panic!("expected one part write, got {effects:?}")
+        };
+        assert!(backend_upload.is_none());
     }
 
     #[test]
     fn provider_needs_length() {
         let (mut op, record) = in_place_op(None);
 
-        let effects = op.step(read_record(&record));
+        let effects = op.step(read_record(&record, None));
 
         assert!(
             !effects
@@ -945,7 +976,7 @@ mod test {
         let (mut op, record) = in_place_op(Some(4));
         let upload = record.backend_upload.clone().unwrap();
 
-        let effects = op.step(read_record(&record));
+        let effects = op.step(read_record(&record, None));
         let [
             Effect::Blob(BlobEffect::WritePart {
                 backend_upload,

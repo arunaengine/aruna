@@ -425,6 +425,7 @@ dependencies = [
  "lru 0.18.4",
  "md5",
  "opendal",
+ "percent-encoding",
  "postcard",
  "reqwest 0.13.5",
  "rustix",

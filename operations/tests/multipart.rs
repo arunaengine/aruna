@@ -1878,8 +1878,43 @@ async fn s3_provider_flow() {
         results.push((index, part));
     }
     results.sort_by_key(|(index, _)| *index);
-    let parts: Vec<_> = results.into_iter().map(|(_, part)| part).collect();
-    let expected = payloads.concat();
+    let mut parts: Vec<_> = results.into_iter().map(|(_, part)| part).collect();
+
+    // A rejected replacement must leave the acknowledged part 1 as it was.
+    let rejected = drive(
+        UploadPartOperation::new(UploadPartInput {
+            bucket: "bucket".to_string(),
+            key: "in-place.bin".to_string(),
+            upload_id: upload.upload_id,
+            part_number: 1,
+            content_length: Some(4),
+            body: Some(stream_from_bytes(b"evil")),
+            created_by,
+            compressed: false,
+            encrypted: false,
+            expected_checksums: vec![ExpectedChecksum {
+                algorithm: ChecksumAlgorithm::Sha256,
+                digest: vec![0u8; 32],
+            }],
+        }),
+        &context.driver,
+    )
+    .await;
+    assert!(rejected.is_err());
+    // An accepted replacement waits staged and is copied in at completion.
+    let replaced = upload_part_bytes(
+        &context,
+        "bucket",
+        "in-place.bin",
+        upload.upload_id,
+        3,
+        b"TAIL",
+        created_by,
+    )
+    .await;
+    assert!(!replaced.location.partial);
+    parts[2] = replaced;
+    let expected = [&payloads[0][..], &payloads[1][..], b"TAIL"].concat();
 
     let result = complete_upload(
         &context,

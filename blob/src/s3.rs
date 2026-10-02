@@ -17,11 +17,19 @@ use aws_sdk_s3::types::{
 use bytes::Bytes;
 use futures::StreamExt;
 use http_body::{Frame, SizeHint};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 const DEFAULT_REGION: &str = "eu-central-1";
+/// A copy source names a key as a URL path: everything but unreserved characters and `/`.
+const COPY_SOURCE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~')
+    .remove(b'/');
 // AWS rejects CreateBucket requests that name us-east-1 explicitly.
 const IMPLICIT_REGION: &str = "us-east-1";
 
@@ -219,6 +227,35 @@ impl NativeMultipart {
             .e_tag()
             .map(str::to_string)
             .ok_or_else(|| BlobError::WriteError("backend returned no part ETag".to_string()))
+    }
+
+    /// Copies a whole object of the same provider into one part, so no byte passes the node.
+    pub async fn copy_part(
+        &self,
+        path: &str,
+        upload_id: &str,
+        part_number: u16,
+        source: &NativeMultipart,
+        source_path: &str,
+    ) -> Result<String, BlobError> {
+        let key = source.key(source_path);
+        let encoded = utf8_percent_encode(&key, COPY_SOURCE);
+        let output = self
+            .client
+            .upload_part_copy()
+            .bucket(&self.bucket)
+            .key(self.key(path))
+            .upload_id(upload_id)
+            .part_number(i32::from(part_number))
+            .copy_source(format!("{}/{encoded}", source.bucket))
+            .send()
+            .await
+            .map_err(|error| write_error("copy part", error))?;
+        output
+            .copy_part_result()
+            .and_then(|result| result.e_tag())
+            .map(str::to_string)
+            .ok_or_else(|| BlobError::WriteError("backend returned no copied part ETag".into()))
     }
 
     /// Assembles the listed parts, in order, under the backend ETags recorded for them.

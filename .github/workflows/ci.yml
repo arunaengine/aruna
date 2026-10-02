@@ -216,7 +216,7 @@ jobs:
           | test(=blob::tests::s3_backend_routes) | test(=blob::tests::s3_native_multipart)
           | test(=blob::tests::s3_abort_path) | test(=blob::tests::s3_abandoned_cleanup)
           | test(=blob::tests::s3_provider_upload) | test(=blob::tests::s3_provider_abort)
-          | test(=blob::tests::s3_abort_streaming))
+          | test(=blob::tests::s3_abort_streaming) | test(=blob::tests::s3_staged_replacement))
           | (package(aruna-operations) & binary(multipart) & test(=s3_provider_flow))'
 
   docker-backend:
