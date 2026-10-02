@@ -279,6 +279,21 @@ impl FrameIndex {
         self.offsets[frame as usize]..self.offsets[frame as usize + 1]
     }
 
+    /// Stored bytes of frames `first` up to `last`, cut after the last frame that fits `budget`.
+    /// Always covers `first`.
+    pub(crate) fn fetch_range(&self, first: u64, last: u64, budget: u64) -> Range<u64> {
+        let start = self.offsets[first as usize];
+        let mut end = self.offsets[first as usize + 1];
+        for frame in first + 1..=last {
+            let next = self.offsets[frame as usize + 1];
+            if next - start > budget {
+                break;
+            }
+            end = next;
+        }
+        start..end
+    }
+
     /// BLAKE3 of the stored bytes of one frame.
     pub(crate) fn digest(&self, frame: u64) -> &[u8; 32] {
         &self.digests[frame as usize]
@@ -519,6 +534,24 @@ mod tests {
             let result = decode(&tampered, &layout, size, 0..10);
             assert!(matches!(result, Err(BlobError::IntegrityCheckFailed(_))));
         }
+    }
+
+    #[test]
+    fn fetches_join_frames() {
+        let data = random(5 * FRAME_SIZE as usize, 9);
+        let (stored, layout) = encode(&data, 3);
+        let index = index_of(&stored, &layout, data.len() as u64);
+        let frame = |frame| index.frame_range(frame);
+
+        assert_eq!(index.fetch_range(1, 4, 0), frame(1));
+        assert_eq!(
+            index.fetch_range(1, 2, u64::MAX),
+            frame(1).start..frame(2).end
+        );
+        assert_eq!(
+            index.fetch_range(0, 4, 3 * FRAME_SIZE + 128),
+            frame(0).start..frame(2).end
+        );
     }
 
     #[test]

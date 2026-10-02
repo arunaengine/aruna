@@ -24,6 +24,8 @@ use tokio::time::timeout;
 
 /// Upper bound for the parsed seek tables kept in memory, about 1.6 TiB of framed data.
 const INDEX_CACHE_BYTES: usize = 64 << 20;
+/// Stored bytes one backend request fetches for consecutive frames of a range.
+const FETCH_BYTES: u64 = 8 << 20;
 
 /// Parsed seek tables keyed by their hash. Stored objects never change, so entries stay valid.
 #[derive(Debug)]
@@ -63,13 +65,15 @@ impl IndexCache {
 }
 
 /// Random access to the original bytes of a framed copy. Keeps the last decoded
-/// frame, so sequential reads decode each frame once.
+/// frame, so sequential reads decode each frame once, and fetches the stored bytes
+/// of consecutive frames in one request.
 pub(super) struct FrameReader {
     operator: Operator,
     path: String,
     index: Arc<FrameIndex>,
     size: u64,
     decoded: Option<(u64, Bytes)>,
+    fetched: Option<(Range<u64>, Bytes)>,
     idle: Duration,
 }
 
@@ -106,15 +110,31 @@ async fn read_range(
 }
 
 impl FrameReader {
-    /// The original bytes of one frame.
-    async fn frame(&mut self, frame: u64) -> Result<Bytes, BlobError> {
+    /// The original bytes of one frame; `last` is the last frame the caller still needs.
+    async fn frame(&mut self, frame: u64, last: u64) -> Result<Bytes, BlobError> {
         if let Some((cached, bytes)) = &self.decoded
             && *cached == frame
         {
             return Ok(bytes.clone());
         }
         let range = self.index.frame_range(frame);
-        let stored = read_range(&self.operator, &self.path, range, self.idle).await?;
+        let stored = match &self.fetched {
+            Some((fetched, bytes)) if fetched.start <= range.start && range.end <= fetched.end => {
+                let start = (range.start - fetched.start) as usize;
+                bytes.slice(start..start + (range.end - range.start) as usize)
+            }
+            _ => {
+                let fetch = self.index.fetch_range(frame, last, FETCH_BYTES);
+                let bytes =
+                    read_range(&self.operator, &self.path, fetch.clone(), self.idle).await?;
+                if bytes.len() as u64 != fetch.end - fetch.start {
+                    return Err(BlobError::ReadError("short frame read".to_string()));
+                }
+                let stored = bytes.slice(..(range.end - range.start) as usize);
+                self.fetched = Some((fetch, bytes));
+                stored
+            }
+        };
         let length = codec::frame_len(self.size, frame);
         let digest = *self.index.digest(frame);
         let decoded =
@@ -128,7 +148,7 @@ impl FrameReader {
     /// Original bytes from `start`, up to `end` and the end of that frame.
     async fn piece(&mut self, start: u64, end: u64) -> Result<Bytes, BlobError> {
         let frame = start / FRAME_SIZE;
-        let decoded = self.frame(frame).await?;
+        let decoded = self.frame(frame, (end - 1) / FRAME_SIZE).await?;
         let frame_start = frame * FRAME_SIZE;
         let to = (end - frame_start).min(decoded.len() as u64);
         Ok(decoded.slice((start - frame_start) as usize..to as usize))
@@ -285,6 +305,7 @@ impl BlobHandler {
             index,
             size,
             decoded: None,
+            fetched: None,
             idle,
         })
     }
