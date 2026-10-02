@@ -675,6 +675,65 @@ fn completes_at_provider() {
 }
 
 #[test]
+fn frames_in_place_object() {
+    // Compression was turned on after the upload opened: the raw provider object is composed
+    // into frames, and only that copy is checked and published.
+    let mut op = CompleteUploadOperation::new(finalize_input());
+    let target = composed_location(Ulid::from_bytes([5u8; 16]));
+    op.upload_record = Some(in_place_record(&op, &target));
+    op.compression = Compression::Zstd { level: 3 };
+    op.state = CompleteUploadState::ComposeBlob;
+
+    let effects = op.step(Event::Blob(BlobEvent::WriteFinished {
+        location: target.clone(),
+    }));
+
+    let [
+        Effect::Blob(BlobEffect::Compose {
+            resolved, parts, ..
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("expected a framed compose, got {effects:?}")
+    };
+    assert_eq!(parts, &vec![target.clone()]);
+    assert_eq!(resolved.compression, Compression::Zstd { level: 3 });
+    assert_eq!(op.composed_location, None);
+
+    let mut framed = composed_location(Ulid::from_bytes([5u8; 16]));
+    framed.ulid = Ulid::from_bytes([8u8; 16]);
+    framed.backend_path = "bucket/framed".to_string();
+    let effects = op.step(Event::Blob(BlobEvent::WriteFinished {
+        location: framed.clone(),
+    }));
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction { .. })]
+    ));
+    assert_eq!(op.composed_location, Some(framed));
+}
+
+#[test]
+fn raw_in_place_object() {
+    // Without compression the provider object is published as it is.
+    let mut op = CompleteUploadOperation::new(finalize_input());
+    let target = composed_location(Ulid::from_bytes([5u8; 16]));
+    op.upload_record = Some(in_place_record(&op, &target));
+    op.state = CompleteUploadState::ComposeBlob;
+
+    let effects = op.step(Event::Blob(BlobEvent::WriteFinished {
+        location: target.clone(),
+    }));
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction { .. })]
+    ));
+    assert_eq!(op.composed_location, Some(target));
+}
+
+#[test]
 fn conflict_keeps_object() {
     // The in-place object is the only copy of its parts, so a refused finalize keeps it.
     let mut op = CompleteUploadOperation::new(finalize_input());

@@ -882,13 +882,20 @@ impl CompleteUploadOperation {
                 parts: self.resolved_parts.clone(),
             })];
         }
-        let pinned = ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone())
-            .with_compression(self.compression);
         let parts = self
             .resolved_parts
             .iter()
             .map(|part| part.location.clone())
             .collect();
+        self.compose_parts(parts)
+    }
+
+    fn compose_parts(&mut self, parts: Vec<BackendLocation>) -> Effects {
+        let Some(upload) = self.upload_record.as_ref() else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        let pinned = ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone())
+            .with_compression(self.compression);
         self.state = CompleteUploadState::ComposeBlob;
         smallvec![Effect::Blob(BlobEffect::Compose {
             bucket: self.input.bucket.clone(),
@@ -910,6 +917,12 @@ impl CompleteUploadOperation {
             Event::Blob(BlobEvent::Error(error)) => return self.schedule_error(error.into()),
             _ => return self.schedule_error(CompleteUploadError::InvalidOperationState),
         };
+        // The provider assembled raw parts, but compression was turned on after the upload
+        // opened: the object is composed into frames. Its target row keeps the raw object for
+        // a retry and discards it once the upload record is gone.
+        if self.compression != Compression::Off && self.in_place_target(&location) {
+            return self.compose_parts(vec![location]);
+        }
         self.composed_location = Some(location.clone());
         self.final_location = None;
 
