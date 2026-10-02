@@ -18,7 +18,7 @@ use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, ResolvedBackend, WriteOwner,
 };
-use aruna_core::structs::storage::format::StoredFormat;
+use aruna_core::structs::storage::format::{Compression, StoredFormat};
 use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};
 use bytes::Bytes;
 use byteview::ByteView;
@@ -150,7 +150,13 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
-        // Only S3 backends have a provider upload; the others keep one blob per part.
+        // Only S3 backends have a provider upload; the others keep one blob per part. A provider
+        // upload assembles the raw parts, so a compressed bucket composes frames from blobs.
+        if resolved.compression != Compression::Off {
+            return BlobEvent::UploadOpened {
+                backend_upload: None,
+            };
+        }
         match self.native_for(&template) {
             Ok(Some(_)) => {}
             Ok(None) => {

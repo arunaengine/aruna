@@ -3392,6 +3392,32 @@ async fn s3_multipart_compose() {
     assert_eq!(read_back(&handler, location).await, b"first-second");
 }
 
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_compressed_upload() {
+    // A provider upload assembles raw parts, so a compressed bucket keeps a blob per part.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+
+    let event = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "framed.bin",
+            cold_backend().with_compression(Compression::Zstd { level: 3 }),
+            test_user_id(),
+        )
+        .await;
+
+    assert!(matches!(
+        event,
+        BlobEvent::UploadOpened {
+            backend_upload: None
+        }
+    ));
+}
+
 async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bool) {
     let key: aruna_core::types::Key = backend_id.to_bytes().to_vec().into();
     let record = GroupStorage {
