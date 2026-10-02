@@ -76,6 +76,8 @@ pub enum UploadPartError {
     MissingBody,
     #[error("body size did not match Content-Length header")]
     IncompleteBody,
+    #[error("a part of this upload needs its Content-Length")]
+    MissingContentLength,
     #[error("missing stored checksum for {0}")]
     MissingExpectedChecksum(&'static str),
     #[error("checksum mismatch for {0}")]
@@ -231,6 +233,10 @@ impl UploadPartOperation {
             return self.emit_error(PolicyGateError::Drift.into());
         }
 
+        // A provider upload takes the part size before the first byte.
+        if record.backend_upload.is_some() && self.input.content_length.is_none() {
+            return self.emit_error(UploadPartError::MissingContentLength);
+        }
         let Some(blob) = self.input.body.take() else {
             return self.emit_error(UploadPartError::MissingBody);
         };
@@ -871,15 +877,14 @@ mod test {
         assert_eq!(resolved.storage_class, record.storage_class);
     }
 
-    #[test]
-    fn in_place_keeps_etag() {
-        // A part streamed into the provider upload records the ETag completion must name.
+    /// An operation about to read the record of an in-place upload, with that record.
+    fn in_place_op(content_length: Option<u64>) -> (UploadPartOperation, MultipartUpload) {
         let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
         let upload = BackendUpload {
             location: op.written_location.take().unwrap(),
             upload_id: "provider-upload".to_string(),
         };
-        op.input.content_length = Some(4);
+        op.input.content_length = content_length;
         op.input.body = Some(BackendStream::new(tokio_util::io::ReaderStream::new(
             &b"part"[..],
         )));
@@ -899,18 +904,47 @@ mod test {
             placement_policies: Vec::new(),
             subject_generation: 0,
             completing_since_ms: None,
-            backend_upload: Some(upload.clone()),
+            backend_upload: Some(upload),
         };
+        (op, record)
+    }
 
-        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+    fn read_record(record: &MultipartUpload) -> Event {
+        Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (
-                    op.input.upload_id.to_bytes().to_vec().into(),
+                    record.upload_id.to_bytes().to_vec().into(),
                     Some(record.to_bytes().unwrap().into()),
                 ),
                 (NODE_SUBJECT_KEY.to_vec().into(), None),
             ],
-        }));
+        })
+    }
+
+    #[test]
+    fn in_place_needs_length() {
+        let (mut op, record) = in_place_op(None);
+
+        let effects = op.step(read_record(&record));
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Blob(_)))
+        );
+        assert_eq!(
+            op.finalize().unwrap_err(),
+            UploadPartError::MissingContentLength
+        );
+    }
+
+    #[test]
+    fn in_place_keeps_etag() {
+        // A part streamed into the provider upload records the ETag completion must name.
+        let (mut op, record) = in_place_op(Some(4));
+        let upload = record.backend_upload.clone().unwrap();
+
+        let effects = op.step(read_record(&record));
         let [
             Effect::Blob(BlobEffect::WritePart {
                 backend_upload,

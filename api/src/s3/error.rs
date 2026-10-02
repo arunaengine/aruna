@@ -349,6 +349,12 @@ impl IntoS3Error for UploadPartError {
                 checksum_mismatch_logged(algorithm, "UploadPart")
             }
             UploadPartError::IncompleteBody => incomplete_body_error(),
+            UploadPartError::MissingContentLength => {
+                s3_error!(
+                    MissingContentLength,
+                    "You must provide the Content-Length HTTP header."
+                )
+            }
             UploadPartError::WriteFailed(message) => write_failed_error(&message, "UploadPart"),
             UploadPartError::PolicyGateError(ref error) => policy_gate_error(error, "UploadPart"),
             UploadPartError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
