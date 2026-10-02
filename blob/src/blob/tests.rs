@@ -3394,6 +3394,52 @@ async fn s3_multipart_compose() {
 
 #[tokio::test]
 #[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_framed_compose() {
+    // Frames do not follow the part boundaries; the composed object still reads back whole.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let upload_id = Ulid::generate();
+    let mib = 1024 * 1024;
+    let payloads = [vec![1u8; 6 * mib], vec![2u8; 6 * mib], b"tail".to_vec()];
+
+    let mut parts = Vec::new();
+    for (index, payload) in payloads.iter().enumerate() {
+        let BlobEvent::WriteFinished { location } = handler
+            .write_blob_part(
+                MultipartPartKey::new(upload_id, index as u16 + 1),
+                cold_backend(),
+                test_user_id(),
+                stream_from_bytes(payload),
+            )
+            .await
+        else {
+            panic!("s3 part write failed")
+        };
+        parts.push(location);
+    }
+
+    let framed = cold_backend().with_compression(Compression::Zstd { level: 3 });
+    let BlobEvent::WriteFinished { location } = handler
+        .compose_blob("bucket", "framed.bin", framed, test_user_id(), parts)
+        .await
+    else {
+        panic!("s3 framed compose failed")
+    };
+
+    let expected = payloads.concat();
+    assert!(matches!(
+        location.format.layout,
+        aruna_core::structs::storage::format::StoredLayout::Frames(_)
+    ));
+    assert_eq!(location.blob_size, expected.len() as u64);
+    assert!(location.stored_size() < mib as u64);
+    assert_eq!(location.hashes, Hasher::new_with_bytes(&expected).to_map());
+    assert_eq!(read_back(&handler, location).await, expected);
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
 async fn s3_compressed_upload() {
     // A provider upload assembles raw parts, so a compressed bucket keeps a blob per part.
     let env = s3_env();

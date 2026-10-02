@@ -102,7 +102,7 @@ async fn open_writer(
 
 /// Writer chunk for a composition. `None` keeps each input part as one S3 part; other kinds
 /// stream in chunks only as large as their provider's part limit requires. Frames do not
-/// follow the input parts, so a framed composition streams in chunks on S3 too.
+/// follow the input parts, so on S3 they stream in chunks sized for its 10,000 part limit.
 pub(super) fn compose_chunk(backend: &Backend, total: u64, framed: bool) -> Option<usize> {
     const MIB: u64 = 1024 * 1024;
     let limit: u64 = match backend {
