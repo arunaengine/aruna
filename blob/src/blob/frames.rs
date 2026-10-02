@@ -20,6 +20,7 @@ use std::io;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 /// Upper bound for the parsed seek tables kept in memory, about 1.6 TiB of framed data.
@@ -64,25 +65,33 @@ impl IndexCache {
     }
 }
 
-/// Random access to the original bytes of a framed copy. Keeps the last decoded
-/// frame, so sequential reads decode each frame once, and fetches the stored bytes
-/// of consecutive frames in one request.
+/// Random access to the original bytes of a framed copy. Fetches the stored bytes of
+/// consecutive frames in one request, decodes them in parallel, and fetches the next batch
+/// of a longer read while the current one is decoded.
 pub(super) struct FrameReader {
     operator: Operator,
     path: String,
     index: Arc<FrameIndex>,
     size: u64,
-    decoded: Option<(u64, Bytes)>,
-    fetched: Option<(Range<u64>, Bytes)>,
+    /// The first frame of the decoded batch, and its frames.
+    decoded: Option<(u64, Vec<Bytes>)>,
+    ahead: Option<(Range<u64>, JoinHandle<Result<Bytes, BlobError>>)>,
     idle: Duration,
 }
 
-/// Walks the frames of one range; `expected` holds the hash a full read must match.
+impl Drop for FrameReader {
+    fn drop(&mut self) {
+        if let Some((_, task)) = self.ahead.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Walks the frames of one range.
 struct FrameCursor {
     reader: FrameReader,
     position: u64,
     end: u64,
-    expected: Option<(blake3::Hasher, [u8; 32])>,
 }
 
 /// Reads one byte range on its own task, so the stream that awaits it stays `Sync`.
@@ -110,38 +119,68 @@ async fn read_range(
 }
 
 impl FrameReader {
+    /// Starts fetching the stored bytes of `frames` on its own task.
+    fn fetch(&self, frames: Range<u64>) -> (Range<u64>, JoinHandle<Result<Bytes, BlobError>>) {
+        let range = self.index.frames_range(&frames);
+        let (operator, path, idle) = (self.operator.clone(), self.path.clone(), self.idle);
+        let task = tokio::spawn(async move {
+            let expected = range.end - range.start;
+            let bytes = read_range(&operator, &path, range, idle).await?;
+            match bytes.len() as u64 == expected {
+                true => Ok(bytes),
+                false => Err(BlobError::ReadError("short frame read".to_string())),
+            }
+        });
+        (frames, task)
+    }
+
     /// The original bytes of one frame; `last` is the last frame the caller still needs.
     async fn frame(&mut self, frame: u64, last: u64) -> Result<Bytes, BlobError> {
-        if let Some((cached, bytes)) = &self.decoded
-            && *cached == frame
+        if let Some((first, frames)) = &self.decoded
+            && let Some(bytes) = frame
+                .checked_sub(*first)
+                .and_then(|at| frames.get(at as usize))
         {
             return Ok(bytes.clone());
         }
-        let range = self.index.frame_range(frame);
-        let stored = match &self.fetched {
-            Some((fetched, bytes)) if fetched.start <= range.start && range.end <= fetched.end => {
-                let start = (range.start - fetched.start) as usize;
-                bytes.slice(start..start + (range.end - range.start) as usize)
-            }
-            _ => {
-                let fetch = self.index.fetch_range(frame, last, FETCH_BYTES);
-                let bytes =
-                    read_range(&self.operator, &self.path, fetch.clone(), self.idle).await?;
-                if bytes.len() as u64 != fetch.end - fetch.start {
-                    return Err(BlobError::ReadError("short frame read".to_string()));
+        let (frames, task) = match self.ahead.take() {
+            Some((frames, task)) if frames.start == frame => (frames, task),
+            other => {
+                if let Some((_, task)) = other {
+                    task.abort();
                 }
-                let stored = bytes.slice(..(range.end - range.start) as usize);
-                self.fetched = Some((fetch, bytes));
-                stored
+                self.fetch(self.index.fetch_frames(frame, last, FETCH_BYTES))
             }
         };
-        let length = codec::frame_len(self.size, frame);
-        let digest = *self.index.digest(frame);
-        let decoded =
-            tokio::task::spawn_blocking(move || codec::decode_frame(length, &digest, stored))
-                .await
-                .map_err(|error| BlobError::ReadError(error.to_string()))??;
-        self.decoded = Some((frame, decoded.clone()));
+        let stored = task
+            .await
+            .map_err(|error| BlobError::ReadError(error.to_string()))??;
+        if frames.end <= last {
+            let next = self.index.fetch_frames(frames.end, last, FETCH_BYTES);
+            self.ahead = Some(self.fetch(next));
+        }
+        let decoded = self.decode(&frames, stored).await?;
+        let bytes = decoded[0].clone();
+        self.decoded = Some((frames.start, decoded));
+        Ok(bytes)
+    }
+
+    /// Checks and decodes each frame of one fetched batch on the blocking pool, in parallel.
+    async fn decode(&self, frames: &Range<u64>, stored: Bytes) -> Result<Vec<Bytes>, BlobError> {
+        let base = self.index.frames_range(frames).start;
+        let tasks = frames.clone().map(|frame| {
+            let range = self.index.frame_range(frame);
+            let bytes = stored.slice((range.start - base) as usize..(range.end - base) as usize);
+            let (length, digest) = (
+                codec::frame_len(self.size, frame),
+                *self.index.digest(frame),
+            );
+            tokio::task::spawn_blocking(move || codec::decode_frame(length, &digest, bytes))
+        });
+        let mut decoded = Vec::new();
+        for task in futures::future::join_all(tasks).await {
+            decoded.push(task.map_err(|error| BlobError::ReadError(error.to_string()))??);
+        }
         Ok(decoded)
     }
 
@@ -213,27 +252,18 @@ impl AsyncSliceReader for SliceReader {
 impl FrameCursor {
     async fn next(&mut self) -> Result<Option<Bytes>, BlobError> {
         if self.position >= self.end {
-            if let Some((hasher, expected)) = self.expected.take()
-                && hasher.finalize().as_bytes() != &expected
-            {
-                return Err(BlobError::IntegrityCheckFailed(
-                    "blake3 hash mismatch".to_string(),
-                ));
-            }
             return Ok(None);
         }
         let piece = self.reader.piece(self.position, self.end).await?;
-        if let Some((hasher, _)) = self.expected.as_mut() {
-            hasher.update(&piece);
-        }
         self.position += piece.len() as u64;
         Ok(Some(piece))
     }
 }
 
 impl BlobHandler {
-    /// Streams the original bytes in `range` of a framed copy. A full read also
-    /// checks the BLAKE3 of the whole object at its end.
+    /// Streams the original bytes in `range` of a framed copy. Every frame is checked
+    /// against its digest in the authenticated seek table before any of its bytes are returned,
+    /// so a full read needs no separate check of the whole object's BLAKE3.
     pub(super) async fn read_frames(
         &self,
         location: &BackendLocation,
@@ -266,23 +296,10 @@ impl BlobHandler {
                 "range is outside the blob".to_string(),
             ));
         }
-        let expected = match (range.start, range.end) {
-            (0, end) if end == size => {
-                let hash = location.get_blake3().ok_or_else(|| {
-                    BlobError::IntegrityCheckFailed("missing stored blake3 hash".to_string())
-                })?;
-                let hash: [u8; 32] = hash.try_into().map_err(|_| {
-                    BlobError::IntegrityCheckFailed("invalid stored blake3 hash".to_string())
-                })?;
-                Some((blake3::Hasher::new(), hash))
-            }
-            _ => None,
-        };
         Ok(FrameCursor {
             reader: self.frame_reader(location, layout).await?,
             position: range.start,
             end: range.end,
-            expected,
         })
     }
 
@@ -305,7 +322,7 @@ impl BlobHandler {
             index,
             size,
             decoded: None,
-            fetched: None,
+            ahead: None,
             idle,
         })
     }
