@@ -215,7 +215,8 @@ impl BlobHandler {
         Ok(Some(state.chain.begin(part_number, attempt)))
     }
 
-    /// Frees the provider part an attempt claimed, once its operation settled.
+    /// Frees the provider part an attempt claimed. A committed attempt keeps its claim, so a
+    /// request admitted before that commit cannot overwrite the acknowledged part later.
     pub(super) fn release_claim(&self, attempt: Ulid) {
         for state in self.chains().values_mut() {
             state.claims.retain(|_, held| *held != attempt);
@@ -637,7 +638,7 @@ struct PartWrite {
 
 impl PartWrite {
     /// Reports whether the upload was aborted while the part streamed. An accepted part keeps
-    /// its claim until its operation commits or rolls back; a failed one frees it now.
+    /// its claim, also after its commit, until its part is deleted; a failed one frees it now.
     async fn settle(mut self, accepted: bool) -> bool {
         self.settled = true;
         if !accepted {

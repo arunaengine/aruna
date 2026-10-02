@@ -3145,7 +3145,7 @@ async fn s3_cancelled_write() {
 
 #[tokio::test]
 async fn claims_one_writer() {
-    // One attempt at a time writes a provider part; a settled attempt frees it.
+    // One attempt at a time writes a provider part, and an acknowledged one keeps it.
     let context = setup_blob_handle(5).await;
     let handler = context.blob_handle.handler.clone();
     let (first, second) = (Ulid::generate(), Ulid::generate());
@@ -3159,8 +3159,16 @@ async fn claims_one_writer() {
         handler.claim_part("upload", 2, second),
         Ok(Some(_))
     ));
-    // The release of the first attempt's reservation is how its operation settles.
+    // A committed attempt keeps its claim; only deleting its part, a rollback, frees it.
     handler.clear_active(first);
+    assert!(matches!(handler.claim_part("upload", 1, second), Ok(None)));
+    let mut part = make_test_location();
+    part.ulid = first;
+    part.partial = true;
+    assert!(matches!(
+        handler.delete_blob(part).await,
+        BlobEvent::DeleteFinished
+    ));
     assert!(matches!(
         handler.claim_part("upload", 1, second),
         Ok(Some(_))

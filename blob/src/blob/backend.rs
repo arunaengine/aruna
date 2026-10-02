@@ -228,8 +228,6 @@ impl BlobHandler {
         if let Ok(mut active) = self.reservation_active.lock() {
             active.remove(&id);
         }
-        // An in-place part settles through its release or rollback delete like any write.
-        self.release_claim(id);
     }
 
     pub(super) fn reservation_active(&self, id: Ulid) -> bool {
