@@ -12,7 +12,8 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE, MANAGED_COPY_KEYSPACE,
     S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
@@ -21,10 +22,10 @@ use aruna_core::structs::storage::blob::{
     ManagedCopyRecord, ResolvedBackend, VersionKey,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
-use aruna_core::structs::storage::format::{Compression, EncodingClass};
+use aruna_core::structs::storage::format::{Compression, CompressionMigration, EncodingClass};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 
 /// Steps of one version migration; errors name the step they stopped in.
@@ -55,7 +56,7 @@ pub enum MigrateState {
 pub enum MigrateOutcome {
     /// The version now names a copy in the target encoding.
     Migrated,
-    /// Nothing to do: already encoded, not materialized, not serveable, or changed meanwhile.
+    /// Nothing to do: already encoded, not materialized, or changed meanwhile.
     Skipped,
 }
 
@@ -357,23 +358,20 @@ impl MigrateVersionOperation {
 
     /// A governed version moves only while its registration names the old copy and may
     /// serve; the placement the gate admitted stays the same, since the backend does not change.
+    /// A copy that cannot serve yet fails, so a retry pass moves it after revalidation.
     fn handle_copy(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected(event);
         };
-        match check_serveable(value.as_ref().map(|value| value.as_ref())) {
-            Ok(copy)
-                if self
-                    .old
-                    .as_ref()
-                    .is_some_and(|old| copy.location.same_object(old)) =>
-            {
-                self.copy = Some(copy);
-                self.read_target()
-            }
-            Err(ManagedCopyError::Conversion(error)) => self.fail(error.into()),
-            _ => self.skip(),
+        let copy = match check_serveable(value.as_ref().map(|value| value.as_ref())) {
+            Ok(copy) => copy,
+            Err(error) => return self.fail(error.into()),
+        };
+        if !(self.old.as_ref()).is_some_and(|old| copy.location.same_object(old)) {
+            return self.fail(ManagedCopyError::Mismatched.into());
         }
+        self.copy = Some(copy);
+        self.read_target()
     }
 
     fn read_target(&mut self) -> Effects {
@@ -586,43 +584,108 @@ impl Operation for MigrateVersionOperation {
     }
 }
 
-/// Versions one task run handles before it yields to other timers.
+/// Versions one task run handles per bucket before it yields to other timers.
 const MIGRATION_PAGE: usize = 64;
+/// Queued buckets one task run advances; the next run continues after the last one.
+const BUCKET_PAGE: usize = 16;
 /// Delay between task runs while a migration still has versions left.
-pub const MIGRATION_CONTINUE: std::time::Duration = std::time::Duration::from_secs(1);
+pub const MIGRATION_CONTINUE: Duration = Duration::from_secs(1);
+/// Passes started again after a pass with failures, before the migration ends with them.
+const MIGRATION_RETRIES: u32 = 10;
+/// Wait before the first retry pass; it doubles per pass up to `RETRY_MAX`.
+const RETRY_BASE: Duration = Duration::from_secs(60);
+const RETRY_MAX: Duration = Duration::from_secs(3600);
 
-/// Advances every unfinished migration by one page. Returns whether work is left.
-pub async fn process_migrations(context: &crate::driver::DriverContext) -> Result<bool, String> {
-    use aruna_core::keyspaces::COMPRESSION_MIGRATION_KEYSPACE;
-    use aruna_core::structs::storage::format::CompressionMigration;
-    let (rows, _) = crate::jobs::store::iter_prefix_page(
+/// What one task run left behind.
+#[derive(Debug, PartialEq)]
+pub struct MigrationRun {
+    /// When the task must run again; `None` once no queued migration has work left.
+    pub next: Option<Duration>,
+    /// Queue key the next run resumes after; `None` starts at the head.
+    pub cursor: Option<Key>,
+}
+
+/// Advances the unfinished migrations of one page of queued buckets by one page each.
+pub async fn process_migrations(
+    context: &crate::driver::DriverContext,
+    after: Option<Key>,
+) -> Result<MigrationRun, String> {
+    let resumed = after.is_some();
+    let (rows, cursor) = crate::jobs::store::iter_prefix_page(
         &context.storage_handle,
-        COMPRESSION_MIGRATION_KEYSPACE,
+        COMPRESSION_QUEUE_KEYSPACE,
         None,
-        None,
-        usize::MAX,
+        after,
+        BUCKET_PAGE,
         None,
     )
     .await?;
-    let mut pending = false;
-    for (key, value) in rows {
-        let record = CompressionMigration::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
+    let now = crate::effect_adapters::routing::now_ms();
+    let mut next = None::<Duration>;
+    let mut soon = |after: Duration| next = Some(next.map_or(after, |next| next.min(after)));
+    for (key, _) in rows {
+        let Some(record) = read_progress(context, &key).await? else {
+            continue;
+        };
         if record.finished_at_ms.is_some() {
             continue;
         }
+        if let Some(at) = record.retry_at_ms.filter(|at| *at > now) {
+            soon(Duration::from_millis(at - now));
+            continue;
+        }
         let bucket = String::from_utf8(key.to_vec()).map_err(|error| error.to_string())?;
-        pending |= migrate_page(context, &bucket, record).await?;
+        if let Some(after) = migrate_page(context, &bucket, record).await? {
+            soon(after);
+        }
     }
-    Ok(pending)
+    // Queued buckets after this page, or before it when the run resumed mid-queue.
+    if cursor.is_some() || resumed {
+        soon(MIGRATION_CONTINUE);
+    }
+    Ok(MigrationRun { next, cursor })
 }
 
-/// Migrates one page of a bucket's versions and stores the progress, unless a
-/// newer setting replaced the record meanwhile.
+async fn read_progress(
+    context: &crate::driver::DriverContext,
+    key: &Key,
+) -> Result<Option<CompressionMigration>, String> {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
+            key: key.clone(),
+            txn_id: None,
+        })
+        .await;
+    match event {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|value| CompressionMigration::from_bytes(value.as_ref()))
+            .transpose()
+            .map_err(|error| error.to_string()),
+        other => Err(format!("could not read migration progress: {other:?}")),
+    }
+}
+
+/// Wait before retry pass `retries + 1`.
+fn retry_delay(retries: u32) -> Duration {
+    RETRY_BASE
+        .saturating_mul(1 << retries.min(16))
+        .min(RETRY_MAX)
+}
+
+/// Migrates one page of a bucket's versions and stores the progress, unless a newer
+/// setting replaced the record meanwhile. Returns when the bucket needs the next run.
 async fn migrate_page(
     context: &crate::driver::DriverContext,
     bucket: &str,
-    mut record: aruna_core::structs::storage::format::CompressionMigration,
-) -> Result<bool, String> {
+    mut record: CompressionMigration,
+) -> Result<Option<Duration>, String> {
+    // A due retry pass counts its own skips and failures.
+    if record.retry_at_ms.take().is_some() {
+        record.skipped = 0;
+        record.failed = 0;
+    }
     let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
     let (versions, next) = crate::jobs::store::iter_prefix_page(
         &context.storage_handle,
@@ -646,21 +709,31 @@ async fn migrate_page(
         }
         record.cursor = Some(key.to_vec());
     }
-    let done = next.is_none();
-    if done {
-        record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
-    }
+    let now = crate::effect_adapters::routing::now_ms();
+    let after = match (next.is_some(), record.failed > 0) {
+        (true, _) => Some(MIGRATION_CONTINUE),
+        // Successful versions are already in the target, so a retry pass reads no blob for them.
+        (false, true) if record.retries < MIGRATION_RETRIES => {
+            let wait = retry_delay(record.retries);
+            record.retries += 1;
+            record.cursor = None;
+            record.retry_at_ms = Some(now.saturating_add(wait.as_millis() as u64));
+            Some(wait)
+        }
+        (false, _) => {
+            record.finished_at_ms = Some(now);
+            None
+        }
+    };
     store_progress(context, bucket, &record).await?;
-    Ok(!done)
+    Ok(after)
 }
 
 async fn store_progress(
     context: &crate::driver::DriverContext,
     bucket: &str,
-    record: &aruna_core::structs::storage::format::CompressionMigration,
+    record: &CompressionMigration,
 ) -> Result<(), String> {
-    use aruna_core::keyspaces::COMPRESSION_MIGRATION_KEYSPACE;
-    use aruna_core::structs::storage::format::CompressionMigration;
     let storage = &context.storage_handle;
     let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
@@ -696,11 +769,21 @@ async fn store_progress(
     storage
         .send_storage_effect(StorageEffect::Write {
             key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
-            key,
+            key: key.clone(),
             value: value.into(),
             txn_id: Some(txn_id),
         })
         .await;
+    // A finished migration leaves the queue together with its last progress.
+    if record.finished_at_ms.is_some() {
+        storage
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: COMPRESSION_QUEUE_KEYSPACE.to_string(),
+                key,
+                txn_id: Some(txn_id),
+            })
+            .await;
+    }
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
@@ -923,6 +1006,44 @@ mod tests {
         let moved = ManagedCopyRecord::from_bytes(value).unwrap();
         assert!(moved.location.same_object(operation.new.as_ref().unwrap()));
         assert_eq!(moved.policies, copy.policies);
+    }
+
+    #[test]
+    fn unserveable_copy_fails() {
+        // A copy waiting for revalidation is a failure, so a later retry pass moves it.
+        let mut operation = operation();
+        let version = raw_version()
+            .with_policies(vec![PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([3; 16]),
+                digest: [4; 32],
+            }])
+            .unwrap();
+        written(&mut operation, &version);
+        operation.step(read_result(Some(bucket(ZSTD))));
+        operation.step(read_result(Some(version.to_bytes().unwrap())));
+
+        operation.step(read_result(None));
+        operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: TxnId::default(),
+        }));
+        operation.step(Event::Blob(BlobEvent::ReservationReleased {
+            id: Ulid::nil(),
+        }));
+
+        assert_eq!(
+            operation.finalize(),
+            Err(MigrateVersionError::ManagedCopy(
+                ManagedCopyError::Unregistered
+            ))
+        );
+    }
+
+    #[test]
+    fn retry_waits_double() {
+        assert_eq!(retry_delay(0), RETRY_BASE);
+        assert_eq!(retry_delay(1), 2 * RETRY_BASE);
+        assert_eq!(retry_delay(6), RETRY_MAX);
+        assert_eq!(retry_delay(u32::MAX), RETRY_MAX);
     }
 
     #[test]

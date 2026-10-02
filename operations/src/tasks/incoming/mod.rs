@@ -191,6 +191,9 @@ pub(crate) struct OperationsTaskHandler {
     // Where a capped reclaim sweep resumes. Loss on restart is fine: the next
     // sweep starts from the head and reaches the tail over the ticks after it.
     reclaim_cursor: std::sync::Mutex<Option<Key>>,
+    // Queued bucket the next migration run resumes after. Loss on restart is fine: the
+    // next run starts at the head of the queue.
+    migration_cursor: std::sync::Mutex<Option<Key>>,
     // Rotation state of the bounded outbox drain. Loss on restart is fine: the
     // next rotation opens at the head.
     rotation: std::sync::Mutex<OutboxRotation>,
@@ -326,6 +329,7 @@ impl OperationsTaskHandler {
             rocrate_limits: RoCrateLimits::default(),
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
             reclaim_cursor: std::sync::Mutex::new(None),
+            migration_cursor: std::sync::Mutex::new(None),
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
             drain_guard: tokio::sync::Mutex::new(()),
             outbox_limits: OutboxLimits::default(),
@@ -789,9 +793,16 @@ impl OperationsTaskHandler {
                 self.drain_blob_reclaim().await;
             }),
             TaskKey::MigrateCompression => Box::pin(async move {
-                let after = match crate::blob::migration::process_migrations(&self.context).await {
-                    Ok(true) => Some(crate::blob::migration::MIGRATION_CONTINUE),
-                    Ok(false) => None,
+                let start = (self.migration_cursor.lock())
+                    .expect("migration cursor mutex poisoned")
+                    .clone();
+                let run = crate::blob::migration::process_migrations(&self.context, start).await;
+                let after = match run {
+                    Ok(run) => {
+                        *(self.migration_cursor.lock()).expect("migration cursor mutex poisoned") =
+                            run.cursor;
+                        run.next
+                    }
                     Err(message) => {
                         warn!(message = %message, "Compression migration run failed");
                         Some(RECLAIM_SWEEP_RETRY)

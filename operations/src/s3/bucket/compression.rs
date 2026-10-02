@@ -7,7 +7,9 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{COMPRESSION_MIGRATION_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
@@ -142,11 +144,11 @@ impl PutCompressionOperation {
             Ok(value) => writes.push((S3_BUCKET_KEYSPACE.to_string(), self.key(), value.into())),
             Err(error) => return self.fail(error.into()),
         }
-        // A change, or a finished run that left failed versions, starts a fresh run; the record
-        // is replaced atomically with the setting. An unfinished run is only woken.
-        let retry = stored
-            .as_ref()
-            .is_some_and(|record| record.finished_at_ms.is_some() && record.failed > 0);
+        // A change, or a run that finished or waits with failed versions, starts a fresh run;
+        // the record is replaced atomically with the setting. A running pass is only woken.
+        let retry = stored.as_ref().is_some_and(|record| {
+            record.failed > 0 && (record.finished_at_ms.is_some() || record.retry_at_ms.is_some())
+        });
         let migration = match previous != self.compression || retry {
             true => {
                 let record = CompressionMigration::new(self.compression, self.now_ms);
@@ -165,6 +167,13 @@ impl PutCompressionOperation {
         self.wake = migration
             .as_ref()
             .is_some_and(|record| record.finished_at_ms.is_none());
+        if self.wake {
+            writes.push((
+                COMPRESSION_QUEUE_KEYSPACE.to_string(),
+                self.key(),
+                Vec::<u8>::new().into(),
+            ));
+        }
         self.output = Some(Ok(migration));
         self.state = PutCompressionState::WriteBucket;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
@@ -403,9 +412,10 @@ mod tests {
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected one batch write, got {effects:?}")
         };
-        let [(_, _, info), (space, _, record)] = writes.as_slice() else {
-            panic!("expected bucket and migration rows, got {writes:?}")
+        let [(_, _, info), (space, _, record), (queue, _, _)] = writes.as_slice() else {
+            panic!("expected bucket, migration and queue rows, got {writes:?}")
         };
+        assert_eq!(queue, COMPRESSION_QUEUE_KEYSPACE);
         assert_eq!(BucketInfo::from_bytes(info).unwrap().compression, zstd);
         assert_eq!(space, COMPRESSION_MIGRATION_KEYSPACE);
         assert_eq!(
@@ -457,7 +467,7 @@ mod tests {
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected one batch write, got {effects:?}")
         };
-        assert_eq!(writes.len(), 2);
+        assert_eq!(writes.len(), 3);
         assert_eq!(commit(&mut operation).len(), 1);
         let fresh = CompressionMigration::new(zstd, 5);
         assert_eq!(operation.finalize(), Ok(Some(fresh)));
@@ -468,7 +478,8 @@ mod tests {
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected one batch write, got {effects:?}")
         };
-        assert_eq!(writes.len(), 1);
+        // The bucket row and the queue entry; the running record stays as it is.
+        assert_eq!(writes.len(), 2);
         assert!(matches!(
             commit(&mut operation).as_slice(),
             [Effect::Task(TaskEffect::ShortenTimer { .. })]

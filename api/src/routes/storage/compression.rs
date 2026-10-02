@@ -63,11 +63,17 @@ pub struct BucketCompressionResponse {
 /// Progress of re-encoding this node's stored versions to the current setting.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct MigrationProgress {
+    /// Versions moved to the current setting over all passes.
     pub migrated: u64,
-    /// Versions that needed no change, could not be served, or changed while they were read.
+    /// Versions the current pass did not need to change.
     pub skipped: u64,
-    /// Versions that failed; sending the same setting again retries them.
+    /// Versions the current or last pass could not move; later passes retry them.
     pub failed: u64,
+    /// Passes started again because the pass before them had failures.
+    pub retries: u32,
+    /// Set while a retry pass waits; it starts at this time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at_ms: Option<u64>,
     pub started_at_ms: u64,
     /// Set once every version was visited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +86,8 @@ impl From<CompressionMigration> for MigrationProgress {
             migrated: migration.migrated,
             skipped: migration.skipped,
             failed: migration.failed,
+            retries: migration.retries,
+            retry_at_ms: migration.retry_at_ms,
             started_at_ms: migration.started_at_ms,
             finished_at_ms: migration.finished_at_ms,
         }
@@ -152,6 +160,7 @@ impl TryFrom<BucketCompressionRequest> for Compression {
                     "migrated": 120,
                     "skipped": 4,
                     "failed": 0,
+                    "retries": 0,
                     "started_at_ms": 1790000000000_u64,
                     "finished_at_ms": 1790000060000_u64
                 }
@@ -214,8 +223,10 @@ pub async fn get_bucket_compression(
 - Objects are stored as 1 MiB frames; a frame that saves less than 1 KiB or 5 percent stays raw.
 - Writes after the change use the new setting. Existing objects on this node are re-encoded in the
   background; buckets on other nodes are not changed.
-- Sending the current setting again resumes an unfinished re-encoding, or restarts one that
-  finished with failed versions. The response reports this node's current progress.
+- Versions that fail are retried automatically in later passes, with a wait that doubles from
+  1 minute up to 1 hour, for up to 10 passes. A migration that still has failures then finishes.
+- Sending the current setting again resumes a running re-encoding, or restarts one that finished
+  or waits with failed versions. The response reports this node's current progress.
 - S3 behavior does not change: sizes, ranges and checksums always refer to the original bytes.
 - Quotas count original bytes; backend capacity counts stored bytes.
 

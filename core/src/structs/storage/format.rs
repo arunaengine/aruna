@@ -138,9 +138,16 @@ pub struct CompressionMigration {
     pub target: Compression,
     /// Last version key handled; the next batch resumes after it.
     pub cursor: Option<Vec<u8>>,
+    /// Versions moved to `target` over all passes.
     pub migrated: u64,
+    /// Versions the current pass did not need to change.
     pub skipped: u64,
+    /// Versions the current or last pass could not move.
     pub failed: u64,
+    /// Passes started again because the pass before them had failures.
+    pub retries: u32,
+    /// Set while a retry pass waits; it starts at this time.
+    pub retry_at_ms: Option<u64>,
     pub started_at_ms: u64,
     pub finished_at_ms: Option<u64>,
 }
@@ -153,6 +160,8 @@ impl CompressionMigration {
             migrated: 0,
             skipped: 0,
             failed: 0,
+            retries: 0,
+            retry_at_ms: None,
             started_at_ms,
             finished_at_ms: None,
         }

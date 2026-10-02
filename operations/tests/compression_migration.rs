@@ -12,7 +12,7 @@ use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    COMPRESSION_MIGRATION_KEYSPACE, TASK_TIMER_KEYSPACE,
+    COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE, TASK_TIMER_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::realm::RealmId;
@@ -172,6 +172,27 @@ async fn content(context: &TestContext, version: &BlobVersion) -> Vec<u8> {
     chunks.concat()
 }
 
+/// One task run from the head of the queue; returns when the task must run again.
+async fn run(context: &TestContext) -> Option<std::time::Duration> {
+    process_migrations(&context.driver, None)
+        .await
+        .unwrap()
+        .next
+}
+
+/// Every stored blob file under the test root.
+fn blob_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        match path.is_dir() {
+            true => files.extend(blob_files(&path)),
+            false => files.push(path),
+        }
+    }
+    files
+}
+
 async fn progress(context: &TestContext) -> CompressionMigration {
     let value = read(
         context,
@@ -204,10 +225,10 @@ async fn migrates_bucket_copies() {
     drive(operation, &context.driver).await.unwrap();
 
     // Each run only reads the stored record, so a second run is what a restart sees.
-    assert!(process_migrations(&context.driver).await.unwrap());
+    assert!(run(&context).await.is_some());
     let partial = progress(&context).await;
     assert!(partial.cursor.is_some() && partial.finished_at_ms.is_none());
-    assert!(!process_migrations(&context.driver).await.unwrap());
+    assert!(run(&context).await.is_none());
     let done = progress(&context).await;
     assert_eq!((done.migrated, done.failed), (72, 0));
     assert!(done.finished_at_ms.is_some());
@@ -244,7 +265,7 @@ async fn migrates_bucket_copies() {
     assert_eq!(outcome.failed, 0);
 
     // A run after completion has nothing left to do.
-    assert!(!process_migrations(&context.driver).await.unwrap());
+    assert!(run(&context).await.is_none());
 }
 
 async fn clear_timers(context: &TestContext) {
@@ -313,4 +334,76 @@ async fn restart_resumes_migration() {
     let encoding = version(&context, "a.txt", version_id).await.location_key();
     assert_eq!(encoding.unwrap().encoding, EncodingClass::Zstd { level: 3 });
     shutdown.token().cancel();
+}
+
+#[tokio::test]
+async fn failed_version_retries() {
+    // A backend fault fails the only version; once it recovers, the waiting retry pass
+    // moves it without anyone sending the setting again.
+    let context = setup_context().await;
+    let data = b"research data ".repeat(10_000);
+    let version_id = put(&context, "a.txt", &data).await;
+    let [file] = blob_files(&context._temp_dir.path().join("blobstore"))
+        .try_into()
+        .unwrap();
+    let hidden = file.with_extension("hidden");
+    std::fs::rename(&file, &hidden).unwrap();
+    let zstd = Compression::Zstd { level: 3 };
+    let operation = PutCompressionOperation::new(BUCKET.to_string(), context.group_id, zstd, 1);
+    drive(operation, &context.driver).await.unwrap();
+
+    let wait = run(&context).await;
+
+    let waiting = progress(&context).await;
+    assert_eq!(wait, Some(std::time::Duration::from_secs(60)));
+    assert_eq!((waiting.failed, waiting.retries), (1, 1));
+    assert!(waiting.retry_at_ms.is_some() && waiting.finished_at_ms.is_none());
+    // Before the retry is due, a run leaves the bucket alone.
+    assert!(run(&context).await.is_some());
+    assert_eq!(progress(&context).await, waiting);
+
+    std::fs::rename(&hidden, &file).unwrap();
+    let due = CompressionMigration {
+        retry_at_ms: Some(0),
+        ..waiting
+    };
+    write(
+        &context,
+        COMPRESSION_MIGRATION_KEYSPACE,
+        BUCKET,
+        &due.to_bytes().unwrap(),
+    )
+    .await;
+    assert!(run(&context).await.is_none());
+
+    let done = progress(&context).await;
+    assert_eq!((done.migrated, done.failed, done.retries), (1, 0, 1));
+    assert!(done.finished_at_ms.is_some() && done.retry_at_ms.is_none());
+    let encoding = version(&context, "a.txt", version_id).await.location_key();
+    assert_eq!(encoding.unwrap().encoding, EncodingClass::Zstd { level: 3 });
+    // The finished migration left the queue, so later runs scan nothing.
+    let queued = read(
+        &context,
+        COMPRESSION_QUEUE_KEYSPACE,
+        BUCKET.as_bytes().to_vec(),
+    )
+    .await;
+    assert!(queued.is_none());
+}
+
+async fn write(context: &TestContext, keyspace: &str, key: &str, value: &[u8]) {
+    let event = context
+        .driver
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: keyspace.to_string(),
+            key: key.as_bytes().to_vec().into(),
+            value: value.to_vec().into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
 }
