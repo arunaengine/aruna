@@ -5,18 +5,20 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::cleanup::schedule_cleanup_effect;
+use crate::blob::managed_copy::{ManagedCopyError, check_serveable, read_effect};
 use crate::blob::records::{blob_location_read, read_version_effect};
 use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
+    S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo, ResolvedBackend,
-    VersionKey,
+    BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo, ManagedCopyKey,
+    ManagedCopyRecord, ResolvedBackend, VersionKey,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
@@ -37,6 +39,7 @@ pub enum MigrateState {
     StartTransaction,
     ReadBucket,
     CheckVersion,
+    CheckCopy,
     ReadTarget,
     WriteRows,
     UpdateUsage,
@@ -52,7 +55,7 @@ pub enum MigrateState {
 pub enum MigrateOutcome {
     /// The version now names a copy in the target encoding.
     Migrated,
-    /// Nothing to do: already encoded, not materialized, governed, or changed meanwhile.
+    /// Nothing to do: already encoded, not materialized, not serveable, or changed meanwhile.
     Skipped,
 }
 
@@ -66,6 +69,8 @@ pub enum MigrateVersionError {
     Blob(#[from] BlobError),
     #[error(transparent)]
     Usage(#[from] UsageUpdateError),
+    #[error(transparent)]
+    ManagedCopy(#[from] ManagedCopyError),
     #[error("the copy in the target encoding disappeared before it was adopted")]
     TargetMissing,
     #[error("the re-encoded copy does not match the original bytes")]
@@ -90,6 +95,8 @@ pub struct MigrateVersionOperation {
     version: Option<BlobVersion>,
     old: Option<BackendLocation>,
     new: Option<BackendLocation>,
+    /// The registration of a governed version, moved to the new copy on commit.
+    copy: Option<ManagedCopyRecord>,
     /// Set when the commit made the new copy the owner of its location row.
     owns_row: bool,
     usage: Option<UsageCounterUpdate>,
@@ -107,6 +114,7 @@ impl MigrateVersionOperation {
             version: None,
             old: None,
             new: None,
+            copy: None,
             owns_row: false,
             usage: None,
             output: None,
@@ -175,12 +183,9 @@ impl MigrateVersionOperation {
             Ok(version) => version,
             Err(error) => return self.fail(error.into()),
         };
-        // Governed versions keep a registered managed copy; they are left alone.
         let wanted = EncodingClass::from(self.target);
         let key = match &version.state {
-            BlobVersionState::Materialized { encoding, .. }
-                if *encoding != wanted && version.placement_policies.is_empty() =>
-            {
+            BlobVersionState::Materialized { encoding, .. } if *encoding != wanted => {
                 version.location_key()
             }
             _ => None,
@@ -336,7 +341,39 @@ impl MigrateVersionOperation {
         if current != self.version {
             return self.skip();
         }
-        self.read_target()
+        let governed = (self.version.as_ref()).is_some_and(|v| !v.placement_policies.is_empty());
+        let Some(old) = self.old.as_ref().filter(|_| governed) else {
+            return self.read_target();
+        };
+        let key = ManagedCopyKey::new(self.version_key.clone(), old.backend.clone());
+        match read_effect(&key, self.txn_id) {
+            Ok(effect) => {
+                self.state = MigrateState::CheckCopy;
+                smallvec![effect]
+            }
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
+    /// A governed version moves only while its registration names the old copy and may
+    /// serve; the placement the gate admitted stays the same, since the backend does not change.
+    fn handle_copy(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected(event);
+        };
+        match check_serveable(value.as_ref().map(|value| value.as_ref())) {
+            Ok(copy)
+                if self
+                    .old
+                    .as_ref()
+                    .is_some_and(|old| copy.location.same_object(old)) =>
+            {
+                self.copy = Some(copy);
+                self.read_target()
+            }
+            Err(ManagedCopyError::Conversion(error)) => self.fail(error.into()),
+            _ => self.skip(),
+        }
     }
 
     fn read_target(&mut self) -> Effects {
@@ -400,6 +437,17 @@ impl MigrateVersionOperation {
         let mut migrated = version.clone();
         if let BlobVersionState::Materialized { encoding, .. } = &mut migrated.state {
             *encoding = published.format.encoding();
+        }
+        if let Some(copy) = self.copy.as_ref() {
+            let copy = ManagedCopyRecord {
+                location: published,
+                ..copy.clone()
+            };
+            writes.push((
+                MANAGED_COPY_KEYSPACE.to_string(),
+                copy.key().to_bytes()?.into(),
+                copy.to_bytes()?.into(),
+            ));
         }
         writes.push((
             BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -500,6 +548,7 @@ impl Operation for MigrateVersionOperation {
             MigrateState::StartTransaction => self.handle_started(event),
             MigrateState::ReadBucket => self.handle_bucket(event),
             MigrateState::CheckVersion => self.handle_check(event),
+            MigrateState::CheckCopy => self.handle_copy(event),
             MigrateState::ReadTarget => self.handle_target(event),
             MigrateState::WriteRows => self.handle_rows(event),
             MigrateState::UpdateUsage => self.handle_usage(event),
@@ -666,7 +715,8 @@ mod tests {
     use super::*;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::checksum::HASH_BLAKE3;
-    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::placement::policy::PlacementPolicyRef;
+    use aruna_core::structs::storage::blob::{BackendRef, ManagedCopyState};
     use aruna_core::structs::storage::format::{FrameLayout, StoredFormat, StoredLayout};
     use std::collections::HashMap;
     use ulid::Ulid;
@@ -832,6 +882,47 @@ mod tests {
         };
         let spaces: Vec<&str> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
         assert_eq!(spaces, [BLOB_VERSIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE]);
+    }
+
+    #[test]
+    fn governed_moves_registration() {
+        // The registration follows the copy in the same transaction as the version.
+        let mut operation = operation();
+        let version = raw_version()
+            .with_policies(vec![PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([3; 16]),
+                digest: [4; 32],
+            }])
+            .unwrap();
+        written(&mut operation, &version);
+        operation.step(read_result(Some(bucket(ZSTD))));
+        let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the registration read, got {effects:?}")
+        };
+        assert_eq!(key_space, MANAGED_COPY_KEYSPACE);
+        let old = operation.old.clone().unwrap();
+        let copy = ManagedCopyRecord::new(
+            operation.version_key.clone(),
+            iroh::SecretKey::from_bytes(&[9; 32]).public(),
+            old,
+            version.placement_policies.clone(),
+            7,
+            ManagedCopyState::Registered,
+        )
+        .unwrap();
+        operation.step(read_result(Some(copy.to_bytes().unwrap())));
+
+        let effects = operation.step(read_result(None));
+
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the row writes, got {effects:?}")
+        };
+        let (space, _, value) = &writes[1];
+        assert_eq!(space, MANAGED_COPY_KEYSPACE);
+        let moved = ManagedCopyRecord::from_bytes(value).unwrap();
+        assert!(moved.location.same_object(operation.new.as_ref().unwrap()));
+        assert_eq!(moved.policies, copy.policies);
     }
 
     #[test]
