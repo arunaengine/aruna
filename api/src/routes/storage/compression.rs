@@ -64,8 +64,9 @@ pub struct BucketCompressionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct MigrationProgress {
     pub migrated: u64,
-    /// Versions that needed no change, were governed, or changed while they were read.
+    /// Versions that needed no change, could not be served, or changed while they were read.
     pub skipped: u64,
+    /// Versions that failed; sending the same setting again retries them.
     pub failed: u64,
     pub started_at_ms: u64,
     /// Set once every version was visited.
@@ -132,10 +133,10 @@ impl TryFrom<BucketCompressionRequest> for Compression {
 **Authentication**: realm bearer token with READ on the bucket.
 
 **Behavior**
-- Node-local read of the replicated bucket record.
+- Node-local read of this node's bucket record.
 - `mode` is `off` or `zstd`; `level` is present only for `zstd`.
-- `migration` reports this node's re-encoding of stored objects after the last change. Other nodes
-  re-encode their own copies and report their own progress.
+- `migration` reports this node's re-encoding of stored objects after the last change. Buckets on
+  other nodes are separate and keep their own setting.
 - S3 clients see no difference: sizes, ranges and checksums always refer to the original bytes."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     responses(
@@ -212,7 +213,9 @@ pub async fn get_bucket_compression(
 **Behavior**
 - Objects are stored as 1 MiB frames; a frame that saves less than 1 KiB or 5 percent stays raw.
 - Writes after the change use the new setting. Existing objects on this node are re-encoded in the
-  background; other nodes re-encode their own copies.
+  background; buckets on other nodes are not changed.
+- Sending the current setting again resumes an unfinished re-encoding, or restarts one that
+  finished with failed versions. The response reports this node's current progress.
 - S3 behavior does not change: sizes, ranges and checksums always refer to the original bytes.
 - Quotas count original bytes; backend capacity counts stored bytes.
 
@@ -254,9 +257,8 @@ pub async fn put_bucket_compression(
         })?
         .group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
-    let started_at_ms = now_ms();
-    let previous = drive(
-        PutCompressionOperation::new(bucket.clone(), group_id, compression, started_at_ms),
+    let migration = drive(
+        PutCompressionOperation::new(bucket.clone(), group_id, compression, now_ms()),
         &state.get_ctx(),
     )
     .await
@@ -269,8 +271,6 @@ pub async fn put_bucket_compression(
         }
         other => ServerError::InternalError(other.to_string()),
     })?;
-    let migration =
-        (previous != compression).then(|| CompressionMigration::new(compression, started_at_ms));
     Ok(Json(BucketCompressionResponse::new(
         bucket,
         compression,

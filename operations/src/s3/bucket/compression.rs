@@ -1,5 +1,6 @@
 //! Changes the compression setting a bucket record carries for later writes. A change also
-//! starts this node's migration of the bucket's stored copies.
+//! starts this node's migration of the bucket's stored copies; the same setting again resumes
+//! an unfinished migration or restarts one that left failed versions.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -21,6 +22,7 @@ enum PutCompressionState {
     Init,
     StartTransaction,
     ReadBucket,
+    ReadMigration,
     WriteBucket,
     CommitTransaction,
     Finish,
@@ -47,17 +49,19 @@ pub enum PutCompressionError {
     },
 }
 
-/// Stores a new compression setting; returns the setting it replaced.
+/// Stores a compression setting; returns this node's migration for it, if one exists.
 #[derive(Debug, PartialEq)]
 pub struct PutCompressionOperation {
     bucket: String,
     group_id: GroupId,
     compression: Compression,
     now_ms: u64,
-    changed: bool,
+    info: Option<BucketInfo>,
+    /// Set when the commit must wake the migration task.
+    wake: bool,
     state: PutCompressionState,
     txn_id: Option<TxnId>,
-    output: Option<Result<Compression, PutCompressionError>>,
+    output: Option<Result<Option<CompressionMigration>, PutCompressionError>>,
 }
 
 impl PutCompressionOperation {
@@ -67,7 +71,8 @@ impl PutCompressionOperation {
             group_id,
             compression,
             now_ms,
-            changed: false,
+            info: None,
+            wake: false,
             state: PutCompressionState::Init,
             txn_id: None,
             output: None,
@@ -89,6 +94,7 @@ impl PutCompressionOperation {
             PutCompressionState::Init => "Init",
             PutCompressionState::StartTransaction => "StartTransaction",
             PutCompressionState::ReadBucket => "ReadBucket",
+            PutCompressionState::ReadMigration => "ReadMigration",
             PutCompressionState::WriteBucket => "WriteBucket",
             PutCompressionState::CommitTransaction => "CommitTransaction",
             PutCompressionState::Finish => "Finish",
@@ -101,36 +107,65 @@ impl PutCompressionOperation {
         })
     }
 
-    fn write_bucket(&mut self, value: Option<Vec<u8>>) -> Effects {
+    fn read_migration(&mut self, value: Option<Vec<u8>>) -> Effects {
         let Some(value) = value else {
             return self.fail(PutCompressionError::NoSuchBucket);
         };
-        let mut info = match BucketInfo::from_bytes(&value) {
+        let info = match BucketInfo::from_bytes(&value) {
             Ok(info) => info,
             Err(error) => return self.fail(error.into()),
         };
         if info.group_id != self.group_id {
             return self.fail(PutCompressionError::GroupMismatch);
         }
+        self.info = Some(info);
+        self.state = PutCompressionState::ReadMigration;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
+            key: self.key(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn write_bucket(&mut self, value: Option<Vec<u8>>) -> Effects {
+        let stored = match value.map(|value| CompressionMigration::from_bytes(&value)) {
+            Some(Ok(record)) => Some(record).filter(|record| record.target == self.compression),
+            Some(Err(error)) => return self.fail(error.into()),
+            None => None,
+        };
+        let Some(mut info) = self.info.take() else {
+            return self.fail(PutCompressionError::NotFinished);
+        };
         let previous = std::mem::replace(&mut info.compression, self.compression);
-        self.changed = previous != self.compression;
         let mut writes = Vec::new();
         match info.to_bytes() {
             Ok(value) => writes.push((S3_BUCKET_KEYSPACE.to_string(), self.key(), value.into())),
             Err(error) => return self.fail(error.into()),
         }
-        // A change restarts this node's migration; the record is replaced atomically with it.
-        if self.changed {
-            match CompressionMigration::new(self.compression, self.now_ms).to_bytes() {
-                Ok(value) => writes.push((
-                    COMPRESSION_MIGRATION_KEYSPACE.to_string(),
-                    self.key(),
-                    value.into(),
-                )),
-                Err(error) => return self.fail(error.into()),
+        // A change, or a finished run that left failed versions, starts a fresh run; the record
+        // is replaced atomically with the setting. An unfinished run is only woken.
+        let retry = stored
+            .as_ref()
+            .is_some_and(|record| record.finished_at_ms.is_some() && record.failed > 0);
+        let migration = match previous != self.compression || retry {
+            true => {
+                let record = CompressionMigration::new(self.compression, self.now_ms);
+                match record.to_bytes() {
+                    Ok(value) => writes.push((
+                        COMPRESSION_MIGRATION_KEYSPACE.to_string(),
+                        self.key(),
+                        value.into(),
+                    )),
+                    Err(error) => return self.fail(error.into()),
+                }
+                Some(record)
             }
-        }
-        self.output = Some(Ok(previous));
+            false => stored,
+        };
+        self.wake = migration
+            .as_ref()
+            .is_some_and(|record| record.finished_at_ms.is_none());
+        self.output = Some(Ok(migration));
         self.state = PutCompressionState::WriteBucket;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
@@ -140,7 +175,7 @@ impl PutCompressionOperation {
 }
 
 impl Operation for PutCompressionOperation {
-    type Output = Compression;
+    type Output = Option<CompressionMigration>;
     type Error = PutCompressionError;
 
     fn start(&mut self) -> Effects {
@@ -175,6 +210,12 @@ impl Operation for PutCompressionOperation {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return self.unexpected("ReadResult", event);
                 };
+                self.read_migration(value.map(|value| value.to_vec()))
+            }
+            PutCompressionState::ReadMigration => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                    return self.unexpected("ReadResult", event);
+                };
                 self.write_bucket(value.map(|value| value.to_vec()))
             }
             PutCompressionState::WriteBucket => {
@@ -193,7 +234,7 @@ impl Operation for PutCompressionOperation {
                 };
                 self.txn_id = None;
                 self.state = PutCompressionState::Finish;
-                match self.changed {
+                match self.wake {
                     true => smallvec![Effect::Task(TaskEffect::ShortenTimer {
                         key: TaskKey::MigrateCompression,
                         after: Duration::ZERO,
@@ -312,13 +353,29 @@ mod tests {
     }
 
     fn read(operation: &mut PutCompressionOperation, info: Option<BucketInfo>) -> Effects {
+        read_with(operation, info, None)
+    }
+
+    /// Answers the bucket read and, once it passed, the migration read.
+    fn read_with(
+        operation: &mut PutCompressionOperation,
+        info: Option<BucketInfo>,
+        migration: Option<CompressionMigration>,
+    ) -> Effects {
         operation.start();
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"b".to_vec().into(),
             value: info.map(|info| info.to_bytes().unwrap().into()),
+        }));
+        if operation.state != PutCompressionState::ReadMigration {
+            return effects;
+        }
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"b".to_vec().into(),
+            value: migration.map(|record| record.to_bytes().unwrap().into()),
         }))
     }
 
@@ -363,7 +420,10 @@ mod tests {
                 ..
             })]
         ));
-        assert_eq!(operation.finalize(), Ok(Compression::Off));
+        assert_eq!(
+            operation.finalize(),
+            Ok(Some(CompressionMigration::new(zstd, 5)))
+        );
     }
 
     #[test]
@@ -378,6 +438,42 @@ mod tests {
         };
         assert_eq!(writes.len(), 1);
         assert!(commit(&mut operation).is_empty());
+        assert_eq!(operation.finalize(), Ok(None));
+    }
+
+    #[test]
+    fn same_setting_retries() {
+        // A finished run with failures restarts; an unfinished run is woken and reported.
+        let zstd = Compression::Zstd { level: 3 };
+        let mut info = bucket(group());
+        info.compression = zstd;
+        let mut failed = CompressionMigration::new(zstd, 1);
+        failed.failed = 2;
+        failed.finished_at_ms = Some(4);
+        let mut operation = PutCompressionOperation::new("b".to_string(), group(), zstd, 5);
+
+        let effects = read_with(&mut operation, Some(info.clone()), Some(failed));
+
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one batch write, got {effects:?}")
+        };
+        assert_eq!(writes.len(), 2);
+        assert_eq!(commit(&mut operation).len(), 1);
+        let fresh = CompressionMigration::new(zstd, 5);
+        assert_eq!(operation.finalize(), Ok(Some(fresh)));
+
+        let running = CompressionMigration::new(zstd, 1);
+        let mut operation = PutCompressionOperation::new("b".to_string(), group(), zstd, 5);
+        let effects = read_with(&mut operation, Some(info), Some(running.clone()));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one batch write, got {effects:?}")
+        };
+        assert_eq!(writes.len(), 1);
+        assert!(matches!(
+            commit(&mut operation).as_slice(),
+            [Effect::Task(TaskEffect::ShortenTimer { .. })]
+        ));
+        assert_eq!(operation.finalize(), Ok(Some(running)));
     }
 
     #[test]
