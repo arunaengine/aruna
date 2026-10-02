@@ -23,6 +23,8 @@ const FOOTER_LEN: u64 = 9;
 const WINDOW_LOG: u32 = 20;
 /// Frames of the largest S3 object (5 TiB). Bounds the tail read before any frame.
 const MAX_FRAMES: u64 = 5 << 20;
+/// Parts of the largest S3 multipart upload; each may end with one short frame.
+const MAX_PARTS: u64 = 10_000;
 /// Largest zstd block; raw frames are cut into blocks of this size.
 const BLOCK_MAX: usize = 128 << 10;
 
@@ -30,15 +32,15 @@ fn frame_count(size: u64) -> u64 {
     size.div_ceil(FRAME_SIZE)
 }
 
-/// Original length of one frame of an object of `size` bytes.
-pub(crate) fn frame_len(size: u64, frame: u64) -> u64 {
-    FRAME_SIZE.min(size - frame * FRAME_SIZE)
+/// Length of the digest frame and seek table that end an object of `frames` frames.
+fn table_len(frames: u64) -> u64 {
+    2 * HEADER_LEN + frames * (DIGEST_LEN + ENTRY_LEN) + FOOTER_LEN
 }
 
-/// Length of the digest frame and seek table that end the stored object.
-fn table_len(size: u64) -> u64 {
-    let frames = frame_count(size);
-    2 * HEADER_LEN + frames * (DIGEST_LEN + ENTRY_LEN) + FOOTER_LEN
+/// Whether `frames` frames of at most 1 MiB, with one short frame per part, can hold `size`.
+fn plausible_frames(size: u64, frames: u64) -> bool {
+    let least = frame_count(size);
+    frames <= MAX_FRAMES && frames >= least && frames <= (least + MAX_PARTS).min(size)
 }
 
 fn integrity(message: &str) -> BlobError {
@@ -106,6 +108,9 @@ impl FrameWriter {
     pub(crate) fn push(&mut self, original: usize, stored: &[u8]) -> Result<(), BlobError> {
         let too_large = || BlobError::WriteError("frame is too large".to_string());
         let len = u32::try_from(stored.len()).map_err(|_| too_large())?;
+        if original == 0 || original as u64 > FRAME_SIZE {
+            return Err(too_large());
+        }
         let original = u32::try_from(original).map_err(|_| too_large())?;
         if u64::from(self.frames) >= MAX_FRAMES {
             return Err(BlobError::WriteError(
@@ -127,7 +132,7 @@ impl FrameWriter {
         let frame_size =
             u32::try_from(self.entries.len() as u64 + FOOTER_LEN).map_err(too_large)?;
         let digest_size = u32::try_from(self.digests.len()).map_err(too_large)?;
-        let mut table = Vec::with_capacity(table_len(u64::from(self.frames) * FRAME_SIZE) as usize);
+        let mut table = Vec::with_capacity(table_len(u64::from(self.frames)) as usize);
         table.extend_from_slice(&DIGEST_MAGIC.to_le_bytes());
         table.extend_from_slice(&digest_size.to_le_bytes());
         table.extend_from_slice(&self.digests);
@@ -139,6 +144,7 @@ impl FrameWriter {
         table.extend_from_slice(&SEEKABLE_MAGIC.to_le_bytes());
         let layout = FrameLayout {
             level: self.level,
+            frames: self.frames,
             stored_size: self.stored + table.len() as u64,
             index_hash: *blake3::hash(&table).as_bytes(),
         };
@@ -196,30 +202,34 @@ impl FrameEncoder {
 
 /// Byte range of the digests and seek table, checked against the record before any read.
 pub(crate) fn table_range(size: u64, layout: &FrameLayout) -> Result<Range<u64>, BlobError> {
-    if frame_count(size) > MAX_FRAMES {
-        return Err(integrity("object has too many frames"));
+    let frames = u64::from(layout.frames);
+    if !plausible_frames(size, frames) {
+        return Err(integrity("frame count does not fit the object size"));
     }
-    let len = table_len(size);
+    let len = table_len(frames);
     if layout.stored_size < len {
         return Err(integrity("stored size is too small for the seek table"));
     }
     Ok(layout.stored_size - len..layout.stored_size)
 }
 
-/// The checked seek table: where each frame starts in the stored object and its BLAKE3.
+/// The checked seek table: where each frame starts in the stored object and in the original
+/// bytes, and its BLAKE3.
 #[derive(Debug)]
 pub(crate) struct FrameIndex {
     size: u64,
-    /// One start per frame, then the end of the last frame.
+    /// One stored start per frame, then the end of the last frame.
     offsets: Vec<u64>,
+    /// One original start per frame, then the object size.
+    starts: Vec<u64>,
     digests: Vec<[u8; 32]>,
 }
 
 impl FrameIndex {
     /// Verifies the table hash before using any value, then checks every frame bound.
     pub(crate) fn parse(size: u64, layout: &FrameLayout, tail: &[u8]) -> Result<Self, BlobError> {
-        let frames = frame_count(size);
-        if frames > MAX_FRAMES || tail.len() as u64 != table_len(size) {
+        let frames = u64::from(layout.frames);
+        if !plausible_frames(size, frames) || tail.len() as u64 != table_len(frames) {
             return Err(integrity("seek table has the wrong length"));
         }
         if blake3::hash(tail).as_bytes() != &layout.index_hash {
@@ -248,30 +258,44 @@ impl FrameIndex {
         let bound = zstd::zstd_safe::compress_bound(FRAME_SIZE as usize) as u64;
         let entries = &table[HEADER_LEN as usize..footer];
         let mut offsets = Vec::with_capacity(frames as usize + 1);
-        let mut start = 0u64;
-        for (frame, entry) in entries
-            .as_chunks::<{ ENTRY_LEN as usize }>()
-            .0
-            .iter()
-            .enumerate()
-        {
+        let mut starts = Vec::with_capacity(frames as usize + 1);
+        let (mut start, mut position) = (0u64, 0u64);
+        for entry in entries.as_chunks::<{ ENTRY_LEN as usize }>().0 {
             let stored = u64::from(read_u32(entry, 0));
             let original = u64::from(read_u32(entry, 4));
-            if stored == 0 || stored > bound || original != frame_len(size, frame as u64) {
+            if stored == 0 || stored > bound || original == 0 || original > FRAME_SIZE {
                 return Err(integrity("seek table entry is invalid"));
             }
             offsets.push(start);
+            starts.push(position);
             start += stored;
+            position += original;
         }
         offsets.push(start);
-        if start + tail.len() as u64 != layout.stored_size {
+        starts.push(position);
+        if start + tail.len() as u64 != layout.stored_size || position != size {
             return Err(integrity("frames do not fill the stored object"));
         }
         Ok(Self {
             size,
             offsets,
+            starts,
             digests,
         })
+    }
+
+    /// The frame that holds original byte `position`, which must be below the object size.
+    pub(crate) fn frame_at(&self, position: u64) -> u64 {
+        (self.starts.partition_point(|start| *start <= position) - 1) as u64
+    }
+
+    /// Original byte range of one frame.
+    pub(crate) fn original_range(&self, frame: u64) -> Range<u64> {
+        self.starts[frame as usize]..self.starts[frame as usize + 1]
+    }
+
+    pub(crate) fn original_len(&self, frame: u64) -> u64 {
+        self.starts[frame as usize + 1] - self.starts[frame as usize]
     }
 
     /// Stored byte range of one frame.
@@ -306,7 +330,7 @@ impl FrameIndex {
 
     /// Bytes the parsed table holds in memory.
     pub(crate) fn memory(&self) -> usize {
-        self.offsets.len() * size_of::<u64>() + self.digests.len() * DIGEST_LEN as usize
+        2 * self.offsets.len() * size_of::<u64>() + self.digests.len() * DIGEST_LEN as usize
     }
 }
 
@@ -392,13 +416,13 @@ mod tests {
         let mut out = Vec::new();
         let mut position = range.start;
         while position < range.end {
-            let frame = position / FRAME_SIZE;
+            let frame = index.frame_at(position);
             let bytes = index.frame_range(frame);
             let bytes = &stored[bytes.start as usize..bytes.end as usize];
-            let length = frame_len(size, frame);
+            let length = index.original_len(frame);
             let digest = index.digest(frame);
             let decoded = decode_frame(length, digest, Bytes::copy_from_slice(bytes))?;
-            let frame_start = frame * FRAME_SIZE;
+            let frame_start = index.original_range(frame).start;
             let to = (range.end - frame_start).min(length);
             out.extend_from_slice(&decoded[(position - frame_start) as usize..to as usize]);
             position = frame_start + to;
@@ -507,6 +531,7 @@ mod tests {
         // A record claiming more frames than the format allows is refused before any read.
         let layout = FrameLayout {
             level: 3,
+            frames: u32::MAX,
             stored_size: u64::MAX,
             index_hash: [0; 32],
         };
@@ -535,6 +560,46 @@ mod tests {
             let result = decode(&tampered, &layout, size, 0..10);
             assert!(matches!(result, Err(BlobError::IntegrityCheckFailed(_))));
         }
+    }
+
+    #[test]
+    fn short_frames_inside() {
+        // Two parts framed on their own: each ends with a short frame.
+        let data = random(3 * FRAME_SIZE as usize, 4);
+        let cuts = [FRAME_SIZE as usize, 300_000, FRAME_SIZE as usize, 5];
+        let mut writer = FrameWriter::new(3);
+        let mut stored = Vec::new();
+        let mut at = 0;
+        for cut in cuts {
+            let frame = encode_frame(Bytes::copy_from_slice(&data[at..at + cut]), 3).unwrap();
+            writer.push(cut, &frame).unwrap();
+            stored.extend_from_slice(&frame);
+            at += cut;
+        }
+        let (table, layout) = writer.finish().unwrap();
+        stored.extend(table);
+        let size = at as u64;
+        let ranges = [
+            0..size,
+            FRAME_SIZE - 3..FRAME_SIZE + 300_003,
+            size - 6..size,
+        ];
+
+        for range in ranges {
+            let expected = &data[range.start as usize..range.end as usize];
+            assert_eq!(decode(&stored, &layout, size, range).unwrap(), expected);
+        }
+        // A count that does not fit the size is refused before any read.
+        let mut wrong = layout.clone();
+        wrong.frames = 1;
+        assert!(table_range(size, &wrong).is_err());
+        // Frames are never empty and never longer than 1 MiB.
+        assert!(FrameWriter::new(3).push(0, b"x").is_err());
+        assert!(
+            FrameWriter::new(3)
+                .push(FRAME_SIZE as usize + 1, b"x")
+                .is_err()
+        );
     }
 
     #[test]

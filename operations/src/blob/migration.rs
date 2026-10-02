@@ -811,6 +811,7 @@ mod tests {
         if framed {
             format.layout = StoredLayout::Frames(Box::new(FrameLayout {
                 level: 3,
+                frames: 1,
                 stored_size: 20,
                 index_hash: [0; 32],
             }));

@@ -5,7 +5,7 @@
 
 use super::BlobHandler;
 use crate::bao_tree::OpenDalReader;
-use crate::codec::{self, FRAME_SIZE, FrameIndex};
+use crate::codec::{self, FrameIndex};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::BackendStream;
@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-/// Upper bound for the parsed seek tables kept in memory, about 1.6 TiB of framed data.
+/// Upper bound for the parsed seek tables kept in memory, about 1.3 TiB of framed data.
 const INDEX_CACHE_BYTES: usize = 64 << 20;
 /// Stored bytes one backend request fetches for consecutive frames of a range.
 const FETCH_BYTES: u64 = 8 << 20;
@@ -174,10 +174,7 @@ impl FrameReader {
         let tasks = frames.clone().map(|frame| {
             let range = self.index.frame_range(frame);
             let bytes = stored.slice((range.start - base) as usize..(range.end - base) as usize);
-            let (length, digest) = (
-                codec::frame_len(self.size, frame),
-                *self.index.digest(frame),
-            );
+            let (length, digest) = (self.index.original_len(frame), *self.index.digest(frame));
             tokio::task::spawn_blocking(move || codec::decode_frame(length, &digest, bytes))
         });
         let mut decoded = Vec::new();
@@ -189,9 +186,9 @@ impl FrameReader {
 
     /// Original bytes from `start`, up to `end` and the end of that frame.
     async fn piece(&mut self, start: u64, end: u64) -> Result<Bytes, BlobError> {
-        let frame = start / FRAME_SIZE;
-        let decoded = self.frame(frame, (end - 1) / FRAME_SIZE).await?;
-        let frame_start = frame * FRAME_SIZE;
+        let frame = self.index.frame_at(start);
+        let decoded = self.frame(frame, self.index.frame_at(end - 1)).await?;
+        let frame_start = self.index.original_range(frame).start;
         let to = (end - frame_start).min(decoded.len() as u64);
         Ok(decoded.slice((start - frame_start) as usize..to as usize))
     }

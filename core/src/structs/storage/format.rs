@@ -29,6 +29,8 @@ pub enum StoredLayout {
 pub struct FrameLayout {
     /// The zstd level the frames were written with.
     pub level: u8,
+    /// Frames are at most 1 MiB; a multipart part may end with a shorter one.
+    pub frames: u32,
     pub stored_size: u64,
     pub index_hash: [u8; 32],
 }

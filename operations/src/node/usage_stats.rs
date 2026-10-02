@@ -1809,6 +1809,7 @@ mod tests {
         framed.hashes.insert("blake3".to_string(), vec![2u8; 32]);
         framed.format.layout = StoredLayout::Frames(Box::new(FrameLayout {
             level: 3,
+            frames: 1,
             stored_size: 40,
             index_hash: [0u8; 32],
         }));
