@@ -36,7 +36,8 @@ use crate::s3::checksum::{
 use crate::s3::cors::{map_bucket_cors, parse_bucket_cors};
 use crate::s3::error::{IntoS3Error, gate_context_error, routing_inputs_error};
 use crate::s3::multipart_join::{
-    CompletionFailure, CompletionRegistry, await_completion, completion_registry,
+    CompletionFailure, CompletionRegistry, CompletionRequest, await_completion,
+    completion_registry, conflicting_completion,
 };
 use crate::s3::scope::SubpathScope;
 use crate::s3::server::DeleteObjectsBody;
@@ -1318,6 +1319,15 @@ impl S3 for ArunaS3Service {
         let gate = gate_context(&self.state, self.realm_id, now_ms())
             .await
             .map_err(gate_context_error)?;
+        let checksum_type = parse_checksum_type(&checksum_request.checksum_type);
+        let object_size = req.input.mpu_object_size.map(checked_size).transpose()?;
+        let request = CompletionRequest::new(
+            &completed_parts,
+            &checksum_request.expected,
+            checksum_type,
+            checksum_request.checksum_type_declared,
+            object_size,
+        );
         let mut operation = CompleteUploadOperation::new(CMUI {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
@@ -1327,9 +1337,9 @@ impl S3 for ArunaS3Service {
             completed_parts,
             expected_checksums: checksum_request.expected.clone(),
             checksum_algorithm: checksum_request.response_algorithm,
-            checksum_type: parse_checksum_type(&checksum_request.checksum_type),
+            checksum_type,
             checksum_type_explicit: checksum_request.checksum_type_declared,
-            object_size: req.input.mpu_object_size.map(checked_size).transpose()?,
+            object_size,
             created_by: user_access.user_identity,
             quota_ceiling,
             now_ms: now_ms(),
@@ -1365,10 +1375,14 @@ impl S3 for ArunaS3Service {
             };
             Arc::new(outcome)
         };
-        let joined = self.completions.join(
+        // A request may only join or replay the completion of exactly what it asks for.
+        let Ok(joined) = self.completions.join_as(
             (req.input.bucket.clone(), req.input.key.clone(), upload_id),
+            request,
             work.instrument(tracing::Span::current()),
-        );
+        ) else {
+            return Err(conflicting_completion());
+        };
 
         match await_completion(joined).await.as_ref() {
             Ok(result) => Ok(self.complete_upload_response(

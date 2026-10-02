@@ -19,18 +19,40 @@ pub struct Joined<V> {
 
 pub type JoinWatch<V> = watch::Receiver<Option<Joined<V>>>;
 
+/// Each key is owned by the request that started its work, named by an identity of type `I`.
 #[derive(Debug)]
-pub struct JoinRegistry<K, V> {
+pub struct JoinRegistry<K, V, I = ()> {
     retention: Duration,
     /// Decides which finished values stay joinable; `None` keeps every value.
     retain_if: Option<fn(&V) -> bool>,
-    entries: Mutex<HashMap<K, JoinWatch<V>>>,
+    entries: Mutex<HashMap<K, (I, JoinWatch<V>)>>,
 }
+
+/// Another request owns the key: joining would hand it a value computed for that request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JoinConflict;
 
 impl<K, V> JoinRegistry<K, V>
 where
     K: Eq + Hash,
     V: Clone + Send + Sync + 'static,
+{
+    /// Joins the work already running for `key`, or spawns `work` for it.
+    pub fn join<F>(&self, key: K, work: F) -> JoinWatch<V>
+    where
+        F: Future<Output = V> + Send + 'static,
+    {
+        match self.join_as(key, (), work) {
+            Ok(watch) | Err((_, watch)) => watch,
+        }
+    }
+}
+
+impl<K, V, I> JoinRegistry<K, V, I>
+where
+    K: Eq + Hash,
+    V: Clone + Send + Sync + 'static,
+    I: Eq,
 {
     /// A finished value stays joinable for `retention` after it arrived.
     pub fn new(retention: Duration) -> Self {
@@ -49,17 +71,22 @@ where
         self
     }
 
-    /// Joins the work already running for `key`, or spawns `work` for it. The
-    /// work is detached, so dropping the returned watch never cancels it. Work
-    /// that ended without a value, such as by panicking, is not joined again.
-    pub fn join<F>(&self, key: K, work: F) -> JoinWatch<V>
+    /// Joins the work `identity` started for `key`, or spawns detached `work`. Work that ended
+    /// without a value is not joined again; another identity's running or retained work is a
+    /// conflict, returned beside it.
+    pub fn join_as<F>(
+        &self,
+        key: K,
+        identity: I,
+        work: F,
+    ) -> Result<JoinWatch<V>, (JoinConflict, JoinWatch<V>)>
     where
         F: Future<Output = V> + Send + 'static,
     {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let retention = self.retention;
         let retain_if = self.retain_if;
-        entries.retain(|_, watch| {
+        entries.retain(|_, (_, watch)| {
             // Read closed first, so a value sent just before the producer ended is seen.
             // An ended producer without a value failed, so its key must start fresh work.
             let ended = watch.has_changed().is_err();
@@ -68,11 +95,14 @@ where
                     && retain_if.is_none_or(|keep| keep(&joined.value))
             })
         });
-        if let Some(watch) = entries.get(&key) {
-            return watch.clone();
+        if let Some((owner, watch)) = entries.get(&key) {
+            return match *owner == identity {
+                true => Ok(watch.clone()),
+                false => Err((JoinConflict, watch.clone())),
+            };
         }
         let (sender, receiver) = watch::channel(None);
-        entries.insert(key, receiver.clone());
+        entries.insert(key, (identity, receiver.clone()));
         tokio::spawn(async move {
             let value = work.await;
             let _ = sender.send(Some(Joined {
@@ -80,7 +110,7 @@ where
                 value,
             }));
         });
-        receiver
+        Ok(receiver)
     }
 }
 
@@ -132,6 +162,30 @@ mod tests {
         assert_eq!(await_joined(first).await, Some("first"));
         assert_eq!(await_joined(second).await, Some("first"));
         assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    // Another identity neither joins the running work nor replays its retained value.
+    #[tokio::test(start_paused = true)]
+    async fn refuses_other_identity() {
+        let registry: JoinRegistry<&str, &str, u8> = JoinRegistry::new(RETENTION);
+        let (gate, blocked) = tokio::sync::oneshot::channel();
+        let first = registry
+            .join_as("key", 1, async move {
+                let _ = blocked.await;
+                "first"
+            })
+            .unwrap();
+
+        assert!(registry.join_as("key", 2, async { "second" }).is_err());
+        let same = registry.join_as("key", 1, async { "again" }).unwrap();
+        let _ = gate.send(());
+        assert_eq!(await_joined(first).await, Some("first"));
+        assert_eq!(await_joined(same).await, Some("first"));
+        assert!(registry.join_as("key", 2, async { "second" }).is_err());
+
+        tokio::time::advance(RETENTION).await;
+        let fresh = registry.join_as("key", 2, async { "second" }).unwrap();
+        assert_eq!(await_joined(fresh).await, Some("second"));
     }
 
     // A caller inside the retention window gets the finished value; one after
