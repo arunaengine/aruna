@@ -92,6 +92,11 @@ jobs:
       LLVM_PROFILE_FILE: cargo-test-%m.profraw
       # Instrumented frames are larger, so deep async tests overflow the 2 MiB default.
       RUST_MIN_STACK: 8388608
+      # The MinIO endpoint of the S3 backend tests, as in the tests workflow.
+      ARUNA_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      ARUNA_TEST_S3_ACCESS_KEY: aruna-test
+      ARUNA_TEST_S3_SECRET_KEY: aruna-test-secret
+      ARUNA_TEST_S3_REGION: us-east-1
 
     steps:
       - name: Check out repository
@@ -121,6 +126,24 @@ jobs:
         with:
           name: coverage-archive
 
+      # S3 multipart code only runs against a real S3 endpoint, so it is measured here too.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=aruna-test \
+            -e MINIO_ROOT_PASSWORD=aruna-test-secret \
+            cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1 \
+            server /data
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO did not become ready" >&2
+          docker logs minio >&2 || true
+          exit 1
+
       # Shows whether the coverage export stays within memory at four threads.
       - name: Sample memory use
         run: nohup sh -c 'while sleep 5; do printf "%s " "$(date +%T)"; free -m | sed -n 2p; done' > memory.log 2>&1 &
@@ -140,6 +163,14 @@ jobs:
           exec cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
           -E "binary(git_native)"'
+
+      # The S3 backend cases of the tests workflow, split across the shards like the Git tests.
+      - name: Run instrumented S3 backend tests
+        run: >-
+          cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
+          -E '(package(aruna-blob) & kind(lib) & test(/^blob::tests::s3_/))
+          | (package(aruna-operations) & binary(multipart) & test(/^s3_/))'
 
       - name: Collect coverage
         # LLVM exports use Rayon's pool, independently of grcov's parser threads;
