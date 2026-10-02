@@ -2018,6 +2018,7 @@ mod decision_tests {
             placement_policies: Vec::new(),
             subject_generation: 0,
             completing_since_ms: None,
+            backend_upload: None,
         }
     }
 

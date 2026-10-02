@@ -77,6 +77,16 @@ pub struct MultipartUpload {
     /// When the current completion attempt claimed the record, in epoch ms.
     /// Only meaningful while the status is `Completing`.
     pub completing_since_ms: Option<u64>,
+    /// The provider upload an S3 backend streams the parts into; `None` keeps one blob per part.
+    pub backend_upload: Option<BackendUpload>,
+}
+
+/// A provider's own multipart upload, written in place so completion copies no byte.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BackendUpload {
+    /// Where the completed object lands. It holds no object until completion.
+    pub location: BackendLocation,
+    pub upload_id: String,
 }
 
 impl MultipartUpload {
@@ -161,6 +171,8 @@ pub struct MultipartPart {
     pub part_number: u16,
     pub location: BackendLocation,
     pub created_at: SystemTime,
+    /// The provider's ETag of an in-place part, which completion must name.
+    pub backend_etag: Option<String>,
 }
 
 impl MultipartPart {

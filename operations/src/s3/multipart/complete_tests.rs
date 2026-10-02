@@ -77,6 +77,7 @@ fn open_upload_record(input: &CompleteUploadInput) -> MultipartUpload {
         placement_policies: Vec::new(),
         subject_generation: 0,
         completing_since_ms: None,
+        backend_upload: None,
     }
 }
 
@@ -100,6 +101,7 @@ fn part_record(part_number: u16, blob_size: u64) -> MultipartPart {
             hashes: HashMap::new(),
         },
         created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000180),
+        backend_etag: None,
     }
 }
 

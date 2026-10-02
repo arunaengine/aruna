@@ -512,6 +512,7 @@ impl UploadPartOperation {
             part_number: self.input.part_number,
             location,
             created_at: SystemTime::now(),
+            backend_etag: None,
         };
         let key =
             match MultipartPartKey::new(self.input.upload_id, self.input.part_number).to_bytes() {
@@ -838,6 +839,7 @@ mod test {
             placement_policies: Vec::new(),
             subject_generation: 0,
             completing_since_ms: None,
+            backend_upload: None,
         };
 
         let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {

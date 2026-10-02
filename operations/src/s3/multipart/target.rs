@@ -80,6 +80,7 @@ mod pure_tests {
             placement_policies: Vec::new(),
             subject_generation: 0,
             completing_since_ms: since,
+            backend_upload: None,
         }
     }
 

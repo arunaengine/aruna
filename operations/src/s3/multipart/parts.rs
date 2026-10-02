@@ -339,6 +339,7 @@ mod test {
             placement_policies: Vec::new(),
             subject_generation: 0,
             completing_since_ms: None,
+            backend_upload: None,
         }
     }
 
@@ -358,6 +359,7 @@ mod test {
             part_number,
             location: part_location(),
             created_at: SystemTime::UNIX_EPOCH,
+            backend_etag: None,
         };
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {

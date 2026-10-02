@@ -351,6 +351,7 @@ pub struct BackendLocation {
     pub created_by: UserId,
     pub created_at: SystemTime,
     pub staging: bool,
+    /// One part of an unfinished provider multipart upload: never an object of its own.
     pub partial: bool,
     pub blob_size: u64,
     pub hashes: HashMap<String, Vec<u8>>,

@@ -288,6 +288,7 @@ impl CreateMultipartOperation {
             placement_policies: self.stored_policies.clone(),
             subject_generation: self.stored_subject,
             completing_since_ms: None,
+            backend_upload: None,
         };
         let value = match record.to_bytes() {
             Ok(value) => value,

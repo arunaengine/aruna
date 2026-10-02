@@ -1694,6 +1694,7 @@ mod tests {
             placement_policies: Vec::new(),
             subject_generation: 0,
             completing_since_ms: None,
+            backend_upload: None,
         };
 
         let decoded = decode_entry(
@@ -1737,6 +1738,7 @@ mod tests {
                 hashes: HashMap::from([("md5".to_string(), vec![1_u8; 16])]),
             },
             created_at: SystemTime::UNIX_EPOCH,
+            backend_etag: None,
         };
 
         let decoded = decode_entry(
