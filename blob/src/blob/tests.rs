@@ -11,7 +11,7 @@ use super::{
     control_plane::{parse_replication_init, validate_init_ack, with_timeout},
 };
 use crate::messages::{MessageType, ReplicationMessage};
-use crate::s3::make_bucket;
+use crate::s3::{NativeMultipart, create_s3_client, make_bucket};
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
@@ -2659,6 +2659,88 @@ async fn s3_roundtrip_range() {
         other => panic!("unexpected read event {other:?}"),
     };
     assert!(gone, "deleted object must not be readable");
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_native_multipart() {
+    // Parts sent out of order, one left out, assemble exactly as listed.
+    let env = s3_env();
+    let bucket = unique_name("native-");
+    let config = s3_config(&env, None);
+    make_bucket(&bucket, &config).await.unwrap();
+    let native = NativeMultipart::from_config(&config, &bucket, "/", None).unwrap();
+    let path = "parts/object.bin";
+    let upload_id = native.create(path).await.unwrap();
+    let mib = 1024 * 1024;
+    let first = vec![1u8; 5 * mib];
+    let unused = vec![2u8; 5 * mib];
+    let last = b"tail".to_vec();
+    let mut etags = HashMap::new();
+    for (number, payload) in [(3u16, &last), (2, &unused), (1, &first)] {
+        let etag = native
+            .upload_part(
+                path,
+                &upload_id,
+                number,
+                payload.len() as u64,
+                stream_from_bytes(payload),
+            )
+            .await
+            .unwrap();
+        etags.insert(number, etag);
+    }
+
+    native
+        .complete(
+            path,
+            &upload_id,
+            &[(1, etags[&1].clone()), (3, etags[&3].clone())],
+        )
+        .await
+        .unwrap();
+
+    let client = create_s3_client(
+        &env.endpoint,
+        Some(env.region.clone()),
+        &env.access_key,
+        &env.secret_key,
+        true,
+    )
+    .await
+    .unwrap();
+    let object = client
+        .get_object()
+        .bucket(&bucket)
+        .key(path)
+        .send()
+        .await
+        .unwrap();
+    let body = object.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), [first, last].concat().as_slice());
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_abort_path() {
+    // Every unfinished upload of the exact path is aborted, a longer key is left alone.
+    let env = s3_env();
+    let bucket = unique_name("abort-");
+    let config = s3_config(&env, None);
+    make_bucket(&bucket, &config).await.unwrap();
+    let native = NativeMultipart::from_config(&config, &bucket, "/root", None).unwrap();
+    native.create("blob").await.unwrap();
+    let kept = native.create("blob").await.unwrap();
+    native
+        .upload_part("blob", &kept, 1, 4, stream_from_bytes(b"part"))
+        .await
+        .unwrap();
+    native.create("blob-other").await.unwrap();
+
+    assert_eq!(native.abort_path("blob").await.unwrap(), 2);
+    assert_eq!(native.abort_path("blob").await.unwrap(), 0);
+    assert_eq!(native.abort_path("blob-other").await.unwrap(), 1);
+    native.abort("blob", &kept).await.unwrap();
 }
 
 #[tokio::test]

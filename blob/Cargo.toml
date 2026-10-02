@@ -18,6 +18,8 @@ aruna-storage = { workspace = true }
 async-trait = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+aws-smithy-http-client = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
 bao-tree = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
@@ -28,6 +30,7 @@ chrono = { workspace = true }
 crc-fast = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
 iroh-io = { workspace = true }
 md5 = { workspace = true }
 opendal = { workspace = true }

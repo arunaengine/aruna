@@ -5,6 +5,9 @@
 
 use crate::error::BlobLibError;
 use aruna_core::egress::{EgressError, EgressPolicy};
+use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
+use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns, ResolveDnsError};
+use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use opendal::layers::HttpClientLayer;
 use opendal::raw::{HttpBody, HttpClient, HttpFetch};
 use opendal::{Buffer, ErrorKind};
@@ -74,6 +77,46 @@ impl Resolve for ScreenedResolver {
     }
 }
 
+/// The same screen for AWS SDK connections, which resolve names through their own client.
+#[derive(Clone)]
+struct ScreenedDns {
+    policy: EgressPolicy,
+    lookup: Lookup,
+}
+
+impl fmt::Debug for ScreenedDns {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScreenedDns")
+            .field("policy", &self.policy)
+            .finish()
+    }
+}
+
+impl ResolveDns for ScreenedDns {
+    fn resolve_dns<'a>(&'a self, name: &'a str) -> DnsFuture<'a> {
+        DnsFuture::new(async move {
+            let resolved = (self.lookup)(name.to_string()).await.map_err(|error| {
+                ResolveDnsError::new(EgressError::ResolveFailed {
+                    host: name.to_string(),
+                    reason: error.to_string(),
+                })
+            })?;
+            let allowed: Vec<IpAddr> = resolved
+                .into_iter()
+                .map(|address| address.ip())
+                .filter(|address| self.policy.check(*address).is_ok())
+                .collect();
+            if allowed.is_empty() {
+                return Err(ResolveDnsError::new(EgressError::NoAllowedAddress(
+                    name.to_string(),
+                )));
+            }
+            Ok(allowed)
+        })
+    }
+}
+
 /// Screens opendal's own request targets, which include IP-literal credential
 /// endpoints that hyper connects to without consulting the DNS resolver.
 #[derive(Clone)]
@@ -113,6 +156,7 @@ impl HttpFetch for ScreenedFetch {
 #[derive(Clone)]
 pub struct EgressGuard {
     policy: EgressPolicy,
+    lookup: Lookup,
     opendal: reqwest::Client,
     plain: reqwest::Client,
 }
@@ -134,9 +178,31 @@ impl EgressGuard {
     fn build(policy: EgressPolicy, lookup: Lookup) -> Result<Self, BlobLibError> {
         Ok(Self {
             opendal: guarded_client(policy.clone(), lookup.clone(), None, READ_TIMEOUT)?,
-            plain: guarded_client(policy.clone(), lookup, Some(REDIRECT_HOPS), READ_TIMEOUT)?,
+            plain: guarded_client(
+                policy.clone(),
+                lookup.clone(),
+                Some(REDIRECT_HOPS),
+                READ_TIMEOUT,
+            )?,
+            lookup,
             policy,
         })
+    }
+
+    /// An AWS SDK http client for `endpoint`, whose names resolve through the screen. The SDK
+    /// follows no redirects, so a literal host is screened once here.
+    pub fn sdk_client(&self, endpoint: &str) -> Result<SharedHttpClient, EgressError> {
+        let host = Url::parse(endpoint)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .ok_or_else(|| EgressError::MissingHost(endpoint.to_string()))?;
+        screen_host(&self.policy, &host)?;
+        Ok(aws_smithy_http_client::Builder::new()
+            .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
+            .build_with_resolver(ScreenedDns {
+                policy: self.policy.clone(),
+                lookup: self.lookup.clone(),
+            }))
     }
 
     /// Replaces the client opendal uses for data-plane requests *and* for the

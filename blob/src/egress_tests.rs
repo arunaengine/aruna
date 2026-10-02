@@ -430,3 +430,33 @@ async fn invenio_redirect_refused() {
         assert_eq!(entry.hits(), 2, "only the repository answered: {location}");
     }
 }
+
+#[tokio::test]
+async fn sdk_client_screens() {
+    // The SDK client screens a literal endpoint at once and a name when it resolves.
+    let loopback: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let strict = EgressGuard::build(EgressPolicy::strict(), fixed_lookup(loopback)).unwrap();
+    assert!(matches!(
+        strict.sdk_client("http://127.0.0.1:9"),
+        Err(EgressError::BlockedAddress(_))
+    ));
+    assert!(strict.sdk_client("http://storage.test:9").is_ok());
+
+    let screened = |policy| ScreenedDns {
+        policy,
+        lookup: fixed_lookup(loopback),
+    };
+    assert!(
+        screened(EgressPolicy::strict())
+            .resolve_dns("storage.test")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        screened(EgressPolicy::loopback())
+            .resolve_dns("storage.test")
+            .await
+            .unwrap(),
+        vec![loopback.ip()]
+    );
+}

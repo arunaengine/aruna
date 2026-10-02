@@ -213,7 +213,8 @@ jobs:
           --run-ignored all --no-tests fail
           -E 'package(aruna-blob) & kind(lib) & (test(=blob::tests::s3_roundtrip_range)
           | test(=blob::tests::s3_multipart_compose) | test(=blob::tests::s3_group_backend)
-          | test(=blob::tests::s3_backend_routes))'
+          | test(=blob::tests::s3_backend_routes) | test(=blob::tests::s3_native_multipart)
+          | test(=blob::tests::s3_abort_path))'
 
   docker-backend:
     runs-on: ubuntu-latest

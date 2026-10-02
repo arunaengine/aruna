@@ -2,11 +2,26 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::egress::EgressGuard;
 use aruna_core::errors::BlobError;
+use aruna_core::stream::{BackendStream, StreamError};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region, RequestChecksumCalculation};
-use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
+use aws_sdk_s3::config::{
+    BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
+};
+use aws_sdk_s3::error::DisplayErrorContext;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{
+    BucketLocationConstraint, CompletedMultipartUpload, CompletedPart, CreateBucketConfiguration,
+};
+use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream::BoxStream;
+use http_body::{Frame, SizeHint};
 use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::{Mutex, PoisonError};
+use std::task::{Context, Poll};
 
 const DEFAULT_REGION: &str = "eu-central-1";
 // AWS rejects CreateBucket requests that name us-east-1 explicitly.
@@ -94,6 +109,257 @@ pub async fn make_bucket(bucket: &str, config: &HashMap<String, String>) -> Resu
                 .map_err(|_| BlobError::MakeBucketError(err.to_string())),
             _ => Err(BlobError::MakeBucketError(err.to_string())),
         },
+    }
+}
+
+/// The provider's own multipart calls for one bucket. OpenDAL picks part boundaries itself and
+/// hides the upload id, so in-place multipart uploads and their cleanup use this client.
+#[derive(Clone, Debug)]
+pub struct NativeMultipart {
+    client: Client,
+    bucket: String,
+    root: String,
+}
+
+impl NativeMultipart {
+    /// Builds the client from an S3 backend's service config; tenant backends pass their guard.
+    pub fn from_config(
+        config: &HashMap<String, String>,
+        bucket: &str,
+        root: &str,
+        guard: Option<&EgressGuard>,
+    ) -> Result<Self, BlobError> {
+        let endpoint = required_key(config, "endpoint")?;
+        let credentials = Credentials::new(
+            required_key(config, "access_key_id")?,
+            required_key(config, "secret_access_key")?,
+            None,
+            None,
+            "Aruna_v3",
+        );
+        let region = config
+            .get("region")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_REGION.to_string());
+        let path_style = config
+            .get("force_path_style")
+            .is_none_or(|value| value.trim().parse::<bool>().unwrap_or(true));
+        // Built without the shared config loader, so no environment or profile setting applies.
+        let mut builder = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new(region))
+            .credentials_provider(credentials)
+            .endpoint_url(endpoint)
+            .force_path_style(path_style)
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
+        if let Some(guard) = guard {
+            let client = guard
+                .sdk_client(endpoint)
+                .map_err(|error| BlobError::OperatorCreationFailed(error.to_string()))?;
+            builder = builder.http_client(client);
+        }
+        Ok(Self {
+            client: Client::from_conf(builder.build()),
+            bucket: bucket.to_string(),
+            root: root.to_string(),
+        })
+    }
+
+    /// The object key OpenDAL uses for `path` under this backend's root.
+    fn key(&self, path: &str) -> String {
+        let path = path.trim_start_matches('/');
+        match self.root.trim_matches('/') {
+            "" => path.to_string(),
+            root => format!("{root}/{path}"),
+        }
+    }
+
+    pub async fn create(&self, path: &str) -> Result<String, BlobError> {
+        let output = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(self.key(path))
+            .send()
+            .await
+            .map_err(|error| write_error("create", error))?;
+        output
+            .upload_id()
+            .map(str::to_string)
+            .ok_or_else(|| BlobError::WriteError("backend returned no multipart upload id".into()))
+    }
+
+    /// Streams one part straight to the backend and returns its ETag.
+    pub async fn upload_part(
+        &self,
+        path: &str,
+        upload_id: &str,
+        part_number: u16,
+        size: u64,
+        body: BackendStream<Result<Bytes, StreamError>>,
+    ) -> Result<String, BlobError> {
+        let length = i64::try_from(size)
+            .map_err(|_| BlobError::WriteError("part is too large".to_string()))?;
+        let body = PartBody {
+            stream: Mutex::new(body.0),
+            size,
+        };
+        let output = self
+            .client
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(self.key(path))
+            .upload_id(upload_id)
+            .part_number(i32::from(part_number))
+            .content_length(length)
+            .body(ByteStream::from_body_1_x(body))
+            .send()
+            .await
+            .map_err(|error| write_error("upload part", error))?;
+        output
+            .e_tag()
+            .map(str::to_string)
+            .ok_or_else(|| BlobError::WriteError("backend returned no part ETag".to_string()))
+    }
+
+    /// Assembles the listed parts, in order, under the backend ETags recorded for them.
+    pub async fn complete(
+        &self,
+        path: &str,
+        upload_id: &str,
+        parts: &[(u16, String)],
+    ) -> Result<(), BlobError> {
+        let parts = parts
+            .iter()
+            .map(|(part_number, etag)| {
+                CompletedPart::builder()
+                    .part_number(i32::from(*part_number))
+                    .e_tag(etag)
+                    .build()
+            })
+            .collect();
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(self.key(path))
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|error| write_error("complete", error))?;
+        Ok(())
+    }
+
+    /// Frees the stored parts of one upload; an upload the backend no longer has is gone already.
+    pub async fn abort(&self, path: &str, upload_id: &str) -> Result<(), BlobError> {
+        match self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(self.key(path))
+            .upload_id(upload_id)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|service| service.is_no_such_upload()) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(BlobError::DeleteError(format!(
+                "abort multipart upload: {}",
+                DisplayErrorContext(&error)
+            ))),
+        }
+    }
+
+    /// Aborts every unfinished upload of exactly this path, such as one an abandoned writer left.
+    pub async fn abort_path(&self, path: &str) -> Result<usize, BlobError> {
+        let key = self.key(path);
+        let mut aborted = 0;
+        let mut key_marker = None;
+        let mut upload_marker = None;
+        loop {
+            let page = self
+                .client
+                .list_multipart_uploads()
+                .bucket(&self.bucket)
+                .prefix(&key)
+                .set_key_marker(key_marker.take())
+                .set_upload_id_marker(upload_marker.take())
+                .send()
+                .await
+                .map_err(|error| {
+                    BlobError::DeleteError(format!(
+                        "list multipart uploads: {}",
+                        DisplayErrorContext(&error)
+                    ))
+                })?;
+            for upload in page.uploads() {
+                if upload.key() != Some(key.as_str()) {
+                    continue;
+                }
+                if let Some(upload_id) = upload.upload_id() {
+                    self.abort(path, upload_id).await?;
+                    aborted += 1;
+                }
+            }
+            if !page.is_truncated().unwrap_or(false) {
+                return Ok(aborted);
+            }
+            key_marker = page.next_key_marker().map(str::to_string);
+            upload_marker = page.next_upload_id_marker().map(str::to_string);
+            if key_marker.is_none() && upload_marker.is_none() {
+                return Ok(aborted);
+            }
+        }
+    }
+}
+
+fn write_error<E>(call: &str, error: aws_sdk_s3::error::SdkError<E>) -> BlobError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    BlobError::WriteError(format!(
+        "{call} multipart upload: {}",
+        DisplayErrorContext(&error)
+    ))
+}
+
+/// A part body the SDK sends without buffering. The mutex only makes the stream `Sync`.
+struct PartBody {
+    stream: Mutex<BoxStream<'static, Result<Bytes, StreamError>>>,
+    size: u64,
+}
+
+impl http_body::Body for PartBody {
+    type Data = Bytes;
+    type Error = StreamError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, StreamError>>> {
+        let stream = self
+            .get_mut()
+            .stream
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        stream
+            .poll_next_unpin(context)
+            .map(|item| item.map(|chunk| chunk.map(Frame::data)))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.size)
     }
 }
 
