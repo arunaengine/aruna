@@ -42,10 +42,10 @@ pub enum MultipartUploadStatus {
     Aborting,
 }
 
-/// How long one completion attempt owns an upload. A request whose connection
-/// died leaves the record `Completing`, so a later attempt takes it over once
-/// the lease lapses instead of failing forever with `NoSuchUpload`.
-pub const COMPLETION_LEASE_MS: u64 = 15 * 60 * 1000;
+/// How long one completion attempt owns an upload. A completion outlives its request and runs
+/// until its deadline, so only a node that stopped leaves the record `Completing` this long; a
+/// later attempt then takes it over instead of failing forever with `NoSuchUpload`.
+pub const COMPLETION_LEASE_MS: u64 = COMPLETION_DEADLINE_MS;
 
 /// Ceiling on one CompleteMultipartUpload. Composing a huge object is
 /// legitimately slow, so the bound only has to stop an operation that never
