@@ -16,7 +16,7 @@ use aws_sdk_s3::types::{
     BucketLocationConstraint, CompletedMultipartUpload, CompletedPart, CreateBucketConfiguration,
 };
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use http_body::{Frame, SizeHint};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use std::collections::HashMap;
@@ -194,6 +194,7 @@ impl NativeMultipart {
             .bucket(&self.bucket)
             .key(self.key(path))
             .send()
+            .boxed()
             .await
             .map_err(|error| write_error("create", error))?;
         output
@@ -227,6 +228,7 @@ impl NativeMultipart {
             .content_length(length)
             .body(ByteStream::from_body_1_x(body))
             .send()
+            .boxed()
             .await
             .map_err(|error| write_error("upload part", error))?;
         output
@@ -255,6 +257,7 @@ impl NativeMultipart {
             .part_number(i32::from(part_number))
             .copy_source(format!("{}/{encoded}", source.bucket))
             .send()
+            .boxed()
             .await
             .map_err(|error| write_error("copy part", error))?;
         output
@@ -291,6 +294,7 @@ impl NativeMultipart {
                     .build(),
             )
             .send()
+            .boxed()
             .await
             .map_err(|error| write_error("complete", error))?;
         Ok(())
@@ -305,6 +309,7 @@ impl NativeMultipart {
             .key(self.key(path))
             .upload_id(upload_id)
             .send()
+            .boxed()
             .await
         {
             Ok(_) => Ok(()),
@@ -337,6 +342,7 @@ impl NativeMultipart {
                 .set_key_marker(key_marker.take())
                 .set_upload_id_marker(upload_marker.take())
                 .send()
+                .boxed()
                 .await
                 .map_err(|error| {
                     BlobError::DeleteError(format!(

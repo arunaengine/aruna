@@ -640,7 +640,9 @@ impl BlobHandler {
             (Some(operator), Some(path)) => {
                 self.delete_path(operator, path).await?;
                 match location {
-                    Some(location) if abandoned => self.abort_uploads(location, path).await,
+                    Some(location) if abandoned => {
+                        Box::pin(self.abort_uploads(location, path)).await
+                    }
                     _ => Ok(()),
                 }
             }
@@ -1157,7 +1159,7 @@ impl BlobHandler {
             Err(err) => {
                 let cleanup = if abandoned {
                     match self.delete_path(&operator, &storage_path).await {
-                        Ok(()) => self.abort_uploads(&location, &storage_path).await,
+                        Ok(()) => Box::pin(self.abort_uploads(&location, &storage_path)).await,
                         Err(error) => Err(error),
                     }
                 } else {

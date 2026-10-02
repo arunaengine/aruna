@@ -113,7 +113,7 @@ impl BlobHandler {
         let path = location.get_storage_path()?;
         let operator = self.operator_from_location(location)?;
         self.delete_path(&operator, &path).await?;
-        self.abort_uploads(location, &path).await?;
+        Box::pin(self.abort_uploads(location, &path)).await?;
         self.release_reservation(location).await
     }
 
@@ -187,7 +187,7 @@ impl BlobHandler {
             },
             Err(error) => {
                 // A create whose answer was lost may still have opened an upload at this path.
-                _ = self.discard_target(&location).await;
+                _ = Box::pin(self.discard_target(&location)).await;
                 BlobEvent::Error(error)
             }
         }
@@ -239,7 +239,7 @@ impl BlobHandler {
         let attempt = Ulid::generate();
         match self.claim_part(&upload.upload_id, part.part_number, attempt) {
             Ok(Some(chain)) => {
-                self.stream_part(
+                Box::pin(self.stream_part(
                     upload,
                     part.part_number,
                     attempt,
@@ -247,7 +247,7 @@ impl BlobHandler {
                     size,
                     created_by,
                     blob,
-                )
+                ))
                 .await
             }
             Ok(None) => {
@@ -272,8 +272,16 @@ impl BlobHandler {
         let attempt = Ulid::generate();
         match self.claim_part(&upload.upload_id, part_number, attempt) {
             Ok(Some(chain)) => {
-                self.stream_part(upload, part_number, attempt, chain, size, created_by, blob)
-                    .await
+                Box::pin(self.stream_part(
+                    upload,
+                    part_number,
+                    attempt,
+                    chain,
+                    size,
+                    created_by,
+                    blob,
+                ))
+                .await
             }
             Ok(None) => BlobEvent::Error(BlobError::WriteError(
                 "another write holds this provider part".to_string(),
@@ -441,7 +449,7 @@ impl BlobHandler {
                 "too many active blob reservations".to_string(),
             ));
         };
-        match self.finish_upload(&upload, &parts).await {
+        match Box::pin(self.finish_upload(&upload, &parts)).await {
             Ok(location) => {
                 self.chains().remove(&upload.upload_id);
                 reservation.retain();
