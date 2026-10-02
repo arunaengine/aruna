@@ -262,8 +262,9 @@ pub async fn sweep_stale_uploads(
             now_ms,
         });
         // An abort is transactional, so finishing one that stopped midway is safe to repeat.
+        // The status is checked again in that transaction: this scan may be stale.
         if record.status == MultipartUploadStatus::Aborting {
-            operation = operation.including_in_progress();
+            operation = operation.resuming_abort();
         }
         match drive(operation, context).await {
             Ok(_) => {

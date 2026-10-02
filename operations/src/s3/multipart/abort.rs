@@ -91,6 +91,7 @@ pub struct AbortUploadOperation {
     upload_parts: Vec<MultipartPart>,
     cleanup_index: usize,
     skip_status_check: bool,
+    resume_abort: bool,
     cleanup: WriteCleanup<AbortUploadError>,
     output: Option<Result<(), AbortUploadError>>,
 }
@@ -105,6 +106,7 @@ impl AbortUploadOperation {
             upload_parts: Vec::new(),
             cleanup_index: 0,
             skip_status_check: false,
+            resume_abort: false,
             cleanup: WriteCleanup::default(),
             output: None,
         }
@@ -113,6 +115,12 @@ impl AbortUploadOperation {
     /// A purge may skip status checks after it owns the destination write fence.
     pub fn including_in_progress(mut self) -> Self {
         self.skip_status_check = true;
+        self
+    }
+
+    /// Also finishes an abort that stopped midway, judged on the record read in this transaction.
+    pub fn resuming_abort(mut self) -> Self {
+        self.resume_abort = true;
         self
     }
 
@@ -181,6 +189,10 @@ impl AbortUploadOperation {
             &self.input.key,
             if self.skip_status_check {
                 StatusCheck::Skip
+            } else if self.resume_abort {
+                StatusCheck::Recover {
+                    now_ms: self.input.now_ms,
+                }
             } else {
                 StatusCheck::Takeover {
                     now_ms: self.input.now_ms,
@@ -525,6 +537,31 @@ mod pure_tests {
         operation.txn_id = Some(TxnId::from_bytes([3u8; 16]));
         operation.state = AbortUploadState::CommitMarkTransaction;
         operation
+    }
+
+    #[test]
+    fn resume_spares_completion() {
+        let mut operation = AbortUploadOperation::new(input()).resuming_abort();
+        let mut record = marked().upload_record.unwrap();
+        record.status = MultipartUploadStatus::Completing;
+        record.completing_since_ms = Some(operation.input.now_ms);
+        operation.txn_id = Some(TxnId::from_bytes([3u8; 16]));
+        operation.state = AbortUploadState::ReadUploadMark;
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: operation.input.upload_id.to_bytes().to_vec().into(),
+            value: Some(record.to_bytes().unwrap().into()),
+        }));
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Storage(StorageEffect::Write { .. })))
+        );
+        assert_eq!(
+            operation.finalize(),
+            Err(AbortUploadError::CompletionInProgress)
+        );
     }
 
     #[test]
