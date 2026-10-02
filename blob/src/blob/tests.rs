@@ -10,6 +10,7 @@ use super::{
     control_plane::timeout_event,
     control_plane::{parse_replication_init, validate_init_ack, with_timeout},
 };
+use crate::hash::Hasher;
 use crate::messages::{MessageType, ReplicationMessage};
 use crate::s3::{NativeMultipart, create_s3_client, make_bucket};
 use aruna_core::alpn::Alpn;
@@ -34,7 +35,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
-use aruna_core::structs::storage::multipart::MultipartPartKey;
+use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};
 use aruna_core::{NodeId, UserId};
 use aruna_net::streams::BiStream;
 use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
@@ -2791,6 +2792,142 @@ async fn s3_abandoned_cleanup() {
 
     assert_eq!(native.abort_path(&path).await.unwrap(), 0);
     assert!(operator.stat(&path).await.is_err());
+}
+
+async fn in_place_part(
+    handler: &BlobHandler,
+    upload: &BackendUpload,
+    part_number: u16,
+    payload: &[u8],
+) -> MultipartPart {
+    let BlobEvent::PartWritten {
+        location,
+        backend_etag,
+    } = handler
+        .write_upload_part(
+            upload.clone(),
+            part_number,
+            Some(payload.len() as u64),
+            test_user_id(),
+            stream_from_bytes(payload),
+        )
+        .await
+    else {
+        panic!("in-place part write failed")
+    };
+    assert!(location.partial);
+    MultipartPart {
+        part_number,
+        location,
+        created_at: SystemTime::now(),
+        backend_etag: Some(backend_etag),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_in_place_upload() {
+    // Saved states cover parts 1 and 2; part 3 is left out and part 4 is read back.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = handler
+        .open_upload("bucket", "in-place.bin", cold_backend(), test_user_id())
+        .await
+    else {
+        panic!("s3 upload did not open")
+    };
+    let mib = 1024 * 1024;
+    let payloads: HashMap<u16, Vec<u8>> = HashMap::from([
+        (1, vec![1u8; 5 * mib]),
+        (2, vec![2u8; 5 * mib + 3]),
+        (3, vec![3u8; 5 * mib]),
+        (4, b"tail".to_vec()),
+    ]);
+    let mut parts = HashMap::new();
+    for number in [1u16, 3, 2, 4] {
+        let part = in_place_part(&handler, &upload, number, &payloads[&number]).await;
+        parts.insert(number, part);
+    }
+    let listed = vec![parts[&1].clone(), parts[&2].clone(), parts[&4].clone()];
+    let expected = [&payloads[&1], &payloads[&2], &payloads[&4]]
+        .map(|payload| payload.as_slice())
+        .concat();
+
+    let BlobEvent::WriteFinished { location } = handler
+        .complete_upload(upload.clone(), listed.clone())
+        .await
+    else {
+        panic!("in-place completion failed")
+    };
+    assert_eq!(location.blob_size, expected.len() as u64);
+    assert_eq!(location.hashes, Hasher::new_with_bytes(&expected).to_map());
+    assert_eq!(read_back(&handler, location.clone()).await, expected);
+
+    // A repeated completion whose first answer was lost finds the object and hashes it again.
+    let BlobEvent::WriteFinished { location: again } =
+        handler.complete_upload(upload, listed).await
+    else {
+        panic!("repeated completion failed")
+    };
+    assert_eq!(again.hashes, location.hashes);
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_in_place_abort() {
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = handler
+        .open_upload("bucket", "aborted.bin", cold_backend(), test_user_id())
+        .await
+    else {
+        panic!("s3 upload did not open")
+    };
+    in_place_part(&handler, &upload, 1, b"part").await;
+
+    assert!(matches!(
+        handler.abort_upload(upload.clone()).await,
+        BlobEvent::UploadAborted
+    ));
+    let path = upload.location.get_storage_path().unwrap();
+    let native = handler.native_for(&upload.location).unwrap().unwrap();
+    assert_eq!(native.abort_path(&path).await.unwrap(), 0);
+    // Deleting an in-place part touches nothing: the provider upload owned it.
+    let mut part = upload.location.clone();
+    part.partial = true;
+    assert!(matches!(
+        handler.delete_blob(part).await,
+        BlobEvent::DeleteFinished
+    ));
+}
+
+#[tokio::test]
+async fn filesystem_keeps_parts() {
+    // Without a provider upload, parts stay blobs of their own.
+    let context = setup_blob_handle(5).await;
+    let event = context
+        .blob_handle
+        .handler
+        .open_upload(
+            "bucket",
+            "key",
+            ResolvedBackend::node_default(),
+            test_user_id(),
+        )
+        .await;
+
+    assert!(matches!(
+        event,
+        BlobEvent::UploadOpened {
+            backend_upload: None
+        }
+    ));
 }
 
 #[tokio::test]
