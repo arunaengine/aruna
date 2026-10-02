@@ -643,8 +643,10 @@ async fn refresh_keeps_presigned() -> TestResult<()> {
             .presigned(PresigningConfig::expires_in(Duration::from_secs(120))?)
             .await?;
 
+        // Only a renewed bearer token lets the refresh move the expiry later.
+        let renewed = sign_token(&seed, seed.user_id, None, 3600)?;
         http.post(format!("{sessions}/{access_key}/refresh"))
-            .bearer_auth(&bearer)
+            .bearer_auth(&renewed)
             .send()
             .await?
             .error_for_status()?;

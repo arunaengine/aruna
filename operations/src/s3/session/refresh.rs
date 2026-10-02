@@ -144,6 +144,17 @@ impl RefreshS3Operation {
         if session.last_used_at.is_none() {
             return self.fail(S3SessionError::Idle);
         }
+        if self.config.expiry <= session.expiry {
+            return self.fail(S3SessionError::NotExtended);
+        }
+        // Only one replaced pair is kept, so it must lapse before the next rotation.
+        if session
+            .previous
+            .as_ref()
+            .is_some_and(|previous| previous.expiry > self.config.now)
+        {
+            return self.fail(S3SessionError::TooEarly);
+        }
         let index = match decode_index(values[1].1.as_ref()) {
             Ok(index) => index,
             Err(error) => return self.fail(error),

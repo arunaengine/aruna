@@ -80,6 +80,8 @@ pub enum S3SessionError {
     WrongGroup,
     #[error("session is not in its refresh window")]
     TooEarly,
+    #[error("refresh would not extend the session expiry")]
+    NotExtended,
     #[error("session has not been used since it was issued")]
     Idle,
     #[error("session operation is not finished")]
@@ -107,6 +109,7 @@ impl S3SessionError {
                 | Self::WrongOwner
                 | Self::WrongGroup
                 | Self::TooEarly
+                | Self::NotExtended
                 | Self::Idle
         )
     }
@@ -465,6 +468,75 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error, S3SessionError::InvalidToken);
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_previous() {
+        let (_directory, context) = test_context();
+        let encryption_key = CredentialEncryptionKey::derive(&[7u8; 32]);
+        let user = UserId::local(Ulid::from_bytes([2u8; 16]), RealmId::from_bytes([1u8; 32]));
+        let group = Ulid::from_bytes([3u8; 16]);
+        let issuer = [4u8; 32];
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let expiry = start + SESSION_MAX_TTL;
+        let issued = drive(
+            CreateS3Operation::new(
+                session_config(user, group, start, expiry, issuer),
+                encryption_key.clone(),
+            ),
+            &context,
+        )
+        .await
+        .unwrap();
+        let touch = |token: &Secret, now: SystemTime| {
+            TouchS3Operation::new(TouchS3Config {
+                access_key: issued.access_key_id.clone(),
+                token_hash: S3Session::hash_token(token.expose()),
+                now,
+                issued_by: issuer,
+            })
+        };
+        let refresh = |now: SystemTime, expiry: SystemTime| {
+            RefreshS3Operation::new(
+                RefreshS3Config {
+                    access_key: issued.access_key_id.clone(),
+                    user_identity: user,
+                    group_id: group,
+                    now,
+                    expiry,
+                    path_restrictions: None,
+                    issued_by: issuer,
+                },
+                encryption_key.clone(),
+            )
+        };
+        drive(touch(&issued.session_token, start), &context)
+            .await
+            .unwrap();
+
+        // A bearer that caps the expiry leaves nothing to gain from rotating.
+        let window = expiry - Duration::from_secs(4 * 60);
+        let error = drive(refresh(window, expiry), &context).await.unwrap_err();
+        assert_eq!(error, S3SessionError::NotExtended);
+
+        let refreshed = drive(refresh(window, expiry + Duration::from_secs(60)), &context)
+            .await
+            .unwrap();
+        let later = window + Duration::from_secs(1);
+        drive(touch(&refreshed.session_token, later), &context)
+            .await
+            .unwrap();
+        // A second rotation would evict the first pair before its expiry.
+        let error = drive(refresh(later, expiry + Duration::from_secs(120)), &context)
+            .await
+            .unwrap_err();
+        assert_eq!(error, S3SessionError::TooEarly);
+        drive(
+            touch(&issued.session_token, expiry - Duration::from_secs(1)),
+            &context,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
