@@ -203,6 +203,52 @@ fn refuses_disabled_backend() {
 }
 
 #[test]
+fn stale_encoding_aborts() {
+    // The setting changed while the parts were composed: the raw object must not
+    // become a version a finished migration would never revisit.
+    let mut op = CompleteUploadOperation::new(finalize_input());
+    op.upload_record = Some(open_upload_record(&op.input));
+    op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
+    op.state = CompleteUploadState::StartFinalizeTransaction;
+    let txn_id = TxnId::generate();
+    op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    op.step(fence_clear());
+    let bucket = BucketInfo {
+        group_id: Ulid::from_bytes([6u8; 16]),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: op.input.created_by,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Zstd { level: 3 },
+    };
+
+    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (
+                b"bucket".to_vec().into(),
+                Some(bucket.to_bytes().unwrap().into()),
+            ),
+            (b"subject".to_vec().into(), None),
+        ],
+    }));
+
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
+                if *aborted == txn_id
+        ),
+        "expected the finalize transaction to abort, got {effects:?}"
+    );
+    assert_eq!(
+        op.cleanup.take_error(),
+        Some(StorageError::TransactionConflict.into())
+    );
+}
+
+#[test]
 fn fence_rejects_stray() {
     let mut op = CompleteUploadOperation::new(finalize_input());
     op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
