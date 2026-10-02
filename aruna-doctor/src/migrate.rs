@@ -1,5 +1,5 @@
 //! Re-encodes legacy rows, adds missing event size rows, seals plain secrets, moves node secrets
-//! into the node vault and deletes unreadable S3 sessions; repeats are safe.
+//! into the node vault and deletes unreadable S3 sessions and uploads; repeats are safe.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -16,6 +16,7 @@ use aruna_core::keyspaces::{
     GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY,
     NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_SESSION_KEYSPACE,
     SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
@@ -39,6 +40,7 @@ mod jobs;
 mod mappings;
 mod sessions;
 mod sizes;
+mod uploads;
 mod vault;
 
 #[derive(Debug, Serialize)]
@@ -85,6 +87,10 @@ pub struct MigrateOutput {
     /// S3 sessions in an older format are deleted; their holders mint new ones.
     pub sessions_scanned: usize,
     pub sessions_deleted: usize,
+    /// Multipart uploads in an older format are deleted with their parts; clients start again.
+    pub uploads_scanned: usize,
+    pub uploads_deleted: usize,
+    pub upload_parts_deleted: usize,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -117,6 +123,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let session_rows = db.keyspace(S3_SESSION_KEYSPACE, KeyspaceCreateOptions::default)?;
     let expiry_rows = db.keyspace(SESSION_EXPIRY_KEYSPACE, KeyspaceCreateOptions::default)?;
     let owner_rows = db.keyspace(SESSION_OWNER_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let upload_rows = db.keyspace(UPLOAD_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let part_rows = db.keyspace(UPLOAD_PART_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -140,6 +148,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         rewrites::<GitRecord, git::LegacyRecord>(&db, &git_rows, GIT_RECORD_KEYSPACE)?;
     let sizes = sizes::missing_sizes(&db, &event_rows, &size_rows)?;
     let stale = sessions::stale_sessions(&db, &session_rows, &expiry_rows, &owner_rows)?;
+    let old_uploads = uploads::stale_uploads(&db, &upload_rows, &part_rows)?;
     let record = |target: &DocumentTarget| matches!(target, DocumentTarget::GitRecord { .. });
     let git_outbox = mappings::outbox_rows(
         &db,
@@ -217,6 +226,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         (&session_rows, &stale.sessions),
         (&expiry_rows, &stale.expiries),
         (&owner_rows, &stale.owner_removes),
+        (&upload_rows, &old_uploads.uploads),
+        (&part_rows, &old_uploads.parts),
     ] {
         for key in keys {
             txn.remove(keyspace.clone(), key.clone());
@@ -263,6 +274,9 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         event_sizes_written: sizes.rows.len(),
         sessions_scanned: stale.scanned,
         sessions_deleted: stale.sessions.len(),
+        uploads_scanned: old_uploads.scanned,
+        uploads_deleted: old_uploads.uploads.len(),
+        upload_parts_deleted: old_uploads.parts.len(),
     })
 }
 
