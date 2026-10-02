@@ -1,5 +1,6 @@
 //! Re-encodes one local version with its bucket's compression. The new copy is published only if
 //! the setting and version are unchanged; reclaim keeps the old copy while another version uses it.
+//! A copy that already exists in the target encoding is adopted without reading the old one.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -14,7 +15,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobVersion, BlobVersionState, BucketInfo, ResolvedBackend, VersionKey,
+    BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo, ResolvedBackend,
+    VersionKey,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
@@ -29,6 +31,7 @@ pub enum MigrateState {
     Init,
     ReadVersion,
     ReadLocation,
+    FindTarget,
     ReadBlob,
     WriteBlob,
     StartTransaction,
@@ -63,6 +66,8 @@ pub enum MigrateVersionError {
     Blob(#[from] BlobError),
     #[error(transparent)]
     Usage(#[from] UsageUpdateError),
+    #[error("the copy in the target encoding disappeared before it was adopted")]
+    TargetMissing,
     #[error("the re-encoded copy does not match the original bytes")]
     ContentMismatch,
     #[error("version migration did not finish")]
@@ -202,7 +207,43 @@ impl MigrateVersionOperation {
         if old.staging || old.partial {
             return self.skip();
         }
-        self.old = Some(old.clone());
+        self.old = Some(old);
+        match self.target_key() {
+            Ok(key) => {
+                self.state = MigrateState::FindTarget;
+                smallvec![blob_location_read(&key, None)]
+            }
+            Err(error) => self.fail(error),
+        }
+    }
+
+    /// The row of this content in the target encoding, on the backend that holds it now.
+    fn target_key(&self) -> Result<BlobLocationKey, MigrateVersionError> {
+        let old = self.old.as_ref().ok_or(MigrateVersionError::NotFinished)?;
+        let mut key = old.location_key()?;
+        key.encoding = EncodingClass::from(self.target);
+        Ok(key)
+    }
+
+    /// A finished copy in the target encoding is adopted; only without one is the old copy read.
+    fn handle_found(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected(event);
+        };
+        let found = match value.map(|value| BackendLocation::from_bytes(value.as_ref())) {
+            Some(Ok(found)) => !found.staging && !found.partial,
+            Some(Err(error)) => return self.fail(error.into()),
+            None => false,
+        };
+        if found {
+            self.state = MigrateState::StartTransaction;
+            return smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })];
+        }
+        let Some(old) = self.old.clone() else {
+            return self.fail(MigrateVersionError::NotFinished);
+        };
         self.state = MigrateState::ReadBlob;
         smallvec![Effect::Blob(BlobEffect::Read { location: old })]
     }
@@ -295,13 +336,17 @@ impl MigrateVersionOperation {
         if current != self.version {
             return self.skip();
         }
-        let key = match self.new.as_ref().map(BackendLocation::location_key) {
-            Some(Ok(key)) => key,
-            Some(Err(error)) => return self.fail(error.into()),
-            None => return self.fail(MigrateVersionError::NotFinished),
-        };
-        self.state = MigrateState::ReadTarget;
-        smallvec![blob_location_read(&key, self.txn_id)]
+        self.read_target()
+    }
+
+    fn read_target(&mut self) -> Effects {
+        match self.target_key() {
+            Ok(key) => {
+                self.state = MigrateState::ReadTarget;
+                smallvec![blob_location_read(&key, self.txn_id)]
+            }
+            Err(error) => self.fail(error),
+        }
     }
 
     /// An existing copy in the target class is adopted; otherwise the new copy
@@ -326,34 +371,35 @@ impl MigrateVersionOperation {
         &mut self,
         existing: Option<Vec<u8>>,
     ) -> Result<Vec<(String, Key, Value)>, MigrateVersionError> {
-        let (Some(new), Some(old), Some(version)) =
-            (self.new.as_ref(), self.old.as_ref(), self.version.as_ref())
-        else {
+        let (Some(old), Some(version)) = (self.old.as_ref(), self.version.as_ref()) else {
             return Err(MigrateVersionError::NotFinished);
         };
-        let new_key = new.location_key()?;
         let old_key = old.location_key()?;
         let mut writes = Vec::new();
-        match existing {
+        let published = match existing {
             Some(value) => {
                 let existing = BackendLocation::from_bytes(&value)?;
-                self.owns_row = existing.same_object(new);
+                self.owns_row = (self.new.as_ref()).is_some_and(|new| existing.same_object(new));
+                existing
             }
             None => {
+                let new = self.new.clone().ok_or(MigrateVersionError::TargetMissing)?;
                 writes.push((
                     BLOB_LOCATIONS_KEYSPACE.to_string(),
-                    new_key.to_bytes().into(),
+                    new.location_key()?.to_bytes().into(),
                     new.to_bytes()?.into(),
                 ));
                 self.owns_row = true;
                 self.usage = Some(UsageCounterUpdate::for_stored(
-                    StoredDelta::for_location(new, true).ok_or(MigrateVersionError::NotFinished)?,
+                    StoredDelta::for_location(&new, true)
+                        .ok_or(MigrateVersionError::NotFinished)?,
                 ));
+                new
             }
-        }
+        };
         let mut migrated = version.clone();
         if let BlobVersionState::Materialized { encoding, .. } = &mut migrated.state {
-            *encoding = new_key.encoding;
+            *encoding = published.format.encoding();
         }
         writes.push((
             BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -448,6 +494,7 @@ impl Operation for MigrateVersionOperation {
             MigrateState::Init => self.start(),
             MigrateState::ReadVersion => self.handle_version(event),
             MigrateState::ReadLocation => self.handle_location(event),
+            MigrateState::FindTarget => self.handle_found(event),
             MigrateState::ReadBlob => self.handle_read(event),
             MigrateState::WriteBlob => self.handle_written(event),
             MigrateState::StartTransaction => self.handle_started(event),
@@ -679,6 +726,7 @@ mod tests {
         operation.start();
         operation.step(read_result(Some(version.to_bytes().unwrap())));
         operation.step(read_result(Some(location(false).to_bytes().unwrap())));
+        operation.step(read_result(None));
         let blob = BackendStream::new(futures_util::stream::empty::<
             Result<bytes::Bytes, std::io::Error>,
         >());
@@ -756,6 +804,34 @@ mod tests {
         assert_eq!(class, EncodingClass::Zstd { level: 3 });
         let old = ReclaimCandidateKey::from_bytes(&writes[2].1).unwrap();
         assert_eq!(old.encoding, EncodingClass::Raw);
+    }
+
+    #[test]
+    fn adopts_existing_copy() {
+        // Another version already moved this content: nothing is read or written again.
+        let mut operation = operation();
+        let version = raw_version();
+        operation.start();
+        operation.step(read_result(Some(version.to_bytes().unwrap())));
+        operation.step(read_result(Some(location(false).to_bytes().unwrap())));
+
+        let effects = operation.step(read_result(Some(location(true).to_bytes().unwrap())));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        operation.step(read_result(Some(bucket(ZSTD))));
+        operation.step(read_result(Some(version.to_bytes().unwrap())));
+        let effects = operation.step(read_result(Some(location(true).to_bytes().unwrap())));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the row writes, got {effects:?}")
+        };
+        let spaces: Vec<&str> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
+        assert_eq!(spaces, [BLOB_VERSIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE]);
     }
 
     #[test]
