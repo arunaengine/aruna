@@ -2928,6 +2928,79 @@ async fn s3_provider_abort() {
 }
 
 #[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_abort_streaming() {
+    // A part still streaming during an abort aborts again when it settles.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "streaming.bin",
+            cold_backend(),
+            test_user_id(),
+        )
+        .await
+    else {
+        panic!("s3 upload did not open")
+    };
+    let half = 3 * 1024 * 1024;
+    let (started, on_start) = tokio::sync::oneshot::channel::<()>();
+    let (release, on_release) = tokio::sync::oneshot::channel::<()>();
+    let first = futures::stream::once(async move {
+        _ = started.send(());
+        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![1u8; half]))
+    });
+    let rest = futures::stream::once(async move {
+        _ = on_release.await;
+        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![2u8; half]))
+    });
+    let writing = tokio::spawn({
+        let handler = handler.clone();
+        let upload = upload.clone();
+        async move {
+            handler
+                .write_upload_part(
+                    upload,
+                    1,
+                    Some(2 * half as u64),
+                    test_user_id(),
+                    BackendStream::new(futures::StreamExt::chain(first, rest)),
+                )
+                .await
+        }
+    });
+    on_start.await.unwrap();
+
+    assert!(matches!(
+        handler.abort_upload(upload.clone()).await,
+        BlobEvent::UploadAborted
+    ));
+    assert!(matches!(
+        handler
+            .write_upload_part(
+                upload.clone(),
+                2,
+                Some(4),
+                test_user_id(),
+                stream_from_bytes(b"late")
+            )
+            .await,
+        BlobEvent::Error(_)
+    ));
+    release.send(()).unwrap();
+    assert!(matches!(writing.await.unwrap(), BlobEvent::Error(_)));
+
+    let path = upload.location.get_storage_path().unwrap();
+    let native = handler.native_for(&upload.location).unwrap().unwrap();
+    assert_eq!(native.abort_path(&path).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn filesystem_keeps_parts() {
     // Without a provider upload, parts stay blobs of their own.
     let context = setup_blob_handle(5).await;

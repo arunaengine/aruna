@@ -35,8 +35,17 @@ struct PartTee {
     client_failed: Option<String>,
 }
 
+/// What this node knows about one provider upload: its saved hash states and part writes.
+#[derive(Debug, Default)]
+pub(super) struct UploadState {
+    chain: PartChain,
+    writes: usize,
+    /// Set by an abort; a part write that settles afterwards must abort again.
+    aborted: bool,
+}
+
 impl BlobHandler {
-    fn chains(&self) -> std::sync::MutexGuard<'_, HashMap<String, PartChain>> {
+    fn chains(&self) -> std::sync::MutexGuard<'_, HashMap<String, UploadState>> {
         self.part_chains
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -178,11 +187,15 @@ impl BlobHandler {
             ));
         };
         let attempt = Ulid::generate();
-        let chain = self
-            .chains()
-            .entry(upload.upload_id.clone())
-            .or_default()
-            .begin(part_number, attempt);
+        let chain = {
+            let mut uploads = self.chains();
+            let state = uploads.entry(upload.upload_id.clone()).or_default();
+            if state.aborted {
+                return BlobEvent::Error(aborted_upload());
+            }
+            state.writes += 1;
+            state.chain.begin(part_number, attempt)
+        };
         let tee = Arc::new(StdMutex::new(PartTee {
             part: Hasher::new(),
             chain,
@@ -218,6 +231,15 @@ impl BlobHandler {
                 .await
         }
         .await;
+        if self.settle_write(&upload.upload_id) {
+            // An abort ran while this part streamed, so the part it may have left goes too.
+            if let Ok(native) = self.native_upload(&upload.location)
+                && let Ok(path) = upload.location.get_storage_path()
+            {
+                _ = timeout(self.io_timeout(), native.abort(&path, &upload.upload_id)).await;
+            }
+            return BlobEvent::Error(aborted_upload());
+        }
         let tee = std::mem::replace(
             &mut *tee.lock().unwrap_or_else(PoisonError::into_inner),
             PartTee {
@@ -264,9 +286,23 @@ impl BlobHandler {
         }
     }
 
+    /// Ends one part write; reports whether the upload was aborted meanwhile.
+    fn settle_write(&self, upload_id: &str) -> bool {
+        let mut uploads = self.chains();
+        let Some(state) = uploads.get_mut(upload_id) else {
+            return false;
+        };
+        state.writes = state.writes.saturating_sub(1);
+        let aborted = state.aborted;
+        if aborted && state.writes == 0 {
+            uploads.remove(upload_id);
+        }
+        aborted
+    }
+
     fn with_chain(&self, upload_id: &str, change: impl FnOnce(&mut PartChain)) {
-        if let Some(chain) = self.chains().get_mut(upload_id) {
-            change(chain);
+        if let Some(state) = self.chains().get_mut(upload_id) {
+            change(&mut state.chain);
         }
     }
 
@@ -334,10 +370,10 @@ impl BlobHandler {
             }
         }
 
-        let (mut state, offset, _) = self
-            .chains()
-            .get(&upload.upload_id)
-            .map_or_else(|| (Hasher::new(), 0, 0), |chain| chain.resume(&listed));
+        let (mut state, offset, _) = self.chains().get(&upload.upload_id).map_or_else(
+            || (Hasher::new(), 0, 0),
+            |state| state.chain.resume(&listed),
+        );
         let mut hashed = offset;
         if offset < total {
             let reader = timeout(self.io_timeout(), operator.reader(&path))
@@ -372,8 +408,13 @@ impl BlobHandler {
         })
     }
 
-    /// Frees the provider's parts and any object a lost completion left at the target.
+    /// Frees the provider's parts and any object a lost completion left at the target. Parts
+    /// still streaming abort again when they settle, and the target row aborts once more later.
     pub(super) async fn abort_upload(&self, upload: BackendUpload) -> BlobEvent {
+        self.chains()
+            .entry(upload.upload_id.clone())
+            .or_default()
+            .aborted = true;
         let aborted = async {
             let native = self.native_upload(&upload.location)?;
             let path = upload.location.get_storage_path()?;
@@ -382,15 +423,33 @@ impl BlobHandler {
                 .map_err(|_| BlobError::DeleteError("timed out aborting the upload".into()))??;
             let operator = self.operator_from_location(&upload.location)?;
             self.delete_path(&operator, &path).await?;
+            self.write_target_row(&upload.location, upload.record_id)
+                .await?;
             self.release_reservation(&upload.location).await
         }
         .await;
+        let mut uploads = self.chains();
         match aborted {
             Ok(()) => {
-                self.chains().remove(&upload.upload_id);
+                if uploads
+                    .get(&upload.upload_id)
+                    .is_some_and(|state| state.writes == 0)
+                {
+                    uploads.remove(&upload.upload_id);
+                }
                 BlobEvent::UploadAborted
             }
-            Err(error) => BlobEvent::Error(error),
+            Err(error) => {
+                // The upload stays open for a retry, so its parts may stream again.
+                if let Some(state) = uploads.get_mut(&upload.upload_id) {
+                    state.aborted = false;
+                }
+                BlobEvent::Error(error)
+            }
         }
     }
+}
+
+fn aborted_upload() -> BlobError {
+    BlobError::WriteError("the multipart upload was aborted".to_string())
 }

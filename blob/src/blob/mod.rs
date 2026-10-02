@@ -70,7 +70,7 @@ pub struct BlobHandler {
     reservation_active: Arc<StdMutex<HashSet<Ulid>>>,
     /// Hash states of in-place uploads, by provider upload id. Lost on restart, which only costs
     /// a longer read at completion.
-    part_chains: Arc<StdMutex<HashMap<String, crate::part_chain::PartChain>>>,
+    part_chains: Arc<StdMutex<HashMap<String, in_place::UploadState>>>,
     /// Shutdown close for the blob write path, mirroring the storage close so a
     /// mutation cannot land on a backend behind the final storage sync.
     closed: Arc<AtomicBool>,

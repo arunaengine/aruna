@@ -526,7 +526,12 @@ async fn owns_write(
         WriteOwner::Blob { .. } => BackendLocation::from_bytes(&value).ok()?,
         WriteOwner::UploadPart { .. } => MultipartPart::from_bytes(&value).ok()?.location,
         WriteOwner::Upload { .. } | WriteOwner::CompletedUpload { .. } => {
-            match MultipartUpload::from_bytes(&value).ok()?.backend_upload {
+            let record = MultipartUpload::from_bytes(&value).ok()?;
+            // An aborting upload gives its target up, so late provider parts are aborted too.
+            if record.status == MultipartUploadStatus::Aborting {
+                return Some(false);
+            }
+            match record.backend_upload {
                 Some(upload) => upload.location,
                 None => return Some(false),
             }
@@ -767,63 +772,65 @@ mod tests {
 
     #[tokio::test]
     async fn upload_keeps_target() {
-        // An in-place target stays while its upload record names it, so a retry completes.
-        let (_dir, storage, context) = setup_context();
-        let BlobCleanupWork::DeleteBlob { location } =
-            BlobCleanupWork::from_bytes(&delete_work()).unwrap()
-        else {
-            panic!("expected a delete row")
-        };
-        let upload_id = Ulid::generate();
-        let record = MultipartUpload {
-            upload_id,
-            backend: location.backend.clone(),
-            storage_class: None,
-            bucket: "bucket".to_string(),
-            key: "object".to_string(),
-            group_id: Ulid::generate(),
-            created_by: location.created_by,
-            created_at: SystemTime::now(),
-            status: MultipartUploadStatus::Open,
-            checksum_hint: None,
-            metadata: HashMap::new(),
-            placement_policies: Vec::new(),
-            subject_generation: 0,
-            completing_since_ms: None,
-            backend_upload: Some(BackendUpload {
-                location: location.clone(),
-                upload_id: "provider".to_string(),
-                record_id: Ulid::from_bytes([9u8; 16]),
-            }),
-        };
-        let event = storage
-            .send_storage_effect(StorageEffect::Write {
-                key_space: UPLOAD_KEYSPACE.to_string(),
-                key: upload_id.to_bytes().to_vec().into(),
-                value: record.to_bytes().unwrap().into(),
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::WriteResult { .. })
-        ));
-        let row = |upload_id| {
-            BlobCleanupWork::ReconcileWrite {
-                location: location.clone(),
+        // An open upload keeps its in-place target for a retry; an aborting one gives it up.
+        for (status, kept) in [
+            (MultipartUploadStatus::Open, true),
+            (MultipartUploadStatus::Aborting, false),
+        ] {
+            let (_dir, storage, context) = setup_context();
+            let BlobCleanupWork::DeleteBlob { mut location } =
+                BlobCleanupWork::from_bytes(&delete_work()).unwrap()
+            else {
+                panic!("expected a delete row")
+            };
+            // Opened long ago, so no create can still be running.
+            location.ulid = Ulid::from_parts(1, 3);
+            let upload_id = Ulid::generate();
+            let record = MultipartUpload {
+                upload_id,
+                backend: location.backend.clone(),
+                storage_class: None,
+                bucket: "bucket".to_string(),
+                key: "object".to_string(),
+                group_id: Ulid::generate(),
+                created_by: location.created_by,
+                created_at: SystemTime::now(),
+                status,
+                checksum_hint: None,
+                metadata: HashMap::new(),
+                placement_policies: Vec::new(),
+                subject_generation: 0,
+                completing_since_ms: None,
+                backend_upload: Some(BackendUpload {
+                    location: location.clone(),
+                    upload_id: "provider".to_string(),
+                    record_id: upload_id,
+                }),
+            };
+            let event = storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: UPLOAD_KEYSPACE.to_string(),
+                    key: upload_id.to_bytes().to_vec().into(),
+                    value: record.to_bytes().unwrap().into(),
+                    txn_id: None,
+                })
+                .await;
+            assert!(matches!(
+                event,
+                Event::Storage(StorageEvent::WriteResult { .. })
+            ));
+            let row = BlobCleanupWork::ReconcileWrite {
+                location,
                 owner: WriteOwner::Upload { upload_id },
-            }
-            .to_bytes()
-            .unwrap()
-        };
-        write_rows(&storage, vec![row(upload_id), row(Ulid::generate())]).await;
+            };
+            write_rows(&storage, vec![row.to_bytes().unwrap()]).await;
 
-        let outcome = process_cleanup_batch(&context).await.unwrap();
+            let outcome = process_cleanup_batch(&context).await.unwrap();
 
-        // The unowned row tries to delete, which fails here without a blob handle.
-        assert_eq!(outcome.processed, 1);
-        assert_eq!(outcome.failed, 1);
-        assert_eq!(remaining_rows(&storage).await, 1);
+            // A discard needs the blob handle this context lacks, so it fails and the row waits.
+            assert_eq!(outcome.processed, usize::from(kept));
+            assert_eq!(outcome.failed, usize::from(!kept));
+        }
     }
 
     #[tokio::test]
