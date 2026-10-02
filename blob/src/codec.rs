@@ -21,6 +21,8 @@ const HEADER_LEN: u64 = 8;
 const FOOTER_LEN: u64 = 9;
 /// A zstd window of 1 MiB covers any frame; larger windows are refused.
 const WINDOW_LOG: u32 = 20;
+/// Frames of the largest S3 object (5 TiB). Bounds the tail read before any frame.
+const MAX_FRAMES: u64 = 5 << 20;
 /// Largest zstd block; raw frames are cut into blocks of this size.
 const BLOCK_MAX: usize = 128 << 10;
 
@@ -105,10 +107,12 @@ impl FrameWriter {
         let too_large = || BlobError::WriteError("frame is too large".to_string());
         let len = u32::try_from(stored.len()).map_err(|_| too_large())?;
         let original = u32::try_from(original).map_err(|_| too_large())?;
-        self.frames = self
-            .frames
-            .checked_add(1)
-            .ok_or_else(|| BlobError::WriteError("object has too many frames".to_string()))?;
+        if u64::from(self.frames) >= MAX_FRAMES {
+            return Err(BlobError::WriteError(
+                "object has too many frames".to_string(),
+            ));
+        }
+        self.frames += 1;
         self.digests
             .extend_from_slice(blake3::hash(stored).as_bytes());
         self.entries.extend_from_slice(&len.to_le_bytes());
@@ -192,6 +196,9 @@ impl FrameEncoder {
 
 /// Byte range of the digests and seek table, checked against the record before any read.
 pub(crate) fn table_range(size: u64, layout: &FrameLayout) -> Result<Range<u64>, BlobError> {
+    if frame_count(size) > MAX_FRAMES {
+        return Err(integrity("object has too many frames"));
+    }
     let len = table_len(size);
     if layout.stored_size < len {
         return Err(integrity("stored size is too small for the seek table"));
@@ -212,7 +219,7 @@ impl FrameIndex {
     /// Verifies the table hash before using any value, then checks every frame bound.
     pub(crate) fn parse(size: u64, layout: &FrameLayout, tail: &[u8]) -> Result<Self, BlobError> {
         let frames = frame_count(size);
-        if tail.len() as u64 != table_len(size) {
+        if frames > MAX_FRAMES || tail.len() as u64 != table_len(size) {
             return Err(integrity("seek table has the wrong length"));
         }
         if blake3::hash(tail).as_bytes() != &layout.index_hash {
@@ -481,6 +488,13 @@ mod tests {
         let digest = *blake3::hash(&open).as_bytes();
         let result = decode_frame(1024, &digest, Bytes::from(open));
         assert!(matches!(result, Err(BlobError::IntegrityCheckFailed(_))));
+        // A record claiming more frames than the format allows is refused before any read.
+        let layout = FrameLayout {
+            level: 3,
+            stored_size: u64::MAX,
+            index_hash: [0; 32],
+        };
+        assert!(table_range(u64::MAX, &layout).is_err());
     }
 
     #[test]
