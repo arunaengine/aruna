@@ -3144,6 +3144,120 @@ async fn s3_cancelled_write() {
 }
 
 #[tokio::test]
+async fn claims_one_writer() {
+    // One attempt at a time writes a provider part; a settled attempt frees it.
+    let context = setup_blob_handle(5).await;
+    let handler = context.blob_handle.handler.clone();
+    let (first, second) = (Ulid::generate(), Ulid::generate());
+
+    assert!(matches!(
+        handler.claim_part("upload", 1, first),
+        Ok(Some(_))
+    ));
+    assert!(matches!(handler.claim_part("upload", 1, second), Ok(None)));
+    assert!(matches!(
+        handler.claim_part("upload", 2, second),
+        Ok(Some(_))
+    ));
+    // The release of the first attempt's reservation is how its operation settles.
+    handler.clear_active(first);
+    assert!(matches!(
+        handler.claim_part("upload", 1, second),
+        Ok(Some(_))
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_overlapping_writes() {
+    // An overlapping first upload of one part waits staged; its accepted record wins at completion.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "overlap.bin",
+            cold_backend(),
+            test_user_id(),
+        )
+        .await
+    else {
+        panic!("s3 upload did not open")
+    };
+    let size = 5 * 1024 * 1024;
+    let (started, on_start) = tokio::sync::oneshot::channel::<()>();
+    let (release, on_release) = tokio::sync::oneshot::channel::<()>();
+    let first = futures::stream::once(async move {
+        _ = started.send(());
+        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![1u8; size / 2]))
+    });
+    let rest = futures::stream::once(async move {
+        _ = on_release.await;
+        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![1u8; size / 2]))
+    });
+    let claimed = tokio::spawn({
+        let handler = handler.clone();
+        let upload = upload.clone();
+        async move {
+            handler
+                .write_upload_part(
+                    upload,
+                    1,
+                    Some(size as u64),
+                    test_user_id(),
+                    BackendStream::new(futures::StreamExt::chain(first, rest)),
+                )
+                .await
+        }
+    });
+    on_start.await.unwrap();
+
+    let second = vec![2u8; size];
+    let BlobEvent::WriteFinished { location } = handler
+        .write_part(
+            upload.clone(),
+            MultipartPartKey::new(upload.record_id, 1),
+            cold_backend(),
+            test_user_id(),
+            false,
+            false,
+            Some(size as u64),
+            stream_from_bytes(&second),
+        )
+        .await
+    else {
+        panic!("the overlapping write was not staged")
+    };
+    assert!(!location.partial);
+    release.send(()).unwrap();
+    assert!(matches!(
+        claimed.await.unwrap(),
+        BlobEvent::PartWritten { .. }
+    ));
+    let last = in_place_part(&handler, &upload, 2, b"tail").await;
+    let staged = MultipartPart {
+        part_number: 1,
+        location,
+        created_at: SystemTime::now(),
+        backend_etag: None,
+    };
+
+    let BlobEvent::WriteFinished { location } =
+        handler.complete_upload(upload, vec![staged, last]).await
+    else {
+        panic!("completion failed")
+    };
+    assert_eq!(
+        read_back(&handler, location).await,
+        [second.as_slice(), b"tail"].concat()
+    );
+}
+
+#[tokio::test]
 async fn filesystem_keeps_parts() {
     // Without a provider upload, parts stay blobs of their own.
     let context = setup_blob_handle(5).await;

@@ -217,7 +217,7 @@ jobs:
           | test(=blob::tests::s3_abort_path) | test(=blob::tests::s3_abandoned_cleanup)
           | test(=blob::tests::s3_provider_upload) | test(=blob::tests::s3_provider_abort)
           | test(=blob::tests::s3_abort_streaming) | test(=blob::tests::s3_staged_replacement)
-          | test(=blob::tests::s3_cancelled_write))
+          | test(=blob::tests::s3_cancelled_write) | test(=blob::tests::s3_overlapping_writes))
           | (package(aruna-operations) & binary(multipart) & test(=s3_provider_flow))'
 
   docker-backend:

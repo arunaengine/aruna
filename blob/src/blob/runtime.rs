@@ -620,14 +620,27 @@ impl BlobHandler {
                 blob,
             } => Box::pin(self.write_blob(&bucket, &key, resolved, created_by, blob)).await,
             BlobEffect::WritePart {
+                upload_id,
                 part_number,
+                resolved,
                 created_by,
+                compressed,
+                encrypted,
                 backend_upload: Some(upload),
                 size,
                 blob,
-                ..
             } => {
-                Box::pin(self.write_upload_part(*upload, part_number, size, created_by, blob)).await
+                Box::pin(self.write_part(
+                    *upload,
+                    MultipartPartKey::new(upload_id, part_number),
+                    resolved,
+                    created_by,
+                    compressed,
+                    encrypted,
+                    size,
+                    blob,
+                ))
+                .await
             }
             BlobEffect::WritePart {
                 upload_id,

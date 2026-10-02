@@ -18,7 +18,7 @@ use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, ResolvedBackend, WriteOwner,
 };
-use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart};
+use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};
 use bytes::Bytes;
 use byteview::ByteView;
 use futures::StreamExt;
@@ -41,6 +41,8 @@ struct PartTee {
 pub(super) struct UploadState {
     chain: PartChain,
     writes: usize,
+    /// The attempt allowed to write each provider part until its operation settles.
+    claims: HashMap<u16, Ulid>,
     /// Set by an abort; a part write that settles afterwards must abort again.
     aborted: bool,
 }
@@ -192,6 +194,73 @@ impl BlobHandler {
     }
 
     /// Streams one part into the provider upload, hashing it as it passes.
+    /// Claims the provider part for `attempt`, with the hash state to feed. `None` means
+    /// another attempt holds it: only one attempt at a time may write a provider part.
+    pub(super) fn claim_part(
+        &self,
+        upload_id: &str,
+        part_number: u16,
+        attempt: Ulid,
+    ) -> Result<Option<Option<Hasher>>, BlobError> {
+        let mut uploads = self.chains();
+        let state = uploads.entry(upload_id.to_string()).or_default();
+        if state.aborted {
+            return Err(aborted_upload());
+        }
+        if state.claims.contains_key(&part_number) {
+            return Ok(None);
+        }
+        state.claims.insert(part_number, attempt);
+        state.writes += 1;
+        Ok(Some(state.chain.begin(part_number, attempt)))
+    }
+
+    /// Frees the provider part an attempt claimed, once its operation settled.
+    pub(super) fn release_claim(&self, attempt: Ulid) {
+        for state in self.chains().values_mut() {
+            state.claims.retain(|_, held| *held != attempt);
+        }
+    }
+
+    /// Writes a part of an in-place upload. While another attempt holds the provider part, this
+    /// one waits in a blob of its own, which completion copies in if its record is accepted.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn write_part(
+        &self,
+        upload: BackendUpload,
+        part: MultipartPartKey,
+        resolved: ResolvedBackend,
+        created_by: UserId,
+        compressed: bool,
+        encrypted: bool,
+        size: Option<u64>,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    ) -> BlobEvent {
+        let attempt = Ulid::generate();
+        match self.claim_part(&upload.upload_id, part.part_number, attempt) {
+            Ok(Some(chain)) => {
+                self.stream_part(
+                    upload,
+                    part.part_number,
+                    attempt,
+                    chain,
+                    size,
+                    created_by,
+                    blob,
+                )
+                .await
+            }
+            Ok(None) => {
+                Box::pin(
+                    self.write_blob_part(part, resolved, created_by, compressed, encrypted, blob),
+                )
+                .await
+            }
+            Err(error) => BlobEvent::Error(error),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) async fn write_upload_part(
         &self,
         upload: BackendUpload,
@@ -200,25 +269,42 @@ impl BlobHandler {
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
-        let Some(size) = size else {
-            return BlobEvent::Error(BlobError::WriteError(
-                "an in-place part needs its Content-Length".to_string(),
-            ));
-        };
         let attempt = Ulid::generate();
-        let chain = {
-            let mut uploads = self.chains();
-            let state = uploads.entry(upload.upload_id.clone()).or_default();
-            if state.aborted {
-                return BlobEvent::Error(aborted_upload());
+        match self.claim_part(&upload.upload_id, part_number, attempt) {
+            Ok(Some(chain)) => {
+                self.stream_part(upload, part_number, attempt, chain, size, created_by, blob)
+                    .await
             }
-            state.writes += 1;
-            state.chain.begin(part_number, attempt)
-        };
+            Ok(None) => BlobEvent::Error(BlobError::WriteError(
+                "another write holds this provider part".to_string(),
+            )),
+            Err(error) => BlobEvent::Error(error),
+        }
+    }
+
+    /// Streams one claimed part into the provider upload, hashing it as it passes.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_part(
+        &self,
+        upload: BackendUpload,
+        part_number: u16,
+        attempt: Ulid,
+        chain: Option<Hasher>,
+        size: Option<u64>,
+        created_by: UserId,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    ) -> BlobEvent {
         let write = PartWrite {
             handler: self.clone(),
             upload: upload.clone(),
+            attempt,
             settled: false,
+        };
+        let Some(size) = size else {
+            write.settle(false).await;
+            return BlobEvent::Error(BlobError::WriteError(
+                "an in-place part needs its Content-Length".to_string(),
+            ));
         };
         let tee = Arc::new(StdMutex::new(PartTee {
             part: Hasher::new(),
@@ -255,9 +341,6 @@ impl BlobHandler {
                 .await
         }
         .await;
-        if write.settle().await {
-            return BlobEvent::Error(aborted_upload());
-        }
         let tee = std::mem::replace(
             &mut *tee.lock().unwrap_or_else(PoisonError::into_inner),
             PartTee {
@@ -267,6 +350,10 @@ impl BlobHandler {
                 client_failed: None,
             },
         );
+        let accepted = sent.is_ok() && tee.client_failed.is_none() && tee.size == size;
+        if write.settle(accepted).await {
+            return BlobEvent::Error(aborted_upload());
+        }
         let backend_etag = match (sent, tee.client_failed) {
             (Ok(etag), None) if tee.size == size => etag,
             (sent, failed) => {
@@ -536,13 +623,18 @@ impl BlobHandler {
 struct PartWrite {
     handler: BlobHandler,
     upload: BackendUpload,
+    attempt: Ulid,
     settled: bool,
 }
 
 impl PartWrite {
-    /// Reports whether the upload was aborted while the part streamed.
-    async fn settle(mut self) -> bool {
+    /// Reports whether the upload was aborted while the part streamed. An accepted part keeps
+    /// its claim until its operation commits or rolls back; a failed one frees it now.
+    async fn settle(mut self, accepted: bool) -> bool {
         self.settled = true;
+        if !accepted {
+            self.handler.release_claim(self.attempt);
+        }
         let aborted = self.handler.settle_write(&self.upload.upload_id);
         if aborted {
             self.handler.abort_again(&self.upload).await;
@@ -553,7 +645,11 @@ impl PartWrite {
 
 impl Drop for PartWrite {
     fn drop(&mut self) {
-        if self.settled || !self.handler.settle_write(&self.upload.upload_id) {
+        if self.settled {
+            return;
+        }
+        self.handler.release_claim(self.attempt);
+        if !self.handler.settle_write(&self.upload.upload_id) {
             return;
         }
         let (handler, upload) = (self.handler.clone(), self.upload.clone());
