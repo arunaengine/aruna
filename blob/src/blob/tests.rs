@@ -2826,7 +2826,7 @@ async fn in_place_part(
 
 #[tokio::test]
 #[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
-async fn s3_in_place_upload() {
+async fn s3_provider_upload() {
     // Saved states cover parts 1 and 2; part 3 is left out and part 4 is read back.
     let env = s3_env();
     let context = setup_s3_mixed(&env).await;
@@ -2877,7 +2877,7 @@ async fn s3_in_place_upload() {
 
 #[tokio::test]
 #[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
-async fn s3_in_place_abort() {
+async fn s3_provider_abort() {
     let env = s3_env();
     let context = setup_s3_mixed(&env).await;
     let handler = context.blob_handle.handler.clone();

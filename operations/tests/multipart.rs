@@ -1844,7 +1844,7 @@ async fn setup_s3_context() -> (TestContext, HashMap<String, String>) {
 
 #[tokio::test]
 #[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
-async fn s3_in_place_flow() {
+async fn s3_provider_flow() {
     // Out-of-order parts land in the provider upload and complete with exact hashes.
     let (context, config) = setup_s3_context().await;
     let realm_id = RealmId::from_bytes([1u8; 32]);

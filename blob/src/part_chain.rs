@@ -137,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn in_order_needs_no_read() {
+    fn ordered_skips_read() {
         let mut chain = PartChain::default();
         let parts = [attempt(1, 3000), attempt(2, 3000), attempt(3, 17)];
         parts.iter().for_each(|part| upload(&mut chain, *part));
@@ -161,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn skipped_part_reads_rest() {
+    fn skipped_part_rereads() {
         let mut chain = PartChain::default();
         let parts = [attempt(1, 700), attempt(2, 900), attempt(3, 64)];
         parts.iter().for_each(|part| upload(&mut chain, *part));
@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn earlier_repeat_drops_active() {
+    fn repeat_drops_active() {
         let mut chain = PartChain::default();
         let parts = [attempt(1, 300), attempt(2, 300)];
         upload(&mut chain, parts[0]);
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_part_frees_slot() {
+    fn failure_frees_slot() {
         let mut chain = PartChain::default();
         let failed = attempt(1, 100);
         assert!(chain.begin(1, failed.attempt).is_some());

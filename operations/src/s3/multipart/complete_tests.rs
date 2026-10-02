@@ -570,7 +570,7 @@ fn in_place_record(op: &CompleteUploadOperation, target: &BackendLocation) -> Mu
 }
 
 #[test]
-fn in_place_completes_upload() {
+fn completes_at_provider() {
     // The provider assembles the parts; no compose reads them back.
     let mut op = CompleteUploadOperation::new(finalize_input());
     let target = composed_location(Ulid::from_bytes([5u8; 16]));
@@ -593,7 +593,7 @@ fn in_place_completes_upload() {
 }
 
 #[test]
-fn conflict_keeps_in_place() {
+fn conflict_keeps_object() {
     // The in-place object is the only copy of its parts, so a refused finalize keeps it.
     let mut op = CompleteUploadOperation::new(finalize_input());
     let target = composed_location(Ulid::from_bytes([5u8; 16]));

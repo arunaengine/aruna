@@ -922,7 +922,7 @@ mod test {
     }
 
     #[test]
-    fn in_place_needs_length() {
+    fn provider_needs_length() {
         let (mut op, record) = in_place_op(None);
 
         let effects = op.step(read_record(&record));
@@ -939,7 +939,7 @@ mod test {
     }
 
     #[test]
-    fn in_place_keeps_etag() {
+    fn keeps_provider_etag() {
         // A part streamed into the provider upload records the ETag completion must name.
         let (mut op, record) = in_place_op(Some(4));
         let upload = record.backend_upload.clone().unwrap();
