@@ -29,8 +29,8 @@ use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, HiddenBlobKey,
-    ResolvedBackend,
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork, BlobTimeoutConfig,
+    HiddenBlobKey, ResolvedBackend, WriteOwner,
 };
 use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
@@ -451,6 +451,34 @@ async fn keyspace_count(storage_handle: &storage::StorageHandle, key_space: &str
         panic!("unexpected storage event")
     };
     values.len()
+}
+
+/// Cleanup rows that leave a target to the upload record `record_id`.
+async fn upload_rows(storage_handle: &storage::StorageHandle, record_id: Ulid) -> usize {
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 256,
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("unexpected storage event")
+    };
+    values
+        .iter()
+        .filter(|(_, value)| {
+            matches!(
+                BlobCleanupWork::from_bytes(value),
+                Ok(BlobCleanupWork::ReconcileWrite {
+                    owner: WriteOwner::Upload { upload_id },
+                    ..
+                }) if upload_id == record_id
+            )
+        })
+        .count()
 }
 
 fn test_user_id() -> UserId {
@@ -2915,6 +2943,11 @@ async fn s3_provider_abort() {
         handler.abort_upload(upload.clone()).await,
         BlobEvent::UploadAborted
     ));
+    // The release removed the reservation row, but the queued discard stays for late parts.
+    assert_eq!(
+        upload_rows(&context.storage_handle, upload.record_id).await,
+        1
+    );
     let path = upload.location.get_storage_path().unwrap();
     let native = handler.native_for(&upload.location).unwrap().unwrap();
     assert_eq!(native.abort_path(&path).await.unwrap(), 0);
@@ -3054,6 +3087,60 @@ async fn s3_abort_streaming() {
     let path = upload.location.get_storage_path().unwrap();
     let native = handler.native_for(&upload.location).unwrap().unwrap();
     assert_eq!(native.abort_path(&path).await.unwrap(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_cancelled_write() {
+    // A part write whose request is cancelled after an abort still settles and aborts again.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "cancelled.bin",
+            cold_backend(),
+            test_user_id(),
+        )
+        .await
+    else {
+        panic!("s3 upload did not open")
+    };
+    let (started, on_start) = tokio::sync::oneshot::channel::<()>();
+    let first = futures::stream::once(async move {
+        _ = started.send(());
+        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![1u8; 1024]))
+    });
+    let body = futures::StreamExt::chain(first, futures::stream::pending());
+    let writing = tokio::spawn({
+        let handler = handler.clone();
+        let upload = upload.clone();
+        async move {
+            handler
+                .write_upload_part(
+                    upload,
+                    1,
+                    Some(2048),
+                    test_user_id(),
+                    BackendStream::new(body),
+                )
+                .await
+        }
+    });
+    on_start.await.unwrap();
+    assert!(matches!(
+        handler.abort_upload(upload.clone()).await,
+        BlobEvent::UploadAborted
+    ));
+
+    writing.abort();
+    assert!(writing.await.unwrap_err().is_cancelled());
+
+    assert!(!handler.chains().contains_key(&upload.upload_id));
 }
 
 #[tokio::test]

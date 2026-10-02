@@ -46,7 +46,7 @@ pub(super) struct UploadState {
 }
 
 impl BlobHandler {
-    fn chains(&self) -> std::sync::MutexGuard<'_, HashMap<String, UploadState>> {
+    pub(super) fn chains(&self) -> std::sync::MutexGuard<'_, HashMap<String, UploadState>> {
         self.part_chains
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -64,6 +64,24 @@ impl BlobHandler {
         location: &BackendLocation,
         record_id: Ulid,
     ) -> Result<(), BlobError> {
+        self.write_upload_row(intent_key(location), location, record_id)
+            .await
+    }
+
+    /// Queues one more discard of the target under its own key, which no reservation release
+    /// removes: the provider may still take late parts after an abort.
+    async fn queue_discard(&self, upload: &BackendUpload) -> Result<(), BlobError> {
+        let key = ByteView::from(Ulid::generate().to_bytes().to_vec());
+        self.write_upload_row(key, &upload.location, upload.record_id)
+            .await
+    }
+
+    async fn write_upload_row(
+        &self,
+        key: ByteView,
+        location: &BackendLocation,
+        record_id: Ulid,
+    ) -> Result<(), BlobError> {
         let work = BlobCleanupWork::ReconcileWrite {
             location: location.clone(),
             owner: WriteOwner::Upload {
@@ -75,7 +93,7 @@ impl BlobHandler {
             .storage
             .send_effect(Effect::Storage(StorageEffect::Write {
                 key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-                key: intent_key(location),
+                key,
                 value,
                 txn_id: None,
             }))
@@ -197,6 +215,11 @@ impl BlobHandler {
             state.writes += 1;
             state.chain.begin(part_number, attempt)
         };
+        let write = PartWrite {
+            handler: self.clone(),
+            upload: upload.clone(),
+            settled: false,
+        };
         let tee = Arc::new(StdMutex::new(PartTee {
             part: Hasher::new(),
             chain,
@@ -232,13 +255,7 @@ impl BlobHandler {
                 .await
         }
         .await;
-        if self.settle_write(&upload.upload_id) {
-            // An abort ran while this part streamed, so the part it may have left goes too.
-            if let Ok(native) = self.native_upload(&upload.location)
-                && let Ok(path) = upload.location.get_storage_path()
-            {
-                _ = timeout(self.io_timeout(), native.abort(&path, &upload.upload_id)).await;
-            }
+        if write.settle().await {
             return BlobEvent::Error(aborted_upload());
         }
         let tee = std::mem::replace(
@@ -284,6 +301,25 @@ impl BlobHandler {
                 ..upload.location
             },
             backend_etag,
+        }
+    }
+
+    /// Aborts the provider upload again for a part that settled after the abort. A failure
+    /// leaves durable work, so the cleanup drain retries it.
+    async fn abort_again(&self, upload: &BackendUpload) {
+        let aborted = async {
+            let native = self.native_upload(&upload.location)?;
+            let path = upload.location.get_storage_path()?;
+            timeout(self.io_timeout(), native.abort(&path, &upload.upload_id))
+                .await
+                .map_err(|_| BlobError::DeleteError("timed out aborting the upload".into()))?
+        }
+        .await;
+        if let Err(error) = aborted {
+            tracing::warn!(%error, "Aborting a late part failed; queuing it for the cleanup drain");
+            if let Err(error) = self.queue_discard(upload).await {
+                tracing::error!(%error, "Failed to queue the abort of a late part");
+            }
         }
     }
 
@@ -468,9 +504,9 @@ impl BlobHandler {
                 .map_err(|_| BlobError::DeleteError("timed out aborting the upload".into()))??;
             let operator = self.operator_from_location(&upload.location)?;
             self.delete_path(&operator, &path).await?;
-            self.write_target_row(&upload.location, upload.record_id)
-                .await?;
-            self.release_reservation(&upload.location).await
+            self.release_reservation(&upload.location).await?;
+            // After the release, which removes the reservation row, so this work stays queued.
+            self.queue_discard(&upload).await
         }
         .await;
         let mut uploads = self.chains();
@@ -490,6 +526,43 @@ impl BlobHandler {
                     state.aborted = false;
                 }
                 BlobEvent::Error(error)
+            }
+        }
+    }
+}
+
+/// One part write in flight. Dropped unfinished, as when its request is cancelled, it still
+/// settles, and after an abort it aborts the provider upload again.
+struct PartWrite {
+    handler: BlobHandler,
+    upload: BackendUpload,
+    settled: bool,
+}
+
+impl PartWrite {
+    /// Reports whether the upload was aborted while the part streamed.
+    async fn settle(mut self) -> bool {
+        self.settled = true;
+        let aborted = self.handler.settle_write(&self.upload.upload_id);
+        if aborted {
+            self.handler.abort_again(&self.upload).await;
+        }
+        aborted
+    }
+}
+
+impl Drop for PartWrite {
+    fn drop(&mut self) {
+        if self.settled || !self.handler.settle_write(&self.upload.upload_id) {
+            return;
+        }
+        let (handler, upload) = (self.handler.clone(), self.upload.clone());
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move { handler.abort_again(&upload).await });
+            }
+            Err(_) => {
+                tracing::error!("Cannot abort after a cancelled part write without a runtime")
             }
         }
     }
