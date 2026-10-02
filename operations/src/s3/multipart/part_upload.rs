@@ -248,7 +248,7 @@ impl UploadPartOperation {
             created_by: self.input.created_by,
             compressed: self.input.compressed,
             encrypted: self.input.encrypted,
-            backend_upload: record.backend_upload,
+            backend_upload: record.backend_upload.map(Box::new),
             size: self.input.content_length,
             blob,
         })]
@@ -955,7 +955,7 @@ mod test {
         else {
             panic!("expected one part write, got {effects:?}")
         };
-        assert_eq!(backend_upload.as_ref(), Some(&upload));
+        assert_eq!(backend_upload.as_deref(), Some(&upload));
         assert_eq!(*size, Some(4));
 
         let mut written = upload.location.clone();

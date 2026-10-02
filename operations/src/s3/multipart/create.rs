@@ -148,7 +148,9 @@ impl CreateMultipartOperation {
             self.pending_error = Some(error);
             self.state = CreateMultipartState::AbortBackendUpload;
             let mut effects = self.abort();
-            effects.push(Effect::Blob(BlobEffect::AbortUpload { backend_upload }));
+            effects.push(Effect::Blob(BlobEffect::AbortUpload {
+                backend_upload: Box::new(backend_upload),
+            }));
             return effects;
         }
         self.state = CreateMultipartState::Error;
@@ -471,7 +473,9 @@ impl Operation for CreateMultipartOperation {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             });
         if let Some(backend_upload) = self.backend_upload.take() {
-            effects.push(Effect::Blob(BlobEffect::AbortUpload { backend_upload }));
+            effects.push(Effect::Blob(BlobEffect::AbortUpload {
+                backend_upload: Box::new(backend_upload),
+            }));
         }
         effects
     }
@@ -679,7 +683,7 @@ mod pure_tests {
                 [
                     Effect::Storage(StorageEffect::AbortTransaction { .. }),
                     Effect::Blob(BlobEffect::AbortUpload { backend_upload }),
-                ] if *backend_upload == upload
+                ] if **backend_upload == upload
             ),
             "expected both aborts, got {effects:?}"
         );

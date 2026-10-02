@@ -69,7 +69,7 @@ pub enum BlobEffect {
         compressed: bool,
         encrypted: bool,
         /// Streams the part into this provider upload instead of a blob of its own.
-        backend_upload: Option<BackendUpload>,
+        backend_upload: Option<Box<BackendUpload>>,
         /// Declared part size; a provider upload needs it before the first byte.
         size: Option<u64>,
         blob: BackendStream<Result<Bytes, StreamError>>,
@@ -83,11 +83,11 @@ pub enum BlobEffect {
     },
     /// Assembles the listed in-place parts and hashes the finished object.
     CompleteUpload {
-        backend_upload: BackendUpload,
+        backend_upload: Box<BackendUpload>,
         parts: Vec<MultipartPart>,
     },
     AbortUpload {
-        backend_upload: BackendUpload,
+        backend_upload: Box<BackendUpload>,
     },
     Compose {
         bucket: String,

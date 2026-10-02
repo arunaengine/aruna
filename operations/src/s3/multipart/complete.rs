@@ -861,7 +861,7 @@ impl CompleteUploadOperation {
         if let Some(backend_upload) = upload.backend_upload.clone() {
             self.state = CompleteUploadState::ComposeBlob;
             return smallvec![Effect::Blob(BlobEffect::CompleteUpload {
-                backend_upload,
+                backend_upload: Box::new(backend_upload),
                 parts: self.resolved_parts.clone(),
             })];
         }

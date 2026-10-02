@@ -244,7 +244,9 @@ impl AbortUploadOperation {
                 match backend_upload {
                     Some(backend_upload) => {
                         self.state = AbortUploadState::AbortBackendUpload;
-                        smallvec![Effect::Blob(BlobEffect::AbortUpload { backend_upload })]
+                        smallvec![Effect::Blob(BlobEffect::AbortUpload {
+                            backend_upload: Box::new(backend_upload),
+                        })]
                     }
                     None => self.read_upload_parts(),
                 }

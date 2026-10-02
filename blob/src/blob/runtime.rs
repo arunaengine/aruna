@@ -614,7 +614,7 @@ impl BlobHandler {
                 blob,
                 ..
             } => {
-                Box::pin(self.write_upload_part(upload, part_number, size, created_by, blob)).await
+                Box::pin(self.write_upload_part(*upload, part_number, size, created_by, blob)).await
             }
             BlobEffect::WritePart {
                 upload_id,
@@ -652,9 +652,9 @@ impl BlobHandler {
             BlobEffect::CompleteUpload {
                 backend_upload,
                 parts,
-            } => Box::pin(self.complete_upload(backend_upload, parts)).await,
+            } => Box::pin(self.complete_upload(*backend_upload, parts)).await,
             BlobEffect::AbortUpload { backend_upload } => {
-                Box::pin(self.abort_upload(backend_upload)).await
+                Box::pin(self.abort_upload(*backend_upload)).await
             }
             BlobEffect::Read { location } => Box::pin(self.read_blob(location)).await,
             BlobEffect::ReadRange { location, range } => {
