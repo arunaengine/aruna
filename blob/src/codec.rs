@@ -21,6 +21,8 @@ const HEADER_LEN: u64 = 8;
 const FOOTER_LEN: u64 = 9;
 /// A zstd window of 1 MiB covers any frame; larger windows are refused.
 const WINDOW_LOG: u32 = 20;
+/// Largest zstd block; raw frames are cut into blocks of this size.
+const BLOCK_MAX: usize = 128 << 10;
 
 fn frame_count(size: u64) -> u64 {
     size.div_ceil(FRAME_SIZE)
@@ -47,7 +49,8 @@ fn read_u32(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(value)
 }
 
-/// Compresses one frame with a zstd checksum. Data that does not compress becomes raw blocks.
+/// Compresses one frame with a zstd checksum. A frame that saves less than
+/// max(1 KiB, 5 percent) is stored as raw blocks instead.
 pub(crate) fn encode_frame(raw: Bytes, level: u8) -> Result<Bytes, BlobError> {
     let failed =
         |error: std::io::Error| BlobError::WriteError(format!("zstd compression failed: {error}"));
@@ -55,7 +58,27 @@ pub(crate) fn encode_frame(raw: Bytes, level: u8) -> Result<Bytes, BlobError> {
     compressor
         .set_parameter(CParameter::ChecksumFlag(true))
         .map_err(failed)?;
-    compressor.compress(&raw).map(Bytes::from).map_err(failed)
+    let compressed = compressor.compress(&raw).map_err(failed)?;
+    let wanted = 1024.max(raw.len() / 20);
+    match raw.len().saturating_sub(compressed.len()) >= wanted {
+        true => Ok(Bytes::from(compressed)),
+        false => Ok(raw_frame(&raw)),
+    }
+}
+
+/// A zstd frame of raw blocks: single segment, 4 byte content size, no checksum.
+fn raw_frame(raw: &[u8]) -> Bytes {
+    let mut out = BytesMut::with_capacity(raw.len() + 9 + 3 * raw.len().div_ceil(BLOCK_MAX));
+    out.extend_from_slice(&0xFD2F_B528u32.to_le_bytes());
+    out.extend_from_slice(&[0xA0]);
+    out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+    let mut blocks = raw.chunks(BLOCK_MAX).peekable();
+    while let Some(block) = blocks.next() {
+        let header = ((block.len() as u32) << 3) | u32::from(blocks.peek().is_none());
+        out.extend_from_slice(&header.to_le_bytes()[..3]);
+        out.extend_from_slice(block);
+    }
+    out.freeze()
 }
 
 /// Collects the seek table while frames are written.
@@ -482,6 +505,21 @@ mod tests {
             let result = decode(&tampered, &layout, size, 0..10);
             assert!(matches!(result, Err(BlobError::IntegrityCheckFailed(_))));
         }
+    }
+
+    #[test]
+    fn small_savings_stay_raw() {
+        // 10,000 zero bytes save about 9.7 KiB, less than 5 percent of 1 MiB.
+        let mut weak = random(FRAME_SIZE as usize, 5);
+        weak[..10_000].fill(0);
+        let stored = encode_frame(Bytes::from(weak.clone()), 3).unwrap();
+        assert!(stored.len() > weak.len());
+        assert_eq!(zstd::stream::decode_all(&stored[..]).unwrap(), weak);
+
+        let mut strong = random(FRAME_SIZE as usize, 5);
+        strong[..FRAME_SIZE as usize / 10].fill(0);
+        let stored = encode_frame(Bytes::from(strong.clone()), 3).unwrap();
+        assert!(stored.len() < strong.len() - FRAME_SIZE as usize / 20);
     }
 
     #[tokio::test]
