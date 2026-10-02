@@ -318,6 +318,14 @@ pub enum WriteOwner {
     Upload {
         upload_id: Ulid,
     },
+    /// A completed in-place target whose commit is uncertain: kept while the upload record
+    /// names it, or registered once a committed version owns it.
+    CompletedUpload {
+        upload_id: Ulid,
+        blake3: [u8; 32],
+        realm_id: RealmId,
+        ttl_ms: u64,
+    },
 }
 
 impl BlobCleanupWork {

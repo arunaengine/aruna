@@ -76,6 +76,8 @@ pub enum BlobEffect {
     },
     /// Opens a provider multipart upload where the backend has one; others answer `None`.
     OpenUpload {
+        /// The upload record that will own the provider upload, written after it opens.
+        record_id: Ulid,
         bucket: String,
         key: String,
         resolved: ResolvedBackend,

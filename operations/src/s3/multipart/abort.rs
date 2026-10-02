@@ -610,6 +610,7 @@ mod pure_tests {
                 upload.backend_upload = Some(BackendUpload {
                     location,
                     upload_id: "provider".to_string(),
+                    record_id: Ulid::from_bytes([9u8; 16]),
                 });
             }
 

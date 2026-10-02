@@ -3,17 +3,23 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::BlobHandler;
-use super::backend::build_backend_path;
+use super::backend::{build_backend_path, intent_key};
 use crate::hash::Hasher;
 use crate::part_chain::{PartAttempt, PartChain};
 use crate::s3::{NativeMultipart, multipart_etag};
 use aruna_core::UserId;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
-use aruna_core::events::BlobEvent;
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::handle::Handle as _;
+use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::storage::blob::{BackendLocation, ResolvedBackend};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BlobCleanupWork, ResolvedBackend, WriteOwner,
+};
 use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart};
 use bytes::Bytes;
+use byteview::ByteView;
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
@@ -42,8 +48,48 @@ impl BlobHandler {
         })
     }
 
+    /// Replaces the target's cleanup row: it is kept while the record names it, else discarded.
+    async fn write_target_row(
+        &self,
+        location: &BackendLocation,
+        record_id: Ulid,
+    ) -> Result<(), BlobError> {
+        let work = BlobCleanupWork::ReconcileWrite {
+            location: location.clone(),
+            owner: WriteOwner::Upload {
+                upload_id: record_id,
+            },
+        };
+        let value = ByteView::from(work.to_bytes().map_err(BlobError::ConversionError)?);
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+                key: intent_key(location),
+                value,
+                txn_id: None,
+            }))
+            .await;
+        match event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+            event => Err(BlobError::WriteError(format!(
+                "failed to write the upload target row: {event:?}"
+            ))),
+        }
+    }
+
+    /// Removes an in-place target, every provider upload under its path and its reservation.
+    pub(super) async fn discard_target(&self, location: &BackendLocation) -> Result<(), BlobError> {
+        let path = location.get_storage_path()?;
+        let operator = self.operator_from_location(location)?;
+        self.delete_path(&operator, &path).await?;
+        self.abort_uploads(location, &path).await?;
+        self.release_reservation(location).await
+    }
+
     pub(super) async fn open_upload(
         &self,
+        record_id: Ulid,
         bucket: &str,
         key: &str,
         resolved: ResolvedBackend,
@@ -88,6 +134,11 @@ impl BlobHandler {
             Ok(location) => location,
             Err(error) => return BlobEvent::Error(error),
         };
+        // Written before the provider upload exists, so a lost answer or a stop leaves a row.
+        if let Err(error) = self.write_target_row(&location, record_id).await {
+            _ = self.release_reservation(&location).await;
+            return BlobEvent::Error(error);
+        }
         let opened = async {
             let native = self.native_upload(&location)?;
             let path = location.get_storage_path()?;
@@ -101,10 +152,12 @@ impl BlobHandler {
                 backend_upload: Some(BackendUpload {
                     location,
                     upload_id,
+                    record_id,
                 }),
             },
             Err(error) => {
-                _ = self.release_reservation(&location).await;
+                // A create whose answer was lost may still have opened an upload at this path.
+                _ = self.discard_target(&location).await;
                 BlobEvent::Error(error)
             }
         }
@@ -232,8 +285,8 @@ impl BlobHandler {
             Ok(location) => {
                 self.chains().remove(&upload.upload_id);
                 reservation.retain();
-                // The object is the only copy of the parts: a failure keeps it for a retry.
-                match self.finalize_reservation(&location).await {
+                // The object is the only copy of the parts: its row keeps it for a retry.
+                match self.write_target_row(&location, upload.record_id).await {
                     Ok(()) => BlobEvent::WriteFinished { location },
                     Err(error) => BlobEvent::Error(error),
                 }

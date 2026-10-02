@@ -883,6 +883,7 @@ mod test {
         let upload = BackendUpload {
             location: op.written_location.take().unwrap(),
             upload_id: "provider-upload".to_string(),
+            record_id: Ulid::from_bytes([9u8; 16]),
         };
         op.input.content_length = content_length;
         op.input.body = Some(BackendStream::new(tokio_util::io::ReaderStream::new(

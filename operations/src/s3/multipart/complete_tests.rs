@@ -565,8 +565,44 @@ fn in_place_record(op: &CompleteUploadOperation, target: &BackendLocation) -> Mu
     record.backend_upload = Some(BackendUpload {
         location: target.clone(),
         upload_id: "provider".to_string(),
+        record_id: Ulid::from_bytes([9u8; 16]),
     });
     record
+}
+
+#[test]
+fn uncertain_keeps_object() {
+    // A commit that may not have landed leaves the in-place object to the upload or its version.
+    let mut op = CompleteUploadOperation::new(finalize_input());
+    let mut target = composed_location(Ulid::from_bytes([5u8; 16]));
+    target.hashes.insert(
+        aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+        vec![7u8; 32],
+    );
+    op.upload_record = Some(in_place_record(&op, &target));
+    op.reset_done = true;
+    op.composed_location = Some(target.clone());
+    op.state = CompleteUploadState::CommitFinalizeTransaction;
+
+    let effects = op.step(Event::Storage(StorageEvent::Error {
+        error: StorageError::CommitFailed,
+    }));
+
+    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        panic!("expected reconciliation to be queued, got {effects:?}")
+    };
+    assert_eq!(
+        BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
+        BlobCleanupWork::ReconcileWrite {
+            location: target,
+            owner: WriteOwner::CompletedUpload {
+                upload_id: op.input.upload_id,
+                blake3: [7u8; 32],
+                realm_id: op.input.realm_id,
+                ttl_ms: RoCrateLimits::default().holder_ttl_ms,
+            },
+        }
+    );
 }
 
 #[test]

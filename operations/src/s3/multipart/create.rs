@@ -93,6 +93,8 @@ pub struct CreateMultipartResult {
 #[derive(Debug, PartialEq)]
 pub struct CreateMultipartOperation {
     input: CreateMultipartInput,
+    /// Chosen before the provider upload opens, so its cleanup row can name the record.
+    upload_id: Ulid,
     state: CreateMultipartState,
     txn_id: Option<TxnId>,
     resolved: Option<ResolvedBackend>,
@@ -116,6 +118,7 @@ impl CreateMultipartOperation {
     pub fn new(input: CreateMultipartInput) -> Self {
         Self {
             input,
+            upload_id: Ulid::generate(),
             state: CreateMultipartState::Init,
             txn_id: None,
             resolved: None,
@@ -189,6 +192,7 @@ impl CreateMultipartOperation {
         };
         self.state = CreateMultipartState::OpenUpload;
         smallvec![Effect::Blob(BlobEffect::OpenUpload {
+            record_id: self.upload_id,
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
             resolved,
@@ -348,7 +352,7 @@ impl CreateMultipartOperation {
         let record = MultipartUpload {
             backend: resolved.backend,
             storage_class: resolved.storage_class,
-            upload_id: Ulid::generate(),
+            upload_id: self.upload_id,
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
             group_id: self.input.group_id,
@@ -666,6 +670,7 @@ mod pure_tests {
                 hashes: std::collections::HashMap::new(),
             },
             upload_id: "provider".to_string(),
+            record_id: Ulid::from_bytes([9u8; 16]),
         };
         operation.step(opened(Some(upload.clone())));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {

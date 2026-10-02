@@ -2834,7 +2834,13 @@ async fn s3_provider_upload() {
     let BlobEvent::UploadOpened {
         backend_upload: Some(upload),
     } = handler
-        .open_upload("bucket", "in-place.bin", cold_backend(), test_user_id())
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "in-place.bin",
+            cold_backend(),
+            test_user_id(),
+        )
         .await
     else {
         panic!("s3 upload did not open")
@@ -2892,7 +2898,13 @@ async fn s3_provider_abort() {
     let BlobEvent::UploadOpened {
         backend_upload: Some(upload),
     } = handler
-        .open_upload("bucket", "aborted.bin", cold_backend(), test_user_id())
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "aborted.bin",
+            cold_backend(),
+            test_user_id(),
+        )
         .await
     else {
         panic!("s3 upload did not open")
@@ -2923,6 +2935,7 @@ async fn filesystem_keeps_parts() {
         .blob_handle
         .handler
         .open_upload(
+            Ulid::generate(),
             "bucket",
             "key",
             ResolvedBackend::node_default(),

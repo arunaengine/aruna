@@ -322,6 +322,19 @@ impl BlobHandle {
         handler.reconcile_reservation(location).await
     }
 
+    /// Removes an in-place target no upload record or version owns any more.
+    pub async fn discard_target(
+        &self,
+        location: aruna_core::structs::storage::blob::BackendLocation,
+    ) -> Result<(), BlobError> {
+        let effect = BlobEffect::Delete {
+            location: location.clone(),
+        };
+        let _hold = self.handler.hold_backends(&effect)?;
+        let handler = self.handler.with_group_backends(&effect).await?;
+        handler.discard_target(&location).await
+    }
+
     pub fn clear_reservation(&self, id: Ulid) {
         self.handler.clear_active(id);
     }
@@ -644,11 +657,12 @@ impl BlobHandler {
                 parts,
             } => Box::pin(self.compose_blob(&bucket, &key, resolved, created_by, parts)).await,
             BlobEffect::OpenUpload {
+                record_id,
                 bucket,
                 key,
                 resolved,
                 created_by,
-            } => Box::pin(self.open_upload(&bucket, &key, resolved, created_by)).await,
+            } => Box::pin(self.open_upload(record_id, &bucket, &key, resolved, created_by)).await,
             BlobEffect::CompleteUpload {
                 backend_upload,
                 parts,

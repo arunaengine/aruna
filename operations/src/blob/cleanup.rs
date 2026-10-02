@@ -27,7 +27,7 @@ use aruna_core::types::Key;
 use tracing::{error, warn};
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, now_ms};
 use crate::groups::backends::{backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
 use crate::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
@@ -328,6 +328,23 @@ async fn delete_cleanup_rows(
 async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> bool {
     match work {
         BlobCleanupWork::DeleteBlob { location } => delete_blob(context, location).await,
+        BlobCleanupWork::ReconcileWrite {
+            location,
+            owner: WriteOwner::Upload { upload_id },
+        } => reconcile_target(context, upload_id, None, location).await,
+        BlobCleanupWork::ReconcileWrite {
+            location,
+            owner:
+                WriteOwner::CompletedUpload {
+                    upload_id,
+                    blake3,
+                    realm_id,
+                    ttl_ms,
+                },
+        } => {
+            let holder = (blake3, realm_id, ttl_ms);
+            reconcile_target(context, upload_id, Some(holder), location).await
+        }
         // The committed metadata decides. An unreadable owner is not a proof of
         // either outcome, so the row waits for a drain that can read it.
         BlobCleanupWork::ReconcileWrite { location, owner } => {
@@ -343,7 +360,9 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> boo
                             realm_id,
                             ttl_ms,
                         } => register_dht(context, blake3, realm_id, ttl_ms).await,
-                        WriteOwner::UploadPart { .. } | WriteOwner::Upload { .. } => true,
+                        WriteOwner::UploadPart { .. }
+                        | WriteOwner::Upload { .. }
+                        | WriteOwner::CompletedUpload { .. } => true,
                     }
                 }
                 Some(false) => delete_blob(context, location).await,
@@ -357,6 +376,52 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> boo
             realm_id,
             ttl_ms,
         } => register_dht(context, blake3, realm_id, ttl_ms).await,
+    }
+}
+
+/// An in-place target stays while its upload record names it, or once a committed version owns
+/// it. Neither, after the grace a running create needs, discards it with its provider uploads.
+async fn reconcile_target(
+    context: &DriverContext,
+    upload_id: Ulid,
+    holder: Option<([u8; 32], RealmId, u64)>,
+    location: BackendLocation,
+) -> bool {
+    match owns_write(context, &WriteOwner::Upload { upload_id }, &location).await {
+        None => return false,
+        Some(true) => {
+            if let Some(blob_handle) = context.blob_handle.as_ref() {
+                blob_handle.clear_reservation(location.ulid);
+            }
+            return true;
+        }
+        Some(false) => {}
+    }
+    if let Some((blake3, realm_id, ttl_ms)) = holder {
+        let owner = WriteOwner::Blob {
+            blake3,
+            realm_id,
+            ttl_ms,
+        };
+        match owns_write(context, &owner, &location).await {
+            None => return false,
+            Some(true) => return register_dht(context, blake3, realm_id, ttl_ms).await,
+            Some(false) => {}
+        }
+    }
+    let opened_ms = location.ulid.timestamp_ms();
+    if now_ms().saturating_sub(opened_ms) < BLOB_CLEANUP_AFTER.as_millis() as u64 {
+        return false;
+    }
+    let Some(blob_handle) = context.blob_handle.as_ref() else {
+        return false;
+    };
+    match blob_handle.discard_target(location).await {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(%error, "Discarding an in-place upload target failed");
+            false
+        }
     }
 }
 
@@ -438,7 +503,9 @@ async fn owns_write(
                 .ok()?
                 .into(),
         ),
-        WriteOwner::Upload { upload_id } => (UPLOAD_KEYSPACE, upload_id.to_bytes().to_vec().into()),
+        WriteOwner::Upload { upload_id } | WriteOwner::CompletedUpload { upload_id, .. } => {
+            (UPLOAD_KEYSPACE, upload_id.to_bytes().to_vec().into())
+        }
     };
     let event = context
         .storage_handle
@@ -458,11 +525,12 @@ async fn owns_write(
     let owned = match owner {
         WriteOwner::Blob { .. } => BackendLocation::from_bytes(&value).ok()?,
         WriteOwner::UploadPart { .. } => MultipartPart::from_bytes(&value).ok()?.location,
-        WriteOwner::Upload { .. } => match MultipartUpload::from_bytes(&value).ok()?.backend_upload
-        {
-            Some(upload) => upload.location,
-            None => return Some(false),
-        },
+        WriteOwner::Upload { .. } | WriteOwner::CompletedUpload { .. } => {
+            match MultipartUpload::from_bytes(&value).ok()?.backend_upload {
+                Some(upload) => upload.location,
+                None => return Some(false),
+            }
+        }
     };
     Some(owned.same_object(location))
 }
@@ -725,6 +793,7 @@ mod tests {
             backend_upload: Some(BackendUpload {
                 location: location.clone(),
                 upload_id: "provider".to_string(),
+                record_id: Ulid::from_bytes([9u8; 16]),
             }),
         };
         let event = storage

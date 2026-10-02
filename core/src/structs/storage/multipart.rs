@@ -87,6 +87,8 @@ pub struct BackendUpload {
     /// Where the completed object lands. It holds no object until completion.
     pub location: BackendLocation,
     pub upload_id: String,
+    /// The Aruna upload record this provider upload belongs to.
+    pub record_id: Ulid,
 }
 
 impl MultipartUpload {

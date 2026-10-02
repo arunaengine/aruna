@@ -10,16 +10,17 @@ use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    DHT_KEYSPACE, OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, UPLOAD_KEYSPACE,
+    UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    Backend, BackendConfig, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    CurrentVersionPointer, HashIndex, VersionKey,
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork, BlobHeadKey,
+    BlobLocationKey, BlobVersion, CurrentVersionPointer, HashIndex, VersionKey, WriteOwner,
 };
 use aruna_core::structs::storage::multipart::{
     COMPLETION_LEASE_MS, MultipartChecksumHint, MultipartChecksumType, MultipartObjectKey,
@@ -1951,4 +1952,86 @@ async fn s3_provider_flow() {
             .unwrap(),
         0
     );
+
+    // A create whose answer was lost left a provider upload and only its target row.
+    let mut lost = target.clone();
+    lost.backend_path = format!("bucket/lost/{}", Ulid::generate());
+    lost.ulid = Ulid::from_parts(1, 9);
+    let lost_path = lost.get_storage_path().unwrap();
+    native.create(&lost_path).await.unwrap();
+    write_target_row(&context, Ulid::generate(), &lost).await;
+    process_cleanup_batch(&context.driver).await.unwrap();
+    assert_eq!(native.abort_path(&lost_path).await.unwrap(), 0);
+}
+
+/// Replaces the cleanup row under `key` with one that leaves `location` to an upload record.
+async fn write_target_row(context: &TestContext, key: Ulid, location: &BackendLocation) {
+    let work = BlobCleanupWork::ReconcileWrite {
+        location: location.clone(),
+        owner: WriteOwner::Upload {
+            upload_id: Ulid::generate(),
+        },
+    };
+    let event = context
+        .driver
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: key.to_bytes().to_vec().into(),
+            value: work.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+}
+
+async fn stored_blob(context: &TestContext, key: &str) -> BackendLocation {
+    let blob_handle = context.driver.blob_handle.as_ref().unwrap();
+    let Event::Blob(BlobEvent::WriteFinished { location }) = blob_handle
+        .send_blob_effect(BlobEffect::Write {
+            bucket: "bucket".to_string(),
+            key: key.to_string(),
+            resolved: aruna_core::structs::storage::blob::ResolvedBackend::node_default(),
+            created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
+            blob: stream_from_bytes(b"target"),
+        })
+        .await
+    else {
+        panic!("blob write failed")
+    };
+    location
+}
+
+#[tokio::test]
+async fn orphan_target_discarded() {
+    // A target no upload record names waits out the create grace, then goes.
+    let context = setup_context().await;
+    let fresh = stored_blob(&context, "fresh.bin").await;
+    write_target_row(&context, fresh.ulid, &fresh).await;
+    let stale = stored_blob(&context, "stale.bin").await;
+    let mut old = stale.clone();
+    old.ulid = Ulid::from_parts(1, 7);
+    write_target_row(&context, stale.ulid, &old).await;
+
+    process_cleanup_batch(&context.driver).await.unwrap();
+
+    assert!(exists(fresh.get_full_path().unwrap()).unwrap());
+    assert!(!exists(stale.get_full_path().unwrap()).unwrap());
+    let rows = read_value(
+        &context.driver,
+        BLOB_CLEANUP_KEYSPACE,
+        fresh.ulid.to_bytes().to_vec(),
+    )
+    .await;
+    assert!(rows.is_some());
+    let gone = read_value(
+        &context.driver,
+        BLOB_CLEANUP_KEYSPACE,
+        stale.ulid.to_bytes().to_vec(),
+    )
+    .await;
+    assert!(gone.is_none());
 }

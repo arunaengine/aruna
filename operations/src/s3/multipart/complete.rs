@@ -398,14 +398,23 @@ impl CompleteUploadOperation {
         else {
             return self.queue_cleanup_work(BlobCleanupWork::ReconcileReservation { location });
         };
-        self.queue_cleanup_work(BlobCleanupWork::ReconcileWrite {
-            location,
-            owner: WriteOwner::Blob {
+        let (realm_id, ttl_ms) = (self.input.realm_id, self.rocrate_limits.holder_ttl_ms);
+        // An in-place object is the only copy of its parts: a commit that did not land must
+        // leave it to the upload, one that did to its version.
+        let owner = match self.in_place_target(&location) {
+            true => WriteOwner::CompletedUpload {
+                upload_id: self.input.upload_id,
                 blake3,
-                realm_id: self.input.realm_id,
-                ttl_ms: self.rocrate_limits.holder_ttl_ms,
+                realm_id,
+                ttl_ms,
             },
-        })
+            false => WriteOwner::Blob {
+                blake3,
+                realm_id,
+                ttl_ms,
+            },
+        };
+        self.queue_cleanup_work(BlobCleanupWork::ReconcileWrite { location, owner })
     }
 
     fn queue_rollback_delete(&mut self) -> Effects {
