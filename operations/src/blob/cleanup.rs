@@ -343,7 +343,7 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> boo
                             realm_id,
                             ttl_ms,
                         } => register_dht(context, blake3, realm_id, ttl_ms).await,
-                        WriteOwner::UploadPart { .. } => true,
+                        WriteOwner::UploadPart { .. } | WriteOwner::Upload { .. } => true,
                     }
                 }
                 Some(false) => delete_blob(context, location).await,
@@ -438,6 +438,7 @@ async fn owns_write(
                 .ok()?
                 .into(),
         ),
+        WriteOwner::Upload { upload_id } => (UPLOAD_KEYSPACE, upload_id.to_bytes().to_vec().into()),
     };
     let event = context
         .storage_handle
@@ -457,6 +458,11 @@ async fn owns_write(
     let owned = match owner {
         WriteOwner::Blob { .. } => BackendLocation::from_bytes(&value).ok()?,
         WriteOwner::UploadPart { .. } => MultipartPart::from_bytes(&value).ok()?.location,
+        WriteOwner::Upload { .. } => match MultipartUpload::from_bytes(&value).ok()?.backend_upload
+        {
+            Some(upload) => upload.location,
+            None => return Some(false),
+        },
     };
     Some(owned.same_object(location))
 }
@@ -469,10 +475,13 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
+    use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, UPLOAD_KEYSPACE};
     use aruna_core::structs::execution::job::RoCrateLimits;
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
+    };
+    use aruna_core::structs::storage::multipart::{
+        BackendUpload, MultipartUpload, MultipartUploadStatus,
     };
     use aruna_storage::storage::{FjallStorage, StorageHandle};
     use std::collections::HashMap;
@@ -684,6 +693,66 @@ mod tests {
         let outcome = process_cleanup_batch(&context).await.unwrap();
 
         assert_eq!(outcome.processed, 0);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(remaining_rows(&storage).await, 1);
+    }
+
+    #[tokio::test]
+    async fn upload_keeps_target() {
+        // An in-place target stays while its upload record names it, so a retry completes.
+        let (_dir, storage, context) = setup_context();
+        let BlobCleanupWork::DeleteBlob { location } =
+            BlobCleanupWork::from_bytes(&delete_work()).unwrap()
+        else {
+            panic!("expected a delete row")
+        };
+        let upload_id = Ulid::generate();
+        let record = MultipartUpload {
+            upload_id,
+            backend: location.backend.clone(),
+            storage_class: None,
+            bucket: "bucket".to_string(),
+            key: "object".to_string(),
+            group_id: Ulid::generate(),
+            created_by: location.created_by,
+            created_at: SystemTime::now(),
+            status: MultipartUploadStatus::Open,
+            checksum_hint: None,
+            metadata: HashMap::new(),
+            placement_policies: Vec::new(),
+            subject_generation: 0,
+            completing_since_ms: None,
+            backend_upload: Some(BackendUpload {
+                location: location.clone(),
+                upload_id: "provider".to_string(),
+            }),
+        };
+        let event = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: UPLOAD_KEYSPACE.to_string(),
+                key: upload_id.to_bytes().to_vec().into(),
+                value: record.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        let row = |upload_id| {
+            BlobCleanupWork::ReconcileWrite {
+                location: location.clone(),
+                owner: WriteOwner::Upload { upload_id },
+            }
+            .to_bytes()
+            .unwrap()
+        };
+        write_rows(&storage, vec![row(upload_id), row(Ulid::generate())]).await;
+
+        let outcome = process_cleanup_batch(&context).await.unwrap();
+
+        // The unowned row tries to delete, which fails here without a blob handle.
+        assert_eq!(outcome.processed, 1);
         assert_eq!(outcome.failed, 1);
         assert_eq!(remaining_rows(&storage).await, 1);
     }

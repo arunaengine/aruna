@@ -368,12 +368,27 @@ impl CompleteUploadOperation {
         }
         self.state = CompleteUploadState::CleanupFailedCompose;
         match self.composed_location.take() {
+            // An in-place object is the only copy of its parts, so a retry completes from it.
+            Some(location) if self.in_place_target(&location) => {
+                let upload_id = self.input.upload_id;
+                self.queue_cleanup_work(BlobCleanupWork::ReconcileWrite {
+                    location,
+                    owner: WriteOwner::Upload { upload_id },
+                })
+            }
             Some(location) => {
                 self.rollback_location = Some(location.clone());
                 smallvec![Effect::Blob(BlobEffect::Delete { location })]
             }
             None => self.emit_pending_error(),
         }
+    }
+
+    fn in_place_target(&self, location: &BackendLocation) -> bool {
+        self.upload_record
+            .as_ref()
+            .and_then(|upload| upload.backend_upload.as_ref())
+            .is_some_and(|upload| upload.location.same_object(location))
     }
 
     fn queue_reconcile_write(&mut self, location: BackendLocation) -> Effects {
@@ -843,6 +858,13 @@ impl CompleteUploadOperation {
         let Some(upload) = self.upload_record.as_ref() else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
+        if let Some(backend_upload) = upload.backend_upload.clone() {
+            self.state = CompleteUploadState::ComposeBlob;
+            return smallvec![Effect::Blob(BlobEffect::CompleteUpload {
+                backend_upload,
+                parts: self.resolved_parts.clone(),
+            })];
+        }
         let pinned = ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone());
         let parts = self
             .resolved_parts

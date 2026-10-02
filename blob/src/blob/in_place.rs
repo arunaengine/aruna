@@ -232,12 +232,10 @@ impl BlobHandler {
             Ok(location) => {
                 self.chains().remove(&upload.upload_id);
                 reservation.retain();
+                // The object is the only copy of the parts: a failure keeps it for a retry.
                 match self.finalize_reservation(&location).await {
                     Ok(()) => BlobEvent::WriteFinished { location },
-                    Err(error) => BlobEvent::Error(BlobError::WriteCleanup {
-                        location,
-                        message: error.to_string(),
-                    }),
+                    Err(error) => BlobEvent::Error(error),
                 }
             }
             Err(error) => BlobEvent::Error(error),

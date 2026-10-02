@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use super::*;
 use aruna_core::structs::storage::blob::BackendRef;
-use aruna_core::structs::storage::multipart::{COMPLETION_LEASE_MS, MultipartChecksumHint};
+use aruna_core::structs::storage::multipart::{
+    BackendUpload, COMPLETION_LEASE_MS, MultipartChecksumHint,
+};
 use aruna_core::task::{TaskEffect, TaskKey};
 
 pub(super) const TEST_NOW_MS: u64 = 1_700_000_000_000;
@@ -556,6 +558,66 @@ fn conflict_deletes_composed() {
         effects.as_slice(),
         [Effect::Blob(BlobEffect::Delete { .. })]
     ));
+}
+
+fn in_place_record(op: &CompleteUploadOperation, target: &BackendLocation) -> MultipartUpload {
+    let mut record = open_upload_record(&op.input);
+    record.backend_upload = Some(BackendUpload {
+        location: target.clone(),
+        upload_id: "provider".to_string(),
+    });
+    record
+}
+
+#[test]
+fn in_place_completes_upload() {
+    // The provider assembles the parts; no compose reads them back.
+    let mut op = CompleteUploadOperation::new(finalize_input());
+    let target = composed_location(Ulid::from_bytes([5u8; 16]));
+    op.upload_record = Some(in_place_record(&op, &target));
+    op.resolved_parts = vec![part_record(1, 10)];
+
+    let effects = op.compose_blob();
+
+    let [
+        Effect::Blob(BlobEffect::CompleteUpload {
+            backend_upload,
+            parts,
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("expected the provider completion, got {effects:?}")
+    };
+    assert_eq!(backend_upload.location, target);
+    assert_eq!(parts, &op.resolved_parts);
+}
+
+#[test]
+fn conflict_keeps_in_place() {
+    // The in-place object is the only copy of its parts, so a refused finalize keeps it.
+    let mut op = CompleteUploadOperation::new(finalize_input());
+    let target = composed_location(Ulid::from_bytes([5u8; 16]));
+    op.upload_record = Some(in_place_record(&op, &target));
+    op.reset_done = true;
+    op.composed_location = Some(target.clone());
+    op.state = CompleteUploadState::CommitFinalizeTransaction;
+
+    let effects = op.step(Event::Storage(StorageEvent::Error {
+        error: StorageError::TransactionConflict,
+    }));
+
+    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        panic!("expected a kept cleanup row, got {effects:?}")
+    };
+    assert_eq!(
+        BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
+        BlobCleanupWork::ReconcileWrite {
+            location: target,
+            owner: WriteOwner::Upload {
+                upload_id: op.input.upload_id,
+            },
+        }
+    );
 }
 
 #[test]

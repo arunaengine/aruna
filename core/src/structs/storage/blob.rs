@@ -314,6 +314,10 @@ pub enum WriteOwner {
         upload_id: Ulid,
         part_number: u16,
     },
+    /// The target of an in-place upload, kept while the upload record names it.
+    Upload {
+        upload_id: Ulid,
+    },
 }
 
 impl BlobCleanupWork {
