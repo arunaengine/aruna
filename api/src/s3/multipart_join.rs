@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::structs::checksum::ExpectedChecksum;
+use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_operations::s3::multipart::complete::{CompleteMultipartPart, CompleteUploadResult};
 use aruna_tasks::join_registry::{JoinRegistry, JoinWatch, await_joined};
@@ -27,17 +27,26 @@ pub type CompletionRegistry = JoinRegistry<CompletionKey, CompletionOutcome, Com
 pub struct CompletionRequest {
     parts: Vec<CompleteMultipartPart>,
     expected_checksums: Vec<ExpectedChecksum>,
+    checksum_algorithm: Option<ChecksumAlgorithm>,
     checksum_type: MultipartChecksumType,
     checksum_type_explicit: bool,
     object_size: Option<u64>,
+}
+
+/// The checksum a CompleteMultipartUpload declares: its algorithm, type and whether the type
+/// was named.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeclaredChecksum {
+    pub algorithm: Option<ChecksumAlgorithm>,
+    pub checksum_type: MultipartChecksumType,
+    pub explicit: bool,
 }
 
 impl CompletionRequest {
     pub fn new(
         parts: &[CompleteMultipartPart],
         expected_checksums: &[ExpectedChecksum],
-        checksum_type: MultipartChecksumType,
-        checksum_type_explicit: bool,
+        declared: DeclaredChecksum,
         object_size: Option<u64>,
     ) -> Self {
         let parts = parts
@@ -53,8 +62,9 @@ impl CompletionRequest {
         Self {
             parts,
             expected_checksums: expected_checksums.to_vec(),
-            checksum_type,
-            checksum_type_explicit,
+            checksum_algorithm: declared.algorithm,
+            checksum_type: declared.checksum_type,
+            checksum_type_explicit: declared.explicit,
             object_size,
         }
     }
@@ -137,12 +147,19 @@ mod tests {
         }
     }
 
+    fn declared(checksum_type: MultipartChecksumType, explicit: bool) -> DeclaredChecksum {
+        DeclaredChecksum {
+            algorithm: None,
+            checksum_type,
+            explicit,
+        }
+    }
+
     fn request() -> CompletionRequest {
         CompletionRequest::new(
             &[part("abc")],
             &[],
-            MultipartChecksumType::FullObject,
-            false,
+            declared(MultipartChecksumType::FullObject, false),
             None,
         )
     }
@@ -163,8 +180,7 @@ mod tests {
         let quoted = CompletionRequest::new(
             &[part("\"abc\"")],
             &[],
-            MultipartChecksumType::FullObject,
-            false,
+            declared(MultipartChecksumType::FullObject, false),
             None,
         );
         assert_eq!(quoted, request());
@@ -180,22 +196,28 @@ mod tests {
             CompletionRequest::new(
                 &[part("def")],
                 &[],
-                MultipartChecksumType::FullObject,
-                false,
+                declared(MultipartChecksumType::FullObject, false),
                 None,
             ),
             CompletionRequest::new(
                 &[part("abc")],
                 &[],
-                MultipartChecksumType::FullObject,
-                false,
+                declared(MultipartChecksumType::FullObject, false),
                 Some(9),
             ),
             CompletionRequest::new(
                 &[part("abc")],
                 &[],
-                MultipartChecksumType::Composite,
-                true,
+                declared(MultipartChecksumType::Composite, true),
+                None,
+            ),
+            CompletionRequest::new(
+                &[part("abc")],
+                &[],
+                DeclaredChecksum {
+                    algorithm: Some(ChecksumAlgorithm::Crc32),
+                    ..declared(MultipartChecksumType::FullObject, false)
+                },
                 None,
             ),
         ] {

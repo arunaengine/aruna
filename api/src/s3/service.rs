@@ -36,7 +36,7 @@ use crate::s3::checksum::{
 use crate::s3::cors::{map_bucket_cors, parse_bucket_cors};
 use crate::s3::error::{IntoS3Error, gate_context_error, routing_inputs_error};
 use crate::s3::multipart_join::{
-    CompletionFailure, CompletionRegistry, CompletionRequest, await_completion,
+    CompletionFailure, CompletionRegistry, CompletionRequest, DeclaredChecksum, await_completion,
     completion_registry, conflicting_completion,
 };
 use crate::s3::scope::SubpathScope;
@@ -1321,11 +1321,15 @@ impl S3 for ArunaS3Service {
             .map_err(gate_context_error)?;
         let checksum_type = parse_checksum_type(&checksum_request.checksum_type);
         let object_size = req.input.mpu_object_size.map(checked_size).transpose()?;
+        let declared = DeclaredChecksum {
+            algorithm: checksum_request.response_algorithm,
+            checksum_type,
+            explicit: checksum_request.checksum_type_declared,
+        };
         let request = CompletionRequest::new(
             &completed_parts,
             &checksum_request.expected,
-            checksum_type,
-            checksum_request.checksum_type_declared,
+            declared,
             object_size,
         );
         let mut operation = CompleteUploadOperation::new(CMUI {
