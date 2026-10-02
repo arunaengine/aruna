@@ -263,6 +263,11 @@ impl TaskQueues {
             handler
                 .reschedule_timer(TaskKey::DrainCleanupQueue, Duration::ZERO)
                 .await;
+            // A run deletes its timer before the page it works on, so a crash in between
+            // leaves an unfinished migration without one. A run with nothing left is cheap.
+            handler
+                .reschedule_timer(TaskKey::MigrateCompression, Duration::ZERO)
+                .await;
         }
         if refresh_holders {
             handler

@@ -1,5 +1,6 @@
 //! A compression change re-encodes this node's copies in the background, resumes from stored
-//! progress, keeps shared copies until no version names them, and serves the same bytes.
+//! progress and after a restart, keeps shared copies until no version names them, and serves the
+//! same bytes.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -27,12 +28,15 @@ use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::cleanup::process_cleanup_batch;
 use aruna_operations::blob::migration::process_migrations;
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::s3::bucket::compression::PutCompressionOperation;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::storage;
 use futures_util::TryStreamExt;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -241,4 +245,45 @@ async fn migrates_bucket_copies() {
 
     // A run after completion has nothing left to do.
     assert!(!process_migrations(&context.driver).await.unwrap());
+}
+
+#[tokio::test]
+async fn restart_resumes_migration() {
+    // The setting change committed but no timer survived, as after a crash between the
+    // two: the restart alone must finish the migration.
+    let context = setup_context().await;
+    let version_id = put(&context, "a.txt", &b"research data ".repeat(10_000)).await;
+    let zstd = Compression::Zstd { level: 3 };
+    let operation = PutCompressionOperation::new(BUCKET.to_string(), context.group_id, zstd, 1);
+    drive(operation, &context.driver).await.unwrap();
+    assert!(progress(&context).await.finished_at_ms.is_none());
+
+    let task_handle = aruna_tasks::TaskHandle::new();
+    let restarted = Arc::new(DriverContext {
+        storage_handle: context.driver.storage_handle.clone(),
+        net_handle: context.driver.net_handle.clone(),
+        blob_handle: context.driver.blob_handle.clone(),
+        metadata_handle: None,
+        task_handle: Some(task_handle.clone()),
+        compute_handle: None,
+    });
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    start_task_queues(restarted, task_handle, JobsRuntime::new(), &shutdown).await;
+
+    // A generous cap only detects lost progress; the run itself needs a few seconds.
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        loop {
+            let record = progress(&context).await;
+            if record.finished_at_ms.is_some() {
+                return record;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the restart re-arms the migration");
+    assert_eq!((finished.migrated, finished.failed), (1, 0));
+    let encoding = version(&context, "a.txt", version_id).await.location_key();
+    assert_eq!(encoding.unwrap().encoding, EncodingClass::Zstd { level: 3 });
+    shutdown.token().cancel();
 }
