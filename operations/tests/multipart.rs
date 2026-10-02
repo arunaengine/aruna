@@ -11,7 +11,7 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    DHT_KEYSPACE, OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, UPLOAD_KEYSPACE,
+    BUCKET_STATS_DB, DHT_KEYSPACE, OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, UPLOAD_KEYSPACE,
     UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
@@ -1949,8 +1949,14 @@ async fn s3_provider_flow() {
     let chunks: Vec<bytes::Bytes> = futures_util::TryStreamExt::try_collect(blob).await.unwrap();
     assert_eq!(chunks.concat(), expected);
 
-    // An aborted upload leaves no provider parts behind.
+    // An aborted upload leaves no provider parts behind and frees its bucket slot, also when
+    // a drain ran while the upload was live.
     let aborted = create_upload(&context, "bucket", "aborted.bin", group_id, created_by).await;
+    let slot = aborted.backend_upload.clone().unwrap().location;
+    let load = || bucket_load(&context, &slot);
+    let before = load().await;
+    process_cleanup_batch(&context.driver).await.unwrap();
+    assert_eq!(load().await, before);
     upload_part_bytes(
         &context,
         "bucket",
@@ -1972,6 +1978,7 @@ async fn s3_provider_flow() {
     )
     .await
     .unwrap();
+    assert_eq!(load().await, before - 1);
     let target = aborted.backend_upload.unwrap().location;
     let native = aruna_blob::s3::NativeMultipart::from_config(
         &config,
@@ -2069,4 +2076,15 @@ async fn orphan_target_discarded() {
     )
     .await;
     assert!(gone.is_none());
+}
+
+/// Reserved objects counted in the bucket that holds `location`.
+async fn bucket_load(context: &TestContext, location: &BackendLocation) -> u64 {
+    let mut key = location.backend.key_bytes();
+    key.push(0);
+    key.extend_from_slice(location.storage_bucket.as_bytes());
+    read_value(&context.driver, BUCKET_STATS_DB, key)
+        .await
+        .map(|value| u64::from_le_bytes(value.as_ref().try_into().unwrap()))
+        .unwrap_or(0)
 }

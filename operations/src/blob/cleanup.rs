@@ -134,6 +134,25 @@ pub struct BlobCleanupOutcome {
     pub processed: usize,
     pub failed: usize,
     pub dropped: usize,
+    /// Rows that must stay queued without being failures, such as a live upload's target.
+    pub kept: usize,
+}
+
+/// What one drain pass did with a row.
+enum RowOutcome {
+    Done,
+    Failed,
+    /// Not finished, but nothing went wrong: the row waits for a later pass.
+    Kept,
+}
+
+impl From<bool> for RowOutcome {
+    fn from(done: bool) -> Self {
+        match done {
+            true => Self::Done,
+            false => Self::Failed,
+        }
+    }
 }
 
 // Pages through the whole queue so persistently failing rows cannot starve the
@@ -175,11 +194,13 @@ pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanu
                 outcome.dropped = outcome.dropped.saturating_add(1);
                 continue;
             }
-            if run_cleanup_work(context, work).await {
-                done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
-                outcome.processed = outcome.processed.saturating_add(1);
-            } else {
-                outcome.failed = outcome.failed.saturating_add(1);
+            match run_cleanup_work(context, work).await {
+                RowOutcome::Done => {
+                    done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
+                    outcome.processed = outcome.processed.saturating_add(1);
+                }
+                RowOutcome::Failed => outcome.failed = outcome.failed.saturating_add(1),
+                RowOutcome::Kept => outcome.kept = outcome.kept.saturating_add(1),
             }
         }
 
@@ -325,9 +346,9 @@ async fn delete_cleanup_rows(
 }
 
 // Best-effort execution: a failed entry stays queued and retries next drain.
-async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> bool {
+async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> RowOutcome {
     match work {
-        BlobCleanupWork::DeleteBlob { location } => delete_blob(context, location).await,
+        BlobCleanupWork::DeleteBlob { location } => delete_blob(context, location).await.into(),
         BlobCleanupWork::ReconcileWrite {
             location,
             owner: WriteOwner::Upload { upload_id },
@@ -348,7 +369,7 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> boo
         // The committed metadata decides. An unreadable owner is not a proof of
         // either outcome, so the row waits for a drain that can read it.
         BlobCleanupWork::ReconcileWrite { location, owner } => {
-            match owns_write(context, &owner, &location).await {
+            let done = match owns_write(context, &owner, &location).await {
                 None => false,
                 Some(true) => {
                     if let Some(blob_handle) = context.blob_handle.as_ref() {
@@ -366,35 +387,32 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> boo
                     }
                 }
                 Some(false) => delete_blob(context, location).await,
-            }
+            };
+            done.into()
         }
         BlobCleanupWork::ReconcileReservation { location } => {
-            reconcile_reservation(context, location).await
+            reconcile_reservation(context, location).await.into()
         }
         BlobCleanupWork::RegisterDht {
             blake3,
             realm_id,
             ttl_ms,
-        } => register_dht(context, blake3, realm_id, ttl_ms).await,
+        } => register_dht(context, blake3, realm_id, ttl_ms).await.into(),
     }
 }
 
-/// An in-place target stays while its upload record names it, or once a committed version owns
-/// it. Neither, after the grace a running create needs, discards it with its provider uploads.
+/// A live upload's target row stays queued: it is also the bucket reservation abort or
+/// completion settles. A committed version takes it over; otherwise, after the grace a running
+/// create needs, the target goes with its provider uploads.
 async fn reconcile_target(
     context: &DriverContext,
     upload_id: Ulid,
     holder: Option<([u8; 32], RealmId, u64)>,
     location: BackendLocation,
-) -> bool {
+) -> RowOutcome {
     match owns_write(context, &WriteOwner::Upload { upload_id }, &location).await {
-        None => return false,
-        Some(true) => {
-            if let Some(blob_handle) = context.blob_handle.as_ref() {
-                blob_handle.clear_reservation(location.ulid);
-            }
-            return true;
-        }
+        None => return RowOutcome::Failed,
+        Some(true) => return RowOutcome::Kept,
         Some(false) => {}
     }
     if let Some((blake3, realm_id, ttl_ms)) = holder {
@@ -404,23 +422,28 @@ async fn reconcile_target(
             ttl_ms,
         };
         match owns_write(context, &owner, &location).await {
-            None => return false,
-            Some(true) => return register_dht(context, blake3, realm_id, ttl_ms).await,
+            None => return RowOutcome::Failed,
+            Some(true) => {
+                if let Some(blob_handle) = context.blob_handle.as_ref() {
+                    blob_handle.clear_reservation(location.ulid);
+                }
+                return register_dht(context, blake3, realm_id, ttl_ms).await.into();
+            }
             Some(false) => {}
         }
     }
     let opened_ms = location.ulid.timestamp_ms();
     if now_ms().saturating_sub(opened_ms) < BLOB_CLEANUP_AFTER.as_millis() as u64 {
-        return false;
+        return RowOutcome::Kept;
     }
     let Some(blob_handle) = context.blob_handle.as_ref() else {
-        return false;
+        return RowOutcome::Failed;
     };
     match blob_handle.discard_target(location).await {
-        Ok(()) => true,
+        Ok(()) => RowOutcome::Done,
         Err(error) => {
             warn!(%error, "Discarding an in-place upload target failed");
-            false
+            RowOutcome::Failed
         }
     }
 }
@@ -827,9 +850,12 @@ mod tests {
 
             let outcome = process_cleanup_batch(&context).await.unwrap();
 
-            // A discard needs the blob handle this context lacks, so it fails and the row waits.
-            assert_eq!(outcome.processed, usize::from(kept));
+            // A kept row is the target's reservation and stays; a discard needs the blob handle
+            // this context lacks, so it fails and the row waits.
+            assert_eq!(outcome.processed, 0);
+            assert_eq!(outcome.kept, usize::from(kept));
             assert_eq!(outcome.failed, usize::from(!kept));
+            assert_eq!(remaining_rows(&storage).await, 1);
         }
     }
 
