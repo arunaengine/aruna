@@ -65,6 +65,9 @@ impl IndexCache {
     }
 }
 
+/// A running fetch of stored frame bytes.
+type Fetch = JoinHandle<Result<Bytes, BlobError>>;
+
 /// Random access to the original bytes of a framed copy. Fetches the stored bytes of
 /// consecutive frames in one request, decodes them in parallel, and fetches the next batch
 /// of a longer read while the current one is decoded.
@@ -75,7 +78,7 @@ pub(super) struct FrameReader {
     size: u64,
     /// The first frame of the decoded batch, and its frames.
     decoded: Option<(u64, Vec<Bytes>)>,
-    ahead: Option<(Range<u64>, JoinHandle<Result<Bytes, BlobError>>)>,
+    ahead: Option<(Range<u64>, Fetch)>,
     idle: Duration,
 }
 
@@ -120,7 +123,7 @@ async fn read_range(
 
 impl FrameReader {
     /// Starts fetching the stored bytes of `frames` on its own task.
-    fn fetch(&self, frames: Range<u64>) -> (Range<u64>, JoinHandle<Result<Bytes, BlobError>>) {
+    fn fetch(&self, frames: Range<u64>) -> (Range<u64>, Fetch) {
         let range = self.index.frames_range(&frames);
         let (operator, path, idle) = (self.operator.clone(), self.path.clone(), self.idle);
         let task = tokio::spawn(async move {
