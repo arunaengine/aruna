@@ -31,6 +31,8 @@ pub struct AnnouncePresenceConfig {
 pub struct AnnouncePresenceOperation {
     config: AnnouncePresenceConfig,
     state: AnnouncePresenceState,
+    /// Set once the put was sent again after a failure.
+    retried: bool,
     output: Option<Result<(), AnnouncePresenceError>>,
 }
 
@@ -62,6 +64,7 @@ impl AnnouncePresenceOperation {
         Self {
             config,
             state: AnnouncePresenceState::Init,
+            retried: false,
             output: None,
         }
     }
@@ -75,6 +78,16 @@ impl AnnouncePresenceOperation {
             realm_id: self.config.realm_id,
             node_id: self.config.node_id,
         }
+    }
+
+    fn put_presence(&mut self) -> Effects {
+        self.state = AnnouncePresenceState::PutPresence;
+        smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Put {
+            key: self.presence_key(),
+            realm_id: self.config.realm_id,
+            value: self.config.node_id.as_bytes().to_vec(),
+            ttl: REALM_PRESENCE_TTL,
+        }))]
     }
 
     fn finish_success(&mut self) -> Effects {
@@ -104,13 +117,7 @@ impl Operation for AnnouncePresenceOperation {
     type Error = AnnouncePresenceError;
 
     fn start(&mut self) -> Effects {
-        self.state = AnnouncePresenceState::PutPresence;
-        smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Put {
-            key: self.presence_key(),
-            realm_id: self.config.realm_id,
-            value: self.config.node_id.as_bytes().to_vec(),
-            ttl: REALM_PRESENCE_TTL,
-        }))]
+        self.put_presence()
     }
 
     fn step(&mut self, event: Event) -> Effects {
@@ -126,6 +133,13 @@ impl Operation for AnnouncePresenceOperation {
                     } else {
                         self.finish_success()
                     }
+                }
+                // A concurrent announce of this node, such as its refresh timer, can store a
+                // newer revision first; this put is then refused as stale. A second put gets a
+                // new revision and replaces it.
+                Event::Net(NetEvent::Dht(DhtEvent::Error { .. })) if !self.retried => {
+                    self.retried = true;
+                    self.put_presence()
                 }
                 Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => {
                     self.fail(AnnouncePresenceError::PutFailed(error))
@@ -200,10 +214,44 @@ mod pure_tests {
         let effects = op.step(Event::Net(NetEvent::Dht(DhtEvent::Error {
             error: DhtError::Other("boom".to_string()),
         })));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Net(NetEffect::Dht(DhtEffect::Put { .. }))]
+        ));
+        let effects = op.step(Event::Net(NetEvent::Dht(DhtEvent::Error {
+            error: DhtError::Other("boom".to_string()),
+        })));
         assert!(effects.is_empty());
         assert!(matches!(
             op.finalize(),
             Err(AnnouncePresenceError::PutFailed(DhtError::Other(message))) if message == "boom"
         ));
+    }
+    #[test]
+    fn stale_put_retries() {
+        // A newer revision stored by a concurrent announce refuses this put once.
+        let realm_id = RealmId([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let mut op = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
+            realm_id,
+            node_id,
+            schedule_refresh: false,
+        });
+        let first = op.start();
+
+        let effects = op.step(Event::Net(NetEvent::Dht(DhtEvent::Error {
+            error: DhtError::StoreFailed(
+                "DHT error: invalid request: record version is stale or conflicting".to_string(),
+            ),
+        })));
+        assert_eq!(effects, first);
+        op.step(Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
+            key: op.presence_key(),
+            remote_attempt_count: 0,
+            remote_store_count: 0,
+        })));
+
+        assert!(op.is_complete());
+        assert_eq!(op.finalize(), Ok(()));
     }
 }
