@@ -2843,7 +2843,8 @@ async fn s3_provider_upload() {
     let payloads: HashMap<u16, Vec<u8>> = HashMap::from([
         (1, vec![1u8; 5 * mib]),
         (2, vec![2u8; 5 * mib + 3]),
-        (3, vec![3u8; 5 * mib]),
+        // Same size as part 2, so only the ETag tells the two selections apart.
+        (3, vec![3u8; 5 * mib + 3]),
         (4, b"tail".to_vec()),
     ]);
     let mut parts = HashMap::new();
@@ -2868,11 +2869,18 @@ async fn s3_provider_upload() {
 
     // A repeated completion whose first answer was lost finds the object and hashes it again.
     let BlobEvent::WriteFinished { location: again } =
-        handler.complete_upload(upload, listed).await
+        handler.complete_upload(upload.clone(), listed).await
     else {
         panic!("repeated completion failed")
     };
     assert_eq!(again.hashes, location.hashes);
+
+    // A lost completion of another selection of the same size is not this object.
+    let other = vec![parts[&1].clone(), parts[&3].clone(), parts[&4].clone()];
+    assert!(matches!(
+        handler.complete_upload(upload, other).await,
+        BlobEvent::Error(_)
+    ));
 }
 
 #[tokio::test]

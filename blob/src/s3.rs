@@ -322,6 +322,21 @@ impl NativeMultipart {
     }
 }
 
+/// The ETag a provider gives an object assembled from these parts: the MD5 of their binary MD5s
+/// and the part count. `None` when a part ETag is not a plain MD5, as with SSE-KMS.
+pub fn multipart_etag(etags: &[(u16, String)]) -> Option<String> {
+    let mut digests = Vec::with_capacity(etags.len() * 16);
+    for (_, etag) in etags {
+        let digest = hex::decode(etag.trim_matches('"')).ok()?;
+        if digest.len() != 16 {
+            return None;
+        }
+        digests.extend(digest);
+    }
+    let digest = md5::compute(&digests);
+    Some(format!("{}-{}", hex::encode(digest.0), etags.len()))
+}
+
 fn write_error<E>(call: &str, error: aws_sdk_s3::error::SdkError<E>) -> BlobError
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -391,6 +406,18 @@ mod tests {
             .expect_err("handshake against a closed socket must fail");
 
         assert!(matches!(err, SdkError::DispatchFailure(_)), "{err:?}");
+    }
+
+    #[test]
+    fn composes_multipart_etag() {
+        // Two parts of "a" and "b": the provider ETag is md5(md5(a) ++ md5(b)) with "-2".
+        let part = |bytes: &[u8]| format!("\"{}\"", hex::encode(md5::compute(bytes).0));
+        let etags = [(1, part(b"a")), (2, part(b"b"))];
+        let joined = [md5::compute(b"a").0, md5::compute(b"b").0].concat();
+        let expected = format!("{}-2", hex::encode(md5::compute(joined).0));
+
+        assert_eq!(multipart_etag(&etags), Some(expected));
+        assert_eq!(multipart_etag(&[(1, "\"kms-tag\"".to_string())]), None);
     }
 
     #[test]

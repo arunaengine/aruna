@@ -29,6 +29,7 @@ cap-std = { workspace = true }
 chrono = { workspace = true }
 crc-fast = { workspace = true }
 futures = { workspace = true }
+hex = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 iroh-io = { workspace = true }

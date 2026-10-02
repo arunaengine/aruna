@@ -6,7 +6,7 @@ use super::BlobHandler;
 use super::backend::build_backend_path;
 use crate::hash::Hasher;
 use crate::part_chain::{PartAttempt, PartChain};
-use crate::s3::NativeMultipart;
+use crate::s3::{NativeMultipart, multipart_etag};
 use aruna_core::UserId;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
@@ -268,9 +268,15 @@ impl BlobHandler {
         let path = upload.location.get_storage_path()?;
         let operator = self.operator_from_location(&upload.location)?;
         if let Err(error) = native.complete(&path, &upload.upload_id, &etags).await {
-            // A completion whose answer was lost leaves the object; the path is this upload's.
+            // A completion whose answer was lost leaves the object. Only the ETag of exactly
+            // these parts proves it is this selection, not an earlier one of the same size.
+            let expected = multipart_etag(&etags);
             match timeout(self.io_timeout(), operator.stat(&path)).await {
-                Ok(Ok(metadata)) if metadata.content_length() == total => {}
+                Ok(Ok(metadata))
+                    if metadata.content_length() == total
+                        && expected.is_some()
+                        && metadata.etag().map(|etag| etag.trim_matches('"'))
+                            == expected.as_deref() => {}
                 _ => return Err(error),
             }
         }
