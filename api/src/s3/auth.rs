@@ -39,6 +39,20 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::debug;
 
+tokio::task_local! {
+    /// The session token hash of the request being verified, which selects its signing secret.
+    static REQUEST_TOKEN: Option<String>;
+}
+
+/// Runs `future` with the request's session token available to secret lookup.
+pub(crate) async fn with_request_token<F: Future>(token: Option<String>, future: F) -> F::Output {
+    REQUEST_TOKEN.scope(token, future).await
+}
+
+pub(crate) fn request_token(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    request_token_hash(headers, uri).ok()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Access {
     Read,
@@ -80,12 +94,15 @@ impl S3Auth for AuthProvider {
                     "The Access Key Id you provided does not exist in our records."
                 ));
             }
-            let secret = session.open_secret(&self.encryption_key).map_err(|_| {
-                s3_error!(
-                    InvalidAccessKeyId,
-                    "The Access Key Id you provided does not exist in our records."
-                )
-            })?;
+            let token = REQUEST_TOKEN.try_with(Clone::clone).ok().flatten();
+            let secret = session
+                .open_secret_for(&self.encryption_key, token.as_deref(), SystemTime::now())
+                .map_err(|_| {
+                    s3_error!(
+                        InvalidAccessKeyId,
+                        "The Access Key Id you provided does not exist in our records."
+                    )
+                })?;
             return Ok(SecretKey::from(secret));
         }
         let user_access = self.query_user_access(access_key_id).await?;
@@ -438,7 +455,7 @@ impl AuthProvider {
         if session.is_expired(now) {
             return Err(s3_error!(ExpiredToken, "Session token has expired"));
         }
-        if !session.token_matches(token_hash) {
+        if !session.token_matches(token_hash, now) {
             return Err(s3_error!(InvalidToken, "Invalid session token"));
         }
         self.admit_credential_at(&session.as_user_access(), now)
@@ -716,6 +733,7 @@ mod tests {
             path_restrictions: None,
             issued_by,
             last_used_at: None,
+            previous: None,
         };
         session
             .encrypt_secret(
@@ -893,6 +911,56 @@ mod tests {
         let duplicate = Uri::from_static("/?X-Amz-Security-Token=one&X-Amz-Security-Token=two");
         let error = request_token_hash(&headers, &duplicate).unwrap_err();
         assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidToken);
+    }
+
+    #[tokio::test]
+    async fn refreshed_keeps_signed() {
+        // A request signed before a refresh carries the old token and verifies with the old secret.
+        use aruna_core::structs::identity::s3_session::PreviousCredential;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider(dir.path().to_str().unwrap());
+        let now = SystemTime::now();
+        let node = *provider.node_id.as_bytes();
+        let mut old = issued_session(&provider, node, now + std::time::Duration::from_secs(120));
+        old.token_hash = S3Session::hash_token("previous-token");
+        old.encrypt_secret(
+            &CredentialEncryptionKey::derive(&[7u8; 32]),
+            "previous-secret",
+        )
+        .unwrap();
+        let mut session = S3Session {
+            expiry: now + std::time::Duration::from_secs(3_600),
+            ..old.clone()
+        };
+        session.token_hash = S3Session::hash_token("temporary-token");
+        session
+            .encrypt_secret(
+                &CredentialEncryptionKey::derive(&[7u8; 32]),
+                "temporary-secret",
+            )
+            .unwrap();
+        session.previous = Some(PreviousCredential {
+            secret: old.secret,
+            token_hash: old.token_hash.clone(),
+            expiry: old.expiry,
+        });
+        store_session(&provider, &session).await;
+
+        for (token, expected) in [
+            (Some(old.token_hash.clone()), "previous-secret"),
+            (Some(session.token_hash.clone()), "temporary-secret"),
+            (None, "temporary-secret"),
+        ] {
+            let secret = with_request_token(token, provider.get_secret_key(&session.access_key))
+                .await
+                .unwrap();
+            assert_eq!(secret.expose(), expected);
+        }
+        assert!(
+            provider
+                .admit_session(&session, &old.token_hash, now)
+                .is_ok()
+        );
     }
 
     #[tokio::test]

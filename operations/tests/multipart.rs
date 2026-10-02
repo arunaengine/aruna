@@ -7,19 +7,20 @@
 
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BUCKET_STATS_DB, DHT_KEYSPACE, OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, UPLOAD_KEYSPACE,
+    UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    Backend, BackendConfig, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    CurrentVersionPointer, HashIndex, VersionKey,
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork, BlobHeadKey,
+    BlobLocationKey, BlobVersion, CurrentVersionPointer, HashIndex, VersionKey, WriteOwner,
 };
 use aruna_core::structs::storage::multipart::{
     COMPLETION_LEASE_MS, MultipartChecksumHint, MultipartChecksumType, MultipartObjectKey,
@@ -1727,6 +1728,46 @@ async fn sweep_reclaims_upload() {
     assert_eq!(count_blob_files(&context.blob_root), baseline);
 }
 
+// An abort cancelled after it marked the record leaves `Aborting`, which no client can abort again.
+#[tokio::test]
+async fn sweep_finishes_abort() {
+    let context = setup_context().await;
+    let realm_id = RealmId::from_bytes([9u8; 32]);
+    let created_by = UserId::local(Ulid::generate(), realm_id);
+    let baseline = count_blob_files(&context.blob_root);
+    let upload = create_upload(
+        &context,
+        "bucket-a",
+        "halted.bin",
+        Ulid::generate(),
+        created_by,
+    )
+    .await;
+    let part = upload_part_bytes(
+        &context,
+        "bucket-a",
+        "halted.bin",
+        upload.upload_id,
+        1,
+        &vec![4u8; MIN_PART_SIZE],
+        created_by,
+    )
+    .await;
+    let mut halted = read_upload(&context, upload.upload_id).await.unwrap();
+    halted.status = MultipartUploadStatus::Aborting;
+    write_upload(&context, &halted).await;
+
+    let outcome = sweep_stale_uploads(&context.driver, now_ms())
+        .await
+        .unwrap();
+
+    assert_eq!((outcome.aborted, outcome.failed), (1, 0));
+    assert!(read_upload(&context, upload.upload_id).await.is_none());
+    drain_cleanup(&context).await;
+    assert!(!exists(part.location.get_full_path().unwrap()).unwrap());
+    assert_eq!(count_blob_files(&context.blob_root), baseline);
+}
+
 async fn write_upload(context: &TestContext, record: &MultipartUpload) {
     let event = context
         .driver
@@ -1742,4 +1783,308 @@ async fn write_upload(context: &TestContext, record: &MultipartUpload) {
         event,
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
+}
+
+/// One S3 backend from the `ARUNA_TEST_S3_*` endpoint, so parts stream into its provider upload.
+async fn setup_s3_context() -> (TestContext, HashMap<String, String>) {
+    let variable =
+        |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+    let config = HashMap::from([
+        ("endpoint".to_string(), variable("ARUNA_TEST_S3_ENDPOINT")),
+        (
+            "region".to_string(),
+            std::env::var("ARUNA_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+        ),
+        (
+            "access_key_id".to_string(),
+            variable("ARUNA_TEST_S3_ACCESS_KEY"),
+        ),
+        (
+            "secret_access_key".to_string(),
+            variable("ARUNA_TEST_S3_SECRET_KEY"),
+        ),
+        ("force_path_style".to_string(), "true".to_string()),
+    ]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_root = temp_dir.path().to_str().unwrap();
+    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+    // Bucket names stay under 63 characters: the random tail of a ULID is enough.
+    let unique = Ulid::generate().to_string().to_lowercase()[14..].to_string();
+    let blob_handle = BlobHandler::new(
+        BackendConfig {
+            backend_type: Backend::S3,
+            root: String::new(),
+            service_config: config.clone(),
+            bucket_prefix: Some(format!("aip-{unique}-")),
+            max_bucket_size: None,
+            multipart_bucket: Some(format!("aip-parts-{unique}")),
+            timeouts: Default::default(),
+        },
+        storage_handle.clone(),
+        net_handle.clone(),
+    )
+    .await
+    .unwrap();
+    let context = TestContext {
+        _temp_dir: temp_dir,
+        blob_root: String::new(),
+        driver: DriverContext {
+            storage_handle,
+            net_handle: Some(net_handle),
+            blob_handle: Some(blob_handle),
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        },
+    };
+    (context, config)
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_provider_flow() {
+    // Out-of-order parts land in the provider upload and complete with exact hashes.
+    let (context, config) = setup_s3_context().await;
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+    let created_by = UserId::local(Ulid::generate(), realm_id);
+    let group_id = Ulid::generate();
+    let upload = create_upload(&context, "bucket", "in-place.bin", group_id, created_by).await;
+    let backend_upload = upload
+        .backend_upload
+        .clone()
+        .expect("an S3 backend opens one");
+    let payloads = [
+        vec![1u8; MIN_PART_SIZE],
+        vec![2u8; MIN_PART_SIZE + 7],
+        b"tail".to_vec(),
+    ];
+    let mut results = Vec::new();
+    for index in [1usize, 0, 2] {
+        let part = upload_part_bytes(
+            &context,
+            "bucket",
+            "in-place.bin",
+            upload.upload_id,
+            (index + 1) as u16,
+            &payloads[index],
+            created_by,
+        )
+        .await;
+        assert!(part.location.partial);
+        results.push((index, part));
+    }
+    results.sort_by_key(|(index, _)| *index);
+    let mut parts: Vec<_> = results.into_iter().map(|(_, part)| part).collect();
+
+    // A rejected replacement must leave the acknowledged part 1 as it was.
+    let rejected = drive(
+        UploadPartOperation::new(UploadPartInput {
+            bucket: "bucket".to_string(),
+            key: "in-place.bin".to_string(),
+            upload_id: upload.upload_id,
+            part_number: 1,
+            content_length: Some(4),
+            body: Some(stream_from_bytes(b"evil")),
+            created_by,
+            compressed: false,
+            encrypted: false,
+            expected_checksums: vec![ExpectedChecksum {
+                algorithm: ChecksumAlgorithm::Sha256,
+                digest: vec![0u8; 32],
+            }],
+        }),
+        &context.driver,
+    )
+    .await;
+    assert!(rejected.is_err());
+    // An accepted replacement waits staged and is copied in at completion.
+    let replaced = upload_part_bytes(
+        &context,
+        "bucket",
+        "in-place.bin",
+        upload.upload_id,
+        3,
+        b"TAIL",
+        created_by,
+    )
+    .await;
+    assert!(!replaced.location.partial);
+    parts[2] = replaced;
+    let expected = [&payloads[0][..], &payloads[1][..], b"TAIL"].concat();
+
+    let result = complete_upload(
+        &context,
+        "bucket",
+        "in-place.bin",
+        upload.upload_id,
+        realm_id,
+        node_id,
+        &parts,
+        MultipartChecksumType::FullObject,
+        Some(expected.len() as u64),
+        created_by,
+    )
+    .await;
+
+    assert_eq!(result.location.blob_size, expected.len() as u64);
+    assert_eq!(
+        result.location.hashes,
+        aruna_blob::hash::Hasher::new_with_bytes(&expected).to_map()
+    );
+    assert!(result.location.same_object(&backend_upload.location));
+    drain_cleanup(&context).await;
+    let blob_handle = context.driver.blob_handle.as_ref().unwrap();
+    let Event::Blob(BlobEvent::ReadFinished { blob, .. }) = blob_handle
+        .send_blob_effect(BlobEffect::Read {
+            location: result.location.clone(),
+        })
+        .await
+    else {
+        panic!("the completed object is not readable")
+    };
+    let chunks: Vec<bytes::Bytes> = futures_util::TryStreamExt::try_collect(blob).await.unwrap();
+    assert_eq!(chunks.concat(), expected);
+
+    // An aborted upload leaves no provider parts behind and frees its bucket slot, also when
+    // a drain ran while the upload was live.
+    let aborted = create_upload(&context, "bucket", "aborted.bin", group_id, created_by).await;
+    let slot = aborted.backend_upload.clone().unwrap().location;
+    let load = || bucket_load(&context, &slot);
+    let before = load().await;
+    process_cleanup_batch(&context.driver).await.unwrap();
+    assert_eq!(load().await, before);
+    upload_part_bytes(
+        &context,
+        "bucket",
+        "aborted.bin",
+        aborted.upload_id,
+        1,
+        b"part",
+        created_by,
+    )
+    .await;
+    drive(
+        AbortUploadOperation::new(AbortUploadInput {
+            bucket: "bucket".to_string(),
+            key: "aborted.bin".to_string(),
+            upload_id: aborted.upload_id,
+            now_ms: now_ms(),
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap();
+    assert_eq!(load().await, before - 1);
+    let target = aborted.backend_upload.unwrap().location;
+    let native = aruna_blob::s3::NativeMultipart::from_config(
+        &config,
+        &target.storage_bucket,
+        &target.root,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        native
+            .abort_path(&target.get_storage_path().unwrap())
+            .await
+            .unwrap(),
+        0
+    );
+
+    // A create whose answer was lost left a provider upload and only its target row.
+    let mut lost = target.clone();
+    lost.backend_path = format!("bucket/lost/{}", Ulid::generate());
+    lost.ulid = Ulid::from_parts(1, 9);
+    let lost_path = lost.get_storage_path().unwrap();
+    native.create(&lost_path).await.unwrap();
+    write_target_row(&context, Ulid::generate(), &lost).await;
+    process_cleanup_batch(&context.driver).await.unwrap();
+    assert_eq!(native.abort_path(&lost_path).await.unwrap(), 0);
+}
+
+/// Replaces the cleanup row under `key` with one that leaves `location` to an upload record.
+async fn write_target_row(context: &TestContext, key: Ulid, location: &BackendLocation) {
+    let work = BlobCleanupWork::ReconcileWrite {
+        location: location.clone(),
+        owner: WriteOwner::Upload {
+            upload_id: Ulid::generate(),
+        },
+    };
+    let event = context
+        .driver
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: key.to_bytes().to_vec().into(),
+            value: work.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+}
+
+async fn stored_blob(context: &TestContext, key: &str) -> BackendLocation {
+    let blob_handle = context.driver.blob_handle.as_ref().unwrap();
+    let Event::Blob(BlobEvent::WriteFinished { location }) = blob_handle
+        .send_blob_effect(BlobEffect::Write {
+            bucket: "bucket".to_string(),
+            key: key.to_string(),
+            resolved: aruna_core::structs::storage::blob::ResolvedBackend::node_default(),
+            created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
+            blob: stream_from_bytes(b"target"),
+        })
+        .await
+    else {
+        panic!("blob write failed")
+    };
+    location
+}
+
+#[tokio::test]
+async fn orphan_target_discarded() {
+    // A target no upload record names waits out the create grace, then goes.
+    let context = setup_context().await;
+    let fresh = stored_blob(&context, "fresh.bin").await;
+    write_target_row(&context, fresh.ulid, &fresh).await;
+    let stale = stored_blob(&context, "stale.bin").await;
+    let mut old = stale.clone();
+    old.ulid = Ulid::from_parts(1, 7);
+    write_target_row(&context, stale.ulid, &old).await;
+
+    process_cleanup_batch(&context.driver).await.unwrap();
+
+    assert!(exists(fresh.get_full_path().unwrap()).unwrap());
+    assert!(!exists(stale.get_full_path().unwrap()).unwrap());
+    let rows = read_value(
+        &context.driver,
+        BLOB_CLEANUP_KEYSPACE,
+        fresh.ulid.to_bytes().to_vec(),
+    )
+    .await;
+    assert!(rows.is_some());
+    let gone = read_value(
+        &context.driver,
+        BLOB_CLEANUP_KEYSPACE,
+        stale.ulid.to_bytes().to_vec(),
+    )
+    .await;
+    assert!(gone.is_none());
+}
+
+/// Reserved objects counted in the bucket that holds `location`.
+async fn bucket_load(context: &TestContext, location: &BackendLocation) -> u64 {
+    let mut key = location.backend.key_bytes();
+    key.push(0);
+    key.extend_from_slice(location.storage_bucket.as_bytes());
+    read_value(&context.driver, BUCKET_STATS_DB, key)
+        .await
+        .map(|value| u64::from_le_bytes(value.as_ref().try_into().unwrap()))
+        .unwrap_or(0)
 }

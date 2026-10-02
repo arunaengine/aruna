@@ -76,6 +76,8 @@ pub enum UploadPartError {
     MissingBody,
     #[error("body size did not match Content-Length header")]
     IncompleteBody,
+    #[error("a part of this upload needs its Content-Length")]
+    MissingContentLength,
     #[error("missing stored checksum for {0}")]
     MissingExpectedChecksum(&'static str),
     #[error("checksum mismatch for {0}")]
@@ -131,6 +133,8 @@ pub struct UploadPartOperation {
     txn_id: Option<TxnId>,
     conflicts: u8,
     written_location: Option<BackendLocation>,
+    /// The provider's ETag of a part written into its multipart upload.
+    backend_etag: Option<String>,
     replaced_location: Option<BackendLocation>,
     rollback_location: Option<BackendLocation>,
     cleanup: WriteCleanup<UploadPartError>,
@@ -145,6 +149,7 @@ impl UploadPartOperation {
             txn_id: None,
             conflicts: 0,
             written_location: None,
+            backend_etag: None,
             replaced_location: None,
             rollback_location: None,
             cleanup: WriteCleanup::default(),
@@ -172,8 +177,13 @@ impl UploadPartOperation {
         if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
             return self.emit_error(error.into());
         }
-        // One round trip answers both "does this upload exist" and "does the
-        // subject that admitted it still hold".
+        // One round trip answers "does this upload exist", "does the subject that
+        // admitted it still hold" and "is this part number already acknowledged".
+        let part_key =
+            match MultipartPartKey::new(self.input.upload_id, self.input.part_number).to_bytes() {
+                Ok(key) => key,
+                Err(err) => return self.emit_error(err.into()),
+            };
         self.state = UploadPartState::ReadUpload;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![
@@ -185,6 +195,7 @@ impl UploadPartOperation {
                     NODE_SUBJECT_KEYSPACE.to_string(),
                     Key::from(NODE_SUBJECT_KEY.to_vec()),
                 ),
+                (UPLOAD_PART_KEYSPACE.to_string(), part_key.into()),
             ],
             txn_id: None,
         })]
@@ -205,6 +216,9 @@ impl UploadPartOperation {
             },
             Some((_, None)) => None,
             None => return self.emit_error(UploadPartError::InvalidOperationState),
+        };
+        let Some((_, acknowledged)) = values.next() else {
+            return self.emit_error(UploadPartError::InvalidOperationState);
         };
 
         let Some(value) = value else {
@@ -228,6 +242,10 @@ impl UploadPartOperation {
             return self.emit_error(PolicyGateError::Drift.into());
         }
 
+        // A provider upload takes the part size before the first byte.
+        if record.backend_upload.is_some() && self.input.content_length.is_none() {
+            return self.emit_error(UploadPartError::MissingContentLength);
+        }
         let Some(blob) = self.input.body.take() else {
             return self.emit_error(UploadPartError::MissingBody);
         };
@@ -239,6 +257,13 @@ impl UploadPartOperation {
             created_by: self.input.created_by,
             compressed: self.input.compressed,
             encrypted: self.input.encrypted,
+            // A replacement waits in a blob of its own: a rejected one must leave the
+            // acknowledged provider part intact, and completion copies it in.
+            backend_upload: record
+                .backend_upload
+                .filter(|_| acknowledged.is_none())
+                .map(Box::new),
+            size: self.input.content_length,
             blob,
         })]
     }
@@ -246,6 +271,13 @@ impl UploadPartOperation {
     fn handle_write_finished(&mut self, event: Event) -> Effects {
         let location = match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
+            Event::Blob(BlobEvent::PartWritten {
+                location,
+                backend_etag,
+            }) => {
+                self.backend_etag = Some(backend_etag);
+                location
+            }
             // Only a client-sourced stream fault may become a client error; a
             // server-side write fault must stay retryable, never a bad digest.
             Event::Blob(BlobEvent::Error(BlobError::StreamFailed(message))) => {
@@ -512,6 +544,7 @@ impl UploadPartOperation {
             part_number: self.input.part_number,
             location,
             created_at: SystemTime::now(),
+            backend_etag: self.backend_etag.clone(),
         };
         let key =
             match MultipartPartKey::new(self.input.upload_id, self.input.part_number).to_bytes() {
@@ -788,7 +821,7 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::storage::multipart::MultipartUploadStatus;
+    use aruna_core::structs::storage::multipart::{BackendUpload, MultipartUploadStatus};
     use aruna_storage::storage;
     use tempfile::tempdir;
 
@@ -838,6 +871,7 @@ mod test {
             placement_policies: Vec::new(),
             subject_generation: 0,
             completing_since_ms: None,
+            backend_upload: None,
         };
 
         let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
@@ -847,6 +881,7 @@ mod test {
                     Some(record.to_bytes().unwrap().into()),
                 ),
                 (NODE_SUBJECT_KEY.to_vec().into(), None),
+                (b"part".to_vec().into(), None),
             ],
         }));
 
@@ -855,6 +890,129 @@ mod test {
         };
         assert_eq!(resolved.backend, record.backend);
         assert_eq!(resolved.storage_class, record.storage_class);
+    }
+
+    /// An operation about to read the record of an in-place upload, with that record.
+    fn in_place_op(content_length: Option<u64>) -> (UploadPartOperation, MultipartUpload) {
+        let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
+        let upload = BackendUpload {
+            location: op.written_location.take().unwrap(),
+            upload_id: "provider-upload".to_string(),
+            record_id: Ulid::from_bytes([9u8; 16]),
+        };
+        op.input.content_length = content_length;
+        op.input.body = Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+            &b"part"[..],
+        )));
+        op.state = UploadPartState::ReadUpload;
+        let record = MultipartUpload {
+            upload_id: op.input.upload_id,
+            backend: upload.location.backend.clone(),
+            storage_class: None,
+            bucket: "mybucket".to_string(),
+            key: "object.txt".to_string(),
+            group_id: Ulid::generate(),
+            created_by: test_user_id(),
+            created_at: SystemTime::UNIX_EPOCH,
+            status: MultipartUploadStatus::Open,
+            checksum_hint: None,
+            metadata: std::collections::HashMap::new(),
+            placement_policies: Vec::new(),
+            subject_generation: 0,
+            completing_since_ms: None,
+            backend_upload: Some(upload),
+        };
+        (op, record)
+    }
+
+    /// Answers the first read; `acknowledged` is the part record already stored, if any.
+    fn read_record(record: &MultipartUpload, acknowledged: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    record.upload_id.to_bytes().to_vec().into(),
+                    Some(record.to_bytes().unwrap().into()),
+                ),
+                (NODE_SUBJECT_KEY.to_vec().into(), None),
+                (b"part".to_vec().into(), acknowledged.map(Into::into)),
+            ],
+        })
+    }
+
+    #[test]
+    fn replacement_waits_staged() {
+        // A replaced part must not touch the acknowledged provider part before completion.
+        let (mut op, record) = in_place_op(Some(4));
+
+        let effects = op.step(read_record(&record, Some(b"acknowledged".to_vec())));
+
+        let [Effect::Blob(BlobEffect::WritePart { backend_upload, .. })] = effects.as_slice()
+        else {
+            panic!("expected one part write, got {effects:?}")
+        };
+        assert!(backend_upload.is_none());
+    }
+
+    #[test]
+    fn provider_needs_length() {
+        let (mut op, record) = in_place_op(None);
+
+        let effects = op.step(read_record(&record, None));
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Blob(_)))
+        );
+        assert_eq!(
+            op.finalize().unwrap_err(),
+            UploadPartError::MissingContentLength
+        );
+    }
+
+    #[test]
+    fn keeps_provider_etag() {
+        // A part streamed into the provider upload records the ETag completion must name.
+        let (mut op, record) = in_place_op(Some(4));
+        let upload = record.backend_upload.clone().unwrap();
+
+        let effects = op.step(read_record(&record, None));
+        let [
+            Effect::Blob(BlobEffect::WritePart {
+                backend_upload,
+                size,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected one part write, got {effects:?}")
+        };
+        assert_eq!(backend_upload.as_deref(), Some(&upload));
+        assert_eq!(*size, Some(4));
+
+        let mut written = upload.location.clone();
+        written.partial = true;
+        let effects = op.step(Event::Blob(BlobEvent::PartWritten {
+            location: written,
+            backend_etag: "\"etag\"".to_string(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+
+        op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
+        op.state = UploadPartState::ReadExistingPart;
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"part".to_vec().into(),
+            value: None,
+        }));
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected the part record, got {effects:?}")
+        };
+        let part = MultipartPart::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(part.backend_etag.as_deref(), Some("\"etag\""));
+        assert!(part.location.partial);
     }
 
     #[test]

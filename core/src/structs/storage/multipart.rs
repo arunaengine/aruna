@@ -42,10 +42,10 @@ pub enum MultipartUploadStatus {
     Aborting,
 }
 
-/// How long one completion attempt owns an upload. A request whose connection
-/// died leaves the record `Completing`, so a later attempt takes it over once
-/// the lease lapses instead of failing forever with `NoSuchUpload`.
-pub const COMPLETION_LEASE_MS: u64 = 15 * 60 * 1000;
+/// How long one completion attempt owns an upload. A completion outlives its request and runs
+/// until its deadline, so only a node that stopped leaves the record `Completing` this long; a
+/// later attempt then takes it over instead of failing forever with `NoSuchUpload`.
+pub const COMPLETION_LEASE_MS: u64 = COMPLETION_DEADLINE_MS;
 
 /// Ceiling on one CompleteMultipartUpload. Composing a huge object is
 /// legitimately slow, so the bound only has to stop an operation that never
@@ -77,6 +77,18 @@ pub struct MultipartUpload {
     /// When the current completion attempt claimed the record, in epoch ms.
     /// Only meaningful while the status is `Completing`.
     pub completing_since_ms: Option<u64>,
+    /// The provider upload an S3 backend streams the parts into; `None` keeps one blob per part.
+    pub backend_upload: Option<BackendUpload>,
+}
+
+/// A provider's own multipart upload, written in place so completion copies no byte.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BackendUpload {
+    /// Where the completed object lands. It holds no object until completion.
+    pub location: BackendLocation,
+    pub upload_id: String,
+    /// The Aruna upload record this provider upload belongs to.
+    pub record_id: Ulid,
 }
 
 impl MultipartUpload {
@@ -161,6 +173,8 @@ pub struct MultipartPart {
     pub part_number: u16,
     pub location: BackendLocation,
     pub created_at: SystemTime,
+    /// The provider's ETag of an in-place part, which completion must name.
+    pub backend_etag: Option<String>,
 }
 
 impl MultipartPart {

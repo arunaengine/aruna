@@ -740,3 +740,35 @@ async fn recursive_list_truncates() {
     );
     assert!(truncated);
 }
+
+#[test]
+fn resolves_one_region() {
+    // Both S3 clients take the configured region, else the region variables opendal reads.
+    let variables = |name: &str| (name == "AWS_DEFAULT_REGION").then(|| "eu-west-2".to_string());
+    let configured = HashMap::from([("region".to_string(), "us-west-1".to_string())]);
+    let blank = HashMap::from([("region".to_string(), " ".to_string())]);
+
+    assert_eq!(
+        s3_region(&configured, variables).as_deref(),
+        Some("us-west-1")
+    );
+    assert_eq!(s3_region(&blank, variables).as_deref(), Some("eu-west-2"));
+    assert_eq!(s3_region(&HashMap::new(), |_| None), None);
+}
+
+#[test]
+fn native_signs_alike() {
+    // The native multipart client signs with the region the operator config carries.
+    let config = s3_operator_config(HashMap::from([
+        ("endpoint".to_string(), "https://s3.example.org".to_string()),
+        ("region".to_string(), "us-west-1".to_string()),
+        ("access_key_id".to_string(), "key".to_string()),
+        ("secret_access_key".to_string(), "secret".to_string()),
+    ]));
+    let native = crate::s3::NativeMultipart::from_config(&config, "data", "/", None).unwrap();
+
+    assert_eq!(
+        native.region().as_deref(),
+        config.get("region").map(String::as_str)
+    );
+}

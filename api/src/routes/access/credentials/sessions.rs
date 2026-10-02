@@ -264,13 +264,16 @@ pub async fn list_s3_sessions(
 must still be a member of the session's group with READ or WRITE on some path under its data root.
 
 **Behavior**
-- The access key id is kept while the signing secret and session token are rotated in place, so the
-  previous pair stops working.
+- The access key id is kept while the signing secret and session token are rotated in place. The
+  previous pair keeps working until its original expiry, so requests signed before the refresh
+  still verify; it stops working after that expiry.
 - Activity is reset for the next cycle, and the new expiry is capped by the bearer token's own.
 
 **Limits**
 - Refresh is accepted at or after five minutes before expiry, and only when the session has
-  completed an authenticated S3 request since its last issuance."#,
+  completed an authenticated S3 request since its last issuance.
+- Refresh is refused while the previous pair is still valid, and when the bearer token's expiry
+  would not move the session's expiry later."#,
     params(("access_key_id" = String, Path, description = "Access key id returned by the session exchange")),
     responses(
         (
@@ -300,7 +303,7 @@ must still be a member of the session's group with READ or WRITE on some path un
         (status = 401, description = "Missing or invalid bearer token, or one with no remaining lifetime", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted, the caller is no longer a member of the group, or lacks readable access under its data path", body = ErrorResponse),
         (status = 404, description = "Session not found on this node, or it belongs to another user", body = ErrorResponse),
-        (status = 409, description = "The session is idle, expired, or not yet in its refresh window", body = ErrorResponse)
+        (status = 409, description = "The session is idle, expired, not yet in its refresh window, or cannot be extended", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -527,6 +530,9 @@ fn map_refresh_error(error: S3SessionError) -> ServerError {
         S3SessionError::TooEarly => {
             ServerError::Conflict("session refresh is not available yet".to_string())
         }
+        S3SessionError::NotExtended => ServerError::Conflict(
+            "session cannot be extended beyond the bearer token's expiry".to_string(),
+        ),
         S3SessionError::Idle => ServerError::Conflict("session is idle".to_string()),
         S3SessionError::Expired => ServerError::Conflict("session has expired".to_string()),
         S3SessionError::InvalidExpiry => ServerError::Unauthorized,

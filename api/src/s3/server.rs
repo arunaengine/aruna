@@ -386,8 +386,11 @@ impl PreparedRequest {
             .request
             .take()
             .expect("request is present before the handler runs");
-        let mut handler: BoxFuture<'static, Result<HttpResponse, HttpError>> =
-            Box::pin(async move { shared.call(request).await }.instrument(span));
+        let token = super::auth::request_token(request.headers(), request.uri());
+        let mut handler: BoxFuture<'static, Result<HttpResponse, HttpError>> = Box::pin(
+            super::auth::with_request_token(token, async move { shared.call(request).await })
+                .instrument(span),
+        );
         let connection = self.connection.clone();
         let stream = self.stream.clone();
         let deadline = deadline_activity.clone();

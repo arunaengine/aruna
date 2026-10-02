@@ -5,7 +5,7 @@
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::write_cleanup::{WriteCleanup, delete_records_effect};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};
 use aruna_core::operation::Operation;
@@ -25,6 +25,7 @@ pub enum AbortUploadState {
     ReadUploadMark,
     WriteUploadAborting,
     CommitMarkTransaction,
+    AbortBackendUpload,
     ReadUploadParts,
     StartDeleteTransaction,
     DeleteUploadRecords,
@@ -59,6 +60,8 @@ pub enum AbortUploadError {
     CompletionInProgress,
     #[error("AbortMultipartUpload failed")]
     AbortUploadFailed,
+    #[error(transparent)]
+    BlobError(#[from] BlobError),
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -91,6 +94,7 @@ pub struct AbortUploadOperation {
     upload_parts: Vec<MultipartPart>,
     cleanup_index: usize,
     skip_status_check: bool,
+    resume_abort: bool,
     cleanup: WriteCleanup<AbortUploadError>,
     output: Option<Result<(), AbortUploadError>>,
 }
@@ -105,6 +109,7 @@ impl AbortUploadOperation {
             upload_parts: Vec::new(),
             cleanup_index: 0,
             skip_status_check: false,
+            resume_abort: false,
             cleanup: WriteCleanup::default(),
             output: None,
         }
@@ -113,6 +118,12 @@ impl AbortUploadOperation {
     /// A purge may skip status checks after it owns the destination write fence.
     pub fn including_in_progress(mut self) -> Self {
         self.skip_status_check = true;
+        self
+    }
+
+    /// Also finishes an abort that stopped midway, judged on the record read in this transaction.
+    pub fn resuming_abort(mut self) -> Self {
+        self.resume_abort = true;
         self
     }
 
@@ -181,6 +192,10 @@ impl AbortUploadOperation {
             &self.input.key,
             if self.skip_status_check {
                 StatusCheck::Skip
+            } else if self.resume_abort {
+                StatusCheck::Recover {
+                    now_ms: self.input.now_ms,
+                }
             } else {
                 StatusCheck::Takeover {
                     now_ms: self.input.now_ms,
@@ -221,19 +236,20 @@ impl AbortUploadOperation {
         match event {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                 self.txn_id = None;
-
-                let prefix = match MultipartPartKey::prefix(self.input.upload_id) {
-                    Ok(prefix) => prefix,
-                    Err(err) => return self.schedule_error(err.into()),
-                };
-                self.state = AbortUploadState::ReadUploadParts;
-                smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: UPLOAD_PART_KEYSPACE.to_string(),
-                    prefix: Some(prefix.into()),
-                    start: None,
-                    limit: 10_000,
-                    txn_id: None,
-                })]
+                // The provider parts go first: a failure reopens the upload for a retry.
+                let backend_upload = self
+                    .upload_record
+                    .as_ref()
+                    .and_then(|upload| upload.backend_upload.clone());
+                match backend_upload {
+                    Some(backend_upload) => {
+                        self.state = AbortUploadState::AbortBackendUpload;
+                        smallvec![Effect::Blob(BlobEffect::AbortUpload {
+                            backend_upload: Box::new(backend_upload),
+                        })]
+                    }
+                    None => self.read_upload_parts(),
+                }
             }
             Event::Storage(StorageEvent::Error { error }) if error.proves_no_commit() => {
                 self.emit_error(error.into())
@@ -244,6 +260,29 @@ impl AbortUploadOperation {
             }
             _ => self.emit_error(AbortUploadError::InvalidOperationState),
         }
+    }
+
+    fn backend_aborted(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Blob(BlobEvent::UploadAborted) => self.read_upload_parts(),
+            Event::Blob(BlobEvent::Error(error)) => self.schedule_error(error.into()),
+            _ => self.schedule_error(AbortUploadError::InvalidOperationState),
+        }
+    }
+
+    fn read_upload_parts(&mut self) -> Effects {
+        let prefix = match MultipartPartKey::prefix(self.input.upload_id) {
+            Ok(prefix) => prefix,
+            Err(err) => return self.schedule_error(err.into()),
+        };
+        self.state = AbortUploadState::ReadUploadParts;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: UPLOAD_PART_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: None,
+            limit: 10_000,
+            txn_id: None,
+        })]
     }
 
     fn upload_parts_read(&mut self, event: Event) -> Effects {
@@ -436,6 +475,7 @@ impl Operation for AbortUploadOperation {
             AbortUploadState::ReadUploadMark => self.mark_upload_read(event),
             AbortUploadState::WriteUploadAborting => self.handle_upload_marked(event),
             AbortUploadState::CommitMarkTransaction => self.handle_mark_committed(event),
+            AbortUploadState::AbortBackendUpload => self.backend_aborted(event),
             AbortUploadState::ReadUploadParts => self.upload_parts_read(event),
             AbortUploadState::StartDeleteTransaction => self.delete_started(event),
             AbortUploadState::DeleteUploadRecords => self.records_deleted(event),
@@ -490,6 +530,7 @@ mod pure_tests {
     use super::*;
     use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use aruna_core::structs::storage::multipart::BackendUpload;
 
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -521,10 +562,78 @@ mod pure_tests {
             placement_policies: Vec::new(),
             subject_generation: 0,
             completing_since_ms: None,
+            backend_upload: None,
         });
         operation.txn_id = Some(TxnId::from_bytes([3u8; 16]));
         operation.state = AbortUploadState::CommitMarkTransaction;
         operation
+    }
+
+    #[test]
+    fn resume_spares_completion() {
+        let mut operation = AbortUploadOperation::new(input()).resuming_abort();
+        let mut record = marked().upload_record.unwrap();
+        record.status = MultipartUploadStatus::Completing;
+        record.completing_since_ms = Some(operation.input.now_ms);
+        operation.txn_id = Some(TxnId::from_bytes([3u8; 16]));
+        operation.state = AbortUploadState::ReadUploadMark;
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: operation.input.upload_id.to_bytes().to_vec().into(),
+            value: Some(record.to_bytes().unwrap().into()),
+        }));
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Storage(StorageEffect::Write { .. })))
+        );
+        assert_eq!(
+            operation.finalize(),
+            Err(AbortUploadError::CompletionInProgress)
+        );
+    }
+
+    #[test]
+    fn aborts_provider_first() {
+        // The provider parts go before any record, and a failed provider abort reopens the upload.
+        for (answer, aborted) in [
+            (BlobEvent::UploadAborted, true),
+            (
+                BlobEvent::Error(BlobError::DeleteError("unreachable".to_string())),
+                false,
+            ),
+        ] {
+            let mut operation = marked();
+            let location = part_location();
+            if let Some(upload) = operation.upload_record.as_mut() {
+                upload.backend_upload = Some(BackendUpload {
+                    location,
+                    upload_id: "provider".to_string(),
+                    record_id: Ulid::from_bytes([9u8; 16]),
+                });
+            }
+
+            let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: TxnId::from_bytes([3u8; 16]),
+            }));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::AbortUpload { .. })]
+            ));
+
+            let effects = operation.step(Event::Blob(answer));
+            match aborted {
+                true => assert!(matches!(
+                    effects.as_slice(),
+                    [Effect::Storage(StorageEffect::Iter { .. })]
+                )),
+                false => assert!(matches!(
+                    effects.as_slice(),
+                    [Effect::Storage(StorageEffect::StartTransaction { .. })]
+                )),
+            }
+        }
     }
 
     #[test]
@@ -591,6 +700,7 @@ mod pure_tests {
             part_number: 1,
             location: location.clone(),
             created_at: SystemTime::UNIX_EPOCH,
+            backend_etag: None,
         });
         let txn_id = TxnId::from_bytes([5u8; 16]);
         operation.txn_id = Some(txn_id);
@@ -632,6 +742,7 @@ mod pure_tests {
             part_number: 1,
             location: part_location(),
             created_at: SystemTime::UNIX_EPOCH,
+            backend_etag: None,
         });
         let txn_id = TxnId::from_bytes([5u8; 16]);
         operation.txn_id = Some(txn_id);

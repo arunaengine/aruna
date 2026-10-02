@@ -8,15 +8,15 @@ use crate::placement::policy::{
 };
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::errors::{BlobError, ConversionError, StorageError};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{BucketInfo, ResolvedBackend};
 use aruna_core::structs::storage::multipart::{
-    MultipartChecksumHint, MultipartUpload, MultipartUploadStatus,
+    BackendUpload, MultipartChecksumHint, MultipartUpload, MultipartUploadStatus,
 };
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::types::{Effects, GroupId, TxnId};
@@ -31,11 +31,14 @@ pub enum CreateMultipartState {
     Init,
     ReadGateBucket,
     PolicyGate,
+    CheckOpenFence,
+    OpenUpload,
     StartTransaction,
     CheckPurgeFence,
     FenceBackend,
     WriteUpload,
     CommitTransaction,
+    AbortBackendUpload,
     Finish,
     Error,
 }
@@ -64,6 +67,8 @@ pub enum CreateMultipartError {
     PurgeFence(#[from] PurgeFenceError),
     #[error("CreateMultipartUpload failed")]
     CreateUploadFailed,
+    #[error(transparent)]
+    BlobError(#[from] BlobError),
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -88,6 +93,8 @@ pub struct CreateMultipartResult {
 #[derive(Debug, PartialEq)]
 pub struct CreateMultipartOperation {
     input: CreateMultipartInput,
+    /// Chosen before the provider upload opens, so its cleanup row can name the record.
+    upload_id: Ulid,
     state: CreateMultipartState,
     txn_id: Option<TxnId>,
     resolved: Option<ResolvedBackend>,
@@ -101,6 +108,9 @@ pub struct CreateMultipartOperation {
     /// part and the completion inherit exactly what was evaluated here.
     stored_policies: Vec<PlacementPolicyRef>,
     stored_subject: u64,
+    /// The provider upload opened for this record; aborted unless a commit may own it.
+    backend_upload: Option<BackendUpload>,
+    pending_error: Option<CreateMultipartError>,
     output: Option<Result<CreateMultipartResult, CreateMultipartError>>,
 }
 
@@ -108,6 +118,7 @@ impl CreateMultipartOperation {
     pub fn new(input: CreateMultipartInput) -> Self {
         Self {
             input,
+            upload_id: Ulid::generate(),
             state: CreateMultipartState::Init,
             txn_id: None,
             resolved: None,
@@ -117,6 +128,8 @@ impl CreateMultipartOperation {
             gate: None,
             stored_policies: Vec::new(),
             stored_subject: 0,
+            backend_upload: None,
+            pending_error: None,
             output: None,
         }
     }
@@ -134,9 +147,72 @@ impl CreateMultipartOperation {
     }
 
     fn emit_error(&mut self, error: CreateMultipartError) -> Effects {
+        if let Some(backend_upload) = self.backend_upload.take() {
+            self.pending_error = Some(error);
+            self.state = CreateMultipartState::AbortBackendUpload;
+            let mut effects = self.abort();
+            effects.push(Effect::Blob(BlobEffect::AbortUpload {
+                backend_upload: Box::new(backend_upload),
+            }));
+            return effects;
+        }
         self.state = CreateMultipartState::Error;
         self.output = Some(Err(error));
         self.abort()
+    }
+
+    /// Waits out the transaction abort, then reports the error that started the cleanup.
+    fn backend_aborted(&mut self, event: Event) -> Effects {
+        if matches!(
+            event,
+            Event::Storage(StorageEvent::TransactionAborted { .. } | StorageEvent::Error { .. })
+        ) {
+            return smallvec![];
+        }
+        let error = self
+            .pending_error
+            .take()
+            .unwrap_or(CreateMultipartError::CreateUploadFailed);
+        self.emit_error(error)
+    }
+
+    /// A fenced destination opens no provider upload; the transaction checks the fence again.
+    fn check_open_fence(&mut self) -> Effects {
+        self.state = CreateMultipartState::CheckOpenFence;
+        smallvec![write_fence_read(&self.input.bucket, None)]
+    }
+
+    /// S3 backends open the provider upload the parts stream into; others answer `None`.
+    fn open_upload(&mut self, event: Event) -> Effects {
+        if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
+            return self.emit_error(error.into());
+        }
+        let Some(resolved) = self.resolved.clone() else {
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+        };
+        self.state = CreateMultipartState::OpenUpload;
+        smallvec![Effect::Blob(BlobEffect::OpenUpload {
+            record_id: self.upload_id,
+            bucket: self.input.bucket.clone(),
+            key: self.input.key.clone(),
+            resolved,
+            created_by: self.input.created_by,
+        })]
+    }
+
+    fn upload_opened(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Blob(BlobEvent::UploadOpened { backend_upload }) => {
+                self.backend_upload = backend_upload;
+                self.start_transaction()
+            }
+            Event::Blob(BlobEvent::Error(error)) => self.emit_error(error.into()),
+            event => self.emit_error(CreateMultipartError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Blob(BlobEvent::UploadOpened)",
+                received: event,
+            }),
+        }
     }
 
     fn handle_init(&mut self) -> Effects {
@@ -179,7 +255,7 @@ impl CreateMultipartOperation {
             &self.stored_policies,
             Some(group_id),
         ) {
-            Ok(None) => self.start_transaction(),
+            Ok(None) => self.check_open_fence(),
             Ok(Some(mut gate)) => {
                 let effects = gate.start();
                 let complete = gate.is_complete();
@@ -219,7 +295,7 @@ impl CreateMultipartOperation {
                     .gate_context
                     .as_ref()
                     .map_or(0, |context| context.subject.generation);
-                self.start_transaction()
+                self.check_open_fence()
             }
             Err(error) => self.emit_error(error.into()),
         }
@@ -276,7 +352,7 @@ impl CreateMultipartOperation {
         let record = MultipartUpload {
             backend: resolved.backend,
             storage_class: resolved.storage_class,
-            upload_id: Ulid::generate(),
+            upload_id: self.upload_id,
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
             group_id: self.input.group_id,
@@ -288,6 +364,7 @@ impl CreateMultipartOperation {
             placement_policies: self.stored_policies.clone(),
             subject_generation: self.stored_subject,
             completing_since_ms: None,
+            backend_upload: self.backend_upload.clone(),
         };
         let value = match record.to_bytes() {
             Ok(value) => value,
@@ -329,6 +406,8 @@ impl CreateMultipartOperation {
             });
         };
 
+        // The committed record owns the provider upload from here on.
+        self.backend_upload = None;
         let Some(record) = self.record.clone() else {
             return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
@@ -348,18 +427,28 @@ impl Operation for CreateMultipartOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if self.state == CreateMultipartState::AbortBackendUpload {
+            return self.backend_aborted(event);
+        }
         if let Event::Storage(StorageEvent::Error { error }) = &event {
+            // A commit that may have landed leaves the provider upload to its record.
+            if self.state == CreateMultipartState::CommitTransaction && !error.proves_no_commit() {
+                self.backend_upload = None;
+            }
             return self.emit_error(error.clone().into());
         }
         match self.state {
             CreateMultipartState::Init => self.handle_init(),
             CreateMultipartState::ReadGateBucket => self.handle_gate_bucket(event),
             CreateMultipartState::PolicyGate => self.handle_policy_gate(event),
+            CreateMultipartState::CheckOpenFence => self.open_upload(event),
+            CreateMultipartState::OpenUpload => self.upload_opened(event),
             CreateMultipartState::StartTransaction => self.handle_transaction_started(event),
             CreateMultipartState::CheckPurgeFence => self.fence_checked(event),
             CreateMultipartState::FenceBackend => self.handle_backend_fenced(event),
             CreateMultipartState::WriteUpload => self.handle_record_written(event),
             CreateMultipartState::CommitTransaction => self.handle_transaction_committed(event),
+            CreateMultipartState::AbortBackendUpload => self.backend_aborted(event),
             CreateMultipartState::Finish => smallvec![],
             CreateMultipartState::Error => self.abort(),
         }
@@ -381,11 +470,18 @@ impl Operation for CreateMultipartOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id
+        let mut effects: Effects = self
+            .txn_id
             .take()
             .map_or_else(smallvec::SmallVec::new, |txn_id| {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+            });
+        if let Some(backend_upload) = self.backend_upload.take() {
+            effects.push(Effect::Blob(BlobEffect::AbortUpload {
+                backend_upload: Box::new(backend_upload),
+            }));
+        }
+        effects
     }
 }
 
@@ -393,12 +489,12 @@ impl Operation for CreateMultipartOperation {
 mod pure_tests {
     use super::{CreateMultipartError, CreateMultipartInput, CreateMultipartOperation};
     use crate::groups::backends::BackendFenceError;
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
-    use aruna_core::structs::storage::multipart::MultipartUpload;
+    use aruna_core::structs::storage::multipart::{BackendUpload, MultipartUpload};
     use aruna_core::structs::storage::routing::{
         BackendCatalog, GroupRoutingInputs, RoutingError, RoutingSnapshot, RoutingTarget,
         StorageRoutingRule,
@@ -457,6 +553,8 @@ mod pure_tests {
         let mut operation = CreateMultipartOperation::new(input(snapshot));
         operation.start();
         operation.step(ungoverned_bucket());
+        operation.step(fence_clear());
+        operation.step(opened(None));
 
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
@@ -479,6 +577,8 @@ mod pure_tests {
         let mut operation = CreateMultipartOperation::new(input(snapshot));
         operation.start();
         operation.step(ungoverned_bucket());
+        operation.step(fence_clear());
+        operation.step(opened(None));
 
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
@@ -505,6 +605,8 @@ mod pure_tests {
         let mut operation = CreateMultipartOperation::new(input(snapshot));
         operation.start();
         operation.step(ungoverned_bucket());
+        operation.step(fence_clear());
+        operation.step(opened(None));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::from(3),
         }));
@@ -522,6 +624,80 @@ mod pure_tests {
             ),
             "expected an abort, got {effects:?}"
         );
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateMultipartError::BackendFenceError(
+                BackendFenceError::Unavailable
+            ))
+        ));
+    }
+
+    fn opened(backend_upload: Option<BackendUpload>) -> Event {
+        Event::Blob(BlobEvent::UploadOpened { backend_upload })
+    }
+
+    #[test]
+    fn refusal_aborts_provider() {
+        // A record that never commits must not strand the provider upload it opened.
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let snapshot = snapshot().with_group_inputs(GroupRoutingInputs {
+            default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+            backend_ids: BTreeSet::from([backend_id]),
+        });
+        let mut operation = CreateMultipartOperation::new(input(snapshot));
+        operation.start();
+        operation.step(ungoverned_bucket());
+        let effects = operation.step(fence_clear());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::OpenUpload { .. })]
+        ));
+        let upload = BackendUpload {
+            location: aruna_core::structs::storage::blob::BackendLocation {
+                backend: BackendRef::Group(backend_id),
+                storage_class: None,
+                root: "/".to_string(),
+                storage_bucket: "tenant".to_string(),
+                backend_path: "bucket/key".to_string(),
+                ulid: Ulid::from_bytes([6u8; 16]),
+                compressed: false,
+                encrypted: false,
+                created_by: aruna_core::UserId::default(),
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+                staging: false,
+                partial: false,
+                blob_size: 0,
+                hashes: std::collections::HashMap::new(),
+            },
+            upload_id: "provider".to_string(),
+            record_id: Ulid::from_bytes([9u8; 16]),
+        };
+        operation.step(opened(Some(upload.clone())));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from(3),
+        }));
+        operation.step(fence_clear());
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(disabled(backend_id).to_bytes().unwrap().into()),
+        }));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::Storage(StorageEffect::AbortTransaction { .. }),
+                    Effect::Blob(BlobEffect::AbortUpload { backend_upload }),
+                ] if **backend_upload == upload
+            ),
+            "expected both aborts, got {effects:?}"
+        );
+        assert!(!operation.is_complete());
+        operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: TxnId::from(3),
+        }));
+        operation.step(Event::Blob(BlobEvent::UploadAborted));
+
         assert!(matches!(
             operation.finalize(),
             Err(CreateMultipartError::BackendFenceError(

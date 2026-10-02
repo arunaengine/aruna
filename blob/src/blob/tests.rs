@@ -3,13 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::backend::{build_backend_path, build_part_path, rebuild_backend_path};
+use super::group::GROUP_WRITE_CHUNK;
+use super::io::compose_chunk;
 use super::{
     BackendRegistry, BlobHandle, BlobHandler, ControlPlaneKind, NodeBackend,
     control_plane::timeout_event,
     control_plane::{parse_replication_init, validate_init_ack, with_timeout},
 };
+use crate::hash::Hasher;
 use crate::messages::{MessageType, ReplicationMessage};
-use crate::s3::make_bucket;
+use crate::s3::{NativeMultipart, create_s3_client, make_bucket};
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
@@ -26,13 +29,13 @@ use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, HiddenBlobKey,
-    ResolvedBackend,
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork, BlobTimeoutConfig,
+    HiddenBlobKey, ResolvedBackend, WriteOwner,
 };
 use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
-use aruna_core::structs::storage::multipart::MultipartPartKey;
+use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};
 use aruna_core::{NodeId, UserId};
 use aruna_net::streams::BiStream;
 use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
@@ -49,12 +52,13 @@ mod failing_close {
     use opendal::raw::oio;
     use opendal::raw::{Access, AccessorInfo, OpWrite, RpWrite};
     use opendal::{Buffer, Builder, Capability, Error, ErrorKind, Metadata, Operator};
-    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Default)]
     pub(super) struct CloseFailsBuilder {
         aborts: Arc<AtomicUsize>,
+        sizes: Arc<Mutex<Vec<usize>>>,
     }
 
     impl Builder for CloseFailsBuilder {
@@ -63,6 +67,7 @@ mod failing_close {
         fn build(self) -> opendal::Result<impl Access> {
             Ok(CloseFailsBackend {
                 aborts: self.aborts,
+                sizes: self.sizes,
             })
         }
     }
@@ -70,6 +75,7 @@ mod failing_close {
     #[derive(Debug)]
     pub(super) struct CloseFailsBackend {
         aborts: Arc<AtomicUsize>,
+        sizes: Arc<Mutex<Vec<usize>>>,
     }
 
     impl Access for CloseFailsBackend {
@@ -87,6 +93,7 @@ mod failing_close {
                     write: true,
                     write_can_empty: true,
                     write_can_multi: true,
+                    write_multi_min_size: Some(5 * 1024 * 1024),
                     ..Default::default()
                 });
             info
@@ -101,6 +108,7 @@ mod failing_close {
                 RpWrite::new(),
                 CloseFailsWriter {
                     aborts: self.aborts.clone(),
+                    sizes: self.sizes.clone(),
                 },
             ))
         }
@@ -108,10 +116,12 @@ mod failing_close {
 
     pub(super) struct CloseFailsWriter {
         aborts: Arc<AtomicUsize>,
+        sizes: Arc<Mutex<Vec<usize>>>,
     }
 
     impl oio::Write for CloseFailsWriter {
-        async fn write(&mut self, _bs: Buffer) -> opendal::Result<()> {
+        async fn write(&mut self, bs: Buffer) -> opendal::Result<()> {
+            self.sizes.lock().unwrap().push(bs.len());
             Ok(())
         }
 
@@ -133,10 +143,22 @@ mod failing_close {
         let aborts = Arc::new(AtomicUsize::new(0));
         let operator = Operator::new(CloseFailsBuilder {
             aborts: aborts.clone(),
+            ..Default::default()
         })
         .unwrap()
         .finish();
         (operator, aborts)
+    }
+
+    pub(super) fn operator_with_sizes() -> (Operator, Arc<Mutex<Vec<usize>>>) {
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let operator = Operator::new(CloseFailsBuilder {
+            sizes: sizes.clone(),
+            ..Default::default()
+        })
+        .unwrap()
+        .finish();
+        (operator, sizes)
     }
 }
 
@@ -150,6 +172,7 @@ mod failing_cleanup {
     #[derive(Debug, Default)]
     struct CleanupBuilder {
         delete_calls: Arc<AtomicUsize>,
+        writer: CleanupWriter,
     }
 
     impl Builder for CleanupBuilder {
@@ -158,6 +181,7 @@ mod failing_cleanup {
         fn build(self) -> opendal::Result<impl Access> {
             Ok(CleanupBackend {
                 delete_calls: self.delete_calls,
+                writer: self.writer,
             })
         }
     }
@@ -165,6 +189,7 @@ mod failing_cleanup {
     #[derive(Debug)]
     struct CleanupBackend {
         delete_calls: Arc<AtomicUsize>,
+        writer: CleanupWriter,
     }
 
     impl Access for CleanupBackend {
@@ -191,7 +216,7 @@ mod failing_cleanup {
             _path: &str,
             _args: OpWrite,
         ) -> opendal::Result<(RpWrite, Self::Writer)> {
-            Ok((RpWrite::new(), CleanupWriter))
+            Ok((RpWrite::new(), self.writer.clone()))
         }
 
         async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
@@ -200,10 +225,20 @@ mod failing_cleanup {
         }
     }
 
-    struct CleanupWriter;
+    /// Counts writes and aborts; a pending writer never finishes a write.
+    #[derive(Clone, Debug, Default)]
+    pub(super) struct CleanupWriter {
+        pending: bool,
+        pub(super) writes: Arc<AtomicUsize>,
+        pub(super) aborts: Arc<AtomicUsize>,
+    }
 
     impl oio::Write for CleanupWriter {
         async fn write(&mut self, _bs: Buffer) -> opendal::Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.pending {
+                std::future::pending::<()>().await;
+            }
             Ok(())
         }
 
@@ -212,6 +247,7 @@ mod failing_cleanup {
         }
 
         async fn abort(&mut self) -> opendal::Result<()> {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
             Err(Error::new(ErrorKind::Unexpected, "injected abort failure"))
         }
     }
@@ -220,10 +256,26 @@ mod failing_cleanup {
         let delete_calls = Arc::new(AtomicUsize::new(0));
         let operator = Operator::new(CleanupBuilder {
             delete_calls: delete_calls.clone(),
+            writer: CleanupWriter::default(),
         })
         .unwrap()
         .finish();
         (operator, delete_calls)
+    }
+
+    pub(super) fn pending_operator() -> (Operator, Arc<AtomicUsize>, CleanupWriter) {
+        let delete_calls = Arc::new(AtomicUsize::new(0));
+        let writer = CleanupWriter {
+            pending: true,
+            ..CleanupWriter::default()
+        };
+        let operator = Operator::new(CleanupBuilder {
+            delete_calls: delete_calls.clone(),
+            writer: writer.clone(),
+        })
+        .unwrap()
+        .finish();
+        (operator, delete_calls, writer)
     }
 }
 
@@ -259,7 +311,10 @@ struct TestContext {
 }
 
 enum TestContextSetup<'a> {
-    Single { max_bucket_size: u64 },
+    Single {
+        max_bucket_size: u64,
+        timeouts: BlobTimeoutConfig,
+    },
     TwoFilesystem,
     S3Mixed(&'a S3Env),
 }
@@ -274,7 +329,10 @@ async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
         .unwrap();
 
     let (backends, policy) = match &setup {
-        TestContextSetup::Single { max_bucket_size } => {
+        TestContextSetup::Single {
+            max_bucket_size,
+            timeouts,
+        } => {
             let blob_root = format!("{temp_root}/blobstore");
             std::fs::create_dir_all(&blob_root).unwrap();
             let mut backends = std::collections::BTreeMap::new();
@@ -288,7 +346,7 @@ async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
                         bucket_prefix: Some("aruna-test-".to_string()),
                         max_bucket_size: Some(*max_bucket_size),
                         multipart_bucket: Some("uploaded-parts".to_string()),
-                        timeouts: Default::default(),
+                        timeouts: *timeouts,
                     },
                     None,
                 )),
@@ -340,7 +398,11 @@ async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
 }
 
 async fn setup_blob_handle(max_bucket_size: u64) -> TestContext {
-    setup_context(TestContextSetup::Single { max_bucket_size }).await
+    setup_context(TestContextSetup::Single {
+        max_bucket_size,
+        timeouts: BlobTimeoutConfig::default(),
+    })
+    .await
 }
 
 fn stream_from_bytes(
@@ -389,6 +451,34 @@ async fn keyspace_count(storage_handle: &storage::StorageHandle, key_space: &str
         panic!("unexpected storage event")
     };
     values.len()
+}
+
+/// Cleanup rows that leave a target to the upload record `record_id`.
+async fn upload_rows(storage_handle: &storage::StorageHandle, record_id: Ulid) -> usize {
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 256,
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("unexpected storage event")
+    };
+    values
+        .iter()
+        .filter(|(_, value)| {
+            matches!(
+                BlobCleanupWork::from_bytes(value),
+                Ok(BlobCleanupWork::ReconcileWrite {
+                    owner: WriteOwner::Upload { upload_id },
+                    ..
+                }) if upload_id == record_id
+            )
+        })
+        .count()
 }
 
 fn test_user_id() -> UserId {
@@ -1061,6 +1151,8 @@ async fn excludes_part_bucket() {
             created_by: test_user_id(),
             compressed: false,
             encrypted: false,
+            backend_upload: None,
+            size: None,
             blob: stream_from_bytes(b"part"),
         })
         .await
@@ -1863,6 +1955,165 @@ async fn failed_write_cleans() {
 }
 
 #[tokio::test]
+async fn compose_part_sizes() {
+    // Each input part, whatever its size, must become exactly one backend part.
+    let context = setup_blob_handle(128 * 1024 * 1024).await;
+    let handler = context.blob_handle.handler.clone();
+
+    for (input, output) in [
+        (vec![16, 16, 7], vec![16, 16, 7]),
+        (vec![5, 5, 1], vec![5, 5, 1]),
+        (vec![5, 16, 8], vec![5, 16, 8]),
+        (vec![9, 6, 12, 2], vec![9, 6, 12, 2]),
+        (vec![0], Vec::new()),
+        (Vec::new(), Vec::new()),
+    ] {
+        let upload_id = Ulid::generate();
+        let mut parts = Vec::new();
+        for (index, size) in input.into_iter().enumerate() {
+            let payload = vec![index as u8; size * 1024 * 1024];
+            let BlobEvent::WriteFinished { location } = handler
+                .write_blob_part(
+                    MultipartPartKey::new(upload_id, (index + 1) as u16),
+                    ResolvedBackend::node_default(),
+                    test_user_id(),
+                    false,
+                    false,
+                    stream_from_bytes(&payload),
+                )
+                .await
+            else {
+                panic!("part write failed")
+            };
+            parts.push(location);
+        }
+
+        for backend in [
+            BackendRef::node_default(),
+            BackendRef::Group(Ulid::generate()),
+        ] {
+            let target = BackendLocation {
+                backend,
+                ..make_test_location()
+            };
+            let (operator, sizes) = failing_close::operator_with_sizes();
+            let event = handler
+                .compose_parts(target, operator, parts.clone(), None)
+                .await;
+            assert!(matches!(
+                event,
+                BlobEvent::Error(BlobError::WriteCleanup { .. })
+            ));
+            assert_eq!(
+                *sizes.lock().unwrap(),
+                output
+                    .iter()
+                    .map(|size| size * 1024 * 1024)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn compose_streams_chunks() {
+    // A chunked composition never holds more than one chunk, whatever the part sizes are.
+    let context = setup_blob_handle(128 * 1024 * 1024).await;
+    let handler = context.blob_handle.handler.clone();
+    let upload_id = Ulid::generate();
+    let mut parts = Vec::new();
+    for (index, size) in [9usize, 6, 3].into_iter().enumerate() {
+        let payload = vec![index as u8; size * 1024 * 1024];
+        let BlobEvent::WriteFinished { location } = handler
+            .write_blob_part(
+                MultipartPartKey::new(upload_id, (index + 1) as u16),
+                ResolvedBackend::node_default(),
+                test_user_id(),
+                false,
+                false,
+                stream_from_bytes(&payload),
+            )
+            .await
+        else {
+            panic!("part write failed")
+        };
+        parts.push(location);
+    }
+    let chunk = 8 * 1024 * 1024;
+    let (operator, sizes) = failing_close::operator_with_sizes();
+
+    handler
+        .compose_parts(make_test_location(), operator, parts, Some(chunk))
+        .await;
+
+    let sizes = sizes.lock().unwrap();
+    assert!(sizes.iter().all(|size| *size <= chunk), "{sizes:?}");
+    assert_eq!(sizes.iter().sum::<usize>(), 18 * 1024 * 1024);
+}
+
+#[test]
+fn compose_chunk_limits() {
+    let tib = 1024u64.pow(4);
+    assert_eq!(compose_chunk(&Backend::S3, 5 * tib), None);
+    assert_eq!(
+        compose_chunk(&Backend::Group(GroupBackendKind::S3), tib),
+        None
+    );
+    assert_eq!(
+        compose_chunk(&Backend::FileSystem, 1024),
+        Some(GROUP_WRITE_CHUNK)
+    );
+    for (backend, limit) in [
+        (Backend::Group(GroupBackendKind::B2), 10_000),
+        (Backend::Group(GroupBackendKind::Gcs), 10_000),
+        (Backend::Group(GroupBackendKind::Azblob), 50_000),
+    ] {
+        let chunk = compose_chunk(&backend, 5 * tib).unwrap() as u64;
+        assert!((5 * tib).div_ceil(chunk) <= limit);
+        assert!(chunk < 1024 * 1024 * 1024);
+    }
+}
+
+#[tokio::test]
+async fn compose_timeout_deletes() {
+    // A compose write dropped by its idle timeout must never be polled again by cleanup.
+    let context = setup_context(TestContextSetup::Single {
+        max_bucket_size: 1024 * 1024,
+        timeouts: BlobTimeoutConfig {
+            transfer_idle_timeout: Duration::from_secs(1),
+            ..BlobTimeoutConfig::default()
+        },
+    })
+    .await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::WriteFinished { location: part } = handler
+        .write_blob_part(
+            MultipartPartKey::new(Ulid::generate(), 1),
+            ResolvedBackend::node_default(),
+            test_user_id(),
+            false,
+            false,
+            stream_from_bytes(b"part"),
+        )
+        .await
+    else {
+        panic!("part write failed")
+    };
+    let (operator, delete_calls, writer) = failing_cleanup::pending_operator();
+
+    let event = handler
+        .compose_parts(make_test_location(), operator, vec![part], None)
+        .await;
+
+    assert!(matches!(
+        event,
+        BlobEvent::Error(BlobError::WriteCleanup { .. })
+    ));
+    assert_eq!(writer.aborts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(delete_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn compose_close_fails() {
     let context = setup_blob_handle(5).await;
     let handler = context.blob_handle.handler.clone();
@@ -1900,7 +2151,7 @@ async fn compose_close_fails() {
 
     let (operator, aborts) = failing_close::operator_with_aborts();
     let event = handler
-        .compose_parts(target.clone(), operator, vec![part])
+        .compose_parts(target.clone(), operator, vec![part], None)
         .await;
 
     assert!(
@@ -1955,7 +2206,7 @@ async fn compose_cleanup_error() {
     let event = context
         .blob_handle
         .handler
-        .compose_parts(target.clone(), operator, Vec::new())
+        .compose_parts(target.clone(), operator, Vec::new(), None)
         .await;
 
     let BlobEvent::Error(BlobError::WriteCleanup { location, .. }) = event else {
@@ -2002,6 +2253,7 @@ async fn abandoned_writer_deletes() {
             false,
             Some(&operator),
             Some("obj/aborted"),
+            None,
         )
         .await
         .unwrap_err();
@@ -2017,11 +2269,42 @@ async fn abandoned_writer_deletes() {
             true,
             Some(&operator),
             Some("obj/abandoned"),
+            None,
         )
         .await
         .unwrap_err();
     assert!(matches!(error, BlobError::DeleteError(_)));
     assert_eq!(delete_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cancelled_write_deletes() {
+    // A write dropped mid-poll leaves the writer unusable, so cleanup must delete by path.
+    let context = setup_blob_handle(5).await;
+    let (operator, delete_calls, writer) = failing_cleanup::pending_operator();
+    let mut write = Box::pin(context.blob_handle.handler.write_stream(
+        make_test_location(),
+        operator,
+        stream_from_bytes(b"payload"),
+    ));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while writer.writes.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(futures::poll!(&mut write).is_pending());
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("write must reach the backend");
+
+    drop(write);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while delete_calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a cancelled write must delete its partial object");
+    assert_eq!(writer.aborts.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -2050,7 +2333,8 @@ async fn unsupported_abort_deletes() {
                 Some(&mut writer),
                 false,
                 Some(&operator),
-                Some("obj/partial")
+                Some("obj/partial"),
+                None,
             )
             .await,
         Ok(())
@@ -2409,6 +2693,664 @@ async fn s3_roundtrip_range() {
         other => panic!("unexpected read event {other:?}"),
     };
     assert!(gone, "deleted object must not be readable");
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_native_multipart() {
+    // Parts sent out of order, one left out, assemble exactly as listed.
+    let env = s3_env();
+    let bucket = unique_name("native-");
+    let config = s3_config(&env, None);
+    make_bucket(&bucket, &config).await.unwrap();
+    let native = NativeMultipart::from_config(&config, &bucket, "/", None).unwrap();
+    let path = "parts/object.bin";
+    let upload_id = native.create(path).await.unwrap();
+    let mib = 1024 * 1024;
+    let first = vec![1u8; 5 * mib];
+    let unused = vec![2u8; 5 * mib];
+    let last = b"tail".to_vec();
+    let mut etags = HashMap::new();
+    for (number, payload) in [(3u16, &last), (2, &unused), (1, &first)] {
+        let etag = native
+            .upload_part(
+                path,
+                &upload_id,
+                number,
+                payload.len() as u64,
+                stream_from_bytes(payload),
+            )
+            .await
+            .unwrap();
+        etags.insert(number, etag);
+    }
+
+    native
+        .complete(
+            path,
+            &upload_id,
+            &[(1, etags[&1].clone()), (3, etags[&3].clone())],
+        )
+        .await
+        .unwrap();
+
+    let client = create_s3_client(
+        &env.endpoint,
+        Some(env.region.clone()),
+        &env.access_key,
+        &env.secret_key,
+        true,
+    )
+    .await
+    .unwrap();
+    let object = client
+        .get_object()
+        .bucket(&bucket)
+        .key(path)
+        .send()
+        .await
+        .unwrap();
+    let body = object.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), [first, last].concat().as_slice());
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_abort_path() {
+    // Every unfinished upload of the exact path is aborted, a longer key is left alone.
+    let env = s3_env();
+    let bucket = unique_name("abort-");
+    let config = s3_config(&env, None);
+    make_bucket(&bucket, &config).await.unwrap();
+    let native = NativeMultipart::from_config(&config, &bucket, "/root", None).unwrap();
+    native.create("blob").await.unwrap();
+    let kept = native.create("blob").await.unwrap();
+    native
+        .upload_part("blob", &kept, 1, 4, stream_from_bytes(b"part"))
+        .await
+        .unwrap();
+    native.create("blob-other").await.unwrap();
+
+    assert_eq!(native.abort_path("blob").await.unwrap(), 2);
+    assert_eq!(native.abort_path("blob").await.unwrap(), 0);
+    assert_eq!(native.abort_path("blob-other").await.unwrap(), 1);
+    native.abort("blob", &kept).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_abandoned_cleanup() {
+    // Cleaning an abandoned write also aborts the provider upload its writer took along.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob(
+            "bucket",
+            "abandoned.bin",
+            cold_backend(),
+            test_user_id(),
+            stream_from_bytes(b"data"),
+        )
+        .await
+    else {
+        panic!("s3 write failed")
+    };
+    let path = location.get_storage_path().unwrap();
+    let native = handler.native_for(&location).unwrap().unwrap();
+    let left = native.create(&path).await.unwrap();
+    native
+        .upload_part(&path, &left, 1, 4, stream_from_bytes(b"part"))
+        .await
+        .unwrap();
+    let operator = handler
+        .registry
+        .operator_for(
+            &location.backend,
+            &location.root,
+            &location.storage_bucket,
+            &handler.egress,
+        )
+        .unwrap();
+
+    handler
+        .clean_partial(None, true, Some(&operator), Some(&path), Some(&location))
+        .await
+        .unwrap();
+
+    assert_eq!(native.abort_path(&path).await.unwrap(), 0);
+    assert!(operator.stat(&path).await.is_err());
+}
+
+async fn in_place_part(
+    handler: &BlobHandler,
+    upload: &BackendUpload,
+    part_number: u16,
+    payload: &[u8],
+) -> MultipartPart {
+    let BlobEvent::PartWritten {
+        location,
+        backend_etag,
+    } = handler
+        .write_upload_part(
+            upload.clone(),
+            part_number,
+            Some(payload.len() as u64),
+            test_user_id(),
+            stream_from_bytes(payload),
+        )
+        .await
+    else {
+        panic!("in-place part write failed")
+    };
+    assert!(location.partial);
+    MultipartPart {
+        part_number,
+        location,
+        created_at: SystemTime::now(),
+        backend_etag: Some(backend_etag),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_provider_upload() {
+    // Saved states cover parts 1 and 2; part 3 is left out and part 4 is read back.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "in-place.bin",
+            cold_backend(),
+            test_user_id(),
+        )
+        .await
+    else {
+        panic!("s3 upload did not open")
+    };
+    let mib = 1024 * 1024;
+    let payloads: HashMap<u16, Vec<u8>> = HashMap::from([
+        (1, vec![1u8; 5 * mib]),
+        (2, vec![2u8; 5 * mib + 3]),
+        // Same size as part 2, so only the ETag tells the two selections apart.
+        (3, vec![3u8; 5 * mib + 3]),
+        (4, b"tail".to_vec()),
+    ]);
+    let mut parts = HashMap::new();
+    for number in [1u16, 3, 2, 4] {
+        let part = in_place_part(&handler, &upload, number, &payloads[&number]).await;
+        parts.insert(number, part);
+    }
+    let listed = vec![parts[&1].clone(), parts[&2].clone(), parts[&4].clone()];
+    let expected = [&payloads[&1], &payloads[&2], &payloads[&4]]
+        .map(|payload| payload.as_slice())
+        .concat();
+
+    let BlobEvent::WriteFinished { location } = handler
+        .complete_upload(upload.clone(), listed.clone())
+        .await
+    else {
+        panic!("in-place completion failed")
+    };
+    assert_eq!(location.blob_size, expected.len() as u64);
+    assert_eq!(location.hashes, Hasher::new_with_bytes(&expected).to_map());
+    assert_eq!(read_back(&handler, location.clone()).await, expected);
+
+    // A repeated completion whose first answer was lost finds the object and hashes it again.
+    let BlobEvent::WriteFinished { location: again } =
+        handler.complete_upload(upload.clone(), listed).await
+    else {
+        panic!("repeated completion failed")
+    };
+    assert_eq!(again.hashes, location.hashes);
+
+    // A lost completion of another selection of the same size is not this object.
+    let other = vec![parts[&1].clone(), parts[&3].clone(), parts[&4].clone()];
+    assert!(matches!(
+        handler.complete_upload(upload, other).await,
+        BlobEvent::Error(_)
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_provider_abort() {
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "aborted.bin",
+            cold_backend(),
+            test_user_id(),
+        )
+        .await
+    else {
+        panic!("s3 upload did not open")
+    };
+    in_place_part(&handler, &upload, 1, b"part").await;
+
+    assert!(matches!(
+        handler.abort_upload(upload.clone()).await,
+        BlobEvent::UploadAborted
+    ));
+    // The release removed the reservation row, but the queued discard stays for late parts.
+    assert_eq!(
+        upload_rows(&context.storage_handle, upload.record_id).await,
+        1
+    );
+    let path = upload.location.get_storage_path().unwrap();
+    let native = handler.native_for(&upload.location).unwrap().unwrap();
+    assert_eq!(native.abort_path(&path).await.unwrap(), 0);
+    // Deleting an in-place part touches nothing: the provider upload owned it.
+    let mut part = upload.location.clone();
+    part.partial = true;
+    assert!(matches!(
+        handler.delete_blob(part).await,
+        BlobEvent::DeleteFinished
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_staged_replacement() {
+    // A replacement waits in a blob of its own; completion copies it over the acknowledged part.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "staged.bin",
+            cold_backend(),
+            test_user_id(),
+        )
+        .await
+    else {
+        panic!("s3 upload did not open")
+    };
+    let mib = 1024 * 1024;
+    in_place_part(&handler, &upload, 1, &vec![1u8; 5 * mib]).await;
+    let last = in_place_part(&handler, &upload, 2, b"tail").await;
+    let replacement = vec![9u8; 5 * mib + 1];
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob_part(
+            MultipartPartKey::new(upload.record_id, 1),
+            cold_backend(),
+            test_user_id(),
+            false,
+            false,
+            stream_from_bytes(&replacement),
+        )
+        .await
+    else {
+        panic!("staged part write failed")
+    };
+    let staged = MultipartPart {
+        part_number: 1,
+        location,
+        created_at: SystemTime::now(),
+        backend_etag: None,
+    };
+
+    let BlobEvent::WriteFinished { location } =
+        handler.complete_upload(upload, vec![staged, last]).await
+    else {
+        panic!("completion with a staged part failed")
+    };
+
+    let expected = [replacement.as_slice(), b"tail"].concat();
+    assert_eq!(location.hashes, Hasher::new_with_bytes(&expected).to_map());
+    assert_eq!(read_back(&handler, location).await, expected);
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_abort_streaming() {
+    // A part still streaming during an abort aborts again when it settles.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "streaming.bin",
+            cold_backend(),
+            test_user_id(),
+        )
+        .await
+    else {
+        panic!("s3 upload did not open")
+    };
+    let half = 3 * 1024 * 1024;
+    let (started, on_start) = tokio::sync::oneshot::channel::<()>();
+    let (release, on_release) = tokio::sync::oneshot::channel::<()>();
+    let first = futures::stream::once(async move {
+        _ = started.send(());
+        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![1u8; half]))
+    });
+    let rest = futures::stream::once(async move {
+        _ = on_release.await;
+        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![2u8; half]))
+    });
+    let writing = tokio::spawn({
+        let handler = handler.clone();
+        let upload = upload.clone();
+        async move {
+            handler
+                .write_upload_part(
+                    upload,
+                    1,
+                    Some(2 * half as u64),
+                    test_user_id(),
+                    BackendStream::new(futures::StreamExt::chain(first, rest)),
+                )
+                .await
+        }
+    });
+    on_start.await.unwrap();
+
+    assert!(matches!(
+        handler.abort_upload(upload.clone()).await,
+        BlobEvent::UploadAborted
+    ));
+    assert!(matches!(
+        handler
+            .write_upload_part(
+                upload.clone(),
+                2,
+                Some(4),
+                test_user_id(),
+                stream_from_bytes(b"late")
+            )
+            .await,
+        BlobEvent::Error(_)
+    ));
+    release.send(()).unwrap();
+    assert!(matches!(writing.await.unwrap(), BlobEvent::Error(_)));
+
+    let path = upload.location.get_storage_path().unwrap();
+    let native = handler.native_for(&upload.location).unwrap().unwrap();
+    assert_eq!(native.abort_path(&path).await.unwrap(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_cancelled_write() {
+    // A part write whose request is cancelled after an abort still settles and aborts again.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "cancelled.bin",
+            cold_backend(),
+            test_user_id(),
+        )
+        .await
+    else {
+        panic!("s3 upload did not open")
+    };
+    let (started, on_start) = tokio::sync::oneshot::channel::<()>();
+    let first = futures::stream::once(async move {
+        _ = started.send(());
+        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![1u8; 1024]))
+    });
+    let body = futures::StreamExt::chain(first, futures::stream::pending());
+    let writing = tokio::spawn({
+        let handler = handler.clone();
+        let upload = upload.clone();
+        async move {
+            handler
+                .write_upload_part(
+                    upload,
+                    1,
+                    Some(2048),
+                    test_user_id(),
+                    BackendStream::new(body),
+                )
+                .await
+        }
+    });
+    on_start.await.unwrap();
+    assert!(matches!(
+        handler.abort_upload(upload.clone()).await,
+        BlobEvent::UploadAborted
+    ));
+
+    writing.abort();
+    assert!(writing.await.unwrap_err().is_cancelled());
+
+    assert!(!handler.chains().contains_key(&upload.upload_id));
+}
+
+#[tokio::test]
+async fn claims_one_writer() {
+    // One attempt at a time writes a provider part, and an acknowledged one keeps it.
+    let context = setup_blob_handle(5).await;
+    let handler = context.blob_handle.handler.clone();
+    let (first, second) = (Ulid::generate(), Ulid::generate());
+
+    assert!(matches!(
+        handler.claim_part("upload", 1, first),
+        Ok(Some(_))
+    ));
+    assert!(matches!(handler.claim_part("upload", 1, second), Ok(None)));
+    assert!(matches!(
+        handler.claim_part("upload", 2, second),
+        Ok(Some(_))
+    ));
+    // A committed attempt keeps its claim; only deleting its part, a rollback, frees it.
+    handler.clear_active(first);
+    assert!(matches!(handler.claim_part("upload", 1, second), Ok(None)));
+    let mut part = make_test_location();
+    part.ulid = first;
+    part.partial = true;
+    assert!(matches!(
+        handler.delete_blob(part).await,
+        BlobEvent::DeleteFinished
+    ));
+    assert!(matches!(
+        handler.claim_part("upload", 1, second),
+        Ok(Some(_))
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_overlapping_writes() {
+    // An overlapping first upload of one part waits staged; its accepted record wins at completion.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "overlap.bin",
+            cold_backend(),
+            test_user_id(),
+        )
+        .await
+    else {
+        panic!("s3 upload did not open")
+    };
+    let size = 5 * 1024 * 1024;
+    let (started, on_start) = tokio::sync::oneshot::channel::<()>();
+    let (release, on_release) = tokio::sync::oneshot::channel::<()>();
+    let first = futures::stream::once(async move {
+        _ = started.send(());
+        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![1u8; size / 2]))
+    });
+    let rest = futures::stream::once(async move {
+        _ = on_release.await;
+        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![1u8; size / 2]))
+    });
+    let claimed = tokio::spawn({
+        let handler = handler.clone();
+        let upload = upload.clone();
+        async move {
+            handler
+                .write_upload_part(
+                    upload,
+                    1,
+                    Some(size as u64),
+                    test_user_id(),
+                    BackendStream::new(futures::StreamExt::chain(first, rest)),
+                )
+                .await
+        }
+    });
+    on_start.await.unwrap();
+
+    let second = vec![2u8; size];
+    let BlobEvent::WriteFinished { location } = handler
+        .write_part(
+            upload.clone(),
+            MultipartPartKey::new(upload.record_id, 1),
+            cold_backend(),
+            test_user_id(),
+            false,
+            false,
+            Some(size as u64),
+            stream_from_bytes(&second),
+        )
+        .await
+    else {
+        panic!("the overlapping write was not staged")
+    };
+    assert!(!location.partial);
+    release.send(()).unwrap();
+    assert!(matches!(
+        claimed.await.unwrap(),
+        BlobEvent::PartWritten { .. }
+    ));
+    let last = in_place_part(&handler, &upload, 2, b"tail").await;
+    let staged = MultipartPart {
+        part_number: 1,
+        location,
+        created_at: SystemTime::now(),
+        backend_etag: None,
+    };
+
+    let BlobEvent::WriteFinished { location } =
+        handler.complete_upload(upload, vec![staged, last]).await
+    else {
+        panic!("completion failed")
+    };
+    assert_eq!(
+        read_back(&handler, location).await,
+        [second.as_slice(), b"tail"].concat()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_delayed_write() {
+    // A write admitted before another attempt's commit must not overwrite the acknowledged part.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "delayed.bin",
+            cold_backend(),
+            test_user_id(),
+        )
+        .await
+    else {
+        panic!("s3 upload did not open")
+    };
+    let size = 5 * 1024 * 1024;
+    let acknowledged = vec![1u8; size];
+    let accepted = in_place_part(&handler, &upload, 1, &acknowledged).await;
+    // The accepted attempt's operation commits and releases its reservation.
+    assert!(matches!(
+        context
+            .blob_handle
+            .send_blob_effect(BlobEffect::ReleaseReservation {
+                id: accepted.location.ulid,
+            })
+            .await,
+        Event::Blob(BlobEvent::ReservationReleased { .. })
+    ));
+
+    let BlobEvent::WriteFinished { location } = handler
+        .write_part(
+            upload.clone(),
+            MultipartPartKey::new(upload.record_id, 1),
+            cold_backend(),
+            test_user_id(),
+            false,
+            false,
+            Some(size as u64),
+            stream_from_bytes(&vec![9u8; size]),
+        )
+        .await
+    else {
+        panic!("the delayed write was not staged")
+    };
+    assert!(!location.partial);
+
+    let last = in_place_part(&handler, &upload, 2, b"tail").await;
+    let BlobEvent::WriteFinished { location } =
+        handler.complete_upload(upload, vec![accepted, last]).await
+    else {
+        panic!("completion of the acknowledged parts failed")
+    };
+    assert_eq!(
+        read_back(&handler, location).await,
+        [acknowledged.as_slice(), b"tail"].concat()
+    );
+}
+
+#[tokio::test]
+async fn filesystem_keeps_parts() {
+    // Without a provider upload, parts stay blobs of their own.
+    let context = setup_blob_handle(5).await;
+    let event = context
+        .blob_handle
+        .handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "key",
+            ResolvedBackend::node_default(),
+            test_user_id(),
+        )
+        .await;
+
+    assert!(matches!(
+        event,
+        BlobEvent::UploadOpened {
+            backend_upload: None
+        }
+    ));
 }
 
 #[tokio::test]

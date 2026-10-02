@@ -314,6 +314,18 @@ pub enum WriteOwner {
         upload_id: Ulid,
         part_number: u16,
     },
+    /// The target of an in-place upload, kept while the upload record names it.
+    Upload {
+        upload_id: Ulid,
+    },
+    /// A completed in-place target whose commit is uncertain: kept while the upload record
+    /// names it, or registered once a committed version owns it.
+    CompletedUpload {
+        upload_id: Ulid,
+        blake3: [u8; 32],
+        realm_id: RealmId,
+        ttl_ms: u64,
+    },
 }
 
 impl BlobCleanupWork {
@@ -351,6 +363,7 @@ pub struct BackendLocation {
     pub created_by: UserId,
     pub created_at: SystemTime,
     pub staging: bool,
+    /// One part of an unfinished provider multipart upload: never an object of its own.
     pub partial: bool,
     pub blob_size: u64,
     pub hashes: HashMap<String, Vec<u8>>,

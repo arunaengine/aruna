@@ -20,6 +20,7 @@ use crate::structs::identity::user::vault::VaultRecords;
 use crate::structs::placement::policy::document::{PlacementPolicyDocument, PolicyPublication};
 use crate::structs::placement::policy::{MAX_REF_INPUT, PlacementDecision};
 use crate::structs::storage::blob::{BackendLocation, HiddenBlobEntry};
+use crate::structs::storage::multipart::BackendUpload;
 use crate::structs::storage::replication::{ReplicationItemError, ReplicationSuboperationResult};
 use crate::structs::storage::routing::GroupRoutingInputs;
 use crate::{
@@ -145,6 +146,15 @@ pub enum BlobEvent {
         stream_id: Ulid,
     },
     GroupBackendChecked,
+    UploadOpened {
+        backend_upload: Option<BackendUpload>,
+    },
+    /// An in-place part: its location is partial and names the provider upload's target.
+    PartWritten {
+        location: BackendLocation,
+        backend_etag: String,
+    },
+    UploadAborted,
     Error(BlobError),
 }
 

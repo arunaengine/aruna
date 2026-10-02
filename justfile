@@ -42,7 +42,7 @@ check:
 	cargo check -p aruna --all-targets --no-default-features --features apptainer --locked
 	cargo check -p aruna --all-targets --no-default-features --features kubernetes --locked
 
-# Single-node stack with Keycloak; prints service URLs and ADMIN_TOKEN.
+# Single-node stack with Keycloak; migrates existing state first, prints service URLs and ADMIN_TOKEN.
 local:
 	bash scripts/local_deploy.sh
 

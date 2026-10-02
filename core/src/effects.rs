@@ -24,6 +24,7 @@ use crate::structs::placement::policy::document::PolicyPublicationClaim;
 use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::blob::{BackendLocation, HiddenBlobKey, ResolvedBackend};
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
+use crate::structs::storage::multipart::{BackendUpload, MultipartPart};
 use crate::structs::storage::usage::UsageDelta;
 use crate::task::TaskEffect;
 use crate::types::{Key, KeySpace, TxnId, Value};
@@ -67,7 +68,28 @@ pub enum BlobEffect {
         created_by: UserId,
         compressed: bool,
         encrypted: bool,
+        /// Streams the part into this provider upload instead of a blob of its own.
+        backend_upload: Option<Box<BackendUpload>>,
+        /// Declared part size; a provider upload needs it before the first byte.
+        size: Option<u64>,
         blob: BackendStream<Result<Bytes, StreamError>>,
+    },
+    /// Opens a provider multipart upload where the backend has one; others answer `None`.
+    OpenUpload {
+        /// The upload record that will own the provider upload, written after it opens.
+        record_id: Ulid,
+        bucket: String,
+        key: String,
+        resolved: ResolvedBackend,
+        created_by: UserId,
+    },
+    /// Assembles the listed in-place parts and hashes the finished object.
+    CompleteUpload {
+        backend_upload: Box<BackendUpload>,
+        parts: Vec<MultipartPart>,
+    },
+    AbortUpload {
+        backend_upload: Box<BackendUpload>,
     },
     Compose {
         bucket: String,

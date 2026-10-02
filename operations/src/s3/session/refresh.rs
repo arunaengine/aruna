@@ -12,7 +12,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::PathRestriction;
-use aruna_core::structs::identity::s3_session::{S3Session, SESSION_MAX_TTL};
+use aruna_core::structs::identity::s3_session::{PreviousCredential, S3Session, SESSION_MAX_TTL};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use std::time::SystemTime;
@@ -144,6 +144,17 @@ impl RefreshS3Operation {
         if session.last_used_at.is_none() {
             return self.fail(S3SessionError::Idle);
         }
+        if self.config.expiry <= session.expiry {
+            return self.fail(S3SessionError::NotExtended);
+        }
+        // Only one replaced pair is kept, so it must lapse before the next rotation.
+        if session
+            .previous
+            .as_ref()
+            .is_some_and(|previous| previous.expiry > self.config.now)
+        {
+            return self.fail(S3SessionError::TooEarly);
+        }
         let index = match decode_index(values[1].1.as_ref()) {
             Ok(index) => index,
             Err(error) => return self.fail(error),
@@ -151,7 +162,7 @@ impl RefreshS3Operation {
         if !index.contains(&self.config.access_key) {
             return self.fail(S3SessionError::IndexInconsistent);
         }
-        let pending = match build_session(
+        let mut pending = match build_session(
             self.config.access_key.clone(),
             self.config.user_identity,
             self.config.group_id,
@@ -163,6 +174,12 @@ impl RefreshS3Operation {
             Ok(pending) => pending,
             Err(error) => return self.fail(error),
         };
+        // Requests signed before this refresh stay valid until the old expiry.
+        pending.session.previous = Some(PreviousCredential {
+            secret: session.secret.clone(),
+            token_hash: session.token_hash.clone(),
+            expiry: session.expiry,
+        });
         let old_expiry = session.expiry;
         let old_key = match expiry_key(old_expiry, &self.config.access_key) {
             Ok(key) => key,

@@ -86,7 +86,12 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
     match effect {
         BlobEffect::Write { resolved, .. }
         | BlobEffect::WritePart { resolved, .. }
+        | BlobEffect::OpenUpload { resolved, .. }
         | BlobEffect::HandleReplication { resolved, .. } => push(&mut ids, &resolved.backend),
+        BlobEffect::CompleteUpload { backend_upload, .. }
+        | BlobEffect::AbortUpload { backend_upload } => {
+            push(&mut ids, &backend_upload.location.backend);
+        }
         BlobEffect::Compose {
             resolved, parts, ..
         } => {

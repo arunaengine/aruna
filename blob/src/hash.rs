@@ -21,6 +21,7 @@ pub struct Hashes {
     pub md5: [u8; 16],
 }
 
+#[derive(Clone)]
 pub struct Hasher {
     blake3: blake3::Hasher,
     crc32: crc_fast::Digest,

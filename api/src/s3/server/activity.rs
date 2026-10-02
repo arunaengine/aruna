@@ -286,14 +286,20 @@ pub(super) async fn run_connection<F>(
     F: Future + Send,
 {
     let mut connection = Box::pin(connection);
-    let initial = tokio::time::sleep(initial);
+    // A select precondition is read only once, so the expired timer re-checks for a request.
+    let initial = async {
+        tokio::time::sleep(initial).await;
+        if activity.has_request() {
+            std::future::pending::<()>().await;
+        }
+    };
     tokio::pin!(initial);
 
     tokio::select! {
         result = &mut connection => {
             let _ = result;
         }
-        _ = &mut initial, if !activity.has_request() => {
+        _ = &mut initial => {
             activity.cancel();
         }
         _ = activity.wait_idle() => {
@@ -357,6 +363,32 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(task.is_finished());
         task.await.expect("unrequested task joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_request_survives() {
+        // The listener marks the request only after the watcher has started.
+        let activity = Arc::new(ConnectionActivity::default());
+        let marker = activity.clone();
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_connection(
+            activity.clone(),
+            async move {
+                marker.mark_request();
+                marker.begin_request();
+                let _sent = entered.send(());
+                std::future::pending::<hyper::Result<()>>().await
+            },
+            INITIAL_REQUEST_TIMEOUT,
+        ));
+        observed.await.expect("request starts");
+        tokio::time::advance(INITIAL_REQUEST_TIMEOUT - Duration::from_secs(1)).await;
+        activity.record_progress(STREAM_PROGRESS_BYTES);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!activity.is_cancelled());
+        assert!(!task.is_finished());
+        task.abort();
     }
 
     #[tokio::test(start_paused = true)]

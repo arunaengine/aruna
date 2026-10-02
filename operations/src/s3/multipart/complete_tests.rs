@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use super::*;
 use aruna_core::structs::storage::blob::BackendRef;
-use aruna_core::structs::storage::multipart::{COMPLETION_LEASE_MS, MultipartChecksumHint};
+use aruna_core::structs::storage::multipart::{
+    BackendUpload, COMPLETION_LEASE_MS, MultipartChecksumHint,
+};
 use aruna_core::task::{TaskEffect, TaskKey};
 
 pub(super) const TEST_NOW_MS: u64 = 1_700_000_000_000;
@@ -77,6 +79,7 @@ fn open_upload_record(input: &CompleteUploadInput) -> MultipartUpload {
         placement_policies: Vec::new(),
         subject_generation: 0,
         completing_since_ms: None,
+        backend_upload: None,
     }
 }
 
@@ -100,6 +103,7 @@ fn part_record(part_number: u16, blob_size: u64) -> MultipartPart {
             hashes: HashMap::new(),
         },
         created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000180),
+        backend_etag: None,
     }
 }
 
@@ -554,6 +558,102 @@ fn conflict_deletes_composed() {
         effects.as_slice(),
         [Effect::Blob(BlobEffect::Delete { .. })]
     ));
+}
+
+fn in_place_record(op: &CompleteUploadOperation, target: &BackendLocation) -> MultipartUpload {
+    let mut record = open_upload_record(&op.input);
+    record.backend_upload = Some(BackendUpload {
+        location: target.clone(),
+        upload_id: "provider".to_string(),
+        record_id: Ulid::from_bytes([9u8; 16]),
+    });
+    record
+}
+
+#[test]
+fn uncertain_keeps_object() {
+    // A commit that may not have landed leaves the in-place object to the upload or its version.
+    let mut op = CompleteUploadOperation::new(finalize_input());
+    let mut target = composed_location(Ulid::from_bytes([5u8; 16]));
+    target.hashes.insert(
+        aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+        vec![7u8; 32],
+    );
+    op.upload_record = Some(in_place_record(&op, &target));
+    op.reset_done = true;
+    op.composed_location = Some(target.clone());
+    op.state = CompleteUploadState::CommitFinalizeTransaction;
+
+    let effects = op.step(Event::Storage(StorageEvent::Error {
+        error: StorageError::CommitFailed,
+    }));
+
+    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        panic!("expected reconciliation to be queued, got {effects:?}")
+    };
+    assert_eq!(
+        BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
+        BlobCleanupWork::ReconcileWrite {
+            location: target,
+            owner: WriteOwner::CompletedUpload {
+                upload_id: op.input.upload_id,
+                blake3: [7u8; 32],
+                realm_id: op.input.realm_id,
+                ttl_ms: RoCrateLimits::default().holder_ttl_ms,
+            },
+        }
+    );
+}
+
+#[test]
+fn completes_at_provider() {
+    // The provider assembles the parts; no compose reads them back.
+    let mut op = CompleteUploadOperation::new(finalize_input());
+    let target = composed_location(Ulid::from_bytes([5u8; 16]));
+    op.upload_record = Some(in_place_record(&op, &target));
+    op.resolved_parts = vec![part_record(1, 10)];
+
+    let effects = op.compose_blob();
+
+    let [
+        Effect::Blob(BlobEffect::CompleteUpload {
+            backend_upload,
+            parts,
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("expected the provider completion, got {effects:?}")
+    };
+    assert_eq!(backend_upload.location, target);
+    assert_eq!(parts, &op.resolved_parts);
+}
+
+#[test]
+fn conflict_keeps_object() {
+    // The in-place object is the only copy of its parts, so a refused finalize keeps it.
+    let mut op = CompleteUploadOperation::new(finalize_input());
+    let target = composed_location(Ulid::from_bytes([5u8; 16]));
+    op.upload_record = Some(in_place_record(&op, &target));
+    op.reset_done = true;
+    op.composed_location = Some(target.clone());
+    op.state = CompleteUploadState::CommitFinalizeTransaction;
+
+    let effects = op.step(Event::Storage(StorageEvent::Error {
+        error: StorageError::TransactionConflict,
+    }));
+
+    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        panic!("expected a kept cleanup row, got {effects:?}")
+    };
+    assert_eq!(
+        BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
+        BlobCleanupWork::ReconcileWrite {
+            location: target,
+            owner: WriteOwner::Upload {
+                upload_id: op.input.upload_id,
+            },
+        }
+    );
 }
 
 #[test]
@@ -1225,6 +1325,32 @@ fn unknown_mark_resets() {
         Some(CompleteUploadError::StorageError(
             StorageError::CommitFailed
         ))
+    );
+}
+
+#[test]
+fn compose_keeps_cause() {
+    let input = finalize_input();
+    let mut operation = CompleteUploadOperation::new(input);
+    operation.upload_record = Some(open_upload_record(&operation.input));
+    operation.state = CompleteUploadState::ComposeBlob;
+
+    let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::WriteError(
+        "part limit exceeded".to_string(),
+    ))));
+
+    assert_eq!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    );
+    assert_eq!(operation.state, CompleteUploadState::ResetUploadTransaction);
+    assert_eq!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::BlobError(BlobError::WriteError(
+            "part limit exceeded".to_string()
+        )))
     );
 }
 

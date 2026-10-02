@@ -128,7 +128,8 @@ impl ListPartsOperation {
         if record.bucket != self.input.bucket || record.key != self.input.key {
             return Err(ListPartsError::UploadTargetMismatch);
         }
-        if record.status != MultipartUploadStatus::Open {
+        // A running completion still owns its parts: a retry lists them and joins it.
+        if record.status == MultipartUploadStatus::Aborting {
             return Err(ListPartsError::UploadNotOpen);
         }
         Ok(())
@@ -338,6 +339,7 @@ mod test {
             placement_policies: Vec::new(),
             subject_generation: 0,
             completing_since_ms: None,
+            backend_upload: None,
         }
     }
 
@@ -357,6 +359,7 @@ mod test {
             part_number,
             location: part_location(),
             created_at: SystemTime::UNIX_EPOCH,
+            backend_etag: None,
         };
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -558,7 +561,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn closed_upload_rejected() {
+    async fn completing_upload_listed() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -567,6 +570,38 @@ mod test {
         let upload_id = Ulid::generate();
         let mut record = upload_record(upload_id, "bucket", "object");
         record.status = MultipartUploadStatus::Completing;
+        record.completing_since_ms = Some(1);
+        seed_upload(&storage_handle, &record).await;
+        seed_part(&storage_handle, upload_id, 1).await;
+        seed_part(&storage_handle, upload_id, 2).await;
+
+        let result = drive(
+            ListPartsOperation::new(ListPartsInput {
+                bucket: "bucket".to_string(),
+                key: "object".to_string(),
+                upload_id,
+                part_number_marker: None,
+                max_parts: ListPartsOperation::DEFAULT_MAX_PARTS,
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+
+        let numbers: Vec<u16> = result.parts.iter().map(|part| part.part_number).collect();
+        assert_eq!(numbers, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn closed_upload_rejected() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+
+        let upload_id = Ulid::generate();
+        let mut record = upload_record(upload_id, "bucket", "object");
+        record.status = MultipartUploadStatus::Aborting;
         seed_upload(&storage_handle, &record).await;
 
         let result = drive(

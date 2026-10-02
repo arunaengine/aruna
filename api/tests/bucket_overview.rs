@@ -258,6 +258,7 @@ async fn setup() -> Fixture {
             metadata: HashMap::new(),
             placement_policies: Vec::new(),
             subject_generation: 0,
+            backend_upload: None,
         }
         .to_bytes()
         .unwrap(),

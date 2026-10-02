@@ -8,7 +8,13 @@ use thiserror::Error;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StatusCheck {
     Open,
-    Takeover { now_ms: u64 },
+    Takeover {
+        now_ms: u64,
+    },
+    /// A takeover that also finishes an abort which stopped midway.
+    Recover {
+        now_ms: u64,
+    },
     Skip,
 }
 
@@ -33,15 +39,19 @@ pub(crate) fn validate_upload(
     }
     match (status, record.status) {
         (StatusCheck::Skip, _) | (StatusCheck::Open, MultipartUploadStatus::Open) => Ok(()),
-        (StatusCheck::Takeover { .. }, MultipartUploadStatus::Open) => Ok(()),
-        (StatusCheck::Takeover { now_ms }, MultipartUploadStatus::Completing)
-            if record.completion_stale(now_ms) =>
-        {
-            Ok(())
-        }
-        (StatusCheck::Takeover { .. }, MultipartUploadStatus::Completing) => {
-            Err(UploadTargetError::CompletionInProgress)
-        }
+        (StatusCheck::Recover { .. }, MultipartUploadStatus::Aborting) => Ok(()),
+        (
+            StatusCheck::Takeover { .. } | StatusCheck::Recover { .. },
+            MultipartUploadStatus::Open,
+        ) => Ok(()),
+        (
+            StatusCheck::Takeover { now_ms } | StatusCheck::Recover { now_ms },
+            MultipartUploadStatus::Completing,
+        ) if record.completion_stale(now_ms) => Ok(()),
+        (
+            StatusCheck::Takeover { .. } | StatusCheck::Recover { .. },
+            MultipartUploadStatus::Completing,
+        ) => Err(UploadTargetError::CompletionInProgress),
         _ => Err(UploadTargetError::NotOpen),
     }
 }
@@ -70,6 +80,7 @@ mod pure_tests {
             placement_policies: Vec::new(),
             subject_generation: 0,
             completing_since_ms: since,
+            backend_upload: None,
         }
     }
 
@@ -102,6 +113,19 @@ mod pure_tests {
                 "key",
                 StatusCheck::Takeover { now_ms: 11 },
             ),
+            Err(UploadTargetError::CompletionInProgress)
+        );
+    }
+
+    #[test]
+    fn recover_rechecks_status() {
+        let check = StatusCheck::Recover { now_ms: 11 };
+        let aborting = upload(MultipartUploadStatus::Aborting, None);
+        let completing = upload(MultipartUploadStatus::Completing, Some(10));
+
+        assert_eq!(validate_upload(&aborting, "bucket", "key", check), Ok(()));
+        assert_eq!(
+            validate_upload(&completing, "bucket", "key", check),
             Err(UploadTargetError::CompletionInProgress)
         );
     }

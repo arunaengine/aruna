@@ -8,19 +8,25 @@
 mod shared;
 
 use aruna_api::routes::credentials::CreatePathRestriction;
+use aruna_api::s3::server::S3ServerTimeouts;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier,
     VersioningConfiguration,
 };
 use shared::{
-    SeedNode, TestResult, create_bearer_token, create_group_http, create_restricted_credentials,
-    create_s3_credentials, s3_client, spawn_complete_seed,
+    AWS_REGION, SeedNode, TestResult, create_bearer_token, create_group_http,
+    create_restricted_credentials, create_s3_credentials, s3_client, sign_token,
+    spawn_complete_seed, spawn_s3_with,
 };
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
 fn service_error_code<T, E>(result: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> Option<String>
@@ -553,6 +559,187 @@ async fn versions_paginate_keys() -> TestResult<()> {
     }
     .await;
 
+    seed.shutdown().await;
+    result
+}
+
+#[tokio::test]
+async fn refresh_keeps_presigned() -> TestResult<()> {
+    // A part signed before its session is refreshed must still upload after the refresh.
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let bucket = "s3-ops-refresh-presigned";
+        let admin_token = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&seed.base_url, &admin_token, bucket).await?;
+        let credentials =
+            create_s3_credentials(&seed.base_url, &admin_token, &group.group_id).await?;
+        let endpoint = seed
+            .s3
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
+        s3_client(endpoint, &credentials)
+            .create_bucket()
+            .bucket(bucket)
+            .send()
+            .await?;
+
+        // The session expiry follows this short bearer token, so it starts inside the refresh window.
+        let bearer = sign_token(&seed, seed.user_id, None, 240)?;
+        let http = reqwest::Client::new();
+        let sessions = format!("{}/api/v1/access/s3/sessions", seed.base_url);
+        let session: serde_json::Value = http
+            .post(&sessions)
+            .bearer_auth(&bearer)
+            .json(&serde_json::json!({ "group_id": group.group_id }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let field = |name: &str| {
+            session[name]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| std::io::Error::other(format!("session misses {name}")))
+        };
+        let access_key = field("access_key_id")?;
+        let session_credentials = Credentials::new(
+            &access_key,
+            field("secret_access_key")?,
+            Some(field("session_token")?),
+            None,
+            "aruna-refresh-test",
+        );
+        let client = S3Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .behavior_version(BehaviorVersion::latest())
+                .region(Region::new(AWS_REGION))
+                .credentials_provider(session_credentials)
+                .endpoint_url(endpoint.endpoint_url.clone())
+                .force_path_style(true)
+                .build(),
+        );
+        let created = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key("object.bin")
+            .send()
+            .await?;
+        let upload_id = created
+            .upload_id()
+            .ok_or_else(|| std::io::Error::other("create multipart missing upload id"))?;
+        let presigned = client
+            .upload_part()
+            .bucket(bucket)
+            .key("object.bin")
+            .upload_id(upload_id)
+            .part_number(1)
+            .presigned(PresigningConfig::expires_in(Duration::from_secs(120))?)
+            .await?;
+
+        // Only a renewed bearer token lets the refresh move the expiry later.
+        let renewed = sign_token(&seed, seed.user_id, None, 3600)?;
+        http.post(format!("{sessions}/{access_key}/refresh"))
+            .bearer_auth(&renewed)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let mut request = http.put(presigned.uri()).body(vec![b'p'; 5 * 1024 * 1024]);
+        for (name, value) in presigned.headers() {
+            request = request.header(name, value);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.text().await?;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+#[tokio::test]
+async fn slow_part_survives() -> TestResult<()> {
+    // A part still sending its body when the initial request timer fires keeps its connection.
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let bucket = "s3-ops-slow-part";
+        let admin_token = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&seed.base_url, &admin_token, bucket).await?;
+        let credentials =
+            create_s3_credentials(&seed.base_url, &admin_token, &group.group_id).await?;
+        let initial = Duration::from_secs(1);
+        let (endpoint, listener) = spawn_s3_with(
+            &seed,
+            S3ServerTimeouts {
+                initial_request: initial,
+                connection_idle: Duration::from_secs(300),
+                stream_lifetime: Duration::from_secs(60 * 60),
+            },
+        )
+        .await?;
+        let client = s3_client(&endpoint, &credentials);
+        client.create_bucket().bucket(bucket).send().await?;
+        let created = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key("slow.bin")
+            .send()
+            .await?;
+        let upload_id = created
+            .upload_id()
+            .ok_or_else(|| std::io::Error::other("create multipart missing upload id"))?;
+        let presigned = client
+            .upload_part()
+            .bucket(bucket)
+            .key("slow.bin")
+            .upload_id(upload_id)
+            .part_number(1)
+            .presigned(PresigningConfig::expires_in(Duration::from_secs(120))?)
+            .await?;
+
+        // The body keeps arriving for about three times the initial request timeout.
+        let (chunk, chunks) = (64 * 1024, 12);
+        let (mut writer, reader) = tokio::io::duplex(chunk);
+        let feeder = tokio::spawn(async move {
+            for _ in 0..chunks {
+                writer.write_all(&vec![b's'; chunk]).await?;
+                tokio::time::sleep(initial / 4).await;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        let mut request = reqwest::Client::new()
+            .put(presigned.uri())
+            .header(reqwest::header::CONTENT_LENGTH, chunk * chunks)
+            .body(reqwest::Body::wrap_stream(
+                tokio_util::io::ReaderStream::new(reader),
+            ));
+        for (name, value) in presigned.headers() {
+            request = request.header(name, value);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.text().await?;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        feeder.await??;
+        listener.abort();
+        Ok(())
+    }
+    .await;
     seed.shutdown().await;
     result
 }

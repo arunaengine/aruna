@@ -30,6 +30,15 @@ pub struct S3Session {
     pub path_restrictions: Option<Vec<PathRestriction>>,
     pub issued_by: [u8; 32],
     pub last_used_at: Option<SystemTime>,
+    /// The pair a refresh replaced, kept until its own expiry for requests signed before.
+    pub previous: Option<PreviousCredential>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PreviousCredential {
+    pub secret: EncryptedS3Secret,
+    pub token_hash: String,
+    pub expiry: SystemTime,
 }
 
 impl S3Session {
@@ -69,8 +78,14 @@ impl S3Session {
                 .is_ok_and(|remaining| remaining <= SESSION_REFRESH_WINDOW)
     }
 
-    pub fn token_matches(&self, token_hash: &str) -> bool {
-        self.token_hash == token_hash
+    pub fn token_matches(&self, token_hash: &str, now: SystemTime) -> bool {
+        self.token_hash == token_hash || self.previous_for(token_hash, now).is_some()
+    }
+
+    fn previous_for(&self, token_hash: &str, now: SystemTime) -> Option<&PreviousCredential> {
+        self.previous
+            .as_ref()
+            .filter(|previous| previous.expiry > now && previous.token_hash == token_hash)
     }
 
     pub fn credential_aad(&self) -> Vec<u8> {
@@ -94,6 +109,26 @@ impl S3Session {
 
     pub fn open_secret(&self, key: &CredentialEncryptionKey) -> Result<String, EncryptionError> {
         self.secret.open(key, &self.credential_aad())
+    }
+
+    /// Opens the secret paired with `token_hash`: the previous one until it expires, else the current.
+    pub fn open_secret_for(
+        &self,
+        key: &CredentialEncryptionKey,
+        token_hash: Option<&str>,
+        now: SystemTime,
+    ) -> Result<String, EncryptionError> {
+        let Some(previous) = token_hash.and_then(|hash| self.previous_for(hash, now)) else {
+            return self.open_secret(key);
+        };
+        let aad = credential_aad(
+            &self.access_key,
+            self.user_identity,
+            self.group_id,
+            self.issued_by,
+            previous.expiry,
+        );
+        previous.secret.open(key, &aad)
     }
 
     pub fn as_user_access(&self) -> UserAccess {
@@ -133,6 +168,7 @@ mod tests {
             path_restrictions: None,
             issued_by: [4u8; 32],
             last_used_at: None,
+            previous: None,
         }
     }
 
@@ -156,8 +192,42 @@ mod tests {
 
     #[test]
     fn token_is_exact() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let session = session(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000));
-        assert!(session.token_matches(&S3Session::hash_token("token")));
-        assert!(!session.token_matches(&S3Session::hash_token("Token")));
+        assert!(session.token_matches(&S3Session::hash_token("token"), now));
+        assert!(!session.token_matches(&S3Session::hash_token("Token"), now));
+    }
+
+    #[test]
+    fn previous_until_expiry() {
+        let key = CredentialEncryptionKey::random();
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut old = session(start + SESSION_MAX_TTL);
+        old.encrypt_secret(&key, "old-secret").unwrap();
+        let mut current = session(start + 2 * SESSION_MAX_TTL);
+        current.token_hash = S3Session::hash_token("new-token");
+        current.encrypt_secret(&key, "new-secret").unwrap();
+        current.previous = Some(PreviousCredential {
+            secret: old.secret,
+            token_hash: old.token_hash,
+            expiry: old.expiry,
+        });
+        let old_token = S3Session::hash_token("token");
+        let before = start + Duration::from_secs(59 * 60);
+
+        assert!(current.token_matches(&old_token, before));
+        assert_eq!(
+            current.open_secret_for(&key, Some(&old_token), before),
+            Ok("old-secret".to_string())
+        );
+        assert_eq!(
+            current.open_secret_for(&key, Some(&S3Session::hash_token("new-token")), before),
+            Ok("new-secret".to_string())
+        );
+        assert!(!current.token_matches(&old_token, start + SESSION_MAX_TTL));
+        assert_eq!(
+            current.open_secret_for(&key, Some(&old_token), start + SESSION_MAX_TTL),
+            Ok("new-secret".to_string())
+        );
     }
 }

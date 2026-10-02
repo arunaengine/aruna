@@ -213,7 +213,13 @@ jobs:
           --run-ignored all --no-tests fail
           -E 'package(aruna-blob) & kind(lib) & (test(=blob::tests::s3_roundtrip_range)
           | test(=blob::tests::s3_multipart_compose) | test(=blob::tests::s3_group_backend)
-          | test(=blob::tests::s3_backend_routes))'
+          | test(=blob::tests::s3_backend_routes) | test(=blob::tests::s3_native_multipart)
+          | test(=blob::tests::s3_abort_path) | test(=blob::tests::s3_abandoned_cleanup)
+          | test(=blob::tests::s3_provider_upload) | test(=blob::tests::s3_provider_abort)
+          | test(=blob::tests::s3_abort_streaming) | test(=blob::tests::s3_staged_replacement)
+          | test(=blob::tests::s3_cancelled_write) | test(=blob::tests::s3_overlapping_writes)
+          | test(=blob::tests::s3_delayed_write))
+          | (package(aruna-operations) & binary(multipart) & test(=s3_provider_flow))'
 
   docker-backend:
     runs-on: ubuntu-latest

@@ -27,7 +27,7 @@ use aruna_core::types::Key;
 use tracing::{error, warn};
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, now_ms};
 use crate::groups::backends::{backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
 use crate::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
@@ -134,6 +134,25 @@ pub struct BlobCleanupOutcome {
     pub processed: usize,
     pub failed: usize,
     pub dropped: usize,
+    /// Rows that must stay queued without being failures, such as a live upload's target.
+    pub kept: usize,
+}
+
+/// What one drain pass did with a row.
+enum RowOutcome {
+    Done,
+    Failed,
+    /// Not finished, but nothing went wrong: the row waits for a later pass.
+    Kept,
+}
+
+impl From<bool> for RowOutcome {
+    fn from(done: bool) -> Self {
+        match done {
+            true => Self::Done,
+            false => Self::Failed,
+        }
+    }
 }
 
 // Pages through the whole queue so persistently failing rows cannot starve the
@@ -175,11 +194,13 @@ pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanu
                 outcome.dropped = outcome.dropped.saturating_add(1);
                 continue;
             }
-            if run_cleanup_work(context, work).await {
-                done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
-                outcome.processed = outcome.processed.saturating_add(1);
-            } else {
-                outcome.failed = outcome.failed.saturating_add(1);
+            match run_cleanup_work(context, work).await {
+                RowOutcome::Done => {
+                    done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
+                    outcome.processed = outcome.processed.saturating_add(1);
+                }
+                RowOutcome::Failed => outcome.failed = outcome.failed.saturating_add(1),
+                RowOutcome::Kept => outcome.kept = outcome.kept.saturating_add(1),
             }
         }
 
@@ -198,8 +219,8 @@ pub struct UploadSweepOutcome {
     pub failed: usize,
 }
 
-/// An upload no client will finish: an `Open` record past its TTL, or a
-/// `Completing` one whose lease lapsed long enough ago that its request is gone.
+/// An upload no client will finish: an `Open` record past its TTL, a `Completing` one whose
+/// lease lapsed long enough ago that its request is gone, or an abort that stopped midway.
 fn stale_upload(record: &MultipartUpload, now_ms: u64) -> bool {
     let age = record
         .created_at
@@ -212,7 +233,7 @@ fn stale_upload(record: &MultipartUpload, now_ms: u64) -> bool {
             .completing_since_ms
             .map(|since| now_ms.saturating_sub(since) >= COMPLETING_TTL_MS)
             .unwrap_or(age >= COMPLETING_TTL_MS),
-        MultipartUploadStatus::Aborting => false,
+        MultipartUploadStatus::Aborting => true,
     }
 }
 
@@ -255,17 +276,18 @@ pub async fn sweep_stale_uploads(
 
     for record in stale {
         let upload_id = record.upload_id;
-        match drive(
-            AbortUploadOperation::new(AbortUploadInput {
-                bucket: record.bucket,
-                key: record.key,
-                upload_id,
-                now_ms,
-            }),
-            context,
-        )
-        .await
-        {
+        let mut operation = AbortUploadOperation::new(AbortUploadInput {
+            bucket: record.bucket,
+            key: record.key,
+            upload_id,
+            now_ms,
+        });
+        // An abort is transactional, so finishing one that stopped midway is safe to repeat.
+        // The status is checked again in that transaction: this scan may be stale.
+        if record.status == MultipartUploadStatus::Aborting {
+            operation = operation.resuming_abort();
+        }
+        match drive(operation, context).await {
             Ok(_) => {
                 outcome.aborted = outcome.aborted.saturating_add(1);
                 warn!(%upload_id, status = ?record.status, "Reclaimed a stale multipart upload");
@@ -324,13 +346,30 @@ async fn delete_cleanup_rows(
 }
 
 // Best-effort execution: a failed entry stays queued and retries next drain.
-async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> bool {
+async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> RowOutcome {
     match work {
-        BlobCleanupWork::DeleteBlob { location } => delete_blob(context, location).await,
+        BlobCleanupWork::DeleteBlob { location } => delete_blob(context, location).await.into(),
+        BlobCleanupWork::ReconcileWrite {
+            location,
+            owner: WriteOwner::Upload { upload_id },
+        } => reconcile_target(context, upload_id, None, location).await,
+        BlobCleanupWork::ReconcileWrite {
+            location,
+            owner:
+                WriteOwner::CompletedUpload {
+                    upload_id,
+                    blake3,
+                    realm_id,
+                    ttl_ms,
+                },
+        } => {
+            let holder = (blake3, realm_id, ttl_ms);
+            reconcile_target(context, upload_id, Some(holder), location).await
+        }
         // The committed metadata decides. An unreadable owner is not a proof of
         // either outcome, so the row waits for a drain that can read it.
         BlobCleanupWork::ReconcileWrite { location, owner } => {
-            match owns_write(context, &owner, &location).await {
+            let done = match owns_write(context, &owner, &location).await {
                 None => false,
                 Some(true) => {
                     if let Some(blob_handle) = context.blob_handle.as_ref() {
@@ -342,20 +381,70 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> boo
                             realm_id,
                             ttl_ms,
                         } => register_dht(context, blake3, realm_id, ttl_ms).await,
-                        WriteOwner::UploadPart { .. } => true,
+                        WriteOwner::UploadPart { .. }
+                        | WriteOwner::Upload { .. }
+                        | WriteOwner::CompletedUpload { .. } => true,
                     }
                 }
                 Some(false) => delete_blob(context, location).await,
-            }
+            };
+            done.into()
         }
         BlobCleanupWork::ReconcileReservation { location } => {
-            reconcile_reservation(context, location).await
+            reconcile_reservation(context, location).await.into()
         }
         BlobCleanupWork::RegisterDht {
             blake3,
             realm_id,
             ttl_ms,
-        } => register_dht(context, blake3, realm_id, ttl_ms).await,
+        } => register_dht(context, blake3, realm_id, ttl_ms).await.into(),
+    }
+}
+
+/// A live upload's target row stays queued: it is also the bucket reservation abort or
+/// completion settles. A committed version takes it over; otherwise, after the grace a running
+/// create needs, the target goes with its provider uploads.
+async fn reconcile_target(
+    context: &DriverContext,
+    upload_id: Ulid,
+    holder: Option<([u8; 32], RealmId, u64)>,
+    location: BackendLocation,
+) -> RowOutcome {
+    match owns_write(context, &WriteOwner::Upload { upload_id }, &location).await {
+        None => return RowOutcome::Failed,
+        Some(true) => return RowOutcome::Kept,
+        Some(false) => {}
+    }
+    if let Some((blake3, realm_id, ttl_ms)) = holder {
+        let owner = WriteOwner::Blob {
+            blake3,
+            realm_id,
+            ttl_ms,
+        };
+        match owns_write(context, &owner, &location).await {
+            None => return RowOutcome::Failed,
+            Some(true) => {
+                if let Some(blob_handle) = context.blob_handle.as_ref() {
+                    blob_handle.clear_reservation(location.ulid);
+                }
+                return register_dht(context, blake3, realm_id, ttl_ms).await.into();
+            }
+            Some(false) => {}
+        }
+    }
+    let opened_ms = location.ulid.timestamp_ms();
+    if now_ms().saturating_sub(opened_ms) < BLOB_CLEANUP_AFTER.as_millis() as u64 {
+        return RowOutcome::Kept;
+    }
+    let Some(blob_handle) = context.blob_handle.as_ref() else {
+        return RowOutcome::Failed;
+    };
+    match blob_handle.discard_target(location).await {
+        Ok(()) => RowOutcome::Done,
+        Err(error) => {
+            warn!(%error, "Discarding an in-place upload target failed");
+            RowOutcome::Failed
+        }
     }
 }
 
@@ -437,6 +526,9 @@ async fn owns_write(
                 .ok()?
                 .into(),
         ),
+        WriteOwner::Upload { upload_id } | WriteOwner::CompletedUpload { upload_id, .. } => {
+            (UPLOAD_KEYSPACE, upload_id.to_bytes().to_vec().into())
+        }
     };
     let event = context
         .storage_handle
@@ -456,6 +548,17 @@ async fn owns_write(
     let owned = match owner {
         WriteOwner::Blob { .. } => BackendLocation::from_bytes(&value).ok()?,
         WriteOwner::UploadPart { .. } => MultipartPart::from_bytes(&value).ok()?.location,
+        WriteOwner::Upload { .. } | WriteOwner::CompletedUpload { .. } => {
+            let record = MultipartUpload::from_bytes(&value).ok()?;
+            // An aborting upload gives its target up, so late provider parts are aborted too.
+            if record.status == MultipartUploadStatus::Aborting {
+                return Some(false);
+            }
+            match record.backend_upload {
+                Some(upload) => upload.location,
+                None => return Some(false),
+            }
+        }
     };
     Some(owned.same_object(location))
 }
@@ -468,10 +571,13 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
+    use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, UPLOAD_KEYSPACE};
     use aruna_core::structs::execution::job::RoCrateLimits;
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
+    };
+    use aruna_core::structs::storage::multipart::{
+        BackendUpload, MultipartUpload, MultipartUploadStatus,
     };
     use aruna_storage::storage::{FjallStorage, StorageHandle};
     use std::collections::HashMap;
@@ -685,6 +791,72 @@ mod tests {
         assert_eq!(outcome.processed, 0);
         assert_eq!(outcome.failed, 1);
         assert_eq!(remaining_rows(&storage).await, 1);
+    }
+
+    #[tokio::test]
+    async fn upload_keeps_target() {
+        // An open upload keeps its in-place target for a retry; an aborting one gives it up.
+        for (status, kept) in [
+            (MultipartUploadStatus::Open, true),
+            (MultipartUploadStatus::Aborting, false),
+        ] {
+            let (_dir, storage, context) = setup_context();
+            let BlobCleanupWork::DeleteBlob { mut location } =
+                BlobCleanupWork::from_bytes(&delete_work()).unwrap()
+            else {
+                panic!("expected a delete row")
+            };
+            // Opened long ago, so no create can still be running.
+            location.ulid = Ulid::from_parts(1, 3);
+            let upload_id = Ulid::generate();
+            let record = MultipartUpload {
+                upload_id,
+                backend: location.backend.clone(),
+                storage_class: None,
+                bucket: "bucket".to_string(),
+                key: "object".to_string(),
+                group_id: Ulid::generate(),
+                created_by: location.created_by,
+                created_at: SystemTime::now(),
+                status,
+                checksum_hint: None,
+                metadata: HashMap::new(),
+                placement_policies: Vec::new(),
+                subject_generation: 0,
+                completing_since_ms: None,
+                backend_upload: Some(BackendUpload {
+                    location: location.clone(),
+                    upload_id: "provider".to_string(),
+                    record_id: upload_id,
+                }),
+            };
+            let event = storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: UPLOAD_KEYSPACE.to_string(),
+                    key: upload_id.to_bytes().to_vec().into(),
+                    value: record.to_bytes().unwrap().into(),
+                    txn_id: None,
+                })
+                .await;
+            assert!(matches!(
+                event,
+                Event::Storage(StorageEvent::WriteResult { .. })
+            ));
+            let row = BlobCleanupWork::ReconcileWrite {
+                location,
+                owner: WriteOwner::Upload { upload_id },
+            };
+            write_rows(&storage, vec![row.to_bytes().unwrap()]).await;
+
+            let outcome = process_cleanup_batch(&context).await.unwrap();
+
+            // A kept row is the target's reservation and stays; a discard needs the blob handle
+            // this context lacks, so it fails and the row waits.
+            assert_eq!(outcome.processed, 0);
+            assert_eq!(outcome.kept, usize::from(kept));
+            assert_eq!(outcome.failed, usize::from(!kept));
+            assert_eq!(remaining_rows(&storage).await, 1);
+        }
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ use super::backend::{
 use super::group::GROUP_WRITE_CHUNK;
 use crate::hash::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
+use crate::s3::NativeMultipart;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
@@ -18,16 +19,17 @@ use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BackendRef, BlobLocationKey, HIDDEN_BLOB_PREFIX, HiddenBlobEntry,
+    Backend, BackendLocation, BackendRef, BlobLocationKey, HIDDEN_BLOB_PREFIX, HiddenBlobEntry,
     HiddenBlobKey, ResolvedBackend,
 };
+use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use aruna_core::structs::storage::multipart::MultipartPartKey;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use opendal::{EntryMode, ErrorKind, Operator};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::ops::{Bound, RangeBounds};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -81,6 +83,25 @@ async fn open_writer(
     }
 }
 
+/// Writer chunk for a composition. `None` keeps each input part as one S3 part; other kinds
+/// stream in chunks only as large as their provider's part limit requires.
+pub(super) fn compose_chunk(backend: &Backend, total: u64) -> Option<usize> {
+    const MIB: u64 = 1024 * 1024;
+    let limit: u64 = match backend {
+        Backend::S3 | Backend::Group(GroupBackendKind::S3) => return None,
+        Backend::Group(GroupBackendKind::Azblob | GroupBackendKind::Azdls) => 50_000,
+        Backend::FileSystem | Backend::Group(GroupBackendKind::Gcs | GroupBackendKind::B2) => {
+            10_000
+        }
+    };
+    let needed = total.div_ceil(limit).div_ceil(MIB) * MIB;
+    Some(
+        usize::try_from(needed)
+            .unwrap_or(usize::MAX)
+            .max(GROUP_WRITE_CHUNK),
+    )
+}
+
 async fn with_deadline<F, T>(deadline: Option<StdInstant>, future: F) -> Result<T, ()>
 where
     F: Future<Output = T>,
@@ -110,8 +131,8 @@ struct HiddenReservation {
     storage_path: Option<String>,
     writer: Option<opendal::Writer>,
     uncertain: bool,
-    /// A writer future a timeout dropped mid-poll leaves opendal's retry layer
-    /// in a bad state, so the writer must never be polled again.
+    /// A writer future dropped mid-poll by a timeout or cancellation leaves
+    /// opendal's retry layer in a bad state, so the writer must never be polled again.
     abandoned: bool,
 }
 
@@ -165,6 +186,10 @@ impl HiddenReservation {
         self.abandoned = true;
     }
 
+    fn mark_settled(&mut self) {
+        self.abandoned = false;
+    }
+
     async fn fail(&mut self, error: BlobError) -> BlobEvent {
         match self.abort().await {
             Ok(()) => BlobEvent::Error(error),
@@ -211,6 +236,7 @@ impl HiddenReservation {
                     abandoned,
                     operator.as_ref(),
                     storage_path.as_deref(),
+                    self.location.as_ref(),
                 )
                 .await;
             if cleanup.is_ok() {
@@ -219,7 +245,13 @@ impl HiddenReservation {
             cleanup
         } else if !self.uncertain {
             handler
-                .clean_partial(None, abandoned, operator.as_ref(), storage_path.as_deref())
+                .clean_partial(
+                    None,
+                    abandoned,
+                    operator.as_ref(),
+                    storage_path.as_deref(),
+                    self.location.as_ref(),
+                )
                 .await
         } else {
             Ok(())
@@ -268,6 +300,7 @@ impl Drop for HiddenReservation {
         let mut writer = self.writer.take();
         let operator = self.operator.clone();
         let storage_path = self.storage_path.clone();
+        let location = self.location.clone();
         let abandoned = self.abandoned;
         let uncertain = self.uncertain;
         runtime.spawn(async move {
@@ -279,6 +312,7 @@ impl Drop for HiddenReservation {
                     abandoned,
                     operator.as_ref(),
                     storage_path.as_deref(),
+                    location.as_ref(),
                 )
                 .await
             {
@@ -398,6 +432,8 @@ impl BlobHandler {
                     .await;
             }
             hasher.update(&bytes);
+            // Stays set if the caller drops this future before the write returns.
+            reservation.mark_abandoned();
             let write = match reservation.writer_mut() {
                 Some(writer) => match deadline {
                     Some(deadline) => {
@@ -415,6 +451,9 @@ impl BlobHandler {
                         .await;
                 }
             };
+            if write.is_ok() {
+                reservation.mark_settled();
+            }
             match write {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
@@ -434,6 +473,7 @@ impl BlobHandler {
             bytes_written = next_size;
         }
 
+        reservation.mark_abandoned();
         let close = match reservation.writer_mut() {
             Some(writer) => match deadline {
                 Some(deadline) => with_deadline(Some(deadline), writer.close()).await,
@@ -449,6 +489,9 @@ impl BlobHandler {
                     .await;
             }
         };
+        if close.is_ok() {
+            reservation.mark_settled();
+        }
         match close {
             Ok(Ok(_)) => {}
             Ok(Err(err)) => {
@@ -581,6 +624,7 @@ impl BlobHandler {
         abandoned: bool,
         operator: Option<&Operator>,
         storage_path: Option<&str>,
+        location: Option<&BackendLocation>,
     ) -> Result<(), BlobError> {
         if let Some(writer) = writer
             && !abandoned
@@ -593,8 +637,54 @@ impl BlobHandler {
             }
         }
         match (operator, storage_path) {
-            (Some(operator), Some(path)) => self.delete_path(operator, path).await,
+            (Some(operator), Some(path)) => {
+                self.delete_path(operator, path).await?;
+                match location {
+                    Some(location) if abandoned => {
+                        Box::pin(self.abort_uploads(location, path)).await
+                    }
+                    _ => Ok(()),
+                }
+            }
             _ => Ok(()),
+        }
+    }
+
+    /// The native multipart client for a location on an S3 backend; `None` for other kinds.
+    pub(super) fn native_for(
+        &self,
+        location: &BackendLocation,
+    ) -> Result<Option<NativeMultipart>, BlobError> {
+        let entry = self.registry.backend(&location.backend)?;
+        let config = &entry.config.service_config;
+        let (bucket, guard) = match entry.config.backend_type {
+            Backend::S3 => (location.storage_bucket.as_str(), None),
+            Backend::Group(GroupBackendKind::S3) => {
+                let bucket = config.get("bucket").ok_or_else(|| {
+                    BlobError::OperatorCreationFailed("group backend has no bucket".to_string())
+                })?;
+                (bucket.as_str(), Some(&self.egress))
+            }
+            _ => return Ok(None),
+        };
+        NativeMultipart::from_config(config, bucket, &location.root, guard).map(Some)
+    }
+
+    /// An abandoned writer took its provider upload id along, so deleting the path leaves the
+    /// uploaded parts behind. The path is unique to one blob, so its uploads are aborted.
+    pub(super) async fn abort_uploads(
+        &self,
+        location: &BackendLocation,
+        storage_path: &str,
+    ) -> Result<(), BlobError> {
+        let Some(native) = self.native_for(location)? else {
+            return Ok(());
+        };
+        match timeout(self.io_timeout(), native.abort_path(storage_path)).await {
+            Ok(result) => result.map(|_| ()),
+            Err(_) => Err(BlobError::DeleteError(
+                "timed out aborting unfinished multipart uploads".to_string(),
+            )),
         }
     }
 
@@ -925,7 +1015,19 @@ impl BlobHandler {
                 return BlobEvent::Error(err);
             }
         };
-        match self.compose_parts(location.clone(), operator, parts).await {
+        let backend_type = match self.registry.config_for(&resolved.backend) {
+            Ok(config) => config.backend_type,
+            Err(err) => {
+                _ = self.release_reservation(&location).await;
+                return BlobEvent::Error(err);
+            }
+        };
+        let total = parts.iter().map(|part| part.blob_size).sum();
+        let chunk = compose_chunk(&backend_type, total);
+        match self
+            .compose_parts(location.clone(), operator, parts, chunk)
+            .await
+        {
             BlobEvent::WriteFinished { location } => {
                 reservation.retain();
                 match self.finalize_reservation(&location).await {
@@ -952,17 +1054,27 @@ impl BlobHandler {
         mut location: BackendLocation,
         operator: Operator,
         parts: Vec<BackendLocation>,
+        chunk: Option<usize>,
     ) -> BlobEvent {
         let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
-        let mut writer = match timeout(
-            self.io_timeout(),
-            open_writer(&operator, &storage_path, &location.backend),
-        )
-        .await
-        {
+        // Without a fixed chunk, each write of at least the backend minimum is one backend part.
+        let opened = match chunk {
+            Some(chunk) => {
+                timeout(
+                    self.io_timeout(),
+                    operator
+                        .writer_with(&storage_path)
+                        .chunk(chunk)
+                        .into_future(),
+                )
+                .await
+            }
+            None => timeout(self.io_timeout(), operator.writer(&storage_path)).await,
+        };
+        let mut writer = match opened {
             Ok(Ok(writer)) => writer,
             Ok(Err(error)) => {
                 return BlobEvent::Error(BlobError::OperatorCreationFailed(error.to_string()));
@@ -977,6 +1089,8 @@ impl BlobHandler {
 
         let mut hasher = Hasher::new();
         let mut ambiguous = false;
+        // A timeout drops the writer future mid-poll, which leaves the writer unusable.
+        let mut abandoned = false;
         let compose_result: Result<u64, BlobError> = async {
             let mut bytes_written = 0u64;
             for part in parts {
@@ -996,31 +1110,39 @@ impl BlobHandler {
                     .map_err(|err| BlobError::ReadError(err.to_string()))?;
 
                 let mut reader = BackendStream::new(reader);
+                // Without a chunk the whole part is written at once so it keeps its own boundary.
+                let mut part_chunks = Vec::new();
+                let mut part_size = 0u64;
                 loop {
-                    let chunk = timeout(self.transfer_idle_timeout(), reader.next())
+                    let next = timeout(self.transfer_idle_timeout(), reader.next())
                         .await
                         .map_err(|_| {
                             BlobError::ReadError("compose reader idle timeout".to_string())
                         })?;
-                    let Some(chunk) = chunk else {
+                    let Some(next) = next else {
                         break;
                     };
-                    let bytes = chunk.map_err(|err| BlobError::ReadError(err.to_string()))?;
+                    let bytes = next.map_err(|err| BlobError::ReadError(err.to_string()))?;
                     hasher.update(&bytes);
-                    timeout(self.transfer_idle_timeout(), writer.write(bytes.to_vec()))
-                        .await
-                        .map_err(|_| {
-                            ambiguous = true;
-                            BlobError::WriteError("compose writer idle timeout".to_string())
-                        })?
-                        .map_err(|err| BlobError::WriteError(err.to_string()))?;
-                    bytes_written += bytes.len() as u64;
+                    part_size += bytes.len() as u64;
+                    part_chunks.push(bytes);
+                    if chunk.is_some() {
+                        let buffered = std::mem::take(&mut part_chunks);
+                        self.compose_write(&mut writer, buffered, &mut abandoned)
+                            .await?;
+                    }
                 }
+                if chunk.is_none() {
+                    self.compose_write(&mut writer, part_chunks, &mut abandoned)
+                        .await?;
+                }
+                bytes_written += part_size;
             }
             timeout(self.transfer_idle_timeout(), writer.close())
                 .await
                 .map_err(|_| {
                     ambiguous = true;
+                    abandoned = true;
                     BlobError::WriteError("compose close idle timeout".to_string())
                 })?
                 .map_err(|err| {
@@ -1030,11 +1152,19 @@ impl BlobHandler {
             Ok(bytes_written)
         }
         .await;
+        ambiguous |= abandoned;
 
         let bytes_written = match compose_result {
             Ok(bytes_written) => bytes_written,
             Err(err) => {
-                let cleanup = abort_partial_writer(&mut writer, self.io_timeout()).await;
+                let cleanup = if abandoned {
+                    match self.delete_path(&operator, &storage_path).await {
+                        Ok(()) => Box::pin(self.abort_uploads(&location, &storage_path)).await,
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    abort_partial_writer(&mut writer, self.io_timeout()).await
+                };
                 if ambiguous {
                     return BlobEvent::Error(BlobError::WriteCleanup {
                         location,
@@ -1057,6 +1187,22 @@ impl BlobHandler {
         location.blob_size = bytes_written;
         location.hashes = hasher.to_map();
         BlobEvent::WriteFinished { location }
+    }
+
+    /// A timeout drops the write mid-poll, so the writer is marked abandoned.
+    async fn compose_write(
+        &self,
+        writer: &mut opendal::Writer,
+        buffer: Vec<Bytes>,
+        abandoned: &mut bool,
+    ) -> Result<(), BlobError> {
+        timeout(self.transfer_idle_timeout(), writer.write(buffer))
+            .await
+            .map_err(|_| {
+                *abandoned = true;
+                BlobError::WriteError("compose writer idle timeout".to_string())
+            })?
+            .map_err(|err| BlobError::WriteError(err.to_string()))
     }
 
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
@@ -1546,6 +1692,12 @@ impl BlobHandler {
 
     pub async fn delete_blob(&self, location: BackendLocation) -> BlobEvent {
         self.clear_active(location.ulid);
+        // An in-place part is no object: its provider upload holds the bytes until it settles.
+        // Deleting it ends its claim: it was rolled back, or a staged record replaced it.
+        if location.partial {
+            self.release_claim(location.ulid);
+            return BlobEvent::DeleteFinished;
+        }
         let operator = match self.operator_from_location(&location) {
             Ok(op) => op,
             Err(err) => return BlobEvent::Error(err),
