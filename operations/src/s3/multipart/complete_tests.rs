@@ -675,7 +675,7 @@ fn completes_at_provider() {
 }
 
 #[test]
-fn frames_in_place_object() {
+fn frames_provider_object() {
     // Compression was turned on after the upload opened: the raw provider object is composed
     // into frames, and only that copy is checked and published.
     let mut op = CompleteUploadOperation::new(finalize_input());
@@ -715,7 +715,7 @@ fn frames_in_place_object() {
 }
 
 #[test]
-fn raw_in_place_object() {
+fn raw_provider_object() {
     // Without compression the provider object is published as it is.
     let mut op = CompleteUploadOperation::new(finalize_input());
     let target = composed_location(Ulid::from_bytes([5u8; 16]));

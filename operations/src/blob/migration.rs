@@ -1,6 +1,5 @@
-//! Re-encodes one local version with its bucket's compression. The new copy is published only if
-//! the setting and version are unchanged; reclaim keeps the old copy while another version uses it.
-//! A copy that already exists in the target encoding is adopted without reading the old one.
+//! Re-encodes one local version with its bucket's compression, or adopts an existing copy in that
+//! encoding; publishes only if setting and version are unchanged, and reclaim keeps shared copies.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

@@ -1,6 +1,5 @@
-//! A compression change re-encodes this node's copies in the background, resumes from stored
-//! progress and after a restart, keeps shared copies until no version names them, and serves the
-//! same bytes.
+//! A compression change re-encodes this node's copies in the background, resumes after a restart,
+//! keeps shared copies until no version names them, and serves the same bytes.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

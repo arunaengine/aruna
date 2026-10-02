@@ -1,6 +1,5 @@
-//! Changes the compression setting a bucket record carries for later writes. A change also
-//! starts this node's migration of the bucket's stored copies; the same setting again resumes
-//! an unfinished migration or restarts one that left failed versions.
+//! Changes a bucket's compression setting and starts this node's migration of its stored copies;
+//! the same setting again resumes an unfinished migration or retries one with failed versions.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

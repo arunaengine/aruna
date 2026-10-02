@@ -616,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn small_savings_stay_raw() {
+    fn small_savings_raw() {
         // 10,000 zero bytes save about 9.7 KiB, less than 5 percent of 1 MiB.
         let mut weak = random(FRAME_SIZE as usize, 5);
         weak[..10_000].fill(0);
