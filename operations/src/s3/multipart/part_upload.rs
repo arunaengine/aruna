@@ -131,6 +131,8 @@ pub struct UploadPartOperation {
     txn_id: Option<TxnId>,
     conflicts: u8,
     written_location: Option<BackendLocation>,
+    /// The provider's ETag of a part written into its multipart upload.
+    backend_etag: Option<String>,
     replaced_location: Option<BackendLocation>,
     rollback_location: Option<BackendLocation>,
     cleanup: WriteCleanup<UploadPartError>,
@@ -145,6 +147,7 @@ impl UploadPartOperation {
             txn_id: None,
             conflicts: 0,
             written_location: None,
+            backend_etag: None,
             replaced_location: None,
             rollback_location: None,
             cleanup: WriteCleanup::default(),
@@ -248,6 +251,13 @@ impl UploadPartOperation {
     fn handle_write_finished(&mut self, event: Event) -> Effects {
         let location = match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
+            Event::Blob(BlobEvent::PartWritten {
+                location,
+                backend_etag,
+            }) => {
+                self.backend_etag = Some(backend_etag);
+                location
+            }
             // Only a client-sourced stream fault may become a client error; a
             // server-side write fault must stay retryable, never a bad digest.
             Event::Blob(BlobEvent::Error(BlobError::StreamFailed(message))) => {
@@ -514,7 +524,7 @@ impl UploadPartOperation {
             part_number: self.input.part_number,
             location,
             created_at: SystemTime::now(),
-            backend_etag: None,
+            backend_etag: self.backend_etag.clone(),
         };
         let key =
             match MultipartPartKey::new(self.input.upload_id, self.input.part_number).to_bytes() {
@@ -791,7 +801,7 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::storage::multipart::MultipartUploadStatus;
+    use aruna_core::structs::storage::multipart::{BackendUpload, MultipartUploadStatus};
     use aruna_storage::storage;
     use tempfile::tempdir;
 
@@ -859,6 +869,84 @@ mod test {
         };
         assert_eq!(resolved.backend, record.backend);
         assert_eq!(resolved.storage_class, record.storage_class);
+    }
+
+    #[test]
+    fn in_place_keeps_etag() {
+        // A part streamed into the provider upload records the ETag completion must name.
+        let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
+        let upload = BackendUpload {
+            location: op.written_location.take().unwrap(),
+            upload_id: "provider-upload".to_string(),
+        };
+        op.input.content_length = Some(4);
+        op.input.body = Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+            &b"part"[..],
+        )));
+        op.state = UploadPartState::ReadUpload;
+        let record = MultipartUpload {
+            upload_id: op.input.upload_id,
+            backend: upload.location.backend.clone(),
+            storage_class: None,
+            bucket: "mybucket".to_string(),
+            key: "object.txt".to_string(),
+            group_id: Ulid::generate(),
+            created_by: test_user_id(),
+            created_at: SystemTime::UNIX_EPOCH,
+            status: MultipartUploadStatus::Open,
+            checksum_hint: None,
+            metadata: std::collections::HashMap::new(),
+            placement_policies: Vec::new(),
+            subject_generation: 0,
+            completing_since_ms: None,
+            backend_upload: Some(upload.clone()),
+        };
+
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    op.input.upload_id.to_bytes().to_vec().into(),
+                    Some(record.to_bytes().unwrap().into()),
+                ),
+                (NODE_SUBJECT_KEY.to_vec().into(), None),
+            ],
+        }));
+        let [
+            Effect::Blob(BlobEffect::WritePart {
+                backend_upload,
+                size,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected one part write, got {effects:?}")
+        };
+        assert_eq!(backend_upload.as_ref(), Some(&upload));
+        assert_eq!(*size, Some(4));
+
+        let mut written = upload.location.clone();
+        written.partial = true;
+        let effects = op.step(Event::Blob(BlobEvent::PartWritten {
+            location: written,
+            backend_etag: "\"etag\"".to_string(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+
+        op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
+        op.state = UploadPartState::ReadExistingPart;
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"part".to_vec().into(),
+            value: None,
+        }));
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected the part record, got {effects:?}")
+        };
+        let part = MultipartPart::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(part.backend_etag.as_deref(), Some("\"etag\""));
+        assert!(part.location.partial);
     }
 
     #[test]
