@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
-/// Upper bound for the parsed seek tables kept in memory, about 8 TiB of framed data.
+/// Upper bound for the parsed seek tables kept in memory, about 1.6 TiB of framed data.
 const INDEX_CACHE_BYTES: usize = 64 << 20;
 
 /// Parsed seek tables keyed by their hash. Stored objects never change, so entries stay valid.
@@ -116,9 +116,11 @@ impl FrameReader {
         let range = self.index.frame_range(frame);
         let stored = read_range(&self.operator, &self.path, range, self.idle).await?;
         let length = codec::frame_len(self.size, frame);
-        let decoded = tokio::task::spawn_blocking(move || codec::decode_frame(length, stored))
-            .await
-            .map_err(|error| BlobError::ReadError(error.to_string()))??;
+        let digest = *self.index.digest(frame);
+        let decoded =
+            tokio::task::spawn_blocking(move || codec::decode_frame(length, &digest, stored))
+                .await
+                .map_err(|error| BlobError::ReadError(error.to_string()))??;
         self.decoded = Some((frame, decoded.clone()));
         Ok(decoded)
     }

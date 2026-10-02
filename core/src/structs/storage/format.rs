@@ -24,7 +24,7 @@ pub enum StoredLayout {
     Frames(Box<FrameLayout>),
 }
 
-/// Record of a framed copy. The index hash covers the seek table that ends the stored object.
+/// Record of a framed copy. The index hash covers the frame digests and seek table at its end.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FrameLayout {
     /// The zstd level the frames were written with.

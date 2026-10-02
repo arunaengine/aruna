@@ -1,5 +1,5 @@
-//! Stores blobs in the zstd seekable format: 1 MiB zstd frames, then a seek table in a skippable
-//! frame that plain zstd decoders skip. The location record keeps the table's BLAKE3 hash.
+//! Stores blobs in the zstd seekable format: 1 MiB zstd frames, a skippable frame with the BLAKE3
+//! of each stored frame, then the seek table. The location record keeps the BLAKE3 of both.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -11,9 +11,11 @@ use zstd::zstd_safe::{CParameter, DParameter};
 
 pub(crate) const FRAME_SIZE: u64 = 1 << 20;
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A5E;
+const DIGEST_MAGIC: u32 = 0x184D_2A50;
 const SEEKABLE_MAGIC: u32 = 0x8F92_EAB1;
 /// Stored size and original size of one frame.
 const ENTRY_LEN: u64 = 8;
+const DIGEST_LEN: u64 = 32;
 /// Skippable frame header (magic, size) and table footer (frame count, descriptor, magic).
 const HEADER_LEN: u64 = 8;
 const FOOTER_LEN: u64 = 9;
@@ -29,8 +31,10 @@ pub(crate) fn frame_len(size: u64, frame: u64) -> u64 {
     FRAME_SIZE.min(size - frame * FRAME_SIZE)
 }
 
+/// Length of the digest frame and seek table that end the stored object.
 fn table_len(size: u64) -> u64 {
-    HEADER_LEN + frame_count(size) * ENTRY_LEN + FOOTER_LEN
+    let frames = frame_count(size);
+    2 * HEADER_LEN + frames * (DIGEST_LEN + ENTRY_LEN) + FOOTER_LEN
 }
 
 fn integrity(message: &str) -> BlobError {
@@ -58,6 +62,7 @@ pub(crate) fn encode_frame(raw: Bytes, level: u8) -> Result<Bytes, BlobError> {
 pub(crate) struct FrameWriter {
     level: u8,
     entries: Vec<u8>,
+    digests: Vec<u8>,
     frames: u32,
     stored: u64,
 }
@@ -67,6 +72,7 @@ impl FrameWriter {
         Self {
             level,
             entries: Vec::new(),
+            digests: Vec::new(),
             frames: 0,
             stored: 0,
         }
@@ -80,17 +86,24 @@ impl FrameWriter {
             .frames
             .checked_add(1)
             .ok_or_else(|| BlobError::WriteError("object has too many frames".to_string()))?;
+        self.digests
+            .extend_from_slice(blake3::hash(stored).as_bytes());
         self.entries.extend_from_slice(&len.to_le_bytes());
         self.entries.extend_from_slice(&original.to_le_bytes());
         self.stored += u64::from(len);
         Ok(())
     }
 
-    /// Returns the seek table that ends the object and the layout record that names it.
+    /// Returns the digests and seek table that end the object and the layout record that names them.
     pub(crate) fn finish(self) -> Result<(Vec<u8>, FrameLayout), BlobError> {
-        let frame_size = u32::try_from(self.entries.len() as u64 + FOOTER_LEN)
-            .map_err(|_| BlobError::WriteError("seek table is too large".to_string()))?;
-        let mut table = Vec::with_capacity((HEADER_LEN + u64::from(frame_size)) as usize);
+        let too_large = |_| BlobError::WriteError("seek table is too large".to_string());
+        let frame_size =
+            u32::try_from(self.entries.len() as u64 + FOOTER_LEN).map_err(too_large)?;
+        let digest_size = u32::try_from(self.digests.len()).map_err(too_large)?;
+        let mut table = Vec::with_capacity(table_len(u64::from(self.frames) * FRAME_SIZE) as usize);
+        table.extend_from_slice(&DIGEST_MAGIC.to_le_bytes());
+        table.extend_from_slice(&digest_size.to_le_bytes());
+        table.extend_from_slice(&self.digests);
         table.extend_from_slice(&SKIPPABLE_MAGIC.to_le_bytes());
         table.extend_from_slice(&frame_size.to_le_bytes());
         table.extend_from_slice(&self.entries);
@@ -154,7 +167,7 @@ impl FrameEncoder {
     }
 }
 
-/// Byte range of the seek table inside the stored object, checked against the record first.
+/// Byte range of the digests and seek table, checked against the record before any read.
 pub(crate) fn table_range(size: u64, layout: &FrameLayout) -> Result<Range<u64>, BlobError> {
     let len = table_len(size);
     if layout.stored_size < len {
@@ -163,24 +176,36 @@ pub(crate) fn table_range(size: u64, layout: &FrameLayout) -> Result<Range<u64>,
     Ok(layout.stored_size - len..layout.stored_size)
 }
 
-/// The checked seek table: where each frame starts in the stored object.
+/// The checked seek table: where each frame starts in the stored object and its BLAKE3.
 #[derive(Debug)]
 pub(crate) struct FrameIndex {
     size: u64,
     /// One start per frame, then the end of the last frame.
     offsets: Vec<u64>,
+    digests: Vec<[u8; 32]>,
 }
 
 impl FrameIndex {
     /// Verifies the table hash before using any value, then checks every frame bound.
-    pub(crate) fn parse(size: u64, layout: &FrameLayout, table: &[u8]) -> Result<Self, BlobError> {
+    pub(crate) fn parse(size: u64, layout: &FrameLayout, tail: &[u8]) -> Result<Self, BlobError> {
         let frames = frame_count(size);
-        if table.len() as u64 != table_len(size) {
+        if tail.len() as u64 != table_len(size) {
             return Err(integrity("seek table has the wrong length"));
         }
-        if blake3::hash(table).as_bytes() != &layout.index_hash {
+        if blake3::hash(tail).as_bytes() != &layout.index_hash {
             return Err(integrity("seek table hash mismatch"));
         }
+        let split = (HEADER_LEN + frames * DIGEST_LEN) as usize;
+        let (digests, table) = tail.split_at(split);
+        if read_u32(digests, 0) != DIGEST_MAGIC
+            || u64::from(read_u32(digests, 4)) != frames * DIGEST_LEN
+        {
+            return Err(integrity("frame digest header is invalid"));
+        }
+        let digests = digests[HEADER_LEN as usize..]
+            .as_chunks::<{ DIGEST_LEN as usize }>()
+            .0
+            .to_vec();
         let footer = table.len() - FOOTER_LEN as usize;
         if read_u32(table, 0) != SKIPPABLE_MAGIC
             || u64::from(read_u32(table, 4)) != table.len() as u64 - HEADER_LEN
@@ -209,15 +234,24 @@ impl FrameIndex {
             start += stored;
         }
         offsets.push(start);
-        if start + table.len() as u64 != layout.stored_size {
+        if start + tail.len() as u64 != layout.stored_size {
             return Err(integrity("frames do not fill the stored object"));
         }
-        Ok(Self { size, offsets })
+        Ok(Self {
+            size,
+            offsets,
+            digests,
+        })
     }
 
     /// Stored byte range of one frame.
     pub(crate) fn frame_range(&self, frame: u64) -> Range<u64> {
         self.offsets[frame as usize]..self.offsets[frame as usize + 1]
+    }
+
+    /// BLAKE3 of the stored bytes of one frame.
+    pub(crate) fn digest(&self, frame: u64) -> &[u8; 32] {
+        &self.digests[frame as usize]
     }
 
     pub(crate) fn size(&self) -> u64 {
@@ -226,12 +260,19 @@ impl FrameIndex {
 
     /// Bytes the parsed table holds in memory.
     pub(crate) fn memory(&self) -> usize {
-        self.offsets.len() * size_of::<u64>()
+        self.offsets.len() * size_of::<u64>() + self.digests.len() * DIGEST_LEN as usize
     }
 }
 
-/// Decodes one stored frame into exactly `expected` bytes; zstd checks the frame checksum.
-pub(crate) fn decode_frame(expected: u64, stored: Bytes) -> Result<Bytes, BlobError> {
+/// Checks the stored frame against its digest, then decodes it into exactly `expected` bytes.
+pub(crate) fn decode_frame(
+    expected: u64,
+    digest: &[u8; 32],
+    stored: Bytes,
+) -> Result<Bytes, BlobError> {
+    if blake3::hash(&stored).as_bytes() != digest {
+        return Err(integrity("frame digest mismatch"));
+    }
     match zstd::zstd_safe::get_frame_content_size(&stored) {
         Ok(Some(size)) if size == expected => {}
         _ => return Err(integrity("zstd frame declares the wrong size")),
@@ -309,7 +350,8 @@ mod tests {
             let bytes = index.frame_range(frame);
             let bytes = &stored[bytes.start as usize..bytes.end as usize];
             let length = frame_len(size, frame);
-            let decoded = decode_frame(length, Bytes::copy_from_slice(bytes))?;
+            let digest = index.digest(frame);
+            let decoded = decode_frame(length, digest, Bytes::copy_from_slice(bytes))?;
             let frame_start = frame * FRAME_SIZE;
             let to = (range.end - frame_start).min(length);
             out.extend_from_slice(&decoded[(position - frame_start) as usize..to as usize]);
@@ -408,12 +450,38 @@ mod tests {
     fn bombs_stay_bounded() {
         // A frame that claims more output than the frame may hold is refused unread.
         let large = zstd::bulk::compress(&vec![0u8; 64 * FRAME_SIZE as usize], 3).unwrap();
-        let result = decode_frame(FRAME_SIZE, Bytes::from(large));
+        let digest = *blake3::hash(&large).as_bytes();
+        let result = decode_frame(FRAME_SIZE, &digest, Bytes::from(large));
         assert!(matches!(result, Err(BlobError::IntegrityCheckFailed(_))));
         // A frame without a declared size is refused too.
         let open = zstd::stream::encode_all(&vec![0u8; 1024][..], 3).unwrap();
-        let result = decode_frame(1024, Bytes::from(open));
+        let digest = *blake3::hash(&open).as_bytes();
+        let result = decode_frame(1024, &digest, Bytes::from(open));
         assert!(matches!(result, Err(BlobError::IntegrityCheckFailed(_))));
+    }
+
+    #[test]
+    fn swapped_frames_fail() {
+        // Valid frames of equal size in another order or from another object
+        // still fail, because the table names each frame's own digest.
+        let mut data = vec![b'a'; 2 * FRAME_SIZE as usize];
+        data[FRAME_SIZE as usize..].fill(b'b');
+        let size = data.len() as u64;
+        let (stored, layout) = encode(&data, 3);
+        let index = index_of(&stored, &layout, size);
+        let (first, second) = (index.frame_range(0), index.frame_range(1));
+        let bytes = |range: &Range<u64>| stored[range.start as usize..range.end as usize].to_vec();
+        assert_eq!(first.end - first.start, second.end - second.start);
+        let mut swapped = bytes(&second);
+        swapped.extend(bytes(&first));
+        swapped.extend_from_slice(&stored[second.end as usize..]);
+        let mut replaced = bytes(&second);
+        replaced.extend_from_slice(&stored[first.end as usize..]);
+
+        for tampered in [swapped, replaced] {
+            let result = decode(&tampered, &layout, size, 0..10);
+            assert!(matches!(result, Err(BlobError::IntegrityCheckFailed(_))));
+        }
     }
 
     #[tokio::test]
