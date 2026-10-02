@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -25,8 +26,8 @@ use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::structs::storage::blob::{
-    BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
-    bucket_permission_path,
+    Backend, BackendConfig, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
+    CurrentVersionPointer, VersionKey, bucket_permission_path,
 };
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartUpload, MultipartUploadStatus,
@@ -37,6 +38,7 @@ use aruna_core::structs::storage::storage_purge::{
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::{
@@ -85,14 +87,35 @@ async fn setup_context() -> TestContext {
     let temp_dir = tempfile::tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    // Creating an upload asks the blob adapter whether the backend has a provider upload.
+    let blob_root = format!("{temp_root}/blobstore");
+    std::fs::create_dir_all(&blob_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+    let blob_handle = BlobHandler::new(
+        BackendConfig {
+            backend_type: Backend::FileSystem,
+            root: blob_root,
+            service_config: HashMap::new(),
+            bucket_prefix: Some("aruna_".to_string()),
+            max_bucket_size: None,
+            multipart_bucket: Some("uploaded-parts".to_string()),
+            timeouts: Default::default(),
+        },
+        storage_handle.clone(),
+        net_handle.clone(),
+    )
+    .await
+    .unwrap();
     let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let group_id = Ulid::generate();
     let user_id = UserId::local(Ulid::generate(), realm_id);
     let driver = Arc::new(DriverContext {
         storage_handle,
-        net_handle: None,
-        blob_handle: None,
+        net_handle: Some(net_handle),
+        blob_handle: Some(blob_handle),
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
