@@ -46,7 +46,7 @@ use aruna_core::structs::storage::blob::{
     bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
-use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
 use aruna_core::structs::storage::replication::{
     ReplicationItemKind, ReplicationNegotiationResult,
@@ -2534,6 +2534,18 @@ impl IncomingVersionOperation {
             if let Err(error) = gated.check_subject(subject.as_ref()) {
                 return self.fail(error.into());
             }
+        }
+        // A replica encoded under an older setting is never published: the bucket's
+        // migration may already have passed this key.
+        let written = self.effective_materialized_location().ok();
+        if bucket
+            .as_ref()
+            .zip(written)
+            .is_some_and(|(bucket, written)| {
+                EncodingClass::from(bucket.compression) != written.format.encoding()
+            })
+        {
+            return self.fail(StorageError::TransactionConflict.into());
         }
         self.verify_replaced()
     }

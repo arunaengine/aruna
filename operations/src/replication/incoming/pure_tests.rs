@@ -3249,3 +3249,30 @@ fn failure_survives_finalize() {
     op.fail(IncomingVersionError::RealmMismatch);
     assert_eq!(op.finalize(), Err(IncomingVersionError::RealmMismatch));
 }
+
+#[test]
+fn stale_encoding_rejects() {
+    // The bucket switched to zstd after this raw replica was stored: publishing it
+    // would leave a copy a finished migration never revisits.
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(91, 91),
+        iroh::SecretKey::from_bytes(&[91; 32]).public(),
+        RealmId::from_bytes([7u8; 32]),
+        make_manifest(ReplicationItemKind::Materialized),
+    );
+    op.state = IncomingVersionState::CheckDrift;
+    op.txn_id = Some(Ulid::from_parts(92, 92));
+    op.existing_blob_location = Some(make_location());
+    let mut bucket = make_bucket_info(Ulid::from_parts(93, 93));
+    bucket.compression = aruna_core::structs::storage::format::Compression::Zstd { level: 3 };
+
+    op.step(bucket_drift(&bucket));
+
+    assert_eq!(op.state, IncomingVersionState::Error);
+    assert!(matches!(
+        op.output,
+        Some(Err(IncomingVersionError::StorageError(
+            aruna_core::errors::StorageError::TransactionConflict
+        )))
+    ));
+}

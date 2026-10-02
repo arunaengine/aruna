@@ -41,7 +41,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CopyOrigin, CurrentVersionPointer, ResolvedBackend, VersionKey, WriteOwner,
 };
-use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
     MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
@@ -980,6 +980,13 @@ impl CompleteUploadOperation {
         let Some(location) = self.composed_location.clone() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
+        // A copy encoded under an older setting is never published: the bucket's
+        // migration may already have passed this key.
+        if bucket.as_ref().is_some_and(|bucket| {
+            EncodingClass::from(bucket.compression) != location.format.encoding()
+        }) {
+            return self.schedule_error(StorageError::TransactionConflict.into());
+        }
         // The compose already ran on the pinned backend, so the finalize must
         // prove it is still enabled or roll the composed object back.
         match fence_backend(&location.backend, self.txn_id) {

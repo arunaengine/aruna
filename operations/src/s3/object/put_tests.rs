@@ -169,6 +169,51 @@ fn guard_allows_edit() {
 }
 
 #[test]
+fn stale_encoding_rejected() {
+    // The setting changed while the bytes streamed: the raw copy must not become
+    // a version a finished migration would never revisit.
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let node_id = iroh::SecretKey::generate().public();
+    let config = put_config(realm_id, group_id, node_id);
+    let current = BucketInfo {
+        group_id,
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: config.user_id,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Zstd { level: 3 },
+    };
+    let mut op = PutObjectOperation::new(config);
+    op.state = PutObjectState::StartTransaction;
+    op.written_location = Some(test_location(op.config.user_id));
+    op.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: Ulid::generate(),
+    }));
+    op.step(fence_clear());
+
+    op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (
+                b"mybucket".to_vec().into(),
+                Some(current.to_bytes().unwrap().into()),
+            ),
+            (b"subject".to_vec().into(), None),
+        ],
+    }));
+    op.step(Event::Blob(BlobEvent::DeleteFinished));
+
+    assert_eq!(
+        op.finalize(),
+        Err(PutObjectError::StorageError(
+            StorageError::TransactionConflict
+        ))
+    );
+}
+
+#[test]
 fn recreate_rejected() {
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let group_id = Ulid::generate();

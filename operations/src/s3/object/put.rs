@@ -705,6 +705,18 @@ impl PutObjectOperation {
                 return self.emit_error(error.into());
             }
         }
+        // A copy encoded under an older setting is never published: the bucket's
+        // migration may already have passed this key.
+        let written = self
+            .get_written_location()
+            .map(|location| location.format.encoding());
+        if current
+            .as_ref()
+            .zip(written)
+            .is_some_and(|(bucket, written)| EncodingClass::from(bucket.compression) != written)
+        {
+            return self.emit_error(StorageError::TransactionConflict.into());
+        }
         self.bucket_policies = observed.policies;
         self.start_fence()
     }
