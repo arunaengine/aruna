@@ -44,6 +44,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
     CurrentVersionPointer, ManagedCopyKey, VersionKey, object_permission_path,
 };
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::multipart::{
     MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
 };
@@ -1098,6 +1099,7 @@ pub struct ReplicateObjectOperation {
     reference_metadata: Option<SourceMetadata>,
     group_inputs: GroupRoutingInputs,
     bucket_rules: Vec<StorageRoutingRule>,
+    bucket_compression: Compression,
     /// Group owning the destination bucket, read with its routing rules.
     bucket_group: Option<GroupId>,
     sync: Option<SyncTransferContext>,
@@ -1143,6 +1145,7 @@ impl ReplicateObjectOperation {
             reference_metadata: None,
             group_inputs: GroupRoutingInputs::default(),
             bucket_rules: Vec::new(),
+            bucket_compression: Compression::Off,
             bucket_group: None,
             sync: None,
             writer_auth_context: None,
@@ -1565,7 +1568,8 @@ impl ReplicateObjectOperation {
         match parse_read(event, BucketInfo::from_bytes) {
             Ok(record) => {
                 self.bucket_group = record.as_ref().map(|info| info.group_id);
-                self.bucket_rules = record.map(|info| info.storage_routing).unwrap_or_default();
+                let info = record.map(|info| (info.storage_routing, info.compression));
+                (self.bucket_rules, self.bucket_compression) = info.unwrap_or_default();
                 self.read_reference_source()
             }
             Err(error) => self.fail(error.into()),
@@ -1666,7 +1670,8 @@ impl ReplicateObjectOperation {
                     .routing
                     .snapshot(self.request.source_group_id)
                     .with_group_inputs(self.group_inputs.clone())
-                    .with_bucket_rules(self.bucket_rules.clone());
+                    .with_bucket_rules(self.bucket_rules.clone())
+                    .with_compression(self.bucket_compression);
                 let resolved =
                     match resolve_backend(&snapshot, &self.request.bucket, &self.request.key) {
                         Ok(resolved) => resolved,
@@ -1805,8 +1810,6 @@ impl ReplicateObjectOperation {
                         blob: Some(MaterializedBlobInfo {
                             hash,
                             size: location.blob_size,
-                            compressed: location.compressed,
-                            encrypted: location.encrypted,
                             location,
                         }),
                         source,
@@ -2196,6 +2199,7 @@ impl ReplicateObjectOperation {
             BlobVersionState::Materialized {
                 blob_hash,
                 backend,
+                encoding,
                 source,
             } => {
                 self.pending_materialized_version = Some(PendingMaterializedVersion {
@@ -2205,7 +2209,7 @@ impl ReplicateObjectOperation {
                     source,
                     metadata,
                 });
-                self.read_blob_location(BlobLocationKey::new(blob_hash, backend))
+                self.read_blob_location(BlobLocationKey::new(blob_hash, encoding, backend))
             }
             BlobVersionState::Deleted => {
                 self.pending_materialized_version = None;
@@ -2701,6 +2705,9 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::format::EncodingClass;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{
         MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
     };
@@ -2762,6 +2769,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
     }
 
@@ -2896,6 +2904,7 @@ mod tests {
         BlobVersion::materialized(
             location.get_blake3().unwrap().try_into().unwrap(),
             BackendRef::node_default(),
+            EncodingClass::Raw,
             location.created_at,
             location.created_by,
             source,
@@ -2950,8 +2959,7 @@ mod tests {
             storage_bucket: "blob-bucket".to_string(),
             backend_path: format!("bucket/key_{}", Ulid::generate()),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: test_user_id(),
             created_at: SystemTime::now(),
             staging: false,

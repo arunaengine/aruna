@@ -41,6 +41,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CopyOrigin, CurrentVersionPointer, ResolvedBackend, VersionKey, WriteOwner,
 };
+use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
     MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
@@ -248,6 +249,8 @@ pub struct CompleteUploadOperation {
     gate: Option<PolicyGateOperation>,
     /// What the gate decided on, re-read inside the finalize transaction.
     gated_bucket: Option<GatedBucket>,
+    /// The bucket's compression when the gate read it; the composed object uses it.
+    compression: Compression,
     /// The reset that returns the record to `Open` has already been taken, so
     /// no later cleanup step may take it a second time.
     reset_done: bool,
@@ -285,6 +288,7 @@ impl CompleteUploadOperation {
             gate_context: None,
             gate: None,
             gated_bucket: None,
+            compression: Compression::Off,
             reset_done: false,
         }
     }
@@ -805,6 +809,10 @@ impl CompleteUploadOperation {
             Ok(bucket) => bucket,
             Err(error) => return self.schedule_error(error.into()),
         };
+        self.compression = bucket
+            .as_ref()
+            .map(|bucket| bucket.compression)
+            .unwrap_or_default();
         let inherited = self
             .upload_record
             .as_ref()
@@ -874,12 +882,20 @@ impl CompleteUploadOperation {
                 parts: self.resolved_parts.clone(),
             })];
         }
-        let pinned = ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone());
         let parts = self
             .resolved_parts
             .iter()
             .map(|part| part.location.clone())
             .collect();
+        self.compose_parts(parts)
+    }
+
+    fn compose_parts(&mut self, parts: Vec<BackendLocation>) -> Effects {
+        let Some(upload) = self.upload_record.as_ref() else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        let pinned = ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone())
+            .with_compression(self.compression);
         self.state = CompleteUploadState::ComposeBlob;
         smallvec![Effect::Blob(BlobEffect::Compose {
             bucket: self.input.bucket.clone(),
@@ -901,6 +917,12 @@ impl CompleteUploadOperation {
             Event::Blob(BlobEvent::Error(error)) => return self.schedule_error(error.into()),
             _ => return self.schedule_error(CompleteUploadError::InvalidOperationState),
         };
+        // The provider assembled raw parts, but compression was turned on after the upload
+        // opened: the object is composed into frames. Its target row keeps the raw object for
+        // a retry and discards it once the upload record is gone.
+        if self.compression != Compression::Off && self.in_place_target(&location) {
+            return self.compose_parts(vec![location]);
+        }
         self.composed_location = Some(location.clone());
         self.final_location = None;
 
@@ -971,6 +993,13 @@ impl CompleteUploadOperation {
         let Some(location) = self.composed_location.clone() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
+        // A copy encoded under an older setting is never published: the bucket's
+        // migration may already have passed this key.
+        if bucket.as_ref().is_some_and(|bucket| {
+            EncodingClass::from(bucket.compression) != location.format.encoding()
+        }) {
+            return self.schedule_error(StorageError::TransactionConflict.into());
+        }
         // The compose already ran on the pinned backend, so the finalize must
         // prove it is still enabled or roll the composed object back.
         match fence_backend(&location.backend, self.txn_id) {
@@ -997,7 +1026,11 @@ impl CompleteUploadOperation {
             return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
         };
         // Only the copy on the upload's pinned backend may be deduplicated.
-        let key = match BlobLocationKey::from_blake3(blake3_hash, location.backend.clone()) {
+        let key = match BlobLocationKey::from_blake3(
+            blake3_hash,
+            location.format.encoding(),
+            location.backend.clone(),
+        ) {
             Ok(key) => key,
             Err(error) => return self.schedule_error(error.into()),
         };
@@ -1208,6 +1241,7 @@ impl CompleteUploadOperation {
                 }
             },
             location.backend.clone(),
+            location.format.encoding(),
             created_at,
             self.input.created_by,
             None,
@@ -1970,6 +2004,8 @@ mod decision_tests {
         PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
     };
     use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::MultipartChecksumHint;
     use aruna_core::types::Value;
     use std::collections::BTreeMap;
@@ -2062,6 +2098,7 @@ mod decision_tests {
             storage_routing: Vec::new(),
             placement_policies: refs,
             placement_policy_generation: generation,
+            compression: Compression::Off,
         };
         info.to_bytes().expect("bucket encodes").into()
     }
@@ -2197,8 +2234,7 @@ mod decision_tests {
             storage_bucket: "aruna".to_string(),
             backend_path: "objects/one".to_string(),
             ulid: Ulid::from_bytes([5u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::default(),
             created_at: std::time::SystemTime::UNIX_EPOCH,
             staging: false,

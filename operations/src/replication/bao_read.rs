@@ -1469,6 +1469,9 @@ impl Operation for IncomingBaoOperation {
 
 #[cfg(test)]
 mod pure_tests {
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::format::EncodingClass;
+    use aruna_core::structs::storage::format::StoredFormat;
     use std::collections::{HashMap, HashSet};
     use std::time::SystemTime;
 
@@ -1549,6 +1552,7 @@ mod pure_tests {
         BlobVersion::materialized(
             hash,
             BackendRef::node_default(),
+            EncodingClass::Raw,
             SystemTime::UNIX_EPOCH,
             UserId::nil(test_realm()),
             None,
@@ -1567,6 +1571,7 @@ mod pure_tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
         .to_bytes()
         .unwrap()
@@ -1581,8 +1586,7 @@ mod pure_tests {
             storage_bucket: "blob-0".to_string(),
             backend_path: "object".to_string(),
             ulid: Ulid::from(6u128),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::nil(test_realm()),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,
@@ -1723,6 +1727,7 @@ mod pure_tests {
         let materialized = BlobVersion::materialized(
             [4u8; 32],
             location.backend.clone(),
+            EncodingClass::Raw,
             SystemTime::UNIX_EPOCH,
             UserId::nil(test_realm()),
             None,

@@ -6,6 +6,8 @@
 
 mod topology;
 
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::EncodingClass;
 use std::time::UNIX_EPOCH;
 
 use aruna_core::effects::StorageEffect;
@@ -58,6 +60,7 @@ async fn seed_bucket(node: &TestNode, realm: &Topology, group_id: Ulid) -> TestR
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
         .to_bytes()?,
     )
@@ -80,6 +83,7 @@ async fn seed_object(node: &TestNode, realm: &Topology, key: &str, tag: u8) -> T
         BlobVersion::materialized(
             [tag; 32],
             BackendRef::node_default(),
+            EncodingClass::Raw,
             UNIX_EPOCH,
             realm.user_id,
             None,

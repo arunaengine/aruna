@@ -14,6 +14,7 @@ use aruna_core::NodeId;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::types::GroupId;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -94,6 +95,7 @@ pub(super) async fn create_remote_bucket(
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             },
         ),
         context.as_ref(),

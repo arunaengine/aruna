@@ -24,6 +24,7 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::format::Compression;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
@@ -120,6 +121,7 @@ async fn seed_bucket(state: &ServerState, actor: &Actor, bucket: &str, group_id:
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
         .to_bytes()
         .unwrap(),

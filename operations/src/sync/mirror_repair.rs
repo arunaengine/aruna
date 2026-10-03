@@ -939,6 +939,7 @@ mod tests {
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::{ReferenceHandling, SyncMode, SyncState, SyncStatusSnapshot};
     use aruna_storage::FjallStorage;
@@ -1020,6 +1021,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         };
         let event = storage
             .send_storage_effect(StorageEffect::BatchWrite {

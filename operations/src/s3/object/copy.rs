@@ -24,6 +24,7 @@ use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBind
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BackendLocation;
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::resolve_backend;
 use aruna_core::types::GroupId;
 use futures_util::StreamExt;
@@ -266,10 +267,13 @@ pub async fn copy_object_tracked(
     };
     let metadata = input.metadata.unwrap_or(source.metadata);
     let routing = routing_snapshot(context, input.group_id, &input.dest_bucket).await?;
-    // Bytes the destination's backend already holds are adopted, not streamed.
+    // Bytes the destination's backend already holds in the destination's encoding
+    // are adopted, not streamed; another encoding gets its own copy.
     let adopt = source.location.clone().filter(|location| {
-        resolve_backend(&routing, &input.dest_bucket, &input.dest_key)
-            .is_ok_and(|resolved| resolved.backend == location.backend)
+        resolve_backend(&routing, &input.dest_bucket, &input.dest_key).is_ok_and(|resolved| {
+            resolved.backend == location.backend
+                && EncodingClass::from(resolved.compression) == location.format.encoding()
+        })
     });
     let body = match (adopt.is_some(), progress) {
         (true, _) => None,
@@ -386,6 +390,7 @@ pub(crate) mod test {
     use aruna_core::structs::storage::blob::{
         Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::storage::format::Compression;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use axum::{Router, routing::get};
@@ -590,6 +595,7 @@ pub(crate) mod test {
             storage_routing: Vec::new(),
             placement_policies: policies,
             placement_policy_generation: 1,
+            compression: Compression::Off,
         };
         let _ = context
             .storage_handle
@@ -973,6 +979,76 @@ pub(crate) mod test {
         let dest_version =
             read_dest_version(&context, "bucket", "dest.txt", result.version_id).await;
         assert!(dest_version.is_materialized());
+    }
+
+    #[tokio::test]
+    async fn copy_keeps_encodings() {
+        // A destination that compresses never adopts the source's raw copy.
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        seed_bucket(&context, "bucket", group_id, user_id, Vec::new()).await;
+        let packed = aruna_core::structs::storage::blob::BucketInfo {
+            group_id,
+            created_at: std::time::UNIX_EPOCH,
+            created_by: user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 1,
+            compression: Compression::Zstd { level: 3 },
+        };
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::S3_BUCKET_KEYSPACE.to_string(),
+                key: b"packed".to_vec().into(),
+                value: packed.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let data: &'static [u8] = b"bytes that need their own copy";
+        let source = drive(
+            PutObjectOperation::new(put_config(
+                realm_id, group_id, node_id, "bucket", "src.txt", data,
+            )),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let pulled = Arc::new(AtomicU64::new(0));
+        let result = copy_object_tracked(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "src.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "packed".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+                references: CopyReferences::Materialize,
+            },
+            Some(pulled.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(pulled.load(Ordering::Relaxed), data.len() as u64);
+        let location = result.location.expect("a materialized copy");
+        assert_ne!(location, source.location);
+        assert_eq!(location.format.encoding(), EncodingClass::Zstd { level: 3 });
     }
 
     #[tokio::test]

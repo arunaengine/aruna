@@ -28,6 +28,7 @@ use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permissi
 use aruna_core::structs::storage::blob::{
     BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, VersionKey, group_permission_path,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
 use aruna_operations::driver::DriverContext;
@@ -877,7 +878,8 @@ async fn reference_syncs_lazily() -> TestResult<()> {
             read_value(
                 harness.joiner.context.as_ref(),
                 BLOB_LOCATIONS_KEYSPACE,
-                BlobLocationKey::new(source_hash, BackendRef::node_default()).to_bytes(),
+                BlobLocationKey::new(source_hash, EncodingClass::Raw, BackendRef::node_default())
+                    .to_bytes(),
             )
             .await?
             .is_none()
@@ -890,7 +892,8 @@ async fn reference_syncs_lazily() -> TestResult<()> {
             read_value(
                 harness.joiner.context.as_ref(),
                 BLOB_LOCATIONS_KEYSPACE,
-                BlobLocationKey::new(source_hash, BackendRef::node_default()).to_bytes(),
+                BlobLocationKey::new(source_hash, EncodingClass::Raw, BackendRef::node_default())
+                    .to_bytes(),
             )
             .await?
             .is_none()
@@ -1772,6 +1775,106 @@ async fn scoped_replication_paths() -> TestResult<()> {
             Some(404),
             "the scoped object must be absent on the joiner, not merely forbidden"
         );
+        Ok(())
+    }
+    .await;
+
+    harness.shutdown().await;
+    result
+}
+
+/// Sets a bucket's compression on one node through REST; `None` turns it off.
+async fn set_compression(
+    base_url: &str,
+    token: &str,
+    bucket: &str,
+    level: Option<u8>,
+) -> TestResult<()> {
+    let body = match level {
+        Some(level) => serde_json::json!({ "mode": "zstd", "level": level }),
+        None => serde_json::json!({ "mode": "off" }),
+    };
+    let response = reqwest::Client::new()
+        .put(format!(
+            "{base_url}/api/v1/data/buckets/{bucket}/storage/compression"
+        ))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await?;
+    if response.status() != StatusCode::OK {
+        return Err(std::io::Error::other(format!(
+            "setting compression returned {}",
+            response.status()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+async fn location_row(context: &DriverContext, key: Vec<u8>) -> TestResult<bool> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+        event => Err(std::io::Error::other(format!("unexpected read event: {event:?}")).into()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compression_matrix_replicates() -> TestResult<()> {
+    // Each node stores its copy with its own bucket setting, whatever the sender used.
+    let harness = ReplicationHarness::new("replication-compression-group").await?;
+
+    let result = async {
+        let cases = [
+            ("compressed-to-raw", Some(9), None),
+            ("raw-to-compressed", None, Some(3)),
+            ("compressed-levels", Some(3), Some(9)),
+        ];
+        for (bucket, seed_level, joiner_level) in cases {
+            // Several compressible frames, and distinct content per case.
+            let body = format!("{bucket} research data ")
+                .repeat(150_000)
+                .into_bytes();
+            let hash = *blake3::hash(&body).as_bytes();
+            harness.create_buckets(bucket, true).await?;
+            let token = &harness.seed_token;
+            set_compression(&harness.seed.base_url, token, bucket, seed_level).await?;
+            set_compression(&harness.joiner.base_url, token, bucket, joiner_level).await?;
+            harness.configure_replication(bucket, bucket, false).await?;
+
+            harness
+                .seed_client
+                .put_object()
+                .bucket(bucket)
+                .key("data.txt")
+                .body(ByteStream::from(body.clone()))
+                .send()
+                .await?;
+
+            harness
+                .assert_object_matches(bucket, "data.txt", &body)
+                .await?;
+            let nodes = [
+                (harness.seed.context.as_ref(), seed_level),
+                (harness.joiner.context.as_ref(), joiner_level),
+            ];
+            for (context, level) in nodes {
+                let class = level.map_or(EncodingClass::Raw, |level| EncodingClass::Zstd { level });
+                let key = BlobLocationKey::new(hash, class, BackendRef::node_default());
+                assert!(
+                    location_row(context, key.to_bytes()).await?,
+                    "{bucket}: expected a {class:?} copy"
+                );
+            }
+        }
         Ok(())
     }
     .await;

@@ -7,6 +7,7 @@ use super::backend::{
     build_backend_path, build_hidden_path, build_part_path, intent_key, intent_value,
 };
 use super::group::GROUP_WRITE_CHUNK;
+use crate::codec::FrameEncoder;
 use crate::hash::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
 use crate::s3::NativeMultipart;
@@ -22,21 +23,30 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendLocation, BackendRef, BlobLocationKey, HIDDEN_BLOB_PREFIX, HiddenBlobEntry,
     HiddenBlobKey, ResolvedBackend,
 };
+use aruna_core::structs::storage::format::{Compression, FrameLayout, StoredFormat, StoredLayout};
 use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use aruna_core::structs::storage::multipart::MultipartPartKey;
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt, stream};
 use opendal::{EntryMode, ErrorKind, Operator};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
-use std::ops::{Bound, RangeBounds};
+use std::ops::{Bound, Range, RangeBounds};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 use tokio::time::{Instant, timeout, timeout_at};
 use ulid::Ulid;
+
+/// Size and time limits of a hidden spool; other writes have none.
+#[derive(Default)]
+struct WriteLimits {
+    max_bytes: Option<u64>,
+    deadline: Option<StdInstant>,
+}
 
 const HIDDEN_LIST_PAGE: usize = 128;
 const HIDDEN_BACKEND_LIMIT: usize = 256;
@@ -57,6 +67,12 @@ enum HiddenCursor {
 /// Resolves the requested bounds against the stored size so a range read can
 /// report how many bytes its stream yields.
 fn range_length(range: &impl RangeBounds<u64>, blob_size: u64) -> u64 {
+    let range = clamped_range(range, blob_size);
+    range.end - range.start
+}
+
+/// The requested bounds as a range inside `0..blob_size`.
+fn clamped_range(range: &impl RangeBounds<u64>, blob_size: u64) -> Range<u64> {
     let start = match range.start_bound() {
         Bound::Included(start) => *start,
         Bound::Excluded(start) => start.saturating_add(1),
@@ -67,7 +83,8 @@ fn range_length(range: &impl RangeBounds<u64>, blob_size: u64) -> u64 {
         Bound::Excluded(end) => *end,
         Bound::Unbounded => blob_size,
     };
-    end.min(blob_size).saturating_sub(start)
+    let end = end.min(blob_size);
+    start.min(end)..end
 }
 
 /// Tenant writers open with an explicit chunk so a small-chunk stream cannot
@@ -84,15 +101,23 @@ async fn open_writer(
 }
 
 /// Writer chunk for a composition. `None` keeps each input part as one S3 part; other kinds
-/// stream in chunks only as large as their provider's part limit requires.
-pub(super) fn compose_chunk(backend: &Backend, total: u64) -> Option<usize> {
+/// stream in chunks only as large as their provider's part limit requires. Frames do not
+/// follow the input parts, so on S3 they stream in chunks sized for its 10,000 part limit.
+pub(super) fn compose_chunk(backend: &Backend, total: u64, framed: bool) -> Option<usize> {
     const MIB: u64 = 1024 * 1024;
     let limit: u64 = match backend {
-        Backend::S3 | Backend::Group(GroupBackendKind::S3) => return None,
+        Backend::S3 | Backend::Group(GroupBackendKind::S3) if !framed => return None,
+        Backend::S3 | Backend::Group(GroupBackendKind::S3) => 10_000,
         Backend::Group(GroupBackendKind::Azblob | GroupBackendKind::Azdls) => 50_000,
         Backend::FileSystem | Backend::Group(GroupBackendKind::Gcs | GroupBackendKind::B2) => {
             10_000
         }
+    };
+    // Raw frames and the frame entries can store a little more than the input.
+    let total = if framed {
+        total.saturating_add(total / 1024).saturating_add(MIB)
+    } else {
+        total
     };
     let needed = total.div_ceil(limit).div_ceil(MIB) * MIB;
     Some(
@@ -190,37 +215,42 @@ impl HiddenReservation {
         self.abandoned = false;
     }
 
-    async fn fail(&mut self, error: BlobError) -> BlobEvent {
-        match self.abort().await {
-            Ok(()) => BlobEvent::Error(error),
-            Err(cleanup) => {
-                let plain = self.key.lock().map_or(true, |key| key.is_none());
-                match (plain, self.location.clone()) {
-                    (true, Some(location)) => BlobEvent::Error(BlobError::WriteCleanup {
-                        location,
-                        message: cleanup.to_string(),
-                    }),
-                    _ => BlobEvent::Error(cleanup),
+    /// Boxed, so each failure exit of a write keeps only a pointer in the caller's stack frame.
+    fn fail(&mut self, error: BlobError) -> BoxFuture<'_, BlobEvent> {
+        Box::pin(async move {
+            match self.abort().await {
+                Ok(()) => BlobEvent::Error(error),
+                Err(cleanup) => {
+                    let plain = self.key.lock().map_or(true, |key| key.is_none());
+                    match (plain, self.location.clone()) {
+                        (true, Some(location)) => BlobEvent::Error(BlobError::WriteCleanup {
+                            location,
+                            message: cleanup.to_string(),
+                        }),
+                        _ => BlobEvent::Error(cleanup),
+                    }
                 }
             }
-        }
+        })
     }
 
-    async fn fail_close(&mut self, error: BlobError) -> BlobEvent {
-        self.mark_uncertain();
-        let cleanup = self.abort().await;
-        let Some(location) = self.location.clone() else {
-            return match cleanup {
-                Ok(()) => BlobEvent::Error(error),
-                Err(cleanup) => BlobEvent::Error(cleanup),
+    fn fail_close(&mut self, error: BlobError) -> BoxFuture<'_, BlobEvent> {
+        Box::pin(async move {
+            self.mark_uncertain();
+            let cleanup = self.abort().await;
+            let Some(location) = self.location.clone() else {
+                return match cleanup {
+                    Ok(()) => BlobEvent::Error(error),
+                    Err(cleanup) => BlobEvent::Error(cleanup),
+                };
             };
-        };
-        BlobEvent::Error(BlobError::WriteCleanup {
-            location,
-            message: match cleanup {
-                Ok(()) => error.to_string(),
-                Err(cleanup) => format!("{error}; {cleanup}"),
-            },
+            BlobEvent::Error(BlobError::WriteCleanup {
+                location,
+                message: match cleanup {
+                    Ok(()) => error.to_string(),
+                    Err(cleanup) => format!("{error}; {cleanup}"),
+                },
+            })
         })
     }
 
@@ -336,7 +366,61 @@ impl BlobHandler {
         operator: Operator,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
-        Box::pin(self.write_stream_limit(location, operator, blob, None, None, None)).await
+        let limits = WriteLimits::default();
+        Box::pin(self.write_stream_limit(location, operator, blob, limits, None, None)).await
+    }
+
+    /// Writes the original bytes as frames compressed with `compression`.
+    async fn write_encoded(
+        &self,
+        location: BackendLocation,
+        operator: Operator,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+        compression: Compression,
+    ) -> BlobEvent {
+        let encoder = match compression {
+            Compression::Off => None,
+            Compression::Zstd { level } => Some(FrameEncoder::new(level)),
+        };
+        let limits = WriteLimits::default();
+        Box::pin(self.write_stream_limit(location, operator, blob, limits, encoder, None)).await
+    }
+
+    /// Appends one piece to the open writer, failing the reservation on error.
+    async fn write_piece(
+        &self,
+        reservation: &mut HiddenReservation,
+        deadline: Option<StdInstant>,
+        bytes: Bytes,
+    ) -> Result<(), BlobEvent> {
+        // Stays set if the caller drops this future before the write returns.
+        reservation.mark_abandoned();
+        let write = match reservation.writer_mut() {
+            Some(writer) => match deadline {
+                Some(deadline) => with_deadline(Some(deadline), writer.write(bytes)).await,
+                None => timeout(self.transfer_idle_timeout(), writer.write(bytes))
+                    .await
+                    .map_err(|_| ()),
+            },
+            None => {
+                let error = BlobError::WriteError("hidden writer is missing".to_string());
+                return Err(reservation.fail(error).await);
+            }
+        };
+        if write.is_ok() {
+            reservation.mark_settled();
+        }
+        match write {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(reservation
+                .fail(BlobError::WriteError(err.to_string()))
+                .await),
+            Err(()) => {
+                reservation.mark_abandoned();
+                let error = BlobError::WriteError("blob write deadline expired".to_string());
+                Err(reservation.fail(error).await)
+            }
+        }
     }
 
     async fn write_stream_limit(
@@ -344,10 +428,14 @@ impl BlobHandler {
         mut location: BackendLocation,
         operator: Operator,
         mut blob: BackendStream<Result<Bytes, StreamError>>,
-        max_bytes: Option<u64>,
-        deadline: Option<StdInstant>,
+        limits: WriteLimits,
+        mut encoder: Option<FrameEncoder>,
         reservation: Option<&mut HiddenReservation>,
     ) -> BlobEvent {
+        let WriteLimits {
+            max_bytes,
+            deadline,
+        } = limits;
         let mut plain = HiddenReservation::new(self.clone());
         let reservation = reservation.unwrap_or(&mut plain);
         reservation.set_location(location.clone());
@@ -432,45 +520,31 @@ impl BlobHandler {
                     .await;
             }
             hasher.update(&bytes);
-            // Stays set if the caller drops this future before the write returns.
-            reservation.mark_abandoned();
-            let write = match reservation.writer_mut() {
-                Some(writer) => match deadline {
-                    Some(deadline) => {
-                        with_deadline(Some(deadline), writer.write(bytes.to_vec())).await
-                    }
-                    None => timeout(self.transfer_idle_timeout(), writer.write(bytes.to_vec()))
-                        .await
-                        .map_err(|_| ()),
+            let pieces = match encoder.as_mut() {
+                Some(encoder) => match encoder.push(&bytes).await {
+                    Ok(pieces) => pieces,
+                    Err(error) => return reservation.fail(error).await,
                 },
-                None => {
-                    return reservation
-                        .fail(BlobError::WriteError(
-                            "hidden writer is missing".to_string(),
-                        ))
-                        .await;
-                }
+                None => vec![bytes],
             };
-            if write.is_ok() {
-                reservation.mark_settled();
-            }
-            match write {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    return reservation
-                        .fail(BlobError::WriteError(err.to_string()))
-                        .await;
-                }
-                Err(()) => {
-                    reservation.mark_abandoned();
-                    return reservation
-                        .fail(BlobError::WriteError(
-                            "blob write deadline expired".to_string(),
-                        ))
-                        .await;
+            for piece in pieces {
+                if let Err(event) = self.write_piece(reservation, deadline, piece).await {
+                    return event;
                 }
             }
             bytes_written = next_size;
+        }
+        if let Some(encoder) = encoder {
+            let (pieces, layout) = match encoder.finish().await {
+                Ok(finished) => finished,
+                Err(error) => return reservation.fail(error).await,
+            };
+            for piece in pieces {
+                if let Err(event) = self.write_piece(reservation, deadline, piece).await {
+                    return event;
+                }
+            }
+            location.format.layout = StoredLayout::Frames(Box::new(layout));
         }
 
         reservation.mark_abandoned();
@@ -564,8 +638,7 @@ impl BlobHandler {
             storage_bucket: backend_bucket.clone(),
             backend_path,
             ulid,
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by,
             created_at: SystemTime::now(),
             staging: false,
@@ -588,8 +661,11 @@ impl BlobHandler {
                 location,
                 operator,
                 blob,
-                max_bytes,
-                deadline,
+                WriteLimits {
+                    max_bytes,
+                    deadline,
+                },
+                None,
                 Some(&mut reservation),
             )
             .await
@@ -774,7 +850,7 @@ impl BlobHandler {
             }
         }
 
-        let key = BlobLocationKey::new(hash, location.backend.clone());
+        let key = BlobLocationKey::new(hash, location.format.encoding(), location.backend.clone());
         let event = self
             .storage
             .send_effect(Effect::Storage(StorageEffect::Read {
@@ -835,8 +911,7 @@ impl BlobHandler {
             storage_bucket: String::new(),
             backend_path,
             ulid,
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by,
             created_at: SystemTime::now(),
             staging: false,
@@ -864,7 +939,9 @@ impl BlobHandler {
                 return BlobEvent::Error(err);
             }
         };
-        match self.write_stream(location.clone(), operator, blob).await {
+        match Box::pin(self.write_encoded(location.clone(), operator, blob, resolved.compression))
+            .await
+        {
             BlobEvent::WriteFinished { location } => {
                 reservation.retain();
                 match self.finalize_reservation(&location).await {
@@ -891,8 +968,6 @@ impl BlobHandler {
         part: MultipartPartKey,
         resolved: ResolvedBackend,
         created_by: UserId,
-        compressed: bool,
-        encrypted: bool,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
         let root = match self.registry.config_for(&resolved.backend) {
@@ -911,8 +986,7 @@ impl BlobHandler {
             storage_bucket: multipart_bucket.clone(),
             backend_path: build_part_path(part.upload_id, part.part_number, ulid),
             ulid,
-            compressed,
-            encrypted,
+            format: StoredFormat::default(),
             created_by,
             created_at: SystemTime::now(),
             staging: false,
@@ -986,8 +1060,7 @@ impl BlobHandler {
             storage_bucket: String::new(),
             backend_path,
             ulid,
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by,
             created_at: SystemTime::now(),
             staging: false,
@@ -1023,11 +1096,16 @@ impl BlobHandler {
             }
         };
         let total = parts.iter().map(|part| part.blob_size).sum();
-        let chunk = compose_chunk(&backend_type, total);
-        match self
-            .compose_parts(location.clone(), operator, parts, chunk)
-            .await
-        {
+        let framed = resolved.compression != Compression::Off;
+        let chunk = compose_chunk(&backend_type, total, framed);
+        let composed = self.compose_parts(
+            location.clone(),
+            operator,
+            parts,
+            chunk,
+            resolved.compression,
+        );
+        match Box::pin(composed).await {
             BlobEvent::WriteFinished { location } => {
                 reservation.retain();
                 match self.finalize_reservation(&location).await {
@@ -1055,7 +1133,12 @@ impl BlobHandler {
         operator: Operator,
         parts: Vec<BackendLocation>,
         chunk: Option<usize>,
+        compression: Compression,
     ) -> BlobEvent {
+        let mut encoder = match compression {
+            Compression::Off => None,
+            Compression::Zstd { level } => Some(FrameEncoder::new(level)),
+        };
         let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
@@ -1091,7 +1174,7 @@ impl BlobHandler {
         let mut ambiguous = false;
         // A timeout drops the writer future mid-poll, which leaves the writer unusable.
         let mut abandoned = false;
-        let compose_result: Result<u64, BlobError> = async {
+        let compose_result: Result<(u64, Option<FrameLayout>), BlobError> = async {
             let mut bytes_written = 0u64;
             for part in parts {
                 let part_operator = self.operator_from_location(&part)?;
@@ -1125,6 +1208,12 @@ impl BlobHandler {
                     let bytes = next.map_err(|err| BlobError::ReadError(err.to_string()))?;
                     hasher.update(&bytes);
                     part_size += bytes.len() as u64;
+                    if let Some(encoder) = encoder.as_mut() {
+                        let pieces = encoder.push(&bytes).await?;
+                        self.compose_write(&mut writer, pieces, &mut abandoned)
+                            .await?;
+                        continue;
+                    }
                     part_chunks.push(bytes);
                     if chunk.is_some() {
                         let buffered = std::mem::take(&mut part_chunks);
@@ -1132,11 +1221,18 @@ impl BlobHandler {
                             .await?;
                     }
                 }
-                if chunk.is_none() {
+                if !part_chunks.is_empty() {
                     self.compose_write(&mut writer, part_chunks, &mut abandoned)
                         .await?;
                 }
                 bytes_written += part_size;
+            }
+            let mut layout = None;
+            if let Some(encoder) = encoder.take() {
+                let (pieces, framed) = encoder.finish().await?;
+                self.compose_write(&mut writer, pieces, &mut abandoned)
+                    .await?;
+                layout = Some(framed);
             }
             timeout(self.transfer_idle_timeout(), writer.close())
                 .await
@@ -1149,13 +1245,13 @@ impl BlobHandler {
                     ambiguous = true;
                     BlobError::WriteError(err.to_string())
                 })?;
-            Ok(bytes_written)
+            Ok((bytes_written, layout))
         }
         .await;
         ambiguous |= abandoned;
 
-        let bytes_written = match compose_result {
-            Ok(bytes_written) => bytes_written,
+        let (bytes_written, layout) = match compose_result {
+            Ok(composed) => composed,
             Err(err) => {
                 let cleanup = if abandoned {
                     match self.delete_path(&operator, &storage_path).await {
@@ -1186,6 +1282,9 @@ impl BlobHandler {
 
         location.blob_size = bytes_written;
         location.hashes = hasher.to_map();
+        if let Some(layout) = layout {
+            location.format.layout = StoredLayout::Frames(Box::new(layout));
+        }
         BlobEvent::WriteFinished { location }
     }
 
@@ -1206,6 +1305,10 @@ impl BlobHandler {
     }
 
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
+        if let StoredLayout::Frames(layout) = &location.format.layout {
+            let range = 0..location.blob_size;
+            return Box::pin(self.read_frames(&location, layout, range)).await;
+        }
         let expected_blake3: [u8; 32] = match location.get_blake3() {
             Some(hash) => match hash.try_into() {
                 Ok(hash) => hash,
@@ -1296,6 +1399,10 @@ impl BlobHandler {
         location: BackendLocation,
         range: impl RangeBounds<u64>,
     ) -> BlobEvent {
+        if let StoredLayout::Frames(layout) = &location.format.layout {
+            let range = clamped_range(&range, location.blob_size);
+            return Box::pin(self.read_frames(&location, layout, range)).await;
+        }
         let operator = match self.operator_from_location(&location) {
             Ok(op) => op,
             Err(err) => return BlobEvent::Error(err),

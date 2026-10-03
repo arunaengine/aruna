@@ -575,6 +575,7 @@ async fn ensure_read(
 #[cfg(test)]
 mod tests {
     //! Tests for the realm side of a device's synced folders.
+    use aruna_core::structs::storage::format::Compression;
 
     use super::*;
     use aruna_core::UserId;
@@ -587,6 +588,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_storage::FjallStorage;
     use std::time::SystemTime;
 
@@ -693,6 +695,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
     }
 
@@ -760,6 +763,7 @@ mod tests {
         let mut version = BlobVersion::materialized(
             [4u8; 32],
             aruna_core::structs::storage::blob::BackendRef::node_default(),
+            EncodingClass::Raw,
             SystemTime::UNIX_EPOCH,
             fixture.auth.user_id,
             None,

@@ -1274,6 +1274,7 @@ mod tests {
     };
     use aruna_core::structs::identity::auth::PathRestriction;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
@@ -1914,6 +1915,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         };
         boundary
             .handler

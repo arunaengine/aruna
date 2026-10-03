@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::structs::storage::format::StoredFormat;
 use std::time::Duration;
 
 use super::*;
@@ -93,8 +94,7 @@ fn part_record(part_number: u16, blob_size: u64) -> MultipartPart {
             storage_bucket: "multipart".to_string(),
             backend_path: format!("part-{part_number}"),
             ulid: Ulid::from_parts(5, 5),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::local(Ulid::from_parts(6, 6), RealmId::from_bytes([4u8; 32])),
             created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000120),
             staging: false,
@@ -199,6 +199,52 @@ fn refuses_disabled_backend() {
     assert_eq!(
         op.cleanup.take_error(),
         Some(BackendFenceError::Unavailable.into())
+    );
+}
+
+#[test]
+fn stale_encoding_aborts() {
+    // The setting changed while the parts were composed: the raw object must not
+    // become a version a finished migration would never revisit.
+    let mut op = CompleteUploadOperation::new(finalize_input());
+    op.upload_record = Some(open_upload_record(&op.input));
+    op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
+    op.state = CompleteUploadState::StartFinalizeTransaction;
+    let txn_id = TxnId::generate();
+    op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    op.step(fence_clear());
+    let bucket = BucketInfo {
+        group_id: Ulid::from_bytes([6u8; 16]),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: op.input.created_by,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Zstd { level: 3 },
+    };
+
+    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (
+                b"bucket".to_vec().into(),
+                Some(bucket.to_bytes().unwrap().into()),
+            ),
+            (b"subject".to_vec().into(), None),
+        ],
+    }));
+
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
+                if *aborted == txn_id
+        ),
+        "expected the finalize transaction to abort, got {effects:?}"
+    );
+    assert_eq!(
+        op.cleanup.take_error(),
+        Some(StorageError::TransactionConflict.into())
     );
 }
 
@@ -626,6 +672,65 @@ fn completes_at_provider() {
     };
     assert_eq!(backend_upload.location, target);
     assert_eq!(parts, &op.resolved_parts);
+}
+
+#[test]
+fn frames_provider_object() {
+    // Compression was turned on after the upload opened: the raw provider object is composed
+    // into frames, and only that copy is checked and published.
+    let mut op = CompleteUploadOperation::new(finalize_input());
+    let target = composed_location(Ulid::from_bytes([5u8; 16]));
+    op.upload_record = Some(in_place_record(&op, &target));
+    op.compression = Compression::Zstd { level: 3 };
+    op.state = CompleteUploadState::ComposeBlob;
+
+    let effects = op.step(Event::Blob(BlobEvent::WriteFinished {
+        location: target.clone(),
+    }));
+
+    let [
+        Effect::Blob(BlobEffect::Compose {
+            resolved, parts, ..
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("expected a framed compose, got {effects:?}")
+    };
+    assert_eq!(parts, &vec![target.clone()]);
+    assert_eq!(resolved.compression, Compression::Zstd { level: 3 });
+    assert_eq!(op.composed_location, None);
+
+    let mut framed = composed_location(Ulid::from_bytes([5u8; 16]));
+    framed.ulid = Ulid::from_bytes([8u8; 16]);
+    framed.backend_path = "bucket/framed".to_string();
+    let effects = op.step(Event::Blob(BlobEvent::WriteFinished {
+        location: framed.clone(),
+    }));
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction { .. })]
+    ));
+    assert_eq!(op.composed_location, Some(framed));
+}
+
+#[test]
+fn raw_provider_object() {
+    // Without compression the provider object is published as it is.
+    let mut op = CompleteUploadOperation::new(finalize_input());
+    let target = composed_location(Ulid::from_bytes([5u8; 16]));
+    op.upload_record = Some(in_place_record(&op, &target));
+    op.state = CompleteUploadState::ComposeBlob;
+
+    let effects = op.step(Event::Blob(BlobEvent::WriteFinished {
+        location: target.clone(),
+    }));
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction { .. })]
+    ));
+    assert_eq!(op.composed_location, Some(target));
 }
 
 #[test]
@@ -1092,8 +1197,7 @@ fn cleanup_covers_omitted() {
         storage_bucket: "objects".to_string(),
         backend_path: "object".to_string(),
         ulid: Ulid::from_parts(7, 7),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: UserId::local(Ulid::from_parts(8, 8), RealmId::from_bytes([4u8; 32])),
         created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000240),
         staging: false,
@@ -1173,8 +1277,7 @@ fn finish_after_commit() {
         storage_bucket: "objects".to_string(),
         backend_path: "object".to_string(),
         ulid: Ulid::from_parts(11, 11),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: UserId::local(Ulid::from_parts(12, 12), RealmId::from_bytes([4u8; 32])),
         created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000300),
         staging: false,

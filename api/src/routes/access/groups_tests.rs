@@ -31,6 +31,9 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CurrentVersionPointer, VersionKey, bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::driver::drive;
 use aruna_operations::groups::list_groups::ListGroupOperation;
@@ -726,6 +729,7 @@ async fn seed_bucket(state: &ServerState, bucket: &str, group_id: Ulid) {
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     store_bytes(
         state,
@@ -751,15 +755,22 @@ async fn seed_object(state: &ServerState, bucket: &str, key: &str, owner: UserId
         state,
         BLOB_VERSIONS_KEYSPACE,
         VersionKey::new(bucket, key, version_id).to_bytes().unwrap(),
-        BlobVersion::materialized(hash, BackendRef::node_default(), created_at, owner, None)
-            .to_bytes()
-            .unwrap(),
+        BlobVersion::materialized(
+            hash,
+            BackendRef::node_default(),
+            EncodingClass::Raw,
+            created_at,
+            owner,
+            None,
+        )
+        .to_bytes()
+        .unwrap(),
     )
     .await;
     store_bytes(
         state,
         BLOB_LOCATIONS_KEYSPACE,
-        BlobLocationKey::new(hash, BackendRef::node_default()).to_bytes(),
+        BlobLocationKey::new(hash, EncodingClass::Raw, BackendRef::node_default()).to_bytes(),
         BackendLocation {
             backend: BackendRef::node_default(),
             storage_class: None,
@@ -767,8 +778,7 @@ async fn seed_object(state: &ServerState, bucket: &str, key: &str, owner: UserId
             storage_bucket: "objects".to_string(),
             backend_path: format!("path/{key}"),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: owner,
             created_at,
             staging: false,

@@ -116,8 +116,6 @@ pub struct UploadPartInput {
     pub content_length: Option<u64>,
     pub body: Option<BackendStream<Result<Bytes, StreamError>>>,
     pub created_by: UserId,
-    pub compressed: bool,
-    pub encrypted: bool,
     pub expected_checksums: Vec<ExpectedChecksum>,
 }
 
@@ -255,8 +253,6 @@ impl UploadPartOperation {
             part_number: self.input.part_number,
             resolved: ResolvedBackend::new(record.backend, record.storage_class),
             created_by: self.input.created_by,
-            compressed: self.input.compressed,
-            encrypted: self.input.encrypted,
             // A replacement waits in a blob of its own: a rejected one must leave the
             // acknowledged provider part intact, and completion copies it in.
             backend_upload: record
@@ -821,6 +817,7 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{BackendUpload, MultipartUploadStatus};
     use aruna_storage::storage;
     use tempfile::tempdir;
@@ -851,8 +848,6 @@ mod test {
                 &b"part"[..],
             ))),
             created_by: test_user_id(),
-            compressed: false,
-            encrypted: false,
             expected_checksums: Vec::new(),
         });
         op.state = UploadPartState::ReadUpload;
@@ -1027,8 +1022,6 @@ mod test {
             content_length: None,
             body: None,
             created_by: test_user_id(),
-            compressed: false,
-            encrypted: false,
             expected_checksums: Vec::new(),
         });
         op.state = UploadPartState::WritePart;
@@ -1056,8 +1049,6 @@ mod test {
             content_length: None,
             body: None,
             created_by: test_user_id(),
-            compressed: false,
-            encrypted: false,
             expected_checksums: Vec::new(),
         });
         op.state = UploadPartState::WritePart;
@@ -1551,8 +1542,6 @@ mod test {
             content_length: None,
             body: None,
             created_by: test_user_id(),
-            compressed: false,
-            encrypted: false,
             expected_checksums: Vec::new(),
         });
         op.written_location = Some(part_location(backend_id));
@@ -1567,8 +1556,7 @@ mod test {
             storage_bucket: "storage".to_string(),
             backend_path: "mybucket/object.txt".to_string(),
             ulid: Ulid::from_bytes([6u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: test_user_id(),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,
@@ -1618,8 +1606,6 @@ mod test {
                 content_length: None,
                 body: None,
                 created_by: test_user_id(),
-                compressed: false,
-                encrypted: false,
                 expected_checksums: Vec::new(),
             }),
             &context,

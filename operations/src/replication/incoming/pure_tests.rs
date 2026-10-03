@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{IncomingVersionError, IncomingVersionOperation, IncomingVersionState, ReceivedBlob};
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::format::StoredFormat;
 
 use crate::replication::protocol::{
     MAX_VALUE_BYTES, MaterializedBlobInfo, ReferenceAdvance, SyncOrigin,
@@ -111,8 +114,7 @@ fn make_location() -> BackendLocation {
         storage_bucket: "blob-bucket".to_string(),
         backend_path: "bucket/key".to_string(),
         ulid: Ulid::from_bytes([0x21; 16]),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: test_user_id(),
         created_at: SystemTime::UNIX_EPOCH,
         staging: false,
@@ -131,6 +133,7 @@ fn make_bucket_info(group_id: Ulid) -> BucketInfo {
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     }
 }
 
@@ -141,8 +144,6 @@ pub(super) fn make_manifest(kind: ReplicationItemKind) -> VersionReplicationMani
             Some(MaterializedBlobInfo {
                 hash: [1u8; 32],
                 size: location.blob_size,
-                compressed: location.compressed,
-                encrypted: location.encrypted,
                 location,
             })
         }
@@ -496,6 +497,7 @@ fn existing_version_skips() {
     let version = BlobVersion::materialized(
         manifest.blob.as_ref().unwrap().hash,
         BackendRef::node_default(),
+        EncodingClass::Raw,
         manifest.created_at,
         manifest.created_by,
         None,
@@ -964,6 +966,7 @@ fn replacement_cleans_metadata() {
     op.replaced_version = Some(BlobVersion::materialized(
         [9u8; 32],
         BackendRef::node_default(),
+        EncodingClass::Raw,
         SystemTime::UNIX_EPOCH + Duration::from_secs(1600000060),
         test_user_id(),
         None,
@@ -1037,6 +1040,7 @@ fn replacement_queues_reclaim() {
     op.replaced_version = Some(BlobVersion::materialized(
         [9u8; 32],
         BackendRef::node_default(),
+        EncodingClass::Raw,
         SystemTime::UNIX_EPOCH + Duration::from_secs(1600000120),
         test_user_id(),
         None,
@@ -1046,6 +1050,7 @@ fn replacement_queues_reclaim() {
         op.replaced_reclaim_key(),
         Some(ReclaimCandidateKey::new(
             BackendRef::node_default(),
+            EncodingClass::Raw,
             [9u8; 32]
         ))
     );
@@ -1091,6 +1096,7 @@ fn replaced_version_fenced() {
     let current = BlobVersion::materialized(
         [9u8; 32],
         BackendRef::node_default(),
+        EncodingClass::Raw,
         manifest.created_at,
         manifest.created_by,
         None,
@@ -1746,6 +1752,7 @@ fn newer_generation_rollback() {
             BlobVersion::materialized(
                 [2u8; 32],
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 SystemTime::UNIX_EPOCH + Duration::from_secs(1600000180),
                 test_user_id(),
                 None,
@@ -1989,7 +1996,7 @@ fn probe_backend(
 }
 
 fn group_backend_key(backend_id: Ulid) -> Vec<u8> {
-    BlobLocationKey::new([1u8; 32], BackendRef::Group(backend_id)).to_bytes()
+    BlobLocationKey::new([1u8; 32], EncodingClass::Raw, BackendRef::Group(backend_id)).to_bytes()
 }
 
 fn probed_key(effects: &aruna_core::types::Effects) -> Vec<u8> {
@@ -3164,6 +3171,7 @@ fn reclaim_uses_enqueue() {
     op.replaced_version = Some(BlobVersion::materialized(
         [9u8; 32],
         BackendRef::node_default(),
+        EncodingClass::Raw,
         fixed_created_at(),
         test_user_id(),
         None,
@@ -3240,4 +3248,31 @@ fn failure_survives_finalize() {
     .with_clock(fixed_trace_clock);
     op.fail(IncomingVersionError::RealmMismatch);
     assert_eq!(op.finalize(), Err(IncomingVersionError::RealmMismatch));
+}
+
+#[test]
+fn stale_encoding_rejects() {
+    // The bucket switched to zstd after this raw replica was stored: publishing it
+    // would leave a copy a finished migration never revisits.
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(91, 91),
+        iroh::SecretKey::from_bytes(&[91; 32]).public(),
+        RealmId::from_bytes([7u8; 32]),
+        make_manifest(ReplicationItemKind::Materialized),
+    );
+    op.state = IncomingVersionState::CheckDrift;
+    op.txn_id = Some(Ulid::from_parts(92, 92));
+    op.existing_blob_location = Some(make_location());
+    let mut bucket = make_bucket_info(Ulid::from_parts(93, 93));
+    bucket.compression = aruna_core::structs::storage::format::Compression::Zstd { level: 3 };
+
+    op.step(bucket_drift(&bucket));
+
+    assert_eq!(op.state, IncomingVersionState::Error);
+    assert!(matches!(
+        op.output,
+        Some(Err(IncomingVersionError::StorageError(
+            aruna_core::errors::StorageError::TransactionConflict
+        )))
+    ));
 }

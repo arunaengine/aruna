@@ -4,6 +4,7 @@
 
 #![recursion_limit = "512"]
 
+use aruna_core::structs::storage::format::Compression;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -208,6 +209,7 @@ async fn setup_fixture() -> Fixture {
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             }
             .to_bytes()
             .unwrap(),
@@ -653,6 +655,7 @@ async fn refuses_offered_write() {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
         .to_bytes()
         .unwrap(),

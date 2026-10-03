@@ -6,6 +6,9 @@ use crate::driver::{DriverContext, drive};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectState,
 };
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::format::StoredFormat;
 
 use crate::node::usage_stats::{QuotaGate, UsageCounterUpdate};
 use aruna_blob::blob::BlobHandler;
@@ -75,8 +78,7 @@ fn test_location(created_by: aruna_core::UserId) -> BackendLocation {
         storage_bucket: "bucket".to_string(),
         backend_path: "path".to_string(),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by,
         created_at: std::time::SystemTime::now(),
         staging: false,
@@ -131,6 +133,7 @@ fn guard_allows_edit() {
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     let edited = BucketInfo {
         cors_configuration: Some(
@@ -166,6 +169,51 @@ fn guard_allows_edit() {
 }
 
 #[test]
+fn stale_encoding_rejected() {
+    // The setting changed while the bytes streamed: the raw copy must not become
+    // a version a finished migration would never revisit.
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let node_id = iroh::SecretKey::generate().public();
+    let config = put_config(realm_id, group_id, node_id);
+    let current = BucketInfo {
+        group_id,
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: config.user_id,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Zstd { level: 3 },
+    };
+    let mut op = PutObjectOperation::new(config);
+    op.state = PutObjectState::StartTransaction;
+    op.written_location = Some(test_location(op.config.user_id));
+    op.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: Ulid::generate(),
+    }));
+    op.step(fence_clear());
+
+    op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (
+                b"mybucket".to_vec().into(),
+                Some(current.to_bytes().unwrap().into()),
+            ),
+            (b"subject".to_vec().into(), None),
+        ],
+    }));
+    op.step(Event::Blob(BlobEvent::DeleteFinished));
+
+    assert_eq!(
+        op.finalize(),
+        Err(PutObjectError::StorageError(
+            StorageError::TransactionConflict
+        ))
+    );
+}
+
+#[test]
 fn recreate_rejected() {
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let group_id = Ulid::generate();
@@ -179,6 +227,7 @@ fn recreate_rejected() {
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     let recreated = BucketInfo {
         created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
@@ -911,6 +960,7 @@ pub async fn test_put_object() {
             key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
             key: BlobLocationKey::from_blake3(
                 result.location.get_blake3().unwrap(),
+                EncodingClass::Raw,
                 result.location.backend.clone(),
             )
             .unwrap()
@@ -1175,7 +1225,12 @@ pub async fn deduplicates_blob() {
     assert_eq!(count_files(Path::new(&blob_root)), 1);
     let blob_hash: [u8; 32] = first.location.get_blake3().unwrap().try_into().unwrap();
 
-    let location_key = BlobLocationKey::new(blob_hash, first.location.backend.clone()).to_bytes();
+    let location_key = BlobLocationKey::new(
+        blob_hash,
+        EncodingClass::Raw,
+        first.location.backend.clone(),
+    )
+    .to_bytes();
     let blob_location_value = read_value(&context, BLOB_LOCATIONS_KEYSPACE, location_key)
         .await
         .expect("missing blob location entry");
@@ -1443,6 +1498,7 @@ async fn delete_keeps_copy() {
         BLOB_LOCATIONS_KEYSPACE,
         BlobLocationKey::new(
             cold.location.get_blake3().unwrap().try_into().unwrap(),
+            EncodingClass::Raw,
             cold.location.backend.clone(),
         )
         .to_bytes(),
@@ -1487,8 +1543,7 @@ fn generation_increments() {
         storage_bucket: "bucket".to_string(),
         backend_path: "path".to_string(),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: op.config.user_id,
         created_at: std::time::SystemTime::now(),
         staging: false,

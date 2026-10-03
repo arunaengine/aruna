@@ -1,7 +1,12 @@
-# Cargo build settings for the host target: clang with the mold linker.
+# Cargo settings: clang with the mold linker for the host target, and the test thread stack.
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# Debug async frames are many times larger than release ones, so deep async tests need more
+# than the 2 MiB default thread stack. Release binaries do not run through Cargo.
+[env]
+RUST_MIN_STACK = "8388608"

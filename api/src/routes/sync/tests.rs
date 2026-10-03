@@ -14,6 +14,7 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, MIRROR_REPAIR_KEYSPACE, S3_BUCKET_KEY
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::format::Compression;
 use tempfile::TempDir;
 
 fn test_node(seed: u8) -> NodeId {
@@ -94,6 +95,7 @@ async fn test_state() -> (TempDir, Arc<ServerState>, AuthContext, SyncRelationsh
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             }
             .to_bytes()
             .unwrap()

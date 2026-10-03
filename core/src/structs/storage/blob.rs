@@ -15,6 +15,7 @@ use crate::structs::execution::staging::VersionSourceBinding;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
+use crate::structs::storage::format::{Compression, EncodingClass, StoredFormat, StoredLayout};
 use crate::structs::storage::group_backend::GroupBackendKind;
 use crate::structs::storage::routing::StorageRoutingRule;
 use crate::types::GroupId;
@@ -190,6 +191,8 @@ impl Display for BackendRef {
 pub struct ResolvedBackend {
     pub backend: BackendRef,
     pub storage_class: Option<String>,
+    /// The bucket's compression at resolution time; parts and hidden blobs ignore it.
+    pub compression: Compression,
 }
 
 impl ResolvedBackend {
@@ -197,7 +200,13 @@ impl ResolvedBackend {
         Self {
             backend,
             storage_class,
+            compression: Compression::Off,
         }
+    }
+
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
     }
 
     pub fn node_default() -> Self {
@@ -358,13 +367,13 @@ pub struct BackendLocation {
     pub storage_bucket: String,
     pub backend_path: String,
     pub ulid: Ulid,
-    pub compressed: bool,
-    pub encrypted: bool,
+    pub format: StoredFormat,
     pub created_by: UserId,
     pub created_at: SystemTime,
     pub staging: bool,
     /// One part of an unfinished provider multipart upload: never an object of its own.
     pub partial: bool,
+    /// Size of the original bytes; `stored_size` is what the backend holds.
     pub blob_size: u64,
     pub hashes: HashMap<String, Vec<u8>>,
 }
@@ -419,6 +428,22 @@ impl BackendLocation {
         self.hashes.get(HASH_BLAKE3).map(|h| h.as_slice())
     }
 
+    /// Key of this copy's location row; fails without a BLAKE3 hash.
+    pub fn location_key(&self) -> Result<BlobLocationKey, ConversionError> {
+        let hash = self
+            .get_blake3()
+            .ok_or_else(|| ConversionError::InvalidLength("missing blake3 hash".to_string()))?;
+        BlobLocationKey::from_blake3(hash, self.format.encoding(), self.backend.clone())
+    }
+
+    /// Bytes this copy occupies on its backend.
+    pub fn stored_size(&self) -> u64 {
+        match &self.format.layout {
+            StoredLayout::Raw => self.blob_size,
+            StoredLayout::Frames(layout) => layout.stored_size,
+        }
+    }
+
     /// Whether both name the same physical object. The path carries a per-write
     /// id, so this distinguishes two copies of identical content.
     pub fn same_object(&self, other: &Self) -> bool {
@@ -429,39 +454,48 @@ impl BackendLocation {
     }
 }
 
-/// Names one physical copy: the content hash followed by the backend holding
-/// it. Deduplication therefore stays inside the backend a write routed to, and
-/// every backend keeps at most one copy of a hash.
+/// Names one physical copy: the content hash, its encoding class and the
+/// backend holding it. Deduplication therefore stays inside the backend a
+/// write routed to and inside one encoding class.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobLocationKey {
     pub blake3_hash: [u8; 32],
+    pub encoding: EncodingClass,
     pub backend: BackendRef,
 }
 
 impl BlobLocationKey {
-    pub fn new(blake3_hash: [u8; 32], backend: BackendRef) -> Self {
+    pub fn new(blake3_hash: [u8; 32], encoding: EncodingClass, backend: BackendRef) -> Self {
         Self {
             blake3_hash,
+            encoding,
             backend,
         }
     }
 
-    pub fn from_blake3(hash: &[u8], backend: BackendRef) -> Result<Self, ConversionError> {
-        Ok(Self::new(hash.try_into()?, backend))
+    pub fn from_blake3(
+        hash: &[u8],
+        encoding: EncodingClass,
+        backend: BackendRef,
+    ) -> Result<Self, ConversionError> {
+        Ok(Self::new(hash.try_into()?, encoding, backend))
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut key = self.blake3_hash.to_vec();
+        key.extend_from_slice(&self.encoding.key_bytes());
         key.extend_from_slice(&self.backend.key_bytes());
         key
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let (hash, backend) = bytes.split_at_checked(32).ok_or_else(|| {
+        let (hash, rest) = bytes.split_at_checked(32).ok_or_else(|| {
             ConversionError::InvalidLength("blob location key is too short".to_string())
         })?;
+        let (encoding, backend) = EncodingClass::split_key(rest)?;
         Ok(Self::new(
             hash.try_into()?,
+            encoding,
             BackendRef::from_key_bytes(backend)?,
         ))
     }
@@ -487,8 +521,9 @@ impl BlobQuarantineRecord {
         }
     }
 
+    /// One row per hash and backend, whatever the encoding of the corrupt copy.
     pub fn key(&self) -> Vec<u8> {
-        BlobLocationKey::new(self.blake3, self.backend.clone()).to_bytes()
+        BlobLocationKey::new(self.blake3, EncodingClass::Raw, self.backend.clone()).to_bytes()
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -623,6 +658,8 @@ pub struct BucketInfo {
     /// Advances on each default change, so a write that read an older default
     /// is detectable at commit time.
     pub placement_policy_generation: u64,
+    /// Compression of new writes; each node also re-encodes its own copies to match.
+    pub compression: Compression,
 }
 
 impl BucketInfo {
@@ -1041,6 +1078,7 @@ impl BlobVersion {
     pub fn materialized(
         blob_hash: [u8; 32],
         backend: BackendRef,
+        encoding: EncodingClass,
         created_at: SystemTime,
         created_by: UserId,
         source: Option<VersionSourceBinding>,
@@ -1051,6 +1089,7 @@ impl BlobVersion {
             state: BlobVersionState::Materialized {
                 blob_hash,
                 backend,
+                encoding,
                 source,
             },
             metadata: HashMap::new(),
@@ -1167,6 +1206,8 @@ pub enum BlobVersionState {
         /// Backend the write routed to. Stamped here so a read never has to
         /// re-derive routing or guess which physical copy the object owns.
         backend: BackendRef,
+        /// Encoding class of the copy, the last part of its location key.
+        encoding: EncodingClass,
         source: Option<VersionSourceBinding>,
     },
     Reference {
@@ -1198,8 +1239,11 @@ impl BlobVersionState {
     pub fn location_key(&self) -> Option<BlobLocationKey> {
         match self {
             Self::Materialized {
-                blob_hash, backend, ..
-            } => Some(BlobLocationKey::new(*blob_hash, backend.clone())),
+                blob_hash,
+                backend,
+                encoding,
+                ..
+            } => Some(BlobLocationKey::new(*blob_hash, *encoding, backend.clone())),
             Self::Reference { .. } | Self::Deleted => None,
         }
     }
@@ -1323,6 +1367,9 @@ mod tests {
     use crate::structs::placement::policy::{
         MAX_POLICY_REFS, PlacementPolicyError, PlacementPolicyRef,
     };
+    use crate::structs::storage::format::Compression;
+    use crate::structs::storage::format::EncodingClass;
+    use crate::structs::storage::format::StoredFormat;
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::time::SystemTime;
@@ -1488,8 +1535,12 @@ mod tests {
     #[test]
     fn key_separates_backends() {
         // One hash on two backends must produce two distinct, decodable keys.
-        let node = BlobLocationKey::new([7u8; 32], BackendRef::node_default());
-        let group = BlobLocationKey::new([7u8; 32], BackendRef::Group(Ulid::from_bytes([4u8; 16])));
+        let node = BlobLocationKey::new([7u8; 32], EncodingClass::Raw, BackendRef::node_default());
+        let group = BlobLocationKey::new(
+            [7u8; 32],
+            EncodingClass::Raw,
+            BackendRef::Group(Ulid::from_bytes([4u8; 16])),
+        );
 
         assert_ne!(node.to_bytes(), group.to_bytes());
         assert_eq!(BlobLocationKey::from_bytes(&node.to_bytes()).unwrap(), node);
@@ -1499,6 +1550,8 @@ mod tests {
         );
         assert!(node.to_bytes().starts_with(&[7u8; 32]));
         assert!(group.to_bytes().starts_with(&[7u8; 32]));
+        // Raw keys keep the hash-then-backend shape stored rows already use.
+        assert_eq!(node.to_bytes(), [&[7u8; 32][..], b"n:default"].concat());
     }
 
     #[test]
@@ -1592,6 +1645,7 @@ mod tests {
             BlobVersion::materialized(
                 [1u8; 32],
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 created_at,
                 created_by,
                 Some(binding.clone()),
@@ -1618,6 +1672,7 @@ mod tests {
         let materialized = BlobVersion::materialized(
             [1u8; 32],
             BackendRef::node_default(),
+            EncodingClass::Raw,
             created_at,
             created_by,
             None,
@@ -1670,8 +1725,7 @@ mod tests {
             storage_bucket: "bucket".to_string(),
             backend_path: "object.bin".to_string(),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::default(),
             created_at: SystemTime::now(),
             staging: false,
@@ -1704,8 +1758,7 @@ mod tests {
             storage_bucket: "bucket".to_string(),
             backend_path: "object.bin".to_string(),
             ulid: Ulid::from_bytes([2u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,
@@ -1772,8 +1825,7 @@ mod tests {
             storage_bucket: "storage".to_string(),
             backend_path: "object.bin".to_string(),
             ulid: Ulid::from_bytes([5u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,
@@ -1811,6 +1863,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 7,
+            compression: Compression::Off,
         }
     }
 
@@ -1883,6 +1936,7 @@ mod tests {
         let version = BlobVersion::materialized(
             [1u8; 32],
             BackendRef::node_default(),
+            EncodingClass::Raw,
             created_at,
             UserId::default(),
             None,

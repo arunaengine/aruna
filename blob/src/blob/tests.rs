@@ -32,6 +32,7 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork, BlobTimeoutConfig,
     HiddenBlobKey, ResolvedBackend, WriteOwner,
 };
+use aruna_core::structs::storage::format::{Compression, StoredFormat};
 use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
@@ -493,8 +494,7 @@ fn make_test_location() -> BackendLocation {
         storage_bucket: "bucket".to_string(),
         backend_path: format!("blob/{}", Ulid::generate()),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: test_user_id(),
         created_at: SystemTime::now(),
         staging: false,
@@ -567,8 +567,6 @@ async fn copies_across_backends() {
             MultipartPartKey::new(Ulid::generate(), 1),
             cold_backend(),
             test_user_id(),
-            false,
-            false,
             blob,
         )
         .await
@@ -780,8 +778,6 @@ async fn pins_part_area() {
             MultipartPartKey::new(Ulid::generate(), 1),
             cold_backend(),
             test_user_id(),
-            false,
-            false,
             stream_from_bytes(b"part"),
         )
         .await
@@ -1149,8 +1145,6 @@ async fn excludes_part_bucket() {
             upload_id: Ulid::generate(),
             part_number: 1,
             created_by: test_user_id(),
-            compressed: false,
-            encrypted: false,
             backend_upload: None,
             size: None,
             blob: stream_from_bytes(b"part"),
@@ -1869,8 +1863,7 @@ async fn reports_finalization_failure() {
         storage_bucket: "finalization-bucket".to_string(),
         backend_path: format!("obj/{}", Ulid::generate()),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: test_user_id(),
         created_at: SystemTime::now(),
         staging: false,
@@ -1915,8 +1908,7 @@ async fn failed_write_cleans() {
         storage_bucket: "bucket".to_string(),
         backend_path: "partial.bin".to_string(),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: test_user_id(),
         created_at: SystemTime::now(),
         staging: false,
@@ -1977,8 +1969,6 @@ async fn compose_part_sizes() {
                     MultipartPartKey::new(upload_id, (index + 1) as u16),
                     ResolvedBackend::node_default(),
                     test_user_id(),
-                    false,
-                    false,
                     stream_from_bytes(&payload),
                 )
                 .await
@@ -1998,7 +1988,7 @@ async fn compose_part_sizes() {
             };
             let (operator, sizes) = failing_close::operator_with_sizes();
             let event = handler
-                .compose_parts(target, operator, parts.clone(), None)
+                .compose_parts(target, operator, parts.clone(), None, Compression::Off)
                 .await;
             assert!(matches!(
                 event,
@@ -2029,8 +2019,6 @@ async fn compose_streams_chunks() {
                 MultipartPartKey::new(upload_id, (index + 1) as u16),
                 ResolvedBackend::node_default(),
                 test_user_id(),
-                false,
-                false,
                 stream_from_bytes(&payload),
             )
             .await
@@ -2043,7 +2031,13 @@ async fn compose_streams_chunks() {
     let (operator, sizes) = failing_close::operator_with_sizes();
 
     handler
-        .compose_parts(make_test_location(), operator, parts, Some(chunk))
+        .compose_parts(
+            make_test_location(),
+            operator,
+            parts,
+            Some(chunk),
+            Compression::Off,
+        )
         .await;
 
     let sizes = sizes.lock().unwrap();
@@ -2054,13 +2048,13 @@ async fn compose_streams_chunks() {
 #[test]
 fn compose_chunk_limits() {
     let tib = 1024u64.pow(4);
-    assert_eq!(compose_chunk(&Backend::S3, 5 * tib), None);
+    assert_eq!(compose_chunk(&Backend::S3, 5 * tib, false), None);
     assert_eq!(
-        compose_chunk(&Backend::Group(GroupBackendKind::S3), tib),
+        compose_chunk(&Backend::Group(GroupBackendKind::S3), tib, false),
         None
     );
     assert_eq!(
-        compose_chunk(&Backend::FileSystem, 1024),
+        compose_chunk(&Backend::FileSystem, 1024, false),
         Some(GROUP_WRITE_CHUNK)
     );
     for (backend, limit) in [
@@ -2068,10 +2062,17 @@ fn compose_chunk_limits() {
         (Backend::Group(GroupBackendKind::Gcs), 10_000),
         (Backend::Group(GroupBackendKind::Azblob), 50_000),
     ] {
-        let chunk = compose_chunk(&backend, 5 * tib).unwrap() as u64;
+        let chunk = compose_chunk(&backend, 5 * tib, false).unwrap() as u64;
         assert!((5 * tib).div_ceil(chunk) <= limit);
         assert!(chunk < 1024 * 1024 * 1024);
     }
+    // Frames do not follow the input parts, so S3 streams them in chunks.
+    let chunk = compose_chunk(&Backend::S3, 5 * tib, true).unwrap() as u64;
+    assert!((5 * tib + 5 * tib / 1024).div_ceil(chunk) <= 10_000);
+    assert_eq!(
+        compose_chunk(&Backend::S3, 1024, true),
+        Some(GROUP_WRITE_CHUNK)
+    );
 }
 
 #[tokio::test]
@@ -2091,8 +2092,6 @@ async fn compose_timeout_deletes() {
             MultipartPartKey::new(Ulid::generate(), 1),
             ResolvedBackend::node_default(),
             test_user_id(),
-            false,
-            false,
             stream_from_bytes(b"part"),
         )
         .await
@@ -2102,7 +2101,13 @@ async fn compose_timeout_deletes() {
     let (operator, delete_calls, writer) = failing_cleanup::pending_operator();
 
     let event = handler
-        .compose_parts(make_test_location(), operator, vec![part], None)
+        .compose_parts(
+            make_test_location(),
+            operator,
+            vec![part],
+            None,
+            Compression::Off,
+        )
         .await;
 
     assert!(matches!(
@@ -2139,8 +2144,7 @@ async fn compose_close_fails() {
         storage_bucket: "compose-target".to_string(),
         backend_path: format!("obj/{}", Ulid::generate()),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: test_user_id(),
         created_at: SystemTime::now(),
         staging: false,
@@ -2151,7 +2155,7 @@ async fn compose_close_fails() {
 
     let (operator, aborts) = failing_close::operator_with_aborts();
     let event = handler
-        .compose_parts(target.clone(), operator, vec![part], None)
+        .compose_parts(target.clone(), operator, vec![part], None, Compression::Off)
         .await;
 
     assert!(
@@ -2206,7 +2210,7 @@ async fn compose_cleanup_error() {
     let event = context
         .blob_handle
         .handler
-        .compose_parts(target.clone(), operator, Vec::new(), None)
+        .compose_parts(target.clone(), operator, Vec::new(), None, Compression::Off)
         .await;
 
     let BlobEvent::Error(BlobError::WriteCleanup { location, .. }) = event else {
@@ -2990,8 +2994,6 @@ async fn s3_staged_replacement() {
             MultipartPartKey::new(upload.record_id, 1),
             cold_backend(),
             test_user_id(),
-            false,
-            false,
             stream_from_bytes(&replacement),
         )
         .await
@@ -3231,8 +3233,6 @@ async fn s3_overlapping_writes() {
             MultipartPartKey::new(upload.record_id, 1),
             cold_backend(),
             test_user_id(),
-            false,
-            false,
             Some(size as u64),
             stream_from_bytes(&second),
         )
@@ -3306,8 +3306,6 @@ async fn s3_delayed_write() {
             MultipartPartKey::new(upload.record_id, 1),
             cold_backend(),
             test_user_id(),
-            false,
-            false,
             Some(size as u64),
             stream_from_bytes(&vec![9u8; size]),
         )
@@ -3368,8 +3366,6 @@ async fn s3_multipart_compose() {
                 MultipartPartKey::new(upload_id, number),
                 cold_backend(),
                 test_user_id(),
-                false,
-                false,
                 stream_from_bytes(&payload),
             )
             .await
@@ -3394,6 +3390,78 @@ async fn s3_multipart_compose() {
     };
 
     assert_eq!(read_back(&handler, location).await, b"first-second");
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_framed_compose() {
+    // Frames do not follow the part boundaries; the composed object still reads back whole.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let upload_id = Ulid::generate();
+    let mib = 1024 * 1024;
+    let payloads = [vec![1u8; 6 * mib], vec![2u8; 6 * mib], b"tail".to_vec()];
+
+    let mut parts = Vec::new();
+    for (index, payload) in payloads.iter().enumerate() {
+        let BlobEvent::WriteFinished { location } = handler
+            .write_blob_part(
+                MultipartPartKey::new(upload_id, index as u16 + 1),
+                cold_backend(),
+                test_user_id(),
+                stream_from_bytes(payload),
+            )
+            .await
+        else {
+            panic!("s3 part write failed")
+        };
+        parts.push(location);
+    }
+
+    let framed = cold_backend().with_compression(Compression::Zstd { level: 3 });
+    let BlobEvent::WriteFinished { location } = handler
+        .compose_blob("bucket", "framed.bin", framed, test_user_id(), parts)
+        .await
+    else {
+        panic!("s3 framed compose failed")
+    };
+
+    let expected = payloads.concat();
+    assert!(matches!(
+        location.format.layout,
+        aruna_core::structs::storage::format::StoredLayout::Frames(_)
+    ));
+    assert_eq!(location.blob_size, expected.len() as u64);
+    assert!(location.stored_size() < mib as u64);
+    assert_eq!(location.hashes, Hasher::new_with_bytes(&expected).to_map());
+    assert_eq!(read_back(&handler, location).await, expected);
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_compressed_upload() {
+    // A provider upload assembles raw parts, so a compressed bucket keeps a blob per part.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+
+    let event = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "framed.bin",
+            cold_backend().with_compression(Compression::Zstd { level: 3 }),
+            test_user_id(),
+        )
+        .await;
+
+    assert!(matches!(
+        event,
+        BlobEvent::UploadOpened {
+            backend_upload: None
+        }
+    ));
 }
 
 async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bool) {
@@ -3715,3 +3783,6 @@ async fn hold_excludes_claim() {
             .is_none()
     );
 }
+
+#[path = "frames_tests.rs"]
+mod frames;

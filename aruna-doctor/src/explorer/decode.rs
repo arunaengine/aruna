@@ -995,6 +995,9 @@ mod tests {
         BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, HashIndex,
     };
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::format::EncodingClass;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{
         MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
         MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
@@ -1026,6 +1029,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 7,
+            compression: Compression::Off,
         };
 
         let decoded = decode_entry(
@@ -1728,8 +1732,7 @@ mod tests {
                 storage_bucket: "blob-bucket".to_string(),
                 backend_path: "multipart/part-5.bin".to_string(),
                 ulid: Ulid::from_bytes([4_u8; 16]),
-                compressed: false,
-                encrypted: false,
+                format: StoredFormat::default(),
                 created_by,
                 created_at: SystemTime::UNIX_EPOCH,
                 staging: false,
@@ -2028,8 +2031,7 @@ mod tests {
             storage_bucket: "blob-bucket".to_string(),
             backend_path: "path/blob.bin".to_string(),
             ulid: Ulid::from_bytes([5_u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by,
             created_at: std::time::SystemTime::UNIX_EPOCH,
             staging: false,
@@ -2040,6 +2042,7 @@ mod tests {
         let version = BlobVersion::materialized(
             [9_u8; 32],
             BackendRef::node_default(),
+            EncodingClass::Raw,
             std::time::SystemTime::UNIX_EPOCH,
             created_by,
             None,
@@ -2071,7 +2074,8 @@ mod tests {
             other => panic!("expected current version pointer, got {other:?}"),
         }
 
-        let location_key = BlobLocationKey::new([9_u8; 32], location.backend.clone());
+        let location_key =
+            BlobLocationKey::new([9_u8; 32], EncodingClass::Raw, location.backend.clone());
         let decoded_location = decode_entry(
             BLOB_LOCATIONS_KEYSPACE,
             &location_key.to_bytes(),

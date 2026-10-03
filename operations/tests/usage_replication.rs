@@ -5,6 +5,7 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 
+use aruna_core::structs::storage::format::Compression;
 use std::sync::Arc;
 
 use aruna_core::document::DocumentTarget;
@@ -66,6 +67,7 @@ async fn snapshot_reaches_peer() -> Result<(), Box<dyn std::error::Error>> {
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             },
         ),
         node_a.context.as_ref(),
@@ -252,6 +254,7 @@ async fn steady_write_publishes() -> Result<(), Box<dyn std::error::Error>> {
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             },
         ),
         node.context.as_ref(),

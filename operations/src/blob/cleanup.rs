@@ -512,9 +512,13 @@ async fn owns_write(
     let (key_space, key): (&str, Key) = match owner {
         WriteOwner::Blob { blake3, .. } => (
             BLOB_LOCATIONS_KEYSPACE,
-            BlobLocationKey::new(*blake3, location.backend.clone())
-                .to_bytes()
-                .into(),
+            BlobLocationKey::new(
+                *blake3,
+                location.format.encoding(),
+                location.backend.clone(),
+            )
+            .to_bytes()
+            .into(),
         ),
         WriteOwner::UploadPart {
             upload_id,
@@ -576,6 +580,8 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
     };
+    use aruna_core::structs::storage::format::EncodingClass;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{
         BackendUpload, MultipartUpload, MultipartUploadStatus,
     };
@@ -609,8 +615,7 @@ mod tests {
                 storage_bucket: "bucket".to_string(),
                 backend_path: "bucket/object".to_string(),
                 ulid: Ulid::generate(),
-                compressed: false,
-                encrypted: false,
+                format: StoredFormat::default(),
                 created_by: UserId::local(Ulid::generate(), realm_id),
                 created_at: SystemTime::now(),
                 staging: false,
@@ -773,7 +778,7 @@ mod tests {
         let event = storage
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: BlobLocationKey::new([7u8; 32], location.backend.clone())
+                key: BlobLocationKey::new([7u8; 32], EncodingClass::Raw, location.backend.clone())
                     .to_bytes()
                     .into(),
                 value: location.to_bytes().unwrap().into(),

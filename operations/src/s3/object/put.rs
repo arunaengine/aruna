@@ -43,6 +43,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CopyOrigin, CurrentVersionPointer, ManagedCopyKey, VersionKey, WriteOwner,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId};
@@ -553,6 +554,11 @@ impl PutObjectOperation {
                     "the adopted blob sits on another backend".to_string(),
                 ));
             }
+            if location.format.encoding() != EncodingClass::from(resolved.compression) {
+                return self.emit_error(PutObjectError::WriteFailed(
+                    "the adopted blob uses another encoding".to_string(),
+                ));
+            }
             self.adopted = true;
             self.written_location = Some(location);
             self.state = PutObjectState::StartTransaction;
@@ -699,6 +705,18 @@ impl PutObjectOperation {
                 return self.emit_error(error.into());
             }
         }
+        // A copy encoded under an older setting is never published: the bucket's
+        // migration may already have passed this key.
+        let written = self
+            .get_written_location()
+            .map(|location| location.format.encoding());
+        if current
+            .as_ref()
+            .zip(written)
+            .is_some_and(|(bucket, written)| EncodingClass::from(bucket.compression) != written)
+        {
+            return self.emit_error(StorageError::TransactionConflict.into());
+        }
         self.bucket_policies = observed.policies;
         self.start_fence()
     }
@@ -713,8 +731,11 @@ impl PutObjectOperation {
         let Some(blake3_hash) = written_location.get_blake3() else {
             return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
         };
-        let key = match BlobLocationKey::from_blake3(blake3_hash, written_location.backend.clone())
-        {
+        let key = match BlobLocationKey::from_blake3(
+            blake3_hash,
+            written_location.format.encoding(),
+            written_location.backend.clone(),
+        ) {
             Ok(key) => key,
             Err(error) => return self.emit_error(error.into()),
         };
@@ -933,6 +954,7 @@ impl PutObjectOperation {
                     }
                 },
                 output.backend.clone(),
+                output.format.encoding(),
                 version_created_at,
                 output.created_by,
                 self.config.version_source.clone(),
@@ -1573,6 +1595,7 @@ mod pure_tests {
     use aruna_core::structs::identity::auth::PathRestriction;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::structs::storage::routing::{
         BackendCatalog, GroupRoutingInputs, RoutingError, RoutingSnapshot, RoutingTarget,
@@ -1833,8 +1856,7 @@ mod pure_tests {
             storage_bucket: "bucket".to_string(),
             backend_path: "bucket/object".to_string(),
             ulid: Ulid::from_bytes([6u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: aruna_core::UserId::default(),
             created_at: std::time::SystemTime::UNIX_EPOCH,
             staging: false,
@@ -1881,6 +1903,8 @@ mod decision_tests {
         PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject, VerifiedPolicy,
     };
     use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::types::{Effects, Value};
     use byteview::ByteView;
@@ -1957,6 +1981,7 @@ mod decision_tests {
             storage_routing: Vec::new(),
             placement_policies: refs,
             placement_policy_generation: generation,
+            compression: Compression::Off,
         };
         ByteView::from(info.to_bytes().expect("bucket encodes"))
     }
@@ -2277,8 +2302,7 @@ mod decision_tests {
             storage_bucket: "aruna".to_string(),
             backend_path: "objects/one".to_string(),
             ulid: Ulid::from_bytes([5u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
             created_at: UNIX_EPOCH,
             staging: false,

@@ -359,6 +359,7 @@ mod pure_tests {
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::routing::{
         GroupRoutingInputs, RoutingError, RoutingTarget, StorageRoutingRule,
     };
@@ -399,6 +400,7 @@ mod pure_tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
     }
 

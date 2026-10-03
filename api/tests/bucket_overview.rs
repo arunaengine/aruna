@@ -2,6 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::format::StoredFormat;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -156,6 +159,7 @@ async fn setup() -> Fixture {
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             }
             .to_bytes()
             .unwrap(),
@@ -182,6 +186,7 @@ async fn setup() -> Fixture {
             BlobVersion::materialized(
                 [1u8; 32],
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 UNIX_EPOCH + Duration::from_secs(3),
                 owner,
                 None,
@@ -192,6 +197,7 @@ async fn setup() -> Fixture {
             BlobVersion::materialized(
                 [2u8; 32],
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 UNIX_EPOCH + Duration::from_secs(2),
                 owner,
                 None,
@@ -216,7 +222,8 @@ async fn setup() -> Fixture {
         write_value(
             &state,
             BLOB_LOCATIONS_KEYSPACE,
-            BlobLocationKey::new([tag; 32], BackendRef::node_default()).to_bytes(),
+            BlobLocationKey::new([tag; 32], EncodingClass::Raw, BackendRef::node_default())
+                .to_bytes(),
             BackendLocation {
                 backend: BackendRef::node_default(),
                 storage_class: None,
@@ -224,8 +231,7 @@ async fn setup() -> Fixture {
                 storage_bucket: "data".to_string(),
                 backend_path: format!("{tag}.blob"),
                 ulid: Ulid::generate(),
-                compressed: false,
-                encrypted: false,
+                format: StoredFormat::default(),
                 created_by: owner,
                 created_at: UNIX_EPOCH,
                 staging: false,

@@ -4,6 +4,7 @@
 
 #![recursion_limit = "256"]
 
+use aruna_core::structs::storage::format::Compression;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -176,6 +177,7 @@ async fn setup_context() -> TestContext {
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             },
         ),
         &driver,
@@ -341,8 +343,6 @@ async fn scoped_fence_isolates() {
                 content_length: Some(8),
                 body: Some(stream(b"part-two")),
                 created_by: context.user_id,
-                compressed: false,
-                encrypted: false,
                 expected_checksums: Vec::new(),
             }),
             &context.driver,

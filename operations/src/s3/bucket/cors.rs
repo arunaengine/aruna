@@ -511,6 +511,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::storage::blob::{BucketCorsConfiguration, BucketCorsRule, BucketInfo};
+    use aruna_core::structs::storage::format::Compression;
     use aruna_storage::storage;
     use std::time::SystemTime;
     use tempfile::tempdir;
@@ -540,6 +541,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
     }
 

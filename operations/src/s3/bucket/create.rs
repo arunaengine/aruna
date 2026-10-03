@@ -255,6 +255,7 @@ impl Operation for CreateBucketOperation {
 mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use aruna_core::structs::storage::format::Compression;
     use aruna_storage::storage;
     use std::time::SystemTime;
     use tempfile::tempdir;
@@ -282,6 +283,7 @@ mod test {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         };
 
         let result = drive(
@@ -316,6 +318,7 @@ mod test {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         };
 
         drive(

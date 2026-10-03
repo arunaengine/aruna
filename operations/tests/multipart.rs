@@ -11,8 +11,8 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    BUCKET_STATS_DB, DHT_KEYSPACE, OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, UPLOAD_KEYSPACE,
-    UPLOAD_PART_KEYSPACE,
+    BUCKET_STATS_DB, DHT_KEYSPACE, OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE,
+    S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
@@ -20,8 +20,10 @@ use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork, BlobHeadKey,
-    BlobLocationKey, BlobVersion, CurrentVersionPointer, HashIndex, VersionKey, WriteOwner,
+    BlobLocationKey, BlobVersion, BucketInfo, CurrentVersionPointer, HashIndex, VersionKey,
+    WriteOwner,
 };
+use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use aruna_core::structs::storage::multipart::{
     COMPLETION_LEASE_MS, MultipartChecksumHint, MultipartChecksumType, MultipartObjectKey,
     MultipartObjectPart, MultipartObjectSummary, MultipartPartKey, MultipartUpload,
@@ -184,8 +186,6 @@ async fn upload_part_bytes(
             content_length: Some(bytes.len() as u64),
             body: Some(stream_from_bytes(bytes)),
             created_by,
-            compressed: false,
-            encrypted: false,
             expected_checksums: vec![],
         }),
         &context.driver,
@@ -275,8 +275,6 @@ async fn completion_persists_parts() {
             content_length: Some(part1.len() as u64),
             body: Some(stream_from_bytes(&part1)),
             created_by,
-            compressed: false,
-            encrypted: false,
             expected_checksums: vec![],
         }),
         &context.driver,
@@ -293,8 +291,6 @@ async fn completion_persists_parts() {
             content_length: Some(part2.len() as u64),
             body: Some(stream_from_bytes(part2)),
             created_by,
-            compressed: false,
-            encrypted: false,
             expected_checksums: vec![],
         }),
         &context.driver,
@@ -364,7 +360,8 @@ async fn completion_persists_parts() {
     assert_eq!(complete.part_count, 2);
 
     let blob_hash: [u8; 32] = complete.location.get_blake3().unwrap().try_into().unwrap();
-    let location_key = BlobLocationKey::new(blob_hash, BackendRef::node_default()).to_bytes();
+    let location_key =
+        BlobLocationKey::new(blob_hash, EncodingClass::Raw, BackendRef::node_default()).to_bytes();
     let blob_location = read_value(&context.driver, BLOB_LOCATIONS_KEYSPACE, location_key)
         .await
         .expect("missing blob location entry");
@@ -615,8 +612,6 @@ async fn overwrite_cleans_blob() {
             content_length: Some(5),
             body: Some(stream_from_bytes(b"first")),
             created_by,
-            compressed: false,
-            encrypted: false,
             expected_checksums: vec![],
         }),
         &context.driver,
@@ -633,8 +628,6 @@ async fn overwrite_cleans_blob() {
             content_length: Some(6),
             body: Some(stream_from_bytes(b"second")),
             created_by,
-            compressed: false,
-            encrypted: false,
             expected_checksums: vec![],
         }),
         &context.driver,
@@ -709,8 +702,6 @@ async fn completion_retains_path() {
             content_length: Some(part1.len() as u64),
             body: Some(stream_from_bytes(&part1)),
             created_by,
-            compressed: false,
-            encrypted: false,
             expected_checksums: vec![],
         }),
         &context.driver,
@@ -727,8 +718,6 @@ async fn completion_retains_path() {
             content_length: Some(part2.len() as u64),
             body: Some(stream_from_bytes(part2)),
             created_by,
-            compressed: false,
-            encrypted: false,
             expected_checksums: vec![],
         }),
         &context.driver,
@@ -930,7 +919,8 @@ async fn completion_deduplicates_multipart() {
         .unwrap()
         .try_into()
         .unwrap();
-    let location_key = BlobLocationKey::new(blob_hash, BackendRef::node_default()).to_bytes();
+    let location_key =
+        BlobLocationKey::new(blob_hash, EncodingClass::Raw, BackendRef::node_default()).to_bytes();
     let blob_location = read_value(&context.driver, BLOB_LOCATIONS_KEYSPACE, location_key)
         .await
         .expect("missing blob location entry");
@@ -1191,8 +1181,6 @@ async fn abort_removes_parts() {
             content_length: Some(4),
             body: Some(stream_from_bytes(b"part")),
             created_by,
-            compressed: false,
-            encrypted: false,
             expected_checksums: vec![],
         }),
         &context.driver,
@@ -1262,8 +1250,6 @@ async fn checksum_mismatch_cleans() {
             content_length: Some(4),
             body: Some(stream_from_bytes(b"part")),
             created_by,
-            compressed: false,
-            encrypted: false,
             expected_checksums: vec![ExpectedChecksum {
                 algorithm: ChecksumAlgorithm::Sha256,
                 digest: vec![0; 32],
@@ -1331,8 +1317,6 @@ async fn delete_removes_metadata() {
             content_length: Some(part1.len() as u64),
             body: Some(stream_from_bytes(&part1)),
             created_by,
-            compressed: false,
-            encrypted: false,
             expected_checksums: vec![],
         }),
         &context.driver,
@@ -1349,8 +1333,6 @@ async fn delete_removes_metadata() {
             content_length: Some(part2.len() as u64),
             body: Some(stream_from_bytes(part2)),
             created_by,
-            compressed: false,
-            encrypted: false,
             expected_checksums: vec![],
         }),
         &context.driver,
@@ -1890,8 +1872,6 @@ async fn s3_provider_flow() {
             content_length: Some(4),
             body: Some(stream_from_bytes(b"evil")),
             created_by,
-            compressed: false,
-            encrypted: false,
             expected_checksums: vec![ExpectedChecksum {
                 algorithm: ChecksumAlgorithm::Sha256,
                 digest: vec![0u8; 32],
@@ -2087,4 +2067,147 @@ async fn bucket_load(context: &TestContext, location: &BackendLocation) -> u64 {
         .await
         .map(|value| u64::from_le_bytes(value.as_ref().try_into().unwrap()))
         .unwrap_or(0)
+}
+
+/// Stores the bucket record with `compression`, as a compression change leaves it.
+async fn set_compression(
+    context: &TestContext,
+    bucket: &str,
+    group_id: Ulid,
+    compression: Compression,
+) {
+    let record = BucketInfo {
+        group_id,
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: UserId::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression,
+    };
+    let event = context
+        .driver
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: bucket.as_bytes().to_vec().into(),
+            value: record.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+}
+
+async fn read_object(context: &TestContext, location: &BackendLocation) -> Vec<u8> {
+    let blob_handle = context.driver.blob_handle.as_ref().unwrap();
+    let Event::Blob(BlobEvent::ReadFinished { blob, .. }) = blob_handle
+        .send_blob_effect(BlobEffect::Read {
+            location: location.clone(),
+        })
+        .await
+    else {
+        panic!("the completed object is not readable")
+    };
+    let chunks: Vec<bytes::Bytes> = futures_util::TryStreamExt::try_collect(blob).await.unwrap();
+    chunks.concat()
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_framed_completion() {
+    // Both kinds of S3 upload end as one framed copy in a compressed bucket.
+    let (context, _) = setup_s3_context().await;
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+    let created_by = UserId::local(Ulid::generate(), realm_id);
+    let group_id = Ulid::generate();
+    let zstd = Compression::Zstd { level: 3 };
+    let payloads = [vec![1u8; MIN_PART_SIZE + 3], b"tail".to_vec()];
+    let expected = payloads.concat();
+    let upload_parts = |key: &'static str, upload_id: Ulid| {
+        let context = &context;
+        let payloads = &payloads;
+        async move {
+            let mut parts = Vec::new();
+            for (index, payload) in payloads.iter().enumerate() {
+                let number = index as u16 + 1;
+                let part = upload_part_bytes(
+                    context, "bucket", key, upload_id, number, payload, created_by,
+                )
+                .await;
+                parts.push(part);
+            }
+            parts
+        }
+    };
+    let complete = |key: &'static str, upload_id: Ulid, parts: Vec<_>| {
+        let context = &context;
+        let size = expected.len() as u64;
+        async move {
+            complete_upload(
+                context,
+                "bucket",
+                key,
+                upload_id,
+                realm_id,
+                node_id,
+                &parts,
+                MultipartChecksumType::FullObject,
+                Some(size),
+                created_by,
+            )
+            .await
+        }
+    };
+
+    // Opened in a compressed bucket: the parts are blobs, composed into frames.
+    set_compression(&context, "bucket", group_id, zstd).await;
+    let upload = create_upload(&context, "bucket", "framed.bin", group_id, created_by).await;
+    assert!(upload.backend_upload.is_none());
+    let parts = upload_parts("framed.bin", upload.upload_id).await;
+    let result = complete("framed.bin", upload.upload_id, parts).await;
+    assert_eq!(result.location.format.encoding(), EncodingClass::from(zstd));
+    assert_eq!(result.location.blob_size, expected.len() as u64);
+    assert_eq!(read_object(&context, &result.location).await, expected);
+
+    // Compression turned on while an in-place upload was open: the provider object is
+    // composed into frames, and the raw object is left to its target row.
+    set_compression(&context, "bucket", group_id, Compression::Off).await;
+    let upload = create_upload(&context, "bucket", "in-place.bin", group_id, created_by).await;
+    let target = upload
+        .backend_upload
+        .clone()
+        .expect("an S3 backend opens one")
+        .location;
+    let parts = upload_parts("in-place.bin", upload.upload_id).await;
+    set_compression(&context, "bucket", group_id, zstd).await;
+    let result = complete("in-place.bin", upload.upload_id, parts).await;
+    assert_eq!(result.location.format.encoding(), EncodingClass::from(zstd));
+    assert!(!result.location.same_object(&target));
+    assert_eq!(
+        result.location.hashes,
+        aruna_blob::hash::Hasher::new_with_bytes(&expected).to_map()
+    );
+    assert_eq!(read_object(&context, &result.location).await, expected);
+    assert!(read_upload(&context, upload.upload_id).await.is_none());
+    let row = read_value(
+        &context.driver,
+        BLOB_CLEANUP_KEYSPACE,
+        target.ulid.to_bytes().to_vec(),
+    )
+    .await
+    .expect("the raw object keeps its target row");
+    let BlobCleanupWork::ReconcileWrite {
+        location,
+        owner: WriteOwner::Upload { upload_id },
+    } = BlobCleanupWork::from_bytes(row.as_ref()).unwrap()
+    else {
+        panic!("the target row must leave the raw object to its upload")
+    };
+    assert!(location.same_object(&target));
+    assert_eq!(upload_id, upload.upload_id);
 }

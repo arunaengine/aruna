@@ -33,6 +33,7 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::format::Compression;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::{
@@ -685,6 +686,7 @@ async fn seed_bucket(state: &Arc<ServerState>, bucket: &str, group_id: Ulid, own
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 1,
+        compression: Compression::Off,
     };
     write_row(
         &state.get_ctx().storage_handle,

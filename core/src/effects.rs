@@ -66,8 +66,6 @@ pub enum BlobEffect {
         /// Pinned at CreateMultipartUpload and carried by every part.
         resolved: ResolvedBackend,
         created_by: UserId,
-        compressed: bool,
-        encrypted: bool,
         /// Streams the part into this provider upload instead of a blob of its own.
         backend_upload: Option<Box<BackendUpload>>,
         /// Declared part size; a provider upload needs it before the first byte.

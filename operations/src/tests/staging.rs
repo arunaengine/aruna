@@ -10,6 +10,7 @@ use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
+use aruna_core::structs::storage::format::Compression;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
 use std::collections::HashMap;
@@ -97,6 +98,7 @@ pub(crate) async fn create_test_bucket(
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     drive(
         CreateBucketOperation::new(bucket.to_string(), info.clone()),

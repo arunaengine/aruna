@@ -5,6 +5,8 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::EncodingClass;
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -379,6 +381,7 @@ async fn seed_holder(
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     let hash: [u8; 32] = location
         .get_blake3()
@@ -388,6 +391,7 @@ async fn seed_holder(
     let version = BlobVersion::materialized(
         hash,
         BackendRef::node_default(),
+        EncodingClass::Raw,
         SystemTime::UNIX_EPOCH,
         owner,
         None,
@@ -428,7 +432,7 @@ async fn seed_holder(
         ),
         (
             BLOB_LOCATIONS_KEYSPACE.to_string(),
-            BlobLocationKey::new(hash, location.backend.clone())
+            BlobLocationKey::new(hash, EncodingClass::Raw, location.backend.clone())
                 .to_bytes()
                 .into(),
             location.to_bytes()?.into(),

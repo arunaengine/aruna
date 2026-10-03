@@ -650,6 +650,7 @@ mod tests {
     use aruna_core::structs::execution::job::RoCrateMediaType;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_storage::FjallStorage;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -671,8 +672,7 @@ mod tests {
             storage_bucket: "storage".to_string(),
             backend_path: format!("_jobs/{upload_id}/input"),
             ulid: Ulid::from_bytes([3u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: owner,
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,
@@ -1039,8 +1039,7 @@ mod tests {
                 storage_bucket: "storage".to_string(),
                 backend_path: "_jobs/input".to_string(),
                 ulid: Ulid::from_bytes([4u8; 16]),
-                compressed: false,
-                encrypted: false,
+                format: StoredFormat::default(),
                 created_by: owner,
                 created_at: SystemTime::UNIX_EPOCH,
                 staging: false,
@@ -1082,8 +1081,7 @@ mod tests {
                 storage_bucket: "storage".to_string(),
                 backend_path: "_jobs/input".to_string(),
                 ulid: Ulid::from_bytes([4u8; 16]),
-                compressed: false,
-                encrypted: false,
+                format: StoredFormat::default(),
                 created_by: owner,
                 created_at: SystemTime::UNIX_EPOCH,
                 staging: false,

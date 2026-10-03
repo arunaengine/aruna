@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::format::StoredFormat;
 
 use crate::jobs::executor::ProgressReporter;
 use crate::sync::incoming::initialize_incoming_fixture;
@@ -181,11 +184,13 @@ async fn seed_bao(
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
     let version = BlobVersion::materialized(
         hash,
         BackendRef::node_default(),
+        EncodingClass::Raw,
         std::time::SystemTime::UNIX_EPOCH,
         owner,
         None,
@@ -224,7 +229,7 @@ async fn seed_bao(
         ),
         (
             BLOB_LOCATIONS_KEYSPACE.to_string(),
-            BlobLocationKey::new(hash, location.backend.clone())
+            BlobLocationKey::new(hash, EncodingClass::Raw, location.backend.clone())
                 .to_bytes()
                 .into(),
             location.to_bytes().unwrap().into(),
@@ -1199,8 +1204,7 @@ fn caps_repeated_hashes() {
         storage_bucket: "bucket".to_string(),
         backend_path: "object".to_string(),
         ulid: Ulid::from_bytes([27; 16]),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: UserId::nil(realm_id),
         created_at: std::time::SystemTime::UNIX_EPOCH,
         staging: false,

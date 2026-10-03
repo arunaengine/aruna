@@ -321,6 +321,7 @@ mod tests {
         RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
     };
     use aruna_core::structs::storage::blob::{BucketInfo, HashIndex};
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
@@ -387,6 +388,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         };
         let alias = HashIndex::new(hash, version_id, realm_id, group_id, node_id, BUCKET, KEY);
         let writes = vec![

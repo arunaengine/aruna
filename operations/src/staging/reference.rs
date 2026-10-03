@@ -589,6 +589,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BlobHeadKey, BlobVersion, CurrentVersionPointer, HashIndex,
     };
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
     use aruna_core::structs::storage::usage::{UsageCounters, global_group_key, usage_group_key};
@@ -846,6 +847,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         };
         let recreated = BucketInfo {
             created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),

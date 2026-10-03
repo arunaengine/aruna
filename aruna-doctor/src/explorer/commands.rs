@@ -352,6 +352,7 @@ mod tests {
         BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
     };
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use aruna_core::structs::storage::format::StoredFormat;
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase};
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -366,8 +367,7 @@ mod tests {
             storage_bucket: "blob-bucket".to_string(),
             backend_path: "path/blob.bin".to_string(),
             ulid: Ulid::from_bytes([5_u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: aruna_core::UserId::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,

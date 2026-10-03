@@ -762,6 +762,7 @@ mod tests {
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_storage::FjallStorage;
     use serde::Serialize;
     use std::collections::HashMap;
@@ -782,8 +783,7 @@ mod tests {
                 storage_bucket: "storage".to_string(),
                 backend_path: format!("_jobs/{upload_id}/input_01"),
                 ulid: Ulid::from_bytes([2u8; 16]),
-                compressed: false,
-                encrypted: false,
+                format: StoredFormat::default(),
                 created_by: UserId::nil(RealmId::from_bytes([1u8; 32])),
                 created_at: UNIX_EPOCH,
                 staging: false,

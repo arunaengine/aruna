@@ -35,6 +35,9 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, VersionKey, bucket_permission_path,
 };
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::request_authorization::authorize;
@@ -844,8 +847,7 @@ fn response_location(created_by: UserId) -> BackendLocation {
         storage_bucket: "objects".to_string(),
         backend_path: "bucket/object".to_string(),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by,
         created_at: UNIX_EPOCH,
         staging: false,
@@ -1041,6 +1043,7 @@ async fn write_materialized_version(
     let version = BlobVersion::materialized(
         hash,
         BackendRef::node_default(),
+        EncodingClass::Raw,
         created_at,
         created_by,
         None,
@@ -1064,8 +1067,7 @@ async fn write_materialized_version(
         storage_bucket: "objects".to_string(),
         backend_path: format!("path/{key}"),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by,
         created_at,
         staging: false,
@@ -1076,7 +1078,7 @@ async fn write_materialized_version(
     let _ = storage
         .send_storage_effect(StorageEffect::Write {
             key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: BlobLocationKey::new(hash, location.backend.clone())
+            key: BlobLocationKey::new(hash, EncodingClass::Raw, location.backend.clone())
                 .to_bytes()
                 .into(),
             value: location.to_bytes().unwrap().into(),
@@ -1913,6 +1915,7 @@ fn test_bucket_info(group_id: Ulid, created_by: UserId) -> BucketInfo {
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     }
 }
 

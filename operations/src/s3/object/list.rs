@@ -555,11 +555,14 @@ impl ListBucketOperation {
                             }));
                         }
                         BlobVersionState::Materialized {
-                            blob_hash, backend, ..
+                            blob_hash,
+                            backend,
+                            encoding,
+                            ..
                         } => {
                             self.location_reads.push((
                                 BLOB_LOCATIONS_KEYSPACE.to_string(),
-                                BlobLocationKey::new(blob_hash, backend.clone())
+                                BlobLocationKey::new(blob_hash, encoding, backend.clone())
                                     .to_bytes()
                                     .into(),
                             ));

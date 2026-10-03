@@ -413,7 +413,7 @@ impl ReclaimBlobOperation {
     }
 
     fn location_key(&self) -> BlobLocationKey {
-        BlobLocationKey::new(self.key.blake3, self.key.backend.clone())
+        BlobLocationKey::new(self.key.blake3, self.key.encoding, self.key.backend.clone())
     }
 
     fn fail(&mut self, error: ReclaimBlobError) -> Effects {
@@ -630,7 +630,7 @@ impl ReclaimBlobOperation {
             return self.fail(ReclaimBlobError::Failed);
         };
         self.output = Some(Ok(ReclaimVerdict::Freed {
-            bytes: location.blob_size,
+            bytes: location.stored_size(),
         }));
         self.state = ReclaimState::DeleteRows;
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
@@ -691,7 +691,7 @@ impl ReclaimBlobOperation {
             self.key.blake3,
             self.key.backend.clone(),
             -1,
-            -i128::from(location.blob_size),
+            -i128::from(location.stored_size()),
         ));
         if update.is_noop() {
             return self.commit();
@@ -821,6 +821,8 @@ mod tests {
     use super::*;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::format::EncodingClass;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key, usage_hash_key};
     use aruna_core::types::Value;
     use std::collections::HashMap;
@@ -852,8 +854,7 @@ mod tests {
             storage_bucket: "storage".to_string(),
             backend_path: "bucket/key_01".to_string(),
             ulid: Ulid::from_bytes([5u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: Default::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,
@@ -867,7 +868,7 @@ mod tests {
     }
 
     fn candidate_key() -> ReclaimCandidateKey {
-        ReclaimCandidateKey::new(BackendRef::node_default(), HASH)
+        ReclaimCandidateKey::new(BackendRef::node_default(), EncodingClass::Raw, HASH)
     }
 
     async fn write(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
@@ -906,7 +907,7 @@ mod tests {
         write(
             context,
             BLOB_LOCATIONS_KEYSPACE,
-            BlobLocationKey::new(HASH, BackendRef::node_default()).to_bytes(),
+            BlobLocationKey::new(HASH, EncodingClass::Raw, BackendRef::node_default()).to_bytes(),
             location(size).to_bytes().unwrap(),
         )
         .await;
@@ -982,6 +983,7 @@ mod tests {
             BlobVersion::materialized(
                 HASH,
                 backend,
+                EncodingClass::Raw,
                 SystemTime::UNIX_EPOCH,
                 Default::default(),
                 None,
@@ -1007,7 +1009,8 @@ mod tests {
             read(
                 &context,
                 BLOB_LOCATIONS_KEYSPACE,
-                BlobLocationKey::new(HASH, BackendRef::node_default()).to_bytes()
+                BlobLocationKey::new(HASH, EncodingClass::Raw, BackendRef::node_default())
+                    .to_bytes()
             )
             .await
             .is_none()
@@ -1056,7 +1059,8 @@ mod tests {
             read(
                 &context,
                 BLOB_LOCATIONS_KEYSPACE,
-                BlobLocationKey::new(HASH, BackendRef::node_default()).to_bytes()
+                BlobLocationKey::new(HASH, EncodingClass::Raw, BackendRef::node_default())
+                    .to_bytes()
             )
             .await
             .is_some()
@@ -1103,7 +1107,8 @@ mod tests {
             read(
                 &context,
                 BLOB_LOCATIONS_KEYSPACE,
-                BlobLocationKey::new(HASH, BackendRef::node_default()).to_bytes(),
+                BlobLocationKey::new(HASH, EncodingClass::Raw, BackendRef::node_default())
+                    .to_bytes(),
             )
             .await
             .is_some()
@@ -1146,7 +1151,8 @@ mod tests {
             read(
                 &context,
                 BLOB_LOCATIONS_KEYSPACE,
-                BlobLocationKey::new(HASH, BackendRef::node_default()).to_bytes(),
+                BlobLocationKey::new(HASH, EncodingClass::Raw, BackendRef::node_default())
+                    .to_bytes(),
             )
             .await
             .is_some()
@@ -1191,7 +1197,8 @@ mod tests {
             read(
                 &context,
                 BLOB_LOCATIONS_KEYSPACE,
-                BlobLocationKey::new(HASH, BackendRef::node_default()).to_bytes(),
+                BlobLocationKey::new(HASH, EncodingClass::Raw, BackendRef::node_default())
+                    .to_bytes(),
             )
             .await
             .is_some()
@@ -1241,7 +1248,8 @@ mod tests {
                 read(
                     &context,
                     BLOB_LOCATIONS_KEYSPACE,
-                    BlobLocationKey::new(HASH, BackendRef::node_default()).to_bytes(),
+                    BlobLocationKey::new(HASH, EncodingClass::Raw, BackendRef::node_default())
+                        .to_bytes(),
                 )
                 .await
                 .is_some()
@@ -1346,7 +1354,8 @@ mod tests {
             read(
                 &context,
                 BLOB_LOCATIONS_KEYSPACE,
-                BlobLocationKey::new(HASH, BackendRef::node_default()).to_bytes(),
+                BlobLocationKey::new(HASH, EncodingClass::Raw, BackendRef::node_default())
+                    .to_bytes(),
             )
             .await
             .is_some()
@@ -1491,7 +1500,8 @@ mod tests {
             write(
                 &context,
                 BLOB_RECLAIM_KEYSPACE,
-                ReclaimCandidateKey::new(BackendRef::node_default(), blake3).to_bytes(),
+                ReclaimCandidateKey::new(BackendRef::node_default(), EncodingClass::Raw, blake3)
+                    .to_bytes(),
                 ReclaimCandidate {
                     enqueued_at: SystemTime::UNIX_EPOCH,
                 }
@@ -1525,6 +1535,7 @@ mod tests {
         let backend_id = Ulid::from_bytes([8u8; 16]);
         let mut operation = reclaim_op(ReclaimCandidateKey::new(
             BackendRef::Group(backend_id),
+            EncodingClass::Raw,
             HASH,
         ));
         operation.start();
@@ -1564,7 +1575,7 @@ mod tests {
         let enqueued_at = SystemTime::UNIX_EPOCH;
         let sweep_time = enqueued_at + Duration::from_secs(60);
         let mut operation = ReclaimBlobOperation::new(
-            ReclaimCandidateKey::new(BackendRef::Group(backend_id), HASH),
+            ReclaimCandidateKey::new(BackendRef::Group(backend_id), EncodingClass::Raw, HASH),
             enqueued_at,
             sweep_time,
         );
@@ -1626,7 +1637,12 @@ mod tests {
         write(
             &context,
             BLOB_RECLAIM_KEYSPACE,
-            ReclaimCandidateKey::new(BackendRef::Node("cold".to_string()), [9u8; 32]).to_bytes(),
+            ReclaimCandidateKey::new(
+                BackendRef::Node("cold".to_string()),
+                EncodingClass::Raw,
+                [9u8; 32],
+            )
+            .to_bytes(),
             ReclaimCandidate {
                 enqueued_at: SystemTime::UNIX_EPOCH,
             }

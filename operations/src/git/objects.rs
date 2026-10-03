@@ -22,6 +22,7 @@ use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::dataset_location::default_bucket;
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use bytes::Bytes;
@@ -67,6 +68,7 @@ pub async fn bucket(
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     match drive(CreateBucketOperation::new(name.clone(), info), context).await {
         Ok(_) | Err(CreateBucketError::BucketAlreadyExists) => {}

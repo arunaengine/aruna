@@ -22,6 +22,9 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BucketInfo, VersionKey,
 };
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::{NodeId, UserId};
 use axum::Extension;
@@ -46,8 +49,7 @@ fn materialized_location(blake3: [u8; 32]) -> BackendLocation {
         storage_bucket: "objects".to_string(),
         backend_path: "blob.bin".to_string(),
         ulid: Ulid::from_bytes([2u8; 16]),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: UserId::nil(RealmId([3u8; 32])),
         created_at: SystemTime::UNIX_EPOCH,
         staging: false,
@@ -153,6 +155,7 @@ async fn seed_version(state: &ServerState) -> (AuthContext, AuthContext, Version
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     write_fixture(
         state,
@@ -170,6 +173,7 @@ async fn seed_version(state: &ServerState) -> (AuthContext, AuthContext, Version
         BlobVersion::materialized(
             hash,
             BackendRef::node_default(),
+            EncodingClass::Raw,
             SystemTime::UNIX_EPOCH,
             owner,
             None,
@@ -181,7 +185,7 @@ async fn seed_version(state: &ServerState) -> (AuthContext, AuthContext, Version
     write_fixture(
         state,
         BLOB_LOCATIONS_KEYSPACE,
-        BlobLocationKey::new(hash, location.backend.clone()).to_bytes(),
+        BlobLocationKey::new(hash, EncodingClass::Raw, location.backend.clone()).to_bytes(),
         location.to_bytes().expect("location serializes"),
     )
     .await;

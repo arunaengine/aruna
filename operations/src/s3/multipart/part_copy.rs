@@ -156,8 +156,6 @@ pub async fn upload_part_copy(
             content_length,
             body: Some(source.blob),
             created_by: input.user_id,
-            compressed: false,
-            encrypted: false,
             expected_checksums: Vec::new(),
         }),
         context,
@@ -328,6 +326,7 @@ mod test {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::multipart::{
         MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
     };
@@ -742,6 +741,7 @@ mod test {
             storage_routing: Vec::new(),
             placement_policies: policies,
             placement_policy_generation: 1,
+            compression: Compression::Off,
         };
         let _ = context
             .storage_handle

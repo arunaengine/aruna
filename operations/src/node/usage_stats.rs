@@ -84,8 +84,8 @@ impl StoredDelta {
         }
     }
 
-    /// Credit for a copy a write newly created. An adopted copy adds nothing,
-    /// so its update never joins the counter rows to the transaction.
+    /// Credit for a copy a write newly created, in stored bytes. An adopted copy
+    /// adds nothing, so its update never joins the counter rows to the transaction.
     pub fn for_location(location: &BackendLocation, new_blob: bool) -> Option<Self> {
         let blake3: [u8; 32] = location.get_blake3()?.try_into().ok()?;
         Some(Self::new(
@@ -93,7 +93,7 @@ impl StoredDelta {
             location.backend.clone(),
             i128::from(new_blob),
             if new_blob {
-                i128::from(location.blob_size)
+                i128::from(location.stored_size())
             } else {
                 0
             },
@@ -715,7 +715,7 @@ impl RebuildStatsOperation {
                     }
                     let delta = UsageCounters {
                         stored_blobs: 1,
-                        stored_bytes: location.blob_size,
+                        stored_bytes: location.stored_size(),
                         ..Default::default()
                     };
                     let hash = BlobLocationKey::from_bytes(key.as_ref())?.blake3_hash;
@@ -723,7 +723,7 @@ impl RebuildStatsOperation {
                     self.global_shards[shard_for_hash(&hash)].add(&delta)?;
                     self.backend_entry(&location.backend, shard_for_hash(&hash))
                         .add(&UsageCounters {
-                            stored_bytes: location.blob_size,
+                            stored_bytes: location.stored_size(),
                             ..Default::default()
                         })?;
                     // Copies of one hash share a size, so the hash prefix keys the map.
@@ -1759,6 +1759,9 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer,
     };
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::format::EncodingClass;
+    use aruna_core::structs::storage::format::{FrameLayout, StoredFormat, StoredLayout};
     use aruna_core::structs::storage::usage::global_shard_keys;
     use std::time::SystemTime;
     use tempfile::tempdir;
@@ -1783,8 +1786,7 @@ mod tests {
             storage_bucket: "bucket".to_string(),
             backend_path: "path".to_string(),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_at: SystemTime::now(),
             created_by: Default::default(),
             staging,
@@ -1798,6 +1800,25 @@ mod tests {
         let mut blake3 = [0u8; 32];
         blake3[0] = shard as u8;
         blake3
+    }
+
+    #[test]
+    fn credit_counts_stored() {
+        // Backend capacity counts what the backend holds, not the original size.
+        let mut framed = location(100, false, false);
+        framed.hashes.insert("blake3".to_string(), vec![2u8; 32]);
+        framed.format.layout = StoredLayout::Frames(Box::new(FrameLayout {
+            level: 3,
+            frames: 1,
+            stored_size: 40,
+            index_hash: [0u8; 32],
+        }));
+
+        let delta = StoredDelta::for_location(&framed, true).unwrap();
+
+        assert_eq!((delta.blobs, delta.bytes), (1, 40));
+        let adopted = StoredDelta::for_location(&framed, false).unwrap();
+        assert_eq!((adopted.blobs, adopted.bytes), (0, 0));
     }
 
     #[test]
@@ -2024,6 +2045,7 @@ mod tests {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 },
             ),
             &ctx,
@@ -2120,6 +2142,7 @@ mod tests {
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             };
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::Write {
@@ -2142,7 +2165,7 @@ mod tests {
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                    key: BlobLocationKey::new(hash, loc.backend.clone())
+                    key: BlobLocationKey::new(hash, EncodingClass::Raw, loc.backend.clone())
                         .to_bytes()
                         .into(),
                     value: loc.to_bytes().unwrap().into(),
@@ -2186,13 +2209,27 @@ mod tests {
         let alpha_live_head = write_version(
             "alpha",
             "live.txt",
-            BlobVersion::materialized(hashes[0], BackendRef::node_default(), now, user, None),
+            BlobVersion::materialized(
+                hashes[0],
+                BackendRef::node_default(),
+                EncodingClass::Raw,
+                now,
+                user,
+                None,
+            ),
         )
         .await;
         write_version(
             "alpha",
             "gone.txt",
-            BlobVersion::materialized(hashes[1], BackendRef::node_default(), now, user, None),
+            BlobVersion::materialized(
+                hashes[1],
+                BackendRef::node_default(),
+                EncodingClass::Raw,
+                now,
+                user,
+                None,
+            ),
         )
         .await;
         let alpha_gone_head =
@@ -2200,13 +2237,27 @@ mod tests {
         write_version(
             "beta",
             "shared.bin",
-            BlobVersion::materialized(hashes[1], BackendRef::node_default(), now, user, None),
+            BlobVersion::materialized(
+                hashes[1],
+                BackendRef::node_default(),
+                EncodingClass::Raw,
+                now,
+                user,
+                None,
+            ),
         )
         .await;
         let beta_head = write_version(
             "beta",
             "shared.bin",
-            BlobVersion::materialized(hashes[1], BackendRef::node_default(), now, user, None),
+            BlobVersion::materialized(
+                hashes[1],
+                BackendRef::node_default(),
+                EncodingClass::Raw,
+                now,
+                user,
+                None,
+            ),
         )
         .await;
         let alpha_ref_head = write_version(
@@ -2432,6 +2483,7 @@ mod tests {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 },
             ),
             &ctx,

@@ -125,6 +125,7 @@ fn cleanup_error(errors: [Option<JobError>; 2]) -> Option<JobError> {
 
 #[cfg(test)]
 mod tests {
+    use aruna_core::structs::storage::format::Compression;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -395,6 +396,7 @@ mod tests {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 },
             ),
             &ctx.driver,

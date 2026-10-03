@@ -311,6 +311,7 @@ mod pure_tests {
         BackendLocation, BackendRef, ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
         VersionKey,
     };
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::types::Key;
     use std::collections::HashMap;
     use std::time::UNIX_EPOCH;
@@ -354,8 +355,7 @@ mod pure_tests {
                 storage_bucket: "aruna".to_string(),
                 backend_path: "objects/one".to_string(),
                 ulid: Ulid::from_bytes([5u8; 16]),
-                compressed: false,
-                encrypted: false,
+                format: StoredFormat::default(),
                 created_by: Default::default(),
                 created_at: UNIX_EPOCH,
                 staging: false,

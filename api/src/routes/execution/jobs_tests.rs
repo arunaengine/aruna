@@ -23,6 +23,7 @@ use aruna_core::structs::identity::auth::{NodeCapabilities, PathRestriction, Per
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::command::{
@@ -405,8 +406,7 @@ fn export_job(job_id: JobId, owner: UserId, expires_at_ms: u64) -> JobRecord {
             storage_bucket: "hidden".to_string(),
             backend_path: format!("_jobs/{job_id}/artifact.zip"),
             ulid: Ulid::from_bytes([8u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: owner,
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,

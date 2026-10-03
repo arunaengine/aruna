@@ -484,6 +484,9 @@ fn storage_event_error(event: Event) -> SearchObjectsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::format::EncodingClass;
+    use aruna_core::structs::storage::format::StoredFormat;
 
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, UNIX_EPOCH};
@@ -625,6 +628,7 @@ mod tests {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 }
                 .to_bytes()
                 .unwrap(),
@@ -667,6 +671,7 @@ mod tests {
             BlobVersion::materialized(
                 blob_hash,
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 created_at,
                 fixture.owner,
                 None,
@@ -682,8 +687,7 @@ mod tests {
             storage_bucket: bucket.to_string(),
             backend_path: key.to_string(),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: fixture.owner,
             created_at,
             staging: false,
@@ -694,7 +698,8 @@ mod tests {
         write_value(
             &fixture.context,
             BLOB_LOCATIONS_KEYSPACE,
-            BlobLocationKey::new(blob_hash, BackendRef::node_default()).to_bytes(),
+            BlobLocationKey::new(blob_hash, EncodingClass::Raw, BackendRef::node_default())
+                .to_bytes(),
             location.to_bytes().unwrap(),
         )
         .await;

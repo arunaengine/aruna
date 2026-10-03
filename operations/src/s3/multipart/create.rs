@@ -247,6 +247,11 @@ impl CreateMultipartOperation {
             Err(error) => return self.emit_error(error.into()),
         };
         self.stored_policies = GatedBucket::observe(bucket.as_ref()).policies;
+        let compression = bucket.as_ref().map(|bucket| bucket.compression);
+        self.resolved = self
+            .resolved
+            .take()
+            .map(|resolved| resolved.with_compression(compression.unwrap_or_default()));
         let group_id = bucket
             .as_ref()
             .map_or(self.input.group_id, |bucket| bucket.group_id);
@@ -493,6 +498,7 @@ mod pure_tests {
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::structs::storage::multipart::{BackendUpload, MultipartUpload};
     use aruna_core::structs::storage::routing::{
@@ -568,6 +574,35 @@ mod pure_tests {
         let record = MultipartUpload::from_bytes(value.as_ref()).unwrap();
         assert_eq!(record.backend, BackendRef::Node("tape".to_string()));
         assert_eq!(record.storage_class.as_deref(), Some("archive"));
+    }
+
+    #[test]
+    fn passes_bucket_compression() {
+        // The blob side opens no provider upload for a compressed bucket, so the parts are
+        // composed into frames.
+        let mut operation = CreateMultipartOperation::new(input(snapshot()));
+        operation.start();
+        let bucket = aruna_core::structs::storage::blob::BucketInfo {
+            group_id: Ulid::from_parts(1, 1),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: aruna_core::UserId::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Zstd { level: 3 },
+        };
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(bucket.to_bytes().unwrap().into()),
+        }));
+
+        let effects = operation.step(fence_clear());
+
+        let [Effect::Blob(BlobEffect::OpenUpload { resolved, .. })] = effects.as_slice() else {
+            panic!("expected the upload to open, got {effects:?}")
+        };
+        assert_eq!(resolved.compression, Compression::Zstd { level: 3 });
     }
 
     #[test]
@@ -660,8 +695,7 @@ mod pure_tests {
                 storage_bucket: "tenant".to_string(),
                 backend_path: "bucket/key".to_string(),
                 ulid: Ulid::from_bytes([6u8; 16]),
-                compressed: false,
-                encrypted: false,
+                format: aruna_core::structs::storage::format::StoredFormat::default(),
                 created_by: aruna_core::UserId::default(),
                 created_at: std::time::SystemTime::UNIX_EPOCH,
                 staging: false,

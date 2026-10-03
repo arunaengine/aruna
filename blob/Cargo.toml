@@ -48,6 +48,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 ulid = { workspace = true }
+zstd = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 rustix = { workspace = true }

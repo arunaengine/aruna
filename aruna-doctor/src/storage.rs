@@ -515,6 +515,7 @@ mod tests {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
+    use aruna_core::structs::storage::format::Compression;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive, routing_snapshot};
     use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
@@ -695,6 +696,7 @@ mod tests {
                         storage_routing: Vec::new(),
                         placement_policies: Vec::new(),
                         placement_policy_generation: 0,
+                        compression: Compression::Off,
                     },
                 ),
                 context.as_ref(),

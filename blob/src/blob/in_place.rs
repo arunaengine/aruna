@@ -18,6 +18,7 @@ use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, ResolvedBackend, WriteOwner,
 };
+use aruna_core::structs::storage::format::{Compression, StoredFormat};
 use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};
 use bytes::Bytes;
 use byteview::ByteView;
@@ -141,8 +142,7 @@ impl BlobHandler {
             storage_bucket: String::new(),
             backend_path,
             ulid,
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by,
             created_at: SystemTime::now(),
             staging: false,
@@ -150,7 +150,13 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
-        // Only S3 backends have a provider upload; the others keep one blob per part.
+        // Only S3 backends have a provider upload; the others keep one blob per part. A provider
+        // upload assembles the raw parts, so a compressed bucket composes frames from blobs.
+        if resolved.compression != Compression::Off {
+            return BlobEvent::UploadOpened {
+                backend_upload: None,
+            };
+        }
         match self.native_for(&template) {
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -232,8 +238,6 @@ impl BlobHandler {
         part: MultipartPartKey,
         resolved: ResolvedBackend,
         created_by: UserId,
-        compressed: bool,
-        encrypted: bool,
         size: Option<u64>,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
@@ -251,12 +255,7 @@ impl BlobHandler {
                 ))
                 .await
             }
-            Ok(None) => {
-                Box::pin(
-                    self.write_blob_part(part, resolved, created_by, compressed, encrypted, blob),
-                )
-                .await
-            }
+            Ok(None) => Box::pin(self.write_blob_part(part, resolved, created_by, blob)).await,
             Err(error) => BlobEvent::Error(error),
         }
     }

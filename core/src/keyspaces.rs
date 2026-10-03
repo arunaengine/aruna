@@ -94,6 +94,10 @@ pub const CHAT_TURN_KEYSPACE: &str = "assistant_chat_turns";
 pub const BLOB_LOCATIONS_KEYSPACE: &str = "blob_locations";
 pub const BLOB_CLEANUP_KEYSPACE: &str = "blob_pending_cleanups";
 pub const BLOB_RECLAIM_KEYSPACE: &str = "blob_reclaim_candidates";
+/// Node-local progress of re-encoding a bucket's copies after a compression change.
+pub const COMPRESSION_MIGRATION_KEYSPACE: &str = "compression_migrations";
+/// Buckets whose compression migration is unfinished; the worker scans only these.
+pub const COMPRESSION_QUEUE_KEYSPACE: &str = "compression_migration_queue";
 pub const HIDDEN_RESERVATION_KEYSPACE: &str = "blob_hidden_reservations";
 /// Durable evidence of a copy that failed hash/bao verification (§8.2), keyed
 /// per (hash, backend) so re-hitting the same corrupt copy overwrites its row.
@@ -349,6 +353,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BLOB_LOCATIONS_KEYSPACE,
     BLOB_CLEANUP_KEYSPACE,
     BLOB_RECLAIM_KEYSPACE,
+    COMPRESSION_MIGRATION_KEYSPACE,
+    COMPRESSION_QUEUE_KEYSPACE,
     HIDDEN_RESERVATION_KEYSPACE,
     BLOB_QUARANTINE_KEYSPACE,
     MANAGED_COPY_KEYSPACE,

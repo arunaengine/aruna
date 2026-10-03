@@ -7,9 +7,7 @@ use super::backend::rebuild_backend_path;
 use super::control_plane::{
     parse_replication_init, read_replication_message, send_replication_message, validate_init_ack,
 };
-use crate::bao_tree::{
-    BaoReadWriter, OpenDalReader, OpenDalWriter, RecvStreamWrapper, SendStreamWrapper,
-};
+use crate::bao_tree::{BaoReadWriter, OpenDalWriter, RecvStreamWrapper, SendStreamWrapper};
 use crate::error::BlobLibError;
 use crate::messages::{MessageType, ReplicationMessage};
 use aruna_core::effects::StorageEffect;
@@ -21,6 +19,7 @@ use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobQuarantineRecord, ResolvedBackend,
 };
+use aruna_core::structs::storage::format::{StoredFormat, StoredLayout};
 use aruna_core::time::unix_timestamp_millis;
 use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
@@ -82,26 +81,10 @@ impl BlobHandler {
                 "bao read location hash mismatch".to_string(),
             ));
         }
-        let operator = match self.operator_from_location(&location) {
-            Ok(operator) => operator,
-            Err(error) => return BlobEvent::Error(error),
-        };
-        let storage_path = match location.get_storage_path() {
-            Ok(path) => path,
-            Err(error) => return BlobEvent::Error(error),
-        };
-        let mut reader = match OpenDalReader::new(
-            &operator,
-            &storage_path,
-            location.blob_size,
-            self.transfer_idle_timeout(),
-        )
-        .await
-        {
+        // Framed copies are decoded, so the peer always receives original bytes.
+        let mut reader = match self.slice_reader(&location).await {
             Ok(reader) => reader,
-            Err(error) => {
-                return BlobEvent::Error(BlobError::OperatorCreationFailed(error.to_string()));
-            }
+            Err(error) => return BlobEvent::Error(error),
         };
         let mut outboard =
             match PreOrderOutboard::<BytesMut>::create(&mut reader, BAO_BLOCK_SIZE).await {
@@ -242,28 +225,9 @@ impl BlobHandler {
         location: BackendLocation,
         keep_alive: bool,
     ) -> BlobEvent {
-        let operator = match self.operator_from_location(&location) {
-            Ok(op) => op,
-            Err(err) => return BlobEvent::Error(err),
-        };
-
-        let storage_path = match location.get_storage_path() {
-            Ok(storage_path) => storage_path,
-            Err(e) => return BlobEvent::Error(e),
-        };
-
-        let mut reader = match OpenDalReader::new(
-            &operator,
-            &storage_path,
-            location.blob_size,
-            self.transfer_idle_timeout(),
-        )
-        .await
-        {
+        let mut reader = match self.slice_reader(&location).await {
             Ok(reader) => reader,
-            Err(err) => {
-                return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
-            }
+            Err(err) => return BlobEvent::Error(err),
         };
         let mut outboard =
             match PreOrderOutboard::<BytesMut>::create(&mut reader, BAO_BLOCK_SIZE).await {
@@ -395,6 +359,8 @@ impl BlobHandler {
             Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
         };
         location.ulid = ulid;
+        // The sender's format describes its own copy; this node stores with its own setting.
+        location.format = StoredFormat::default();
         let Some(mut reservation) = self.hold_reservation(location.ulid) else {
             return BlobEvent::Error(BlobError::ReplicationFailed(
                 "too many active blob reservations".to_string(),
@@ -438,7 +404,7 @@ impl BlobHandler {
         )
         .await
         {
-            Ok(writer) => writer,
+            Ok(writer) => writer.encoded(resolved.compression),
             Err(BlobLibError::IoError(error)) if error.kind() == std::io::ErrorKind::TimedOut => {
                 reservation.retain();
                 return BlobEvent::Error(BlobError::WriteCleanup {
@@ -480,7 +446,11 @@ impl BlobHandler {
             Ok(()) => {
                 let hashes = writer.hasher.to_map();
                 let actual_blake3 = writer.hasher.finalize().blake3;
-                match writer.finalize().await {
+                match writer.finalize().await.map(|layout| {
+                    if let Some(layout) = layout {
+                        location.format.layout = StoredLayout::Frames(Box::new(layout));
+                    }
+                }) {
                     Err(error) => {
                         reservation.retain();
                         BlobEvent::Error(BlobError::WriteCleanup {

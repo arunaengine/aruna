@@ -2636,6 +2636,8 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BackendRef, BlobVersion, BucketInfo, VersionKey, object_permission_path,
     };
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::replication::{ArunaArn, ReplicationItemError};
     use aruna_core::structs::{ReferenceHandling, SyncStatusSnapshot, sync_relationship_key};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -2757,6 +2759,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         };
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -2944,6 +2947,7 @@ mod tests {
         let version = BlobVersion::materialized(
             [7u8; 32],
             BackendRef::node_default(),
+            EncodingClass::Raw,
             SystemTime::UNIX_EPOCH,
             user(),
             None,

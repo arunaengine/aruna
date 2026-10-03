@@ -340,6 +340,9 @@ mod tests {
         BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::format::EncodingClass;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::node_info::NodeUrls;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -710,8 +713,7 @@ mod tests {
             storage_bucket: bucket.to_string(),
             backend_path: key.to_string(),
             ulid: version,
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: user,
             created_at: std::time::SystemTime::UNIX_EPOCH,
             staging: false,
@@ -727,6 +729,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         };
         for (key_space, row_key, value) in [
             (
@@ -745,6 +748,7 @@ mod tests {
                 BlobVersion::materialized(
                     hash,
                     BackendRef::node_default(),
+                    EncodingClass::Raw,
                     std::time::SystemTime::UNIX_EPOCH,
                     user,
                     None,
@@ -754,7 +758,8 @@ mod tests {
             ),
             (
                 BLOB_LOCATIONS_KEYSPACE,
-                BlobLocationKey::new(hash, BackendRef::node_default()).to_bytes(),
+                BlobLocationKey::new(hash, EncodingClass::Raw, BackendRef::node_default())
+                    .to_bytes(),
                 location.to_bytes().unwrap(),
             ),
         ] {

@@ -266,17 +266,21 @@ impl GetAttributesOperation {
 
         match version.state {
             BlobVersionState::Materialized {
-                blob_hash, backend, ..
+                blob_hash,
+                backend,
+                encoding,
+                ..
             } => {
+                let location_key = BlobLocationKey::new(blob_hash, encoding, backend);
                 self.source_metadata = None;
                 self.version_created_at = Some(version.created_at);
                 // Size and checksums are governed metadata: a copy this node may
                 // not serve must not answer for them either.
                 self.source_policies = version.placement_policies.clone();
                 if self.source_policies.is_empty() {
-                    return self.read_blob_location(BlobLocationKey::new(blob_hash, backend));
+                    return self.read_blob_location(location_key);
                 }
-                self.check_managed_copy(version_id, blob_hash, backend)
+                self.check_managed_copy(version_id, location_key)
             }
             BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
                 GetAttributesError::DeleteMarker
@@ -299,18 +303,12 @@ impl GetAttributesOperation {
         smallvec![blob_location_read(&key, self.txn_id)]
     }
 
-    fn check_managed_copy(
-        &mut self,
-        version_id: Ulid,
-        blob_hash: [u8; 32],
-        backend: aruna_core::structs::storage::blob::BackendRef,
-    ) -> Effects {
+    fn check_managed_copy(&mut self, version_id: Ulid, location_key: BlobLocationKey) -> Effects {
         let check = match begin_copy_check(
             &self.input.bucket,
             &self.input.key,
             version_id,
-            blob_hash,
-            backend,
+            location_key,
             self.txn_id,
         ) {
             Ok(check) => check,
@@ -528,6 +526,8 @@ mod tests {
     use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5, HASH_SHA256};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::format::EncodingClass;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -556,8 +556,7 @@ mod tests {
             storage_bucket: "mybucket".to_string(),
             backend_path: "hello.txt".to_string(),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_at: SystemTime::UNIX_EPOCH,
             created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
             staging: false,
@@ -606,6 +605,7 @@ mod tests {
             BlobVersion::materialized(
                 location.get_blake3().unwrap().try_into().unwrap(),
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 location.created_at,
                 location.created_by,
                 None,
@@ -617,9 +617,13 @@ mod tests {
         write(
             storage_handle,
             BLOB_LOCATIONS_KEYSPACE,
-            BlobLocationKey::from_blake3(location.get_blake3().unwrap(), location.backend.clone())
-                .unwrap()
-                .to_bytes(),
+            BlobLocationKey::from_blake3(
+                location.get_blake3().unwrap(),
+                EncodingClass::Raw,
+                location.backend.clone(),
+            )
+            .unwrap()
+            .to_bytes(),
             location.to_bytes().unwrap(),
         )
         .await;
@@ -756,6 +760,7 @@ mod tests {
             BlobVersion::materialized(
                 location.get_blake3().unwrap().try_into().unwrap(),
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 location.created_at,
                 location.created_by,
                 None,
@@ -767,9 +772,13 @@ mod tests {
         write(
             &storage_handle,
             BLOB_LOCATIONS_KEYSPACE,
-            BlobLocationKey::from_blake3(location.get_blake3().unwrap(), location.backend.clone())
-                .unwrap()
-                .to_bytes(),
+            BlobLocationKey::from_blake3(
+                location.get_blake3().unwrap(),
+                EncodingClass::Raw,
+                location.backend.clone(),
+            )
+            .unwrap()
+            .to_bytes(),
             location.to_bytes().unwrap(),
         )
         .await;

@@ -46,6 +46,7 @@ use aruna_core::structs::storage::blob::{
     bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
+use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
 use aruna_core::structs::storage::replication::{
     ReplicationItemKind, ReplicationNegotiationResult,
@@ -181,8 +182,6 @@ pub enum IncomingVersionError {
     BlobHashMismatch,
     #[error("Replicated blob size does not match manifest")]
     BlobSizeMismatch,
-    #[error("Replicated blob storage flags do not match manifest")]
-    StorageFlagsMismatch,
     #[error("Existing blob copy changed before the version committed")]
     ExistingBlobChanged,
     #[error("Replaced multipart metadata exceeds the supported part limit")]
@@ -302,6 +301,8 @@ pub struct IncomingVersionOperation {
     /// The destination bucket's own rules, so this receiver routes its replica
     /// with the tenant's rules and its own class table.
     destination_rules: Vec<StorageRoutingRule>,
+    /// The destination bucket's compression: the replica is stored with this node's setting.
+    destination_compression: Compression,
     destination_inputs: GroupRoutingInputs,
     create_attempted: bool,
     negotiation_result: Option<ReplicationNegotiationResult>,
@@ -362,6 +363,7 @@ impl IncomingVersionOperation {
             txn_id: None,
             destination_group_id: None,
             destination_rules: Vec::new(),
+            destination_compression: Compression::Off,
             destination_inputs: GroupRoutingInputs::default(),
             create_attempted: false,
             negotiation_result: None,
@@ -933,6 +935,7 @@ impl IncomingVersionOperation {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
     }
 
@@ -1068,7 +1071,8 @@ impl IncomingVersionOperation {
         };
         self.state = IncomingVersionState::ReadExistingBlob;
         smallvec![blob_location_read(
-            &BlobLocationKey::new(hash, backend),
+            // Only a copy in this node's own encoding for the bucket can be reused.
+            &BlobLocationKey::new(hash, self.destination_compression.into(), backend),
             None
         )]
     }
@@ -1087,7 +1091,8 @@ impl IncomingVersionOperation {
             .routing
             .snapshot(self.destination_group_id.unwrap_or(self.manifest.group_id))
             .with_group_inputs(self.destination_inputs.clone())
-            .with_bucket_rules(self.destination_rules.clone());
+            .with_bucket_rules(self.destination_rules.clone())
+            .with_compression(self.destination_compression);
         resolve_backend(&snapshot, &self.manifest.bucket, &self.manifest.key)
             .map_err(IncomingVersionError::RoutingFailed)
     }
@@ -1320,10 +1325,11 @@ impl IncomingVersionOperation {
         let replaced = self.replaced_version.as_ref()?.location_key()?;
         let replacement = self.effective_materialized_location().ok().and_then(|it| {
             let hash: [u8; 32] = it.get_blake3()?.try_into().ok()?;
-            Some(BlobLocationKey::new(hash, it.backend))
+            Some(BlobLocationKey::new(hash, it.format.encoding(), it.backend))
         });
-        (replacement.as_ref() != Some(&replaced))
-            .then(|| ReclaimCandidateKey::new(replaced.backend, replaced.blake3_hash))
+        (replacement.as_ref() != Some(&replaced)).then(|| {
+            ReclaimCandidateKey::new(replaced.backend, replaced.encoding, replaced.blake3_hash)
+        })
     }
 
     fn write_replaced_candidate(&mut self, key: ReclaimCandidateKey) -> Effects {
@@ -1369,9 +1375,6 @@ impl IncomingVersionOperation {
         }
         if location.blob_size != blob.size {
             return Err(IncomingVersionError::BlobSizeMismatch);
-        }
-        if location.compressed != blob.compressed || location.encrypted != blob.encrypted {
-            return Err(IncomingVersionError::StorageFlagsMismatch);
         }
 
         Ok(())
@@ -1424,7 +1427,7 @@ impl IncomingVersionOperation {
         };
         self.state = IncomingVersionState::VerifyExistingBlob;
         smallvec![blob_location_read(
-            &BlobLocationKey::new(hash, location.backend),
+            &BlobLocationKey::new(hash, location.format.encoding(), location.backend),
             self.txn_id
         )]
     }
@@ -1607,6 +1610,7 @@ impl IncomingVersionOperation {
                     let materialized = match BlobVersion::materialized(
                         hash,
                         location.backend.clone(),
+                        location.format.encoding(),
                         self.manifest.created_at,
                         self.manifest.created_by,
                         self.manifest.source.clone(),
@@ -2105,6 +2109,7 @@ impl IncomingVersionOperation {
         self.destination_group_id = Some(bucket_info.group_id);
         self.gated_bucket = Some(GatedBucket::observe(Some(&bucket_info)));
         self.destination_rules = bucket_info.storage_routing;
+        self.destination_compression = bucket_info.compression;
         self.load_destination_routing()
     }
 
@@ -2529,6 +2534,18 @@ impl IncomingVersionOperation {
             if let Err(error) = gated.check_subject(subject.as_ref()) {
                 return self.fail(error.into());
             }
+        }
+        // A replica encoded under an older setting is never published: the bucket's
+        // migration may already have passed this key.
+        let written = self.effective_materialized_location().ok();
+        if bucket
+            .as_ref()
+            .zip(written)
+            .is_some_and(|(bucket, written)| {
+                EncodingClass::from(bucket.compression) != written.format.encoding()
+            })
+        {
+            return self.fail(StorageError::TransactionConflict.into());
         }
         self.verify_replaced()
     }

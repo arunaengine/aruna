@@ -15,6 +15,8 @@ use aruna_core::structs::execution::staging::{
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, CurrentVersionPointer};
+use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_storage::storage;
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
@@ -39,6 +41,7 @@ async fn deleted_versions_skipped() {
             BlobVersion::materialized(
                 live_hash,
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 created_at,
                 created_by,
                 None,
@@ -81,8 +84,7 @@ async fn deleted_versions_skipped() {
         storage_bucket: "objects".to_string(),
         backend_path: "path".to_string(),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by,
         created_at,
         staging: false,
@@ -93,7 +95,7 @@ async fn deleted_versions_skipped() {
     let event = storage_handle
         .send_storage_effect(StorageEffect::Write {
             key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: BlobLocationKey::new(live_hash, location.backend.clone())
+            key: BlobLocationKey::new(live_hash, EncodingClass::Raw, location.backend.clone())
                 .to_bytes()
                 .into(),
             value: location.to_bytes().unwrap().into(),
@@ -262,6 +264,7 @@ async fn zero_limit_honored() {
             value: BlobVersion::materialized(
                 hash,
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 created_at,
                 created_by,
                 None,
@@ -484,6 +487,7 @@ async fn seed_materialized_keys(
         let version = BlobVersion::materialized(
             hash,
             BackendRef::node_default(),
+            EncodingClass::Raw,
             created_at,
             created_by,
             None,
@@ -513,7 +517,7 @@ async fn seed_materialized_keys(
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: BlobLocationKey::new(hash, BackendRef::node_default())
+                key: BlobLocationKey::new(hash, EncodingClass::Raw, BackendRef::node_default())
                     .to_bytes()
                     .into(),
                 value: BackendLocation {
@@ -523,8 +527,7 @@ async fn seed_materialized_keys(
                     storage_bucket: "objects".to_string(),
                     backend_path: format!("path/{key}"),
                     ulid: Ulid::generate(),
-                    compressed: false,
-                    encrypted: false,
+                    format: StoredFormat::default(),
                     created_by,
                     created_at,
                     staging: false,
@@ -931,6 +934,7 @@ fn group_round_advances() {
     let version: aruna_core::types::Value = BlobVersion::materialized(
         [1u8; 32],
         BackendRef::node_default(),
+        EncodingClass::Raw,
         created_at,
         created_by,
         None,

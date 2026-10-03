@@ -641,6 +641,9 @@ mod pure_tests {
         BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
         ManagedCopyRecord, ManagedCopyState, VersionKey,
     };
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::format::EncodingClass;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::types::Key;
     use std::collections::HashMap;
     use std::time::UNIX_EPOCH;
@@ -672,6 +675,7 @@ mod pure_tests {
             storage_routing: Vec::new(),
             placement_policies: policies,
             placement_policy_generation: 7,
+            compression: Compression::Off,
         }
     }
 
@@ -679,6 +683,7 @@ mod pure_tests {
         BlobVersion::materialized(
             [6u8; 32],
             BackendRef::node_default(),
+            EncodingClass::Raw,
             UNIX_EPOCH,
             user_id(),
             None,
@@ -698,8 +703,7 @@ mod pure_tests {
                 storage_bucket: "aruna".to_string(),
                 backend_path: "objects/one".to_string(),
                 ulid: Ulid::from_bytes([5u8; 16]),
-                compressed: false,
-                encrypted: false,
+                format: StoredFormat::default(),
                 created_by: Default::default(),
                 created_at: UNIX_EPOCH,
                 staging: false,

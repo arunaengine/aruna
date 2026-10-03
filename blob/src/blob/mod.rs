@@ -17,6 +17,7 @@ use ulid::Ulid;
 
 mod backend;
 mod control_plane;
+mod frames;
 mod group;
 mod in_place;
 mod io;
@@ -78,6 +79,7 @@ pub struct BlobHandler {
     /// each mutation read-locks across the close check and registering itself.
     close_lock: Arc<StdRwLock<()>>,
     rejected_writes: Arc<AtomicU64>,
+    frame_indexes: Arc<StdMutex<frames::IndexCache>>,
     writes_in_flight: Arc<AtomicUsize>,
     writes_drained: Arc<Notify>,
     /// Stops the backend-status monitor at shutdown so its handler clone, and

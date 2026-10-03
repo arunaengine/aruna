@@ -76,7 +76,11 @@ pub fn write_location_effect(
     location: BackendLocation,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
-    let key = BlobLocationKey::new(blake3_hash, location.backend.clone());
+    let key = BlobLocationKey::new(
+        blake3_hash,
+        location.format.encoding(),
+        location.backend.clone(),
+    );
     Ok(Effect::Storage(StorageEffect::Write {
         key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
         key: ByteView::from(key.to_bytes()),

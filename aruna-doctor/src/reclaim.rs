@@ -93,10 +93,11 @@ fn seed_output(database_path: &str, backend: &str) -> Result<SeedOutput, Explore
         if location.backend != wanted || location.staging || location.partial {
             continue;
         }
-        let hash = BlobLocationKey::from_bytes(key.as_ref())
-            .map_err(|error| ExplorerError::Decode(error.to_string()))?
-            .blake3_hash;
-        queued.push(ReclaimCandidateKey::new(wanted.clone(), hash).to_bytes());
+        let key = BlobLocationKey::from_bytes(key.as_ref())
+            .map_err(|error| ExplorerError::Decode(error.to_string()))?;
+        queued.push(
+            ReclaimCandidateKey::new(wanted.clone(), key.encoding, key.blake3_hash).to_bytes(),
+        );
     }
 
     let value = ReclaimCandidate { enqueued_at }
@@ -170,6 +171,8 @@ mod tests {
     use super::{seed_output, status_output};
     use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE};
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, BlobLocationKey};
+    use aruna_core::structs::storage::format::EncodingClass;
+    use aruna_core::structs::storage::format::StoredFormat;
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
     use std::collections::HashMap;
     use std::path::Path;
@@ -185,8 +188,7 @@ mod tests {
             storage_bucket: "storage".to_string(),
             backend_path: "bucket/key_01".to_string(),
             ulid: Ulid::from_bytes([1u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: Default::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging,
@@ -216,8 +218,12 @@ mod tests {
             ] {
                 txn.insert(
                     locations.clone(),
-                    BlobLocationKey::new([seed; 32], location(backend.clone(), staging).backend)
-                        .to_bytes(),
+                    BlobLocationKey::new(
+                        [seed; 32],
+                        EncodingClass::Raw,
+                        location(backend.clone(), staging).backend,
+                    )
+                    .to_bytes(),
                     location(backend, staging).to_bytes().unwrap(),
                 );
             }
