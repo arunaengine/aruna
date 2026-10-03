@@ -12,7 +12,7 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::format::{FrameLayout, StoredLayout};
 use bytes::{Bytes, BytesMut};
-use futures::stream;
+use futures::{StreamExt, stream};
 use iroh_io::AsyncSliceReader;
 use lru::LruCache;
 use opendal::Operator;
@@ -25,8 +25,10 @@ use tokio::time::timeout;
 
 /// Upper bound for the parsed seek tables kept in memory, about 1.3 TiB of framed data.
 const INDEX_CACHE_BYTES: usize = 64 << 20;
-/// Stored bytes one backend request fetches for consecutive frames of a range.
+/// Stored bytes one backend request fetches for consecutive frames, and their decoded bytes.
 const FETCH_BYTES: u64 = 8 << 20;
+/// Frames of one batch that decode on the blocking pool at the same time.
+const DECODE_TASKS: usize = 4;
 
 /// Parsed seek tables keyed by their hash. Stored objects never change, so entries stay valid.
 #[derive(Debug)]
@@ -69,7 +71,7 @@ impl IndexCache {
 type Fetch = JoinHandle<Result<Bytes, BlobError>>;
 
 /// Random access to the original bytes of a framed copy. Fetches the stored bytes of
-/// consecutive frames in one request, decodes them in parallel, and fetches the next batch
+/// consecutive frames in one request, decodes a few in parallel, and fetches the next batch
 /// of a longer read while the current one is decoded.
 pub(super) struct FrameReader {
     operator: Operator,
@@ -146,6 +148,7 @@ impl FrameReader {
         {
             return Ok(bytes.clone());
         }
+        self.decoded = None;
         let (frames, task) = match self.ahead.take() {
             Some((frames, task)) if frames.start == frame => (frames, task),
             other => {
@@ -168,17 +171,20 @@ impl FrameReader {
         Ok(bytes)
     }
 
-    /// Checks and decodes each frame of one fetched batch on the blocking pool, in parallel.
+    /// Checks and decodes each frame of one fetched batch on the blocking pool,
+    /// at most `DECODE_TASKS` at a time.
     async fn decode(&self, frames: &Range<u64>, stored: Bytes) -> Result<Vec<Bytes>, BlobError> {
-        let base = self.index.frames_range(frames).start;
-        let tasks = frames.clone().map(|frame| {
-            let range = self.index.frame_range(frame);
+        let index = self.index.clone();
+        let base = index.frames_range(frames).start;
+        let tasks = frames.clone().map(move |frame| {
+            let range = index.frame_range(frame);
             let bytes = stored.slice((range.start - base) as usize..(range.end - base) as usize);
-            let (length, digest) = (self.index.original_len(frame), *self.index.digest(frame));
+            let (length, digest) = (index.original_len(frame), *index.digest(frame));
             tokio::task::spawn_blocking(move || codec::decode_frame(length, &digest, bytes))
         });
+        let mut tasks = stream::iter(tasks).buffered(DECODE_TASKS);
         let mut decoded = Vec::new();
-        for task in futures::future::join_all(tasks).await {
+        while let Some(task) = tasks.next().await {
             decoded.push(task.map_err(|error| BlobError::ReadError(error.to_string()))??);
         }
         Ok(decoded)

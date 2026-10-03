@@ -303,12 +303,15 @@ impl FrameIndex {
         self.offsets[frame as usize]..self.offsets[frame as usize + 1]
     }
 
-    /// Frames from `first` up to `last` whose stored bytes fit `budget` together.
-    /// Always holds `first`.
+    /// Frames from `first` up to `last` whose stored bytes and original bytes each fit
+    /// `budget` together. Always holds `first`.
     pub(crate) fn fetch_frames(&self, first: u64, last: u64, budget: u64) -> Range<u64> {
-        let start = self.offsets[first as usize];
+        let (start, original) = (self.offsets[first as usize], self.starts[first as usize]);
         let mut end = first + 1;
-        while end <= last && self.offsets[end as usize + 1] - start <= budget {
+        while end <= last
+            && self.offsets[end as usize + 1] - start <= budget
+            && self.starts[end as usize + 1] - original <= budget
+        {
             end += 1;
         }
         first..end
@@ -613,6 +616,12 @@ mod tests {
         assert_eq!(index.fetch_frames(1, 2, u64::MAX), 1..3);
         assert_eq!(index.fetch_frames(0, 4, 3 * FRAME_SIZE + 128), 0..3);
         assert_eq!(index.frames_range(&(1..3)), frame(1).start..frame(2).end);
+
+        // Zero frames store a few bytes each, so their original bytes bound the batch.
+        let zeros = vec![0u8; 5 * FRAME_SIZE as usize];
+        let (stored, layout) = encode(&zeros, 3);
+        let index = index_of(&stored, &layout, zeros.len() as u64);
+        assert_eq!(index.fetch_frames(0, 4, 2 * FRAME_SIZE), 0..2);
     }
 
     #[test]
