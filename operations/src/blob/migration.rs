@@ -734,54 +734,19 @@ async fn store_progress(
     record: &CompressionMigration,
 ) -> Result<(), String> {
     let storage = &context.storage_handle;
-    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
+    let txn_id = match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
-    else {
-        return Err("could not start a progress transaction".to_string());
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        other => return Err(format!("could not start a progress transaction: {other:?}")),
     };
-    let key: Key = bucket.as_bytes().to_vec().into();
-    let current = storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
-            key: key.clone(),
-            txn_id: Some(txn_id),
-        })
-        .await;
-    let replaced = match current {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => CompressionMigration::from_bytes(value.as_ref())
-            .map(|stored| {
-                stored.started_at_ms != record.started_at_ms || stored.target != record.target
-            })
-            .unwrap_or(true),
-        _ => true,
-    };
-    if replaced {
+    let staged = stage_progress(storage, txn_id, bucket, record).await;
+    if !matches!(staged, Ok(true)) {
         storage
             .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
             .await;
-        return Ok(());
-    }
-    let value = record.to_bytes().map_err(|error| error.to_string())?;
-    storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
-            key: key.clone(),
-            value: value.into(),
-            txn_id: Some(txn_id),
-        })
-        .await;
-    // A finished migration leaves the queue together with its last progress.
-    if record.finished_at_ms.is_some() {
-        storage
-            .send_storage_effect(StorageEffect::Delete {
-                key_space: COMPRESSION_QUEUE_KEYSPACE.to_string(),
-                key,
-                txn_id: Some(txn_id),
-            })
-            .await;
+        return staged.map(|_| ());
     }
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
@@ -790,6 +755,63 @@ async fn store_progress(
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         other => Err(format!("migration progress was not stored: {other:?}")),
     }
+}
+
+/// Writes the progress in `txn_id`. Returns `false` when a newer setting replaced the record.
+async fn stage_progress(
+    storage: &aruna_storage::StorageHandle,
+    txn_id: TxnId,
+    bucket: &str,
+    record: &CompressionMigration,
+) -> Result<bool, String> {
+    let key: Key = bucket.as_bytes().to_vec().into();
+    let current = storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
+            key: key.clone(),
+            txn_id: Some(txn_id),
+        })
+        .await;
+    let stored = match current {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => {
+            CompressionMigration::from_bytes(value.as_ref()).map_err(|error| error.to_string())?
+        }
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(false),
+        other => return Err(format!("could not read migration progress: {other:?}")),
+    };
+    if stored.started_at_ms != record.started_at_ms || stored.target != record.target {
+        return Ok(false);
+    }
+    let value = record.to_bytes().map_err(|error| error.to_string())?;
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
+            key: key.clone(),
+            value: value.into(),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => return Err(format!("could not write migration progress: {other:?}")),
+    }
+    // A finished migration leaves the queue together with its last progress.
+    if record.finished_at_ms.is_some() {
+        match storage
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: COMPRESSION_QUEUE_KEYSPACE.to_string(),
+                key,
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+            other => return Err(format!("could not leave the migration queue: {other:?}")),
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
