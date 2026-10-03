@@ -20,8 +20,8 @@ use std::io;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_util::task::AbortOnDropHandle;
 
 /// Upper bound for the parsed seek tables kept in memory, about 1.3 TiB of framed data.
 const INDEX_CACHE_BYTES: usize = 64 << 20;
@@ -67,8 +67,8 @@ impl IndexCache {
     }
 }
 
-/// A running fetch of stored frame bytes.
-type Fetch = JoinHandle<Result<Bytes, BlobError>>;
+/// A running fetch of stored frame bytes; dropping it cancels the fetch.
+type Fetch = AbortOnDropHandle<Result<Bytes, BlobError>>;
 
 /// Random access to the original bytes of a framed copy. Fetches the stored bytes of
 /// consecutive frames in one request, decodes a few in parallel, and fetches the next batch
@@ -82,14 +82,6 @@ pub(super) struct FrameReader {
     decoded: Option<(u64, Vec<Bytes>)>,
     ahead: Option<(Range<u64>, Fetch)>,
     idle: Duration,
-}
-
-impl Drop for FrameReader {
-    fn drop(&mut self) {
-        if let Some((_, task)) = self.ahead.take() {
-            task.abort();
-        }
-    }
 }
 
 /// Walks the frames of one range.
@@ -110,15 +102,12 @@ async fn read_range(
         return Ok(Bytes::new());
     }
     let (operator, path) = (operator.clone(), path.to_string());
-    let mut task = tokio::spawn(async move { operator.read_with(&path).range(range).await });
-    let buffer = match timeout(idle, &mut task).await {
+    let task = tokio::spawn(async move { operator.read_with(&path).range(range).await });
+    let buffer = match timeout(idle, AbortOnDropHandle::new(task)).await {
         Ok(joined) => joined
             .map_err(|error| BlobError::ReadError(error.to_string()))?
             .map_err(|error| BlobError::ReadError(error.to_string()))?,
-        Err(_) => {
-            task.abort();
-            return Err(BlobError::ReadError("frame read idle timeout".to_string()));
-        }
+        Err(_) => return Err(BlobError::ReadError("frame read idle timeout".to_string())),
     };
     Ok(buffer.to_bytes())
 }
@@ -128,14 +117,14 @@ impl FrameReader {
     fn fetch(&self, frames: Range<u64>) -> (Range<u64>, Fetch) {
         let range = self.index.frames_range(&frames);
         let (operator, path, idle) = (self.operator.clone(), self.path.clone(), self.idle);
-        let task = tokio::spawn(async move {
+        let task = AbortOnDropHandle::new(tokio::spawn(async move {
             let expected = range.end - range.start;
             let bytes = read_range(&operator, &path, range, idle).await?;
             match bytes.len() as u64 == expected {
                 true => Ok(bytes),
                 false => Err(BlobError::ReadError("short frame read".to_string())),
             }
-        });
+        }));
         (frames, task)
     }
 
@@ -151,12 +140,7 @@ impl FrameReader {
         self.decoded = None;
         let (frames, task) = match self.ahead.take() {
             Some((frames, task)) if frames.start == frame => (frames, task),
-            other => {
-                if let Some((_, task)) = other {
-                    task.abort();
-                }
-                self.fetch(self.index.fetch_frames(frame, last, FETCH_BYTES))
-            }
+            _ => self.fetch(self.index.fetch_frames(frame, last, FETCH_BYTES)),
         };
         let stored = task
             .await
