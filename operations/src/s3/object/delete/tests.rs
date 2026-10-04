@@ -1169,16 +1169,15 @@ async fn pending_archive_shared() {
     drive(delete_pending(group_id, second), &context)
         .await
         .unwrap();
+    // The last owner leaves the archive to the backend's Retain or reclaim grace: no
+    // delete is queued and the physical charge stays until the archive is freed.
     let pending = read_value(&context, PENDING_LOCATION_KEYSPACE, archive.to_bytes()).await;
-    assert!(pending.is_none());
-    assert_eq!(
-        cleanup_rows().await,
-        vec![BlobCleanupWork::DeleteBlob { location }]
-    );
+    assert!(pending.is_some());
+    assert!(cleanup_rows().await.is_empty());
     let group = read_counters(&context, usage_group_key(group_id)).await;
     assert_eq!((group.objects, group.logical_bytes), (0, 0));
     let physical = read_counters(&context, shard).await;
-    assert_eq!((physical.stored_blobs, physical.stored_bytes), (0, 0));
+    assert_eq!((physical.stored_blobs, physical.stored_bytes), (1, 80));
 }
 
 #[tokio::test]

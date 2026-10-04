@@ -64,8 +64,6 @@ pub enum DeleteObjectState {
     DeleteMultipartPart,
     ReleaseOwner,
     ScanOwners,
-    FreeArchive,
-    QueueArchiveCleanup,
     WriteReclaimCandidate,
     WriteBlobVersion,
     WriteReplicationObligation,
@@ -178,8 +176,6 @@ pub struct DeleteObjectOperation {
     target_location: Option<BlobLocationKey>,
     /// The Pithos archive the deleted version used, with its stored location.
     target_archive: Option<(ArchiveKey, Option<BackendLocation>)>,
-    /// The stored debit of a pending archive this delete freed.
-    freed_copy: Option<StoredDelta>,
     live_before_marker: bool,
     usage_update: Option<UsageCounterUpdate>,
     copy_removal: Option<ManagedCopyRemoval>,
@@ -209,7 +205,6 @@ impl DeleteObjectOperation {
             target_size: None,
             target_location: None,
             target_archive: None,
-            freed_copy: None,
             live_before_marker: false,
             usage_update: None,
             copy_removal: None,
@@ -728,59 +723,14 @@ impl DeleteObjectOperation {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
-        let Some((archive, location)) = self.target_archive.clone() else {
-            return self.emit_error(DeleteObjectError::InvalidOperationState);
-        };
-        let Some(version_id) = self.input.version_id else {
-            return self.emit_error(DeleteObjectError::InvalidOperationState);
-        };
-        let released = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
-        let mut owned = false;
         for (key, _) in &values {
-            // An unreadable owner proves nothing, so the archive is never freed past it.
-            match CopyOwner::from_key(key.as_ref()) {
-                Ok(owner) => owned |= owner.version != released,
-                Err(error) => return self.emit_error(error.into()),
+            // An unreadable owner proves nothing, so the delete stops at it.
+            if let Err(error) = CopyOwner::from_key(key.as_ref()) {
+                return self.emit_error(error.into());
             }
         }
-        let Some(location) = location.filter(|_| !owned) else {
-            return self.start_usage_update();
-        };
-        self.target_archive = Some((archive.clone(), Some(location)));
-        self.state = DeleteObjectState::FreeArchive;
-        smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: PENDING_LOCATION_KEYSPACE.to_string(),
-            key: archive.to_bytes().into(),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn archive_freed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
-            return self.emit_error(DeleteObjectError::InvalidOperationState);
-        };
-        let Some((_, Some(location))) = self.target_archive.clone() else {
-            return self.emit_error(DeleteObjectError::InvalidOperationState);
-        };
-        let bytes = -i128::from(location.stored_size());
-        self.freed_copy = StoredDelta::of_copy(&location, -1, bytes);
-        let work = match (BlobCleanupWork::DeleteBlob { location }).to_bytes() {
-            Ok(work) => work,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        self.state = DeleteObjectState::QueueArchiveCleanup;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-            key: Ulid::generate().to_bytes().to_vec().into(),
-            value: work.into(),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn archive_queued(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.emit_error(DeleteObjectError::InvalidOperationState);
-        };
+        // Even the last owner leaves the archive to its backend's cleanup strategy: Retain keeps
+        // it and a reclaim grace must pass first, so a delete never frees it at once.
         self.start_usage_update()
     }
 
@@ -854,10 +804,7 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::NoTransactionFound);
         };
         let delta = self.usage_delta();
-        let mut update = match self.freed_copy.take() {
-            Some(stored) => UsageCounterUpdate::with_stored(self.input.group_id, delta, stored),
-            None => UsageCounterUpdate::for_group(self.input.group_id, delta),
-        };
+        let mut update = UsageCounterUpdate::for_group(self.input.group_id, delta);
         if update.is_noop() {
             return self.write_delete_audit();
         }
@@ -1096,8 +1043,6 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::DeleteMultipartPart => self.part_deleted(event),
             DeleteObjectState::ReleaseOwner => self.owner_released(event),
             DeleteObjectState::ScanOwners => self.owners_scanned(event),
-            DeleteObjectState::FreeArchive => self.archive_freed(event),
-            DeleteObjectState::QueueArchiveCleanup => self.archive_queued(event),
             DeleteObjectState::WriteReclaimCandidate => self.handle_candidate_written(event),
             DeleteObjectState::WriteBlobVersion => self.version_written(event),
             DeleteObjectState::WriteReplicationObligation => self.obligation_written(event),
