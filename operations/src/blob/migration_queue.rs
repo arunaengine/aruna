@@ -11,12 +11,13 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_KEY_KEYSPACE,
-    TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE, TRANSITION_QUEUE_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE, TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE,
+    TRANSITION_QUEUE_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::structs::storage::blob::VersionKey;
+use aruna_core::structs::storage::blob::{BackendLocation, VersionKey};
 use aruna_core::structs::storage::encryption::{
-    BucketEncryption, BucketKeyRecord, KeyState, SealPlan,
+    BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState, SealPlan,
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::transition::{
@@ -242,10 +243,65 @@ async fn settle(
         store(storage, bucket, &record).await?;
         return Ok(Some(RECHECK));
     }
+    let pending = pending_on_source(storage, &record).await?;
+    if pending > 0 {
+        // Pending archives move only after promotion; until then the source key must stay.
+        record.remaining = pending;
+        record.state = TransitionState::Blocked;
+        record.blocked_reason = Some(PENDING_REASON.to_string());
+        record.retry_at_ms = Some(now.saturating_add(RECHECK.as_millis() as u64));
+        store(storage, bucket, &record).await?;
+        return Ok(Some(RECHECK));
+    }
+    record.remaining = 0;
+    record.blocked_reason = None;
     record.state = TransitionState::Finished;
     record.finished_at_ms = Some(now);
     store(storage, bucket, &record).await?;
     Ok(None)
+}
+
+/// Why a transition waits after every other copy moved.
+const PENDING_REASON: &str = "archives with pending content still use the source key";
+
+/// Pending archives sealed to the transition's source generation, on every backend.
+async fn pending_on_source(
+    storage: &StorageHandle,
+    record: &EncryptionTransition,
+) -> Result<u64, String> {
+    let Some(source) = record.source else {
+        return Ok(0);
+    };
+    let (mut after, mut count) = (None, 0u64);
+    loop {
+        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+            storage,
+            PENDING_LOCATION_KEYSPACE,
+            None,
+            after,
+            PAGE,
+            None,
+        )
+        .await?;
+        let locations = rows
+            .iter()
+            .map(|(_, value)| BackendLocation::from_bytes(value.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        count += uses_key(&locations, source);
+        match cursor {
+            Some(cursor) => after = Some(cursor),
+            None => return Ok(count),
+        }
+    }
+}
+
+/// How many of `locations` are sealed to `source`.
+fn uses_key(locations: &[BackendLocation], source: BucketKeyRef) -> u64 {
+    let sealed = locations
+        .iter()
+        .filter(|location| location.format.bucket_key() == Some(source));
+    sealed.count() as u64
 }
 
 async fn exists(storage: &StorageHandle, key_space: &str, key: Vec<u8>) -> Result<bool, String> {
@@ -378,4 +434,54 @@ async fn retire_source(
         });
     }
     Ok(effects)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
+    use std::time::SystemTime;
+    use ulid::Ulid;
+
+    fn pending(key: Option<BucketKeyRef>) -> BackendLocation {
+        let layout = PithosLayout {
+            stored_size: 9,
+            metadata_digest: [1; 32],
+        };
+        let format = key.map_or_else(StoredFormat::default, |key| {
+            StoredFormat::pithos(layout, key)
+        });
+        BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: String::new(),
+            ulid: Ulid::from_bytes([2; 16]),
+            format,
+            created_by: Default::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 9,
+            hashes: Default::default(),
+        }
+    }
+
+    #[test]
+    fn pending_keeps_source() {
+        let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
+        let newer = BucketKeyRef::new(source.bucket_id, 2);
+        let other = BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1);
+        let locations = [
+            pending(Some(source)),
+            pending(Some(newer)),
+            pending(Some(other)),
+            pending(None),
+            pending(Some(source)),
+        ];
+        assert_eq!(uses_key(&locations, source), 2);
+        assert_eq!(uses_key(&locations[1..4], source), 0);
+    }
 }
