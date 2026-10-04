@@ -113,6 +113,12 @@ pub const BUCKET_AUDIT_KEYSPACE: &str = "bucket_audit";
 pub const PENDING_LOCATION_KEYSPACE: &str = "pending_locations";
 /// The versions that use each Pithos archive, keyed by archive and version.
 pub const COPY_OWNER_KEYSPACE: &str = "blob_copy_owners";
+/// Node-local progress of moving a bucket's copies to new encryption, keyed by bucket name.
+pub const TRANSITION_KEYSPACE: &str = "encryption_transitions";
+/// Buckets whose encryption transition is unfinished; the worker scans only these.
+pub const TRANSITION_QUEUE_KEYSPACE: &str = "encryption_transition_queue";
+/// Old copies a transition still waits to see removed, keyed by bucket and location key.
+pub const TRANSITION_CLEANUP_KEYSPACE: &str = "encryption_transition_cleanups";
 /// Durable evidence of a copy that failed hash/bao verification (§8.2), keyed
 /// per (hash, backend) so re-hitting the same corrupt copy overwrites its row.
 pub const BLOB_QUARANTINE_KEYSPACE: &str = "blob_quarantine";
@@ -472,6 +478,9 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     CRAQLE_QUADS_KEYSPACE,
     CRAQLE_GRAPHS_KEYSPACE,
     CRAQLE_LOG_KEYSPACE,
+    TRANSITION_KEYSPACE,
+    TRANSITION_QUEUE_KEYSPACE,
+    TRANSITION_CLEANUP_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,
