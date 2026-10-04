@@ -686,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn key_record_checks_fingerprint() {
+    fn records_check_fingerprint() {
         let reference = BucketKeyRef::new(Ulid::from_bytes([1; 16]), 1);
         let mut record = BucketKeyRecord::new(reference, Ulid::from_bytes([2; 16]), [3; 32], 4);
         let decoded = BucketKeyRecord::from_bytes(&record.to_bytes().unwrap()).unwrap();

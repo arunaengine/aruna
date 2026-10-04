@@ -182,7 +182,6 @@ pub enum BlobEffect {
         record: GroupStorage,
         secret: GroupStorageSecret,
     },
-    // ----- Bucket keys -----
     /// A fresh X25519 keypair for a bucket key generation.
     GenerateBucketKey,
     /// Seals the private key of `key` to each user key; the plain key is not returned.
