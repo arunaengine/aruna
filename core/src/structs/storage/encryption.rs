@@ -61,6 +61,7 @@ impl BucketKeyRef {
 
 /// Encryption setting of a bucket.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EncryptionMode {
     #[default]
     Off,
@@ -74,12 +75,15 @@ pub enum EncryptionMode {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BlockCipher {
     #[default]
+    #[serde(rename = "chacha20_poly1305")]
     ChaCha20Poly1305,
+    #[serde(rename = "aes256_gcm")]
     Aes256Gcm,
 }
 
 /// How Pithos keys new blocks: from their content, or with a fresh random key each.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BlockKeys {
     #[default]
     ContentDerived,
@@ -235,6 +239,7 @@ impl BucketKeyRecord {
 
 /// Why a user may hold a bucket key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HolderOrigin {
     Creator,
     /// A user with WRITE on the group's admin path.
@@ -458,6 +463,32 @@ mod tests {
         settings.key_generation = 2;
         assert!(plan.still_current(&settings).is_err());
         assert!(SealPlan::capture(&settings, &record).is_err());
+    }
+
+    #[test]
+    fn wire_names_match() {
+        let names = serde_json::to_value((
+            [
+                EncryptionMode::Off,
+                EncryptionMode::NodeManaged,
+                EncryptionMode::VaultLocked,
+            ],
+            [BlockCipher::ChaCha20Poly1305, BlockCipher::Aes256Gcm],
+            [BlockKeys::ContentDerived, BlockKeys::Unique],
+            [
+                HolderOrigin::Creator,
+                HolderOrigin::Admin,
+                HolderOrigin::Explicit,
+            ],
+        ))
+        .unwrap();
+        let expected = serde_json::json!([
+            ["off", "node_managed", "vault_locked"],
+            ["chacha20_poly1305", "aes256_gcm"],
+            ["content_derived", "unique"],
+            ["creator", "admin", "explicit"],
+        ]);
+        assert_eq!(names, expected);
     }
 
     #[test]
