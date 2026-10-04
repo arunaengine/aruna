@@ -409,3 +409,7 @@ impl Operation for SealedCopyOperation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "copy_sealed_tests.rs"]
+mod tests;
