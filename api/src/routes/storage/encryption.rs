@@ -17,6 +17,8 @@ use aruna_core::structs::storage::encryption::{
 use aruna_core::structs::storage::holders::{
     HolderReport, HolderState, Recovery, RecoveryState, resolve_holders,
 };
+use aruna_core::structs::storage::key_audit::AuditAction;
+use aruna_core::structs::storage::transition::{EncryptionTransition, TransitionState};
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use aruna_operations::driver::{DriverContext, drive, now_ms};
@@ -27,6 +29,9 @@ use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::holders::lookup_keys;
 use aruna_operations::s3::bucket::key_install::{InstallInput, InstallKeyOperation};
 use aruna_operations::s3::bucket::key_rows::SettingsError;
+use aruna_operations::s3::bucket::rotate::{
+    ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
+};
 use aruna_operations::s3::key_status::{KeySnapshot, KeyStatusError, KeyStatusOperation};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -107,6 +112,29 @@ pub struct TransitionView {
     pub started_at_ms: u64,
     pub finished_at_ms: Option<u64>,
     pub blocked_reason: Option<String>,
+}
+
+impl From<&EncryptionTransition> for TransitionView {
+    fn from(transition: &EncryptionTransition) -> Self {
+        let name = |value: serde_json::Value| value.as_str().unwrap_or_default().to_string();
+        Self {
+            kind: name(serde_json::json!(transition.kind)),
+            state: name(serde_json::json!(transition.reported_state())),
+            source_generation: transition.source.map(|source| source.generation),
+            target_generation: transition
+                .target
+                .plan
+                .as_ref()
+                .map(|plan| plan.key.generation),
+            done: transition.done,
+            remaining: Some(transition.remaining),
+            failed: transition.failed,
+            cleanup_remaining: Some(transition.cleanup_remaining),
+            started_at_ms: transition.started_at_ms,
+            finished_at_ms: transition.finished_at_ms,
+            blocked_reason: transition.blocked_reason.clone(),
+        }
+    }
 }
 
 /// What the caller may do; display only, every route checks again.
@@ -324,6 +352,15 @@ pub(crate) fn unlock_view(status: Option<&UnlockStatus>, now_ms: u64) -> UnlockV
     }
 }
 
+fn lock_reason(action: AuditAction) -> Option<&'static str> {
+    match action {
+        AuditAction::Lock => Some("manual"),
+        AuditAction::TimedLock => Some("timed"),
+        AuditAction::RestartLock => Some("restart"),
+        _ => None,
+    }
+}
+
 fn count(report: &HolderReport, state: HolderState) -> Option<usize> {
     Some(
         report
@@ -347,12 +384,24 @@ pub(crate) fn build_status(
             .unlocks
             .iter()
             .find(|status| status.key.generation == generation);
-        unlock_view(status, now_ms)
+        let mut view = unlock_view(status, now_ms);
+        if let (None, Some((action, at_ms))) = (&view.session_id, snapshot.locks.get(&generation)) {
+            view.lock_reason = lock_reason(*action).map(str::to_string);
+            view.locked_at_ms = Some(*at_ms);
+        }
+        view
     };
+    // A transition source stays listed until its transition settles.
+    let source = snapshot
+        .transition
+        .as_ref()
+        .filter(|transition| transition.reported_state() != TransitionState::Finished)
+        .and_then(|transition| transition.source);
     let mut records: Vec<_> = snapshot
         .records
         .iter()
         .filter(|record| record.state != KeyState::Retired)
+        .filter(|record| Some(record.key) == settings.active_key() || Some(record.key) == source)
         .collect();
     records.sort_by_key(|record| record.key.generation);
     let active = settings.active_key();
@@ -399,7 +448,7 @@ pub(crate) fn build_status(
             missing_key: count(report, HolderState::MissingKey),
         }),
         recovery: report.map(|report| RecoveryView::from(&report.recovery)),
-        transition: None,
+        transition: snapshot.transition.as_ref().map(TransitionView::from),
         caller: CallerView {
             holder: is_holder(snapshot, caller),
             ready_copy,
@@ -501,7 +550,9 @@ pub async fn get_bucket_encryption(
 - `node_managed` or `vault_locked` on a plain bucket creates key generation 1 and seals a copy of
   its private key to every holder with a published user key. The new key starts unlocked.
 - `expected_generation` must equal the current `storage_generation`.
-- Other mode changes and setting changes of an encrypted bucket answer 501 `not_supported`."#,
+- On an encrypted bucket, another mode, `off`, cipher or block-key mode starts a transition of
+  this node's stored copies; `transition` in the status reports its progress.
+- A change that needs the old key answers 409 `bucket_locked` while that key is locked."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     request_body(
         content = EncryptionRequest,
@@ -509,13 +560,12 @@ pub async fn get_bucket_encryption(
         example = json!({ "mode": "vault_locked", "max_unlock_ms": 3600000, "expected_generation": 0 })
     ),
     responses(
-        (status = 200, description = "The status after the change", body = EncryptionStatus),
+        (status = 200, description = "The status after the change", body = EncryptionStatus, example = json!({ "bucket": "research-raw", "mode": "node_managed", "bucket_id": "01JAMXQ7B1D7Q8E7Q2F3R8Z9KC", "storage_generation": 1, "key_generation": 1, "public_key": "qL3UuCZ0XkWbQZ2yZ8m1qL3UuCZ0XkWbQZ2yZ8m1qL0=", "fingerprint": "5d1c0a6f9e1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5", "cipher": "chacha20_poly1305", "block_keys": "content_derived", "max_unlock_ms": null, "unlock": { "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": null, "max_deadline_ms": null }, "generations": [], "holders": { "ready": 2, "pending": 0, "missing_key": 0 }, "recovery": { "state": "met", "ready_holders": 2, "ready_with_recovery": 1 }, "transition": null, "caller": { "holder": true, "ready_copy": true, "admin": true } })),
         (status = 400, description = "An invalid mode, cipher or unlock maximum", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
-        (status = 409, description = "`stale_generation`, `open_uploads` or `recovery_unmet`", body = ErrorResponse),
-        (status = 501, description = "`not_supported`: this change is not available yet", body = ErrorResponse)
+        (status = 409, description = "`stale_generation`, `open_uploads`, `recovery_unmet`, `bucket_locked`, or `unchanged` when the settings already apply", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -536,12 +586,20 @@ pub async fn put_bucket_encryption(
             current: current.storage_generation,
         }));
     }
-    if current.is_encrypted() || request.mode == EncryptionMode::Off {
-        return Err(refused(
-            StatusCode::NOT_IMPLEMENTED,
-            "not_supported",
-            "only enabling encryption on a plain bucket is available",
-        ));
+    if current.is_encrypted() || current.bucket_id.is_some() {
+        let change = KeyChange::Settings {
+            mode: request.mode,
+            cipher: request.cipher.unwrap_or(current.cipher),
+            block_keys: request.block_keys.unwrap_or(current.block_keys),
+        };
+        let expected = request.expected_generation;
+        change_bucket(&state, &bucket, group_id, &snapshot, change, expected).await?;
+        let status = current_status(&state, bucket, group_id, auth.user_id).await?;
+        return Ok(Json(status));
+    }
+    if request.mode == EncryptionMode::Off {
+        let status = current_status(&state, bucket, group_id, auth.user_id).await?;
+        return Ok(Json(status));
     }
     let context = state.get_ctx();
     let target = (state.get_realm_id(), state.get_node_id(), group_id);
@@ -550,6 +608,77 @@ pub async fn put_bucket_encryption(
         .map_err(enable_refusal)?;
     let status = current_status(&state, bucket, group_id, auth.user_id).await?;
     Ok(Json(status))
+}
+
+/// Applies a mode change or rotation, then installs a new key generation if it made one.
+pub(crate) async fn change_bucket(
+    state: &ServerState,
+    bucket: &str,
+    group_id: GroupId,
+    snapshot: &KeySnapshot,
+    change: KeyChange,
+    expected_generation: u64,
+) -> ServerResult<()> {
+    let creator = snapshot.info.as_ref().map(|info| info.created_by);
+    let users = creator
+        .into_iter()
+        .chain(snapshot.admins.iter().copied())
+        .chain(snapshot.grants.iter().map(|grant| grant.user_id))
+        .collect::<Vec<_>>();
+    let context = state.get_ctx();
+    let lookups = lookup_keys(&context, state.get_node_id(), users).await;
+    let input = ChangeInput {
+        bucket: bucket.to_string(),
+        group_id,
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        change,
+        expected_generation,
+        lookups,
+        now_ms: now_ms(),
+    };
+    let changed = drive(ChangeEncryptionOperation::new(input), &context)
+        .await
+        .map_err(change_refusal)?;
+    if let Some((record, private_key)) = changed.key {
+        let install = InstallInput {
+            key: record.key,
+            public_key: record.public_key,
+            private_key,
+            duration: None,
+            max: changed.settings.max_unlock_ms.map(Duration::from_millis),
+        };
+        // The change is committed either way; a failed install only leaves the key locked.
+        if let Err(error) = drive(InstallKeyOperation::new(install), &context).await {
+            tracing::warn!(%bucket, ?error, "new bucket key stays locked");
+        }
+    }
+    Ok(())
+}
+
+fn change_refusal(error: ChangeError) -> ServerError {
+    match error {
+        ChangeError::Settings(error) => settings_refusal(error),
+        ChangeError::Key(error) => key_refusal(&error),
+        ChangeError::Blob(error) => blob_refusal(error),
+        ChangeError::NotEncrypted => not_encrypted(),
+        ChangeError::Unchanged => refused(
+            StatusCode::CONFLICT,
+            "unchanged",
+            "the bucket already uses these settings",
+        ),
+        ChangeError::OpenUploads => refused(
+            StatusCode::CONFLICT,
+            "open_uploads",
+            "the bucket has open multipart uploads",
+        ),
+        ChangeError::RecoveryUnmet => refused(
+            StatusCode::CONFLICT,
+            "recovery_unmet",
+            "the key holders do not meet the recovery rule",
+        ),
+        other => ServerError::InternalError(other.to_string()),
+    }
 }
 
 /// Creates key generation 1 sealed to the creator and admins, then installs the new key.
@@ -660,6 +789,11 @@ mod tests {
                 record(1, KeyState::Retiring),
                 record(0, KeyState::Retired),
             ],
+            locks: [
+                (2, (AuditAction::RestartLock, 40)),
+                (1, (AuditAction::Lock, 30)),
+            ]
+            .into(),
             unlocks: vec![UnlockStatus {
                 key: BucketKeyRef::new(BUCKET_ID, 1),
                 session_id: Ulid::from_bytes([9; 16]),
@@ -674,14 +808,30 @@ mod tests {
 
     #[test]
     fn reports_retained_generations() {
-        let status = build_status("bucket".to_string(), &snapshot(), None, user(1), 100);
+        let alone = build_status("bucket".to_string(), &snapshot(), None, user(1), 100);
+        assert_eq!(alone.generations.len(), 1);
+        let mut moving = snapshot();
+        moving.transition = Some(EncryptionTransition::new(
+            aruna_core::structs::storage::transition::TransitionKind::Rotate,
+            Some(BucketKeyRef::new(BUCKET_ID, 1)),
+            aruna_core::structs::storage::transition::TransitionTarget {
+                compression: Default::default(),
+                plan: None,
+            },
+            3,
+            9,
+        ));
+        let status = build_status("bucket".to_string(), &moving, None, user(1), 100);
         let roles: Vec<_> = status
             .generations
             .iter()
             .map(|generation| (generation.generation, generation.role.as_str()))
             .collect();
         assert_eq!(roles, [(1, "source"), (2, "active")]);
-        assert_eq!(status.unlock.as_ref().unwrap().state, "locked");
+        let active = status.unlock.as_ref().unwrap();
+        assert_eq!(active.state, "locked");
+        assert_eq!(active.lock_reason.as_deref(), Some("restart"));
+        assert_eq!(active.locked_at_ms, Some(40));
         let source = &status.generations[0].unlock;
         assert_eq!(source.state, "unlocked");
         assert_eq!(source.deadline_ms, Some(110));
@@ -699,12 +849,46 @@ mod tests {
         assert_eq!(json["cipher"], "chacha20_poly1305");
         assert_eq!(json["block_keys"], "content_derived");
         assert!(json["transition"].is_null());
-        assert!(json["unlock"]["lock_reason"].is_null());
+        let mut moving = snapshot();
+        let mut transition = EncryptionTransition::new(
+            aruna_core::structs::storage::transition::TransitionKind::Rotate,
+            Some(BucketKeyRef::new(BUCKET_ID, 1)),
+            aruna_core::structs::storage::transition::TransitionTarget {
+                compression: Default::default(),
+                plan: None,
+            },
+            3,
+            9,
+        );
+        transition.remaining = 2;
+        moving.transition = Some(transition);
+        let status = build_status("bucket".to_string(), &moving, None, user(1), 100);
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["transition"]["kind"], "rotate");
+        assert_eq!(json["transition"]["state"], "running");
+        assert_eq!(json["transition"]["source_generation"], 1);
+        assert_eq!(json["transition"]["remaining"], 2);
+        assert_eq!(json["unlock"]["lock_reason"], "restart");
         let plain = build_status("b".to_string(), &KeySnapshot::default(), None, user(1), 0);
         let json = serde_json::to_value(&plain).unwrap();
         assert_eq!(json["mode"], "off");
         assert!(json["unlock"].is_null() && json["public_key"].is_null());
         assert_eq!(json["generations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn maps_change_codes() {
+        let code = |error| change_refusal(error).response_body().code.unwrap();
+        assert_eq!(code(ChangeError::OpenUploads), "open_uploads");
+        assert_eq!(code(ChangeError::RecoveryUnmet), "recovery_unmet");
+        assert_eq!(code(ChangeError::Unchanged), "unchanged");
+        let stale = BucketKeyError::StaleGeneration {
+            requested: 1,
+            current: 2,
+        };
+        assert_eq!(code(ChangeError::Key(stale)), "stale_generation");
+        let locked = ChangeError::Key(BucketKeyError::Locked(BUCKET_ID));
+        assert_eq!(code(locked), "bucket_locked");
     }
 
     #[test]
