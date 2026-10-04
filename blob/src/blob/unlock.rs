@@ -15,9 +15,10 @@ use aruna_core::structs::storage::encryption::{
     BucketKeyError, BucketKeyRef, CopyTarget, KeyTicket, ReadLease, UnlockStatus, key_matches,
     seal_copies,
 };
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use ulid::Ulid;
 
 /// Buckets that may be unlocked at once on one node.
@@ -26,9 +27,17 @@ pub(super) const UNLOCKED_BUCKETS: usize = 1024;
 const BUCKET_GENERATIONS: usize = 2;
 /// A prepared key that is neither activated nor discarded in this time is dropped.
 const PREPARED_TTL: Duration = Duration::from_secs(300);
+/// Plaintext reads that may hold a lease at once; further admissions wait for a free slot.
+const LEASE_SLOTS: usize = 256;
 
-/// Archives pinned by leases, with the number of leases that pin each.
-type Pins = Arc<StdMutex<HashMap<ArchiveKey, usize>>>;
+/// Archives pinned by leases with their pin counts, and archives claimed for deletion.
+#[derive(Default)]
+struct ArchiveUse {
+    pins: HashMap<ArchiveKey, usize>,
+    deleting: HashSet<ArchiveKey>,
+}
+
+type Pins = Arc<StdMutex<ArchiveUse>>;
 
 /// One unlock session of a key generation.
 struct Session {
@@ -72,22 +81,37 @@ pub struct ArchivePin {
 
 impl Drop for ArchivePin {
     fn drop(&mut self) {
-        let Ok(mut pins) = self.pins.lock() else {
+        let Ok(mut uses) = self.pins.lock() else {
             return;
         };
-        if let Some(count) = pins.get_mut(&self.archive) {
+        if let Some(count) = uses.pins.get_mut(&self.archive) {
             *count -= 1;
             if *count == 0 {
-                pins.remove(&self.archive);
+                uses.pins.remove(&self.archive);
             }
         }
     }
 }
 
-/// The adapter state behind a `ReadLease`: it holds the shared key and the archive pin.
+/// Keeps an archive from being admitted or pinned while its backend copy is deleted.
+pub(super) struct DeleteClaim {
+    archive: ArchiveKey,
+    pins: Pins,
+}
+
+impl Drop for DeleteClaim {
+    fn drop(&mut self) {
+        if let Ok(mut uses) = self.pins.lock() {
+            uses.deleting.remove(&self.archive);
+        }
+    }
+}
+
+/// The adapter state behind a `ReadLease`: the shared key, the archive pin and the lease slot.
 pub(super) struct LeaseGuard {
     _secret: SharedSecret,
     _pin: ArchivePin,
+    _slot: OwnedSemaphorePermit,
 }
 
 /// Unlocked key generations, keyed by bucket id and generation. It never evicts an unlocked
@@ -96,6 +120,7 @@ pub(super) struct UnlockRegistry {
     capacity: usize,
     sessions: HashMap<BucketKeyRef, Vec<Session>>,
     pins: Pins,
+    leases: Arc<Semaphore>,
 }
 
 /// Shows counts only, so no formatted handler carries a key.
@@ -110,10 +135,15 @@ impl std::fmt::Debug for UnlockRegistry {
 
 impl UnlockRegistry {
     pub(super) fn new(capacity: usize) -> Self {
+        Self::with_leases(capacity, LEASE_SLOTS)
+    }
+
+    fn with_leases(capacity: usize, leases: usize) -> Self {
         Self {
             capacity,
             sessions: HashMap::new(),
             pins: Arc::default(),
+            leases: Arc::new(Semaphore::new(leases)),
         }
     }
 
@@ -291,7 +321,8 @@ impl UnlockRegistry {
         key: BucketKeyRef,
         archive: ArchiveKey,
         now: Instant,
-    ) -> Result<ReadLease, BucketKeyError> {
+        slot: OwnedSemaphorePermit,
+    ) -> Result<ReadLease, BlobError> {
         self.purge(now);
         let session = self
             .sessions
@@ -300,7 +331,8 @@ impl UnlockRegistry {
             .ok_or(BucketKeyError::Locked(key.bucket_id))?;
         let guard = LeaseGuard {
             _secret: session.secret.clone(),
-            _pin: self.pin(archive.clone()),
+            _pin: self.pin(archive.clone())?,
+            _slot: slot,
         };
         Ok(ReadLease::new(
             key,
@@ -326,21 +358,59 @@ impl UnlockRegistry {
     }
 
     /// Pins an archive without a key, so cleanup keeps it while keyless work uses it.
-    pub(super) fn pin(&self, archive: ArchiveKey) -> ArchivePin {
-        if let Ok(mut pins) = self.pins.lock() {
-            *pins.entry(archive.clone()).or_default() += 1;
+    /// An archive claimed for deletion is refused.
+    pub(super) fn pin(&self, archive: ArchiveKey) -> Result<ArchivePin, BlobError> {
+        let mut uses = self.pins.lock().map_err(|_| poisoned())?;
+        if uses.deleting.contains(&archive) {
+            return Err(BlobError::ReadError(
+                "the archive is being deleted".to_string(),
+            ));
         }
-        ArchivePin {
+        *uses.pins.entry(archive.clone()).or_default() += 1;
+        Ok(ArchivePin {
             archive,
             pins: Arc::clone(&self.pins),
-        }
+        })
     }
 
     /// Fails closed: an unreadable pin table counts every archive as pinned.
-    pub(super) fn is_pinned(&self, archive: &ArchiveKey) -> bool {
+    #[cfg(test)]
+    fn is_pinned(&self, archive: &ArchiveKey) -> bool {
         self.pins
             .lock()
-            .map_or(true, |pins| pins.contains_key(archive))
+            .map_or(true, |uses| uses.pins.contains_key(archive))
+    }
+
+    /// Claims an unpinned archive for deletion. Hold the claim across the backend delete so no
+    /// lease or pin can start meanwhile.
+    pub(super) fn claim_delete(&self, archive: &ArchiveKey) -> Result<DeleteClaim, BlobError> {
+        let mut uses = self.pins.lock().map_err(|_| poisoned())?;
+        if uses.pins.contains_key(archive) || !uses.deleting.insert(archive.clone()) {
+            return Err(BlobError::DeleteError("the archive is in use".to_string()));
+        }
+        Ok(DeleteClaim {
+            archive: archive.clone(),
+            pins: Arc::clone(&self.pins),
+        })
+    }
+
+    pub(super) fn lease_slots(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.leases)
+    }
+
+    /// Forgets every session, for shutdown; admitted leases keep their own key until they end.
+    pub(super) fn clear(&mut self) {
+        self.sessions.clear();
+    }
+
+    /// Drops the session of `ticket` if it was prepared but never activated.
+    fn drop_prepared(&mut self, ticket: KeyTicket) {
+        if let Some(sessions) = self.sessions.get_mut(&ticket.key) {
+            sessions.retain(|session| session.active || session.session_id != ticket.session_id);
+            if sessions.is_empty() {
+                self.sessions.remove(&ticket.key);
+            }
+        }
     }
 
     /// Removes sessions past their deadline; admitted leases keep their own key.
@@ -366,11 +436,36 @@ impl UnlockRegistry {
     }
 }
 
+fn poisoned() -> BlobError {
+    BlobError::ReadError("unlock registry poisoned".to_string())
+}
+
+/// Drops a prepared key that is still not activated when it can no longer activate.
+fn expire_prepared(registry: Weak<StdMutex<UnlockRegistry>>, ticket: KeyTicket) {
+    tokio::spawn(async move {
+        tokio::time::sleep(PREPARED_TTL).await;
+        if let Some(registry) = registry.upgrade()
+            && let Ok(mut registry) = registry.lock()
+        {
+            registry.drop_prepared(ticket);
+        }
+    });
+}
+
+impl super::BlobHandle {
+    /// Forgets every unlocked key at shutdown; reads already admitted finish with their lease.
+    pub fn clear_unlocks(&self) {
+        if let Ok(mut registry) = self.handler.unlocks.lock() {
+            registry.clear();
+        }
+    }
+}
+
 impl super::BlobHandler {
     /// Runs one unlock registry effect. Monotonic time decides every deadline.
     pub(super) fn unlock_effect(&self, effect: BlobEffect) -> BlobEvent {
         let Ok(mut registry) = self.unlocks.lock() else {
-            return BlobEvent::Error(BlobError::ReadError("unlock registry poisoned".to_string()));
+            return BlobEvent::Error(poisoned());
         };
         let now = Instant::now();
         let result = match effect {
@@ -388,7 +483,10 @@ impl super::BlobHandler {
                     (duration, max),
                     (now, SystemTime::now()),
                 )
-                .map(|ticket| BlobEvent::KeyPrepared { ticket }),
+                .map(|ticket| {
+                    expire_prepared(Arc::downgrade(&self.unlocks), ticket);
+                    BlobEvent::KeyPrepared { ticket }
+                }),
             BlobEffect::ActivateKey { ticket } => registry
                 .activate(ticket, (now, SystemTime::now()))
                 .map(|status| BlobEvent::KeyActivated { status }),
@@ -409,12 +507,36 @@ impl super::BlobHandler {
             BlobEffect::LockKey { bucket_id, session } => Ok(BlobEvent::KeyLocked {
                 locked: registry.lock(bucket_id, session),
             }),
-            BlobEffect::AdmitRead { key, archive } => registry
-                .admit(key, archive, now)
-                .map(|lease| BlobEvent::ReadAdmitted { lease }),
             _ => Err(BucketKeyError::Unsupported),
         };
         result.unwrap_or_else(|error| BlobEvent::Error(error.into()))
+    }
+
+    /// Admits a read once a lease slot is free; the slot stays with the lease until it ends.
+    pub(super) async fn admit_read(&self, key: BucketKeyRef, archive: ArchiveKey) -> BlobEvent {
+        let slots = match self.unlocks.lock() {
+            Ok(registry) => registry.lease_slots(),
+            Err(_) => return BlobEvent::Error(poisoned()),
+        };
+        let Ok(slot) = slots.acquire_owned().await else {
+            return BlobEvent::Error(poisoned());
+        };
+        let admitted = match self.unlocks.lock() {
+            Ok(mut registry) => registry.admit(key, archive, Instant::now(), slot),
+            Err(_) => Err(poisoned()),
+        };
+        match admitted {
+            Ok(lease) => BlobEvent::ReadAdmitted { lease },
+            Err(error) => BlobEvent::Error(error),
+        }
+    }
+
+    /// Claims an archive for deletion; see `UnlockRegistry::claim_delete`.
+    pub(super) fn claim_delete(&self, archive: &ArchiveKey) -> Result<DeleteClaim, BlobError> {
+        self.unlocks
+            .lock()
+            .map_err(|_| poisoned())?
+            .claim_delete(archive)
     }
 
     /// Seals copies with an unlocked key; the registry lock is not held while sealing.
@@ -436,12 +558,6 @@ impl super::BlobHandler {
             Ok(copies) => BlobEvent::CopiesSealed { copies },
             Err(error) => BlobEvent::Error(error.into()),
         }
-    }
-
-    pub(super) fn archive_pinned(&self, archive: &ArchiveKey) -> bool {
-        self.unlocks
-            .lock()
-            .map_or(true, |registry| registry.is_pinned(archive))
     }
 }
 
