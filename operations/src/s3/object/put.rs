@@ -652,7 +652,8 @@ impl PutObjectOperation {
                 key: self.config.request.key.clone(),
                 resolved,
                 created_by: self.config.user_id,
-                blob
+                blob,
+                size: self.config.request.content_length,
             })]
         } else {
             self.emit_error(PutObjectError::MissingBody)

@@ -750,6 +750,7 @@ async fn remote_read_ephemeral() {
             key: "payload".to_string(),
             created_by: owner,
             blob: byte_stream(FIXTURE_BYTES),
+            size: None,
         })
         .await
     else {
@@ -861,6 +862,7 @@ async fn local_candidate() -> (BaoNode, UserId, ExportCandidate) {
             key: "payload".to_string(),
             created_by: owner,
             blob: byte_stream(FIXTURE_BYTES),
+            size: None,
         })
         .await
     else {

@@ -329,6 +329,7 @@ async fn aborts_failed_writes() {
             stream,
             Compression::Off,
             Some(seal),
+            None,
         )
         .await;
     let BlobEvent::Error(BlobError::WriteCleanup { location: kept, .. }) = closed else {
@@ -353,6 +354,7 @@ async fn aborts_failed_writes() {
             stream,
             Compression::Off,
             Some(seal),
+            None,
         )
         .await;
     assert!(matches!(
@@ -770,4 +772,57 @@ async fn lease_outlives_lock() {
     let refused = handler.admit_read(seal.key, archive).await;
     let locked = BlobError::BucketKey(BucketKeyError::Locked(seal.key.bucket_id));
     assert_eq!(refused, BlobEvent::Error(locked));
+}
+
+#[tokio::test]
+async fn declared_size_chunks() {
+    use crate::blob::io::compose_chunk;
+    use aruna_core::structs::storage::blob::Backend;
+
+    let context = setup_two_backends().await;
+    let handler = &context.blob_handle.handler;
+    let seal = plan(
+        &PrivateKey::generate(),
+        BlockCipher::ChaCha20Poly1305,
+        BlockKeys::ContentDerived,
+    );
+    // 150 GiB on a filesystem backend needs chunks of 16 MiB to stay within 10,000 parts.
+    let declared = 150 * 1024u64.pow(3);
+    let chunk = compose_chunk(&Backend::FileSystem, declared, true).unwrap();
+    assert_eq!(chunk, 16 * MIB);
+    let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        root: "/tmp".to_string(),
+        storage_bucket: "sealed-bucket".to_string(),
+        backend_path: format!("obj/{}", ulid::Ulid::generate()),
+        ulid: ulid::Ulid::generate(),
+        format: StoredFormat::default(),
+        created_by: test_user_id(),
+        created_at: std::time::SystemTime::now(),
+        staging: false,
+        partial: false,
+        blob_size: 0,
+        hashes: std::collections::HashMap::new(),
+    };
+    let (operator, sizes) = failing_close::operator_with_sizes();
+    let data = content(40 * MIB);
+    handler
+        .write_encoded(
+            location,
+            operator,
+            stream_from_bytes(&data),
+            Compression::Off,
+            Some(seal),
+            Some(declared),
+        )
+        .await;
+
+    let sizes = sizes.lock().unwrap();
+    let (last, full) = sizes.split_last().unwrap();
+    assert!(
+        full.len() >= 2 && full.iter().all(|size| *size == chunk),
+        "{sizes:?}"
+    );
+    assert!(*last <= chunk, "{sizes:?}");
 }

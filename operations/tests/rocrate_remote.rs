@@ -346,6 +346,7 @@ async fn write_payload(
             key: KEY.to_string(),
             created_by: owner,
             blob,
+            size: None,
         })
         .await
     {

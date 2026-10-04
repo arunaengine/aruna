@@ -1689,6 +1689,7 @@ impl ReplicateObjectOperation {
                     resolved,
                     created_by,
                     blob: stream,
+                    size: None,
                 })]
             }
             Event::StagingSource(StagingSourceEvent::Error { error }) => {

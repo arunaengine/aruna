@@ -51,6 +51,8 @@ use ulid::Ulid;
 struct WriteLimits {
     max_bytes: Option<u64>,
     deadline: Option<StdInstant>,
+    /// Writer chunk that keeps a large object within its provider's part limit.
+    chunk: Option<usize>,
 }
 
 /// Turns original bytes into stored bytes: zstd frames, or one Pithos archive of a bucket key.
@@ -135,10 +137,12 @@ async fn open_writer(
     operator: &Operator,
     path: &str,
     backend: &BackendRef,
+    chunk: Option<usize>,
 ) -> Result<opendal::Writer, opendal::Error> {
-    match backend {
-        BackendRef::Group(_) => operator.writer_with(path).chunk(GROUP_WRITE_CHUNK).await,
-        BackendRef::Node(_) => operator.writer(path).await,
+    match (backend, chunk) {
+        (_, Some(chunk)) => operator.writer_with(path).chunk(chunk).await,
+        (BackendRef::Group(_), None) => operator.writer_with(path).chunk(GROUP_WRITE_CHUNK).await,
+        (BackendRef::Node(_), None) => operator.writer(path).await,
     }
 }
 
@@ -421,7 +425,17 @@ impl BlobHandler {
         blob: BackendStream<Result<Bytes, StreamError>>,
         compression: Compression,
         seal: Option<SealPlan>,
+        size: Option<u64>,
     ) -> BlobEvent {
+        let mut limits = WriteLimits::default();
+        // A sealed archive of a known size picks a chunk that its provider's part limit admits.
+        if let (Some(_), Some(size)) = (seal, size) {
+            let backend = match self.registry.config_for(&location.backend) {
+                Ok(config) => config.backend_type,
+                Err(error) => return BlobEvent::Error(error),
+            };
+            limits.chunk = compose_chunk(&backend, size, true);
+        }
         let encoder = match (seal, compression) {
             (Some(plan), _) => match ArchiveEncoder::new(&plan, compression) {
                 Ok(encoder) => Some(Encoder::Pithos(Box::new(encoder), plan.key)),
@@ -430,7 +444,6 @@ impl BlobHandler {
             (None, Compression::Off) => None,
             (None, Compression::Zstd { level }) => Some(Encoder::Frames(FrameEncoder::new(level))),
         };
-        let limits = WriteLimits::default();
         Box::pin(self.write_stream_limit(location, operator, blob, limits, encoder, None)).await
     }
 
@@ -483,6 +496,7 @@ impl BlobHandler {
         let WriteLimits {
             max_bytes,
             deadline,
+            chunk,
         } = limits;
         let mut plain = HiddenReservation::new(self.clone());
         let reservation = reservation.unwrap_or(&mut plain);
@@ -496,13 +510,13 @@ impl BlobHandler {
             Some(deadline) => {
                 with_deadline(
                     Some(deadline),
-                    open_writer(&operator, &storage_path, &location.backend),
+                    open_writer(&operator, &storage_path, &location.backend, chunk),
                 )
                 .await
             }
             None => timeout(
                 self.io_timeout(),
-                open_writer(&operator, &storage_path, &location.backend),
+                open_writer(&operator, &storage_path, &location.backend, chunk),
             )
             .await
             .map_err(|_| ()),
@@ -723,6 +737,7 @@ impl BlobHandler {
                 WriteLimits {
                     max_bytes,
                     deadline,
+                    chunk: None,
                 },
                 None,
                 Some(&mut reservation),
@@ -1019,6 +1034,27 @@ impl BlobHandler {
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
+        let written = self.write_sized_blob(
+            request_bucket,
+            request_key,
+            resolved,
+            created_by,
+            blob,
+            None,
+        );
+        Box::pin(written).await
+    }
+
+    /// Like `write_blob`; a declared `size` sizes the provider chunks of a sealed archive.
+    pub async fn write_sized_blob(
+        &self,
+        request_bucket: &str,
+        request_key: &str,
+        resolved: ResolvedBackend,
+        created_by: UserId,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+        size: Option<u64>,
+    ) -> BlobEvent {
         let root = match self.registry.config_for(&resolved.backend) {
             Ok(config) => config.root.clone(),
             Err(err) => return BlobEvent::Error(err),
@@ -1069,6 +1105,7 @@ impl BlobHandler {
             blob,
             resolved.compression,
             resolved.encryption,
+            size,
         ))
         .await
         {

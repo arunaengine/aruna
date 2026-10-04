@@ -60,6 +60,8 @@ pub enum BlobEffect {
         resolved: ResolvedBackend,
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
+        /// Declared size of the original bytes, when known; it sizes provider chunks.
+        size: Option<u64>,
     },
     WritePart {
         upload_id: Ulid,

@@ -960,6 +960,7 @@ async fn reuses_current_bucket() {
             key: "one.bin".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"one"),
+            size: None,
         })
         .await
     else {
@@ -974,6 +975,7 @@ async fn reuses_current_bucket() {
             key: "two.bin".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"two"),
+            size: None,
         })
         .await
     else {
@@ -1029,6 +1031,7 @@ async fn starts_fresh_bucket() {
             key: "one.bin".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"one"),
+            size: None,
         })
         .await
     else {
@@ -1043,6 +1046,7 @@ async fn starts_fresh_bucket() {
             key: "two.bin".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"two"),
+            size: None,
         })
         .await
     else {
@@ -1082,6 +1086,7 @@ async fn keeps_bucket_reusable() {
             key: "one.bin".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"one"),
+            size: None,
         })
         .await
     else {
@@ -1116,6 +1121,7 @@ async fn keeps_bucket_reusable() {
             key: "two.bin".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"two"),
+            size: None,
         })
         .await
     else {
@@ -1430,6 +1436,7 @@ async fn range_passes_writes() {
                 key: "object".to_string(),
                 created_by: test_user_id(),
                 blob: body,
+                size: None,
             })
             .await
     });
@@ -1574,6 +1581,7 @@ async fn interlocked_writes_complete() {
                     key: format!("object-{index}"),
                     created_by: test_user_id(),
                     blob: body,
+                    size: None,
                 })
                 .await
         }));
@@ -1602,6 +1610,7 @@ async fn tracks_concurrent_loads() {
             key: "seed".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"seed"),
+            size: None,
         })
         .await
     else {
@@ -1625,6 +1634,7 @@ async fn tracks_concurrent_loads() {
                     key: format!("object-{index}"),
                     created_by: test_user_id(),
                     blob: body,
+                    size: None,
                 })
                 .await
         }));
@@ -2131,6 +2141,7 @@ async fn compose_close_fails() {
             key: "part.bin".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"part-data"),
+            size: None,
         })
         .await
     else {
@@ -2531,6 +2542,7 @@ async fn read_holds_permit() {
             key: "object".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"payload"),
+            size: None,
         })
         .await
     else {
@@ -2575,6 +2587,7 @@ async fn reservation_forces_rollover() {
                     key: format!("object-{index}"),
                     created_by: test_user_id(),
                     blob: body,
+                    size: None,
                 })
                 .await
         }));

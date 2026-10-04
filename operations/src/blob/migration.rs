@@ -270,6 +270,7 @@ impl MigrateVersionOperation {
             resolved,
             created_by: old.created_by,
             blob,
+            size: None,
         });
         self.state = MigrateState::WriteBlob;
         smallvec![effect]

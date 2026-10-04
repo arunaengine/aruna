@@ -652,7 +652,11 @@ impl BlobHandler {
                 resolved,
                 created_by,
                 blob,
-            } => Box::pin(self.write_blob(&bucket, &key, resolved, created_by, blob)).await,
+                size,
+            } => {
+                let write = self.write_sized_blob(&bucket, &key, resolved, created_by, blob, size);
+                Box::pin(write).await
+            }
             BlobEffect::WritePart {
                 upload_id,
                 part_number,
