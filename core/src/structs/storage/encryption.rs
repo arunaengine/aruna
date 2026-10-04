@@ -493,6 +493,11 @@ pub fn seal_copies(
         .collect()
 }
 
+/// The wall-clock deadline `left` after `from_ms`; none when it cannot be represented.
+pub fn deadline_after(from_ms: u64, left: Duration) -> Option<u64> {
+    from_ms.checked_add(u64::try_from(left.as_millis()).ok()?)
+}
+
 /// The X25519 public key of a 32-byte private key.
 pub fn public_key_of(private: &SecretBytes) -> Option<[u8; 32]> {
     let mut bytes = Zeroizing::new([0u8; 32]);
@@ -774,6 +779,13 @@ mod tests {
         let (other, _) = generate_key().unwrap();
         let wrong = seal_copies(key, &other, private.bytes(), (realm, node), &targets, 9);
         assert_eq!(wrong, Err(BucketKeyError::WrongKey));
+    }
+
+    #[test]
+    fn deadlines_stay_representable() {
+        assert_eq!(deadline_after(1_000, Duration::from_secs(2)), Some(3_000));
+        assert_eq!(deadline_after(u64::MAX, Duration::from_millis(1)), None);
+        assert_eq!(deadline_after(0, Duration::MAX), None);
     }
 
     #[test]

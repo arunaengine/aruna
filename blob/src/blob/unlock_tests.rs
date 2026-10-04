@@ -121,6 +121,23 @@ fn bounds_start_at_activation() {
 }
 
 #[test]
+fn unreachable_bounds_refused() {
+    let mut registry = UnlockRegistry::new(UNLOCKED_BUCKETS);
+    let now = Instant::now();
+    let key = reference(1, 1);
+    let endless = Duration::MAX;
+    let refused = unlock(&mut registry, key, 1, (Some(endless), None), now);
+    assert_eq!(refused, Err(BucketKeyError::InvalidDuration));
+    let ticket = unlock(&mut registry, key, 1, (None, None), now).unwrap();
+    let extended = registry.extend(key, ticket.session_id, Some(endless), now);
+    assert_eq!(extended, Err(BucketKeyError::InvalidDuration));
+    assert!(
+        registry.admit(key, archive(1), now).is_ok(),
+        "the session stays as it was"
+    );
+}
+
+#[test]
 fn full_registry_refuses() {
     let mut registry = UnlockRegistry::new(1);
     let now = Instant::now();

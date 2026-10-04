@@ -136,6 +136,12 @@ impl UnlockRegistry {
         if matches!((duration, max), (Some(duration), Some(max)) if duration > max) {
             return Err(BucketKeyError::InvalidDuration);
         }
+        // A bound that no clock can reach is refused before anything is held.
+        let reachable =
+            |bound: Option<Duration>| bound.is_none_or(|bound| now.0.checked_add(bound).is_some());
+        if !reachable(duration) || !reachable(max) {
+            return Err(BucketKeyError::InvalidDuration);
+        }
         let generations = self.generations(key.bucket_id);
         let known = self.sessions.contains_key(&key);
         if !known && generations == 0 && self.buckets() >= self.capacity {
@@ -180,12 +186,20 @@ impl UnlockRegistry {
             .iter()
             .position(|session| !session.active && session.session_id == ticket.session_id)
             .ok_or(BucketKeyError::SessionMismatch)?;
+        let (duration, max) = sessions[index].bounds;
+        let after = |bound: Option<Duration>| match bound {
+            Some(bound) => now
+                .checked_add(bound)
+                .map(Some)
+                .ok_or(BucketKeyError::InvalidDuration),
+            None => Ok(None),
+        };
+        let (deadline, max_deadline) = (after(duration)?, after(max)?);
         let mut session = sessions.swap_remove(index);
-        let (duration, max) = session.bounds;
         session.active = true;
         session.unlocked_at = unlocked_at;
-        session.deadline = duration.map(|duration| now + duration);
-        session.max_deadline = max.map(|max| now + max);
+        session.deadline = deadline;
+        session.max_deadline = max_deadline;
         let status = session.status(ticket.key, now);
         sessions.clear();
         sessions.push(session);
@@ -230,9 +244,13 @@ impl UnlockRegistry {
             .iter_mut()
             .find(|session| session.active && session.session_id == session_id)
             .ok_or(BucketKeyError::SessionMismatch)?;
-        let deadline = duration
-            .map(|duration| now + duration)
-            .or(session.max_deadline);
+        let deadline = match duration {
+            Some(duration) => Some(
+                now.checked_add(duration)
+                    .ok_or(BucketKeyError::InvalidDuration)?,
+            ),
+            None => session.max_deadline,
+        };
         if let (Some(max), Some(deadline)) = (session.max_deadline, deadline)
             && deadline > max
         {

@@ -14,7 +14,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRecord, BucketKeyRef, HolderOrigin, KeyState, KeyTicket,
-    UnlockStatus,
+    UnlockStatus, deadline_after,
 };
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::task::TaskEffect;
@@ -141,6 +141,10 @@ impl UnlockBucketOperation {
         if matches!((self.input.duration, self.max), (Some(asked), Some(max)) if asked > max) {
             return self.fail(BucketKeyError::InvalidDuration);
         }
+        let asked = self.input.duration.or(self.max);
+        if asked.is_some_and(|asked| deadline_after(self.input.now_ms, asked).is_none()) {
+            return self.fail(BucketKeyError::InvalidDuration);
+        }
         let grant = [
             &key.bucket_id.to_bytes()[..],
             &self.input.caller.to_storage_key(),
@@ -208,7 +212,7 @@ impl UnlockBucketOperation {
             actor: Some(self.input.caller),
             node_id: self.input.node_id,
             generation: Some(self.input.key.generation),
-            deadline_ms: deadline.map(|deadline| at_ms + deadline.as_millis() as u64),
+            deadline_ms: deadline.and_then(|deadline| deadline_after(at_ms, deadline)),
             reason: None,
             outcome,
         }
@@ -240,7 +244,7 @@ impl UnlockBucketOperation {
                     .unlocked_at
                     .duration_since(std::time::UNIX_EPOCH)
                     .ok()?;
-                u64::try_from((since + left).as_millis()).ok()
+                deadline_after(u64::try_from(since.as_millis()).ok()?, left)
             }),
             Err(_) => self.intent.as_ref().and_then(|intent| intent.deadline_ms),
         };

@@ -13,6 +13,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRef, HolderOrigin, KeyTicket, UnlockStatus,
+    deadline_after,
 };
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::task::TaskEffect;
@@ -171,7 +172,7 @@ impl ExtendBucketOperation {
             generation: Some(status.key.generation),
             deadline_ms: status
                 .remaining
-                .map(|left| now_ms + left.as_millis() as u64),
+                .and_then(|left| deadline_after(now_ms, left)),
             reason: None,
             outcome: AuditOutcome::Applied,
         };
