@@ -537,6 +537,20 @@ pub async fn set_cancel_requested(
             cancelled_now = true;
             return Ok(JobMutation::Persist);
         }
+        // A parked job holds no claim, so its cancellation runs through the queue at once.
+        if record.state == JobState::AwaitingKey {
+            record.cancel_requested = true;
+            record.updated_at_ms = now_ms;
+            if !record.has_run {
+                record.state = JobState::Cancelled;
+                record.finished_at_ms = Some(now_ms);
+                cancelled_now = true;
+            } else {
+                record.state = JobState::Queued;
+                record.due_at_ms = now_ms;
+            }
+            return Ok(JobMutation::Persist);
+        }
         if record.cancel_requested {
             return Ok(JobMutation::Skip);
         }
