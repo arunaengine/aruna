@@ -5,7 +5,8 @@
 use crate::blob::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
 use crate::blob::records::{
     HeadAliasContext, blob_location_read, build_transition_effects, delete_index_effect,
-    delete_version_effect, write_version_effect,
+    delete_version_effect, owner_delete_effect, owners_scan_effect, pending_location_read,
+    write_version_effect,
 };
 use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish};
 use crate::replication::queue::build_live_obligation;
@@ -16,20 +17,21 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DELETE_AUDIT_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    DELETE_AUDIT_KEYSPACE, OBJECT_METADATA_KEYSPACE, PENDING_LOCATION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, VersionKey,
+    ArchiveKey, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
+    BlobVersionState, CopyOwner, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::delete_audit::{
     BlobAuditKind, BlobAuditRecord, delete_audit_key,
 };
+use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, Key};
@@ -58,6 +60,10 @@ pub enum DeleteObjectState {
     DeleteMultipartSummary,
     ReadMultipartParts,
     DeleteMultipartPart,
+    ReleaseOwner,
+    ScanOwners,
+    FreeArchive,
+    QueueArchiveCleanup,
     WriteReclaimCandidate,
     WriteBlobVersion,
     WriteReplicationObligation,
@@ -168,6 +174,8 @@ pub struct DeleteObjectOperation {
     multipart_delete_index: usize,
     target_size: Option<u64>,
     target_location: Option<BlobLocationKey>,
+    /// The Pithos archive the deleted version used, with its stored location.
+    target_archive: Option<(ArchiveKey, Option<BackendLocation>)>,
     live_before_marker: bool,
     usage_update: Option<UsageCounterUpdate>,
     copy_removal: Option<ManagedCopyRemoval>,
@@ -196,6 +204,7 @@ impl DeleteObjectOperation {
             multipart_delete_index: 0,
             target_size: None,
             target_location: None,
+            target_archive: None,
             live_before_marker: false,
             usage_update: None,
             copy_removal: None,
@@ -338,6 +347,11 @@ impl DeleteObjectOperation {
         self.target_version = Some(summary);
         self.target_location = location_key.clone();
 
+        if let Some(archive) = version.state.pending_archive() {
+            self.target_archive = Some((archive.clone(), None));
+            self.state = DeleteObjectState::ReadTargetLocation;
+            return smallvec![pending_location_read(archive, self.txn_id)];
+        }
         if let Some(key) = location_key {
             self.state = DeleteObjectState::ReadTargetLocation;
             return smallvec![blob_location_read(&key, self.txn_id)];
@@ -351,9 +365,13 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
 
-        self.target_size = value
-            .and_then(|value| BackendLocation::from_bytes(value.as_ref()).ok())
-            .map(|location| location.blob_size);
+        let location = value.and_then(|value| BackendLocation::from_bytes(value.as_ref()).ok());
+        self.target_size = location.as_ref().map(|location| location.blob_size);
+        if let Some(location) =
+            location.filter(|location| matches!(location.format.layout, StoredLayout::Pithos(_)))
+        {
+            self.target_archive = Some((ArchiveKey::of(&location), Some(location)));
+        }
 
         self.read_all_versions()
     }
@@ -666,6 +684,95 @@ impl DeleteObjectOperation {
     /// Queues the copy the deleted version named. Blind and idempotent: two
     /// aliases of one hash just refresh the row, and the sweep owns the recount.
     fn write_reclaim_candidate(&mut self) -> Effects {
+        if let Some((archive, _)) = self.target_archive.as_ref() {
+            return self.release_owner(archive.clone());
+        }
+        self.write_candidate()
+    }
+
+    /// The deleted version no longer uses its archive. A known copy is then freed by the
+    /// reclaim sweep; a pending archive is freed here once no other owner remains.
+    fn release_owner(&mut self, archive: ArchiveKey) -> Effects {
+        let Some(version_id) = self.input.version_id else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let version = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
+        match owner_delete_effect(&CopyOwner::new(archive, version), self.txn_id) {
+            Ok(effect) => {
+                self.state = DeleteObjectState::ReleaseOwner;
+                smallvec![effect]
+            }
+            Err(err) => self.emit_error(err.into()),
+        }
+    }
+
+    fn owner_released(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        match (&self.target_location, &self.target_archive) {
+            (None, Some((archive, _))) => {
+                self.state = DeleteObjectState::ScanOwners;
+                smallvec![owners_scan_effect(archive, self.txn_id)]
+            }
+            _ => self.write_candidate(),
+        }
+    }
+
+    fn owners_scanned(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let Some((archive, location)) = self.target_archive.clone() else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let Some(version_id) = self.input.version_id else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let released = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
+        let owned = values.iter().any(|(key, _)| {
+            CopyOwner::from_key(key.as_ref()).is_ok_and(|owner| owner.version != released)
+        });
+        let Some(location) = location.filter(|_| !owned) else {
+            return self.start_usage_update();
+        };
+        self.target_archive = Some((archive.clone(), Some(location)));
+        self.state = DeleteObjectState::FreeArchive;
+        smallvec![Effect::Storage(StorageEffect::Delete {
+            key_space: PENDING_LOCATION_KEYSPACE.to_string(),
+            key: archive.to_bytes().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn archive_freed(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let Some((_, Some(location))) = self.target_archive.clone() else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let work = match (BlobCleanupWork::DeleteBlob { location }).to_bytes() {
+            Ok(work) => work,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        self.state = DeleteObjectState::QueueArchiveCleanup;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: Ulid::generate().to_bytes().to_vec().into(),
+            value: work.into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn archive_queued(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        self.start_usage_update()
+    }
+
+    fn write_candidate(&mut self) -> Effects {
         let Some(location) = self.target_location.clone() else {
             return self.start_usage_update();
         };
@@ -972,6 +1079,10 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::DeleteMultipartSummary => self.summary_deleted(event),
             DeleteObjectState::ReadMultipartParts => self.parts_read(event),
             DeleteObjectState::DeleteMultipartPart => self.part_deleted(event),
+            DeleteObjectState::ReleaseOwner => self.owner_released(event),
+            DeleteObjectState::ScanOwners => self.owners_scanned(event),
+            DeleteObjectState::FreeArchive => self.archive_freed(event),
+            DeleteObjectState::QueueArchiveCleanup => self.archive_queued(event),
             DeleteObjectState::WriteReclaimCandidate => self.handle_candidate_written(event),
             DeleteObjectState::WriteBlobVersion => self.version_written(event),
             DeleteObjectState::WriteReplicationObligation => self.obligation_written(event),

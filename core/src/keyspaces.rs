@@ -107,6 +107,8 @@ pub const BUCKET_HOLDER_KEYSPACE: &str = "bucket_holders";
 pub const KEY_COPY_KEYSPACE: &str = "bucket_key_copies";
 /// Complete locations of archives whose content hash is unknown, keyed by archive id and backend.
 pub const PENDING_LOCATION_KEYSPACE: &str = "pending_locations";
+/// The versions that use each Pithos archive, keyed by archive and version.
+pub const COPY_OWNER_KEYSPACE: &str = "blob_copy_owners";
 /// Durable evidence of a copy that failed hash/bao verification (§8.2), keyed
 /// per (hash, backend) so re-hitting the same corrupt copy overwrites its row.
 pub const BLOB_QUARANTINE_KEYSPACE: &str = "blob_quarantine";
@@ -367,6 +369,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BUCKET_HOLDER_KEYSPACE,
     KEY_COPY_KEYSPACE,
     PENDING_LOCATION_KEYSPACE,
+    COPY_OWNER_KEYSPACE,
     HIDDEN_RESERVATION_KEYSPACE,
     BLOB_QUARANTINE_KEYSPACE,
     MANAGED_COPY_KEYSPACE,

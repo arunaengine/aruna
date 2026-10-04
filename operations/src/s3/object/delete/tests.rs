@@ -979,3 +979,131 @@ async fn deletes_version() {
         .is_none()
     );
 }
+
+#[tokio::test]
+async fn pending_archive_shared() {
+    use crate::blob::records::owner_write_effect;
+    use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, COPY_OWNER_KEYSPACE};
+    use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork};
+    use aruna_core::structs::storage::encryption::BucketKeyRef;
+    use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
+    use std::time::SystemTime;
+
+    let temp_handle = tempdir().unwrap();
+    let storage_handle = storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+    let context = DriverContext {
+        storage_handle: storage_handle.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let user_id = test_user_id();
+    let layout = PithosLayout {
+        stored_size: 80,
+        metadata_digest: [5u8; 32],
+    };
+    let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        root: "/tmp".to_string(),
+        storage_bucket: "objects".to_string(),
+        backend_path: "sealed".to_string(),
+        ulid: Ulid::generate(),
+        format: StoredFormat::pithos(layout, BucketKeyRef::new(Ulid::generate(), 1)),
+        created_by: user_id,
+        created_at: SystemTime::UNIX_EPOCH,
+        staging: false,
+        partial: false,
+        blob_size: 50,
+        hashes: HashMap::new(),
+    };
+    let archive = ArchiveKey::of(&location);
+    // Two versions of one key share the archive, as a same-bucket copy does.
+    let (first, second) = (Ulid::generate(), Ulid::generate());
+    let version = BlobVersion::pending(archive.clone(), SystemTime::UNIX_EPOCH, user_id, None);
+    let mut writes = vec![
+        (
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new("bucket", "sealed").to_bytes().unwrap(),
+            CurrentVersionPointer::new(second).to_bytes().unwrap(),
+        ),
+        (
+            PENDING_LOCATION_KEYSPACE,
+            archive.to_bytes(),
+            location.to_bytes().unwrap(),
+        ),
+    ];
+    for version_id in [first, second] {
+        let version_key = VersionKey::new("bucket", "sealed", version_id);
+        writes.push((
+            BLOB_VERSIONS_KEYSPACE,
+            version_key.to_bytes().unwrap(),
+            version.to_bytes().unwrap(),
+        ));
+        let owner = CopyOwner::new(archive.clone(), version_key);
+        let Effect::Storage(effect) = owner_write_effect(&owner, None).unwrap() else {
+            panic!("owner rows are storage writes");
+        };
+        storage_handle.send_storage_effect(effect).await;
+    }
+    for (key_space, key, value) in writes {
+        storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            })
+            .await;
+    }
+    let delete = |version_id| {
+        DeleteObjectOperation::new(DeleteObjectInput {
+            bucket: "bucket".to_string(),
+            key: "sealed".to_string(),
+            version_id: Some(version_id),
+            group_id: Ulid::generate(),
+            realm_id: RealmId::from_bytes([1u8; 32]),
+            node_id: test_node_id(),
+            deleted_by: user_id,
+        })
+    };
+    let cleanup_rows = |context: &DriverContext| {
+        let storage_handle = context.storage_handle.clone();
+        async move {
+            let Event::Storage(StorageEvent::IterResult { values, .. }) = storage_handle
+                .send_storage_effect(StorageEffect::Iter {
+                    key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+                    prefix: None,
+                    start: None,
+                    limit: 16,
+                    txn_id: None,
+                })
+                .await
+            else {
+                panic!("unexpected storage event");
+            };
+            values
+                .iter()
+                .map(|(_, value)| BlobCleanupWork::from_bytes(value).unwrap())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    drive(delete(first), &context).await.unwrap();
+    let owner = CopyOwner::new(archive.clone(), VersionKey::new("bucket", "sealed", first));
+    let owner_row = read_value(&context, COPY_OWNER_KEYSPACE, owner.key().unwrap()).await;
+    assert!(owner_row.is_none());
+    let pending = read_value(&context, PENDING_LOCATION_KEYSPACE, archive.to_bytes()).await;
+    assert!(pending.is_some(), "the other owner still uses the archive");
+    assert!(cleanup_rows(&context).await.is_empty());
+
+    drive(delete(second), &context).await.unwrap();
+    let pending = read_value(&context, PENDING_LOCATION_KEYSPACE, archive.to_bytes()).await;
+    assert!(pending.is_none());
+    assert_eq!(
+        cleanup_rows(&context).await,
+        vec![BlobCleanupWork::DeleteBlob { location }]
+    );
+}

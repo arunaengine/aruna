@@ -6,13 +6,13 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE,
-    PENDING_LOCATION_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, COPY_OWNER_KEYSPACE,
+    PATHS_INDEX_KEYSPACE, PENDING_LOCATION_KEYSPACE,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer,
-    HashIndex, VersionKey,
+    ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CopyOwner,
+    CurrentVersionPointer, HashIndex, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
@@ -66,6 +66,41 @@ pub fn blob_location_read(key: &BlobLocationKey, txn_id: Option<TxnId>) -> Effec
     Effect::Storage(StorageEffect::Read {
         key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
         key: ByteView::from(key.to_bytes()),
+        txn_id,
+    })
+}
+
+/// Records that a version uses a Pithos archive, in the transaction that writes the version.
+pub fn owner_write_effect(
+    owner: &CopyOwner,
+    txn_id: Option<TxnId>,
+) -> Result<Effect, ConversionError> {
+    Ok(Effect::Storage(StorageEffect::Write {
+        key_space: COPY_OWNER_KEYSPACE.to_string(),
+        key: ByteView::from(owner.key()?),
+        value: ByteView::from(Vec::new()),
+        txn_id,
+    }))
+}
+
+pub fn owner_delete_effect(
+    owner: &CopyOwner,
+    txn_id: Option<TxnId>,
+) -> Result<Effect, ConversionError> {
+    Ok(Effect::Storage(StorageEffect::Delete {
+        key_space: COPY_OWNER_KEYSPACE.to_string(),
+        key: ByteView::from(owner.key()?),
+        txn_id,
+    }))
+}
+
+/// Reads up to two owners of an archive: enough to see whether another owner remains.
+pub fn owners_scan_effect(archive: &ArchiveKey, txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::Iter {
+        key_space: COPY_OWNER_KEYSPACE.to_string(),
+        prefix: Some(ByteView::from(CopyOwner::prefix(archive))),
+        start: None,
+        limit: 2,
         txn_id,
     })
 }

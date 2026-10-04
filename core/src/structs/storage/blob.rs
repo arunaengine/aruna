@@ -1291,6 +1291,45 @@ impl ArchiveKey {
     }
 }
 
+/// One version that uses a Pithos archive, kept in `blob_copy_owners`. An archive is freed only
+/// once no owner names it, so same-bucket copies share it safely.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CopyOwner {
+    pub archive: ArchiveKey,
+    pub version: VersionKey,
+}
+
+impl CopyOwner {
+    pub fn new(archive: ArchiveKey, version: VersionKey) -> Self {
+        Self { archive, version }
+    }
+
+    /// The archive key and a zero byte. Backend key bytes never contain zero, so the owners of
+    /// one archive form exactly this prefix.
+    pub fn prefix(archive: &ArchiveKey) -> Vec<u8> {
+        let mut prefix = archive.to_bytes();
+        prefix.push(0);
+        prefix
+    }
+
+    pub fn key(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok([Self::prefix(&self.archive), self.version.to_bytes()?].concat())
+    }
+
+    pub fn from_key(bytes: &[u8]) -> Result<Self, ConversionError> {
+        let split = bytes
+            .iter()
+            .skip(16)
+            .position(|byte| *byte == 0)
+            .map(|at| at + 16)
+            .ok_or_else(|| ConversionError::InvalidLength("copy owner key".to_string()))?;
+        Ok(Self::new(
+            ArchiveKey::from_bytes(&bytes[..split])?,
+            VersionKey::from_bytes(&bytes[split + 1..])?,
+        ))
+    }
+}
+
 impl BlobVersionState {
     pub fn blob_hash(&self) -> Option<&[u8; 32]> {
         match self {
@@ -1429,10 +1468,10 @@ impl UserAccess {
 mod tests {
     use super::{
         ArchiveKey, Backend, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey,
-        BlobVersion, BucketCorsConfiguration, BucketCorsRule, BucketInfo, CurrentVersionPointer,
-        HashIndex, HiddenBlobKey, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
-        ManagedCopyState, VersionKey, bucket_permission_path, group_permission_path,
-        key_content_type, object_permission_path,
+        BlobVersion, BucketCorsConfiguration, BucketCorsRule, BucketInfo, CopyOwner,
+        CurrentVersionPointer, HashIndex, HiddenBlobKey, ManagedCopyKey, ManagedCopyQuarantine,
+        ManagedCopyRecord, ManagedCopyState, VersionKey, bucket_permission_path,
+        group_permission_path, key_content_type, object_permission_path,
     };
     use crate::NodeId;
     use crate::UserId;
@@ -2034,6 +2073,29 @@ mod tests {
         );
         assert_eq!(version, restored);
         assert_eq!(restored.to_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn owners_scan_exactly() {
+        let archive = ArchiveKey::new(Ulid::from_bytes([0u8; 16]), BackendRef::Node("col".into()));
+        let version = VersionKey::new("b", "k", Ulid::from_bytes([2u8; 16]));
+        let owner = CopyOwner::new(archive.clone(), version);
+        let key = owner.key().unwrap();
+        assert_eq!(CopyOwner::from_key(&key).unwrap(), owner);
+        assert!(key.starts_with(&CopyOwner::prefix(&archive)));
+        // A backend whose name extends another never falls into its owner range.
+        let longer = ArchiveKey::new(archive.archive_id, BackendRef::Node("cold".into()));
+        let other = CopyOwner::new(longer.clone(), owner.version.clone());
+        assert!(
+            !other
+                .key()
+                .unwrap()
+                .starts_with(&CopyOwner::prefix(&archive))
+        );
+        assert_eq!(
+            CopyOwner::from_key(&other.key().unwrap()).unwrap().archive,
+            longer
+        );
     }
 
     #[test]
