@@ -638,6 +638,12 @@ pub async fn process_migrations(
             soon(after);
         }
     }
+    // Encryption transitions share this task; a run at the queue head advances them all.
+    if !resumed
+        && let Some(after) = crate::blob::migration_queue::process_transitions(context).await?
+    {
+        soon(after);
+    }
     // Queued buckets after this page, or before it when the run resumed mid-queue.
     if cursor.is_some() || resumed {
         soon(MIGRATION_CONTINUE);

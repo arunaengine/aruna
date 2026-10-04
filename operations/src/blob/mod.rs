@@ -11,3 +11,4 @@ pub mod permission_paths;
 pub mod reclaim;
 pub mod records;
 pub mod migration_rewrite;
+pub mod migration_queue;

@@ -1,0 +1,381 @@
+//! Advances queued encryption transitions: one page of versions per bucket and run, then the
+//! wait for old copies to be removed. Only then the source key retires and its node copy goes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::blob::migration::MIGRATION_CONTINUE;
+use crate::blob::migration_rewrite::{RewriteOutcome, RewriteVersionOperation};
+use crate::driver::DriverContext;
+use aruna_core::effects::StorageEffect;
+use aruna_core::errors::ConversionError;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_KEY_KEYSPACE,
+    TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE, TRANSITION_QUEUE_KEYSPACE,
+};
+use aruna_core::node_vault::{VaultEntry, VaultPurpose};
+use aruna_core::structs::storage::blob::VersionKey;
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketKeyRecord, KeyState, SealPlan,
+};
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::transition::{
+    EncryptionTransition, TransitionKind, TransitionState, TransitionTarget, cleanup_prefix,
+};
+use aruna_core::types::{Key, TxnId, Value};
+use aruna_storage::StorageHandle;
+use std::time::{Duration, SystemTime};
+
+/// Versions, or old copies, one run checks per bucket.
+const PAGE: usize = 64;
+/// Queued buckets read per queue page.
+const BUCKET_PAGE: usize = 16;
+/// Wait before a transition looks again for an unlocked key or removed old copies.
+pub const RECHECK: Duration = Duration::from_secs(60);
+/// Passes with failures started again before the transition reports itself blocked.
+const RETRIES: u32 = 10;
+
+/// Advances every queued transition by one page. Returns when the task must run again.
+pub async fn process_transitions(context: &DriverContext) -> Result<Option<Duration>, String> {
+    let storage = &context.storage_handle;
+    let now = crate::effect_adapters::routing::now_ms();
+    let mut next = None::<Duration>;
+    let mut soon = |after: Duration| next = Some(next.map_or(after, |next| next.min(after)));
+    let mut after = None;
+    loop {
+        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+            storage,
+            TRANSITION_QUEUE_KEYSPACE,
+            None,
+            after,
+            BUCKET_PAGE,
+            None,
+        )
+        .await?;
+        for (key, _) in rows {
+            let bucket = String::from_utf8(key.to_vec()).map_err(|error| error.to_string())?;
+            let Some(record) = read_record(storage, &bucket).await? else {
+                continue;
+            };
+            if record.finished_at_ms.is_some() {
+                continue;
+            }
+            if let Some(at) = record.retry_at_ms.filter(|at| *at > now) {
+                soon(Duration::from_millis(at - now));
+                continue;
+            }
+            if let Some(wait) = advance(context, &bucket, record).await? {
+                soon(wait);
+            }
+        }
+        match cursor {
+            Some(cursor) => after = Some(cursor),
+            None => return Ok(next),
+        }
+    }
+}
+
+/// The rows that start converting a bucket's plain copies after encryption is enabled. The
+/// enabling transaction writes them with its settings, then wakes `TaskKey::MigrateCompression`.
+pub fn encrypt_rows(
+    bucket: &str,
+    settings: &BucketEncryption,
+    record: &BucketKeyRecord,
+    compression: Compression,
+    now_ms: u64,
+) -> Result<Vec<(String, Key, Value)>, ConversionError> {
+    let plan = SealPlan::capture(settings, record).map_err(ConversionError::from)?;
+    let target = TransitionTarget { compression, plan };
+    let generation = settings.storage_generation;
+    let kind = TransitionKind::Encrypt;
+    let transition = EncryptionTransition::new(kind, None, target, generation, now_ms);
+    let key: Key = bucket.as_bytes().to_vec().into();
+    Ok(vec![
+        (
+            TRANSITION_KEYSPACE.to_string(),
+            key.clone(),
+            transition.to_bytes()?.into(),
+        ),
+        (
+            TRANSITION_QUEUE_KEYSPACE.to_string(),
+            key,
+            Vec::new().into(),
+        ),
+    ])
+}
+
+async fn read_record(
+    storage: &StorageHandle,
+    bucket: &str,
+) -> Result<Option<EncryptionTransition>, String> {
+    let read = StorageEffect::Read {
+        key_space: TRANSITION_KEYSPACE.to_string(),
+        key: bucket.as_bytes().to_vec().into(),
+        txn_id: None,
+    };
+    match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|value| EncryptionTransition::from_bytes(value.as_ref()))
+            .transpose()
+            .map_err(|error| error.to_string()),
+        other => Err(format!("could not read transition progress: {other:?}")),
+    }
+}
+
+/// One step of a bucket's transition: a page of versions, or a cleanup check after the pass.
+async fn advance(
+    context: &DriverContext,
+    bucket: &str,
+    mut record: EncryptionTransition,
+) -> Result<Option<Duration>, String> {
+    let now = crate::effect_adapters::routing::now_ms();
+    record.retry_at_ms = None;
+    if record.state == TransitionState::Cleanup {
+        return settle(context, bucket, record).await;
+    }
+    if record.cursor.is_none() {
+        // A new pass counts its own waits and failures.
+        record.remaining = 0;
+        record.failed = 0;
+        record.state = TransitionState::Running;
+    }
+    let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
+    let (versions, next) = crate::jobs::store::iter_prefix_page(
+        &context.storage_handle,
+        BLOB_VERSIONS_KEYSPACE,
+        Some(prefix.into()),
+        record.cursor.clone().map(Into::into),
+        PAGE,
+        None,
+    )
+    .await?;
+    for (key, _) in &versions {
+        let version_key = VersionKey::from_bytes(key.as_ref()).map_err(|e| e.to_string())?;
+        let operation =
+            RewriteVersionOperation::new(version_key, record.clone(), SystemTime::now());
+        match crate::driver::drive(operation, context).await {
+            Ok(RewriteOutcome::Moved) => record.done += 1,
+            Ok(RewriteOutcome::Skipped) => {}
+            Ok(RewriteOutcome::AwaitingKey) => record.remaining += 1,
+            Err(error) => {
+                record.failed += 1;
+                tracing::warn!(bucket, %error, "Failed to move a version to the new encryption");
+            }
+        }
+        record.cursor = Some(key.to_vec());
+    }
+    if next.is_some() {
+        store(&context.storage_handle, bucket, &record).await?;
+        return Ok(Some(MIGRATION_CONTINUE));
+    }
+    record.cursor = None;
+    let wait = match (record.failed > 0, record.remaining > 0) {
+        (true, _) if record.retries < RETRIES => {
+            record.retries += 1;
+            Some(RECHECK.saturating_mul(1 << record.retries.min(6)))
+        }
+        (true, _) => {
+            record.state = TransitionState::Blocked;
+            record.blocked_reason = Some("versions failed to move in every retry".to_string());
+            Some(RECHECK.saturating_mul(60))
+        }
+        (false, true) => {
+            record.state = TransitionState::AwaitingKey;
+            Some(RECHECK)
+        }
+        (false, false) => {
+            record.state = TransitionState::Cleanup;
+            return settle(context, bucket, record).await;
+        }
+    };
+    record.retry_at_ms = wait.map(|wait| now.saturating_add(wait.as_millis() as u64));
+    store(&context.storage_handle, bucket, &record).await?;
+    Ok(wait)
+}
+
+/// Counts old copies whose location rows still exist and forgets removed ones. With none
+/// left the transition finishes.
+async fn settle(
+    context: &DriverContext,
+    bucket: &str,
+    mut record: EncryptionTransition,
+) -> Result<Option<Duration>, String> {
+    let storage = &context.storage_handle;
+    let prefix: Key = cleanup_prefix(bucket).into();
+    let mut after = None;
+    let mut left = 0u64;
+    loop {
+        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+            storage,
+            TRANSITION_CLEANUP_KEYSPACE,
+            Some(prefix.clone()),
+            after,
+            PAGE,
+            None,
+        )
+        .await?;
+        for (key, _) in rows {
+            let location = key[prefix.len()..].to_vec();
+            if exists(storage, BLOB_LOCATIONS_KEYSPACE, location).await? {
+                left += 1;
+                continue;
+            }
+            let delete = StorageEffect::Delete {
+                key_space: TRANSITION_CLEANUP_KEYSPACE.to_string(),
+                key,
+                txn_id: None,
+            };
+            match storage.send_storage_effect(delete).await {
+                Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+                other => return Err(format!("could not forget a removed copy: {other:?}")),
+            }
+        }
+        match cursor {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
+    record.cleanup_remaining = left;
+    let now = crate::effect_adapters::routing::now_ms();
+    if left > 0 {
+        record.retry_at_ms = Some(now.saturating_add(RECHECK.as_millis() as u64));
+        store(storage, bucket, &record).await?;
+        return Ok(Some(RECHECK));
+    }
+    record.state = TransitionState::Finished;
+    record.finished_at_ms = Some(now);
+    store(storage, bucket, &record).await?;
+    Ok(None)
+}
+
+async fn exists(storage: &StorageHandle, key_space: &str, key: Vec<u8>) -> Result<bool, String> {
+    let read = StorageEffect::Read {
+        key_space: key_space.to_string(),
+        key: key.into(),
+        txn_id: None,
+    };
+    match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+        other => Err(format!("could not read {key_space}: {other:?}")),
+    }
+}
+
+/// Stores the progress unless a newer change replaced the transition. A finished one leaves
+/// the queue, retires its source key and removes that key's node copy in the same commit.
+async fn store(
+    storage: &StorageHandle,
+    bucket: &str,
+    record: &EncryptionTransition,
+) -> Result<(), String> {
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        other => return Err(format!("could not start a progress transaction: {other:?}")),
+    };
+    let staged = stage(storage, txn_id, bucket, record).await;
+    if !matches!(staged, Ok(true)) {
+        storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+        return staged.map(|_| ());
+    }
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        other => Err(format!("transition progress was not stored: {other:?}")),
+    }
+}
+
+async fn stage(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    bucket: &str,
+    record: &EncryptionTransition,
+) -> Result<bool, String> {
+    let key: Key = bucket.as_bytes().to_vec().into();
+    let read = StorageEffect::Read {
+        key_space: TRANSITION_KEYSPACE.to_string(),
+        key: key.clone(),
+        txn_id: Some(txn_id),
+    };
+    let stored = match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => EncryptionTransition::from_bytes(value.as_ref()).map_err(|e| e.to_string())?,
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(false),
+        other => return Err(format!("could not read transition progress: {other:?}")),
+    };
+    if stored.started_at_ms != record.started_at_ms || stored.kind != record.kind {
+        return Ok(false);
+    }
+    let value = record.to_bytes().map_err(|error| error.to_string())?;
+    let mut effects = vec![StorageEffect::Write {
+        key_space: TRANSITION_KEYSPACE.to_string(),
+        key: key.clone(),
+        value: value.into(),
+        txn_id: Some(txn_id),
+    }];
+    if record.finished_at_ms.is_some() {
+        effects.push(StorageEffect::Delete {
+            key_space: TRANSITION_QUEUE_KEYSPACE.to_string(),
+            key,
+            txn_id: Some(txn_id),
+        });
+        effects.extend(retire_source(storage, txn_id, record).await?);
+    }
+    for effect in effects {
+        match storage.send_storage_effect(effect).await {
+            Event::Storage(
+                StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
+            ) => {}
+            other => return Err(format!("could not store transition progress: {other:?}")),
+        }
+    }
+    Ok(true)
+}
+
+/// No copy needs the source generation any more: it retires and its node copy is removed.
+async fn retire_source(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    record: &EncryptionTransition,
+) -> Result<Vec<StorageEffect>, String> {
+    let Some(source) = record.source else {
+        return Ok(Vec::new());
+    };
+    let current = record.target.plan.map(|plan| plan.key);
+    if current == Some(source) {
+        return Ok(Vec::new());
+    }
+    let read = StorageEffect::Read {
+        key_space: BUCKET_KEY_KEYSPACE.to_string(),
+        key: source.key().into(),
+        txn_id: Some(txn_id),
+    };
+    let mut key = match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => BucketKeyRecord::from_bytes(value.as_ref()).map_err(|e| e.to_string())?,
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(Vec::new()),
+        other => return Err(format!("could not read the source key: {other:?}")),
+    };
+    let vault = key.vault_entry.take().or(record.source_vault);
+    key.state = KeyState::Retired;
+    let mut effects = vec![StorageEffect::Write {
+        key_space: BUCKET_KEY_KEYSPACE.to_string(),
+        key: source.key().into(),
+        value: key.to_bytes().map_err(|e| e.to_string())?.into(),
+        txn_id: Some(txn_id),
+    }];
+    if let Some(id) = vault {
+        effects.push(StorageEffect::VaultDelete {
+            entry: VaultEntry::new(VaultPurpose::BucketKey, id),
+            txn_id: Some(txn_id),
+        });
+    }
+    Ok(effects)
+}
