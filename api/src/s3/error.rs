@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::checksum::checksum_mismatch_error;
-use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
+use aruna_core::errors::{BlobError, ConversionError, SourceResolutionError, StagingSourceError};
+use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::routing::RoutingError;
 use aruna_operations::blob::managed_copy::ManagedCopyError;
 use aruna_operations::driver::{GateContextError, RoutingInputsError};
@@ -475,7 +476,9 @@ impl IntoS3Error for GetObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
             GetObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
-            GetObjectError::BucketLocked { .. } => bucket_locked_error(),
+            GetObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::Locked(_),
+            )) => bucket_locked_error(),
             GetObjectError::NoSuchVersion => missing_version_error(),
             GetObjectError::HistoricalReferenceUnavailable => {
                 s3_error!(
@@ -672,7 +675,12 @@ mod tests {
     #[test]
     fn locked_read_denied() {
         let bucket_id = ulid::Ulid::from_bytes([4; 16]);
-        let error = GetObjectError::BucketLocked { bucket_id }.into_s3_error();
+        let locked = || {
+            GetObjectError::ConversionError(ConversionError::BucketKey(BucketKeyError::Locked(
+                bucket_id,
+            )))
+        };
+        let error = locked().into_s3_error();
         assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
         assert_eq!(error.message(), Some("Bucket is locked"));
         assert_eq!(error.status_code(), Some(http::StatusCode::FORBIDDEN));
@@ -680,7 +688,7 @@ mod tests {
             .headers()
             .and_then(|headers| headers.get(LOCKED_HEADER));
         assert_eq!(header.and_then(|value| value.to_str().ok()), Some("true"));
-        let copy = CopyObjectError::Get(GetObjectError::BucketLocked { bucket_id });
+        let copy = CopyObjectError::Get(locked());
         assert!(copy.into_s3_error().headers().is_some());
         let denied = GetObjectError::HolderAccessDenied.into_s3_error();
         assert!(
