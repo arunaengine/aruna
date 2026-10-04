@@ -145,6 +145,8 @@ encrypted.
   secure erasure. Job and notebook working directories are removed when the job or session ends,
   but logs, reports and files written by your own code are kept as they are; only files written
   to an encrypted bucket are encrypted.
+- **Content fingerprints.** For deduplication, the node keeps content hashes of encrypted
+  objects. These hashes are extra plaintext fingerprints: they can show that two files are equal.
 
 ## Avoiding Common Pitfalls
 
