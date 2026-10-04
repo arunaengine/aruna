@@ -137,6 +137,64 @@ fn run(case: Case) -> (RemoveHolderOperation, Effects) {
     (operation, effects)
 }
 
+fn deleted(effects: &Effects) -> Vec<String> {
+    let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice() else {
+        panic!("expected the delete batch, got {effects:?}");
+    };
+    deletes.iter().map(|(space, _)| space.clone()).collect()
+}
+
+#[test]
+fn removal_needs_confirmation() {
+    // Creator and one explicit holder are ready: removing the grant leaves one holder without a
+    // recovery code, which breaks the rule.
+    let case = || Case {
+        target: user(3),
+        admins: BTreeSet::new(),
+        grants: vec![grant(user(3))],
+        copies: vec![copy(user(1), 2), copy(user(3), 2), copy(user(3), 1)],
+        revision: None,
+        confirm: false,
+    };
+    let (operation, effects) = run(case());
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    assert_eq!(
+        operation.finalize(),
+        Err(RemovalError::RecoveryConfirmationRequired)
+    );
+
+    let (mut operation, effects) = run(Case {
+        confirm: true,
+        ..case()
+    });
+    // The grant and the user's copies of every generation go.
+    assert_eq!(
+        deleted(&effects),
+        [BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE, KEY_COPY_KEYSPACE]
+    );
+    let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+        entries: Vec::new(),
+    }));
+    let [
+        Effect::Storage(StorageEffect::Write {
+            key_space, value, ..
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("expected the audit record, got {effects:?}");
+    };
+    assert_eq!(key_space, BUCKET_AUDIT_KEYSPACE);
+    let record = BucketAuditRecord::from_bytes(value).unwrap();
+    assert_eq!(
+        (record.action, record.actor),
+        (AuditAction::HolderRemoval, Some(user(1)))
+    );
+    assert!(record.reason.is_some(), "a confirmed break is recorded");
+}
+
 #[test]
 fn stale_revision_refused() {
     let (operation, _) = run(Case {
@@ -148,4 +206,25 @@ fn stale_revision_refused() {
         confirm: true,
     });
     assert_eq!(operation.finalize(), Err(RemovalError::StaleHolders));
+}
+
+#[test]
+fn admin_keeps_copies() {
+    // The explicit grant of a current admin goes, but the admin keeps their copies.
+    let (operation, effects) = run(Case {
+        target: user(2),
+        admins: BTreeSet::from([user(2)]),
+        grants: vec![grant(user(2))],
+        copies: vec![copy(user(1), 2), copy(user(2), 2)],
+        revision: None,
+        confirm: false,
+    });
+    assert_eq!(deleted(&effects), [BUCKET_HOLDER_KEYSPACE]);
+    assert!(matches!(
+        operation.output,
+        Some(Ok(RemovalResult {
+            deleted_copies: 0,
+            ..
+        }))
+    ));
 }
