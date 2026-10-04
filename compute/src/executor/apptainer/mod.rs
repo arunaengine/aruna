@@ -676,7 +676,10 @@ impl ExecutorBackend for ApptainerBackend {
             || (status.is_none() && !self.state.attempt_dir(context).exists()))
             && runtime::cgroup_empty(&self.cgroup_path(context))?
         {
-            return remove_staging_temps(&self.state.attempt_dir(context));
+            let directory = self.state.attempt_dir(context);
+            remove_staging_temps(&directory)?;
+            // Staged inputs and outputs are plaintext; logs and status stay as evidence.
+            return remove_tree(&directory.join("workspace"));
         }
         Err(BackendError::Conflict(
             "Apptainer cleanup requires terminal evidence and an empty cgroup".to_string(),
@@ -1385,6 +1388,34 @@ mod tests {
         backend.cleanup(&context).await.unwrap();
 
         assert!(!foreign.exists());
+    }
+
+    #[tokio::test]
+    async fn removes_ended_workspace() {
+        let root = tempdir().unwrap();
+        let backend = test_backend(root.path());
+        let context = FenceContext {
+            attempt: AttemptRef::new("job", 4),
+            attempt_epoch: 1,
+            controller_generation: 3,
+        };
+        let directory = backend.state.attempt_dir(&context);
+        std::fs::create_dir_all(directory.join("workspace/root/in")).unwrap();
+        std::fs::create_dir_all(directory.join("logs")).unwrap();
+        std::fs::write(directory.join("workspace/root/in/data"), b"plain").unwrap();
+        std::fs::write(directory.join("logs/stdout"), b"log").unwrap();
+        let status = StatusRecord {
+            phase: AttemptPhase::Exited { code: 0 },
+            started_at_ms: Some(1),
+            finished_at_ms: 2,
+        };
+        write_json(&directory.join("status.json"), &status).unwrap();
+
+        backend.cleanup(&context).await.unwrap();
+
+        assert!(!directory.join("workspace").exists());
+        assert!(directory.join("logs/stdout").exists());
+        assert!(directory.join("status.json").exists());
     }
 
     #[tokio::test]
