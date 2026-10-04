@@ -980,26 +980,13 @@ async fn deletes_version() {
     );
 }
 
-#[tokio::test]
-async fn pending_archive_shared() {
+/// Seeds versions of `sealed` that share one pending archive, the last one current.
+async fn seed_pending(storage: &storage::StorageHandle, versions: &[Ulid]) -> BackendLocation {
     use crate::blob::records::owner_write_effect;
-    use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, COPY_OWNER_KEYSPACE};
-    use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork};
+    use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::encryption::BucketKeyRef;
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
-    use std::time::SystemTime;
 
-    let temp_handle = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-    let context = DriverContext {
-        storage_handle: storage_handle.clone(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    };
-    let user_id = test_user_id();
     let layout = PithosLayout {
         stored_size: 80,
         metadata_digest: [5u8; 32],
@@ -1012,65 +999,138 @@ async fn pending_archive_shared() {
         backend_path: "sealed".to_string(),
         ulid: Ulid::generate(),
         format: StoredFormat::pithos(layout, BucketKeyRef::new(Ulid::generate(), 1)),
-        created_by: user_id,
-        created_at: SystemTime::UNIX_EPOCH,
+        created_by: test_user_id(),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
         staging: false,
         partial: false,
         blob_size: 50,
         hashes: HashMap::new(),
     };
     let archive = ArchiveKey::of(&location);
-    // Two versions of one key share the archive, as a same-bucket copy does.
-    let (first, second) = (Ulid::generate(), Ulid::generate());
-    let version = BlobVersion::pending(archive.clone(), SystemTime::UNIX_EPOCH, user_id, None);
-    let mut writes = vec![
-        (
-            BLOB_HEAD_KEYSPACE,
-            BlobHeadKey::new("bucket", "sealed").to_bytes().unwrap(),
-            CurrentVersionPointer::new(second).to_bytes().unwrap(),
-        ),
-        (
-            PENDING_LOCATION_KEYSPACE,
-            archive.to_bytes(),
-            location.to_bytes().unwrap(),
-        ),
+    let version = BlobVersion::pending(
+        archive.clone(),
+        location.created_at,
+        location.created_by,
+        None,
+    );
+    let current = *versions.last().unwrap();
+    let mut effects = vec![
+        StorageEffect::Write {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            key: BlobHeadKey::new("bucket", "sealed")
+                .to_bytes()
+                .unwrap()
+                .into(),
+            value: CurrentVersionPointer::new(current)
+                .to_bytes()
+                .unwrap()
+                .into(),
+            txn_id: None,
+        },
+        StorageEffect::Write {
+            key_space: PENDING_LOCATION_KEYSPACE.to_string(),
+            key: archive.to_bytes().into(),
+            value: location.to_bytes().unwrap().into(),
+            txn_id: None,
+        },
     ];
-    for version_id in [first, second] {
-        let version_key = VersionKey::new("bucket", "sealed", version_id);
-        writes.push((
-            BLOB_VERSIONS_KEYSPACE,
-            version_key.to_bytes().unwrap(),
-            version.to_bytes().unwrap(),
-        ));
+    for version_id in versions {
+        let version_key = VersionKey::new("bucket", "sealed", *version_id);
+        effects.push(StorageEffect::Write {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: version_key.to_bytes().unwrap().into(),
+            value: version.to_bytes().unwrap().into(),
+            txn_id: None,
+        });
         let owner = CopyOwner::new(archive.clone(), version_key);
         let Effect::Storage(effect) = owner_write_effect(&owner, None).unwrap() else {
             panic!("owner rows are storage writes");
         };
-        storage_handle.send_storage_effect(effect).await;
+        effects.push(effect);
     }
-    for (key_space, key, value) in writes {
-        storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key: key.into(),
-                value: value.into(),
-                txn_id: None,
-            })
-            .await;
+    for effect in effects {
+        storage.send_storage_effect(effect).await;
     }
-    let delete = |version_id| {
-        DeleteObjectOperation::new(DeleteObjectInput {
-            bucket: "bucket".to_string(),
-            key: "sealed".to_string(),
-            version_id: Some(version_id),
-            group_id: Ulid::generate(),
-            realm_id: RealmId::from_bytes([1u8; 32]),
-            node_id: test_node_id(),
-            deleted_by: user_id,
-        })
+    location
+}
+
+fn delete_pending(group_id: Ulid, version_id: Ulid) -> DeleteObjectOperation {
+    DeleteObjectOperation::new(DeleteObjectInput {
+        bucket: "bucket".to_string(),
+        key: "sealed".to_string(),
+        version_id: Some(version_id),
+        group_id,
+        realm_id: RealmId::from_bytes([1u8; 32]),
+        node_id: test_node_id(),
+        deleted_by: test_user_id(),
+    })
+}
+
+/// Commits one counter update, as the publication of the seeded versions would.
+async fn apply_usage(storage: &storage::StorageHandle, mut update: UsageCounterUpdate) {
+    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    else {
+        panic!("no transaction");
     };
-    let cleanup_rows = |context: &DriverContext| {
-        let storage_handle = context.storage_handle.clone();
+    let mut effects = update.start(txn_id);
+    while let Some(Effect::Storage(effect)) = effects.pop() {
+        let event = storage.send_storage_effect(effect).await;
+        effects = update.step(event, txn_id).unwrap().unwrap_or_default();
+    }
+    storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await;
+}
+
+async fn read_counters(
+    context: &DriverContext,
+    key: Vec<u8>,
+) -> aruna_core::structs::storage::usage::UsageCounters {
+    let value = read_value(context, aruna_core::keyspaces::USAGE_STATS_KEYSPACE, key).await;
+    value.map_or_else(Default::default, |value| {
+        aruna_core::structs::storage::usage::UsageCounters::from_bytes(value.as_ref()).unwrap()
+    })
+}
+
+#[tokio::test]
+async fn pending_archive_shared() {
+    use crate::node::usage_stats::StoredDelta;
+    use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, COPY_OWNER_KEYSPACE};
+    use aruna_core::structs::storage::blob::BlobCleanupWork;
+    use aruna_core::structs::storage::usage::{
+        global_shard_key, shard_for_archive, usage_group_key,
+    };
+
+    let temp_handle = tempdir().unwrap();
+    let storage_handle = storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+    let context = DriverContext {
+        storage_handle: storage_handle.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    // Two versions of one key share the archive, as a same-bucket copy does.
+    let (first, second) = (Ulid::generate(), Ulid::generate());
+    let location = seed_pending(&storage_handle, &[first, second]).await;
+    let archive = ArchiveKey::of(&location);
+    let group_id = Ulid::generate();
+    let published = UsageDelta {
+        objects: 1,
+        logical_bytes: 100,
+        ..Default::default()
+    };
+    let stored = StoredDelta::of_copy(&location, 1, 80).unwrap();
+    apply_usage(
+        &storage_handle,
+        UsageCounterUpdate::with_stored(group_id, published, stored),
+    )
+    .await;
+    let cleanup_rows = || {
+        let storage_handle = storage_handle.clone();
         async move {
             let Event::Storage(StorageEvent::IterResult { values, .. }) = storage_handle
                 .send_storage_effect(StorageEffect::Iter {
@@ -1090,20 +1150,78 @@ async fn pending_archive_shared() {
                 .collect::<Vec<_>>()
         }
     };
+    let shard = global_shard_key(shard_for_archive(location.ulid));
 
-    drive(delete(first), &context).await.unwrap();
+    drive(delete_pending(group_id, first), &context)
+        .await
+        .unwrap();
     let owner = CopyOwner::new(archive.clone(), VersionKey::new("bucket", "sealed", first));
     let owner_row = read_value(&context, COPY_OWNER_KEYSPACE, owner.key().unwrap()).await;
     assert!(owner_row.is_none());
     let pending = read_value(&context, PENDING_LOCATION_KEYSPACE, archive.to_bytes()).await;
     assert!(pending.is_some(), "the other owner still uses the archive");
-    assert!(cleanup_rows(&context).await.is_empty());
+    assert!(cleanup_rows().await.is_empty());
+    let group = read_counters(&context, usage_group_key(group_id)).await;
+    assert_eq!((group.objects, group.logical_bytes), (1, 50));
+    let physical = read_counters(&context, shard.clone()).await;
+    assert_eq!((physical.stored_blobs, physical.stored_bytes), (1, 80));
 
-    drive(delete(second), &context).await.unwrap();
+    drive(delete_pending(group_id, second), &context)
+        .await
+        .unwrap();
     let pending = read_value(&context, PENDING_LOCATION_KEYSPACE, archive.to_bytes()).await;
     assert!(pending.is_none());
     assert_eq!(
-        cleanup_rows(&context).await,
+        cleanup_rows().await,
         vec![BlobCleanupWork::DeleteBlob { location }]
     );
+    let group = read_counters(&context, usage_group_key(group_id)).await;
+    assert_eq!((group.objects, group.logical_bytes), (0, 0));
+    let physical = read_counters(&context, shard).await;
+    assert_eq!((physical.stored_blobs, physical.stored_bytes), (0, 0));
+}
+
+#[tokio::test]
+async fn malformed_owner_aborts() {
+    use aruna_core::keyspaces::COPY_OWNER_KEYSPACE;
+
+    let temp_handle = tempdir().unwrap();
+    let storage_handle = storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+    let context = DriverContext {
+        storage_handle: storage_handle.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let version_id = Ulid::generate();
+    let location = seed_pending(&storage_handle, &[version_id]).await;
+    let archive = ArchiveKey::of(&location);
+    let malformed = [CopyOwner::prefix(&archive), vec![0xFF; 3]].concat();
+    storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: COPY_OWNER_KEYSPACE.to_string(),
+            key: malformed.into(),
+            value: Vec::new().into(),
+            txn_id: None,
+        })
+        .await;
+
+    let result = drive(delete_pending(Ulid::generate(), version_id), &context).await;
+
+    assert!(matches!(result, Err(DeleteObjectError::ConversionError(_))));
+    let pending = read_value(&context, PENDING_LOCATION_KEYSPACE, archive.to_bytes()).await;
+    assert!(
+        pending.is_some(),
+        "an unreadable owner never frees the archive"
+    );
+    let version = VersionKey::new("bucket", "sealed", version_id);
+    let kept = read_value(
+        &context,
+        BLOB_VERSIONS_KEYSPACE,
+        version.to_bytes().unwrap(),
+    )
+    .await;
+    assert!(kept.is_some(), "the delete transaction is aborted");
 }

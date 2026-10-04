@@ -735,9 +735,14 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
         let released = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
-        let owned = values.iter().any(|(key, _)| {
-            CopyOwner::from_key(key.as_ref()).is_ok_and(|owner| owner.version != released)
-        });
+        let mut owned = false;
+        for (key, _) in &values {
+            // An unreadable owner proves nothing, so the archive is never freed past it.
+            match CopyOwner::from_key(key.as_ref()) {
+                Ok(owner) => owned |= owner.version != released,
+                Err(error) => return self.emit_error(error.into()),
+            }
+        }
         let Some(location) = location.filter(|_| !owned) else {
             return self.start_usage_update();
         };
