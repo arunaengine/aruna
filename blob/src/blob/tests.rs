@@ -3805,3 +3805,6 @@ mod frames;
 
 #[path = "pithos_tests.rs"]
 mod pithos;
+
+#[path = "rewrite_tests.rs"]
+mod rewrite;
