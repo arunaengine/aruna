@@ -57,6 +57,7 @@ contains, how it was created and how it can be reused.
 - **Interactive notebooks**: write and run Jupyter notebooks in the portal, with direct access to your data.
 - **AI assistants**: connect AI assistants through [MCP](https://modelcontextprotocol.io/) so they can search, read and work with your data, with your permissions.
 - **Flexible storage**: keep data on local disks or connect other storage systems. Buckets can combine local files, copies and references to files on other nodes.
+- **Encrypted buckets**: a bucket can store new files encrypted, with keys that stay with the people you choose.
 - **Safe transfers**: Aruna checks files when storing and copying them to detect data corruption early.
 - **Open standards**: single sign-on with [OIDC](https://openid.net/connect/), data references with [GA4GH DRS](https://www.ga4gh.org/product/data-repository-service-drs/) and metadata harvesting with [OAI-PMH](https://www.openarchives.org/pmh/).
 - **Simple to deploy**: run a single node as one program, or a cluster of nodes.
@@ -120,6 +121,30 @@ cargo run -p aruna
 Building from source needs the Rust version named in [rust-toolchain.toml](rust-toolchain.toml).
 The node then serves the API documentation on `http://127.0.0.1:3000/swagger-ui` and the S3
 interface on `http://127.0.0.1:1337`.
+
+## Encrypted Buckets
+
+A group admin can turn on encryption for a bucket, in the portal or with
+`PUT /data/buckets/{bucket}/storage/encryption`. The node then stores new files of that bucket
+encrypted.
+
+- **Two modes.** With `node_managed`, the node can open the bucket key after a restart. With
+  `vault_locked`, a key holder must unlock the bucket in the portal; the key stays only in the
+  node's memory, until it is locked again, a time limit ends, or the node restarts.
+- **Key holders.** The bucket creator, the group admins and users granted explicitly hold a sealed
+  copy of the bucket key. Keep at least two holders, or one with a recovery key, so the data is not
+  lost with one person's key.
+- **While locked.** Uploads, listings and object info still work. Reading content, copying it to
+  another bucket and jobs that need it wait or are refused. S3 answers `403 AccessDenied` with the
+  header `x-aruna-bucket-locked: true`.
+- **S3 clients.** Encrypted buckets report `AES256` server-side encryption. `PutBucketEncryption`
+  with `AES256` turns on `node_managed` mode; turning encryption off is only possible through the
+  REST API. Other encryption headers, such as KMS or customer keys, are refused.
+- **What is not covered.** Turning on encryption does not remove plaintext that existed before:
+  backups, old disk blocks and copies on other systems stay as they were. Deleting a file is not
+  secure erasure. Job and notebook working directories are removed when the job or session ends,
+  but logs, reports and files written by your own code are kept as they are; only files written
+  to an encrypted bucket are encrypted.
 
 ## Avoiding Common Pitfalls
 
