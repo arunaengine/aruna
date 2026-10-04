@@ -4,8 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::encryption::{
-    EncryptionStatus, RecoveryView, UnlockView, blob_refusal, bucket_group, holder_report,
-    is_holder, key_refusal, not_encrypted, read_snapshot, refused, settings_refusal, unlock_view,
+    EncryptionStatus, RecoveryView, UnlockView, blob_refusal, bucket_group, change_bucket,
+    current_status, holder_report, is_holder, key_refusal, not_encrypted, read_snapshot, refused,
+    settings_refusal, unlock_view,
 };
 use super::routing::ensure_group_admin;
 use crate::auth::require_unrestricted_auth;
@@ -15,7 +16,10 @@ use aruna_core::UserId;
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, HolderOrigin, UnlockStatus};
-use aruna_core::structs::storage::holders::{HolderEntry, HolderState, KeyLookup, holder_revision};
+use aruna_core::structs::storage::holders::{
+    HolderEntry, HolderState, KeyLookup, holder_revision, revision_with_facts,
+};
+use aruna_core::types::GroupId;
 use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::s3::bucket::holders::lookup_keys;
 use aruna_operations::s3::bucket::key_extend::{ExtendBucketOperation, ExtendError, ExtendInput};
@@ -24,7 +28,11 @@ use aruna_operations::s3::bucket::key_lock::{LockBucketOperation, LockError, Loc
 use aruna_operations::s3::bucket::key_removal::{
     RemovalError, RemovalInput, RemoveHolderOperation,
 };
-use aruna_operations::s3::bucket::key_unlock::{UnlockBucketOperation, UnlockError, UnlockInput};
+use aruna_operations::s3::bucket::key_unlock::{
+    UnlockBucketOperation, UnlockError, UnlockInput, unlock_and_wake,
+};
+use aruna_operations::s3::bucket::rotate::KeyChange;
+use aruna_operations::s3::bucket::seal_missing::{SealMissingInput, SealMissingOperation};
 use aruna_operations::s3::key_status::{AuditPageOperation, KeySnapshot};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -66,6 +74,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 pub struct UnlockQuery {
     /// The bucket id the key belongs to, as shown in the status.
     pub bucket_id: String,
+    /// The key generation the key belongs to.
     pub generation: u64,
     /// Unlock length; without it the session lasts until the bucket maximum.
     pub duration_ms: Option<u64>,
@@ -140,6 +149,7 @@ pub struct RemovalQuery {
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct CopiesQuery {
+    /// The key generation whose copies to return.
     pub generation: u64,
 }
 
@@ -271,12 +281,12 @@ fn status_view(status: &UnlockStatus) -> UnlockView {
     ),
     request_body(content = Vec<u8>, content_type = "application/octet-stream", description = "The 32-byte private key"),
     responses(
-        (status = 200, description = "The unlock state", body = UnlockView),
+        (status = 200, description = "The unlock state", body = UnlockView, example = json!({ "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": 1790003600000_u64, "max_deadline_ms": 1790007200000_u64 })),
         (status = 400, description = "`wrong_key` or `invalid_duration`", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller holds no key of this bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
-        (status = 409, description = "`stale_generation` or `not_encrypted`", body = ErrorResponse),
+        (status = 409, description = "`stale_generation`, `not_encrypted`, or `no_copy` when the caller has no sealed copy of the generation", body = ErrorResponse),
         (status = 503, description = "`unlock_capacity`: no room for another unlocked key", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -293,7 +303,7 @@ pub async fn unlock_bucket(
     let bucket_id = parse_ulid(&query.bucket_id, "bucket_id")?;
     let group_id = bucket_group(&state, &bucket).await?;
     let input = UnlockInput {
-        bucket,
+        bucket: bucket.clone(),
         group_id,
         realm_id: state.get_realm_id(),
         node_id: state.get_node_id(),
@@ -303,16 +313,55 @@ pub async fn unlock_bucket(
         now_ms: now_ms(),
     };
     let operation = UnlockBucketOperation::new(input, private_key);
-    let status = drive(operation, &state.get_ctx())
+    let origin = (state.get_realm_id(), state.get_node_id());
+    let context = state.get_ctx();
+    let status = unlock_and_wake(&context, operation, origin, state.rocrate_limits())
         .await
         .map_err(|error| match error {
             UnlockError::Settings(error) => settings_refusal(error),
             UnlockError::Key(error) => key_refusal(&error),
             UnlockError::Blob(error) => blob_refusal(error),
             UnlockError::NotHolder => forbidden_holder(),
+            UnlockError::NoCopy => refused(
+                StatusCode::CONFLICT,
+                "no_copy",
+                "the caller has no sealed copy of this key generation",
+            ),
             other => ServerError::InternalError(other.to_string()),
         })?;
+    seal_missing(&state, &bucket, group_id, status.key).await;
     Ok(Json(status_view(&status)))
+}
+
+/// Seals copies for holders that still lack one; a failure leaves them pending for later.
+async fn seal_missing(state: &ServerState, bucket: &str, group_id: GroupId, key: BucketKeyRef) {
+    let snapshot = match read_snapshot(state, bucket, group_id).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(%bucket, %error, "could not read holders to seal missing copies");
+            return;
+        }
+    };
+    let users = snapshot
+        .info
+        .as_ref()
+        .map(|info| info.created_by)
+        .into_iter()
+        .chain(snapshot.admins.iter().copied())
+        .chain(snapshot.grants.iter().map(|grant| grant.user_id))
+        .collect::<Vec<_>>();
+    let lookups = lookup_keys(&state.get_ctx(), state.get_node_id(), users).await;
+    let input = SealMissingInput {
+        bucket: bucket.to_string(),
+        group_id,
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        key,
+        lookups,
+    };
+    if let Err(error) = drive(SealMissingOperation::new(input), &state.get_ctx()).await {
+        tracing::warn!(%bucket, ?error, "missing holder copies stay pending");
+    }
 }
 
 #[utoipa::path(
@@ -333,7 +382,7 @@ pub async fn unlock_bucket(
         example = json!({ "generation": 1, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "duration_ms": 900000 })
     ),
     responses(
-        (status = 200, description = "The unlock state", body = UnlockView),
+        (status = 200, description = "The unlock state", body = UnlockView, example = json!({ "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": 1790003600000_u64, "max_deadline_ms": 1790007200000_u64 })),
         (status = 400, description = "`invalid_duration` or an invalid session id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller holds no key of this bucket", body = ErrorResponse),
@@ -388,7 +437,7 @@ pub async fn extend_unlock(
 - Reads already admitted finish; new plaintext reads are refused."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     responses(
-        (status = 200, description = "The locked state of the active generation", body = UnlockView),
+        (status = 200, description = "The locked state of the active generation", body = UnlockView, example = json!({ "state": "locked", "lock_reason": "manual", "locked_at_ms": 1790000000000_u64, "session_id": null, "unlocked_at_ms": null, "deadline_ms": null, "max_deadline_ms": null })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Neither a key holder nor a group admin", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
@@ -445,7 +494,7 @@ pub async fn lock_bucket(
 - `revision` names this list in a later removal."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     responses(
-        (status = 200, description = "The holders", body = HoldersResponse),
+        (status = 200, description = "The holders", body = HoldersResponse, example = json!({ "holders": [{ "user_id": "01JAMXS1P3T9V6Q8W2Y4Z7B5CD@realm", "name": null, "origin": "explicit", "state": "ready", "has_recovery": true, "granted_by": "01JAMXS1P3T9V6Q8W2Y4Z7B5CE@realm", "granted_at_ms": 1790000000000_u64 }], "complete": true, "unresolved": 0, "recovery": { "state": "met", "ready_holders": 2, "ready_with_recovery": 1 }, "revision": "5d1c0a6f9e1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5" })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Neither a key holder nor a group admin", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
@@ -463,12 +512,19 @@ pub async fn list_holders(
     let report = holder_report(&state, &snapshot)
         .await
         .ok_or_else(not_encrypted)?;
+    let creator = snapshot
+        .info
+        .as_ref()
+        .map(|info| info.created_by)
+        .unwrap_or_default();
+    let rows = holder_revision(&snapshot.grants, &snapshot.copies);
+    let revision = revision_with_facts(rows, creator, &snapshot.admins, &report);
     Ok(Json(HoldersResponse {
         holders: report.holders.iter().map(HolderView::from).collect(),
         complete: report.complete,
         unresolved: report.unresolved,
         recovery: RecoveryView::from(&report.recovery),
-        revision: hex::encode(holder_revision(&snapshot.grants, &snapshot.copies)),
+        revision: hex::encode(revision),
     }))
 }
 
@@ -488,7 +544,7 @@ group's admin path.
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     request_body(content = GrantRequest, example = json!({ "user_id": "01JAMXS1P3T9V6Q8W2Y4Z7B5CD@realm" })),
     responses(
-        (status = 200, description = "The new holder", body = HolderView),
+        (status = 200, description = "The new holder", body = HolderView, example = json!({ "user_id": "01JAMXS1P3T9V6Q8W2Y4Z7B5CD@realm", "name": null, "origin": "explicit", "state": "ready", "has_recovery": true, "granted_by": "01JAMXS1P3T9V6Q8W2Y4Z7B5CE@realm", "granted_at_ms": 1790000000000_u64 })),
         (status = 400, description = "Invalid user id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
@@ -647,7 +703,7 @@ pub async fn remove_holder(
         CopiesQuery
     ),
     responses(
-        (status = 200, description = "The caller's copies", body = CopiesResponse),
+        (status = 200, description = "The caller's copies", body = CopiesResponse, example = json!({ "copies": [{ "bucket_id": "01JAMXQ7B1D7Q8E7Q2F3R8Z9KC", "generation": 1, "key_record": "01JAMXT2V4W6X8Y0Z2A4B6C8DE", "key_id": "laptop", "enc": "qL3UuCZ0XkWbQZ2yZ8m1qL3UuCZ0XkWbQZ2yZ8m1qL0=", "ciphertext": "c2VhbGVkIGtleSBieXRlcw==", "created_at_ms": 1790000000000_u64 }] })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller holds no key of this bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
@@ -690,16 +746,16 @@ pub async fn my_copies(
 group's admin path.
 
 **Behavior**
-- Not available yet: answers 501 `not_supported` after the authorization checks."#,
+- Creates the next key generation, sealed to every holder with a published key, and starts a
+  transition that grants this node's archives to it. Needs the current key unlocked."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     request_body(content = RotateRequest, example = json!({ "expected_generation": 1 })),
     responses(
-        (status = 200, description = "The status after the rotation started", body = EncryptionStatus),
+        (status = 200, description = "The status after the rotation started", body = EncryptionStatus, example = json!({ "bucket": "research-raw", "mode": "node_managed", "bucket_id": "01JAMXQ7B1D7Q8E7Q2F3R8Z9KC", "storage_generation": 1, "key_generation": 1, "public_key": "qL3UuCZ0XkWbQZ2yZ8m1qL3UuCZ0XkWbQZ2yZ8m1qL0=", "fingerprint": "5d1c0a6f9e1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5", "cipher": "chacha20_poly1305", "block_keys": "content_derived", "max_unlock_ms": null, "unlock": { "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": null, "max_deadline_ms": null }, "generations": [], "holders": { "ready": 2, "pending": 0, "missing_key": 0 }, "recovery": { "state": "met", "ready_holders": 2, "ready_with_recovery": 1 }, "transition": null, "caller": { "holder": true, "ready_copy": true, "admin": true } })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
-        (status = 409, description = "`stale_generation` or `bucket_locked`", body = ErrorResponse),
-        (status = 501, description = "`not_supported`: rotation is not available yet", body = ErrorResponse)
+        (status = 409, description = "`stale_generation`, `bucket_locked`, `open_uploads` or `recovery_unmet`", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -707,16 +763,17 @@ pub async fn rotate_key(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(bucket): Path<String>,
-    Json(_request): Json<RotateRequest>,
+    Json(request): Json<RotateRequest>,
 ) -> ServerResult<Json<EncryptionStatus>> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = bucket_group(&state, &bucket).await?;
     ensure_group_admin(&state, &auth, group_id).await?;
-    Err(refused(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_supported",
-        "key rotation is not available yet",
-    ))
+    let snapshot = read_snapshot(&state, &bucket, group_id).await?;
+    let change = KeyChange::Rotate;
+    let expected = request.expected_generation;
+    change_bucket(&state, &bucket, group_id, &snapshot, change, expected).await?;
+    let status = current_status(&state, bucket, group_id, auth.user_id).await?;
+    Ok(Json(status))
 }
 
 #[utoipa::path(
@@ -737,7 +794,7 @@ pub async fn rotate_key(
         AuditQuery
     ),
     responses(
-        (status = 200, description = "One page of events", body = AuditResponse),
+        (status = 200, description = "One page of events", body = AuditResponse, example = json!({ "events": [{ "event_id": "01JAMXV3W5X7Y9Z1A3B5C7D9EF", "at_ms": 1790000000000_u64, "action": "unlock", "actor_user_id": "01JAMXS1P3T9V6Q8W2Y4Z7B5CD@realm", "node_id": "b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c", "generation": 1, "deadline_ms": 1790003600000_u64, "reason": null, "outcome": "applied" }], "next_cursor": "01JAMXV3W5X7Y9Z1A3B5C7D9EF" })),
         (status = 400, description = "Invalid cursor", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Neither a key holder nor a group admin", body = ErrorResponse),
