@@ -1,24 +1,28 @@
-//! Changes the encryption of an encrypted bucket. Its stored copies move afterwards through
-//! the bucket's transition record.
+//! Changes the encryption of an encrypted bucket: rotates its key, switches between
+//! `node_managed` and `vault_locked`, decrypts it, or changes its cipher or block keys. Stored
+//! copies move afterwards through the bucket's transition record.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::bucket::key_rows::{
-    Row, SettingsError, authority_read, generation_rows, parse_authority, uploads_open,
+    Row, SettingsError, authority_read, copy_targets, generation_rows, parse_authority,
+    uploads_open,
 };
 use aruna_core::compute::SharedSecret;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BUCKET_KEY_KEYSPACE, TRANSITION_KEYSPACE, TRANSITION_QUEUE_KEYSPACE, UPLOAD_KEYSPACE,
+    BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, TRANSITION_KEYSPACE, TRANSITION_QUEUE_KEYSPACE,
+    UPLOAD_KEYSPACE,
 };
+use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
     BlockCipher, BlockKeys, BucketEncryption, BucketHolder, BucketKeyError, BucketKeyRecord,
-    EncryptionMode, KeyState, SealPlan, SealedCopy,
+    BucketKeyRef, EncryptionMode, KeyState, SealPlan, SealedCopy,
 };
 use aruna_core::structs::storage::holders::{
     HolderReport, KeyLookup, RecoveryState, resolve_holders,
@@ -42,7 +46,12 @@ pub enum ChangeState {
     ReadBucket,
     CheckUploads,
     ReadKey,
+    ReadGrants,
+    GenerateKey,
+    SealCopies,
+    ReadUnlocked,
     WriteRows,
+    WriteVault,
     Commit,
     Finish,
     Error,
@@ -124,6 +133,8 @@ pub struct ChangeEncryptionOperation {
     active: Option<BucketKeyRecord>,
     grants: Vec<BucketHolder>,
     new_key: Option<(BucketKeyRecord, SharedSecret)>,
+    /// The node vault copy this change writes.
+    vault: Option<(Ulid, SharedSecret)>,
     result: Option<ChangeResult>,
     output: Option<Result<ChangeResult, ChangeError>>,
 }
@@ -140,6 +151,7 @@ impl ChangeEncryptionOperation {
             active: None,
             grants: Vec::new(),
             new_key: None,
+            vault: None,
             result: None,
             output: None,
         }
@@ -148,6 +160,7 @@ impl ChangeEncryptionOperation {
     fn fail(&mut self, error: impl Into<ChangeError>) -> Effects {
         self.output = Some(Err(error.into()));
         self.new_key = None;
+        self.vault = None;
         let effects = self.abort();
         self.state = ChangeState::Error;
         effects
@@ -169,7 +182,8 @@ impl ChangeEncryptionOperation {
         }
     }
 
-    /// Rotation and leaving the node vault need a new generation.
+    /// Rotation and leaving the node vault need a new generation; the vault copy of the old
+    /// one is removed once no archive needs it.
     fn new_generation(&self) -> bool {
         let (mode, ..) = self.wanted();
         self.input.change == KeyChange::Rotate
@@ -243,13 +257,56 @@ impl ChangeEncryptionOperation {
             Err(error) => return self.fail(error),
         };
         let vault_entry = record.vault_entry;
+        let key = record.key;
         self.active = Some(record);
         let (mode, ..) = self.wanted();
-        let leaves_vault = mode == EncryptionMode::NodeManaged && vault_entry.is_none();
-        if self.new_generation() || leaves_vault {
-            return self.fail(BucketKeyError::Unsupported);
+        if self.new_generation() {
+            self.state = ChangeState::ReadGrants;
+            let prefix = key.bucket_id.to_bytes().to_vec().into();
+            return self.scan(BUCKET_HOLDER_KEYSPACE, Some(prefix));
+        }
+        if mode == EncryptionMode::NodeManaged && vault_entry.is_none() {
+            // Leaving `vault_locked` needs the unlocked key for the node vault copy.
+            self.state = ChangeState::ReadUnlocked;
+            return smallvec![Effect::Blob(BlobEffect::ReadUnlockedKey { key })];
         }
         self.write_rows(None, Vec::new())
+    }
+
+    fn seal(&mut self, public_key: [u8; 32], private_key: SharedSecret) -> Effects {
+        let (Some(active), Some(info)) = (self.active.as_ref(), self.info.as_ref()) else {
+            return self.fail(ChangeError::NotFinished);
+        };
+        let key = BucketKeyRef::new(active.key.bucket_id, active.key.generation + 1);
+        let record_id = Ulid::generate();
+        let mut record = BucketKeyRecord::new(key, record_id, public_key, self.input.now_ms);
+        let (mode, ..) = self.wanted();
+        // A new `vault_locked` generation never enters the node vault.
+        if mode == EncryptionMode::NodeManaged {
+            record.vault_entry = Some(record_id);
+        }
+        let creator = info.created_by;
+        let report = resolve_holders(
+            creator,
+            &self.admins,
+            &self.grants,
+            &self.input.lookups,
+            &[],
+        );
+        let holders = copy_targets(&report, &self.input.lookups);
+        self.new_key = Some((record, private_key.clone()));
+        if holders.is_empty() {
+            return self.write_rows(None, Vec::new());
+        }
+        self.state = ChangeState::SealCopies;
+        smallvec![Effect::Blob(BlobEffect::SealHolderCopies {
+            key,
+            public_key,
+            private_key,
+            realm_id: self.input.realm_id,
+            node_id: self.input.node_id,
+            holders,
+        })]
     }
 
     fn report(&self, copies: &[SealedCopy]) -> HolderReport {
@@ -275,6 +332,18 @@ impl ChangeEncryptionOperation {
 }
 
 impl ChangeEncryptionOperation {
+    fn write_vault(&mut self) -> Effects {
+        let Some((id, secret)) = self.vault.take() else {
+            return self.commit();
+        };
+        self.state = ChangeState::WriteVault;
+        smallvec![Effect::Storage(StorageEffect::VaultWrite {
+            entry: VaultEntry::new(VaultPurpose::BucketKey, id),
+            secret,
+            txn_id: self.txn_id,
+        })]
+    }
+
     fn commit(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.fail(ChangeError::NotFinished);
@@ -338,7 +407,44 @@ impl Operation for ChangeEncryptionOperation {
             (ChangeState::ReadKey, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
                 self.read_key(value)
             }
+            (ChangeState::ReadGrants, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                let grants = values
+                    .iter()
+                    .map(|(_, value)| BucketHolder::from_bytes(value.as_ref()))
+                    .collect::<Result<Vec<_>, _>>();
+                match grants {
+                    Ok(grants) => {
+                        self.grants = grants;
+                        self.state = ChangeState::GenerateKey;
+                        smallvec![Effect::Blob(BlobEffect::GenerateBucketKey)]
+                    }
+                    Err(error) => self.fail(error),
+                }
+            }
+            (
+                ChangeState::GenerateKey,
+                Event::Blob(BlobEvent::BucketKeyGenerated {
+                    public_key,
+                    private_key,
+                }),
+            ) => self.seal(public_key, private_key),
+            (ChangeState::SealCopies, Event::Blob(BlobEvent::CopiesSealed { copies })) => {
+                let wanted = self.new_key.as_ref().map(|(record, _)| record.key);
+                if copies.iter().any(|copy| Some(copy.key) != wanted) {
+                    return self.fail(ChangeError::NotFinished);
+                }
+                self.write_rows(None, copies)
+            }
+            (
+                ChangeState::ReadUnlocked,
+                Event::Blob(BlobEvent::UnlockedKeyRead { key, private_key }),
+            ) if self.settings.active_key() == Some(key) => {
+                self.write_rows(Some(private_key), Vec::new())
+            }
             (ChangeState::WriteRows, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                self.write_vault()
+            }
+            (ChangeState::WriteVault, Event::Storage(StorageEvent::WriteResult { .. })) => {
                 self.commit()
             }
             (
@@ -369,6 +475,7 @@ impl Operation for ChangeEncryptionOperation {
 
     fn abort(&mut self) -> Effects {
         self.new_key = None;
+        self.vault = None;
         self.txn_id
             .take()
             .map_or_else(smallvec::SmallVec::new, |txn_id| {

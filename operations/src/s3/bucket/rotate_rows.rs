@@ -108,6 +108,13 @@ impl ChangeEncryptionOperation {
             old.to_bytes()?.into(),
         ));
         let key = self.new_key.take();
+        self.vault = match (&secret, old.vault_entry, &key) {
+            (Some(secret), Some(entry), _) => Some((entry, secret.clone())),
+            (None, _, Some((record, secret))) => {
+                record.vault_entry.map(|entry| (entry, secret.clone()))
+            }
+            _ => None,
+        };
         self.result = Some(ChangeResult {
             settings,
             transition,
