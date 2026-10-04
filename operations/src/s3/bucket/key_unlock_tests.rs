@@ -23,6 +23,23 @@ fn private() -> SharedSecret {
 
 /// Runs an unlock by `caller` with `admins` up to its prepare step.
 fn prepared(caller: UserId, admins: &[UserId]) -> (UnlockBucketOperation, Effects) {
+    let (mut operation, effects) = checked(caller, admins);
+    if !matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Iter { .. })]
+    ) {
+        return (operation, effects);
+    }
+    let copy = (Key::from(Vec::new()), Value::from(vec![1]));
+    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+        values: vec![copy],
+        next_start_after: None,
+    }));
+    (operation, effects)
+}
+
+/// Runs an unlock up to the read of the caller's sealed copy.
+fn checked(caller: UserId, admins: &[UserId]) -> (UnlockBucketOperation, Effects) {
     let key = BucketKeyRef::new(BUCKET_ID, 2);
     let input = UnlockInput {
         bucket: "bucket".to_string(),
@@ -251,4 +268,32 @@ fn unsynced_intent_discards() {
         [Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() })]
     );
     assert!(matches!(operation.finalize(), Err(UnlockError::Storage(_))));
+}
+
+#[test]
+fn copyless_holder_refused() {
+    let (mut operation, effects) = checked(user(1), &[]);
+    let [
+        Effect::Storage(StorageEffect::Iter {
+            key_space, prefix, ..
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("expected the copy read, got {effects:?}");
+    };
+    assert_eq!(key_space, KEY_COPY_KEYSPACE);
+    let key = BucketKeyRef::new(BUCKET_ID, 2);
+    assert_eq!(
+        prefix.as_deref(),
+        Some(&SealedCopy::user_prefix(key, user(1))[..])
+    );
+    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: None,
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    assert_eq!(operation.finalize(), Err(UnlockError::NoCopy));
 }

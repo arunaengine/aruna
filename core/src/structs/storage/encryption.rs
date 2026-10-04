@@ -343,6 +343,11 @@ impl SealedCopy {
         .concat()
     }
 
+    /// Scan prefix of the copies `user_id` holds of one key generation.
+    pub fn user_prefix(key: BucketKeyRef, user_id: UserId) -> Vec<u8> {
+        [&key.key()[..], &[USER_TAG], &user_id.to_storage_key()].concat()
+    }
+
     /// Reads the reference and user of a copy key. Token copies are refused until stage 5.
     pub fn parse_key(bytes: &[u8]) -> Result<(BucketKeyRef, UserId, Ulid), ConversionError> {
         let (reference, rest) = bytes
@@ -589,6 +594,8 @@ mod tests {
         };
         let parsed = SealedCopy::parse_key(&copy.key()).unwrap();
         assert_eq!(parsed, (reference, copy.user_id, copy.key_record));
+        assert!(copy.key().starts_with(&SealedCopy::user_prefix(reference, user(5))));
+        assert!(!copy.key().starts_with(&SealedCopy::user_prefix(reference, user(6))));
         let token = [&reference.key()[..], &[TOKEN_TAG], b"ACCESSKEY"].concat();
         assert!(SealedCopy::parse_key(&token).is_err());
         assert_eq!(

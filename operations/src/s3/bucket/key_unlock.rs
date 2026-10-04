@@ -9,12 +9,14 @@ use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE};
+use aruna_core::keyspaces::{
+    BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRecord, BucketKeyRef, HolderOrigin, KeyState, KeyTicket,
-    UnlockStatus, deadline_after,
+    SealedCopy, UnlockStatus, deadline_after,
 };
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::task::TaskEffect;
@@ -31,6 +33,7 @@ enum UnlockStep {
     StartTransaction,
     ReadBucket,
     ReadKey,
+    ReadCopy,
     PrepareKey,
     WriteIntent,
     CommitIntent,
@@ -58,6 +61,9 @@ pub enum UnlockError {
     /// The caller is neither creator, current admin nor an explicit holder (D30).
     #[error("the caller holds no key of this bucket")]
     NotHolder,
+    /// The caller is a holder, but no copy of this generation was sealed to them yet.
+    #[error("the caller holds no sealed copy of this key generation")]
+    NoCopy,
     #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: String,
@@ -89,6 +95,7 @@ pub struct UnlockBucketOperation {
     implicit: bool,
     max: Option<Duration>,
     private_key: Option<SharedSecret>,
+    record: Option<BucketKeyRecord>,
     ticket: Option<KeyTicket>,
     intent: Option<BucketAuditRecord>,
     failure: Option<UnlockError>,
@@ -106,6 +113,7 @@ impl UnlockBucketOperation {
             implicit: false,
             max: None,
             private_key: Some(private_key),
+            record: None,
             ticket: None,
             intent: None,
             failure: None,
@@ -190,6 +198,26 @@ impl UnlockBucketOperation {
         if !(explicit || self.implicit) {
             return self.fail(UnlockError::NotHolder);
         }
+        let prefix = SealedCopy::user_prefix(record.key, self.input.caller);
+        self.record = Some(record);
+        self.step = UnlockStep::ReadCopy;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: KEY_COPY_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: None,
+            limit: 1,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// Only a holder with a copy of this generation can have opened its key.
+    fn copy_read(&mut self, values: Vec<(Key, Value)>) -> Effects {
+        if values.is_empty() {
+            return self.fail(UnlockError::NoCopy);
+        }
+        let Some(record) = self.record.take() else {
+            return self.fail(UnlockError::NotFinished);
+        };
         let Some(private_key) = self.private_key.take() else {
             return self.fail(UnlockError::NotFinished);
         };
@@ -292,6 +320,9 @@ impl Operation for UnlockBucketOperation {
             }
             (UnlockStep::ReadKey, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.prepare(values)
+            }
+            (UnlockStep::ReadCopy, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                self.copy_read(values)
             }
             (UnlockStep::PrepareKey, Event::Blob(BlobEvent::KeyPrepared { ticket }))
                 if ticket.key == self.input.key =>
