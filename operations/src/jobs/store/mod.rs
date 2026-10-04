@@ -42,11 +42,13 @@ use crate::tasks::queue_backoff::retry_delay_ms;
 mod attempt;
 mod key_wait;
 mod query;
+mod remote_wait;
 mod state;
 
 pub use attempt::*;
 pub use key_wait::*;
 pub use query::*;
+pub use remote_wait::*;
 pub use state::*;
 
 pub(super) type JobWrites = Vec<(KeySpace, Key, Value)>;
