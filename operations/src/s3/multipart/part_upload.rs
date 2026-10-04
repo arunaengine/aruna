@@ -541,6 +541,7 @@ impl UploadPartOperation {
             location,
             created_at: SystemTime::now(),
             backend_etag: self.backend_etag.clone(),
+            piece: None,
         };
         let key =
             match MultipartPartKey::new(self.input.upload_id, self.input.part_number).to_bytes() {
@@ -867,6 +868,7 @@ mod test {
             subject_generation: 0,
             completing_since_ms: None,
             backend_upload: None,
+            encryption: None,
         };
 
         let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
@@ -916,6 +918,7 @@ mod test {
             subject_generation: 0,
             completing_since_ms: None,
             backend_upload: Some(upload),
+            encryption: None,
         };
         (op, record)
     }

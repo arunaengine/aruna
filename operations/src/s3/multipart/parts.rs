@@ -340,6 +340,7 @@ mod test {
             subject_generation: 0,
             completing_since_ms: None,
             backend_upload: None,
+            encryption: None,
         }
     }
 
@@ -360,6 +361,7 @@ mod test {
             location: part_location(),
             created_at: SystemTime::UNIX_EPOCH,
             backend_etag: None,
+            piece: None,
         };
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {

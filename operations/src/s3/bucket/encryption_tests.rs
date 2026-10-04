@@ -262,6 +262,7 @@ fn open_uploads_conflict() {
         subject_generation: 0,
         completing_since_ms: None,
         backend_upload: None,
+        encryption: None,
     };
     let values = vec![(b"upload".to_vec().into(), upload.to_bytes().unwrap().into())];
     let effects = operation.step(Event::Storage(StorageEvent::IterResult {

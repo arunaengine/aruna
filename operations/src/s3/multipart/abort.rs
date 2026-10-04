@@ -564,6 +564,7 @@ mod pure_tests {
             subject_generation: 0,
             completing_since_ms: None,
             backend_upload: None,
+            encryption: None,
         });
         operation.txn_id = Some(TxnId::from_bytes([3u8; 16]));
         operation.state = AbortUploadState::CommitMarkTransaction;
@@ -702,6 +703,7 @@ mod pure_tests {
             location: location.clone(),
             created_at: SystemTime::UNIX_EPOCH,
             backend_etag: None,
+            piece: None,
         });
         let txn_id = TxnId::from_bytes([5u8; 16]);
         operation.txn_id = Some(txn_id);
@@ -744,6 +746,7 @@ mod pure_tests {
             location: part_location(),
             created_at: SystemTime::UNIX_EPOCH,
             backend_etag: None,
+            piece: None,
         });
         let txn_id = TxnId::from_bytes([5u8; 16]);
         operation.txn_id = Some(txn_id);

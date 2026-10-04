@@ -2853,6 +2853,7 @@ async fn in_place_part(
         location,
         created_at: SystemTime::now(),
         backend_etag: Some(backend_etag),
+        piece: None,
     }
 }
 
@@ -3005,6 +3006,7 @@ async fn s3_staged_replacement() {
         location,
         created_at: SystemTime::now(),
         backend_etag: None,
+        piece: None,
     };
 
     let BlobEvent::WriteFinished { location } =
@@ -3252,6 +3254,7 @@ async fn s3_overlapping_writes() {
         location,
         created_at: SystemTime::now(),
         backend_etag: None,
+        piece: None,
     };
 
     let BlobEvent::WriteFinished { location } =

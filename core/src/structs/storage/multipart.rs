@@ -8,6 +8,8 @@ use crate::structs::checksum::{ChecksumAlgorithm, HASH_MD5};
 use crate::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use crate::structs::storage::blob::checked_refs;
 use crate::structs::storage::blob::{BackendLocation, BackendRef};
+use crate::structs::storage::encryption::SealPlan;
+use crate::structs::storage::format::Compression;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -79,6 +81,15 @@ pub struct MultipartUpload {
     pub completing_since_ms: Option<u64>,
     /// The provider upload an S3 backend streams the parts into; `None` keeps one blob per part.
     pub backend_upload: Option<BackendUpload>,
+    /// How parts of an encrypted bucket are sealed, captured at creation; `None` stores plain parts.
+    pub encryption: Option<UploadEncryption>,
+}
+
+/// The seal plan and compression every part and the completion of an encrypted upload use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UploadEncryption {
+    pub plan: SealPlan,
+    pub compression: Compression,
 }
 
 /// A provider's own multipart upload, written in place so completion copies no byte.
@@ -175,6 +186,45 @@ pub struct MultipartPart {
     pub created_at: SystemTime,
     /// The provider's ETag of an in-place part, which completion must name.
     pub backend_etag: Option<String>,
+    /// The sealed piece of a part of an encrypted upload.
+    pub piece: Option<PartPiece>,
+}
+
+/// Record of one part sealed as a Pithos piece. It holds no key material.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PartPiece {
+    /// `Piece::to_bytes` of the part; its key id is the part number.
+    pub record: Vec<u8>,
+    /// Length of the stored piece bytes, which completion copies unchanged.
+    pub stored_len: u64,
+    /// File offset the part's content tree was recorded at; `None` recorded no tree.
+    pub content_offset: Option<u64>,
+}
+
+/// File offset to record the content tree of `part_number` at, chosen before its bytes arrive.
+///
+/// Part 1 starts at 0. Later parts assume equal sizes: the lowest saved part that is not the
+/// highest saved part gives the size, else `declared`. Overflow or misalignment records no tree.
+pub fn content_offset(
+    part_number: u16,
+    saved: &[(u16, u64)],
+    declared: Option<u64>,
+) -> Option<u64> {
+    if part_number <= 1 {
+        return Some(0);
+    }
+    let mut others: Vec<_> = saved
+        .iter()
+        .filter(|(number, _)| *number != part_number)
+        .copied()
+        .collect();
+    others.sort_unstable();
+    let size = match others.as_slice() {
+        [(_, size), _, ..] => *size,
+        _ => declared?,
+    };
+    let offset = u64::from(part_number - 1).checked_mul(size)?;
+    (size > 0 && offset.is_multiple_of(1024)).then_some(offset)
 }
 
 impl MultipartPart {
@@ -291,7 +341,9 @@ impl MultipartObjectPart {
 
 #[cfg(test)]
 mod test {
-    use super::{MultipartChecksumType, MultipartObjectKey, MultipartObjectSummary};
+    use super::{
+        MultipartChecksumType, MultipartObjectKey, MultipartObjectSummary, content_offset,
+    };
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use ulid::Ulid;
@@ -445,5 +497,41 @@ mod test {
             MultipartObjectSummary::from_bytes(&summary.to_bytes().unwrap()).unwrap(),
             summary
         );
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn offset_follows_saved() {
+        // Part 1 is at 0; parallel equal parts use the lowest saved part that is not the last.
+        assert_eq!(content_offset(1, &[], None), Some(0));
+        let saved = [(1, 8 * MIB), (2, 8 * MIB), (4, 3 * MIB)];
+        assert_eq!(content_offset(3, &saved, Some(8 * MIB)), Some(16 * MIB));
+        assert_eq!(content_offset(5, &saved, Some(MIB)), Some(32 * MIB));
+        // Missing numbers below still assume the size of the lowest saved part.
+        assert_eq!(
+            content_offset(9, &[(3, 5 * MIB), (7, 6 * MIB)], None),
+            Some(40 * MIB)
+        );
+    }
+
+    #[test]
+    fn offset_uses_declared() {
+        // A single saved part may be the short final one, so the declared size decides.
+        assert_eq!(content_offset(2, &[(3, MIB)], Some(5 * MIB)), Some(5 * MIB));
+        assert_eq!(content_offset(2, &[], Some(5 * MIB)), Some(5 * MIB));
+        assert_eq!(content_offset(2, &[], None), None);
+        // A replaced part does not size itself.
+        assert_eq!(
+            content_offset(2, &[(2, 7 * MIB)], Some(6 * MIB)),
+            Some(6 * MIB)
+        );
+    }
+
+    #[test]
+    fn offset_needs_alignment() {
+        assert_eq!(content_offset(2, &[], Some(5 * MIB + 1)), None);
+        assert_eq!(content_offset(2, &[], Some(0)), None);
+        assert_eq!(content_offset(u16::MAX, &[], Some(u64::MAX / 2)), None);
     }
 }

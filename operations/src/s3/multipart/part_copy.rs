@@ -458,6 +458,7 @@ mod test {
             subject_generation: 1,
             completing_since_ms: None,
             backend_upload: None,
+            encryption: None,
         };
         let event = context
             .storage_handle

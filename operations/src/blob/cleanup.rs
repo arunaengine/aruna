@@ -841,6 +841,7 @@ mod tests {
                     upload_id: "provider".to_string(),
                     record_id: upload_id,
                 }),
+                encryption: None,
             };
             let event = storage
                 .send_storage_effect(StorageEffect::Write {
