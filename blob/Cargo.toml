@@ -36,6 +36,7 @@ iroh-io = { workspace = true }
 md5 = { workspace = true }
 opendal = { workspace = true }
 percent-encoding = { workspace = true }
+pithos_lib = { workspace = true }
 postcard = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
