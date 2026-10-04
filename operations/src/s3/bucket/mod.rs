@@ -10,6 +10,7 @@ pub mod encryption;
 pub mod forward;
 pub mod get;
 pub mod holders;
+pub mod key_grant;
 pub mod key_install;
 pub mod key_rows;
 pub mod list;
