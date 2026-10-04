@@ -22,6 +22,7 @@ mod group;
 mod in_place;
 mod io;
 pub mod pithos;
+mod pithos_hash;
 mod pithos_rewrite;
 mod registry;
 mod replication;

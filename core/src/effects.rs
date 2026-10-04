@@ -250,6 +250,12 @@ pub enum BlobEffect {
     ReadUnlockedKey {
         key: BucketKeyRef,
     },
+    /// Reads the sealed copy at `location` through `lease` and answers the raw hashes of its
+    /// verified plaintext; the plaintext never leaves the adapter.
+    HashArchive {
+        location: BackendLocation,
+        lease: ReadLease,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

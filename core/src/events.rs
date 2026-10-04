@@ -197,6 +197,11 @@ pub enum BlobEvent {
         key: BucketKeyRef,
         private_key: SharedSecret,
     },
+    /// The raw hashes and size of the verified plaintext of a sealed copy.
+    ArchiveHashed {
+        hashes: std::collections::HashMap<String, Vec<u8>>,
+        size: u64,
+    },
 }
 
 #[derive(Debug, PartialEq)]

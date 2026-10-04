@@ -105,6 +105,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::AdmitRead { .. } => (EffectClass::Local, "admit_read"),
         BlobEffect::RewriteCopy { .. } => (EffectClass::Transfer, "rewrite_copy"),
         BlobEffect::ReadUnlockedKey { .. } => (EffectClass::Local, "read_unlocked_key"),
+        BlobEffect::HashArchive { .. } => (EffectClass::Transfer, "hash_archive"),
     }
 }
 
@@ -790,6 +791,9 @@ impl BlobHandler {
                 Box::pin(rewrite).await
             }
             BlobEffect::ReadUnlockedKey { key } => self.read_unlocked(key),
+            BlobEffect::HashArchive { location, lease } => {
+                Box::pin(self.hash_archive(location, lease)).await
+            }
             BlobEffect::OpenConnection { node_id } => Box::pin(self.open_connection(node_id)).await,
             BlobEffect::SendMessage { stream_id, payload } => {
                 self.send_message(stream_id, payload).await
