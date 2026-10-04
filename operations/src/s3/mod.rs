@@ -12,3 +12,4 @@ pub mod purge_fence;
 pub mod session;
 mod write_cleanup;
 pub mod key_status;
+pub mod restart_notice;
