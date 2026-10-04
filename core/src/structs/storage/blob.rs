@@ -441,6 +441,7 @@ impl BackendLocation {
         match &self.format.layout {
             StoredLayout::Raw => self.blob_size,
             StoredLayout::Frames(layout) => layout.stored_size,
+            StoredLayout::Pithos(layout) => layout.stored_size,
         }
     }
 

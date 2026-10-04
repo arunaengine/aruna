@@ -22,6 +22,8 @@ pub enum StoredLayout {
     Raw,
     /// The zstd seekable format: 1 MiB zstd frames, then a seek table in a skippable frame.
     Frames(Box<FrameLayout>),
+    /// A Pithos 1.1 archive with one encrypted file.
+    Pithos(Box<PithosLayout>),
 }
 
 /// Record of a framed copy. The index hash covers the frame digests and seek table at its end.
@@ -33,6 +35,14 @@ pub struct FrameLayout {
     pub frames: u32,
     pub stored_size: u64,
     pub index_hash: [u8; 32],
+}
+
+/// Record of a Pithos copy. The digest covers every directory of the archive, so a changed
+/// archive fails when it is opened, before anything is decrypted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PithosLayout {
+    pub stored_size: u64,
+    pub metadata_digest: [u8; 32],
 }
 
 /// Compression a write applies: off, or zstd with a level.
@@ -75,6 +85,9 @@ impl StoredFormat {
             StoredLayout::Frames(layout) => EncodingClass::Zstd {
                 level: layout.level,
             },
+            StoredLayout::Pithos(layout) => EncodingClass::Pithos {
+                digest: layout.metadata_digest,
+            },
         }
     }
 }
@@ -84,11 +97,19 @@ impl StoredFormat {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum EncodingClass {
     Raw,
-    Zstd { level: u8 },
+    Zstd {
+        level: u8,
+    },
+    /// Encrypted copies are never shared: the archive's metadata digest is unique to each copy.
+    Pithos {
+        digest: [u8; 32],
+    },
 }
 
 /// Tag of the zstd class in keys; backend keys start with `n` or `g` instead.
 const ZSTD_TAG: u8 = b'z';
+/// Tag of the Pithos class in keys, followed by the 32-byte metadata digest.
+const PITHOS_TAG: u8 = b'p';
 
 impl EncodingClass {
     /// Bytes placed between hash and backend in a location key. Raw adds none,
@@ -97,6 +118,7 @@ impl EncodingClass {
         match self {
             Self::Raw => Vec::new(),
             Self::Zstd { level } => vec![ZSTD_TAG, *level],
+            Self::Pithos { digest } => [&[PITHOS_TAG], &digest[..]].concat(),
         }
     }
 
@@ -105,6 +127,9 @@ impl EncodingClass {
         match bytes {
             [] => Ok(Self::Raw),
             [ZSTD_TAG, level] => Ok(Self::Zstd { level: *level }),
+            [PITHOS_TAG, digest @ ..] if digest.len() == 32 => Ok(Self::Pithos {
+                digest: digest.try_into()?,
+            }),
             _ => Err(ConversionError::InvalidLength(
                 "unknown encoding class in key".to_string(),
             )),
@@ -116,6 +141,12 @@ impl EncodingClass {
         match bytes.first() {
             Some(b'n' | b'g') => Ok((Self::Raw, bytes)),
             Some(&ZSTD_TAG) if bytes.len() > 2 => Ok((Self::Zstd { level: bytes[1] }, &bytes[2..])),
+            Some(&PITHOS_TAG) if bytes.len() > 33 => Ok((
+                Self::Pithos {
+                    digest: bytes[1..33].try_into()?,
+                },
+                &bytes[33..],
+            )),
             _ => Err(ConversionError::InvalidLength(
                 "unknown encoding class in location key".to_string(),
             )),
@@ -197,11 +228,25 @@ mod tests {
         );
         let other = BlobLocationKey::new([2; 32], EncodingClass::Zstd { level: 4 }, raw.backend);
         assert_ne!(other.to_bytes(), packed.to_bytes());
-        let candidate = ReclaimCandidateKey::new(BackendRef::node_default(), zstd, [5; 32]);
+        let first = EncodingClass::Pithos { digest: [7; 32] };
+        let sealed = BlobLocationKey::new([2; 32], first, BackendRef::node_default());
         assert_eq!(
-            ReclaimCandidateKey::from_bytes(&candidate.to_bytes()).unwrap(),
-            candidate
+            BlobLocationKey::from_bytes(&sealed.to_bytes()).unwrap(),
+            sealed
         );
+        let second = BlobLocationKey::new(
+            [2; 32],
+            EncodingClass::Pithos { digest: [8; 32] },
+            sealed.backend.clone(),
+        );
+        assert_ne!(second.to_bytes(), sealed.to_bytes());
+        for class in [zstd, first] {
+            let candidate = ReclaimCandidateKey::new(BackendRef::node_default(), class, [5; 32]);
+            assert_eq!(
+                ReclaimCandidateKey::from_bytes(&candidate.to_bytes()).unwrap(),
+                candidate
+            );
+        }
     }
 
     #[test]
