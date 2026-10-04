@@ -486,3 +486,7 @@ impl Operation for ChangeEncryptionOperation {
 
 #[path = "rotate_rows.rs"]
 mod rows;
+
+#[cfg(test)]
+#[path = "rotate_tests.rs"]
+mod tests;
