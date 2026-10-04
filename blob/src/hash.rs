@@ -93,9 +93,61 @@ impl Hasher {
     }
 }
 
+/// Full-object CRC32, CRC32C and CRC64NVME of parts written one after another, from each part's
+/// checksums and length. `None` when a part lacks one of them.
+pub fn combine_crcs<'a>(
+    parts: impl IntoIterator<Item = (&'a HashMap<String, Vec<u8>>, u64)>,
+) -> Option<HashMap<String, Vec<u8>>> {
+    use crc_fast::CrcAlgorithm::{Crc32Iscsi, Crc32IsoHdlc, Crc64Nvme};
+    let algorithms = [
+        (HASH_CRC32, Crc32IsoHdlc),
+        (HASH_CRC32C, Crc32Iscsi),
+        (HASH_CRC64NVME, Crc64Nvme),
+    ];
+    let mut combined = [None::<u64>; 3];
+    for (hashes, len) in parts {
+        for ((name, algorithm), total) in algorithms.iter().zip(&mut combined) {
+            let digest = hashes.get(*name)?;
+            let mut value = [0u8; 8];
+            value.get_mut(8 - digest.len()..)?.copy_from_slice(digest);
+            let value = u64::from_be_bytes(value);
+            *total = Some(match *total {
+                Some(left) => crc_fast::checksum_combine(*algorithm, left, value, len),
+                None => value,
+            });
+        }
+    }
+    let mut out = HashMap::new();
+    for ((name, _), total) in algorithms.iter().zip(combined) {
+        let bytes = total?.to_be_bytes();
+        let width = if *name == HASH_CRC64NVME { 0 } else { 4 };
+        out.insert(name.to_string(), bytes[width..].to_vec());
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::Hasher;
+
+    #[test]
+    fn combines_part_crcs() {
+        // Combined part CRCs equal the CRCs of the whole object, including an empty part.
+        let parts: [&[u8]; 3] = [b"first part bytes", b"", b"and the short last"];
+        let maps: Vec<_> = parts
+            .iter()
+            .map(|part| Hasher::new_with_bytes(part).to_map())
+            .collect();
+        let lens = parts.iter().map(|part| part.len() as u64);
+        let combined = super::combine_crcs(maps.iter().zip(lens)).unwrap();
+        let whole = Hasher::new_with_bytes(&parts.concat()).to_map();
+        for name in [super::HASH_CRC32, super::HASH_CRC32C, super::HASH_CRC64NVME] {
+            assert_eq!(combined[name], whole[name], "{name}");
+        }
+        let mut missing = maps[0].clone();
+        missing.remove(super::HASH_CRC32C);
+        assert_eq!(super::combine_crcs([(&missing, 16)]), None);
+    }
 
     #[test]
     fn computes_known_checksums() {

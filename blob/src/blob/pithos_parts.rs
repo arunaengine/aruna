@@ -1,23 +1,30 @@
-//! Seals the parts of encrypted multipart uploads as Pithos pieces.
+//! Seals the parts of encrypted multipart uploads as Pithos pieces and composes the stored pieces
+//! into one archive. Composition opens no key, so it also works while the bucket is locked.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::BlobHandler;
 use super::backend::build_part_path;
+use super::io::compose_chunk;
+use super::pithos::OBJECT_PATH;
 use crate::hash::Hasher;
 use aruna_core::UserId;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::storage::blob::{BackendLocation, ResolvedBackend};
 use aruna_core::structs::storage::encryption::{BlockCipher, BlockKeys};
-use aruna_core::structs::storage::format::{Compression, StoredFormat};
-use aruna_core::structs::storage::multipart::{MultipartPartKey, PartPiece, UploadEncryption};
+use aruna_core::structs::storage::format::{Compression, PithosLayout, StoredFormat};
+use aruna_core::structs::storage::multipart::{
+    MultipartPart, MultipartPartKey, PartPiece, UploadEncryption,
+};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use opendal::{Operator, Writer};
 use pithos_lib::archive::{
-    BlockKeyMode, Chunking, PayloadCipher, Piece, PieceEncoder, ProcessingOptions,
+    ArchivePath, BlockKeyMode, Chunking, Composition, EntryMetadata, PayloadCipher, Piece,
+    PieceEncoder, ProcessingOptions, compose,
 };
 use pithos_lib::crypto::PublicKey;
 use pithos_lib::error::PithosError;
@@ -238,6 +245,202 @@ impl BlobHandler {
         settle(abandoned, self.io_timeout(), writer.close()).await?;
         Ok((size, piece))
     }
+
+    /// Writes the header, the stored bytes of each part in order and the directory as one
+    /// archive at a new object path. Every stored length and offset is checked on the way.
+    ///
+    /// The location names the key of `upload`; its BLAKE3 is set only when the recorded content
+    /// trees line up with the final offsets.
+    pub async fn compose_pieces(
+        &self,
+        request_bucket: &str,
+        request_key: &str,
+        resolved: ResolvedBackend,
+        created_by: UserId,
+        parts: Vec<MultipartPart>,
+    ) -> BlobEvent {
+        let Some(plan) = resolved.encryption else {
+            return BlobEvent::Error(BlobError::WriteError("pieces need a seal plan".into()));
+        };
+        let composition = match compose_parts(&parts) {
+            Ok(composition) => composition,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let root = match self.registry.config_for(&resolved.backend) {
+            Ok(config) => config.root.clone(),
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let ulid = Ulid::generate();
+        let backend_path =
+            match super::backend::build_backend_path(request_bucket, request_key, ulid) {
+                Ok(path) => path,
+                Err(error) => return BlobEvent::Error(BlobError::ConversionError(error)),
+            };
+        let layout = PithosLayout {
+            stored_size: composition.archive_len(),
+            metadata_digest: composition.metadata_digest(),
+        };
+        let mut hashes = HashMap::new();
+        if let Some(hash) = composition.content_hash() {
+            hashes.insert(HASH_BLAKE3.to_string(), hash.to_vec());
+        }
+        let template = BackendLocation {
+            backend: resolved.backend.clone(),
+            storage_class: resolved.storage_class.clone(),
+            root,
+            storage_bucket: String::new(),
+            backend_path,
+            ulid,
+            format: StoredFormat::pithos(layout, plan.key),
+            created_by,
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: parts.iter().map(|part| part.location.blob_size).sum(),
+            hashes,
+        };
+        let Some(mut reservation) = self.hold_reservation(template.ulid) else {
+            let message = "too many active blob reservations".to_string();
+            return BlobEvent::Error(BlobError::WriteError(message));
+        };
+        let location = match self.reserve_bucket(&resolved.backend, &template).await {
+            Ok(location) => location,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let written = self.write_composed(&location, &composition, &parts).await;
+        match written {
+            Ok(()) => {
+                reservation.retain();
+                match self.finalize_reservation(&location).await {
+                    Ok(()) => BlobEvent::WriteFinished { location },
+                    Err(error) => BlobEvent::Error(BlobError::WriteCleanup {
+                        location,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            Err(error @ BlobError::WriteCleanup { .. }) => {
+                reservation.retain();
+                BlobEvent::Error(error)
+            }
+            Err(error) => {
+                _ = self.release_reservation(&location).await;
+                BlobEvent::Error(error)
+            }
+        }
+    }
+
+    async fn write_composed(
+        &self,
+        location: &BackendLocation,
+        composition: &Composition,
+        parts: &[MultipartPart],
+    ) -> Result<(), BlobError> {
+        let operator = self.operator_from_location(location)?;
+        let path = location.get_storage_path()?;
+        let backend = self.registry.config_for(&location.backend)?.backend_type;
+        let chunk = compose_chunk(&backend, composition.archive_len(), true);
+        let opened = match chunk {
+            Some(chunk) => {
+                let writer = operator.writer_with(&path).chunk(chunk).into_future();
+                timeout(self.io_timeout(), writer).await
+            }
+            None => timeout(self.io_timeout(), operator.writer(&path)).await,
+        };
+        let mut writer = match opened {
+            Ok(Ok(writer)) => writer,
+            Ok(Err(error)) => return Err(BlobError::OperatorCreationFailed(error.to_string())),
+            Err(_) => return Err(deadline_expired()),
+        };
+        let mut abandoned = false;
+        let written = self
+            .copy_pieces(&mut writer, &mut abandoned, composition, parts)
+            .await;
+        let Err(error) = written else {
+            return Ok(());
+        };
+        let cleaned = self
+            .clean_partial(
+                Some(&mut writer),
+                abandoned,
+                Some(&operator),
+                Some(&path),
+                Some(location),
+            )
+            .await;
+        match cleaned {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(BlobError::WriteCleanup {
+                location: location.clone(),
+                message: format!("{error}; {cleanup}"),
+            }),
+        }
+    }
+
+    async fn copy_pieces(
+        &self,
+        writer: &mut Writer,
+        abandoned: &mut bool,
+        composition: &Composition,
+        parts: &[MultipartPart],
+    ) -> Result<(), BlobError> {
+        let idle = self.transfer_idle_timeout();
+        let header = composition.header();
+        settle(abandoned, idle, writer.write(header.to_vec())).await?;
+        let mut offset = header.len() as u64;
+        for (part, start) in parts.iter().zip(composition.piece_offsets()) {
+            let expected = part.piece.as_ref().map(|piece| piece.stored_len);
+            if offset != *start || expected.is_none() {
+                return Err(mismatch());
+            }
+            let copied = self.copy_part(writer, abandoned, &part.location).await?;
+            if Some(copied) != expected {
+                return Err(mismatch());
+            }
+            offset = offset.checked_add(copied).ok_or_else(mismatch)?;
+        }
+        let directory = composition.directory();
+        let end = offset.checked_add(directory.len() as u64);
+        if end != Some(composition.archive_len()) {
+            return Err(mismatch());
+        }
+        settle(abandoned, idle, writer.write(directory.to_vec())).await?;
+        settle(abandoned, idle, writer.close()).await?;
+        Ok(())
+    }
+
+    /// Copies the stored bytes of one part unchanged and returns their length.
+    async fn copy_part(
+        &self,
+        writer: &mut Writer,
+        abandoned: &mut bool,
+        part: &BackendLocation,
+    ) -> Result<u64, BlobError> {
+        let operator = self.operator_from_location(part)?;
+        let path = part.get_storage_path()?;
+        let read_error = |error: opendal::Error| BlobError::ReadError(error.to_string());
+        let opening = async {
+            let reader = operator.reader(&path).await.map_err(read_error)?;
+            reader.into_bytes_stream(..).await.map_err(read_error)
+        };
+        let reader = timeout(self.io_timeout(), opening)
+            .await
+            .map_err(|_| BlobError::ReadError("timed out opening a part".to_string()))??;
+        let mut reader = BackendStream::new(reader);
+        let idle = self.transfer_idle_timeout();
+        let mut copied = 0u64;
+        loop {
+            let next = timeout(idle, reader.next())
+                .await
+                .map_err(|_| BlobError::ReadError("part reader idle timeout".to_string()))?;
+            let Some(bytes) = next else {
+                return Ok(copied);
+            };
+            let bytes = bytes.map_err(|error| BlobError::ReadError(error.to_string()))?;
+            copied += bytes.len() as u64;
+            settle(abandoned, idle, writer.write(bytes)).await?;
+        }
+    }
 }
 
 /// Fixed 4 MiB blocks with the cipher, key mode and compression of `upload`, keyed by the part
@@ -262,6 +465,25 @@ fn piece_encoder(
         None => encoder,
     }
     .map_err(write_error)
+}
+
+/// The composition of the saved pieces in part order. Each record must name its part number
+/// and agree with the stored part's sizes.
+fn compose_parts(parts: &[MultipartPart]) -> Result<Composition, BlobError> {
+    let mut pieces = Vec::with_capacity(parts.len());
+    for part in parts {
+        let record = part.piece.as_ref().ok_or_else(mismatch)?;
+        let piece = Piece::from_bytes(&record.record).map_err(write_error)?;
+        let consistent = piece.key_id() == u64::from(part.part_number)
+            && piece.stored_len() == record.stored_len
+            && piece.original_size() == part.location.blob_size;
+        if !consistent {
+            return Err(mismatch());
+        }
+        pieces.push(piece);
+    }
+    let path = ArchivePath::new(OBJECT_PATH).map_err(write_error)?;
+    compose(path, EntryMetadata::new(0, 0, 0o644), &pieces).map_err(write_error)
 }
 
 /// Off is level 0; zstd takes the Pithos level with the nearest zstd level, the lower on a tie.
@@ -319,6 +541,10 @@ async fn settle<T>(
 
 fn deadline_expired() -> BlobError {
     BlobError::WriteError("blob write deadline expired".to_string())
+}
+
+fn mismatch() -> BlobError {
+    BlobError::IntegrityCheckFailed("a stored part does not match its piece record".to_string())
 }
 
 fn write_error(error: PithosError) -> BlobError {

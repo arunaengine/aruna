@@ -106,6 +106,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::RewriteCopy { .. } => (EffectClass::Transfer, "rewrite_copy"),
         BlobEffect::ReadUnlockedKey { .. } => (EffectClass::Local, "read_unlocked_key"),
         BlobEffect::WritePiece { .. } => (EffectClass::Transfer, "write_piece"),
+        BlobEffect::ComposePieces { .. } => (EffectClass::Transfer, "compose_pieces"),
         BlobEffect::HashArchive { .. } => (EffectClass::Transfer, "hash_archive"),
     }
 }
@@ -129,6 +130,7 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::DeleteHidden { .. }
             | BlobEffect::RewriteCopy { .. }
             | BlobEffect::WritePiece { .. }
+            | BlobEffect::ComposePieces { .. }
     )
 }
 
@@ -804,6 +806,13 @@ impl BlobHandler {
                 let part = MultipartPartKey::new(upload_id, part_number);
                 Box::pin(self.seal_piece(part, resolved, created_by, content_offset, blob)).await
             }
+            BlobEffect::ComposePieces {
+                bucket,
+                key,
+                resolved,
+                created_by,
+                parts,
+            } => Box::pin(self.compose_pieces(&bucket, &key, resolved, created_by, parts)).await,
             BlobEffect::HashArchive { location, lease } => {
                 Box::pin(self.hash_archive(location, lease)).await
             }

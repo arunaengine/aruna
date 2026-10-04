@@ -136,6 +136,14 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
             push(&mut ids, &target.backend);
         }
         BlobEffect::WritePiece { resolved, .. } => push(&mut ids, &resolved.backend),
+        BlobEffect::ComposePieces {
+            resolved, parts, ..
+        } => {
+            push(&mut ids, &resolved.backend);
+            for part in parts {
+                push(&mut ids, &part.location.backend);
+            }
+        }
         BlobEffect::HashArchive { location, .. } => push(&mut ids, &location.backend),
     }
     ids

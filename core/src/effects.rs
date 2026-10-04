@@ -255,6 +255,14 @@ pub enum BlobEffect {
         content_offset: Option<u64>,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
+    /// Composes the stored pieces of `parts`, in order, into one archive without a key.
+    ComposePieces {
+        bucket: String,
+        key: String,
+        resolved: ResolvedBackend,
+        created_by: UserId,
+        parts: Vec<MultipartPart>,
+    },
     /// Hands out the unlocked key of `key`, for its node vault copy when a bucket leaves
     /// `vault_locked`. A locked generation answers `Locked`.
     ReadUnlockedKey {
