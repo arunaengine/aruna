@@ -9,6 +9,7 @@ pub mod delete;
 pub mod forward;
 pub mod get;
 pub mod holders;
+pub mod key_rows;
 pub mod list;
 pub mod placement;
 pub mod routing;
