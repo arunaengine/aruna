@@ -742,7 +742,6 @@ mod test {
             placement_policies: policies,
             placement_policy_generation: 1,
             compression: Compression::Off,
-            encryption: Default::default(),
         };
         let _ = context
             .storage_handle

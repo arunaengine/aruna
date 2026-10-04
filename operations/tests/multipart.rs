@@ -2085,7 +2085,6 @@ async fn set_compression(
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression,
-        encryption: Default::default(),
     };
     let event = context
         .driver

@@ -730,7 +730,6 @@ async fn seed_bucket(state: &ServerState, bucket: &str, group_id: Ulid) {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
-        encryption: Default::default(),
     };
     store_bytes(
         state,

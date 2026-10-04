@@ -15,7 +15,7 @@ use crate::structs::execution::staging::VersionSourceBinding;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
-use crate::structs::storage::encryption::{BucketEncryption, SealPlan};
+use crate::structs::storage::encryption::SealPlan;
 use crate::structs::storage::format::{Compression, EncodingClass, StoredFormat, StoredLayout};
 use crate::structs::storage::group_backend::GroupBackendKind;
 use crate::structs::storage::routing::StorageRoutingRule;
@@ -673,7 +673,6 @@ pub struct BucketInfo {
     pub placement_policy_generation: u64,
     /// Compression of new writes; each node also re-encodes its own copies to match.
     pub compression: Compression,
-    pub encryption: BucketEncryption,
 }
 
 impl BucketInfo {
@@ -688,14 +687,12 @@ impl BucketInfo {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         checked_refs(&self.placement_policies)?;
-        self.encryption.checked()?;
         Ok(postcard::to_allocvec(&self)?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         let info: Self = postcard::from_bytes(bytes)?;
         checked_refs(&info.placement_policies)?;
-        info.encryption.checked()?;
         Ok(info)
     }
 
@@ -1488,7 +1485,6 @@ mod tests {
     use crate::structs::placement::policy::{
         MAX_POLICY_REFS, PlacementPolicyError, PlacementPolicyRef,
     };
-    use crate::structs::storage::encryption::EncryptionMode;
     use crate::structs::storage::format::Compression;
     use crate::structs::storage::format::EncodingClass;
     use crate::structs::storage::format::StoredFormat;
@@ -1986,7 +1982,6 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 7,
             compression: Compression::Off,
-            encryption: Default::default(),
         }
     }
 
@@ -2148,17 +2143,6 @@ mod tests {
         assert_eq!(restored.to_bytes().unwrap(), bytes);
         // A default change is configuration, never bucket identity.
         assert_eq!(info.identity(), restored.identity());
-
-        let mut sealed = info.clone();
-        sealed.encryption.mode = EncryptionMode::NodeManaged;
-        let bytes = postcard::to_allocvec(&sealed).unwrap();
-        assert!(BucketInfo::from_bytes(&bytes).is_err());
-        sealed.encryption.bucket_id = Some(Ulid::from_bytes([5u8; 16]));
-        sealed.encryption.key_generation = 2;
-        sealed.encryption.max_unlock_ms = Some(60_000);
-        let restored = BucketInfo::from_bytes(&sealed.to_bytes().unwrap()).unwrap();
-        assert_eq!(restored, sealed);
-        assert_eq!(restored.identity(), info.identity());
     }
 
     #[test]

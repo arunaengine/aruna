@@ -389,7 +389,6 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
-            encryption: Default::default(),
         };
         let alias = HashIndex::new(hash, version_id, realm_id, group_id, node_id, BUCKET, KEY);
         let writes = vec![

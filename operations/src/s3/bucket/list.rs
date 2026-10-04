@@ -288,7 +288,6 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
-                    encryption: Default::default(),
                 },
             ),
             (
@@ -302,7 +301,6 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
-                    encryption: Default::default(),
                 },
             ),
             (
@@ -316,7 +314,6 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
-                    encryption: Default::default(),
                 },
             ),
         ] {
@@ -369,7 +366,6 @@ mod test {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
-            encryption: Default::default(),
         };
         let entry = |name: &str, group_id| {
             (
@@ -436,7 +432,6 @@ mod test {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
-            encryption: Default::default(),
         };
         let entry = |name: &str, group_id| {
             (
@@ -511,7 +506,6 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
-                    encryption: Default::default(),
                 }
                 .to_bytes()
                 .unwrap()

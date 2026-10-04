@@ -122,7 +122,6 @@ async fn seed_bucket(state: &ServerState, actor: &Actor, bucket: &str, group_id:
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
-            encryption: Default::default(),
         }
         .to_bytes()
         .unwrap(),

@@ -1149,7 +1149,6 @@ async fn seed_preview_object(test: &TestState) -> Value {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
-        encryption: Default::default(),
     };
     write_doc(
         &ctx,
@@ -3758,7 +3757,6 @@ async fn preflight_finds_ids() {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
-        encryption: Default::default(),
     };
     write_doc(
         &ctx,

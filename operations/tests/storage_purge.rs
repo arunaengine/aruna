@@ -178,7 +178,6 @@ async fn setup_context() -> TestContext {
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: Compression::Off,
-                encryption: Default::default(),
             },
         ),
         &driver,

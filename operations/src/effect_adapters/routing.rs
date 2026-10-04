@@ -326,7 +326,6 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
-            encryption: Default::default(),
         }
     }
 
@@ -417,7 +416,6 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Zstd { level: 5 },
-            encryption: Default::default(),
         };
         let record = GroupStorageRouting {
             group_id,

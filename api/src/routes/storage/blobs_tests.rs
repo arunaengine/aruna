@@ -414,7 +414,6 @@ async fn setup_bucket(realm_id: RealmId, owner: UserId) -> (TempDir, Arc<ServerS
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: Compression::Off,
-                encryption: Default::default(),
             }
             .to_bytes()
             .expect("bucket serializes"),

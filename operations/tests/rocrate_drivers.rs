@@ -1405,7 +1405,6 @@ async fn create_bucket(
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: aruna_core::structs::storage::format::Compression::Off,
-                encryption: Default::default(),
             },
         ),
         context,

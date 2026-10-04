@@ -382,7 +382,6 @@ async fn seed_holder(
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
-        encryption: Default::default(),
     };
     let hash: [u8; 32] = location
         .get_blake3()

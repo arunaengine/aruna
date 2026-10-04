@@ -984,7 +984,6 @@ async fn ensure_output_stage(
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
-        encryption: Default::default(),
     };
     match Box::pin(drive(
         CreateBucketOperation::new(bucket.to_string(), info),
