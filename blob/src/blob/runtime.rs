@@ -103,6 +103,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::ExtendKey { .. } => (EffectClass::Local, "extend_key"),
         BlobEffect::LockKey { .. } => (EffectClass::Local, "lock_key"),
         BlobEffect::AdmitRead { .. } => (EffectClass::Local, "admit_read"),
+        BlobEffect::RewriteCopy { .. } => (EffectClass::Transfer, "rewrite_copy"),
     }
 }
 
@@ -123,6 +124,7 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::ReceiveRead { .. }
             | BlobEffect::Delete { .. }
             | BlobEffect::DeleteHidden { .. }
+            | BlobEffect::RewriteCopy { .. }
     )
 }
 
@@ -773,8 +775,19 @@ impl BlobHandler {
             | BlobEffect::DiscardKey { .. }
             | BlobEffect::ReadKeyStatus { .. }
             | BlobEffect::ExtendKey { .. }
-            | BlobEffect::LockKey { .. }
-            | BlobEffect::AdmitRead { .. }) => self.unlock_effect(effect),
+            | BlobEffect::LockKey { .. }) => self.unlock_effect(effect),
+            BlobEffect::AdmitRead { key, archive } => self.admit_read(key, archive).await,
+            BlobEffect::RewriteCopy {
+                bucket,
+                key,
+                source,
+                lease,
+                target,
+                grants_only,
+            } => {
+                let rewrite = self.rewrite_copy(&bucket, &key, source, lease, target, grants_only);
+                Box::pin(rewrite).await
+            }
             BlobEffect::OpenConnection { node_id } => Box::pin(self.open_connection(node_id)).await,
             BlobEffect::SendMessage { stream_id, payload } => {
                 self.send_message(stream_id, payload).await

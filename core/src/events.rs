@@ -187,6 +187,10 @@ pub enum BlobEvent {
         lease: ReadLease,
     },
     Error(BlobError),
+    /// The new copy of a rewrite; its reservation is held until released.
+    CopyRewritten {
+        location: BackendLocation,
+    },
 }
 
 #[derive(Debug, PartialEq)]

@@ -130,6 +130,10 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         | BlobEffect::ExtendKey { .. }
         | BlobEffect::LockKey { .. }
         | BlobEffect::AdmitRead { .. } => {}
+        BlobEffect::RewriteCopy { source, target, .. } => {
+            push(&mut ids, &source.backend);
+            push(&mut ids, &target.backend);
+        }
     }
     ids
 }

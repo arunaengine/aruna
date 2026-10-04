@@ -23,7 +23,7 @@ use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::structs::placement::policy::document::PolicyPublicationClaim;
 use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::blob::{ArchiveKey, BackendLocation, HiddenBlobKey, ResolvedBackend};
-use crate::structs::storage::encryption::{BucketKeyRef, CopyTarget, KeyTicket};
+use crate::structs::storage::encryption::{BucketKeyRef, CopyTarget, KeyTicket, ReadLease};
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use crate::structs::storage::multipart::{BackendUpload, MultipartPart};
 use crate::structs::storage::usage::UsageDelta;
@@ -234,6 +234,16 @@ pub enum BlobEffect {
     AdmitRead {
         key: BucketKeyRef,
         archive: ArchiveKey,
+    },
+    /// Rewrites `source` into the format of `target` inside the adapter, so its plaintext never
+    /// reaches an operation. A sealed source needs `lease`; `grants_only` keeps its blocks.
+    RewriteCopy {
+        bucket: String,
+        key: String,
+        source: BackendLocation,
+        lease: Option<ReadLease>,
+        target: ResolvedBackend,
+        grants_only: bool,
     },
 }
 

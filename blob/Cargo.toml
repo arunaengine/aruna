@@ -50,6 +50,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 ulid = { workspace = true }
 zstd = { workspace = true }
+zeroize = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 rustix = { workspace = true }
