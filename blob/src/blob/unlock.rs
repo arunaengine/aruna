@@ -109,9 +109,17 @@ impl Drop for DeleteClaim {
 
 /// The adapter state behind a `ReadLease`: the shared key, the archive pin and the lease slot.
 pub(super) struct LeaseGuard {
-    _secret: SharedSecret,
+    secret: SharedSecret,
     _pin: ArchivePin,
     _slot: OwnedSemaphorePermit,
+}
+
+impl LeaseGuard {
+    /// The key `lease` admitted. It stays usable after a lock until the lease ends.
+    pub(super) fn secret(lease: &ReadLease) -> Option<&SharedSecret> {
+        let guard = lease.guard().downcast_ref::<LeaseGuard>()?;
+        Some(&guard.secret)
+    }
 }
 
 /// Unlocked key generations, keyed by bucket id and generation. It never evicts an unlocked
@@ -330,7 +338,7 @@ impl UnlockRegistry {
             .and_then(|sessions| sessions.iter().find(|session| session.active))
             .ok_or(BucketKeyError::Locked(key.bucket_id))?;
         let guard = LeaseGuard {
-            _secret: session.secret.clone(),
+            secret: session.secret.clone(),
             _pin: self.pin(archive.clone())?,
             _slot: slot,
         };

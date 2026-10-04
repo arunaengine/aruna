@@ -5,6 +5,7 @@
 
 use super::BlobHandler;
 use super::frames::read_range;
+use super::unlock::LeaseGuard;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -28,7 +29,7 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 /// Path of the one file in the archive of an object.
@@ -358,7 +359,8 @@ impl BlobHandler {
         Ok((BackendStream::new(blob), size))
     }
 
-    /// The key of a sealed copy, only through a lease admitted for exactly this archive.
+    /// The key of a sealed copy, only through a lease admitted for exactly this archive. A lock
+    /// after admission does not stop it: the lease keeps its own key.
     pub(super) fn sealed_keys(
         &self,
         location: &BackendLocation,
@@ -368,11 +370,7 @@ impl BlobHandler {
         if lease.key != key || lease.archive != ArchiveKey::of(location) {
             return Err(BucketKeyError::Locked(key.bucket_id).into());
         }
-        let unlocked = match self.unlocks.lock() {
-            Ok(mut registry) => registry.unlocked_key(key, Instant::now()),
-            Err(_) => Err(BucketKeyError::Locked(key.bucket_id)),
-        };
-        let (secret, _) = unlocked?;
+        let secret = LeaseGuard::secret(lease).ok_or(BucketKeyError::Locked(key.bucket_id))?;
         let bytes: &[u8; 32] = secret
             .bytes()
             .expose()

@@ -709,3 +709,65 @@ async fn reconcile_claims_archives() {
     assert!(handler.reconcile_reservation(location).await.unwrap());
     assert!(!operator.exists(&path).await.unwrap());
 }
+
+#[tokio::test]
+async fn lease_outlives_lock() {
+    use aruna_core::compute::{SecretBytes, SharedSecret};
+    use aruna_core::effects::BlobEffect;
+    use aruna_core::structs::storage::blob::ArchiveKey;
+    use aruna_core::structs::storage::encryption::BucketKeyError;
+
+    let bucket = PrivateKey::from_raw(zeroize::Zeroizing::new([5; 32]));
+    let seal = plan(
+        &bucket,
+        BlockCipher::ChaCha20Poly1305,
+        BlockKeys::ContentDerived,
+    );
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let data = content(300_000);
+    let backend = ResolvedBackend::node_default().with_encryption(Some(seal));
+    let stream = stream_from_bytes(&data);
+    let written = handler
+        .write_blob("bucket", "sealed.bin", backend, test_user_id(), stream)
+        .await;
+    let BlobEvent::WriteFinished { location } = written else {
+        panic!("write failed: {written:?}")
+    };
+    let prepare = BlobEffect::PrepareKey {
+        key: seal.key,
+        public_key: seal.public_key,
+        private_key: SharedSecret::new(SecretBytes::new(vec![5; 32])),
+        duration: None,
+        max: None,
+    };
+    let BlobEvent::KeyPrepared { ticket } = handler.unlock_effect(prepare) else {
+        panic!("prepare failed")
+    };
+    handler.unlock_effect(BlobEffect::ActivateKey { ticket });
+    let archive = ArchiveKey::of(&location);
+    let BlobEvent::ReadAdmitted { lease } = handler.admit_read(seal.key, archive.clone()).await
+    else {
+        panic!("admission failed")
+    };
+
+    // The lock lands after admission; the admitted read still finishes with its own key.
+    let lock = BlobEffect::LockKey {
+        bucket_id: seal.key.bucket_id,
+        session: None,
+    };
+    assert!(matches!(
+        handler.unlock_effect(lock),
+        BlobEvent::KeyLocked { .. }
+    ));
+    let BlobEvent::ReadFinished { blob, .. } = handler.read_sealed(location, None, lease).await
+    else {
+        panic!("the admitted read must finish")
+    };
+    let chunks: Vec<Bytes> = blob.try_collect().await.unwrap();
+    assert!(chunks.concat() == data);
+
+    let refused = handler.admit_read(seal.key, archive).await;
+    let locked = BlobError::BucketKey(BucketKeyError::Locked(seal.key.bucket_id));
+    assert_eq!(refused, BlobEvent::Error(locked));
+}

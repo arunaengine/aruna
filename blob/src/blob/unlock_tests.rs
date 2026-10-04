@@ -232,7 +232,7 @@ fn lock_keeps_leases() {
     assert!(admit(&mut registry, source, archive(7), now).is_err());
     // The admitted read keeps its key and its archive pin until it ends.
     let guard = lease.guard().downcast_ref::<LeaseGuard>().unwrap();
-    assert_eq!(guard._secret, private(1));
+    assert_eq!(guard.secret, private(1));
     assert!(registry.is_pinned(&archive(7)));
     let pin = registry.pin(archive(8)).unwrap();
     drop(lease);
@@ -287,7 +287,7 @@ fn clear_keeps_leases() {
     assert!(registry.status(key.bucket_id, now).is_empty());
     assert!(admit(&mut registry, key, archive(1), now).is_err());
     let guard = lease.guard().downcast_ref::<LeaseGuard>().unwrap();
-    assert_eq!(guard._secret, private(1));
+    assert_eq!(guard.secret, private(1));
 }
 
 #[tokio::test(start_paused = true)]
