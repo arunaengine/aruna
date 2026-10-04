@@ -11,6 +11,7 @@ pub mod delete_audit;
 pub mod encryption;
 pub mod format;
 pub mod group_backend;
+pub mod holders;
 pub mod metadata_registry;
 pub mod multipart;
 pub mod node_info;
