@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod blobs;
+pub mod bucket_keys;
 pub mod bucket_usage;
 pub mod compression;
 pub mod connectors;

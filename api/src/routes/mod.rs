@@ -53,6 +53,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::bucket_usage::router())
         .merge(storage::compression::router())
         .merge(storage::encryption::router())
+        .merge(storage::bucket_keys::router())
         .merge(drs::router())
         .merge(staging::router())
         .merge(storage::deletion::router())
@@ -483,6 +484,9 @@ pub(crate) mod tests {
         ("PUT", "/data/buckets/{bucket}/placement"),
         ("PUT", "/data/buckets/{bucket}/storage/compression"),
         ("PUT", "/data/buckets/{bucket}/storage/encryption"),
+        ("POST", "/data/buckets/{bucket}/storage/encryption/extend"),
+        ("POST", "/data/buckets/{bucket}/storage/encryption/lock"),
+        ("POST", "/data/buckets/{bucket}/storage/encryption/unlock"),
         (
             "DELETE",
             "/data/buckets/{bucket}/storage/encryption/holders/{user}",
