@@ -130,6 +130,17 @@ fn deadlines_close_admission() {
     assert_eq!(beyond, Err(BucketKeyError::InvalidDuration));
     let stranger = registry.extend(key, Ulid::generate(), None, later);
     assert_eq!(stranger, Err(BucketKeyError::SessionMismatch));
+    // A session id is only valid with the generation it unlocked.
+    let source = reference(1, 7);
+    unlock(&mut registry, source, 7, (None, None), later).unwrap();
+    let elsewhere = registry.extend(source, ticket.session_id, None, later);
+    assert_eq!(elsewhere, Err(BucketKeyError::SessionMismatch));
+    let source_session = registry.status(source.bucket_id, later)[1].session_id;
+    let only = KeyTicket {
+        key: source,
+        session_id: source_session,
+    };
+    assert_eq!(registry.lock(source.bucket_id, Some(only)), vec![only]);
 
     // A delayed timer cannot keep the key admitted past its deadline.
     let expired = later + Duration::from_secs(10);
