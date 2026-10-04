@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::blob::migration_queue::encrypt_rows;
 use crate::s3::bucket::key_rows::{
     SettingsError, authority_read, copy_targets, generation_rows, parse_authority, uploads_open,
 };
@@ -18,9 +19,11 @@ use aruna_core::structs::storage::encryption::{
     BlockCipher, BlockKeys, BucketEncryption, BucketHolder, BucketKeyError, BucketKeyRecord,
     BucketKeyRef, EncryptionMode, SealedCopy,
 };
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::holders::{
     HolderReport, KeyLookup, RecoveryState, resolve_holders,
 };
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use aruna_core::{NodeId, UserId};
 use smallvec::smallvec;
@@ -110,6 +113,7 @@ pub struct EnableEncryptionOperation {
     creator: Option<UserId>,
     admins: BTreeSet<UserId>,
     settings: BucketEncryption,
+    compression: Compression,
     grants: Vec<BucketHolder>,
     record: Option<BucketKeyRecord>,
     private_key: Option<SharedSecret>,
@@ -126,6 +130,7 @@ impl EnableEncryptionOperation {
             creator: None,
             admins: BTreeSet::new(),
             settings: BucketEncryption::default(),
+            compression: Compression::Off,
             grants: Vec::new(),
             record: None,
             private_key: None,
@@ -160,6 +165,7 @@ impl EnableEncryptionOperation {
             });
         }
         self.creator = Some(info.created_by);
+        self.compression = info.compression;
         self.settings = settings;
         self.state = EnableState::CheckUploads;
         self.scan(UPLOAD_KEYSPACE, None)
@@ -265,10 +271,16 @@ impl EnableEncryptionOperation {
             &copies,
             &report,
         );
-        let writes = match rows {
+        let mut writes = match rows {
             Ok(writes) => writes,
             Err(error) => return self.fail(error),
         };
+        // Plain copies already stored start their encrypt transition in the same transaction.
+        let (bucket, now_ms) = (&self.input.bucket, self.input.now_ms);
+        match encrypt_rows(bucket, &self.settings, &record, self.compression, now_ms) {
+            Ok(rows) => writes.extend(rows),
+            Err(error) => return self.fail(error),
+        }
         self.result = Some(EnableResult {
             settings: self.settings.clone(),
             key: record,
@@ -308,7 +320,10 @@ impl EnableEncryptionOperation {
         self.private_key = None;
         self.state = EnableState::Finish;
         self.output = self.result.take().map(Ok);
-        smallvec![]
+        smallvec![Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::MigrateCompression,
+            after: std::time::Duration::ZERO,
+        })]
     }
 }
 

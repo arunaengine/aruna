@@ -125,12 +125,15 @@ fn managed_enable_writes() {
         panic!("expected the settings write, got {effects:?}");
     };
     let spaces: Vec<_> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
+    // The same batch starts the encrypt transition of copies stored in plain form.
     assert_eq!(
         spaces,
         [
             BUCKET_ENCRYPTION_KEYSPACE,
             BUCKET_KEY_KEYSPACE,
-            KEY_COPY_KEYSPACE
+            KEY_COPY_KEYSPACE,
+            aruna_core::keyspaces::TRANSITION_KEYSPACE,
+            aruna_core::keyspaces::TRANSITION_QUEUE_KEYSPACE
         ]
     );
     let settings = BucketEncryption::from_bytes(&writes[0].2).unwrap();
@@ -158,9 +161,15 @@ fn managed_enable_writes() {
         effects.as_slice(),
         [Effect::Storage(StorageEffect::CommitTransaction { .. })]
     ));
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+    let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
         txn_id: Ulid::from_bytes([9; 16]),
     }));
+    // The transition runs at once after the commit.
+    let wake = aruna_core::task::TaskEffect::ShortenTimer {
+        key: aruna_core::task::TaskKey::MigrateCompression,
+        after: std::time::Duration::ZERO,
+    };
+    assert_eq!(effects.as_slice(), [Effect::Task(wake)]);
     // The operation hands its only key handle on and keeps none.
     assert!(operation.private_key.is_none());
     let result = operation.finalize().unwrap();
