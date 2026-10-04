@@ -6,6 +6,7 @@ pub mod compression;
 pub mod cors;
 pub mod create;
 pub mod delete;
+pub mod encryption;
 pub mod forward;
 pub mod get;
 pub mod holders;
