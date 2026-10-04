@@ -3501,7 +3501,7 @@ async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bo
         };
         let write = StorageEffect::VaultWrite {
             entry: GroupStorageSecret::vault_entry(backend_id),
-            secret: secret.to_secret().unwrap(),
+            secret: aruna_core::compute::SharedSecret::new(secret.to_secret().unwrap()),
             txn_id: None,
         };
         context.storage_handle.send_storage_effect(write).await;

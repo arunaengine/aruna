@@ -643,7 +643,7 @@ mod tests {
 
     #[test]
     fn keys_never_formatted() {
-        use crate::compute::SecretBytes;
+        use crate::compute::{SecretBytes, SharedSecret};
         use crate::effects::BlobEffect;
         use crate::events::BlobEvent;
         use crate::structs::storage::blob::BackendRef;
@@ -653,13 +653,13 @@ mod tests {
         let prepare = BlobEffect::PrepareKey {
             key,
             public_key: [3; 32],
-            private_key: SecretBytes::new(CANARY.to_vec()),
+            private_key: SharedSecret::new(SecretBytes::new(CANARY.to_vec())),
             duration: None,
             max: None,
         };
         let generated = BlobEvent::BucketKeyGenerated {
             public_key: [3; 32],
-            private_key: SecretBytes::new(CANARY.to_vec()),
+            private_key: SharedSecret::new(SecretBytes::new(CANARY.to_vec())),
         };
         let archive = ArchiveKey::new(Ulid::from_bytes([4; 16]), BackendRef::node_default());
         let guard: Arc<dyn Any + Send + Sync> = Arc::new(SecretBytes::new(CANARY.to_vec()));
@@ -678,6 +678,12 @@ mod tests {
             assert!(!formatted.contains(&canary), "{formatted}");
             assert!(!formatted.contains("99, 97, 110"), "{formatted}");
         }
+        // A shared handle hands one key on without copying it and still prints no bytes.
+        let shared = SharedSecret::new(SecretBytes::new(CANARY.to_vec()));
+        let handed = shared.clone();
+        assert!(std::ptr::eq(shared.bytes(), handed.bytes()));
+        assert!(!format!("{handed:?}").contains(&canary));
+
         // Two leases are equal only when they share one adapter state.
         let same = ReadLease::new(key, archive.clone(), lease.session_id, guard);
         let other = ReadLease::new(key, archive, lease.session_id, Arc::new(()));

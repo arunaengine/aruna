@@ -26,7 +26,7 @@ pub(super) fn vault_effect(
         } => {
             let value = vault_key
                 .ok_or_else(not_open)?
-                .seal(entry, &secret)
+                .seal(entry, secret.bytes())
                 .map_err(|error| StorageError::WriteError(error.to_string()))?;
             let write = StorageEffect::Write {
                 key_space,
@@ -82,7 +82,7 @@ pub(super) fn vault_event(
 mod tests {
     use super::*;
     use crate::{FjallStorage, StorageHandle};
-    use aruna_core::compute::SecretBytes;
+    use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::events::Event;
     use aruna_core::node_vault::VaultPurpose;
     use aruna_core::types::{TxnId, Value};
@@ -97,7 +97,7 @@ mod tests {
     fn write(entry: VaultEntry, txn_id: Option<TxnId>) -> StorageEffect {
         StorageEffect::VaultWrite {
             entry,
-            secret: SecretBytes::new(CANARY.to_vec()),
+            secret: SharedSecret::new(SecretBytes::new(CANARY.to_vec())),
             txn_id,
         }
     }

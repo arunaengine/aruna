@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::audit::AuditPageBatch;
-use crate::compute::SecretBytes;
+use crate::compute::{SecretBytes, SharedSecret};
 use crate::effects::{
     FetchCursor, FrameBoundsError, JOB_PAGE_BYTES, JobRecordFrame, MAX_RECORD_PAGE, ReceiptFrame,
     encoded_len,
@@ -159,7 +159,7 @@ pub enum BlobEvent {
     UploadAborted,
     BucketKeyGenerated {
         public_key: [u8; 32],
-        private_key: SecretBytes,
+        private_key: SharedSecret,
     },
     CopiesSealed {
         copies: Vec<SealedCopy>,

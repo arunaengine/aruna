@@ -342,7 +342,7 @@ async fn reservations_keep_pending() {
 
 #[tokio::test]
 async fn leases_pin_archives() {
-    use aruna_core::compute::SecretBytes;
+    use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::effects::BlobEffect;
     use aruna_core::structs::storage::blob::ArchiveKey;
     use aruna_core::structs::storage::encryption::public_key_of;
@@ -366,7 +366,7 @@ async fn leases_pin_archives() {
     let prepare = BlobEffect::PrepareKey {
         key,
         public_key: public_key_of(&SecretBytes::new(vec![5; 32])).unwrap(),
-        private_key: SecretBytes::new(vec![5; 32]),
+        private_key: SharedSecret::new(SecretBytes::new(vec![5; 32])),
         duration: None,
         max: None,
     };

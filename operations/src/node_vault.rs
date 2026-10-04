@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::compute::SecretBytes;
+use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -18,7 +18,7 @@ pub fn read_secret(entry: VaultEntry, txn_id: Option<TxnId>) -> Effect {
 pub fn write_secret(entry: VaultEntry, secret: SecretBytes, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::VaultWrite {
         entry,
-        secret,
+        secret: SharedSecret::new(secret),
         txn_id,
     })
 }

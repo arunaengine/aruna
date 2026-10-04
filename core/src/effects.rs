@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::UserId;
 use crate::alpn::Alpn;
 use crate::audit::AuditPageRequest;
-use crate::compute::{ExecutionTargetId, SecretBytes};
+use crate::compute::{ExecutionTargetId, SharedSecret};
 use crate::document::DocumentEffect;
 use crate::id::{DhtKeyId, NodeId};
 use crate::jobs::JobRequest;
@@ -187,7 +187,7 @@ pub enum BlobEffect {
     /// Seals the private key of `key` to each user key; the plain key is not returned.
     SealHolderCopies {
         key: BucketKeyRef,
-        private_key: SecretBytes,
+        private_key: SharedSecret,
         realm_id: RealmId,
         node_id: NodeId,
         holders: Vec<CopyTarget>,
@@ -197,7 +197,7 @@ pub enum BlobEffect {
     PrepareKey {
         key: BucketKeyRef,
         public_key: [u8; 32],
-        private_key: SecretBytes,
+        private_key: SharedSecret,
         duration: Option<Duration>,
         max: Option<Duration>,
     },
@@ -404,7 +404,7 @@ pub enum StorageEffect {
     /// Seals `secret` into the node vault under `entry`. Answers `WriteResult`.
     VaultWrite {
         entry: VaultEntry,
-        secret: SecretBytes,
+        secret: SharedSecret,
         txn_id: Option<TxnId>,
     },
     /// Opens the node vault record of `entry`. Answers `VaultResult`.

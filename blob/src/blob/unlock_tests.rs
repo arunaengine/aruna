@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{LeaseGuard, UNLOCKED_BUCKETS, UnlockRegistry};
-use aruna_core::compute::SecretBytes;
+use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::structs::storage::blob::{ArchiveKey, BackendRef};
 use aruna_core::structs::storage::encryption::{
     BucketKeyError, BucketKeyRef, KeyTicket, public_key_of,
@@ -13,8 +13,8 @@ use ulid::Ulid;
 
 const MINUTE: Duration = Duration::from_secs(60);
 
-fn private(seed: u8) -> SecretBytes {
-    SecretBytes::new(vec![seed; 32])
+fn private(seed: u8) -> SharedSecret {
+    SharedSecret::new(SecretBytes::new(vec![seed; 32]))
 }
 
 fn reference(bucket: u8, generation: u64) -> BucketKeyRef {
@@ -33,7 +33,7 @@ fn unlock(
     bounds: (Option<Duration>, Option<Duration>),
     now: Instant,
 ) -> Result<KeyTicket, BucketKeyError> {
-    let public = public_key_of(&private(seed)).unwrap();
+    let public = public_key_of(private(seed).bytes()).unwrap();
     let ticket = registry.prepare(
         key,
         &public,
@@ -50,7 +50,7 @@ fn admits_after_activation() {
     let mut registry = UnlockRegistry::new(UNLOCKED_BUCKETS);
     let now = Instant::now();
     let key = reference(1, 1);
-    let public = public_key_of(&private(1)).unwrap();
+    let public = public_key_of(private(1).bytes()).unwrap();
 
     let wrong = registry.prepare(
         key,
@@ -161,7 +161,7 @@ fn lock_keeps_leases() {
     assert!(registry.admit(source, archive(7), now).is_err());
     // The admitted read keeps its key and its archive pin until it ends.
     let guard = lease.guard().downcast_ref::<LeaseGuard>().unwrap();
-    assert_eq!(guard._secret.expose(), private(1).expose());
+    assert_eq!(guard._secret, private(1));
     assert!(registry.is_pinned(&archive(7)));
     let pin = registry.pin(archive(8));
     drop(lease);

@@ -4,7 +4,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::compute::SecretBytes;
+use aruna_core::compute::SharedSecret;
 use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
@@ -30,7 +30,7 @@ type Pins = Arc<StdMutex<HashMap<ArchiveKey, usize>>>;
 /// One unlock session of a key generation.
 struct Session {
     session_id: Ulid,
-    secret: Arc<SecretBytes>,
+    secret: SharedSecret,
     active: bool,
     unlocked_at: SystemTime,
     prepared_at: Instant,
@@ -80,7 +80,7 @@ impl Drop for ArchivePin {
 
 /// The adapter state behind a `ReadLease`: it holds the shared key and the archive pin.
 pub(super) struct LeaseGuard {
-    _secret: Arc<SecretBytes>,
+    _secret: SharedSecret,
     _pin: ArchivePin,
 }
 
@@ -117,13 +117,13 @@ impl UnlockRegistry {
         &mut self,
         key: BucketKeyRef,
         public_key: &[u8; 32],
-        private_key: SecretBytes,
+        private_key: SharedSecret,
         bounds: (Option<Duration>, Option<Duration>),
         now: (Instant, SystemTime),
     ) -> Result<KeyTicket, BucketKeyError> {
         let (duration, max) = bounds;
         self.purge(now.0);
-        if !key_matches(&private_key, public_key) {
+        if !key_matches(private_key.bytes(), public_key) {
             return Err(BucketKeyError::WrongKey);
         }
         let duration = duration.or(max);
@@ -145,7 +145,7 @@ impl UnlockRegistry {
         let session_id = Ulid::generate();
         sessions.push(Session {
             session_id,
-            secret: Arc::new(private_key),
+            secret: private_key,
             active: false,
             unlocked_at: now.1,
             prepared_at: now.0,
@@ -267,7 +267,7 @@ impl UnlockRegistry {
             .and_then(|sessions| sessions.iter().find(|session| session.active))
             .ok_or(BucketKeyError::Locked(key.bucket_id))?;
         let guard = LeaseGuard {
-            _secret: Arc::clone(&session.secret),
+            _secret: session.secret.clone(),
             _pin: self.pin(archive.clone()),
         };
         Ok(ReadLease::new(

@@ -551,6 +551,28 @@ impl Drop for SecretBytes {
     }
 }
 
+/// One secret allocation that several effects use in turn, so an operation can hand a key on
+/// after an effect used it. A clone shares the allocation and never copies the bytes; they are
+/// zeroed when the last handle drops.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SharedSecret(std::sync::Arc<SecretBytes>);
+
+impl SharedSecret {
+    pub fn new(secret: SecretBytes) -> Self {
+        Self(std::sync::Arc::new(secret))
+    }
+
+    pub fn bytes(&self) -> &SecretBytes {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SharedSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SharedSecret(***)")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogLimits {
     #[serde(rename = "max_bytes_per_stream")]
