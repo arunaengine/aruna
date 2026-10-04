@@ -277,3 +277,65 @@ async fn aborts_failed_writes() {
     assert!(matches!(failed, Err(BlobError::StreamFailed(_))));
     assert!(!operator.exists("object.pith").await.unwrap());
 }
+
+#[tokio::test]
+async fn reservations_keep_pending() {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
+    use aruna_core::structs::checksum::HASH_BLAKE3;
+    use aruna_core::structs::storage::blob::ArchiveKey;
+
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    for owned in [true, false] {
+        let stream = stream_from_bytes(b"sealed bytes");
+        let backend = ResolvedBackend::node_default();
+        let written = handler
+            .write_blob("bucket", "sealed.bin", backend, test_user_id(), stream)
+            .await;
+        let BlobEvent::WriteFinished { mut location } = written else {
+            panic!("write failed: {written:?}")
+        };
+        // The finalized marker of a pending archive names no content hash.
+        location.hashes.remove(HASH_BLAKE3);
+        let layout = PithosLayout {
+            stored_size: 12,
+            metadata_digest: [3; 32],
+        };
+        location.format =
+            StoredFormat::pithos(layout, BucketKeyRef::new(ulid::Ulid::generate(), 1));
+        handler.finalize_reservation(&location).await.unwrap();
+        handler.clear_active(location.ulid);
+        if owned {
+            let event = context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: PENDING_LOCATION_KEYSPACE.to_string(),
+                    key: ArchiveKey::of(&location).to_bytes().into(),
+                    value: location.to_bytes().unwrap().into(),
+                    txn_id: None,
+                })
+                .await;
+            assert!(matches!(
+                event,
+                Event::Storage(StorageEvent::WriteResult { .. })
+            ));
+        }
+
+        assert!(
+            handler
+                .reconcile_reservation(location.clone())
+                .await
+                .unwrap()
+        );
+        assert!(!handler.marker_present(&location).await.unwrap());
+        let operator = handler.operator_from_location(&location).unwrap();
+        let path = location.get_storage_path().unwrap();
+        assert_eq!(
+            operator.exists(&path).await.unwrap(),
+            owned,
+            "owned: {owned}"
+        );
+    }
+}

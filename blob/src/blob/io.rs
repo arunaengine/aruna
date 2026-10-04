@@ -16,12 +16,14 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle as _;
-use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
+use aruna_core::keyspaces::{
+    BLOB_LOCATIONS_KEYSPACE, COPY_OWNER_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+};
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
 use aruna_core::structs::storage::blob::{
-    Backend, BackendLocation, BackendRef, BlobLocationKey, HIDDEN_BLOB_PREFIX, HiddenBlobEntry,
-    HiddenBlobKey, ResolvedBackend,
+    ArchiveKey, Backend, BackendLocation, BackendRef, BlobLocationKey, CopyOwner,
+    HIDDEN_BLOB_PREFIX, HiddenBlobEntry, HiddenBlobKey, ResolvedBackend,
 };
 use aruna_core::structs::storage::format::{Compression, FrameLayout, StoredFormat, StoredLayout};
 use aruna_core::structs::storage::group_backend::GroupBackendKind;
@@ -820,6 +822,13 @@ impl BlobHandler {
             return Ok(true);
         }
         let active = self.reservation_active(location.ulid);
+        // A pending archive has no hash, so its own records prove the commit.
+        if let StoredLayout::Pithos(_) = location.format.layout
+            && self.archive_owned(&location).await?
+        {
+            self.clear_marker(&location).await?;
+            return Ok(true);
+        }
         let hash = match location.get_blake3() {
             Some(hash) => hash
                 .try_into()
@@ -885,6 +894,50 @@ impl BlobHandler {
         self.delete_path(&operator, &storage_path).await?;
         self.release_reservation(&location).await?;
         Ok(true)
+    }
+
+    /// Whether committed records keep a Pithos archive: its pending location names this exact
+    /// object, or a version still owns it.
+    async fn archive_owned(&self, location: &BackendLocation) -> Result<bool, BlobError> {
+        let archive = ArchiveKey::of(location);
+        let reads = [
+            StorageEffect::Read {
+                key_space: PENDING_LOCATION_KEYSPACE.to_string(),
+                key: archive.to_bytes().into(),
+                txn_id: None,
+            },
+            StorageEffect::Iter {
+                key_space: COPY_OWNER_KEYSPACE.to_string(),
+                prefix: Some(CopyOwner::prefix(&archive).into()),
+                start: None,
+                limit: 1,
+                txn_id: None,
+            },
+        ];
+        for read in reads {
+            match self.storage.send_effect(Effect::Storage(read)).await {
+                Event::Storage(StorageEvent::ReadResult {
+                    value: Some(value), ..
+                }) => {
+                    let pending = BackendLocation::from_bytes(&value)?;
+                    if pending.same_object(location) {
+                        return Ok(true);
+                    }
+                }
+                Event::Storage(StorageEvent::IterResult { values, .. }) if !values.is_empty() => {
+                    return Ok(true);
+                }
+                Event::Storage(
+                    StorageEvent::ReadResult { .. } | StorageEvent::IterResult { .. },
+                ) => {}
+                other => {
+                    return Err(BlobError::ReadError(format!(
+                        "failed to read archive owners: {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(false)
     }
 
     pub async fn write_blob(

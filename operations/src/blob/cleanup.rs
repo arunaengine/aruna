@@ -10,13 +10,13 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
-    UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
+    ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
 };
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::multipart::{
@@ -383,7 +383,8 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
                         } => register_dht(context, blake3, realm_id, ttl_ms).await,
                         WriteOwner::UploadPart { .. }
                         | WriteOwner::Upload { .. }
-                        | WriteOwner::CompletedUpload { .. } => true,
+                        | WriteOwner::CompletedUpload { .. }
+                        | WriteOwner::Pending => true,
                     }
                 }
                 Some(false) => delete_blob(context, location).await,
@@ -533,6 +534,10 @@ async fn owns_write(
         WriteOwner::Upload { upload_id } | WriteOwner::CompletedUpload { upload_id, .. } => {
             (UPLOAD_KEYSPACE, upload_id.to_bytes().to_vec().into())
         }
+        WriteOwner::Pending => (
+            PENDING_LOCATION_KEYSPACE,
+            ArchiveKey::of(location).to_bytes().into(),
+        ),
     };
     let event = context
         .storage_handle
@@ -550,7 +555,9 @@ async fn owns_write(
         return Some(false);
     };
     let owned = match owner {
-        WriteOwner::Blob { .. } => BackendLocation::from_bytes(&value).ok()?,
+        WriteOwner::Blob { .. } | WriteOwner::Pending => {
+            BackendLocation::from_bytes(&value).ok()?
+        }
         WriteOwner::UploadPart { .. } => MultipartPart::from_bytes(&value).ok()?.location,
         WriteOwner::Upload { .. } | WriteOwner::CompletedUpload { .. } => {
             let record = MultipartUpload::from_bytes(&value).ok()?;
@@ -881,6 +888,47 @@ mod tests {
         assert_eq!(outcome.processed, 0);
         assert_eq!(outcome.failed, 1);
         assert_eq!(remaining_rows(&storage).await, 1);
+    }
+
+    #[tokio::test]
+    async fn pending_write_owned() {
+        // The pending location row is the commit of an archive without a hash.
+        use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
+        use aruna_core::structs::storage::blob::ArchiveKey;
+        for owned in [true, false] {
+            let (_dir, storage, context) = setup_context();
+            let BlobCleanupWork::DeleteBlob { location } =
+                BlobCleanupWork::from_bytes(&delete_work()).unwrap()
+            else {
+                panic!("expected a delete row")
+            };
+            if owned {
+                let event = storage
+                    .send_storage_effect(StorageEffect::Write {
+                        key_space: PENDING_LOCATION_KEYSPACE.to_string(),
+                        key: ArchiveKey::of(&location).to_bytes().into(),
+                        value: location.to_bytes().unwrap().into(),
+                        txn_id: None,
+                    })
+                    .await;
+                assert!(matches!(
+                    event,
+                    Event::Storage(StorageEvent::WriteResult { .. })
+                ));
+            }
+            let row = BlobCleanupWork::ReconcileWrite {
+                location,
+                owner: WriteOwner::Pending,
+            };
+            write_rows(&storage, vec![row.to_bytes().unwrap()]).await;
+
+            let outcome = process_cleanup_batch(&context).await.unwrap();
+
+            // An unowned archive must be deleted, which needs the blob handle this context lacks.
+            assert_eq!(outcome.processed, usize::from(owned));
+            assert_eq!(outcome.failed, usize::from(!owned));
+            assert_eq!(remaining_rows(&storage).await, usize::from(!owned));
+        }
     }
 
     #[tokio::test]

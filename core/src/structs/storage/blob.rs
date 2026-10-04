@@ -344,6 +344,9 @@ pub enum WriteOwner {
         realm_id: RealmId,
         ttl_ms: u64,
     },
+    /// An encrypted archive published before its content hash is known: kept while its
+    /// `pending_locations` row names it.
+    Pending,
 }
 
 impl BlobCleanupWork {
