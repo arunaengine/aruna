@@ -479,6 +479,10 @@ async fn fill(
     checkpoint(StartupStage::UsageCounters)?;
     stopped(stop)?;
 
+    // Node-managed bucket keys open before content work; vault-locked keys stay locked.
+    open_managed_keys(driver_ctx.as_ref()).await?;
+    stopped(stop)?;
+
     // Bind compute reconciliation before startup recovery.
     initialize_net_holder(
         driver_ctx.clone(),
@@ -496,6 +500,30 @@ async fn fill(
     acquired.task_queues = Some(task_queues);
     checkpoint(StartupStage::TaskQueues)?;
 
+    Ok(())
+}
+
+/// Opens the node-managed bucket keys; a key that fails stays locked and is reported.
+async fn open_managed_keys(driver_ctx: &DriverContext) -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_operations::driver::drive;
+    use aruna_operations::s3::bucket::key_startup::OpenManagedOperation;
+
+    let keys = drive(OpenManagedOperation::new(), driver_ctx).await?;
+    for (key, reason) in &keys.failed {
+        warn!(
+            bucket_id = %key.bucket_id,
+            generation = key.generation,
+            reason = %reason,
+            "A node-managed bucket key stays locked"
+        );
+    }
+    if keys.unreadable > 0 {
+        warn!(rows = keys.unreadable, "Skipped unreadable bucket key rows");
+    }
+    info!(
+        opened = keys.opened.len(),
+        "Opened node-managed bucket keys"
+    );
     Ok(())
 }
 

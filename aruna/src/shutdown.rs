@@ -379,6 +379,8 @@ impl NodeShutdown {
             if !blob_drained {
                 warn!("Blob writes outlived the shutdown drain");
             }
+            // Unlocked keys go now; reads still running finish with their own lease.
+            blob_handle.clear_unlocks();
             blob_handle.rejected_writes()
         } else {
             0
