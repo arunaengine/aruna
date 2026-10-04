@@ -116,14 +116,27 @@ fn deadlines_close_admission() {
     );
     assert_eq!(too_long, Err(BucketKeyError::InvalidDuration));
     // Without a duration the unlock lasts until the maximum.
-    unlock(&mut registry, key, 1, (None, Some(MINUTE)), start).unwrap();
+    let ticket = unlock(&mut registry, key, 1, (None, Some(MINUTE)), start).unwrap();
     let status = registry.status(key.bucket_id, start);
     assert_eq!(status[0].remaining, Some(MINUTE));
 
+    let later = start + Duration::from_secs(30);
+    let short = registry
+        .extend(key, ticket.session_id, Some(Duration::from_secs(10)), later)
+        .unwrap();
+    assert_eq!(short.remaining, Some(Duration::from_secs(10)));
+    assert_eq!(short.max_remaining, Some(Duration::from_secs(30)));
+    let beyond = registry.extend(key, ticket.session_id, Some(MINUTE), later);
+    assert_eq!(beyond, Err(BucketKeyError::InvalidDuration));
+    let stranger = registry.extend(key, Ulid::generate(), None, later);
+    assert_eq!(stranger, Err(BucketKeyError::SessionMismatch));
+
     // A delayed timer cannot keep the key admitted past its deadline.
-    let expired = start + MINUTE;
+    let expired = later + Duration::from_secs(10);
     assert!(registry.admit(key, archive(1), expired).is_err());
     assert!(registry.status(key.bucket_id, expired).is_empty());
+    let locked = registry.extend(key, ticket.session_id, None, expired);
+    assert_eq!(locked, Err(BucketKeyError::Locked(key.bucket_id)));
 }
 
 #[test]
@@ -146,7 +159,14 @@ fn lock_keeps_leases() {
     assert_eq!(locked.len(), 2);
     assert!(registry.admit(active, archive(7), now).is_err());
     assert!(registry.admit(source, archive(7), now).is_err());
-    // The admitted read keeps its key until it ends.
+    // The admitted read keeps its key and its archive pin until it ends.
     let guard = lease.guard().downcast_ref::<LeaseGuard>().unwrap();
     assert_eq!(guard._secret.expose(), private(1).expose());
+    assert!(registry.is_pinned(&archive(7)));
+    let pin = registry.pin(archive(8));
+    drop(lease);
+    assert!(!registry.is_pinned(&archive(7)));
+    assert!(registry.is_pinned(&archive(8)));
+    drop(pin);
+    assert!(!registry.is_pinned(&archive(8)));
 }

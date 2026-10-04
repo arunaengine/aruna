@@ -731,15 +731,14 @@ impl BlobHandler {
             BlobEffect::CheckGroupBackend { record, secret } => {
                 Box::pin(self.check_group_backend(record, secret)).await
             }
-            BlobEffect::GenerateBucketKey
-            | BlobEffect::SealHolderCopies { .. }
-            | BlobEffect::ExtendKey { .. } => {
+            BlobEffect::GenerateBucketKey | BlobEffect::SealHolderCopies { .. } => {
                 BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Unsupported))
             }
             effect @ (BlobEffect::PrepareKey { .. }
             | BlobEffect::ActivateKey { .. }
             | BlobEffect::DiscardKey { .. }
             | BlobEffect::ReadKeyStatus { .. }
+            | BlobEffect::ExtendKey { .. }
             | BlobEffect::LockKey { .. }
             | BlobEffect::AdmitRead { .. }) => self.unlock_effect(effect),
             BlobEffect::OpenConnection { node_id } => Box::pin(self.open_connection(node_id)).await,

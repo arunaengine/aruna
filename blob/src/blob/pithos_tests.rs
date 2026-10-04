@@ -339,3 +339,66 @@ async fn reservations_keep_pending() {
         );
     }
 }
+
+#[tokio::test]
+async fn leases_pin_archives() {
+    use aruna_core::compute::SecretBytes;
+    use aruna_core::effects::BlobEffect;
+    use aruna_core::structs::storage::blob::ArchiveKey;
+    use aruna_core::structs::storage::encryption::public_key_of;
+
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let stream = stream_from_bytes(b"sealed bytes");
+    let backend = ResolvedBackend::node_default();
+    let written = handler
+        .write_blob("bucket", "sealed.bin", backend, test_user_id(), stream)
+        .await;
+    let BlobEvent::WriteFinished { mut location } = written else {
+        panic!("write failed: {written:?}")
+    };
+    let key = BucketKeyRef::new(ulid::Ulid::generate(), 1);
+    let layout = PithosLayout {
+        stored_size: 12,
+        metadata_digest: [3; 32],
+    };
+    location.format = StoredFormat::pithos(layout, key);
+    let prepare = BlobEffect::PrepareKey {
+        key,
+        public_key: public_key_of(&SecretBytes::new(vec![5; 32])).unwrap(),
+        private_key: SecretBytes::new(vec![5; 32]),
+        duration: None,
+        max: None,
+    };
+    let BlobEvent::KeyPrepared { ticket } = handler.unlock_effect(prepare) else {
+        panic!("prepare failed")
+    };
+    let activated = handler.unlock_effect(BlobEffect::ActivateKey { ticket });
+    assert!(matches!(activated, BlobEvent::KeyActivated { .. }));
+    let admit = BlobEffect::AdmitRead {
+        key,
+        archive: ArchiveKey::of(&location),
+    };
+    let BlobEvent::ReadAdmitted { lease } = handler.unlock_effect(admit) else {
+        panic!("admission failed")
+    };
+
+    // Locking stops new reads, but the admitted read still pins its archive.
+    let lock = BlobEffect::LockKey {
+        bucket_id: key.bucket_id,
+        session: None,
+    };
+    assert!(
+        matches!(handler.unlock_effect(lock), BlobEvent::KeyLocked { locked } if locked.len() == 1)
+    );
+    let refused = handler.delete_blob(location.clone()).await;
+    assert!(matches!(
+        refused,
+        BlobEvent::Error(BlobError::DeleteError(_))
+    ));
+    drop(lease);
+    assert_eq!(
+        handler.delete_blob(location).await,
+        BlobEvent::DeleteFinished
+    );
+}

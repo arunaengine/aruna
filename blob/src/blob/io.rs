@@ -1857,6 +1857,12 @@ impl BlobHandler {
     }
 
     pub async fn delete_blob(&self, location: BackendLocation) -> BlobEvent {
+        // An admitted read or keyless work still uses the archive; the cleanup row retries.
+        if let StoredLayout::Pithos(_) = location.format.layout
+            && self.archive_pinned(&ArchiveKey::of(&location))
+        {
+            return BlobEvent::Error(BlobError::DeleteError("the archive is in use".to_string()));
+        }
         self.clear_active(location.ulid);
         // An in-place part is no object: its provider upload holds the bytes until it settles.
         // Deleting it ends its claim: it was rolled back, or a staged record replaced it.

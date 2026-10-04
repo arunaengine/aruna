@@ -13,7 +13,7 @@ use aruna_core::structs::storage::encryption::{
     BucketKeyError, BucketKeyRef, KeyTicket, ReadLease, UnlockStatus, key_matches,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime};
 use ulid::Ulid;
 
@@ -23,6 +23,9 @@ pub(super) const UNLOCKED_BUCKETS: usize = 1024;
 const BUCKET_GENERATIONS: usize = 2;
 /// A prepared key that is neither activated nor discarded in this time is dropped.
 const PREPARED_TTL: Duration = Duration::from_secs(300);
+
+/// Archives pinned by leases, with the number of leases that pin each.
+type Pins = Arc<StdMutex<HashMap<ArchiveKey, usize>>>;
 
 /// One unlock session of a key generation.
 struct Session {
@@ -54,9 +57,31 @@ impl Session {
     }
 }
 
-/// The adapter state behind a `ReadLease`: it holds the shared key.
+/// Keeps an archive pinned while the lease that holds it lives. A pin without a key is the copy
+/// lease of keyless work on an archive; cleanup never deletes a pinned archive.
+pub struct ArchivePin {
+    archive: ArchiveKey,
+    pins: Pins,
+}
+
+impl Drop for ArchivePin {
+    fn drop(&mut self) {
+        let Ok(mut pins) = self.pins.lock() else {
+            return;
+        };
+        if let Some(count) = pins.get_mut(&self.archive) {
+            *count -= 1;
+            if *count == 0 {
+                pins.remove(&self.archive);
+            }
+        }
+    }
+}
+
+/// The adapter state behind a `ReadLease`: it holds the shared key and the archive pin.
 pub(super) struct LeaseGuard {
     _secret: Arc<SecretBytes>,
+    _pin: ArchivePin,
 }
 
 /// Unlocked key generations, keyed by bucket id and generation. It never evicts an unlocked
@@ -64,6 +89,7 @@ pub(super) struct LeaseGuard {
 pub(super) struct UnlockRegistry {
     capacity: usize,
     sessions: HashMap<BucketKeyRef, Vec<Session>>,
+    pins: Pins,
 }
 
 /// Shows counts only, so no formatted handler carries a key.
@@ -81,6 +107,7 @@ impl UnlockRegistry {
         Self {
             capacity,
             sessions: HashMap::new(),
+            pins: Arc::default(),
         }
     }
 
@@ -173,6 +200,34 @@ impl UnlockRegistry {
         statuses
     }
 
+    /// Moves the timed lock of an active session; it never passes the session maximum.
+    pub(super) fn extend(
+        &mut self,
+        key: BucketKeyRef,
+        session_id: Ulid,
+        duration: Option<Duration>,
+        now: Instant,
+    ) -> Result<UnlockStatus, BucketKeyError> {
+        self.purge(now);
+        let session = self
+            .sessions
+            .get_mut(&key)
+            .ok_or(BucketKeyError::Locked(key.bucket_id))?
+            .iter_mut()
+            .find(|session| session.active && session.session_id == session_id)
+            .ok_or(BucketKeyError::SessionMismatch)?;
+        let deadline = duration
+            .map(|duration| now + duration)
+            .or(session.max_deadline);
+        if let (Some(max), Some(deadline)) = (session.max_deadline, deadline)
+            && deadline > max
+        {
+            return Err(BucketKeyError::InvalidDuration);
+        }
+        session.deadline = deadline;
+        Ok(session.status(key, now))
+    }
+
     /// Locks every generation of a bucket, or only `only` when a timer names its session.
     pub(super) fn lock(&mut self, bucket_id: Ulid, only: Option<KeyTicket>) -> Vec<KeyTicket> {
         let mut locked = Vec::new();
@@ -213,6 +268,7 @@ impl UnlockRegistry {
             .ok_or(BucketKeyError::Locked(key.bucket_id))?;
         let guard = LeaseGuard {
             _secret: Arc::clone(&session.secret),
+            _pin: self.pin(archive.clone()),
         };
         Ok(ReadLease::new(
             key,
@@ -220,6 +276,24 @@ impl UnlockRegistry {
             session.session_id,
             Arc::new(guard),
         ))
+    }
+
+    /// Pins an archive without a key, so cleanup keeps it while keyless work uses it.
+    pub(super) fn pin(&self, archive: ArchiveKey) -> ArchivePin {
+        if let Ok(mut pins) = self.pins.lock() {
+            *pins.entry(archive.clone()).or_default() += 1;
+        }
+        ArchivePin {
+            archive,
+            pins: Arc::clone(&self.pins),
+        }
+    }
+
+    /// Fails closed: an unreadable pin table counts every archive as pinned.
+    pub(super) fn is_pinned(&self, archive: &ArchiveKey) -> bool {
+        self.pins
+            .lock()
+            .map_or(true, |pins| pins.contains_key(archive))
     }
 
     /// Removes sessions past their deadline; admitted leases keep their own key.
@@ -278,6 +352,13 @@ impl super::BlobHandler {
             BlobEffect::ReadKeyStatus { bucket_id } => Ok(BlobEvent::KeyStatus {
                 generations: registry.status(bucket_id, now),
             }),
+            BlobEffect::ExtendKey {
+                key,
+                session_id,
+                duration,
+            } => registry
+                .extend(key, session_id, duration, now)
+                .map(|status| BlobEvent::KeyExtended { status }),
             BlobEffect::LockKey { bucket_id, session } => Ok(BlobEvent::KeyLocked {
                 locked: registry.lock(bucket_id, session),
             }),
@@ -287,6 +368,12 @@ impl super::BlobHandler {
             _ => Err(BucketKeyError::Unsupported),
         };
         result.unwrap_or_else(|error| BlobEvent::Error(error.into()))
+    }
+
+    pub(super) fn archive_pinned(&self, archive: &ArchiveKey) -> bool {
+        self.unlocks
+            .lock()
+            .map_or(true, |registry| registry.is_pinned(archive))
     }
 }
 
