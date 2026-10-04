@@ -19,6 +19,9 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+/// Writes of an audit completion before the applied change is reported without its record.
+pub(crate) const AUDIT_ATTEMPTS: u32 = 3;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LockStep {
     Init,
@@ -81,6 +84,8 @@ pub struct LockBucketOperation {
     bucket_id: Option<Ulid>,
     locked: Vec<KeyTicket>,
     audited: bool,
+    audit_writes: Vec<(String, Key, Value)>,
+    attempts: u32,
     timers: usize,
     output: Option<Result<LockResult, LockError>>,
 }
@@ -93,6 +98,8 @@ impl LockBucketOperation {
             bucket_id: None,
             locked: Vec::new(),
             audited: false,
+            audit_writes: Vec::new(),
+            attempts: 0,
             timers: 0,
             output: None,
         }
@@ -192,9 +199,16 @@ impl LockBucketOperation {
         if writes.is_empty() {
             return self.finish(true);
         }
+        self.audit_writes = writes;
+        self.write_audit()
+    }
+
+    /// The audit records stay with the operation until written, so a failed write is retried.
+    fn write_audit(&mut self) -> Effects {
+        self.attempts += 1;
         self.step = LockStep::WriteAudit;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
+            writes: self.audit_writes.clone(),
             txn_id: None,
         })]
     }
@@ -251,6 +265,11 @@ impl Operation for LockBucketOperation {
             // The lock already applied; it stays even when its audit cannot be written.
             (LockStep::WriteAudit, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
                 self.finish(true)
+            }
+            (LockStep::WriteAudit, Event::Storage(StorageEvent::Error { .. }))
+                if self.attempts < AUDIT_ATTEMPTS =>
+            {
+                self.write_audit()
             }
             (LockStep::WriteAudit, Event::Storage(StorageEvent::Error { .. })) => {
                 self.finish(false)
@@ -417,10 +436,23 @@ mod tests {
                 .iter()
                 .all(|record| record.action == AuditAction::Lock)
         );
-        // A failed audit write leaves the lock in place; the sessions' timers end.
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
+        // A failed audit write is retried, and a lasting failure leaves the lock in place.
+        let batch = writes.clone();
+        let failed = || {
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Timeout,
+            })
+        };
+        for _ in 1..AUDIT_ATTEMPTS {
+            let retry = operation.step(failed());
+            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = retry.as_slice()
+            else {
+                panic!("expected the audit retry, got {retry:?}");
+            };
+            assert_eq!(writes, &batch);
+        }
+        // The sessions' timers end once the audit gives up.
+        let effects = operation.step(failed());
         let cancels: Vec<_> = locked
             .iter()
             .map(|ticket| {

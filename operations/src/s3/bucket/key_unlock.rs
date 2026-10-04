@@ -5,7 +5,7 @@
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::key_wake::wake_unlocked;
-use crate::s3::bucket::key_lock::{answers_timer, lock_timer};
+use crate::s3::bucket::key_lock::{AUDIT_ATTEMPTS, answers_timer, lock_timer};
 use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -103,6 +103,9 @@ pub struct UnlockBucketOperation {
     intent: Option<BucketAuditRecord>,
     failure: Option<UnlockError>,
     activated: Option<UnlockStatus>,
+    /// The outcome record until it is written, and the writes tried so far.
+    outcome: Option<BucketAuditRecord>,
+    attempts: u32,
     output: Option<Result<UnlockStatus, UnlockError>>,
 }
 
@@ -121,6 +124,8 @@ impl UnlockBucketOperation {
             intent: None,
             failure: None,
             activated: None,
+            outcome: None,
+            attempts: 0,
             output: None,
         }
     }
@@ -281,6 +286,15 @@ impl UnlockBucketOperation {
             Err(_) => self.intent.as_ref().and_then(|intent| intent.deadline_ms),
         };
         self.output = Some(result);
+        self.outcome = Some(record);
+        self.retry_outcome()
+    }
+
+    fn retry_outcome(&mut self) -> Effects {
+        let Some(record) = self.outcome.clone() else {
+            return self.fail(UnlockError::NotFinished);
+        };
+        self.attempts += 1;
         self.step = UnlockStep::WriteOutcome;
         self.write_record(&record, None)
     }
@@ -409,11 +423,18 @@ impl Operation for UnlockBucketOperation {
                 let error = self.failure.take().unwrap_or(UnlockError::NotFinished);
                 self.write_outcome(Err(error))
             }
-            // The key state is settled; a lost outcome record leaves only the unconfirmed intent.
+            // The key state is settled; a failed outcome write is retried, and a lasting failure
+            // leaves only the unconfirmed intent.
+            (UnlockStep::WriteOutcome, Event::Storage(StorageEvent::Error { .. }))
+                if self.attempts < AUDIT_ATTEMPTS =>
+            {
+                self.retry_outcome()
+            }
             (
                 UnlockStep::WriteOutcome,
                 Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::Error { .. }),
             ) => {
+                self.outcome = None;
                 self.step = UnlockStep::Finish;
                 smallvec![]
             }

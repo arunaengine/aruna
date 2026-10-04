@@ -183,7 +183,12 @@ fn failed_activation_discards() {
         [Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() })]
     );
     let effects = operation.step(Event::Blob(BlobEvent::KeyDiscarded { ticket: ticket() }));
-    assert_eq!(audited(&effects).outcome, AuditOutcome::Failed);
+    let outcome = audited(&effects);
+    assert_eq!(outcome.outcome, AuditOutcome::Failed);
+    // A failed outcome write is retried with the same record.
+    let error = StorageError::Timeout;
+    let effects = operation.step(Event::Storage(StorageEvent::Error { error }));
+    assert_eq!(audited(&effects), outcome);
     operation.step(Event::Storage(StorageEvent::WriteResult {
         key: Key::from(Vec::new()),
     }));
