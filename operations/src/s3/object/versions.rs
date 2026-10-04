@@ -8,7 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::prefix_upper_bound;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
-    NODE_SUBJECT_KEYSPACE,
+    NODE_SUBJECT_KEYSPACE, PENDING_LOCATION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
@@ -498,7 +498,7 @@ impl ListVersionsOperation {
             split_after_marker(versions, marker, |(version_id, _)| *version_id)
         {
             let is_latest = version_id == head_version_id;
-            match version.state {
+            let (read, backend) = match version.state {
                 BlobVersionState::Deleted => {
                     pending.push(PendingItem::Ready(ListVersionsItem::DeleteMarker {
                         key: key.clone(),
@@ -506,6 +506,7 @@ impl ListVersionsOperation {
                         is_latest,
                         created_at: version.created_at,
                     }));
+                    continue;
                 }
                 BlobVersionState::Reference {
                     cached_metadata, ..
@@ -518,6 +519,7 @@ impl ListVersionsOperation {
                         source_metadata: Some(cached_metadata),
                         created_at: version.created_at,
                     }));
+                    continue;
                 }
                 BlobVersionState::Materialized {
                     blob_hash,
@@ -525,37 +527,38 @@ impl ListVersionsOperation {
                     encoding,
                     ..
                 } => {
-                    location_reads.push((
-                        BLOB_LOCATIONS_KEYSPACE.to_string(),
-                        BlobLocationKey::new(blob_hash, encoding, backend.clone())
-                            .to_bytes()
-                            .into(),
-                    ));
-                    let governed = match version.placement_policies.is_empty() {
-                        true => None,
-                        false => {
-                            let copy_key = ManagedCopyKey::new(
-                                VersionKey::new(self.input.bucket.clone(), key.clone(), version_id),
-                                backend,
-                            );
-                            let bytes = match copy_key.to_bytes() {
-                                Ok(bytes) => bytes,
-                                Err(error) => return self.emit_error(error.into()),
-                            };
-                            location_reads.push((MANAGED_COPY_KEYSPACE.to_string(), bytes.into()));
-                            Some((copy_key, version.placement_policies.clone()))
-                        }
-                    };
-                    pending.push(PendingItem::AwaitingLocation {
-                        key: key.clone(),
-                        version_id,
-                        is_latest,
-                        created_at: version.created_at,
-                        governed,
-                    });
+                    let location = BlobLocationKey::new(blob_hash, encoding, backend.clone());
+                    let read = (BLOB_LOCATIONS_KEYSPACE.to_string(), location.to_bytes());
+                    (read, backend)
                 }
-                BlobVersionState::PendingContent { .. } => {}
-            }
+                BlobVersionState::PendingContent { archive, .. } => {
+                    let read = (PENDING_LOCATION_KEYSPACE.to_string(), archive.to_bytes());
+                    (read, archive.backend)
+                }
+            };
+            location_reads.push((read.0, read.1.into()));
+            let governed = match version.placement_policies.is_empty() {
+                true => None,
+                false => {
+                    let copy_key = ManagedCopyKey::new(
+                        VersionKey::new(self.input.bucket.clone(), key.clone(), version_id),
+                        backend,
+                    );
+                    let bytes = match copy_key.to_bytes() {
+                        Ok(bytes) => bytes,
+                        Err(error) => return self.emit_error(error.into()),
+                    };
+                    location_reads.push((MANAGED_COPY_KEYSPACE.to_string(), bytes.into()));
+                    Some((copy_key, version.placement_policies.clone()))
+                }
+            };
+            pending.push(PendingItem::AwaitingLocation {
+                key: key.clone(),
+                version_id,
+                is_latest,
+                created_at: version.created_at,
+                governed,
+            });
         }
 
         self.current_pending = pending;

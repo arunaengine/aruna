@@ -7,11 +7,12 @@ use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer, HashIndex,
-    VersionKey,
+    ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer,
+    HashIndex, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
@@ -65,6 +66,15 @@ pub fn blob_location_read(key: &BlobLocationKey, txn_id: Option<TxnId>) -> Effec
     Effect::Storage(StorageEffect::Read {
         key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
         key: ByteView::from(key.to_bytes()),
+        txn_id,
+    })
+}
+
+/// Reads the location of an archive whose content hash is still pending.
+pub fn pending_location_read(archive: &ArchiveKey, txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::Read {
+        key_space: PENDING_LOCATION_KEYSPACE.to_string(),
+        key: ByteView::from(archive.to_bytes()),
         txn_id,
     })
 }

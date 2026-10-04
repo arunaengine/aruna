@@ -11,7 +11,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::prefix_upper_bound;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
-    NODE_SUBJECT_KEYSPACE,
+    NODE_SUBJECT_KEYSPACE, PENDING_LOCATION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
@@ -532,8 +532,8 @@ impl ListBucketOperation {
                     let Some(version) = version else {
                         continue;
                     };
-                    match version.state {
-                        BlobVersionState::Deleted | BlobVersionState::PendingContent { .. } => {}
+                    let (read, backend) = match version.state {
+                        BlobVersionState::Deleted => continue,
                         BlobVersionState::Reference {
                             source,
                             cached_metadata,
@@ -553,6 +553,7 @@ impl ListBucketOperation {
                                 last_refresh: Some(last_refresh),
                                 version_created_at: None,
                             }));
+                            continue;
                         }
                         BlobVersionState::Materialized {
                             blob_hash,
@@ -560,35 +561,37 @@ impl ListBucketOperation {
                             encoding,
                             ..
                         } => {
-                            self.location_reads.push((
-                                BLOB_LOCATIONS_KEYSPACE.to_string(),
-                                BlobLocationKey::new(blob_hash, encoding, backend.clone())
-                                    .to_bytes()
-                                    .into(),
-                            ));
-                            let governed = match version.placement_policies.is_empty() {
-                                true => None,
-                                false => {
-                                    let copy_key = ManagedCopyKey::new(
-                                        VersionKey::new(&head.bucket, &head.key, version_id),
-                                        backend,
-                                    );
-                                    let bytes = match copy_key.to_bytes() {
-                                        Ok(bytes) => bytes,
-                                        Err(error) => return self.emit_error(error.into()),
-                                    };
-                                    self.location_reads
-                                        .push((MANAGED_COPY_KEYSPACE.to_string(), bytes.into()));
-                                    Some((copy_key, version.placement_policies.clone()))
-                                }
-                            };
-                            self.resolved.push(ResolvedEntry::AwaitingLocation {
-                                head,
-                                version_created_at: version.created_at,
-                                governed,
-                            });
+                            let key = BlobLocationKey::new(blob_hash, encoding, backend.clone());
+                            let read = (BLOB_LOCATIONS_KEYSPACE.to_string(), key.to_bytes());
+                            (read, backend)
                         }
-                    }
+                        BlobVersionState::PendingContent { archive, .. } => {
+                            let read = (PENDING_LOCATION_KEYSPACE.to_string(), archive.to_bytes());
+                            (read, archive.backend)
+                        }
+                    };
+                    self.location_reads.push((read.0, read.1.into()));
+                    let governed = match version.placement_policies.is_empty() {
+                        true => None,
+                        false => {
+                            let copy_key = ManagedCopyKey::new(
+                                VersionKey::new(&head.bucket, &head.key, version_id),
+                                backend,
+                            );
+                            let bytes = match copy_key.to_bytes() {
+                                Ok(bytes) => bytes,
+                                Err(error) => return self.emit_error(error.into()),
+                            };
+                            self.location_reads
+                                .push((MANAGED_COPY_KEYSPACE.to_string(), bytes.into()));
+                            Some((copy_key, version.placement_policies.clone()))
+                        }
+                    };
+                    self.resolved.push(ResolvedEntry::AwaitingLocation {
+                        head,
+                        version_created_at: version.created_at,
+                        governed,
+                    });
                 }
             }
         }

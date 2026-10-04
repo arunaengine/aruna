@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::managed_copy::ManagedCopyError;
-use crate::blob::records::blob_location_read;
+use crate::blob::records::{blob_location_read, pending_location_read};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
@@ -343,8 +343,19 @@ impl HeadObjectOperation {
                     self.finish_lookup()
                 }
             }
-            BlobVersionState::PendingContent { .. } => {
-                self.emit_error(ConversionError::BucketKey(BucketKeyError::Unsupported).into())
+            BlobVersionState::PendingContent { archive, source } => {
+                self.source_binding = source;
+                self.source_metadata = None;
+                self.last_refresh = None;
+                self.version_created_at = Some(version.created_at);
+                self.source_policies = version.placement_policies.clone();
+                // A governed archive has no registered copy to answer for it before its hash.
+                if !version.placement_policies.is_empty() {
+                    let error = ConversionError::BucketKey(BucketKeyError::Unsupported);
+                    return self.emit_error(error.into());
+                }
+                self.state = HeadObjectState::GetBlobLocation;
+                smallvec![pending_location_read(&archive, self.txn_id)]
             }
         }
     }
@@ -643,6 +654,75 @@ mod tests {
             blob_size: 5,
             hashes,
         }
+    }
+
+    #[test]
+    fn pending_reads_location() {
+        use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
+        use aruna_core::structs::placement::policy::PlacementPolicyRef;
+        use aruna_core::structs::storage::blob::ArchiveKey;
+        use aruna_core::structs::storage::encryption::BucketKeyRef;
+        use aruna_core::structs::storage::format::PithosLayout;
+
+        let mut location = location_with_hash();
+        location.hashes.remove(HASH_BLAKE3);
+        let layout = PithosLayout {
+            stored_size: 70,
+            metadata_digest: [3; 32],
+        };
+        location.format = StoredFormat::pithos(layout, BucketKeyRef::new(Ulid::generate(), 1));
+        let archive = ArchiveKey::of(&location);
+        let version_id = Ulid::generate();
+        let version = BlobVersion::pending(
+            archive.clone(),
+            location.created_at,
+            location.created_by,
+            None,
+        );
+        let input = || HeadObjectInput {
+            bucket: "mybucket".to_string(),
+            key: "hello.txt".to_string(),
+            version_id: Some(version_id),
+        };
+
+        let mut operation = HeadObjectOperation::new(input());
+        operation.txn_id = Some(Ulid::generate());
+        let effects = operation.read_version(version_id, version.clone(), true);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, key, .. })]
+                if key_space == PENDING_LOCATION_KEYSPACE && key.as_ref() == archive.to_bytes()
+        ));
+        let read = |value: Option<Vec<u8>>| {
+            Event::Storage(StorageEvent::ReadResult {
+                key: Vec::<u8>::new().into(),
+                value: value.map(Into::into),
+            })
+        };
+        operation.step(read(Some(location.to_bytes().unwrap())));
+        operation.step(read(None));
+        let found =
+            matches!(&operation.output, Some(Ok(output)) if output.location == Some(location));
+        assert!(found);
+
+        // A governed archive is not described before a registered copy can answer for it.
+        let mut operation = HeadObjectOperation::new(input());
+        operation.txn_id = Some(Ulid::generate());
+        let refs = vec![PlacementPolicyRef {
+            policy_id: Ulid::generate(),
+            digest: [1; 32],
+        }];
+        let governed = version.with_policies(refs).unwrap();
+        let effects = operation.read_version(version_id, governed, true);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Storage(StorageEffect::Read { .. })))
+        );
+        assert!(matches!(
+            operation.output,
+            Some(Err(HeadObjectError::ConversionError(_)))
+        ));
     }
 
     #[tokio::test]
