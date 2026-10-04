@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::managed_copy::ManagedCopyError;
+use crate::blob::managed_copy::{ManagedCopyError, serve_reads};
 use crate::blob::records::{blob_location_read, pending_location_read};
 use crate::s3::object::lookup::{
-    ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
-    multipart_summary_read,
+    ExpectedNode, LookupError, begin_copy_check, finish_copy_check, finish_pending_check,
+    location_from_read, multipart_summary_read,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -18,10 +18,9 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
-use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
 };
@@ -39,6 +38,7 @@ pub enum GetAttributesState {
     GetVersion,
     GetCurrentVersion,
     CheckManagedCopy,
+    CheckPendingCopy,
     GetBlobLocation,
     ReadMultipartSummary,
     ReadMultipartParts,
@@ -106,6 +106,8 @@ pub struct GetAttributesOperation {
     resolved_version_id: Option<Ulid>,
     pending_copy: Option<ManagedCopyKey>,
     pending_location: Option<BlobLocationKey>,
+    /// The archive of a governed pending version while its registration is verified.
+    pending_archive: Option<ArchiveKey>,
     /// Refs of the version being described, compared against its registration.
     source_policies: Vec<PlacementPolicyRef>,
     summary: Option<MultipartObjectSummary>,
@@ -125,6 +127,7 @@ impl GetAttributesOperation {
             resolved_version_id: None,
             pending_copy: None,
             pending_location: None,
+            pending_archive: None,
             source_policies: Vec::new(),
             summary: None,
             parts: Vec::new(),
@@ -300,15 +303,42 @@ impl GetAttributesOperation {
                 self.source_metadata = None;
                 self.version_created_at = Some(version.created_at);
                 self.source_policies = version.placement_policies.clone();
-                // A governed archive has no registered copy to answer for it before its hash.
                 if !self.source_policies.is_empty() {
-                    let error = ConversionError::BucketKey(BucketKeyError::Unsupported);
-                    return self.emit_error(error.into());
+                    return self.check_pending_copy(version_id, archive);
                 }
                 self.state = GetAttributesState::GetBlobLocation;
                 smallvec![pending_location_read(&archive, self.txn_id)]
             }
         }
+    }
+
+    /// A governed pending archive answers only through this node's registration of it.
+    fn check_pending_copy(&mut self, version_id: Ulid, archive: ArchiveKey) -> Effects {
+        let version = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
+        let copy_key = ManagedCopyKey::new(version, archive.backend.clone());
+        let effect = match serve_reads(&copy_key, self.txn_id) {
+            Ok(effect) => effect,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        self.pending_copy = Some(copy_key);
+        self.pending_archive = Some(archive);
+        self.state = GetAttributesState::CheckPendingCopy;
+        smallvec![effect]
+    }
+
+    fn handle_pending_copy(&mut self, event: Event) -> Effects {
+        let (Some(copy_key), Some(archive)) =
+            (self.pending_copy.take(), self.pending_archive.take())
+        else {
+            let error = self.lookup_error("a pending registration check", LookupError::Missing);
+            return self.emit_error(error);
+        };
+        if let Err(err) = finish_pending_check(event, &copy_key, &archive, &self.source_policies) {
+            let error = self.lookup_error("Event::Storage(StorageEvent::BatchReadResult)", err);
+            return self.emit_error(error);
+        }
+        self.state = GetAttributesState::GetBlobLocation;
+        smallvec![pending_location_read(&archive, self.txn_id)]
     }
 
     fn read_blob_location(&mut self, key: BlobLocationKey) -> Effects {
@@ -499,6 +529,7 @@ impl Operation for GetAttributesOperation {
             GetAttributesState::GetVersion => self.handle_received_version(event),
             GetAttributesState::GetCurrentVersion => self.current_version_received(event),
             GetAttributesState::CheckManagedCopy => self.handle_managed_copy(event),
+            GetAttributesState::CheckPendingCopy => self.handle_pending_copy(event),
             GetAttributesState::GetBlobLocation => self.location_read(event),
             GetAttributesState::ReadMultipartSummary => self.summary_read(event),
             GetAttributesState::ReadMultipartParts => self.parts_read(event),

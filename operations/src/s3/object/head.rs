@@ -2,12 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::managed_copy::ManagedCopyError;
+use crate::blob::managed_copy::{ManagedCopyError, serve_reads};
 use crate::blob::records::{blob_location_read, pending_location_read};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::s3::object::lookup::{
-    ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
-    multipart_summary_read, summary_from_read,
+    ExpectedNode, LookupError, begin_copy_check, finish_copy_check, finish_pending_check,
+    location_from_read, multipart_summary_read, summary_from_read,
 };
 use aruna_core::effects::{Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
@@ -21,10 +21,9 @@ use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
-use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -39,6 +38,7 @@ pub enum HeadObjectState {
     StartTransaction,
     GetVersion,
     CheckManagedCopy,
+    CheckPendingCopy,
     GetBlobLocation,
     GetCurrentVersion,
     ReadMultipartSummary,
@@ -130,6 +130,8 @@ pub struct HeadObjectOperation {
     /// Held while a governed version's local registration is verified.
     pending_location: Option<BlobLocationKey>,
     pending_copy: Option<ManagedCopyKey>,
+    /// The archive of a governed pending version while its registration is verified.
+    pending_archive: Option<ArchiveKey>,
     /// Refs of the version being served, compared against its registration.
     source_policies: Vec<PlacementPolicyRef>,
     source_binding: Option<VersionSourceBinding>,
@@ -154,6 +156,7 @@ impl HeadObjectOperation {
             reference_source: None,
             pending_location: None,
             pending_copy: None,
+            pending_archive: None,
             source_policies: Vec::new(),
             source_binding: None,
             output: None,
@@ -349,15 +352,42 @@ impl HeadObjectOperation {
                 self.last_refresh = None;
                 self.version_created_at = Some(version.created_at);
                 self.source_policies = version.placement_policies.clone();
-                // A governed archive has no registered copy to answer for it before its hash.
                 if !version.placement_policies.is_empty() {
-                    let error = ConversionError::BucketKey(BucketKeyError::Unsupported);
-                    return self.emit_error(error.into());
+                    return self.check_pending_copy(version_id, archive);
                 }
                 self.state = HeadObjectState::GetBlobLocation;
                 smallvec![pending_location_read(&archive, self.txn_id)]
             }
         }
+    }
+
+    /// A governed pending archive is described only through this node's registration of it.
+    fn check_pending_copy(&mut self, version_id: Ulid, archive: ArchiveKey) -> Effects {
+        let version = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
+        let copy_key = ManagedCopyKey::new(version, archive.backend.clone());
+        let effect = match serve_reads(&copy_key, self.txn_id) {
+            Ok(effect) => effect,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        self.pending_copy = Some(copy_key);
+        self.pending_archive = Some(archive);
+        self.state = HeadObjectState::CheckPendingCopy;
+        smallvec![effect]
+    }
+
+    fn handle_pending_copy(&mut self, event: Event) -> Effects {
+        let (Some(copy_key), Some(archive)) =
+            (self.pending_copy.take(), self.pending_archive.take())
+        else {
+            let error = self.lookup_error("a pending registration check", LookupError::Missing);
+            return self.emit_error(error);
+        };
+        if let Err(err) = finish_pending_check(event, &copy_key, &archive, &self.source_policies) {
+            let error = self.lookup_error("Event::Storage(StorageEvent::BatchReadResult)", err);
+            return self.emit_error(error);
+        }
+        self.state = HeadObjectState::GetBlobLocation;
+        smallvec![pending_location_read(&archive, self.txn_id)]
     }
 
     fn commit_reference(&mut self, source: VersionSourceBinding) -> Effects {
@@ -577,6 +607,7 @@ impl Operation for HeadObjectOperation {
             HeadObjectState::StartTransaction => self.handle_transaction_started(event),
             HeadObjectState::GetVersion => self.handle_received_version(event),
             HeadObjectState::CheckManagedCopy => self.handle_managed_copy(event),
+            HeadObjectState::CheckPendingCopy => self.handle_pending_copy(event),
             HeadObjectState::GetBlobLocation => self.location_read(event),
             HeadObjectState::GetCurrentVersion => self.current_version_received(event),
             HeadObjectState::ReadMultipartSummary => self.summary_read(event),
@@ -705,23 +736,69 @@ mod tests {
             matches!(&operation.output, Some(Ok(output)) if output.location == Some(location));
         assert!(found);
 
-        // A governed archive is not described before a registered copy can answer for it.
-        let mut operation = HeadObjectOperation::new(input());
-        operation.txn_id = Some(Ulid::generate());
+        // A governed archive is described only through the registration of exactly it.
         let refs = vec![PlacementPolicyRef {
             policy_id: Ulid::generate(),
             digest: [1; 32],
         }];
-        let governed = version.with_policies(refs).unwrap();
-        let effects = operation.read_version(version_id, governed, true);
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Storage(StorageEffect::Read { .. })))
-        );
+        let governed = version.with_policies(refs.clone()).unwrap();
+        let version_key = VersionKey::new("mybucket", "hello.txt", version_id);
+        let node_id = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let subject = aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(
+            crate::tests::policy::subject(node_id, "eu"),
+        )
+        .unwrap();
+        let registered = |location: &BackendLocation| {
+            use aruna_core::structs::storage::blob::{ManagedCopyRecord, ManagedCopyState};
+            let record = ManagedCopyRecord::new(
+                version_key.clone(),
+                subject.subject.node_id,
+                location.clone(),
+                refs.clone(),
+                0,
+                ManagedCopyState::Registered,
+            )
+            .unwrap()
+            .stored_under(subject.subject.generation);
+            Event::Storage(StorageEvent::BatchReadResult {
+                values: vec![
+                    (
+                        Vec::<u8>::new().into(),
+                        Some(record.to_bytes().unwrap().into()),
+                    ),
+                    (
+                        Vec::<u8>::new().into(),
+                        Some(subject.to_bytes().unwrap().into()),
+                    ),
+                ],
+            })
+        };
+        let mut operation = HeadObjectOperation::new(input());
+        operation.txn_id = Some(Ulid::generate());
+        let effects = operation.read_version(version_id, governed.clone(), true);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead { .. })]
+        ));
+        let effects = operation.step(registered(&location));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == PENDING_LOCATION_KEYSPACE
+        ));
+
+        // A registration of another archive answers for nothing.
+        let mut other = location.clone();
+        other.ulid = Ulid::generate();
+        let mut operation = HeadObjectOperation::new(input());
+        operation.txn_id = Some(Ulid::generate());
+        operation.read_version(version_id, governed, true);
+        operation.step(registered(&other));
         assert!(matches!(
             operation.output,
-            Some(Err(HeadObjectError::ConversionError(_)))
+            Some(Err(HeadObjectError::ManagedCopyError(
+                ManagedCopyError::Mismatched
+            )))
         ));
     }
 

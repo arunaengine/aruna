@@ -12,7 +12,7 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::OBJECT_METADATA_KEYSPACE;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobLocationKey, ManagedCopyKey, VersionKey,
+    ArchiveKey, BackendLocation, BlobLocationKey, ManagedCopyKey, VersionKey,
 };
 use aruna_core::structs::storage::multipart::{MultipartObjectKey, MultipartObjectSummary};
 use ulid::Ulid;
@@ -88,6 +88,32 @@ pub(crate) fn finish_copy_check(
     )
     .map_err(LookupError::Managed)?;
     Ok(location_key)
+}
+
+/// The registration check of a governed version whose content hash is still pending. The
+/// registered copy must name exactly `archive`; no hash is compared or assumed.
+pub(crate) fn finish_pending_check(
+    event: Event,
+    copy_key: &ManagedCopyKey,
+    archive: &ArchiveKey,
+    refs: &[PlacementPolicyRef],
+) -> Result<(), LookupError> {
+    let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+        return Err(LookupError::InvalidEvent(event));
+    };
+    let (copy, subject) = split_serve_reads(values).map_err(LookupError::Managed)?;
+    let request = CopyRequest {
+        key: copy_key,
+        node_id: Some(subject.subject.node_id),
+        blake3: None,
+        refs,
+        subject_generation: Some(subject.subject.generation),
+    };
+    let record = validate_registration(copy.as_deref(), &request).map_err(LookupError::Managed)?;
+    match &ArchiveKey::of(&record.location) == archive {
+        true => Ok(()),
+        false => Err(LookupError::Managed(ManagedCopyError::Mismatched)),
+    }
 }
 
 pub(crate) fn location_from_read(event: Event) -> Result<Option<BackendLocation>, LookupError> {
