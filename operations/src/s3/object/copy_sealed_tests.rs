@@ -91,7 +91,8 @@ fn input(location: &BackendLocation, version_id: Ulid) -> SealedCopyInput {
         bucket: "bucket".to_string(),
         source_key: SOURCE.to_string(),
         source_version_id: version_id,
-        archive: ArchiveKey::of(location),
+        location: location.clone(),
+        source_policies: Vec::new(),
         size: location.blob_size,
         dest_key: "copy".to_string(),
         metadata: None,
@@ -212,13 +213,26 @@ fn copy_reads_no_content() {
     let location = sealed_location();
     let source_id = Ulid::generate();
     let mut operation = SealedCopyOperation::new(input(&location, source_id));
+    let missing = || {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: None,
+        })
+    };
     let mut effects = operation.start();
+    // An ungoverned bucket needs no gate, so the transaction starts at once.
+    effects.extend(operation.step(missing()));
     let txn_id = Ulid::from_bytes([1; 16]);
     effects.extend(operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id })));
-    effects.extend(operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: Vec::<u8>::new().into(),
-        value: None,
-    })));
+    effects.extend(operation.step(missing()));
+    effects.extend(
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Vec::<u8>::new().into(), None),
+                (Vec::<u8>::new().into(), None),
+            ],
+        })),
+    );
     let source = BlobVersion::pending(
         ArchiveKey::of(&location),
         SystemTime::UNIX_EPOCH,
@@ -245,4 +259,89 @@ fn copy_reads_no_content() {
         effects.last(),
         Some(Effect::Storage(StorageEffect::Write { key_space, .. })) if key_space == BLOB_HEAD_KEYSPACE
     ));
+}
+
+#[tokio::test]
+async fn governed_copy_registered() {
+    // A governed source copies like a plain write: gated, stored with the bucket default and
+    // the source refs, and registered on this node.
+    use crate::blob::managed_copy::{CopyRequest, validate_registration};
+    use crate::driver::gate_context;
+    use crate::s3::object::copy::test::{admits, full_context, seed_bucket};
+    use crate::tests::policy::{seed_gate, subject};
+    use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
+    use aruna_core::structs::storage::blob::ManagedCopyKey;
+
+    let (_temp, context) = full_context().await;
+    let realm_id = RealmId::from_bytes([3; 32]);
+    let node_id = context.net_handle.as_ref().unwrap().node_id();
+    let user_id = UserId::local(Ulid::generate(), realm_id);
+    let (source_policy, bucket_policy) = (admits(node_id, 1), admits(node_id, 2));
+    let (source_ref, bucket_ref) = (source_policy.policy_ref(), bucket_policy.policy_ref());
+    let policies = [source_policy, bucket_policy];
+    seed_gate(
+        &context,
+        realm_id,
+        user_id,
+        subject(node_id, "eu"),
+        &policies,
+    )
+    .await;
+    let mut request = input(&sealed_location(), Ulid::generate());
+    request.realm_id = realm_id;
+    request.node_id = node_id;
+    request.source_policies = vec![source_ref];
+    seed_bucket(
+        &context,
+        "bucket",
+        request.group_id,
+        user_id,
+        vec![bucket_ref],
+    )
+    .await;
+    let source = BlobVersion::pending(
+        ArchiveKey::of(&request.location),
+        SystemTime::UNIX_EPOCH,
+        UserId::default(),
+        None,
+    )
+    .with_policies(vec![source_ref])
+    .unwrap();
+    seed(&context.storage_handle, request.source_version_id, &source).await;
+    let gate = gate_context(&context, realm_id, 1_000)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let operation = SealedCopyOperation::new(request.clone()).with_gate(gate.clone());
+    let result = drive(operation, &context).await.unwrap();
+
+    let version = copied(&context.storage_handle, result.version_id).await;
+    let refs = PlacementPolicyRef::canonical_set(&[source_ref, bucket_ref]).unwrap();
+    assert_eq!(version.placement_policies, refs);
+    let key = ManagedCopyKey::new(
+        VersionKey::new("bucket", "copy", result.version_id),
+        request.location.backend.clone(),
+    );
+    let row = get(
+        &context.storage_handle,
+        MANAGED_COPY_KEYSPACE,
+        key.to_bytes().unwrap(),
+    )
+    .await;
+    let registered = validate_registration(
+        row.as_deref(),
+        &CopyRequest {
+            key: &key,
+            node_id: Some(node_id),
+            blake3: None,
+            refs: &refs,
+            subject_generation: Some(gate.subject.generation),
+        },
+    );
+    assert_eq!(registered.unwrap().location, request.location);
+
+    // Without a destination gate a governed copy fails closed.
+    let refused = drive(SealedCopyOperation::new(request), &context).await;
+    assert!(matches!(refused, Err(SealedCopyError::PolicyGate(_))));
 }

@@ -3,22 +3,28 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, owner_write_effect, write_head_effect, write_version_effect,
 };
 use crate::node::usage_stats::{QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError};
+use crate::placement::policy::{
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
+    split_drift_reads, union_refs, write_gate,
+};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
-    ArchiveKey, BlobHeadKey, BlobVersion, BlobVersionState, CopyOwner, CurrentVersionPointer,
-    VersionKey,
+    ArchiveKey, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
+    CopyOrigin, CopyOwner, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::usage::UsageDelta;
@@ -47,8 +53,12 @@ pub enum SealedCopyError {
     NoSuchVersion,
     #[error("the source version no longer uses the archive the copy was asked for")]
     SourceChanged,
-    #[error("a copy of a governed encrypted object needs its plaintext")]
-    Governed,
+    #[error(transparent)]
+    PolicyGate(#[from] PolicyGateError),
+    #[error(transparent)]
+    ManagedCopy(#[from] ManagedCopyError),
+    #[error(transparent)]
+    Policy(#[from] PlacementPolicyError),
     #[error("Invalid operation state")]
     InvalidState,
     #[error("operation did not finish")]
@@ -62,7 +72,9 @@ pub struct SealedCopyInput {
     pub source_key: String,
     pub source_version_id: Ulid,
     /// The archive HEAD described; the source version must still use exactly it.
-    pub archive: ArchiveKey,
+    pub location: BackendLocation,
+    /// Refs of the source version; the copy carries them with the bucket default.
+    pub source_policies: Vec<PlacementPolicyRef>,
     /// Original size of the object, for logical usage and quota.
     pub size: u64,
     pub dest_key: String,
@@ -83,14 +95,18 @@ pub struct SealedCopyResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Step {
     Init,
+    ReadBucket,
+    Gate,
     Start,
     Fence,
+    Drift,
     ReadSource,
     ReadLiveness,
     WriteHead,
     WriteIndex,
     WriteVersion,
     WriteOwner,
+    Register,
     Quota,
     Usage,
     Commit,
@@ -102,6 +118,13 @@ enum Step {
 pub struct SealedCopyOperation {
     input: SealedCopyInput,
     step: Step,
+    /// Destination of this node; absent fails every governed copy closed.
+    gate_context: Option<GateContext>,
+    gate: Option<PolicyGateOperation>,
+    /// What the gate decided on, read again inside the transaction.
+    gated: Option<GatedBucket>,
+    /// The bucket default joined with the source refs, stored on the copy.
+    refs: Vec<PlacementPolicyRef>,
     txn_id: Option<TxnId>,
     version_id: Ulid,
     version: Option<BlobVersion>,
@@ -117,6 +140,10 @@ impl SealedCopyOperation {
         Self {
             input,
             step: Step::Init,
+            gate_context: None,
+            gate: None,
+            gated: None,
+            refs: Vec::new(),
             txn_id: None,
             version_id: Ulid::generate(),
             version: None,
@@ -126,6 +153,80 @@ impl SealedCopyOperation {
             usage: None,
             output: None,
         }
+    }
+
+    pub fn with_gate(mut self, context: GateContext) -> Self {
+        self.gate_context = Some(context);
+        self
+    }
+
+    fn archive(&self) -> ArchiveKey {
+        ArchiveKey::of(&self.input.location)
+    }
+
+    /// Gates the bucket default joined with the source refs before the transaction, like a write.
+    fn bucket_read(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return Err(SealedCopyError::InvalidState);
+        };
+        let bucket = value
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()?;
+        let observed = GatedBucket::observe(bucket.as_ref());
+        self.refs = union_refs(&observed.policies, &self.input.source_policies)?;
+        let governed = !self.refs.is_empty();
+        self.gated = Some(observed.stored_under(self.gate_context.as_ref(), governed));
+        let group_id = Some(self.input.group_id);
+        match write_gate(self.gate_context.as_ref(), &self.refs, group_id)? {
+            None => Ok(self.begin()),
+            Some(mut gate) => {
+                let effects = gate.start();
+                let complete = gate.is_complete();
+                self.gate = Some(gate);
+                self.step = Step::Gate;
+                match complete {
+                    true => self.finish_gate(),
+                    false => Ok(effects),
+                }
+            }
+        }
+    }
+
+    fn gate_step(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
+        let gate = self.gate.as_mut().ok_or(SealedCopyError::InvalidState)?;
+        let effects = gate.step(event);
+        match gate.is_complete() {
+            true => self.finish_gate(),
+            false => Ok(effects),
+        }
+    }
+
+    fn finish_gate(&mut self) -> Result<Effects, SealedCopyError> {
+        let gate = self.gate.take().ok_or(SealedCopyError::InvalidState)?;
+        let outcome = gate.finalize().map_err(PolicyGateError::from)?;
+        gate_decision(outcome)?;
+        Ok(self.begin())
+    }
+
+    fn begin(&mut self) -> Effects {
+        self.step = Step::Start;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    /// The default and subject the gate admitted must still hold when the copy commits.
+    fn drift_read(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return Err(SealedCopyError::InvalidState);
+        };
+        let (bucket, subject) = split_drift_reads(values)?;
+        let gated = self.gated.as_ref().ok_or(SealedCopyError::InvalidState)?;
+        if !gated.matches(&GatedBucket::observe(bucket.as_ref())) {
+            return Err(PolicyGateError::Drift.into());
+        }
+        gated.check_subject(subject.as_ref())?;
+        self.read_source()
     }
 
     fn fail(&mut self, error: impl Into<SealedCopyError>) -> Effects {
@@ -182,22 +283,25 @@ impl SealedCopyOperation {
             <[_; 2]>::try_from(values).map_err(|_| SealedCopyError::InvalidState)?;
         let source = source.ok_or(SealedCopyError::NoSuchVersion)?;
         let source = BlobVersion::from_bytes(source.as_ref())?;
-        if !source.placement_policies.is_empty() {
-            return Err(SealedCopyError::Governed);
+        if source.placement_policies
+            != PlacementPolicyRef::canonical_set(&self.input.source_policies)?
+        {
+            return Err(SealedCopyError::SourceChanged);
         }
+        let archive = self.archive();
         let state = match source.state {
             BlobVersionState::Materialized {
                 blob_hash,
                 backend,
                 encoding: encoding @ EncodingClass::Pithos { .. },
                 ..
-            } if backend == self.input.archive.backend => BlobVersionState::Materialized {
+            } if backend == archive.backend => BlobVersionState::Materialized {
                 blob_hash,
                 backend,
                 encoding,
                 source: None,
             },
-            BlobVersionState::PendingContent { archive, .. } if archive == self.input.archive => {
+            BlobVersionState::PendingContent { archive: used, .. } if used == archive => {
                 BlobVersionState::PendingContent {
                     archive,
                     source: None,
@@ -208,7 +312,11 @@ impl SealedCopyOperation {
         let metadata = self.input.metadata.clone().unwrap_or(source.metadata);
         let mut version = BlobVersion::deleted(SystemTime::now(), self.input.user_id);
         version.state = state;
-        self.version = Some(version.with_metadata(metadata));
+        self.version = Some(
+            version
+                .with_metadata(metadata)
+                .with_policies(self.refs.clone())?,
+        );
         self.existing = head
             .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
             .transpose()?;
@@ -270,9 +378,29 @@ impl SealedCopyOperation {
 
     /// The new version owns the archive too, so neither alias frees it while the other lives.
     fn write_owner(&mut self) -> Result<Effects, SealedCopyError> {
-        let owner = CopyOwner::new(self.input.archive.clone(), self.dest_version());
+        let owner = CopyOwner::new(self.archive(), self.dest_version());
         self.step = Step::WriteOwner;
         Ok(smallvec![owner_write_effect(&owner, self.txn_id)?])
+    }
+
+    /// Registers the copy like any write, so governed reads find this node's copy of it.
+    fn register(&mut self) -> Result<Effects, SealedCopyError> {
+        let subject_generation = self
+            .gated
+            .as_ref()
+            .and_then(|gated| gated.subject_generation);
+        let registration = CopyRegistration {
+            version: self.dest_version(),
+            node_id: self.input.node_id,
+            location: &self.input.location,
+            policies: &self.refs,
+            origin: CopyOrigin::Write,
+            subject_generation: subject_generation.unwrap_or_default(),
+            registered_at_ms: self.version_id.timestamp_ms(),
+        };
+        let effect = register_effect(registration, self.txn_id)?;
+        self.step = Step::Register;
+        Ok(smallvec![effect])
     }
 
     /// The copy adds a logical object but no physical bytes: the archive is already credited.
@@ -350,16 +478,21 @@ impl SealedCopyOperation {
                 self.step = Step::Fence;
                 Ok(smallvec![write_fence_read(&self.input.bucket, self.txn_id)])
             }
+            (Step::ReadBucket, event) => self.bucket_read(event),
+            (Step::Gate, event) => self.gate_step(event),
             (Step::Fence, event) => {
                 check_write_fence(event, &self.input.bucket, &self.input.dest_key)?;
-                self.read_source()
+                self.step = Step::Drift;
+                Ok(smallvec![drift_reads(&self.input.bucket, self.txn_id)])
             }
+            (Step::Drift, event) => self.drift_read(event),
             (Step::ReadSource, event) => self.source_read(event),
             (Step::ReadLiveness, event) => self.liveness_read(event),
             (Step::WriteHead, _) if written => self.write_index(),
             (Step::WriteIndex, _) if written => self.write_version(),
             (Step::WriteVersion, _) if written => self.write_owner(),
-            (Step::WriteOwner, _) if written => self.start_quota(),
+            (Step::WriteOwner, _) if written => self.register(),
+            (Step::Register, _) if written => self.start_quota(),
             (Step::Quota, event) => self.quota_step(event),
             (Step::Usage, event) => self.usage_step(event),
             (Step::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
@@ -381,9 +514,11 @@ impl Operation for SealedCopyOperation {
     type Error = SealedCopyError;
 
     fn start(&mut self) -> Effects {
-        self.step = Step::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
+        self.step = Step::ReadBucket;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: self.input.bucket.as_bytes().into(),
+            txn_id: None,
         })]
     }
 

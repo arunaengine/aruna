@@ -24,7 +24,7 @@ use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation};
+use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::resolve_backend;
 use aruna_core::types::GroupId;
@@ -115,6 +115,7 @@ fn sealed_error(error: SealedCopyError) -> CopyObjectError {
         SealedCopyError::QuotaExceeded { limit, usage } => {
             put(PutObjectError::QuotaExceeded { limit, usage })
         }
+        SealedCopyError::PolicyGate(error) => put(PutObjectError::PolicyGate(error)),
         SealedCopyError::NoSuchVersion => CopyObjectError::Get(GetObjectError::NoSuchVersion),
         error => put(PutObjectError::WriteFailed(error.to_string())),
     }
@@ -368,7 +369,8 @@ async fn sealed_copy(
         bucket: input.dest_bucket,
         source_key: input.source_key,
         source_version_id,
-        archive: ArchiveKey::of(&location),
+        location: location.clone(),
+        source_policies: head.source_policies,
         size: location.blob_size,
         dest_key: input.dest_key,
         metadata: input.metadata,
@@ -378,6 +380,10 @@ async fn sealed_copy(
         node_id: input.node_id,
         quota_ceiling: input.quota_ceiling,
     });
+    let operation = match gate_context(context, input.realm_id, now_ms()).await? {
+        Some(gate) => operation.with_gate(gate),
+        None => operation,
+    };
     let version_id = drive(operation, context)
         .await
         .map_err(sealed_error)?
@@ -627,7 +633,10 @@ pub(crate) mod test {
     }
 
     /// A rule that admits exactly this node, so a governed write is allowed.
-    fn admits(node_id: NodeId, seed: u8) -> aruna_core::structs::placement::policy::VerifiedPolicy {
+    pub(crate) fn admits(
+        node_id: NodeId,
+        seed: u8,
+    ) -> aruna_core::structs::placement::policy::VerifiedPolicy {
         let policy = aruna_core::structs::placement::policy::PlacementPolicy::new(
             Ulid::from_bytes([seed; 16]),
             "residency".to_string(),
