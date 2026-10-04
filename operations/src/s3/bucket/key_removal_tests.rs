@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::s3::bucket::key_rows::authority_rows;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::vault::UserKeyRecord;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -70,6 +71,7 @@ fn run(case: Case) -> (RemoveHolderOperation, Effects) {
         .revision
         .unwrap_or_else(|| holder_revision(&case.grants, &case.copies));
     let lookups = [user(1), user(2), user(3)].map(|user| (user, keys(user)));
+    let admins: Vec<_> = case.admins.iter().copied().collect();
     let mut operation = RemoveHolderOperation::new(RemovalInput {
         bucket: "bucket".to_string(),
         group_id: Ulid::from_bytes([3; 16]),
@@ -78,7 +80,7 @@ fn run(case: Case) -> (RemoveHolderOperation, Effects) {
         removed_by: user(1),
         revision,
         confirm_recovery: case.confirm,
-        admins: case.admins,
+        realm_id: RealmId::from_bytes([1; 32]),
         lookups: BTreeMap::from(lookups),
         now_ms: 9,
     });
@@ -102,16 +104,7 @@ fn run(case: Case) -> (RemoveHolderOperation, Effects) {
         key_generation: 2,
         ..Default::default()
     };
-    let values = vec![
-        (
-            Key::from(b"bucket".to_vec()),
-            Some(info.to_bytes().unwrap().into()),
-        ),
-        (
-            Key::from(b"bucket".to_vec()),
-            Some(settings.to_bytes().unwrap().into()),
-        ),
-    ];
+    let values = authority_rows(&info, Some(&settings), &admins);
     operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
     let rows = |values: Vec<Vec<u8>>| {
         Event::Storage(StorageEvent::IterResult {

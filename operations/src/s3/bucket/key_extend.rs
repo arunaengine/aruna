@@ -4,12 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::bucket::key_lock::lock_timer;
-use crate::s3::bucket::key_rows::{SettingsError, parse_settings, settings_read};
+use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRef, HolderOrigin, KeyTicket, UnlockStatus,
 };
@@ -18,7 +19,6 @@ use aruna_core::task::TaskEffect;
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
 use smallvec::smallvec;
-use std::collections::BTreeSet;
 use std::time::Duration;
 use thiserror::Error;
 use ulid::Ulid;
@@ -59,17 +59,17 @@ pub enum ExtendError {
     NotFinished,
 }
 
-/// An extension of `session_id` in `generation`; `admins` decides implicit authority now.
+/// An extension of `session_id` in `generation`; implicit authority is read right before it.
 #[derive(Debug, PartialEq)]
 pub struct ExtendInput {
     pub bucket: String,
     pub group_id: GroupId,
+    pub realm_id: RealmId,
     pub node_id: NodeId,
     pub caller: UserId,
     pub generation: u64,
     pub session_id: Ulid,
     pub duration: Option<Duration>,
-    pub admins: BTreeSet<UserId>,
     pub now_ms: u64,
 }
 
@@ -100,16 +100,18 @@ impl ExtendBucketOperation {
     }
 
     fn authorize(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let (info, settings) = match parse_settings(values, self.input.group_id) {
-            Ok(read) => read,
+        let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+        let state = match parse_authority(values, realm_id, group_id) {
+            Ok(state) => state,
             Err(error) => return self.fail(error),
         };
+        let settings = state.settings;
         let Some(bucket_id) = settings.bucket_id else {
             return self.fail(ExtendError::NotEncrypted);
         };
         self.key = Some(BucketKeyRef::new(bucket_id, self.input.generation));
         let caller = self.input.caller;
-        if info.created_by == caller || self.input.admins.contains(&caller) {
+        if state.info.created_by == caller || state.admins.contains(&caller) {
             return self.extend();
         }
         self.step = ExtendStep::ReadGrant;
@@ -200,7 +202,8 @@ impl Operation for ExtendBucketOperation {
 
     fn start(&mut self) -> Effects {
         self.step = ExtendStep::ReadBucket;
-        smallvec![settings_read(&self.input.bucket, None)]
+        let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+        smallvec![authority_read(&self.input.bucket, realm_id, group_id, None)]
     }
 
     fn step(&mut self, event: Event) -> Effects {
@@ -251,7 +254,7 @@ impl Operation for ExtendBucketOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::identity::realm::RealmId;
+    use crate::s3::bucket::key_rows::authority_rows;
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
     use aruna_core::structs::storage::format::Compression;
@@ -273,7 +276,7 @@ mod tests {
             generation: 2,
             session_id: SESSION,
             duration: Some(Duration::from_secs(30)),
-            admins: BTreeSet::new(),
+            realm_id: RealmId::from_bytes([1; 32]),
             now_ms: 1_000,
         });
         operation.start();
@@ -293,11 +296,7 @@ mod tests {
             key_generation: 3,
             ..Default::default()
         };
-        let row = |value: Vec<u8>| (Key::from(Vec::new()), Some(Value::from(value)));
-        let values = vec![
-            row(info.to_bytes().unwrap()),
-            row(settings.to_bytes().unwrap()),
-        ];
+        let values = authority_rows(&info, Some(&settings), &[]);
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
         (operation, effects)
     }

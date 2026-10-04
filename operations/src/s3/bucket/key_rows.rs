@@ -7,17 +7,20 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
-    BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE,
-    S3_BUCKET_KEYSPACE,
+    AUTH_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
+    KEY_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyRecord, CopyTarget, GrantState, HolderOrigin, SealedCopy,
 };
-use aruna_core::structs::storage::holders::{HolderReport, HolderState, KeyLookup};
+use aruna_core::structs::storage::holders::{HolderReport, HolderState, KeyLookup, admin_users};
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 pub type Row = (String, Key, Value);
@@ -30,6 +33,108 @@ pub enum SettingsError {
     NoSuchBucket,
     #[error("the bucket changed owner")]
     GroupMismatch,
+    #[error("an authorization document is missing")]
+    MissingAuthority,
+}
+
+/// A bucket, its settings and the users with implicit key authority, read together.
+#[derive(Debug, PartialEq)]
+pub struct BucketState {
+    pub info: BucketInfo,
+    pub settings: BucketEncryption,
+    pub admins: BTreeSet<UserId>,
+}
+
+/// Reads a bucket, its settings and the realm and group authorization documents together, so
+/// implicit authority comes from the snapshot the change commits against (D30).
+pub fn authority_read(
+    bucket: &str,
+    realm_id: RealmId,
+    group_id: GroupId,
+    txn_id: Option<TxnId>,
+) -> Effect {
+    let key: Key = bucket.as_bytes().to_vec().into();
+    Effect::Storage(StorageEffect::BatchRead {
+        reads: vec![
+            (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key),
+            (
+                AUTH_KEYSPACE.to_string(),
+                realm_id.as_bytes().to_vec().into(),
+            ),
+            (
+                AUTH_KEYSPACE.to_string(),
+                group_id.to_bytes().to_vec().into(),
+            ),
+        ],
+        txn_id,
+    })
+}
+
+/// The state an `authority_read` returned; admins hold WRITE on the group admin path now.
+pub fn parse_authority(
+    mut values: Vec<(Key, Option<Value>)>,
+    realm_id: RealmId,
+    group_id: GroupId,
+) -> Result<BucketState, SettingsError> {
+    if values.len() != 4 {
+        return Err(ConversionError::InvalidLength("bucket authority read".to_string()).into());
+    }
+    let documents = values.split_off(2);
+    let (info, settings) = parse_settings(values, group_id)?;
+    let mut documents = documents.into_iter().map(|(_, value)| value);
+    let (Some(Some(realm)), Some(Some(group))) = (documents.next(), documents.next()) else {
+        return Err(SettingsError::MissingAuthority);
+    };
+    let realm = RealmAuthorizationDocument::from_bytes(&realm)?;
+    let group = GroupAuthorizationDocument::from_bytes(&group)?;
+    let path = group_admin_path(realm_id, group_id);
+    let admins = admin_users(realm.roles.values().chain(group.roles.values()), &path);
+    Ok(BucketState {
+        info,
+        settings,
+        admins,
+    })
+}
+
+/// Rows an `authority_read` answers with, where `admins` hold the group admin role.
+#[cfg(test)]
+pub(crate) fn authority_rows(
+    info: &BucketInfo,
+    settings: Option<&BucketEncryption>,
+    admins: &[UserId],
+) -> Vec<(Key, Option<Value>)> {
+    use aruna_core::structs::identity::auth::{Actor, Permission, Role};
+    let realm_id = info.created_by.realm_id;
+    let actor = Actor {
+        node_id: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+        user_id: info.created_by,
+        realm_id,
+    };
+    let realm = RealmAuthorizationDocument {
+        realm_id,
+        roles: Default::default(),
+        operation_restrictions: Default::default(),
+    };
+    let admin = Role {
+        role_id: ulid::Ulid::from_bytes([1; 16]),
+        name: "keepers".to_string(),
+        permissions: [(group_admin_path(realm_id, info.group_id), Permission::WRITE)].into(),
+        assigned_users: admins.iter().copied().collect(),
+    };
+    let group = GroupAuthorizationDocument {
+        group_id: info.group_id,
+        roles: [(admin.role_id, admin)].into(),
+        policies: Vec::new(),
+    };
+    let row = |value: Vec<u8>| (Key::from(Vec::new()), Some(Value::from(value)));
+    let settings = settings.map(|settings| Value::from(settings.to_bytes().unwrap()));
+    vec![
+        row(info.to_bytes().unwrap()),
+        (Key::from(Vec::new()), settings),
+        row(realm.to_bytes(&actor).unwrap()),
+        row(group.to_bytes(&actor).unwrap()),
+    ]
 }
 
 /// Reads a bucket record and its encryption settings in one transaction.
@@ -197,6 +302,31 @@ mod tests {
         assert_eq!(other, Err(SettingsError::GroupMismatch));
         let missing = parse_settings(vec![row(None), row(None)], group_id);
         assert_eq!(missing, Err(SettingsError::NoSuchBucket));
+    }
+
+    #[test]
+    fn authority_from_documents() {
+        use aruna_core::structs::storage::format::Compression;
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let group_id = Ulid::from_bytes([3; 16]);
+        let info = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user(1),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+        };
+        let rows = authority_rows(&info, None, &[user(2)]);
+        let state = parse_authority(rows, realm_id, group_id).unwrap();
+        assert_eq!(state.admins, BTreeSet::from([user(2)]));
+        // Without its documents nobody holds implicit authority.
+        let mut rows = authority_rows(&info, None, &[user(2)]);
+        rows[3].1 = None;
+        let missing = parse_authority(rows, realm_id, group_id);
+        assert_eq!(missing, Err(SettingsError::MissingAuthority));
     }
 
     #[test]

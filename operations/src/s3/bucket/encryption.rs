@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::bucket::key_rows::{
-    SettingsError, copy_targets, generation_rows, parse_settings, settings_read, uploads_open,
+    SettingsError, authority_read, copy_targets, generation_rows, parse_authority, uploads_open,
 };
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -75,7 +75,8 @@ pub enum EnableError {
     NotFinished,
 }
 
-/// What the caller resolved before the transaction: admins and key directory answers.
+/// What the caller resolved before the transaction: the key directory answers. Admins are read
+/// in the transaction; one without a lookup is reported unavailable and gets no copy yet.
 #[derive(Debug, PartialEq)]
 pub struct EnableInput {
     pub bucket: String,
@@ -88,7 +89,6 @@ pub struct EnableInput {
     pub max_unlock_ms: Option<u64>,
     /// The storage generation the caller read; another one means a concurrent change.
     pub expected_generation: u64,
-    pub admins: BTreeSet<UserId>,
     pub lookups: BTreeMap<UserId, KeyLookup>,
     pub now_ms: u64,
 }
@@ -108,6 +108,7 @@ pub struct EnableEncryptionOperation {
     state: EnableState,
     txn_id: Option<TxnId>,
     creator: Option<UserId>,
+    admins: BTreeSet<UserId>,
     settings: BucketEncryption,
     grants: Vec<BucketHolder>,
     record: Option<BucketKeyRecord>,
@@ -123,6 +124,7 @@ impl EnableEncryptionOperation {
             state: EnableState::Init,
             txn_id: None,
             creator: None,
+            admins: BTreeSet::new(),
             settings: BucketEncryption::default(),
             grants: Vec::new(),
             record: None,
@@ -140,8 +142,12 @@ impl EnableEncryptionOperation {
     }
 
     fn read_bucket(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let (info, settings) = match parse_settings(values, self.input.group_id) {
-            Ok(read) => read,
+        let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+        let (info, settings) = match parse_authority(values, realm_id, group_id) {
+            Ok(state) => {
+                self.admins = state.admins;
+                (state.info, state.settings)
+            }
             Err(error) => return self.fail(error),
         };
         if settings.is_encrypted() {
@@ -225,7 +231,7 @@ impl EnableEncryptionOperation {
 
     fn report(&self, copies: &[SealedCopy]) -> HolderReport {
         let (creator, input) = (self.creator.unwrap_or_default(), &self.input);
-        resolve_holders(creator, &input.admins, &self.grants, &input.lookups, copies)
+        resolve_holders(creator, &self.admins, &self.grants, &input.lookups, copies)
     }
 
     fn write_settings(&mut self, copies: Vec<SealedCopy>) -> Effects {
@@ -331,7 +337,13 @@ impl Operation for EnableEncryptionOperation {
             ) => {
                 self.txn_id = Some(txn_id);
                 self.state = EnableState::ReadBucket;
-                smallvec![settings_read(&self.input.bucket, Some(txn_id))]
+                let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+                smallvec![authority_read(
+                    &self.input.bucket,
+                    realm_id,
+                    group_id,
+                    Some(txn_id)
+                )]
             }
             (EnableState::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.read_bucket(values)

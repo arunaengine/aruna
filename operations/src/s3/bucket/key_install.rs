@@ -267,7 +267,7 @@ mod tests {
         use aruna_core::structs::storage::encryption::{BlockCipher, BlockKeys, EncryptionMode};
         use aruna_core::structs::storage::format::Compression;
         use aruna_core::structs::storage::holders::KeyLookup;
-        use std::collections::{BTreeMap, BTreeSet, HashMap};
+        use std::collections::{BTreeMap, HashMap};
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
@@ -309,6 +309,20 @@ mod tests {
             placement_policy_generation: 0,
             compression: Compression::Off,
         };
+        // The authorization documents the enable reads its admins from.
+        let rows = crate::s3::bucket::key_rows::authority_rows(&info, None, &[]);
+        let documents = [realm_id.as_bytes().to_vec(), group_id.to_bytes().to_vec()];
+        for (key, (_, value)) in documents.into_iter().zip(rows.into_iter().skip(2)) {
+            let key_space = aruna_core::keyspaces::AUTH_KEYSPACE.to_string();
+            let value = value.unwrap();
+            let write = StorageEffect::Write {
+                key_space,
+                key: key.into(),
+                value,
+                txn_id: None,
+            };
+            storage.send_storage_effect(write).await;
+        }
         drive(
             CreateBucketOperation::new("sealed".to_string(), info),
             &context,
@@ -340,7 +354,6 @@ mod tests {
                 block_keys: BlockKeys::ContentDerived,
                 max_unlock_ms: None,
                 expected_generation: 0,
-                admins: BTreeSet::new(),
                 lookups: BTreeMap::from([(creator, KeyLookup::Keys(vec![record]))]),
                 now_ms: 1,
             }),

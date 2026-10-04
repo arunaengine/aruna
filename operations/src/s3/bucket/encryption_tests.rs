@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::s3::bucket::key_rows::authority_rows;
 use aruna_core::compute::SecretBytes;
 use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE};
 use aruna_core::structs::identity::user::vault::UserKeyRecord;
@@ -43,7 +44,6 @@ fn input(mode: EncryptionMode, lookups: BTreeMap<UserId, KeyLookup>) -> EnableIn
         block_keys: BlockKeys::ContentDerived,
         max_unlock_ms: None,
         expected_generation: 0,
-        admins: BTreeSet::from([user(2)]),
         lookups,
         now_ms: 5,
     }
@@ -67,16 +67,8 @@ fn generated(operation: &mut EnableEncryptionOperation) -> (Effects, [u8; 32]) {
     let txn_id = Ulid::from_bytes([9; 16]);
     operation.start();
     operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-    let read = vec![
-        (
-            b"bucket".to_vec().into(),
-            Some(bucket().to_bytes().unwrap().into()),
-        ),
-        (b"bucket".to_vec().into(), None),
-    ];
-    operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: read,
-    }));
+    let values = authority_rows(&bucket(), None, &[user(2)]);
+    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
     let effects = operation.step(Event::Storage(StorageEvent::IterResult {
         values: Vec::new(),
         next_start_after: None,
@@ -221,17 +213,8 @@ fn bucket_read(
     operation.step(Event::Storage(StorageEvent::TransactionStarted {
         txn_id: Ulid::from_bytes([9; 16]),
     }));
-    let settings = settings.map(|settings| settings.to_bytes().unwrap().into());
-    let read = vec![
-        (
-            b"bucket".to_vec().into(),
-            Some(bucket().to_bytes().unwrap().into()),
-        ),
-        (b"bucket".to_vec().into(), settings),
-    ];
-    operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: read,
-    }))
+    let values = authority_rows(&bucket(), settings.as_ref(), &[user(2)]);
+    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
 }
 
 #[test]

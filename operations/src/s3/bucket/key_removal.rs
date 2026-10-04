@@ -3,12 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::key_rows::{SettingsError, parse_settings, settings_read};
+use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketHolder, EncryptionMode, HolderOrigin, SealedCopy,
 };
@@ -68,12 +69,12 @@ pub enum RemovalError {
 pub struct RemovalInput {
     pub bucket: String,
     pub group_id: GroupId,
+    pub realm_id: RealmId,
     pub node_id: NodeId,
     pub user_id: UserId,
     pub removed_by: UserId,
     pub revision: [u8; 32],
     pub confirm_recovery: bool,
-    pub admins: BTreeSet<UserId>,
     pub lookups: BTreeMap<UserId, KeyLookup>,
     pub now_ms: u64,
 }
@@ -91,6 +92,7 @@ pub struct RemoveHolderOperation {
     step: RemovalStep,
     txn_id: Option<TxnId>,
     creator: Option<UserId>,
+    admins: BTreeSet<UserId>,
     settings: BucketEncryption,
     grants: Vec<BucketHolder>,
     audit: Option<BucketAuditRecord>,
@@ -104,6 +106,7 @@ impl RemoveHolderOperation {
             step: RemovalStep::Init,
             txn_id: None,
             creator: None,
+            admins: BTreeSet::new(),
             settings: BucketEncryption::default(),
             grants: Vec::new(),
             audit: None,
@@ -146,7 +149,7 @@ impl RemoveHolderOperation {
         }
         let creator = self.creator.unwrap_or_default();
         // A user who stays creator or admin keeps the copies those roles entitle them to.
-        let implicit = creator == target || self.input.admins.contains(&target);
+        let implicit = creator == target || self.admins.contains(&target);
         let remaining: Vec<_> = self
             .grants
             .iter()
@@ -159,7 +162,7 @@ impl RemoveHolderOperation {
         let active = self.settings.active_key();
         let in_active = |copy: &&SealedCopy| Some(copy.key) == active;
         let report = |grants: &[BucketHolder], copies: Vec<SealedCopy>| {
-            let (admins, lookups) = (&self.input.admins, &self.input.lookups);
+            let (admins, lookups) = (&self.admins, &self.input.lookups);
             resolve_holders(creator, admins, grants, lookups, &copies).recovery
         };
         let before = report(
@@ -233,13 +236,21 @@ impl Operation for RemoveHolderOperation {
             ) => {
                 self.txn_id = Some(txn_id);
                 self.step = RemovalStep::ReadBucket;
-                smallvec![settings_read(&self.input.bucket, Some(txn_id))]
+                let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+                smallvec![authority_read(
+                    &self.input.bucket,
+                    realm_id,
+                    group_id,
+                    Some(txn_id)
+                )]
             }
             (RemovalStep::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                match parse_settings(values, self.input.group_id) {
-                    Ok((info, settings)) => {
-                        self.creator = Some(info.created_by);
-                        self.settings = settings;
+                let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+                match parse_authority(values, realm_id, group_id) {
+                    Ok(state) => {
+                        self.creator = Some(state.info.created_by);
+                        self.admins = state.admins;
+                        self.settings = state.settings;
                         self.scan(RemovalStep::ReadGrants, BUCKET_HOLDER_KEYSPACE)
                     }
                     Err(error) => self.fail(error),

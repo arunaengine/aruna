@@ -4,13 +4,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::bucket::key_lock::lock_timer;
-use crate::s3::bucket::key_rows::{SettingsError, parse_settings, settings_read};
+use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRecord, BucketKeyRef, HolderOrigin, KeyState, KeyTicket,
     UnlockStatus,
@@ -20,7 +21,6 @@ use aruna_core::task::TaskEffect;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use aruna_core::{NodeId, UserId};
 use smallvec::smallvec;
-use std::collections::BTreeSet;
 use std::time::Duration;
 use thiserror::Error;
 use ulid::Ulid;
@@ -67,16 +67,16 @@ pub enum UnlockError {
     NotFinished,
 }
 
-/// One unlock request; `admins` decides the caller's implicit authority at this moment.
+/// One unlock request; the caller's implicit authority is read in the unlock's transaction.
 #[derive(Debug, PartialEq)]
 pub struct UnlockInput {
     pub bucket: String,
     pub group_id: GroupId,
+    pub realm_id: RealmId,
     pub node_id: NodeId,
     pub caller: UserId,
     pub key: BucketKeyRef,
     pub duration: Option<Duration>,
-    pub admins: BTreeSet<UserId>,
     pub now_ms: u64,
 }
 
@@ -85,7 +85,7 @@ pub struct UnlockBucketOperation {
     input: UnlockInput,
     step: UnlockStep,
     txn_id: Option<TxnId>,
-    creator: Option<UserId>,
+    implicit: bool,
     max: Option<Duration>,
     private_key: Option<SharedSecret>,
     ticket: Option<KeyTicket>,
@@ -102,7 +102,7 @@ impl UnlockBucketOperation {
             input,
             step: UnlockStep::Init,
             txn_id: None,
-            creator: None,
+            implicit: false,
             max: None,
             private_key: Some(private_key),
             ticket: None,
@@ -121,10 +121,12 @@ impl UnlockBucketOperation {
     }
 
     fn read_key(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let settings = match parse_settings(values, self.input.group_id) {
-            Ok((info, settings)) => {
-                self.creator = Some(info.created_by);
-                settings
+        let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+        let settings = match parse_authority(values, realm_id, group_id) {
+            Ok(state) => {
+                let caller = self.input.caller;
+                self.implicit = state.info.created_by == caller || state.admins.contains(&caller);
+                state.settings
             }
             Err(error) => return self.fail(error),
         };
@@ -180,9 +182,7 @@ impl UnlockBucketOperation {
             Ok(grant) => grant.is_some_and(|grant| grant.origin == HolderOrigin::Explicit),
             Err(error) => return self.fail(error),
         };
-        let caller = self.input.caller;
-        let implicit = self.creator == Some(caller) || self.input.admins.contains(&caller);
-        if !(explicit || implicit) {
+        if !(explicit || self.implicit) {
             return self.fail(UnlockError::NotHolder);
         }
         let Some(private_key) = self.private_key.take() else {
@@ -266,7 +266,13 @@ impl Operation for UnlockBucketOperation {
             ) => {
                 self.txn_id = Some(txn_id);
                 self.step = UnlockStep::ReadBucket;
-                smallvec![settings_read(&self.input.bucket, Some(txn_id))]
+                let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+                smallvec![authority_read(
+                    &self.input.bucket,
+                    realm_id,
+                    group_id,
+                    Some(txn_id)
+                )]
             }
             (UnlockStep::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.read_key(values)

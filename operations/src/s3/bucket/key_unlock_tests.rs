@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::s3::bucket::key_rows::authority_rows;
 use aruna_core::compute::SecretBytes;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -21,7 +22,7 @@ fn private() -> SharedSecret {
 }
 
 /// Runs an unlock by `caller` with `admins` up to its prepare step.
-fn prepared(caller: UserId, admins: BTreeSet<UserId>) -> (UnlockBucketOperation, Effects) {
+fn prepared(caller: UserId, admins: &[UserId]) -> (UnlockBucketOperation, Effects) {
     let key = BucketKeyRef::new(BUCKET_ID, 2);
     let input = UnlockInput {
         bucket: "bucket".to_string(),
@@ -30,7 +31,7 @@ fn prepared(caller: UserId, admins: BTreeSet<UserId>) -> (UnlockBucketOperation,
         caller,
         key,
         duration: Some(Duration::from_secs(60)),
-        admins,
+        realm_id: RealmId::from_bytes([1; 32]),
         now_ms: 1_000,
     };
     let mut operation = UnlockBucketOperation::new(input, private());
@@ -56,10 +57,7 @@ fn prepared(caller: UserId, admins: BTreeSet<UserId>) -> (UnlockBucketOperation,
         ..Default::default()
     };
     let row = |value: Option<Vec<u8>>| (Key::from(Vec::new()), value.map(Value::from));
-    let values = vec![
-        row(Some(info.to_bytes().unwrap())),
-        row(Some(settings.to_bytes().unwrap())),
-    ];
+    let values = authority_rows(&info, Some(&settings), admins);
     operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
     let public = public_key_of(private().bytes()).unwrap();
     let record = BucketKeyRecord::new(key, Ulid::from_bytes([6; 16]), public, 1);
@@ -90,7 +88,7 @@ fn audited(effects: &Effects) -> BucketAuditRecord {
 
 #[test]
 fn intent_before_activation() {
-    let (mut operation, effects) = prepared(user(1), BTreeSet::new());
+    let (mut operation, effects) = prepared(user(1), &[]);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Blob(BlobEffect::PrepareKey { .. })]
@@ -142,7 +140,7 @@ fn intent_before_activation() {
 
 #[test]
 fn failed_activation_discards() {
-    let (mut operation, _) = prepared(user(1), BTreeSet::new());
+    let (mut operation, _) = prepared(user(1), &[]);
     operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket: ticket() }));
     operation.step(Event::Storage(StorageEvent::WriteResult {
         key: Key::from(Vec::new()),
@@ -167,13 +165,13 @@ fn failed_activation_discards() {
 #[test]
 fn former_admin_refused() {
     // Admin rights decide implicit authority at the moment of the unlock (D30).
-    let (operation, effects) = prepared(user(2), BTreeSet::new());
+    let (operation, effects) = prepared(user(2), &[]);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::AbortTransaction { .. })]
     ));
     assert_eq!(operation.finalize(), Err(UnlockError::NotHolder));
-    let (_, effects) = prepared(user(2), BTreeSet::from([user(2)]));
+    let (_, effects) = prepared(user(2), &[user(2)]);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Blob(BlobEffect::PrepareKey { .. })]
