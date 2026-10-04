@@ -7,11 +7,13 @@ use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE};
+use aruna_core::keyspaces::{
+    BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
-    BucketEncryption, BucketHolder, EncryptionMode, HolderOrigin, SealedCopy,
+    BucketEncryption, BucketHolder, BucketKeyRecord, HolderOrigin, KeyState, SealedCopy,
 };
 use aruna_core::structs::storage::holders::{
     KeyLookup, Recovery, RecoveryState, holder_revision, resolve_holders,
@@ -31,6 +33,7 @@ enum RemovalStep {
     ReadBucket,
     ReadGrants,
     ReadCopies,
+    ReadKeys,
     DeleteRows,
     WriteAudit,
     CommitTransaction,
@@ -81,7 +84,8 @@ pub struct RemovalInput {
 
 #[derive(Debug, PartialEq)]
 pub struct RemovalResult {
-    pub recovery: Recovery,
+    /// Recovery after the removal, per retained generation without a node copy.
+    pub recovery: BTreeMap<u64, Recovery>,
     /// Copies deleted with the grant; a user who stays creator or admin keeps theirs.
     pub deleted_copies: usize,
 }
@@ -95,6 +99,7 @@ pub struct RemoveHolderOperation {
     admins: BTreeSet<UserId>,
     settings: BucketEncryption,
     grants: Vec<BucketHolder>,
+    copies: Vec<SealedCopy>,
     audit: Option<BucketAuditRecord>,
     output: Option<Result<RemovalResult, RemovalError>>,
 }
@@ -109,6 +114,7 @@ impl RemoveHolderOperation {
             admins: BTreeSet::new(),
             settings: BucketEncryption::default(),
             grants: Vec::new(),
+            copies: Vec::new(),
             audit: None,
             output: None,
         }
@@ -135,7 +141,10 @@ impl RemoveHolderOperation {
         })]
     }
 
-    fn remove(&mut self, copies: Vec<SealedCopy>) -> Effects {
+    /// Every retained generation without a node copy keeps its recovery path unless confirmed;
+    /// a decrypting change keeps source generations while new writes use mode off.
+    fn remove(&mut self, keys: Vec<BucketKeyRecord>) -> Effects {
+        let copies = std::mem::take(&mut self.copies);
         if holder_revision(&self.grants, &copies) != self.input.revision {
             return self.fail(RemovalError::StaleHolders);
         }
@@ -159,25 +168,28 @@ impl RemoveHolderOperation {
         let (removed, kept): (Vec<_>, Vec<_>) = copies
             .into_iter()
             .partition(|copy| copy.user_id == target && !implicit);
-        let active = self.settings.active_key();
-        let in_active = |copy: &&SealedCopy| Some(copy.key) == active;
         let report = |grants: &[BucketHolder], copies: Vec<SealedCopy>| {
             let (admins, lookups) = (&self.admins, &self.input.lookups);
             resolve_holders(creator, admins, grants, lookups, &copies).recovery
         };
-        let before = report(
-            &self.grants,
-            removed
+        let retained = keys
+            .iter()
+            .filter(|record| record.state != KeyState::Retired && record.vault_entry.is_none());
+        let mut recovery = BTreeMap::new();
+        let mut breaks = false;
+        for record in retained {
+            let of_key = |copy: &&SealedCopy| copy.key == record.key;
+            let all = removed
                 .iter()
                 .chain(&kept)
-                .filter(in_active)
+                .filter(of_key)
                 .cloned()
-                .collect(),
-        );
-        let after = report(&remaining, kept.iter().filter(in_active).cloned().collect());
-        let breaks = self.settings.mode == EncryptionMode::VaultLocked
-            && before.state == RecoveryState::Met
-            && after.state != RecoveryState::Met;
+                .collect();
+            let before = report(&self.grants, all);
+            let after = report(&remaining, kept.iter().filter(of_key).cloned().collect());
+            breaks |= before.state == RecoveryState::Met && after.state != RecoveryState::Met;
+            recovery.insert(record.key.generation, after);
+        }
         if breaks && !self.input.confirm_recovery {
             return self.fail(RemovalError::RecoveryConfirmationRequired);
         }
@@ -188,8 +200,9 @@ impl RemoveHolderOperation {
                 .iter()
                 .map(|copy| (KEY_COPY_KEYSPACE.to_string(), copy.key().into())),
         );
+        let active = self.settings.active_key();
         self.output = Some(Ok(RemovalResult {
-            recovery: after,
+            recovery,
             deleted_copies: removed.len(),
         }));
         let reason = breaks.then(|| "recovery rule broken with confirmation".to_string());
@@ -267,7 +280,16 @@ impl Operation for RemoveHolderOperation {
             }
             (RemovalStep::ReadCopies, Event::Storage(StorageEvent::IterResult { values, .. })) => {
                 match decode(&values, SealedCopy::from_bytes) {
-                    Ok(copies) => self.remove(copies),
+                    Ok(copies) => {
+                        self.copies = copies;
+                        self.scan(RemovalStep::ReadKeys, BUCKET_KEY_KEYSPACE)
+                    }
+                    Err(error) => self.fail(error),
+                }
+            }
+            (RemovalStep::ReadKeys, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                match decode(&values, BucketKeyRecord::from_bytes) {
+                    Ok(keys) => self.remove(keys),
                     Err(error) => self.fail(error),
                 }
             }

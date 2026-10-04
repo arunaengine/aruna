@@ -8,7 +8,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::vault::UserKeyRecord;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::encryption::{BucketKeyRef, GrantState};
+use aruna_core::structs::storage::encryption::{BucketKeyRef, EncryptionMode, GrantState};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::vault_format::key_fingerprint;
 use std::time::SystemTime;
@@ -63,9 +63,14 @@ struct Case {
     copies: Vec<SealedCopy>,
     revision: Option<[u8; 32]>,
     confirm: bool,
+    mode: EncryptionMode,
+    keys: Vec<(u64, KeyState)>,
 }
 
-/// Runs a removal on a vault-locked bucket of creator user(1) up to its delete batch.
+/// The active generation 2 of a vault-locked bucket.
+const LOCKED: (EncryptionMode, u64, KeyState) = (EncryptionMode::VaultLocked, 2, KeyState::Active);
+
+/// Runs a removal on a bucket of creator user(1) up to its delete batch.
 fn run(case: Case) -> (RemoveHolderOperation, Effects) {
     let revision = case
         .revision
@@ -99,7 +104,7 @@ fn run(case: Case) -> (RemoveHolderOperation, Effects) {
         compression: Compression::Off,
     };
     let settings = BucketEncryption {
-        mode: EncryptionMode::VaultLocked,
+        mode: case.mode,
         bucket_id: Some(BUCKET_ID),
         key_generation: 2,
         ..Default::default()
@@ -126,7 +131,14 @@ fn run(case: Case) -> (RemoveHolderOperation, Effects) {
         .iter()
         .map(|copy| copy.to_bytes().unwrap())
         .collect();
-    let effects = operation.step(rows(copies));
+    operation.step(rows(copies));
+    let keys = case.keys.iter().map(|&(generation, state)| {
+        let key = BucketKeyRef::new(BUCKET_ID, generation);
+        let mut record = BucketKeyRecord::new(key, Ulid::generate(), [5; 32], 1);
+        record.state = state;
+        record.to_bytes().unwrap()
+    });
+    let effects = operation.step(rows(keys.collect()));
     (operation, effects)
 }
 
@@ -148,6 +160,8 @@ fn removal_needs_confirmation() {
         copies: vec![copy(user(1), 2), copy(user(3), 2), copy(user(3), 1)],
         revision: None,
         confirm: false,
+        mode: LOCKED.0,
+        keys: vec![(LOCKED.1, LOCKED.2)],
     };
     let (operation, effects) = run(case());
     assert!(matches!(
@@ -197,6 +211,8 @@ fn stale_revision_refused() {
         copies: vec![copy(user(1), 2)],
         revision: Some([0; 32]),
         confirm: true,
+        mode: LOCKED.0,
+        keys: vec![(LOCKED.1, LOCKED.2)],
     });
     assert_eq!(operation.finalize(), Err(RemovalError::StaleHolders));
 }
@@ -211,6 +227,8 @@ fn admin_keeps_copies() {
         copies: vec![copy(user(1), 2), copy(user(2), 2)],
         revision: None,
         confirm: false,
+        mode: LOCKED.0,
+        keys: vec![(LOCKED.1, LOCKED.2)],
     });
     assert_eq!(deleted(&effects), [BUCKET_HOLDER_KEYSPACE]);
     assert!(matches!(
@@ -220,4 +238,37 @@ fn admin_keeps_copies() {
             ..
         }))
     ));
+}
+
+#[test]
+fn retained_generation_protected() {
+    // A decrypting change turned writes off, but generation 1 still holds archives.
+    let case = |confirm| Case {
+        target: user(3),
+        admins: BTreeSet::new(),
+        grants: vec![grant(user(3))],
+        copies: vec![copy(user(1), 1), copy(user(3), 1)],
+        revision: None,
+        confirm,
+        mode: EncryptionMode::Off,
+        keys: vec![(1, KeyState::Retiring), (2, KeyState::Retired)],
+    };
+    let (operation, _) = run(case(false));
+    assert_eq!(
+        operation.finalize(),
+        Err(RemovalError::RecoveryConfirmationRequired)
+    );
+    let (operation, effects) = run(case(true));
+    assert_eq!(
+        deleted(&effects),
+        [BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE]
+    );
+    let Some(Ok(result)) = &operation.output else {
+        panic!("expected a removal result");
+    };
+    assert_eq!(
+        result.recovery.keys().copied().collect::<Vec<_>>(),
+        [1],
+        "a retired generation needs no recovery"
+    );
 }
