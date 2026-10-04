@@ -79,17 +79,52 @@ impl HolderReport {
     }
 }
 
-/// Digest of a bucket's stored grants and copies. A removal names the revision it was decided
-/// on, so a concurrent holder change refuses it instead of breaking recovery unseen.
+/// Digest of a bucket's stored grants and copies with their contents. A removal names the
+/// revision it was decided on, so a concurrent holder change refuses it.
 pub fn holder_revision(grants: &[BucketHolder], copies: &[SealedCopy]) -> [u8; 32] {
-    let mut rows: Vec<Vec<u8>> = grants.iter().map(BucketHolder::key).collect();
-    rows.extend(copies.iter().map(SealedCopy::key));
+    let grant_rows = grants
+        .iter()
+        .map(|grant| (grant.key(), grant.to_bytes().unwrap_or_default()));
+    let copy_rows = copies
+        .iter()
+        .map(|copy| (copy.key(), copy.to_bytes().unwrap_or_default()));
+    let mut rows: Vec<_> = grant_rows.chain(copy_rows).collect();
     rows.sort_unstable();
     let mut hasher = blake3::Hasher::new();
-    for row in rows {
-        hasher.update(&(row.len() as u64).to_be_bytes());
-        hasher.update(&row);
+    for (key, value) in rows {
+        for part in [key, value] {
+            hasher.update(&(part.len() as u64).to_be_bytes());
+            hasher.update(&part);
+        }
     }
+    *hasher.finalize().as_bytes()
+}
+
+/// `rows` from `holder_revision` with the resolved authority and recovery facts of `report`, so
+/// a lost admin role or a changed key directory answer also refuses a stale removal.
+pub fn revision_with_facts(
+    rows: [u8; 32],
+    creator: UserId,
+    admins: &BTreeSet<UserId>,
+    report: &HolderReport,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&rows);
+    hasher.update(&creator.to_storage_key());
+    for admin in admins {
+        hasher.update(&admin.to_storage_key());
+    }
+    // Debug names are stable within one build, which is all a list-then-remove round needs.
+    for holder in &report.holders {
+        hasher.update(&holder.user_id.to_storage_key());
+        let facts = format!(
+            "{:?}{:?}{:?}",
+            holder.origin, holder.state, holder.has_recovery
+        );
+        hasher.update(&(facts.len() as u64).to_be_bytes());
+        hasher.update(facts.as_bytes());
+    }
+    hasher.update(format!("{:?}", report.recovery).as_bytes());
     *hasher.finalize().as_bytes()
 }
 

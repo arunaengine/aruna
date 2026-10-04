@@ -193,4 +193,32 @@ fn revision_tracks_rows() {
     assert_eq!(holder_revision(&grants, &reordered), revision);
     assert_ne!(holder_revision(&[], &copies), revision);
     assert_ne!(holder_revision(&grants, &copies[..1]), revision);
+    // A changed row content changes the revision too.
+    let mut ready = grants.clone();
+    ready[0].state = GrantState::Ready;
+    assert_ne!(holder_revision(&ready, &copies), revision);
+}
+
+#[test]
+fn revision_tracks_facts() {
+    let (creator, admin) = (user(1), user(2));
+    let copies = [copy(creator), copy(admin)];
+    let rows = holder_revision(&[], &copies);
+    let lookups = BTreeMap::from([(creator, keys(creator, false)), (admin, keys(admin, false))]);
+    let admins = BTreeSet::from([admin]);
+    let report = resolve_holders(creator, &admins, &[], &lookups, &copies);
+    let revision = revision_with_facts(rows, creator, &admins, &report);
+    // The same rows with a lost admin role or another directory answer are another revision.
+    let none = BTreeSet::new();
+    let without = resolve_holders(creator, &none, &[], &lookups, &copies);
+    assert_ne!(
+        revision_with_facts(rows, creator, &none, &without),
+        revision
+    );
+    let recovered = BTreeMap::from([(creator, keys(creator, true)), (admin, keys(admin, false))]);
+    let report = resolve_holders(creator, &admins, &[], &recovered, &copies);
+    assert_ne!(
+        revision_with_facts(rows, creator, &admins, &report),
+        revision
+    );
 }

@@ -72,10 +72,21 @@ const LOCKED: (EncryptionMode, u64, KeyState) = (EncryptionMode::VaultLocked, 2,
 
 /// Runs a removal on a bucket of creator user(1) up to its delete batch.
 fn run(case: Case) -> (RemoveHolderOperation, Effects) {
-    let revision = case
-        .revision
-        .unwrap_or_else(|| holder_revision(&case.grants, &case.copies));
     let lookups = [user(1), user(2), user(3)].map(|user| (user, keys(user)));
+    let revision = case.revision.unwrap_or_else(|| {
+        // The list the caller saw: rows and facts of the active generation 2, if any.
+        let active = case.mode != EncryptionMode::Off;
+        let in_active: Vec<_> = case
+            .copies
+            .iter()
+            .filter(|copy| active && copy.key.generation == 2)
+            .cloned()
+            .collect();
+        let lookups = BTreeMap::from(lookups.clone());
+        let report = resolve_holders(user(1), &case.admins, &case.grants, &lookups, &in_active);
+        let rows = holder_revision(&case.grants, &case.copies);
+        revision_with_facts(rows, user(1), &case.admins, &report)
+    });
     let admins: Vec<_> = case.admins.iter().copied().collect();
     let mut operation = RemoveHolderOperation::new(RemovalInput {
         bucket: "bucket".to_string(),

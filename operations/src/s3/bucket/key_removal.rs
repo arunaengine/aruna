@@ -16,7 +16,7 @@ use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketHolder, BucketKeyRecord, HolderOrigin, KeyState, SealedCopy,
 };
 use aruna_core::structs::storage::holders::{
-    KeyLookup, Recovery, RecoveryState, holder_revision, resolve_holders,
+    KeyLookup, Recovery, RecoveryState, holder_revision, resolve_holders, revision_with_facts,
 };
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -141,11 +141,26 @@ impl RemoveHolderOperation {
         })]
     }
 
+    /// The revision of the holder list as the caller saw it: rows and facts of the active key.
+    fn revision(&self, copies: &[SealedCopy]) -> [u8; 32] {
+        let active = self.settings.active_key();
+        let in_active: Vec<_> = copies
+            .iter()
+            .filter(|copy| Some(copy.key) == active)
+            .cloned()
+            .collect();
+        let creator = self.creator.unwrap_or_default();
+        let (admins, lookups) = (&self.admins, &self.input.lookups);
+        let report = resolve_holders(creator, admins, &self.grants, lookups, &in_active);
+        let rows = holder_revision(&self.grants, copies);
+        revision_with_facts(rows, creator, admins, &report)
+    }
+
     /// Every retained generation without a node copy keeps its recovery path unless confirmed;
     /// a decrypting change keeps source generations while new writes use mode off.
     fn remove(&mut self, keys: Vec<BucketKeyRecord>) -> Effects {
         let copies = std::mem::take(&mut self.copies);
-        if holder_revision(&self.grants, &copies) != self.input.revision {
+        if self.revision(&copies) != self.input.revision {
             return self.fail(RemovalError::StaleHolders);
         }
         let target = self.input.user_id;
