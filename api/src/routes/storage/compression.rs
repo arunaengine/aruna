@@ -14,6 +14,7 @@ use aruna_operations::s3::bucket::compression::{
     MigrationStatusOperation, PutCompressionError, PutCompressionOperation,
 };
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::key_status::bucket_settings;
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,9 @@ pub struct BucketCompressionResponse {
     pub mode: CompressionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
+    /// The zstd level Pithos applies in an encrypted bucket; absent for plain buckets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_level: Option<u8>,
     /// This node's re-encoding of stored objects after the last change; absent before any change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration: Option<MigrationProgress>,
@@ -108,6 +112,7 @@ impl BucketCompressionResponse {
             bucket,
             mode,
             level,
+            effective_level: None,
             migration: migration.map(Into::into),
         }
     }
@@ -145,7 +150,9 @@ impl TryFrom<BucketCompressionRequest> for Compression {
 - `mode` is `off` or `zstd`; `level` is present only for `zstd`.
 - `migration` reports this node's re-encoding of stored objects after the last change. Buckets on
   other nodes are separate and keep their own setting.
-- S3 clients see no difference: sizes, ranges and checksums always refer to the original bytes."#,
+- S3 clients see no difference: sizes, ranges and checksums always refer to the original bytes.
+- `effective_level` is the zstd level Pithos applies in an encrypted bucket: the nearest of 1, 4,
+  8, 11, 15, 18 and 22, the lower on a tie."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     responses(
         (
@@ -156,6 +163,7 @@ impl TryFrom<BucketCompressionRequest> for Compression {
                 "bucket": "research-raw",
                 "mode": "zstd",
                 "level": 3,
+                "effective_level": 4,
                 "migration": {
                     "migrated": 120,
                     "skipped": 4,
@@ -203,11 +211,13 @@ pub async fn get_bucket_compression(
     .await
     .map_err(|error| ServerError::InternalError(error.to_string()))?;
     let migration = migration.filter(|migration| migration.target == info.compression);
-    Ok(Json(BucketCompressionResponse::new(
-        bucket,
-        info.compression,
-        migration,
-    )))
+    let encrypted = bucket_settings(&state.get_ctx(), &bucket)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .is_encrypted();
+    let mut response = BucketCompressionResponse::new(bucket, info.compression, migration);
+    response.effective_level = info.compression.pithos_level().filter(|_| encrypted);
+    Ok(Json(response))
 }
 
 #[utoipa::path(

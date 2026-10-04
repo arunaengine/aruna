@@ -101,6 +101,17 @@ impl Compression {
             _ => Ok(self),
         }
     }
+
+    /// The zstd level Pithos applies: its nearest supported level, the lower on a tie.
+    pub fn pithos_level(self) -> Option<u8> {
+        const PITHOS_ZSTD: [u8; 7] = [1, 4, 8, 11, 15, 18, 22];
+        let Self::Zstd { level } = self else {
+            return None;
+        };
+        PITHOS_ZSTD
+            .into_iter()
+            .min_by_key(|zstd| zstd.abs_diff(level))
+    }
 }
 
 /// Encryption of the stored bytes.
@@ -313,6 +324,16 @@ mod tests {
                 candidate
             );
         }
+    }
+
+    #[test]
+    fn pithos_nearest_level() {
+        let effective = |level| Compression::Zstd { level }.pithos_level();
+        assert_eq!(effective(3), Some(4));
+        assert_eq!(effective(6), Some(4));
+        assert_eq!(effective(13), Some(11));
+        assert_eq!(effective(22), Some(22));
+        assert_eq!(Compression::Off.pithos_level(), None);
     }
 
     #[test]
