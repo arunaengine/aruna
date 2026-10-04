@@ -6,7 +6,7 @@
 use super::BlobHandler;
 use super::backend::build_part_path;
 use super::io::compose_chunk;
-use super::pithos::OBJECT_PATH;
+use super::pithos::{OBJECT_PATH, cipher, key_mode, pithos_level, write_error};
 use crate::hash::Hasher;
 use aruna_core::UserId;
 use aruna_core::errors::BlobError;
@@ -14,8 +14,7 @@ use aruna_core::events::BlobEvent;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::storage::blob::{BackendLocation, ResolvedBackend};
-use aruna_core::structs::storage::encryption::{BlockCipher, BlockKeys};
-use aruna_core::structs::storage::format::{Compression, PithosLayout, StoredFormat};
+use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
 use aruna_core::structs::storage::multipart::{
     MultipartPart, MultipartPartKey, PartPiece, UploadEncryption,
 };
@@ -23,8 +22,8 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use opendal::{Operator, Writer};
 use pithos_lib::archive::{
-    ArchivePath, BlockKeyMode, Chunking, Composition, EntryMetadata, PayloadCipher, Piece,
-    PieceEncoder, ProcessingOptions, compose,
+    ArchivePath, Chunking, Composition, EntryMetadata, Piece, PieceEncoder, ProcessingOptions,
+    compose,
 };
 use pithos_lib::crypto::PublicKey;
 use pithos_lib::error::PithosError;
@@ -36,8 +35,6 @@ use ulid::Ulid;
 const MIB: usize = 1 << 20;
 /// Multipart parts use fixed blocks, so equal parts line up with the whole file.
 const PART_BLOCK: usize = 4 * MIB;
-/// Zstd levels that the Pithos compression levels 1 to 7 stand for.
-const PITHOS_ZSTD: [u8; 7] = [1, 4, 8, 11, 15, 18, 22];
 
 impl BlobHandler {
     /// Writes one part of an encrypted upload as a Pithos piece keyed by its part number.
@@ -486,32 +483,6 @@ fn compose_parts(parts: &[MultipartPart]) -> Result<Composition, BlobError> {
     compose(path, EntryMetadata::new(0, 0, 0o644), &pieces).map_err(write_error)
 }
 
-/// Off is level 0; zstd takes the Pithos level with the nearest zstd level, the lower on a tie.
-fn pithos_level(compression: Compression) -> u8 {
-    let Compression::Zstd { level } = compression else {
-        return 0;
-    };
-    let nearest = PITHOS_ZSTD
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, zstd)| zstd.abs_diff(level));
-    nearest.map_or(0, |(index, _)| index as u8 + 1)
-}
-
-fn cipher(cipher: BlockCipher) -> PayloadCipher {
-    match cipher {
-        BlockCipher::ChaCha20Poly1305 => PayloadCipher::ChaCha20Poly1305,
-        BlockCipher::Aes256Gcm => PayloadCipher::Aes256Gcm,
-    }
-}
-
-fn key_mode(keys: BlockKeys) -> BlockKeyMode {
-    match keys {
-        BlockKeys::ContentDerived => BlockKeyMode::ContentDerived,
-        BlockKeys::Unique => BlockKeyMode::Unique,
-    }
-}
-
 /// Runs sealing on the blocking pool.
 async fn blocking<T: Send + 'static>(
     task: impl FnOnce() -> Result<T, PithosError> + Send + 'static,
@@ -545,8 +516,4 @@ fn deadline_expired() -> BlobError {
 
 fn mismatch() -> BlobError {
     BlobError::IntegrityCheckFailed("a stored part does not match its piece record".to_string())
-}
-
-fn write_error(error: PithosError) -> BlobError {
-    BlobError::WriteError(error.to_string())
 }
