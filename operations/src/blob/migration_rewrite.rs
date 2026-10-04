@@ -457,3 +457,6 @@ impl Operation for RewriteVersionOperation {
 #[path = "rewrite_rows.rs"]
 mod rows;
 
+#[cfg(test)]
+#[path = "rewrite_tests.rs"]
+mod tests;
