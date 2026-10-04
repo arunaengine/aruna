@@ -5,7 +5,8 @@
 use crate::s3::auth::Action;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::storage::blob::ensure_confined_path;
+use aruna_core::structs::storage::blob::{BackendLocation, ensure_confined_path};
+use aruna_core::structs::storage::format::{StoredEncryption, StoredFormat};
 use aruna_core::structs::storage::multipart::{MultipartChecksumHint, MultipartChecksumType};
 use aruna_operations::s3::multipart::complete::CompleteMultipartPart;
 use aruna_operations::s3::object::get::ObjectRangeRequest;
@@ -13,6 +14,7 @@ use aruna_operations::s3::object::put::PutObjectInput as BlobPutObjectInput;
 use base64::prelude::*;
 use http::HeaderMap;
 use s3s::dto::ChecksumAlgorithm as S3ChecksumAlgorithm;
+use s3s::dto::ServerSideEncryption;
 use s3s::dto::{
     ChecksumType, CompletedPart, CopySource, CreateMultipartUploadInput, PartNumber, PutObjectInput,
 };
@@ -171,6 +173,38 @@ pub(crate) fn reject_sse(requested: bool) -> S3Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Encrypted buckets accept absent or `AES256` SSE on new objects; plain buckets reject
+/// `AES256`. KMS, SSE-C and other algorithms stay rejected.
+pub(crate) fn check_sse(
+    requested: Option<&ServerSideEncryption>,
+    other: bool,
+    encrypted: bool,
+) -> S3Result<()> {
+    reject_sse(other)?;
+    match requested.map(ServerSideEncryption::as_str) {
+        None => Ok(()),
+        Some(ServerSideEncryption::AES256) if encrypted => Ok(()),
+        Some(ServerSideEncryption::AES256) => Err(s3_error!(
+            InvalidArgument,
+            "Server-side encryption is not enabled for this bucket"
+        )),
+        Some(_) => reject_sse(true),
+    }
+}
+
+/// `AES256` for a copy stored encrypted, so responses describe the actual stored copy.
+pub(crate) fn sse_header(encrypted: bool) -> Option<ServerSideEncryption> {
+    encrypted.then(|| ServerSideEncryption::from_static(ServerSideEncryption::AES256))
+}
+
+pub(crate) fn stored_encrypted(format: &StoredFormat) -> bool {
+    matches!(format.encryption, StoredEncryption::Pithos(_))
+}
+
+pub(crate) fn location_sse(location: Option<&BackendLocation>) -> Option<ServerSideEncryption> {
+    sse_header(location.is_some_and(|location| stored_encrypted(&location.format)))
 }
 
 pub(crate) fn parse_checksum_hint(
@@ -723,6 +757,22 @@ mod tests {
     fn accepts_valid_names() {
         for name in ["abc", "my-bucket", "my.bucket-1", &"a".repeat(63)] {
             assert_eq!(bucket_name_reason(name), None, "rejected {name}");
+        }
+    }
+
+    #[test]
+    fn sse_by_bucket_mode() {
+        use super::{ServerSideEncryption, check_sse};
+        let aes = ServerSideEncryption::from_static(ServerSideEncryption::AES256);
+        let kms = ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS);
+        assert!(check_sse(None, false, false).is_ok());
+        assert!(check_sse(None, false, true).is_ok());
+        assert!(check_sse(Some(&aes), false, true).is_ok());
+        let plain = check_sse(Some(&aes), false, false).unwrap_err();
+        assert_eq!(plain.code().as_str(), "InvalidArgument");
+        for (requested, other) in [(Some(&kms), false), (None, true), (Some(&aes), true)] {
+            let refused = check_sse(requested, other, true).unwrap_err();
+            assert_eq!(refused.code().as_str(), "NotImplemented");
         }
     }
 }

@@ -16,7 +16,8 @@ const S3_ALLOWED_HEADERS: &str = "authorization,content-type,content-md5,range,\
      x-amz-content-sha256,x-amz-date,x-amz-security-token,x-amz-user-agent";
 const S3_EXPOSED_HEADERS: &str = "etag,content-range,accept-ranges,content-length,last-modified,\
      x-amz-request-id,x-amz-version-id,x-amz-delete-marker,aruna-source-content-type,\
-     aruna-source-etag,aruna-source-last-modified,aruna-last-refresh";
+     aruna-source-etag,aruna-source-last-modified,aruna-last-refresh,x-aruna-bucket-locked,\
+     x-amz-server-side-encryption";
 pub(crate) const S3_PREFLIGHT_VARY: &[HeaderName] = &[
     header::ORIGIN,
     header::ACCESS_CONTROL_REQUEST_METHOD,

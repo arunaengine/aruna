@@ -6,7 +6,7 @@ use super::{ArunaS3Service, reference_etag};
 use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, UploadChecksumRequest, encode_checksums,
 };
-use crate::s3::util::map_checksum_type;
+use crate::s3::util::{map_checksum_type, sse_header, stored_encrypted};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -126,6 +126,7 @@ impl ArunaS3Service {
                 .get(HASH_MD5)
                 .map(|value| ETag::Strong(hex::encode(value))),
             version_id: Some(result.version_id.to_string()),
+            server_side_encryption: sse_header(stored_encrypted(&result.location.format)),
             ..Default::default()
         };
 
@@ -157,6 +158,7 @@ impl ArunaS3Service {
             ))),
             size: Some(result.location.blob_size as i64),
             version_id: Some(result.version_id.to_string()),
+            server_side_encryption: sse_header(stored_encrypted(&result.location.format)),
             ..Default::default()
         };
         output.apply_checksums(encode_checksums(

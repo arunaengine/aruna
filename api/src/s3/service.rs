@@ -7,6 +7,7 @@
 mod attributes;
 mod bucket;
 mod copy;
+mod encryption;
 mod listing;
 mod multipart;
 mod object;
@@ -43,10 +44,11 @@ use crate::s3::multipart_join::{
 use crate::s3::scope::SubpathScope;
 use crate::s3::server::DeleteObjectsBody;
 use crate::s3::util::{
-    checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
-    map_checksum_type, parse_checksum_hint, parse_checksum_type, parse_completed_part,
-    parse_copy_source, parse_part_number, parse_source_range, parse_upload_id, parse_version_id,
-    reject_sse, validate_object_key,
+    check_sse, checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
+    location_sse, map_checksum_type, parse_checksum_hint, parse_checksum_type,
+    parse_completed_part, parse_copy_source, parse_part_number, parse_source_range,
+    parse_upload_id, parse_version_id, reject_sse, sse_header, stored_encrypted,
+    validate_object_key,
 };
 use aruna_compute::session::TouchedObject;
 use aruna_core::NodeId;
@@ -111,21 +113,23 @@ use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
     ChecksumType, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
     CopyObjectOutput, CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
-    CreateMultipartUploadOutput, DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput,
+    CreateMultipartUploadOutput, DeleteBucketCorsInput, DeleteBucketCorsOutput,
+    DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, DeleteBucketInput,
     DeleteBucketOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput,
     DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, ETag,
     EncodingType, Error as S3DeleteError, GetBucketCorsInput, GetBucketCorsOutput,
-    GetBucketLocationInput, GetBucketLocationOutput, GetBucketReplicationInput,
-    GetBucketReplicationOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
-    GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectInput, GetObjectOutput,
-    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
-    ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
-    ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
-    ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MetadataDirective,
-    Owner, PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput,
-    PutBucketReplicationOutput, PutBucketVersioningInput, PutBucketVersioningOutput,
-    PutObjectInput, PutObjectOutput, StreamingBlob, UploadPartCopyInput, UploadPartCopyOutput,
-    UploadPartInput, UploadPartOutput,
+    GetBucketEncryptionInput, GetBucketEncryptionOutput, GetBucketLocationInput,
+    GetBucketLocationOutput, GetBucketReplicationInput, GetBucketReplicationOutput,
+    GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectAttributesInput,
+    GetObjectAttributesOutput, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
+    HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
+    ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectVersionsInput,
+    ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+    ListObjectsV2Output, ListPartsInput, ListPartsOutput, MetadataDirective, Owner,
+    PutBucketCorsInput, PutBucketCorsOutput, PutBucketEncryptionInput, PutBucketEncryptionOutput,
+    PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketVersioningInput,
+    PutBucketVersioningOutput, PutObjectInput, PutObjectOutput, StreamingBlob, UploadPartCopyInput,
+    UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -551,6 +555,48 @@ impl S3 for ArunaS3Service {
     }
 
     #[tracing::instrument(err, skip(self, req))]
+    async fn get_bucket_encryption(
+        &self,
+        req: S3Request<GetBucketEncryptionInput>,
+    ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
+        let config = self.encryption_config(&req.input.bucket).await?;
+        Ok(S3Response::new(GetBucketEncryptionOutput {
+            server_side_encryption_configuration: Some(config),
+        }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn put_bucket_encryption(
+        &self,
+        req: S3Request<PutBucketEncryptionInput>,
+    ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let extras = req
+            .extensions
+            .get::<PolicyRequestExtras>()
+            .cloned()
+            .ok_or_else(|| s3_error!(InternalError, "Missing policy context"))?;
+        let config = &req.input.server_side_encryption_configuration;
+        self.enable_encryption(&req.input.bucket, config, &user_access, extras)
+            .await?;
+        Ok(S3Response::new(PutBucketEncryptionOutput::default()))
+    }
+
+    #[tracing::instrument(err, skip(self, _req))]
+    async fn delete_bucket_encryption(
+        &self,
+        _req: S3Request<DeleteBucketEncryptionInput>,
+    ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
+        Err(s3_error!(
+            NotImplemented,
+            "Disable bucket encryption through the Aruna REST API"
+        ))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
     async fn list_objects_v2(
         &self,
         req: S3Request<ListObjectsV2Input>,
@@ -795,14 +841,16 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
-        reject_sse(
-            req.input.server_side_encryption.is_some()
-                || req.input.ssekms_key_id.is_some()
+        let encrypted = self.bucket_encrypted(&req.input.bucket).await?;
+        check_sse(
+            req.input.server_side_encryption.as_ref(),
+            req.input.ssekms_key_id.is_some()
                 || req.input.ssekms_encryption_context.is_some()
                 || req.input.bucket_key_enabled.is_some()
                 || req.input.sse_customer_algorithm.is_some()
                 || req.input.sse_customer_key.is_some()
                 || req.input.sse_customer_key_md5.is_some(),
+            encrypted,
         )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
@@ -914,9 +962,10 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
-        reject_sse(
-            req.input.server_side_encryption.is_some()
-                || req.input.ssekms_key_id.is_some()
+        let encrypted = self.bucket_encrypted(&req.input.bucket).await?;
+        check_sse(
+            req.input.server_side_encryption.as_ref(),
+            req.input.ssekms_key_id.is_some()
                 || req.input.ssekms_encryption_context.is_some()
                 || req.input.bucket_key_enabled.is_some()
                 || req.input.sse_customer_algorithm.is_some()
@@ -925,6 +974,7 @@ impl S3 for ArunaS3Service {
                 || req.input.copy_source_sse_customer_algorithm.is_some()
                 || req.input.copy_source_sse_customer_key.is_some()
                 || req.input.copy_source_sse_customer_key_md5.is_some(),
+            encrypted,
         )?;
         validate_object_key(&req.input.key)?;
         let dest_bucket_info = req.extensions.get::<BucketInfo>().cloned();
@@ -1043,14 +1093,16 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
-        reject_sse(
-            req.input.server_side_encryption.is_some()
-                || req.input.ssekms_key_id.is_some()
+        let encrypted = self.bucket_encrypted(&req.input.bucket).await?;
+        check_sse(
+            req.input.server_side_encryption.as_ref(),
+            req.input.ssekms_key_id.is_some()
                 || req.input.ssekms_encryption_context.is_some()
                 || req.input.bucket_key_enabled.is_some()
                 || req.input.sse_customer_algorithm.is_some()
                 || req.input.sse_customer_key.is_some()
                 || req.input.sse_customer_key_md5.is_some(),
+            encrypted,
         )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
@@ -1094,6 +1146,7 @@ impl S3 for ArunaS3Service {
             upload_id: Some(result.record.upload_id.to_string()),
             checksum_algorithm: req.input.checksum_algorithm,
             checksum_type: checksum_hint.map(|hint| map_checksum_type(hint.checksum_type)),
+            server_side_encryption: sse_header(encrypted),
             ..Default::default()
         }))
     }
@@ -1173,6 +1226,7 @@ impl S3 for ArunaS3Service {
                 .hashes
                 .get(HASH_MD5)
                 .map(|value| ETag::Strong(hex::encode(value))),
+            server_side_encryption: sse_header(stored_encrypted(&result.location.format)),
             ..Default::default()
         };
         output.apply_checksums(encode_checksums(
@@ -1516,6 +1570,7 @@ impl S3 for ArunaS3Service {
         };
         let content = StreamingBlob::wrap(blob);
         let mut output = GetObjectOutput {
+            server_side_encryption: location_sse(result.location.as_ref()),
             body: Some(content),
             accept_ranges: resolved_range.as_ref().map(|_| "bytes".to_string()),
             content_length: resolved_range
@@ -1727,6 +1782,7 @@ impl S3 for ArunaS3Service {
             result.version_created_at,
         );
         let mut output = HeadObjectOutput {
+            server_side_encryption: location_sse(result.location.as_ref()),
             content_length: response_fields.content_length,
             content_type: response_fields.content_type,
             e_tag: response_fields.e_tag,
