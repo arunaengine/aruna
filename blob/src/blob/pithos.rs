@@ -3,24 +3,33 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::BlobHandler;
 use super::frames::read_range;
 use aruna_core::errors::BlobError;
-use aruna_core::structs::storage::encryption::{BlockCipher, BlockKeys, SealPlan};
-use aruna_core::structs::storage::format::{Compression, PithosLayout};
+use aruna_core::events::BlobEvent;
+use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation};
+use aruna_core::structs::storage::encryption::{
+    BlockCipher, BlockKeys, BucketKeyError, ReadLease, SealPlan,
+};
+use aruna_core::structs::storage::format::{Compression, PithosLayout, StoredLayout};
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use opendal::Operator;
 use pithos_lib::archive::{
     AccessKeys, ArchivePath, AsyncArchive, BlockKeyMode, BlockingHook, CdcConfig, Chunking,
-    Composition, EntryMetadata, OpenOptions, PayloadCipher, Piece, PieceEncoder, ProcessingOptions,
-    compose,
+    Composition, EntryKind, EntryMetadata, OpenLimits, OpenOptions, PayloadCipher, Piece,
+    PieceEncoder, ProcessingOptions, compose,
 };
-use pithos_lib::crypto::PublicKey;
+use pithos_lib::crypto::{PrivateKey, PublicKey};
 use pithos_lib::error::PithosError;
 use pithos_lib::source::{AsyncArchiveSource, SourceError};
 use std::ops::Range;
-use std::sync::Arc;
-use std::time::Duration;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 /// Path of the one file in the archive of an object.
 pub const OBJECT_PATH: &str = "object";
@@ -30,6 +39,10 @@ const MIB: usize = 1 << 20;
 const BATCH: usize = MIB;
 /// Zstd levels that the Pithos compression levels 1 to 7 stand for.
 const PITHOS_ZSTD: [u8; 7] = [1, 4, 8, 11, 15, 18, 22];
+/// Largest original object a Pithos write accepts: 5 TiB.
+pub const MAX_SIZE: u64 = 5 << 40;
+/// Largest decoded block: the FastCDC maximum of single uploads.
+const MAX_BLOCK: u64 = 16 << 20;
 
 /// One stored archive. Stored objects never change, so reads need no pinned revision.
 struct StoredArchive {
@@ -81,6 +94,25 @@ impl BlockingHook for TokioBlocking {
     }
 }
 
+/// Limits of Aruna archives: one 5 TiB file in blocks of at least 1 MiB, up to 10,000 pieces,
+/// and no parent directories or references.
+pub(super) fn limits() -> OpenLimits {
+    let descriptors = 5_252_881;
+    OpenLimits {
+        max_directory_bytes: 1 << 30,
+        max_total_directory_bytes: 1 << 30,
+        max_parent_directories: 0,
+        max_references: 0,
+        max_descriptors: descriptors,
+        max_accessible_block_references: descriptors,
+        max_opaque_metadata_bytes: 512 << 20,
+        // The zstd bound of the largest block, plus nonce and tag.
+        max_stored_block_bytes: zstd::zstd_safe::compress_bound(MAX_BLOCK as usize) as u64 + 28,
+        max_decoded_block_bytes: MAX_BLOCK,
+        ..OpenLimits::default()
+    }
+}
+
 /// Streams the original bytes of `range` from the Pithos copy at `path`.
 ///
 /// Opening fails before anything is decrypted when the archive does not match `layout`. `keys`
@@ -99,12 +131,28 @@ pub async fn read(
         idle,
     };
     let options = OpenOptions::default()
+        .with_limits(limits())
         .with_access_keys(keys)
         .with_expected_metadata_digest(layout.metadata_digest);
     let archive =
         AsyncArchive::open_with_hook(source, options, Some(layout.stored_size), TokioBlocking)
             .await
             .map_err(blob_error)?;
+    let single = {
+        let mut entries = archive.entries();
+        match (entries.next(), entries.next()) {
+            (Some(entry), None) => {
+                entry.path == OBJECT_PATH
+                    && matches!(entry.kind, EntryKind::File { .. })
+                    && entry.references.is_empty()
+            }
+            _ => false,
+        }
+    };
+    if !single {
+        let message = "a Pithos copy must hold exactly one file named object";
+        return Err(BlobError::IntegrityCheckFailed(message.to_string()));
+    }
     let stream = Arc::new(archive)
         .read_range_owned(OBJECT_PATH, range)
         .map_err(blob_error)?;
@@ -152,7 +200,8 @@ impl ArchiveEncoder {
         Bytes::copy_from_slice(&self.header)
     }
 
-    /// Takes `bytes` in slices of at most one batch, sealing each full batch on the blocking pool.
+    /// Takes `bytes` in slices of at most one batch, sealing each full batch on the blocking
+    /// pool. The size cap is checked before each batch is sealed.
     pub(super) async fn push(&mut self, mut bytes: &[u8]) -> Result<Vec<Bytes>, BlobError> {
         let mut out = Vec::new();
         while !bytes.is_empty() {
@@ -218,13 +267,120 @@ impl ArchiveEncoder {
         self.size = self
             .size
             .checked_add(len as u64)
-            .ok_or(BlobError::SizeLimitExceeded { limit: u64::MAX })?;
+            .filter(|size| *size <= MAX_SIZE)
+            .ok_or(BlobError::SizeLimitExceeded { limit: MAX_SIZE })?;
         Ok(())
     }
 }
 
 fn sealing_failed() -> BlobError {
     BlobError::WriteError("an earlier Pithos batch failed".to_string())
+}
+
+/// The plaintext of one leased read. It keeps the lease until it ends and is polled only through
+/// `&mut self`, so it may be shared. A whole read checks the recorded BLAKE3 at its end.
+struct LeasedRead<S> {
+    stream: Mutex<Pin<Box<S>>>,
+    hasher: blake3::Hasher,
+    expected: Option<Vec<u8>>,
+    _lease: ReadLease,
+}
+
+impl<S: Stream<Item = Result<Bytes, BlobError>>> Stream for LeasedRead<S> {
+    type Item = Result<Bytes, BlobError>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let Ok(stream) = this.stream.get_mut() else {
+            return Poll::Ready(None);
+        };
+        match stream.as_mut().poll_next(context) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.hasher.update(&chunk);
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(None) => match this.expected.take() {
+                Some(hash) if this.hasher.finalize().as_bytes()[..] != hash[..] => {
+                    let message = "blake3 hash mismatch".to_string();
+                    Poll::Ready(Some(Err(BlobError::IntegrityCheckFailed(message))))
+                }
+                _ => Poll::Ready(None),
+            },
+            other => other,
+        }
+    }
+}
+
+impl BlobHandler {
+    /// Streams `range`, or the whole object, of a Pithos copy under `lease`, which must be
+    /// admitted for this copy's key and archive. The stream keeps the lease until it ends; a
+    /// whole read is also checked against the recorded BLAKE3.
+    pub async fn read_sealed(
+        &self,
+        location: BackendLocation,
+        range: Option<Range<u64>>,
+        lease: ReadLease,
+    ) -> BlobEvent {
+        match self.sealed_stream(&location, range, lease).await {
+            Ok((blob, stream_size)) => BlobEvent::ReadFinished { blob, stream_size },
+            Err(error) => BlobEvent::Error(error),
+        }
+    }
+
+    async fn sealed_stream(
+        &self,
+        location: &BackendLocation,
+        range: Option<Range<u64>>,
+        lease: ReadLease,
+    ) -> Result<(BackendStream<Result<Bytes, StreamError>>, u64), BlobError> {
+        let StoredLayout::Pithos(layout) = &location.format.layout else {
+            return Err(BlobError::ReadError("not a Pithos copy".to_string()));
+        };
+        let keys = self.sealed_keys(location, &lease)?;
+        let expected = match range {
+            Some(_) => None,
+            None => Some(location.get_blake3().map(<[u8]>::to_vec).ok_or_else(|| {
+                BlobError::IntegrityCheckFailed("missing stored blake3 hash".to_string())
+            })?),
+        };
+        let range = range.unwrap_or(0..location.blob_size);
+        let operator = self.operator_from_location(location)?;
+        let path = location.get_storage_path()?;
+        let idle = self.transfer_idle_timeout();
+        let size = range.end.saturating_sub(range.start);
+        let stream = Box::pin(read(operator, path, layout, keys, range, idle).await?);
+        let blob = LeasedRead {
+            stream: Mutex::new(stream),
+            hasher: blake3::Hasher::new(),
+            expected,
+            _lease: lease,
+        };
+        Ok((BackendStream::new(blob), size))
+    }
+
+    /// The key of a sealed copy, only through a lease admitted for exactly this archive.
+    pub(super) fn sealed_keys(
+        &self,
+        location: &BackendLocation,
+        lease: &ReadLease,
+    ) -> Result<AccessKeys, BlobError> {
+        let key = location.format.bucket_key().ok_or_else(needs_bucket_key)?;
+        if lease.key != key || lease.archive != ArchiveKey::of(location) {
+            return Err(BucketKeyError::Locked(key.bucket_id).into());
+        }
+        let unlocked = match self.unlocks.lock() {
+            Ok(mut registry) => registry.unlocked_key(key, Instant::now()),
+            Err(_) => Err(BucketKeyError::Locked(key.bucket_id)),
+        };
+        let (secret, _) = unlocked?;
+        let bytes: &[u8; 32] = secret
+            .bytes()
+            .expose()
+            .try_into()
+            .map_err(|_| BlobError::from(BucketKeyError::WrongKey))?;
+        let raw = Zeroizing::new(*bytes);
+        Ok(AccessKeys::new().with_key(PrivateKey::from_raw(raw)))
+    }
 }
 
 fn cipher(cipher: BlockCipher) -> PayloadCipher {
@@ -290,5 +446,44 @@ fn blob_error(error: PithosError) -> BlobError {
         | PithosError::InvalidReadRange { .. }
         | PithosError::FileNotFound(_) => BlobError::ReadError(error.to_string()),
         error => BlobError::IntegrityCheckFailed(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArchiveEncoder, BATCH, MAX_SIZE};
+    use aruna_core::errors::BlobError;
+    use aruna_core::structs::storage::encryption::{BucketKeyRef, SealPlan};
+    use aruna_core::structs::storage::format::Compression;
+    use pithos_lib::crypto::PrivateKey;
+
+    fn encoder() -> ArchiveEncoder {
+        let plan = SealPlan {
+            key: BucketKeyRef::new(ulid::Ulid::from_bytes([1; 16]), 1),
+            public_key: *PrivateKey::generate().public_key().as_bytes(),
+            cipher: Default::default(),
+            block_keys: Default::default(),
+            storage_generation: 1,
+        };
+        ArchiveEncoder::new(&plan, Compression::Off).unwrap()
+    }
+
+    #[tokio::test]
+    async fn batches_stay_bounded() {
+        let mut encoder = encoder();
+        encoder.push(&vec![7; 3 * BATCH + 10]).await.unwrap();
+        assert_eq!(encoder.batch.len(), 10);
+        assert_eq!(encoder.size, 3 * BATCH as u64);
+    }
+
+    #[tokio::test]
+    async fn caps_original_size() {
+        let mut encoder = encoder();
+        encoder.size = MAX_SIZE - 5;
+        let refused = encoder.push(&vec![7; BATCH]).await;
+        assert_eq!(
+            refused.unwrap_err(),
+            BlobError::SizeLimitExceeded { limit: MAX_SIZE }
+        );
     }
 }

@@ -255,6 +255,17 @@ async fn writes_read_back() {
 }
 
 #[tokio::test]
+async fn writes_selected_cipher() {
+    let bucket = PrivateKey::generate();
+    let data = content(300_000);
+    let seal = plan(&bucket, BlockCipher::Aes256Gcm, BlockKeys::Unique);
+    let (_context, operator, path, layout) = written(&data, seal, Compression::Off).await;
+    let size = data.len() as u64;
+    let whole = read_at(&operator, &path, &layout, &bucket, 0..size).await;
+    assert!(whole.unwrap() == data);
+}
+
+#[tokio::test]
 async fn writes_empty_object() {
     let bucket = PrivateKey::generate();
     let seal = plan(&bucket, BlockCipher::ChaCha20Poly1305, BlockKeys::Unique);
@@ -349,6 +360,33 @@ async fn aborts_failed_writes() {
         BlobEvent::Error(BlobError::StreamFailed(_))
     ));
     assert!(!operator.exists(&path).await.unwrap());
+}
+
+#[tokio::test]
+async fn rejects_other_shapes() {
+    use pithos_lib::archive::{Archive, ArchiveWriter, OpenOptions, WriteOptions};
+    use pithos_lib::source::MemorySource;
+
+    let bucket = PrivateKey::generate();
+    let options = WriteOptions::new(PrivateKey::generate(), vec![bucket.public_key()]);
+    let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
+    let processing = ProcessingOptions::new(true, 0).unwrap();
+    for name in [OBJECT_PATH, "other"] {
+        let path = ArchivePath::new(name).unwrap();
+        let metadata = EntryMetadata::new(0, 0, 0o644);
+        writer
+            .add_file(path, metadata, processing, None, &b"data"[..])
+            .unwrap();
+    }
+    let archive = writer.finish().unwrap();
+    let opened = Archive::open(MemorySource::new(archive.clone()), OpenOptions::default());
+    let layout = PithosLayout {
+        stored_size: archive.len() as u64,
+        metadata_digest: opened.unwrap().metadata_digest(),
+    };
+    let (_dir, operator) = stored(&archive).await;
+    let refused = read_all(&operator, &layout, &bucket, 0..4).await;
+    assert!(matches!(refused, Err(BlobError::IntegrityCheckFailed(_))));
 }
 
 #[tokio::test]
@@ -563,4 +601,69 @@ async fn seals_with_unlocked() {
     };
     let opened = open_sealed(&[6; 32], &sealed, &info, &[]).unwrap();
     assert_eq!(opened.as_slice(), bucket_key.expose());
+}
+
+#[tokio::test]
+async fn reads_with_lease() {
+    use aruna_core::compute::{SecretBytes, SharedSecret};
+    use aruna_core::effects::BlobEffect;
+    use aruna_core::structs::storage::blob::ArchiveKey;
+
+    let bucket = PrivateKey::from_raw(zeroize::Zeroizing::new([5; 32]));
+    let seal = plan(
+        &bucket,
+        BlockCipher::ChaCha20Poly1305,
+        BlockKeys::ContentDerived,
+    );
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let data = content(300_000);
+    let backend = ResolvedBackend::node_default().with_encryption(Some(seal));
+    let stream = stream_from_bytes(&data);
+    let written = handler
+        .write_blob("bucket", "sealed.bin", backend, test_user_id(), stream)
+        .await;
+    let BlobEvent::WriteFinished { location } = written else {
+        panic!("write failed: {written:?}")
+    };
+    let prepare = BlobEffect::PrepareKey {
+        key: seal.key,
+        public_key: seal.public_key,
+        private_key: SharedSecret::new(SecretBytes::new(vec![5; 32])),
+        duration: None,
+        max: None,
+    };
+    let BlobEvent::KeyPrepared { ticket } = handler.unlock_effect(prepare) else {
+        panic!("prepare failed")
+    };
+    handler.unlock_effect(BlobEffect::ActivateKey { ticket });
+    let archive = ArchiveKey::of(&location);
+    let collect = |event: BlobEvent| async move {
+        let BlobEvent::ReadFinished { blob, stream_size } = event else {
+            panic!("read failed: {event:?}")
+        };
+        let chunks: Vec<Bytes> = blob.try_collect().await.unwrap();
+        (chunks.concat(), stream_size)
+    };
+    let BlobEvent::ReadAdmitted { lease } = handler.admit_read(seal.key, archive.clone()).await
+    else {
+        panic!("admission failed")
+    };
+    let whole = handler.read_sealed(location.clone(), None, lease).await;
+    assert_eq!(collect(whole).await, (data.clone(), data.len() as u64));
+    let BlobEvent::ReadAdmitted { lease } = handler.admit_read(seal.key, archive).await else {
+        panic!("admission failed")
+    };
+    let part = handler
+        .read_sealed(location.clone(), Some(1_000..9_000), lease)
+        .await;
+    assert_eq!(collect(part).await, (data[1_000..9_000].to_vec(), 8_000));
+
+    // A lease of another archive never opens this copy.
+    let other = ArchiveKey::new(ulid::Ulid::generate(), location.backend.clone());
+    let BlobEvent::ReadAdmitted { lease } = handler.admit_read(seal.key, other).await else {
+        panic!("admission failed")
+    };
+    let refused = handler.read_sealed(location, None, lease).await;
+    assert!(matches!(refused, BlobEvent::Error(BlobError::BucketKey(_))));
 }

@@ -274,6 +274,13 @@ pub enum BlobEffect {
         location: BackendLocation,
         lease: ReadLease,
     },
+    /// Streams `range`, or the whole object, of the sealed copy at `location` under `lease`.
+    /// The stream keeps the lease until it ends.
+    ReadSealed {
+        location: BackendLocation,
+        range: Option<Range<u64>>,
+        lease: ReadLease,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
