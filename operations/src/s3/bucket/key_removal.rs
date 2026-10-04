@@ -1,5 +1,5 @@
 //! Removes an explicit key holder of a bucket. It rereads holders and copies in its transaction,
-//! refuses a stale holder revision and asks for confirmation before it breaks recovery.
+//! refuses a stale holder revision and asks for confirmation before it weakens recovery.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -187,7 +187,13 @@ impl RemoveHolderOperation {
                 .collect();
             let before = report(&self.grants, all);
             let after = report(&remaining, kept.iter().filter(of_key).cloned().collect());
-            breaks |= before.state == RecoveryState::Met && after.state != RecoveryState::Met;
+            let weakens = after.ready_holders < before.ready_holders
+                || after.ready_with_recovery < before.ready_with_recovery;
+            // A degraded or unknown recovery path is protected against any further loss.
+            breaks |= match before.state {
+                RecoveryState::Met => after.state != RecoveryState::Met,
+                RecoveryState::Degraded | RecoveryState::Unknown => weakens,
+            };
             recovery.insert(record.key.generation, after);
         }
         if breaks && !self.input.confirm_recovery {
@@ -205,7 +211,7 @@ impl RemoveHolderOperation {
             recovery,
             deleted_copies: removed.len(),
         }));
-        let reason = breaks.then(|| "recovery rule broken with confirmation".to_string());
+        let reason = breaks.then(|| "recovery weakened with confirmation".to_string());
         let record = BucketAuditRecord {
             event_id: Ulid::generate(),
             bucket_id: grant.bucket_id,

@@ -272,3 +272,31 @@ fn retained_generation_protected() {
         "a retired generation needs no recovery"
     );
 }
+
+#[test]
+fn weak_recovery_protected() {
+    // The creator has no copy; user(4) has no directory answer, so its recovery is unknown.
+    for target in [user(3), user(4)] {
+        let case = |confirm| Case {
+            target,
+            admins: BTreeSet::new(),
+            grants: vec![grant(target)],
+            copies: vec![copy(target, 2)],
+            revision: None,
+            confirm,
+            mode: LOCKED.0,
+            keys: vec![(LOCKED.1, LOCKED.2)],
+        };
+        let (operation, _) = run(case(false));
+        assert_eq!(
+            operation.finalize(),
+            Err(RemovalError::RecoveryConfirmationRequired),
+            "the last ready holder of {target:?} needs confirmation"
+        );
+        let (_, effects) = run(case(true));
+        assert_eq!(
+            deleted(&effects),
+            [BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE]
+        );
+    }
+}
