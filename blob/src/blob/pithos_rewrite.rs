@@ -189,6 +189,7 @@ impl BlobHandler {
             idle,
         };
         let options = OpenOptions::default()
+            .with_limits(super::pithos::limits())
             .with_access_keys(keys)
             .with_expected_metadata_digest(layout.metadata_digest);
         let archive = AsyncArchive::open(stored, options, Some(layout.stored_size)).await;
