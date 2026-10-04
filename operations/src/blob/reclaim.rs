@@ -687,12 +687,11 @@ impl ReclaimBlobOperation {
         let (Some(txn_id), Some(location)) = (self.txn_id, self.location.as_ref()) else {
             return self.fail(ReclaimBlobError::Failed);
         };
-        let mut update = UsageCounterUpdate::for_stored(StoredDelta::new(
-            self.key.blake3,
-            self.key.backend.clone(),
-            -1,
-            -i128::from(location.stored_size()),
-        ));
+        let bytes = -i128::from(location.stored_size());
+        let stored = StoredDelta::of_copy(location, -1, bytes).unwrap_or_else(|| {
+            StoredDelta::new(self.key.blake3, self.key.backend.clone(), -1, bytes)
+        });
+        let mut update = UsageCounterUpdate::for_stored(stored);
         if update.is_noop() {
             return self.commit();
         }

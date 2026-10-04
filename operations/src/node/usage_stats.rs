@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NODE_STATS_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -18,13 +18,14 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::usage::{
     DIRTY_GLOBAL_KEY, DIRTY_PREFIX, GLOBAL_SHARD_COUNT, NodeUsageSnapshot, SUMMARY_GLOBAL_KEY,
     SUMMARY_GROUP_PREFIX, USAGE_GLOBAL_KEY, USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX,
     UsageCounterError, UsageCounters, UsageDelta, dirty_group_id, dirty_group_key,
-    global_group_key, global_shard_index, global_shard_key, global_shard_keys, shard_for_hash,
-    usage_backend_key, usage_global_key, usage_group_id, usage_group_key, usage_group_prefix,
-    usage_hash_key, usage_node_id, usage_snapshot_key, usage_summary_key,
+    global_group_key, global_shard_index, global_shard_key, global_shard_keys, shard_for_archive,
+    shard_for_hash, usage_backend_key, usage_global_key, usage_group_id, usage_group_key,
+    usage_group_prefix, usage_node_id, usage_snapshot_key, usage_summary_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -65,10 +66,10 @@ pub struct UsageCounterUpdate {
     phase: UsageUpdatePhase,
 }
 
-/// One physical copy's contribution to the stored counters.
+/// One physical copy's contribution to the stored counters, booked against one shard.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredDelta {
-    pub blake3: [u8; 32],
+    pub shard: usize,
     pub backend: BackendRef,
     pub blobs: i128,
     pub bytes: i128,
@@ -77,27 +78,38 @@ pub struct StoredDelta {
 impl StoredDelta {
     pub fn new(blake3: [u8; 32], backend: BackendRef, blobs: i128, bytes: i128) -> Self {
         Self {
-            blake3,
+            shard: shard_for_hash(&blake3),
             backend,
             blobs,
             bytes,
         }
     }
 
+    /// A Pithos archive is booked against the shard of its archive id, a plain copy against the
+    /// shard of its content hash. `None` for a plain copy without a hash.
+    pub fn of_copy(location: &BackendLocation, blobs: i128, bytes: i128) -> Option<Self> {
+        let shard = match &location.format.layout {
+            StoredLayout::Pithos(_) => shard_for_archive(location.ulid),
+            StoredLayout::Raw | StoredLayout::Frames(_) => {
+                shard_for_hash(location.get_blake3()?.try_into().ok()?)
+            }
+        };
+        Some(Self {
+            shard,
+            backend: location.backend.clone(),
+            blobs,
+            bytes,
+        })
+    }
+
     /// Credit for a copy a write newly created, in stored bytes. An adopted copy
     /// adds nothing, so its update never joins the counter rows to the transaction.
     pub fn for_location(location: &BackendLocation, new_blob: bool) -> Option<Self> {
-        let blake3: [u8; 32] = location.get_blake3()?.try_into().ok()?;
-        Some(Self::new(
-            blake3,
-            location.backend.clone(),
-            i128::from(new_blob),
-            if new_blob {
-                i128::from(location.stored_size())
-            } else {
-                0
-            },
-        ))
+        let bytes = match new_blob {
+            true => i128::from(location.stored_size()),
+            false => 0,
+        };
+        Self::of_copy(location, i128::from(new_blob), bytes)
     }
 
     /// The global hash shard carries both stored counters; the backend row
@@ -108,7 +120,7 @@ impl StoredDelta {
         }
         vec![
             (
-                usage_hash_key(&self.blake3),
+                global_shard_key(self.shard),
                 UsageDelta {
                     stored_blobs: self.blobs,
                     stored_bytes: self.bytes,
@@ -116,7 +128,7 @@ impl StoredDelta {
                 },
             ),
             (
-                usage_backend_key(&self.backend, shard_for_hash(&self.blake3)),
+                usage_backend_key(&self.backend, self.shard),
                 UsageDelta {
                     stored_bytes: self.bytes,
                     ..Default::default()
@@ -572,6 +584,7 @@ pub enum RebuildStatsState {
     Init,
     ScanBuckets,
     ScanBlobs,
+    ScanPending,
     ScanHeads,
     ScanVersions,
     ScanCounters,
@@ -610,6 +623,8 @@ pub struct RebuildStatsOperation {
     txn_id: Option<TxnId>,
     bucket_groups: HashMap<String, GroupId>,
     blob_sizes: HashMap<Vec<u8>, u64>,
+    /// Original sizes of pending archives by archive key, for their versions' logical bytes.
+    pending_sizes: HashMap<Vec<u8>, u64>,
     current_versions: HashMap<(String, String), ulid::Ulid>,
     global: UsageCounters,
     global_shards: Vec<UsageCounters>,
@@ -638,6 +653,7 @@ impl RebuildStatsOperation {
             txn_id: None,
             bucket_groups: HashMap::new(),
             blob_sizes: HashMap::new(),
+            pending_sizes: HashMap::new(),
             current_versions: HashMap::new(),
             global: UsageCounters::default(),
             global_shards: vec![UsageCounters::default(); GLOBAL_SHARD_COUNT],
@@ -670,6 +686,7 @@ impl RebuildStatsOperation {
         match self.state {
             RebuildStatsState::ScanBuckets => Some(S3_BUCKET_KEYSPACE),
             RebuildStatsState::ScanBlobs => Some(BLOB_LOCATIONS_KEYSPACE),
+            RebuildStatsState::ScanPending => Some(PENDING_LOCATION_KEYSPACE),
             RebuildStatsState::ScanHeads => Some(BLOB_HEAD_KEYSPACE),
             RebuildStatsState::ScanVersions => Some(BLOB_VERSIONS_KEYSPACE),
             RebuildStatsState::ScanCounters => Some(USAGE_STATS_KEYSPACE),
@@ -707,27 +724,38 @@ impl RebuildStatsOperation {
                     self.bucket_groups.insert(bucket, info.group_id);
                 }
             }
-            RebuildStatsState::ScanBlobs => {
+            RebuildStatsState::ScanBlobs | RebuildStatsState::ScanPending => {
+                let pending = self.state == RebuildStatsState::ScanPending;
                 for (key, value) in values {
                     let location = BackendLocation::from_bytes(value.as_ref())?;
                     if location.staging || location.partial {
                         continue;
                     }
+                    let shard = match pending {
+                        true => {
+                            self.pending_sizes.insert(key.to_vec(), location.blob_size);
+                            shard_for_archive(location.ulid)
+                        }
+                        false => {
+                            let hash = BlobLocationKey::from_bytes(key.as_ref())?.blake3_hash;
+                            // Copies of one hash share a size, so the hash prefix keys the map.
+                            self.blob_sizes.insert(hash.to_vec(), location.blob_size);
+                            StoredDelta::of_copy(&location, 1, 0)
+                                .map_or_else(|| shard_for_hash(&hash), |stored| stored.shard)
+                        }
+                    };
                     let delta = UsageCounters {
                         stored_blobs: 1,
                         stored_bytes: location.stored_size(),
                         ..Default::default()
                     };
-                    let hash = BlobLocationKey::from_bytes(key.as_ref())?.blake3_hash;
                     self.global.add(&delta)?;
-                    self.global_shards[shard_for_hash(&hash)].add(&delta)?;
-                    self.backend_entry(&location.backend, shard_for_hash(&hash))
+                    self.global_shards[shard].add(&delta)?;
+                    self.backend_entry(&location.backend, shard)
                         .add(&UsageCounters {
                             stored_bytes: location.stored_size(),
                             ..Default::default()
                         })?;
-                    // Copies of one hash share a size, so the hash prefix keys the map.
-                    self.blob_sizes.insert(hash.to_vec(), location.blob_size);
                 }
             }
             RebuildStatsState::ScanHeads => {
@@ -774,7 +802,14 @@ impl RebuildStatsOperation {
                         BlobVersionState::Reference {
                             cached_metadata, ..
                         } => Some((0, cached_metadata.content_length)),
-                        BlobVersionState::Deleted | BlobVersionState::PendingContent { .. } => None,
+                        BlobVersionState::PendingContent { archive, .. } => {
+                            let size = self.pending_sizes.get(&archive.to_bytes()).copied();
+                            if size.is_none() {
+                                self.orphan_versions += 1;
+                            }
+                            size.map(|size| (size, 0))
+                        }
+                        BlobVersionState::Deleted => None,
                     }) else {
                         continue;
                     };
@@ -804,7 +839,8 @@ impl RebuildStatsOperation {
     fn next_scan(&mut self) -> Effects {
         let next = match self.state {
             RebuildStatsState::ScanBuckets => RebuildStatsState::ScanBlobs,
-            RebuildStatsState::ScanBlobs => RebuildStatsState::ScanHeads,
+            RebuildStatsState::ScanBlobs => RebuildStatsState::ScanPending,
+            RebuildStatsState::ScanPending => RebuildStatsState::ScanHeads,
             RebuildStatsState::ScanHeads => RebuildStatsState::ScanVersions,
             RebuildStatsState::ScanVersions => {
                 if self.orphan_versions > 0 {
@@ -984,6 +1020,7 @@ impl Operation for RebuildStatsOperation {
             RebuildStatsState::Init => self.start(),
             RebuildStatsState::ScanBuckets
             | RebuildStatsState::ScanBlobs
+            | RebuildStatsState::ScanPending
             | RebuildStatsState::ScanHeads
             | RebuildStatsState::ScanVersions
             | RebuildStatsState::ScanCounters => self.handle_page(event),
@@ -1763,6 +1800,7 @@ mod tests {
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::{FrameLayout, StoredFormat, StoredLayout};
     use aruna_core::structs::storage::usage::global_shard_keys;
+    use aruna_core::structs::storage::usage::usage_hash_key;
     use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -2326,6 +2364,54 @@ mod tests {
         assert_eq!(beta.objects, 1);
         assert_eq!(beta.logical_bytes, 80);
         assert_eq!(beta.referenced_bytes, 0);
+    }
+
+    #[test]
+    fn archives_book_once() {
+        use aruna_core::structs::storage::blob::ArchiveKey;
+        use aruna_core::structs::storage::encryption::BucketKeyRef;
+        use aruna_core::structs::storage::format::PithosLayout;
+
+        let mut sealed = location(100, false, false);
+        let layout = PithosLayout {
+            stored_size: 130,
+            metadata_digest: [4u8; 32],
+        };
+        sealed.format = StoredFormat::pithos(layout, BucketKeyRef::new(Ulid::generate(), 1));
+        // A pending archive has no hash; its shard comes from its archive id alone.
+        let pending = StoredDelta::for_location(&sealed, true).unwrap();
+        assert_eq!(pending.shard, shard_for_archive(sealed.ulid));
+        assert_eq!((pending.blobs, pending.bytes), (1, 130));
+        sealed.hashes.insert("blake3".to_string(), vec![9u8; 32]);
+        let known = StoredDelta::for_location(&sealed, true).unwrap();
+        assert_eq!(known.shard, pending.shard);
+
+        let group_id = Ulid::generate();
+        let version_id = Ulid::generate();
+        let archive = ArchiveKey::of(&sealed);
+        let mut operation = RebuildStatsOperation::new();
+        operation.state = RebuildStatsState::ScanPending;
+        let row = ByteView::from(sealed.to_bytes().unwrap());
+        operation
+            .consume_values(&[(ByteView::from(archive.to_bytes()), row)])
+            .unwrap();
+        assert_eq!(operation.global.stored_bytes, 130);
+        assert_eq!(operation.global_shards[pending.shard].stored_blobs, 1);
+
+        let version =
+            BlobVersion::pending(archive, SystemTime::UNIX_EPOCH, Default::default(), None);
+        let key = VersionKey::new("target", "sealed.bin", version_id);
+        operation.state = RebuildStatsState::ScanVersions;
+        operation
+            .bucket_groups
+            .insert("target".to_string(), group_id);
+        let version = (
+            ByteView::from(key.to_bytes().unwrap()),
+            ByteView::from(version.to_bytes().unwrap()),
+        );
+        operation.consume_values(&[version]).unwrap();
+        assert_eq!(operation.groups.get(&group_id).unwrap().logical_bytes, 100);
+        assert_eq!(operation.orphan_versions, 0);
     }
 
     #[test]

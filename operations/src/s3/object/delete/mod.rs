@@ -8,7 +8,9 @@ use crate::blob::records::{
     delete_version_effect, owner_delete_effect, owners_scan_effect, pending_location_read,
     write_version_effect,
 };
-use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish};
+use crate::node::usage_stats::{
+    StoredDelta, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
+};
 use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::UserId;
@@ -176,6 +178,8 @@ pub struct DeleteObjectOperation {
     target_location: Option<BlobLocationKey>,
     /// The Pithos archive the deleted version used, with its stored location.
     target_archive: Option<(ArchiveKey, Option<BackendLocation>)>,
+    /// The stored debit of a pending archive this delete freed.
+    freed_copy: Option<StoredDelta>,
     live_before_marker: bool,
     usage_update: Option<UsageCounterUpdate>,
     copy_removal: Option<ManagedCopyRemoval>,
@@ -205,6 +209,7 @@ impl DeleteObjectOperation {
             target_size: None,
             target_location: None,
             target_archive: None,
+            freed_copy: None,
             live_before_marker: false,
             usage_update: None,
             copy_removal: None,
@@ -752,6 +757,8 @@ impl DeleteObjectOperation {
         let Some((_, Some(location))) = self.target_archive.clone() else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
+        let bytes = -i128::from(location.stored_size());
+        self.freed_copy = StoredDelta::of_copy(&location, -1, bytes);
         let work = match (BlobCleanupWork::DeleteBlob { location }).to_bytes() {
             Ok(work) => work,
             Err(err) => return self.emit_error(err.into()),
@@ -842,7 +849,10 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::NoTransactionFound);
         };
         let delta = self.usage_delta();
-        let mut update = UsageCounterUpdate::for_group(self.input.group_id, delta);
+        let mut update = match self.freed_copy.take() {
+            Some(stored) => UsageCounterUpdate::with_stored(self.input.group_id, delta, stored),
+            None => UsageCounterUpdate::for_group(self.input.group_id, delta),
+        };
         if update.is_noop() {
             return self.write_delete_audit();
         }
