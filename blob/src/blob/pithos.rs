@@ -383,14 +383,14 @@ impl BlobHandler {
     }
 }
 
-fn cipher(cipher: BlockCipher) -> PayloadCipher {
+pub(super) fn cipher(cipher: BlockCipher) -> PayloadCipher {
     match cipher {
         BlockCipher::ChaCha20Poly1305 => PayloadCipher::ChaCha20Poly1305,
         BlockCipher::Aes256Gcm => PayloadCipher::Aes256Gcm,
     }
 }
 
-fn key_mode(keys: BlockKeys) -> BlockKeyMode {
+pub(super) fn key_mode(keys: BlockKeys) -> BlockKeyMode {
     match keys {
         BlockKeys::ContentDerived => BlockKeyMode::ContentDerived,
         BlockKeys::Unique => BlockKeyMode::Unique,
@@ -398,7 +398,7 @@ fn key_mode(keys: BlockKeys) -> BlockKeyMode {
 }
 
 /// Off is level 0; zstd takes the Pithos level with the nearest zstd level, the lower on a tie.
-fn pithos_level(compression: Compression) -> u8 {
+pub(super) fn pithos_level(compression: Compression) -> u8 {
     let Compression::Zstd { level } = compression else {
         return 0;
     };
@@ -427,7 +427,7 @@ fn compose_object(pieces: &[Piece]) -> Result<Composition, PithosError> {
     compose(path, EntryMetadata::new(0, 0, 0o644), pieces)
 }
 
-fn write_error(error: PithosError) -> BlobError {
+pub(super) fn write_error(error: PithosError) -> BlobError {
     BlobError::WriteError(error.to_string())
 }
 
