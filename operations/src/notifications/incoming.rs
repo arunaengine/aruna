@@ -565,6 +565,13 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             }
             validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
         }
+        NotificationKind::BucketLockedByRestart {
+            bucket, group_id, ..
+        } => {
+            if bucket.is_empty() || group_id.is_nil() {
+                return Err("restart lock notification has empty bucket or group".to_string());
+            }
+        }
     }
     Ok(())
 }

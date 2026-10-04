@@ -90,6 +90,12 @@ pub enum NotificationKind {
         request_id: Ulid,
         actor_user_id: UserId,
     },
+    /// A node restart locked an unlocked encrypted bucket; a holder must unlock it again.
+    BucketLockedByRestart {
+        bucket: String,
+        node_id: NodeId,
+        group_id: GroupId,
+    },
 }
 
 impl NotificationKind {
@@ -106,6 +112,7 @@ impl NotificationKind {
             | NotificationKind::DataUploaded { .. }
             | NotificationKind::SyncCompleted { .. }
             | NotificationKind::SyncFailed { .. } => "resource.watch",
+            NotificationKind::BucketLockedByRestart { .. } => "bucket.encryption",
         }
     }
 
@@ -121,6 +128,7 @@ impl NotificationKind {
             NotificationKind::DataUploaded { .. } => "data_uploaded",
             NotificationKind::SyncCompleted { .. } => "sync_completed",
             NotificationKind::SyncFailed { .. } => "sync_failed",
+            NotificationKind::BucketLockedByRestart { .. } => "bucket_locked_by_restart",
         }
     }
 }
@@ -363,6 +371,11 @@ mod tests {
         let data_group_id = Ulid::generate();
         let data_node_id = make_node_id(8);
         for kind in [
+            NotificationKind::BucketLockedByRestart {
+                bucket: "raw".to_string(),
+                node_id: make_node_id(9),
+                group_id: Ulid::generate(),
+            },
             NotificationKind::GroupJoinRequested {
                 group_id: Ulid::generate(),
                 request_id: Ulid::generate(),
