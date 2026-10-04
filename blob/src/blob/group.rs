@@ -122,6 +122,7 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         // Key effects touch no backend; the read that uses a lease claims its own.
         | BlobEffect::GenerateBucketKey
         | BlobEffect::SealHolderCopies { .. }
+        | BlobEffect::SealUnlocked { .. }
         | BlobEffect::PrepareKey { .. }
         | BlobEffect::ActivateKey { .. }
         | BlobEffect::DiscardKey { .. }

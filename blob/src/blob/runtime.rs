@@ -95,6 +95,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::CheckGroupBackend { .. } => (EffectClass::Control, "check_group_backend"),
         BlobEffect::GenerateBucketKey => (EffectClass::Local, "generate_bucket_key"),
         BlobEffect::SealHolderCopies { .. } => (EffectClass::Local, "seal_holder_copies"),
+        BlobEffect::SealUnlocked { .. } => (EffectClass::Local, "seal_unlocked"),
         BlobEffect::PrepareKey { .. } => (EffectClass::Local, "prepare_key"),
         BlobEffect::ActivateKey { .. } => (EffectClass::Local, "activate_key"),
         BlobEffect::DiscardKey { .. } => (EffectClass::Local, "discard_key"),
@@ -761,6 +762,12 @@ impl BlobHandler {
                     Err(error) => BlobEvent::Error(error.into()),
                 }
             }
+            BlobEffect::SealUnlocked {
+                key,
+                realm_id,
+                node_id,
+                holders,
+            } => self.seal_unlocked(key, (realm_id, node_id), &holders),
             effect @ (BlobEffect::PrepareKey { .. }
             | BlobEffect::ActivateKey { .. }
             | BlobEffect::DiscardKey { .. }

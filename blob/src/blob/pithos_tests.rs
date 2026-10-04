@@ -442,3 +442,54 @@ async fn keys_seal_through_adapter() {
         Event::Blob(BlobEvent::Error(BlobError::BucketKey(_)))
     ));
 }
+
+#[tokio::test]
+async fn seals_with_unlocked() {
+    use aruna_core::compute::{SecretBytes, SharedSecret};
+    use aruna_core::effects::BlobEffect;
+    use aruna_core::key_seal::{SealedSecret, open_sealed};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::encryption::{
+        BucketKeyError, CopyTarget, copy_info, public_key_of,
+    };
+
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let key = BucketKeyRef::new(ulid::Ulid::generate(), 1);
+    let realm_id = RealmId::from_bytes([1; 32]);
+    let node_id = handler.net.node_id();
+    let holder = SecretBytes::new(vec![6; 32]);
+    let target = CopyTarget {
+        user_id: test_user_id(),
+        key_record: ulid::Ulid::generate(),
+        key_id: "slot".to_string(),
+        public_key: public_key_of(&holder).unwrap(),
+    };
+    let seal = || handler.seal_unlocked(key, (realm_id, node_id), std::slice::from_ref(&target));
+    // A locked generation seals nothing, so the grant stays pending.
+    let locked = BlobError::BucketKey(BucketKeyError::Locked(key.bucket_id));
+    assert_eq!(seal(), BlobEvent::Error(locked));
+
+    let bucket_key = SecretBytes::new(vec![5; 32]);
+    let prepare = BlobEffect::PrepareKey {
+        key,
+        public_key: public_key_of(&bucket_key).unwrap(),
+        private_key: SharedSecret::new(SecretBytes::new(vec![5; 32])),
+        duration: None,
+        max: None,
+    };
+    let BlobEvent::KeyPrepared { ticket } = handler.unlock_effect(prepare) else {
+        panic!("prepare failed")
+    };
+    handler.unlock_effect(BlobEffect::ActivateKey { ticket });
+    let BlobEvent::CopiesSealed { copies } = seal() else {
+        panic!("an unlocked key seals")
+    };
+    let info = copy_info(realm_id, node_id, key, target.user_id, target.key_record);
+    let sealed = SealedSecret {
+        enc: copies[0].enc,
+        ciphertext: copies[0].ciphertext.clone(),
+    };
+    let opened = open_sealed(&[6; 32], &sealed, &info, &[]).unwrap();
+    assert_eq!(opened.as_slice(), bucket_key.expose());
+}

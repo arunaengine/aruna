@@ -193,6 +193,14 @@ pub enum BlobEffect {
         node_id: NodeId,
         holders: Vec<CopyTarget>,
     },
+    /// Seals copies with the unlocked key of `key`, which never leaves the adapter. A locked
+    /// generation answers `Locked`, so the caller records the holders as pending.
+    SealUnlocked {
+        key: BucketKeyRef,
+        realm_id: RealmId,
+        node_id: NodeId,
+        holders: Vec<CopyTarget>,
+    },
     /// Holds a key checked against `public_key`; no read may use it before activation.
     /// `max` bounds the session from its start, including every extension.
     PrepareKey {

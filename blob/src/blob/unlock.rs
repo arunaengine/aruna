@@ -4,13 +4,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::NodeId;
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::ArchiveKey;
 use aruna_core::structs::storage::encryption::{
-    BucketKeyError, BucketKeyRef, KeyTicket, ReadLease, UnlockStatus, key_matches,
+    BucketKeyError, BucketKeyRef, CopyTarget, KeyTicket, ReadLease, UnlockStatus, key_matches,
+    seal_copies,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -31,6 +34,7 @@ type Pins = Arc<StdMutex<HashMap<ArchiveKey, usize>>>;
 struct Session {
     session_id: Ulid,
     secret: SharedSecret,
+    public_key: [u8; 32],
     active: bool,
     unlocked_at: SystemTime,
     prepared_at: Instant,
@@ -146,6 +150,7 @@ impl UnlockRegistry {
         sessions.push(Session {
             session_id,
             secret: private_key,
+            public_key: *public_key,
             active: false,
             unlocked_at: now.1,
             prepared_at: now.0,
@@ -278,6 +283,21 @@ impl UnlockRegistry {
         ))
     }
 
+    /// The handle and public key of the active session of `key`, for sealing inside the adapter.
+    pub(super) fn unlocked_key(
+        &mut self,
+        key: BucketKeyRef,
+        now: Instant,
+    ) -> Result<(SharedSecret, [u8; 32]), BucketKeyError> {
+        self.purge(now);
+        let session = self
+            .sessions
+            .get(&key)
+            .and_then(|sessions| sessions.iter().find(|session| session.active))
+            .ok_or(BucketKeyError::Locked(key.bucket_id))?;
+        Ok((session.secret.clone(), session.public_key))
+    }
+
     /// Pins an archive without a key, so cleanup keeps it while keyless work uses it.
     pub(super) fn pin(&self, archive: ArchiveKey) -> ArchivePin {
         if let Ok(mut pins) = self.pins.lock() {
@@ -368,6 +388,27 @@ impl super::BlobHandler {
             _ => Err(BucketKeyError::Unsupported),
         };
         result.unwrap_or_else(|error| BlobEvent::Error(error.into()))
+    }
+
+    /// Seals copies with an unlocked key; the registry lock is not held while sealing.
+    pub(super) fn seal_unlocked(
+        &self,
+        key: BucketKeyRef,
+        origin: (RealmId, NodeId),
+        holders: &[CopyTarget],
+    ) -> BlobEvent {
+        let unlocked = match self.unlocks.lock() {
+            Ok(mut registry) => registry.unlocked_key(key, Instant::now()),
+            Err(_) => Err(BucketKeyError::Locked(key.bucket_id)),
+        };
+        let now_ms = aruna_core::time::unix_timestamp_millis();
+        let sealed = unlocked.and_then(|(secret, public_key)| {
+            seal_copies(key, &public_key, secret.bytes(), origin, holders, now_ms)
+        });
+        match sealed {
+            Ok(copies) => BlobEvent::CopiesSealed { copies },
+            Err(error) => BlobEvent::Error(error.into()),
+        }
     }
 
     pub(super) fn archive_pinned(&self, archive: &ArchiveKey) -> bool {
