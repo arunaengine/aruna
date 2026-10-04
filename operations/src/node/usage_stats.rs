@@ -15,8 +15,8 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    BucketInfo, CurrentVersionPointer, VersionKey,
+    ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
+    BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::usage::{
@@ -625,6 +625,8 @@ pub struct RebuildStatsOperation {
     blob_sizes: HashMap<Vec<u8>, u64>,
     /// Original sizes of pending archives by archive key, for their versions' logical bytes.
     pending_sizes: HashMap<Vec<u8>, u64>,
+    /// Pithos archives already charged: during promotion one archive has a known and a pending row.
+    charged_archives: HashSet<Vec<u8>>,
     current_versions: HashMap<(String, String), ulid::Ulid>,
     global: UsageCounters,
     global_shards: Vec<UsageCounters>,
@@ -654,6 +656,7 @@ impl RebuildStatsOperation {
             bucket_groups: HashMap::new(),
             blob_sizes: HashMap::new(),
             pending_sizes: HashMap::new(),
+            charged_archives: HashSet::new(),
             current_versions: HashMap::new(),
             global: UsageCounters::default(),
             global_shards: vec![UsageCounters::default(); GLOBAL_SHARD_COUNT],
@@ -744,6 +747,13 @@ impl RebuildStatsOperation {
                                 .map_or_else(|| shard_for_hash(&hash), |stored| stored.shard)
                         }
                     };
+                    if matches!(location.format.layout, StoredLayout::Pithos(_))
+                        && !self
+                            .charged_archives
+                            .insert(ArchiveKey::of(&location).to_bytes())
+                    {
+                        continue;
+                    }
                     let delta = UsageCounters {
                         stored_blobs: 1,
                         stored_bytes: location.stored_size(),
@@ -2366,7 +2376,6 @@ mod tests {
 
     #[test]
     fn archives_book_once() {
-        use aruna_core::structs::storage::blob::ArchiveKey;
         use aruna_core::structs::storage::encryption::BucketKeyRef;
         use aruna_core::structs::storage::format::PithosLayout;
 
@@ -2410,6 +2419,51 @@ mod tests {
         operation.consume_values(&[version]).unwrap();
         assert_eq!(operation.groups.get(&group_id).unwrap().logical_bytes, 100);
         assert_eq!(operation.orphan_versions, 0);
+    }
+
+    #[test]
+    fn promotion_charges_once() {
+        use aruna_core::structs::storage::blob::BlobLocationKey;
+        use aruna_core::structs::storage::encryption::BucketKeyRef;
+        use aruna_core::structs::storage::format::{EncodingClass, PithosLayout};
+
+        let mut sealed = location(100, false, false);
+        let layout = PithosLayout {
+            stored_size: 130,
+            metadata_digest: [4u8; 32],
+        };
+        sealed.format = StoredFormat::pithos(layout, BucketKeyRef::new(Ulid::generate(), 1));
+        let archive = ArchiveKey::of(&sealed);
+        let mut known = sealed.clone();
+        known.hashes.insert("blake3".to_string(), vec![9u8; 32]);
+        let known_key = BlobLocationKey::new([9u8; 32], EncodingClass::Raw, sealed.backend.clone());
+        let mut operation = RebuildStatsOperation::new();
+        operation.state = RebuildStatsState::ScanBlobs;
+        let row = ByteView::from(known.to_bytes().unwrap());
+        operation
+            .consume_values(&[(ByteView::from(known_key.to_bytes()), row)])
+            .unwrap();
+        operation.state = RebuildStatsState::ScanPending;
+        let row = ByteView::from(sealed.to_bytes().unwrap());
+        operation
+            .consume_values(&[(ByteView::from(archive.to_bytes()), row)])
+            .unwrap();
+        assert_eq!(operation.global.stored_bytes, 130);
+        assert_eq!(operation.global.stored_blobs, 1);
+
+        // A promoted and a still pending alias each count their logical bytes.
+        let group_id = Ulid::generate();
+        operation.bucket_groups.insert("b".to_string(), group_id);
+        operation.state = RebuildStatsState::ScanVersions;
+        let pending =
+            BlobVersion::pending(archive, SystemTime::UNIX_EPOCH, Default::default(), None);
+        let pending_key = VersionKey::new("b", "pending", Ulid::generate());
+        let row = (
+            ByteView::from(pending_key.to_bytes().unwrap()),
+            ByteView::from(pending.to_bytes().unwrap()),
+        );
+        operation.consume_values(&[row]).unwrap();
+        assert_eq!(operation.groups.get(&group_id).unwrap().logical_bytes, 100);
     }
 
     #[test]
