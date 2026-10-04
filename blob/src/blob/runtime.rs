@@ -555,6 +555,9 @@ impl BlobHandler {
             writes_drained: Arc::new(tokio::sync::Notify::new()),
             monitor_cancel: CancellationToken::new(),
             monitor_task: Arc::new(StdMutex::new(None)),
+            unlocks: Arc::new(StdMutex::new(super::unlock::UnlockRegistry::new(
+                super::unlock::UNLOCKED_BUCKETS,
+            ))),
         };
         blob_handler.ensure_multipart_bucket().await?;
         blob_handler.probe_all_backends().await;
@@ -730,15 +733,15 @@ impl BlobHandler {
             }
             BlobEffect::GenerateBucketKey
             | BlobEffect::SealHolderCopies { .. }
-            | BlobEffect::PrepareKey { .. }
+            | BlobEffect::ExtendKey { .. } => {
+                BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Unsupported))
+            }
+            effect @ (BlobEffect::PrepareKey { .. }
             | BlobEffect::ActivateKey { .. }
             | BlobEffect::DiscardKey { .. }
             | BlobEffect::ReadKeyStatus { .. }
-            | BlobEffect::ExtendKey { .. }
             | BlobEffect::LockKey { .. }
-            | BlobEffect::AdmitRead { .. } => {
-                BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Unsupported))
-            }
+            | BlobEffect::AdmitRead { .. }) => self.unlock_effect(effect),
             BlobEffect::OpenConnection { node_id } => Box::pin(self.open_connection(node_id)).await,
             BlobEffect::SendMessage { stream_id, payload } => {
                 self.send_message(stream_id, payload).await

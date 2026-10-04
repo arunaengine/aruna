@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::UserId;
+use crate::compute::SecretBytes;
 use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
@@ -14,8 +15,11 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use ulid::Ulid;
+use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 /// HPKE purpose label of a bucket private key sealed to a user key.
 pub const COPY_PURPOSE: &[u8] = b"aruna bucket key copy v1";
@@ -422,6 +426,22 @@ impl PartialEq for ReadLease {
         (self.key, &self.archive, self.session_id) == (other.key, &other.archive, other.session_id)
             && Arc::ptr_eq(&self.guard, &other.guard)
     }
+}
+
+/// The X25519 public key of a 32-byte private key.
+pub fn public_key_of(private: &SecretBytes) -> Option<[u8; 32]> {
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    if private.expose().len() != bytes.len() {
+        return None;
+    }
+    bytes.copy_from_slice(private.expose());
+    let secret = StaticSecret::from(*bytes);
+    Some(PublicKey::from(&secret).to_bytes())
+}
+
+/// Whether `private` is the X25519 private key of `public`, compared in constant time.
+pub fn key_matches(private: &SecretBytes, public: &[u8; 32]) -> bool {
+    public_key_of(private).is_some_and(|derived| derived.ct_eq(public).into())
 }
 
 /// HPKE info of a copy: the purpose label, then the realm, node, bucket, generation, user and

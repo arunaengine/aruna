@@ -26,6 +26,7 @@ mod registry;
 mod replication;
 mod runtime;
 mod source;
+mod unlock;
 
 pub use group::{BackendClaim, GroupHold};
 pub use registry::{BackendRegistry, NodeBackend};
@@ -87,6 +88,8 @@ pub struct BlobHandler {
     /// with it the storage handle, is released before storage closes.
     monitor_cancel: CancellationToken,
     monitor_task: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Unlocked bucket keys of this node. Memory only, so a restart locks every bucket.
+    unlocks: Arc<StdMutex<unlock::UnlockRegistry>>,
 }
 
 #[derive(Clone, Debug)]
