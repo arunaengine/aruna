@@ -106,6 +106,9 @@ async fn build_response(
             if let Err(reason) = validate_inbound_batch(&records, unix_timestamp_millis()) {
                 return NotificationTransportMessage::Reject(reason);
             }
+            if let Err(reason) = verify_node_origin(&records, peer) {
+                return NotificationTransportMessage::Reject(reason);
+            }
             if let Err(reason) = verify_batch_holder(&records, &realm_config, local_node_id) {
                 return NotificationTransportMessage::Reject(reason);
             }
@@ -287,6 +290,17 @@ async fn build_response(
                 "unexpected notification control message".to_string(),
             )
         }
+    }
+}
+
+/// A restart notice speaks for the node that restarted, so only that node may deliver it.
+fn verify_node_origin(records: &[NotificationRecord], peer: NodeId) -> Result<(), String> {
+    let foreign = records.iter().any(|record| {
+        matches!(&record.kind, NotificationKind::BucketLockedByRestart { node_id, .. } if *node_id != peer)
+    });
+    match foreign {
+        true => Err("restart lock notification from another node".to_string()),
+        false => Ok(()),
     }
 }
 
