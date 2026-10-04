@@ -123,6 +123,16 @@ fn intent_before_activation() {
     let effects = operation.step(Event::Blob(BlobEvent::KeyActivated {
         status: status.clone(),
     }));
+    // The timed lock of this session is armed for the remaining time.
+    let key = lock_timer(&ticket());
+    let arm = TaskEffect::ResetTimer {
+        key: key.clone(),
+        after: Duration::from_secs(60),
+    };
+    assert_eq!(effects.as_slice(), [Effect::Task(arm)]);
+    let after = Duration::from_secs(60);
+    let event = aruna_core::task::TaskEvent::TimerScheduled { key, after };
+    let effects = operation.step(Event::Task(event));
     assert_eq!(audited(&effects).outcome, AuditOutcome::Applied);
     operation.step(Event::Storage(StorageEvent::WriteResult {
         key: Key::from(Vec::new()),

@@ -11,6 +11,7 @@ use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::encryption::{BucketHolder, HolderOrigin, KeyTicket};
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
 use smallvec::smallvec;
@@ -25,6 +26,7 @@ enum LockStep {
     ReadGrant,
     LockKeys,
     WriteAudit,
+    CancelTimers,
     Finish,
     Error,
 }
@@ -78,6 +80,8 @@ pub struct LockBucketOperation {
     step: LockStep,
     bucket_id: Option<Ulid>,
     locked: Vec<KeyTicket>,
+    audited: bool,
+    timers: usize,
     output: Option<Result<LockResult, LockError>>,
 }
 
@@ -88,8 +92,25 @@ impl LockBucketOperation {
             step: LockStep::Init,
             bucket_id: None,
             locked: Vec::new(),
+            audited: false,
+            timers: 0,
             output: None,
         }
+    }
+
+    /// The node's own lock of one timed session, after its deadline passed.
+    pub fn timed(session: KeyTicket, node_id: NodeId) -> Self {
+        let mut operation = Self::new(LockInput {
+            bucket: String::new(),
+            group_id: Ulid::nil(),
+            node_id,
+            caller: None,
+            session: Some(session),
+            admins: BTreeSet::new(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
+        });
+        operation.bucket_id = Some(session.key.bucket_id);
+        operation
     }
 
     fn fail(&mut self, error: impl Into<LockError>) -> Effects {
@@ -176,9 +197,35 @@ impl LockBucketOperation {
         })]
     }
 
+    /// A manual lock ends the timers of the sessions it locked; a timed lock is its own timer.
     fn finish(&mut self, audited: bool) -> Effects {
+        self.audited = audited;
+        let cancels: Effects = match self.input.caller {
+            Some(_) => self
+                .locked
+                .iter()
+                .map(|ticket| {
+                    Effect::Task(TaskEffect::CancelTimer {
+                        key: lock_timer(ticket),
+                    })
+                })
+                .collect(),
+            None => Effects::new(),
+        };
+        if !cancels.is_empty() {
+            self.timers = cancels.len();
+            self.step = LockStep::CancelTimers;
+            return cancels;
+        }
+        self.complete()
+    }
+
+    fn complete(&mut self) -> Effects {
         let locked = std::mem::take(&mut self.locked);
-        self.output = Some(Ok(LockResult { locked, audited }));
+        self.output = Some(Ok(LockResult {
+            locked,
+            audited: self.audited,
+        }));
         self.step = LockStep::Finish;
         smallvec![]
     }
@@ -189,6 +236,9 @@ impl Operation for LockBucketOperation {
     type Error = LockError;
 
     fn start(&mut self) -> Effects {
+        if self.input.caller.is_none() && self.bucket_id.is_some() {
+            return self.lock();
+        }
         self.step = LockStep::ReadBucket;
         smallvec![settings_read(&self.input.bucket, None)]
     }
@@ -219,6 +269,14 @@ impl Operation for LockBucketOperation {
             (LockStep::LockKeys, Event::Blob(BlobEvent::KeyLocked { locked })) => {
                 self.audit(locked)
             }
+            // A timer that cannot be cancelled fires later and finds its session gone.
+            (LockStep::CancelTimers, Event::Task(_)) => {
+                self.timers = self.timers.saturating_sub(1);
+                match self.timers {
+                    0 => self.complete(),
+                    _ => smallvec![],
+                }
+            }
             (LockStep::Finish | LockStep::Error, _) => smallvec![],
             (_, Event::Blob(BlobEvent::Error(error))) => self.fail(error),
             (state, received) => self.fail(LockError::InvalidStateEvent {
@@ -239,6 +297,15 @@ impl Operation for LockBucketOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+/// The in-memory timer of one unlock session.
+pub fn lock_timer(ticket: &KeyTicket) -> TaskKey {
+    TaskKey::LockBucket {
+        bucket_id: ticket.key.bucket_id,
+        generation: ticket.key.generation,
+        session_id: ticket.session_id,
     }
 }
 
@@ -334,10 +401,25 @@ mod tests {
                 .iter()
                 .all(|record| record.action == AuditAction::Lock)
         );
-        // A failed audit write leaves the lock in place.
-        operation.step(Event::Storage(StorageEvent::Error {
+        // A failed audit write leaves the lock in place; the sessions' timers end.
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
             error: StorageError::Timeout,
         }));
+        let cancels: Vec<_> = locked
+            .iter()
+            .map(|ticket| {
+                Effect::Task(TaskEffect::CancelTimer {
+                    key: lock_timer(ticket),
+                })
+            })
+            .collect();
+        assert_eq!(effects.into_vec(), cancels);
+        for ticket in &locked {
+            let key = lock_timer(ticket);
+            operation.step(Event::Task(aruna_core::task::TaskEvent::TimerCancelled {
+                key,
+            }));
+        }
         assert_eq!(
             operation.finalize(),
             Ok(LockResult {
@@ -349,7 +431,10 @@ mod tests {
 
     #[test]
     fn timed_lock_names_session() {
-        let (mut operation, effects) = read(None, Some(ticket(2)));
+        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let mut operation = LockBucketOperation::timed(ticket(2), node);
+        // The node locks by session alone, without reading the bucket.
+        let effects = operation.start();
         let lock = BlobEffect::LockKey {
             bucket_id: BUCKET_ID,
             session: Some(ticket(2)),

@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::s3::bucket::key_lock::lock_timer;
 use crate::s3::bucket::key_rows::{SettingsError, parse_settings, settings_read};
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -15,6 +16,7 @@ use aruna_core::structs::storage::encryption::{
     UnlockStatus,
 };
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
+use aruna_core::task::TaskEffect;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use aruna_core::{NodeId, UserId};
 use smallvec::smallvec;
@@ -33,6 +35,7 @@ enum UnlockStep {
     WriteIntent,
     CommitIntent,
     ActivateKey,
+    ArmTimer,
     DiscardKey,
     WriteOutcome,
     Finish,
@@ -88,6 +91,7 @@ pub struct UnlockBucketOperation {
     ticket: Option<KeyTicket>,
     intent: Option<BucketAuditRecord>,
     failure: Option<UnlockError>,
+    activated: Option<UnlockStatus>,
     output: Option<Result<UnlockStatus, UnlockError>>,
 }
 
@@ -104,6 +108,7 @@ impl UnlockBucketOperation {
             ticket: None,
             intent: None,
             failure: None,
+            activated: None,
             output: None,
         }
     }
@@ -302,9 +307,24 @@ impl Operation for UnlockBucketOperation {
                     .ticket
                     .is_some_and(|ticket| ticket.session_id == status.session_id) =>
             {
-                self.ticket = None;
-                self.write_outcome(Ok(status))
+                let Some(ticket) = self.ticket.take() else {
+                    return self.fail(UnlockError::NotFinished);
+                };
+                let Some(after) = status.remaining else {
+                    return self.write_outcome(Ok(status));
+                };
+                // The registry closes admission at the deadline; the timer records the lock.
+                self.activated = Some(status);
+                self.step = UnlockStep::ArmTimer;
+                smallvec![Effect::Task(TaskEffect::ResetTimer {
+                    key: lock_timer(&ticket),
+                    after,
+                })]
             }
+            (UnlockStep::ArmTimer, Event::Task(_)) => match self.activated.take() {
+                Some(status) => self.write_outcome(Ok(status)),
+                None => self.fail(UnlockError::NotFinished),
+            },
             // A failed activation discards the prepared key; the intent stays unconfirmed.
             (UnlockStep::ActivateKey, Event::Blob(BlobEvent::Error(error))) => {
                 let Some(ticket) = self.ticket.take() else {

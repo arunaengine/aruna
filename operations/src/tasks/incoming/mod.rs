@@ -105,6 +105,7 @@ use crate::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
 };
 use crate::replication::queue::{REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer};
+use crate::s3::bucket::key_lock::LockBucketOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::sync::document_outbox::{
     OUTBOX_DRAIN_SIZE, read_outbox_records, read_outbox_tails, restore_outbox_timers,
@@ -119,6 +120,7 @@ use crate::tasks::queue_backoff::{retry_after_ms, retry_delay_ms};
 use crate::tasks::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_task_timers,
 };
+use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
 
 mod outbox;
 mod restore;
@@ -815,6 +817,22 @@ impl OperationsTaskHandler {
             }),
             TaskKey::RefreshBlobHolders => Box::pin(async move {
                 self.refresh_blob_holders().await;
+            }),
+            TaskKey::LockBucket {
+                bucket_id,
+                generation,
+                session_id,
+            } => Box::pin(async move {
+                let key = BucketKeyRef::new(bucket_id, generation);
+                let ticket = KeyTicket { key, session_id };
+                let Some(net_handle) = self.context.net_handle.as_ref() else {
+                    warn!("Cannot record a timed bucket lock without net handle");
+                    return;
+                };
+                let operation = LockBucketOperation::timed(ticket, net_handle.node_id());
+                if let Err(error) = drive(operation, &self.context).await {
+                    warn!(error = %error, "Timed bucket lock failed");
+                }
             }),
             TaskKey::DrainFamilyOutbox => Box::pin(async move {
                 self.drain_family_outbox().await;
