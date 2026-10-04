@@ -15,7 +15,7 @@ use crate::structs::execution::staging::VersionSourceBinding;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
-use crate::structs::storage::encryption::BucketEncryption;
+use crate::structs::storage::encryption::{BucketEncryption, SealPlan};
 use crate::structs::storage::format::{Compression, EncodingClass, StoredFormat, StoredLayout};
 use crate::structs::storage::group_backend::GroupBackendKind;
 use crate::structs::storage::routing::StorageRoutingRule;
@@ -194,6 +194,8 @@ pub struct ResolvedBackend {
     pub storage_class: Option<String>,
     /// The bucket's compression at resolution time; parts and hidden blobs ignore it.
     pub compression: Compression,
+    /// The bucket's seal plan at resolution time; `None` stores plain bytes.
+    pub encryption: Option<SealPlan>,
 }
 
 impl ResolvedBackend {
@@ -202,11 +204,17 @@ impl ResolvedBackend {
             backend,
             storage_class,
             compression: Compression::Off,
+            encryption: None,
         }
     }
 
     pub fn with_compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
+        self
+    }
+
+    pub fn with_encryption(mut self, plan: Option<SealPlan>) -> Self {
+        self.encryption = plan;
         self
     }
 

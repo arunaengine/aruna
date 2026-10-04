@@ -9,7 +9,8 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::storage::blob::ResolvedBackend;
-use aruna_core::structs::storage::format::{Compression, PithosLayout, StoredLayout};
+use aruna_core::structs::storage::encryption::BucketKeyRef;
+use aruna_core::structs::storage::format::{Compression, PithosLayout, StoredFormat};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use opendal::Operator;
@@ -157,10 +158,12 @@ async fn refuses_unkeyed_reads() {
     let BlobEvent::WriteFinished { mut location } = written else {
         panic!("write failed: {written:?}")
     };
-    location.format.layout = StoredLayout::Pithos(Box::new(PithosLayout {
+    let layout = PithosLayout {
         stored_size: 12,
         metadata_digest: [3; 32],
-    }));
+    };
+    let key = BucketKeyRef::new(ulid::Ulid::from_bytes([4; 16]), 1);
+    location.format = StoredFormat::pithos(layout, key);
 
     let whole = handler.read_blob(location.clone()).await;
     assert!(matches!(whole, BlobEvent::Error(BlobError::ReadError(_))));

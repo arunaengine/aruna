@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     Blob(BlobEvent),
     StagingSource(StagingSourceEvent),

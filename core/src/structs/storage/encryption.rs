@@ -125,6 +125,58 @@ impl BucketEncryption {
     }
 }
 
+/// How an encrypting write seals, captured from the bucket when the write is resolved.
+/// It holds public material only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SealPlan {
+    pub key: BucketKeyRef,
+    pub public_key: [u8; 32],
+    pub cipher: BlockCipher,
+    pub block_keys: BlockKeys,
+    /// The bucket's storage generation when the plan was captured.
+    pub storage_generation: u64,
+}
+
+impl SealPlan {
+    /// The plan of new writes to a bucket with `settings`, sealing to its active `record`.
+    /// A plain bucket has none.
+    pub fn capture(
+        settings: &BucketEncryption,
+        record: &BucketKeyRecord,
+    ) -> Result<Option<Self>, BucketKeyError> {
+        if !settings.is_encrypted() {
+            return Ok(None);
+        }
+        let active = settings.active_key().ok_or(BucketKeyError::Unsupported)?;
+        if record.key != active || record.state != KeyState::Active {
+            return Err(BucketKeyError::StaleGeneration {
+                requested: record.key.generation,
+                current: active.generation,
+            });
+        }
+        Ok(Some(Self {
+            key: active,
+            public_key: record.public_key,
+            cipher: settings.cipher,
+            block_keys: settings.block_keys,
+            storage_generation: settings.storage_generation,
+        }))
+    }
+
+    /// Fails when the bucket moved to another key or stored format since the plan was taken.
+    pub fn still_current(&self, settings: &BucketEncryption) -> Result<(), BucketKeyError> {
+        let (requested, current) = if settings.active_key() != Some(self.key) {
+            (self.key.generation, settings.key_generation)
+        } else {
+            (self.storage_generation, settings.storage_generation)
+        };
+        match requested == current {
+            true => Ok(()),
+            false => Err(BucketKeyError::StaleGeneration { requested, current }),
+        }
+    }
+}
+
 /// Lifecycle of one key generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum KeyState {
@@ -378,6 +430,34 @@ mod tests {
         assert_eq!(settings.active_key(), Some(active));
         settings.mode = EncryptionMode::Off;
         assert_eq!(settings.active_key(), None);
+    }
+
+    #[test]
+    fn plans_follow_settings() {
+        let mut settings = BucketEncryption::default();
+        let key = BucketKeyRef::new(Ulid::from_bytes([2; 16]), 1);
+        let record = BucketKeyRecord::new(key, Ulid::from_bytes([3; 16]), [4; 32], 5);
+        assert_eq!(SealPlan::capture(&settings, &record), Ok(None));
+
+        settings.mode = EncryptionMode::NodeManaged;
+        settings.bucket_id = Some(key.bucket_id);
+        settings.key_generation = 1;
+        settings.cipher = BlockCipher::Aes256Gcm;
+        settings.storage_generation = 6;
+        let plan = SealPlan::capture(&settings, &record).unwrap().unwrap();
+        assert_eq!((plan.key, plan.public_key), (key, [4; 32]));
+        assert_eq!(plan.cipher, BlockCipher::Aes256Gcm);
+        plan.still_current(&settings).unwrap();
+
+        let mut retiring = record.clone();
+        retiring.state = KeyState::Retiring;
+        assert!(SealPlan::capture(&settings, &retiring).is_err());
+        settings.storage_generation = 7;
+        assert!(plan.still_current(&settings).is_err());
+        settings.storage_generation = 6;
+        settings.key_generation = 2;
+        assert!(plan.still_current(&settings).is_err());
+        assert!(SealPlan::capture(&settings, &record).is_err());
     }
 
     #[test]

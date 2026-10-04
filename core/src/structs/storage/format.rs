@@ -4,14 +4,47 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::errors::ConversionError;
-use serde::{Deserialize, Serialize};
+use crate::structs::storage::encryption::BucketKeyRef;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// How one copy stores its bytes. Its raw default encodes like the two `false`
-/// flags it replaced, so older location rows decode unchanged.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// flags it replaced, so older location rows decode unchanged. Only valid pairs of layout and
+/// encryption encode or decode.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StoredFormat {
     pub layout: StoredLayout,
     pub encryption: StoredEncryption,
+}
+
+/// The encoded shape of a stored format.
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "StoredFormat")]
+struct FormatParts<L, E> {
+    layout: L,
+    encryption: E,
+}
+
+impl Serialize for StoredFormat {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.checked().map_err(serde::ser::Error::custom)?;
+        let parts = FormatParts {
+            layout: &self.layout,
+            encryption: &self.encryption,
+        };
+        parts.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StoredFormat {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let parts = FormatParts::<StoredLayout, StoredEncryption>::deserialize(deserializer)?;
+        let format = Self {
+            layout: parts.layout,
+            encryption: parts.encryption,
+        };
+        format.checked().map_err(serde::de::Error::custom)?;
+        Ok(format)
+    }
 }
 
 /// Arrangement of the stored bytes.
@@ -70,14 +103,43 @@ impl Compression {
     }
 }
 
-/// Encryption of the stored bytes. No variant encrypts yet.
+/// Encryption of the stored bytes.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum StoredEncryption {
     #[default]
     None,
+    /// The piece keys of a Pithos archive are granted to this bucket key generation.
+    Pithos(Box<BucketKeyRef>),
 }
 
 impl StoredFormat {
+    /// A Pithos archive of a bucket key generation.
+    pub fn pithos(layout: PithosLayout, key: BucketKeyRef) -> Self {
+        Self {
+            layout: StoredLayout::Pithos(Box::new(layout)),
+            encryption: StoredEncryption::Pithos(Box::new(key)),
+        }
+    }
+
+    /// Raw bytes and frames are plain; a Pithos archive always names its key generation.
+    pub fn checked(&self) -> Result<(), ConversionError> {
+        match (&self.layout, &self.encryption) {
+            (StoredLayout::Raw | StoredLayout::Frames(_), StoredEncryption::None)
+            | (StoredLayout::Pithos(_), StoredEncryption::Pithos(_)) => Ok(()),
+            _ => Err(ConversionError::InvalidLength(
+                "stored layout and encryption do not match".to_string(),
+            )),
+        }
+    }
+
+    /// The key generation an encrypted copy needs; `None` for plain copies.
+    pub fn bucket_key(&self) -> Option<BucketKeyRef> {
+        match &self.encryption {
+            StoredEncryption::Pithos(key) => Some(**key),
+            StoredEncryption::None => None,
+        }
+    }
+
     /// The class this copy shares physical bytes within.
     pub fn encoding(&self) -> EncodingClass {
         match &self.layout {
@@ -211,9 +273,13 @@ impl CompressionMigration {
 
 #[cfg(test)]
 mod tests {
-    use super::{Compression, EncodingClass, StoredFormat};
+    use super::{
+        Compression, EncodingClass, FormatParts, PithosLayout, StoredEncryption, StoredFormat,
+        StoredLayout,
+    };
     use crate::structs::storage::blob::{BackendRef, BlobLocationKey};
     use crate::structs::storage::cleanup::ReclaimCandidateKey;
+    use crate::structs::storage::encryption::BucketKeyRef;
 
     #[test]
     fn classes_split_keys() {
@@ -255,6 +321,40 @@ mod tests {
         assert!(Compression::Zstd { level: 23 }.checked().is_err());
         assert!(Compression::Zstd { level: 19 }.checked().is_ok());
         assert!(Compression::Off.checked().is_ok());
+    }
+
+    #[test]
+    fn pairs_are_checked() {
+        let key = BucketKeyRef::new(ulid::Ulid::from_bytes([1; 16]), 2);
+        let layout = PithosLayout {
+            stored_size: 9,
+            metadata_digest: [3; 32],
+        };
+        let sealed = StoredFormat::pithos(layout.clone(), key);
+        let bytes = postcard::to_allocvec(&sealed).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<StoredFormat>(&bytes).unwrap(),
+            sealed
+        );
+        assert_eq!(sealed.bucket_key(), Some(key));
+
+        let unkeyed = StoredFormat {
+            layout: StoredLayout::Pithos(Box::new(layout)),
+            encryption: StoredEncryption::None,
+        };
+        let plain_keyed = StoredFormat {
+            layout: StoredLayout::Raw,
+            encryption: StoredEncryption::Pithos(Box::new(key)),
+        };
+        for format in [unkeyed, plain_keyed] {
+            assert!(postcard::to_allocvec(&format).is_err());
+            let parts = FormatParts {
+                layout: &format.layout,
+                encryption: &format.encryption,
+            };
+            let bytes = postcard::to_allocvec(&parts).unwrap();
+            assert!(postcard::from_bytes::<StoredFormat>(&bytes).is_err());
+        }
     }
 
     #[test]
