@@ -578,3 +578,7 @@ pub async fn promote_unlocked(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "promote_tests.rs"]
+mod tests;
