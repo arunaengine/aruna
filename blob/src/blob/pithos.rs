@@ -19,8 +19,8 @@ use futures::{Stream, StreamExt};
 use opendal::Operator;
 use pithos_lib::archive::{
     AccessKeys, ArchivePath, AsyncArchive, BlockKeyMode, BlockingHook, CdcConfig, Chunking,
-    Composition, EntryKind, EntryMetadata, OpenLimits, OpenOptions, PayloadCipher, Piece,
-    PieceEncoder, ProcessingOptions, compose,
+    Composition, EntryKind, EntryMetadata, NoExternalBlocks, OpenLimits, OpenOptions,
+    PayloadCipher, Piece, PieceEncoder, ProcessingOptions, compose,
 };
 use pithos_lib::crypto::{PrivateKey, PublicKey};
 use pithos_lib::error::PithosError;
@@ -126,6 +126,24 @@ pub async fn read(
     range: Range<u64>,
     idle: Duration,
 ) -> Result<impl Stream<Item = Result<Bytes, BlobError>> + Send + 'static, BlobError> {
+    let archive = open(operator, path, layout, keys, idle).await?;
+    let stream = archive
+        .read_range_owned(OBJECT_PATH, range)
+        .map_err(blob_error)?;
+    Ok(stream.map(|chunk| chunk.map(Bytes::from).map_err(blob_error)))
+}
+
+/// An opened Aruna archive whose single file reads with the granted keys.
+type OpenArchive = Arc<AsyncArchive<StoredArchive, NoExternalBlocks, TokioBlocking>>;
+
+/// Opens the copy at `path` within the Aruna limits and checks its single-file shape.
+async fn open(
+    operator: Operator,
+    path: String,
+    layout: &PithosLayout,
+    keys: AccessKeys,
+    idle: Duration,
+) -> Result<OpenArchive, BlobError> {
     let source = StoredArchive {
         operator,
         path,
@@ -154,10 +172,41 @@ pub async fn read(
         let message = "a Pithos copy must hold exactly one file named object";
         return Err(BlobError::IntegrityCheckFailed(message.to_string()));
     }
-    let stream = Arc::new(archive)
-        .read_range_owned(OBJECT_PATH, range)
-        .map_err(blob_error)?;
-    Ok(stream.map(|chunk| chunk.map(Bytes::from).map_err(blob_error)))
+    Ok(Arc::new(archive))
+}
+
+/// Plaintext of a sealed copy by offset, for an authorized remote read. It keeps the lease,
+/// so the key and the archive stay in use until the transfer ends.
+pub(super) struct SealedReader {
+    archive: OpenArchive,
+    size: u64,
+    _lease: ReadLease,
+}
+
+impl iroh_io::AsyncSliceReader for SealedReader {
+    async fn read_at(&mut self, offset: u64, len: usize) -> std::io::Result<Bytes> {
+        let len = len.min(self.size.saturating_sub(offset) as usize);
+        self.read_exact_at(offset, len).await
+    }
+
+    async fn read_exact_at(&mut self, offset: u64, len: usize) -> std::io::Result<Bytes> {
+        let end = offset
+            .checked_add(len as u64)
+            .filter(|end| *end <= self.size)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+        let mut stream = Arc::clone(&self.archive)
+            .read_range_owned(OBJECT_PATH, offset..end)
+            .map_err(std::io::Error::other)?;
+        let mut out = BytesMut::with_capacity(len);
+        while let Some(chunk) = stream.next().await {
+            out.extend_from_slice(&chunk.map_err(std::io::Error::other)?);
+        }
+        Ok(out.freeze())
+    }
+
+    async fn size(&mut self) -> std::io::Result<u64> {
+        Ok(self.size)
+    }
 }
 
 /// Seals original bytes into one Pithos archive while a write streams them to the backend.
@@ -357,6 +406,26 @@ impl BlobHandler {
             _lease: lease,
         };
         Ok((BackendStream::new(blob), size))
+    }
+
+    /// A slice reader over the plaintext of the sealed copy at `location`, under `lease`.
+    pub(super) async fn sealed_reader(
+        &self,
+        location: &BackendLocation,
+        lease: ReadLease,
+    ) -> Result<SealedReader, BlobError> {
+        let StoredLayout::Pithos(layout) = &location.format.layout else {
+            return Err(BlobError::ReadError("not a Pithos copy".to_string()));
+        };
+        let keys = self.sealed_keys(location, &lease)?;
+        let operator = self.operator_from_location(location)?;
+        let path = location.get_storage_path()?;
+        let archive = open(operator, path, layout, keys, self.transfer_idle_timeout()).await?;
+        Ok(SealedReader {
+            archive,
+            size: location.blob_size,
+            _lease: lease,
+        })
     }
 
     /// The key of a sealed copy, only through a lease admitted for exactly this archive. A lock

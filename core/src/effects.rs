@@ -283,6 +283,14 @@ pub enum BlobEffect {
         range: Option<Range<u64>>,
         lease: ReadLease,
     },
+    /// Serves the plaintext of the sealed copy at `location` to an authorized remote reader
+    /// under `lease`. Replication of sealed copies stays refused.
+    ServeSealedRead {
+        stream_id: Ulid,
+        location: BackendLocation,
+        expected_blake3: [u8; 32],
+        lease: ReadLease,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -210,10 +210,12 @@ impl AsyncSliceReader for FrameReader {
     }
 }
 
-/// Source of a bao transfer: the stored bytes of a raw copy, or decoded frames.
+/// Source of a bao transfer: the stored bytes of a raw copy, decoded frames, or the plaintext
+/// of a sealed copy under a read lease.
 pub(super) enum SliceReader {
     Raw(OpenDalReader),
     Framed(FrameReader),
+    Sealed(super::pithos::SealedReader),
 }
 
 impl AsyncSliceReader for SliceReader {
@@ -221,6 +223,7 @@ impl AsyncSliceReader for SliceReader {
         match self {
             Self::Raw(reader) => reader.read_at(offset, len).await,
             Self::Framed(reader) => reader.read_at(offset, len).await,
+            Self::Sealed(reader) => reader.read_at(offset, len).await,
         }
     }
 
@@ -228,6 +231,7 @@ impl AsyncSliceReader for SliceReader {
         match self {
             Self::Raw(reader) => reader.read_exact_at(offset, len).await,
             Self::Framed(reader) => reader.read_exact_at(offset, len).await,
+            Self::Sealed(reader) => reader.read_exact_at(offset, len).await,
         }
     }
 
@@ -235,6 +239,7 @@ impl AsyncSliceReader for SliceReader {
         match self {
             Self::Raw(reader) => reader.size().await,
             Self::Framed(reader) => reader.size().await,
+            Self::Sealed(reader) => reader.size().await,
         }
     }
 }

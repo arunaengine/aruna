@@ -109,6 +109,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::ComposePieces { .. } => (EffectClass::Transfer, "compose_pieces"),
         BlobEffect::HashArchive { .. } => (EffectClass::Transfer, "hash_archive"),
         BlobEffect::ReadSealed { .. } => (EffectClass::Read, "read_sealed"),
+        BlobEffect::ServeSealedRead { .. } => (EffectClass::Transfer, "serve_sealed_read"),
     }
 }
 
@@ -826,6 +827,15 @@ impl BlobHandler {
                 range,
                 lease,
             } => Box::pin(self.read_sealed(location, range, lease)).await,
+            BlobEffect::ServeSealedRead {
+                stream_id,
+                location,
+                expected_blake3,
+                lease,
+            } => {
+                let serve = self.serve_sealed_read(stream_id, location, expected_blake3, lease);
+                Box::pin(serve).await
+            }
             BlobEffect::OpenConnection { node_id } => Box::pin(self.open_connection(node_id)).await,
             BlobEffect::SendMessage { stream_id, payload } => {
                 self.send_message(stream_id, payload).await

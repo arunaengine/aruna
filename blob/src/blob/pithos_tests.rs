@@ -826,3 +826,79 @@ async fn declared_size_chunks() {
     );
     assert!(*last <= chunk, "{sizes:?}");
 }
+
+#[tokio::test]
+async fn serves_leased_plaintext() {
+    use crate::blob::BAO_BLOCK_SIZE;
+    use aruna_core::compute::{SecretBytes, SharedSecret};
+    use aruna_core::effects::BlobEffect;
+    use aruna_core::structs::storage::blob::ArchiveKey;
+    use bao_tree::io::fsm::CreateOutboard;
+    use bao_tree::io::outboard::PreOrderOutboard;
+    use iroh_io::AsyncSliceReader;
+
+    let bucket = PrivateKey::from_raw(zeroize::Zeroizing::new([5; 32]));
+    let seal = plan(
+        &bucket,
+        BlockCipher::ChaCha20Poly1305,
+        BlockKeys::ContentDerived,
+    );
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let data = content(300_000);
+    let backend = ResolvedBackend::node_default().with_encryption(Some(seal));
+    let written = handler
+        .write_blob(
+            "bucket",
+            "sealed.bin",
+            backend,
+            test_user_id(),
+            stream_from_bytes(&data),
+        )
+        .await;
+    let BlobEvent::WriteFinished { location } = written else {
+        panic!("write failed: {written:?}")
+    };
+
+    // Replication never carries a sealed copy, unlocked or not.
+    let replicated = handler
+        .replicate_blob(
+            ulid::Ulid::generate(),
+            ulid::Ulid::generate(),
+            location.clone(),
+            false,
+        )
+        .await;
+    assert!(matches!(
+        replicated,
+        BlobEvent::Error(BlobError::ReadError(_))
+    ));
+
+    let prepare = BlobEffect::PrepareKey {
+        key: seal.key,
+        public_key: seal.public_key,
+        private_key: SharedSecret::new(SecretBytes::new(vec![5; 32])),
+        duration: None,
+        max: None,
+    };
+    let BlobEvent::KeyPrepared { ticket } = handler.unlock_effect(prepare) else {
+        panic!("prepare failed")
+    };
+    handler.unlock_effect(BlobEffect::ActivateKey { ticket });
+    let BlobEvent::ReadAdmitted { lease } = handler
+        .admit_read(seal.key, ArchiveKey::of(&location))
+        .await
+    else {
+        panic!("admission failed")
+    };
+
+    // The authorized reader gets the plaintext, and its bao root is the content address.
+    let mut reader = handler.sealed_reader(&location, lease).await.unwrap();
+    assert_eq!(reader.size().await.unwrap(), data.len() as u64);
+    let part = reader.read_exact_at(1_000, 8_000).await.unwrap();
+    assert!(part == data[1_000..9_000]);
+    let outboard = PreOrderOutboard::<bytes::BytesMut>::create(&mut reader, BAO_BLOCK_SIZE)
+        .await
+        .unwrap();
+    assert_eq!(outboard.root, blake3::hash(&data));
+}

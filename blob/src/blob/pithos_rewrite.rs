@@ -6,6 +6,7 @@
 use super::BlobHandler;
 use super::backend::build_backend_path;
 use super::frames::read_range;
+use super::unlock::LeaseGuard;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::BackendStream;
@@ -136,13 +137,11 @@ impl BlobHandler {
         lease: Option<&ReadLease>,
     ) -> Result<AccessKeys, BlobError> {
         let key = (source.format.bucket_key()).ok_or_else(super::pithos::needs_bucket_key)?;
-        let admitted =
-            lease.is_some_and(|lease| lease.key == key && lease.archive == ArchiveKey::of(source));
-        let unlocked = match self.unlocks.lock() {
-            Ok(mut registry) if admitted => registry.unlocked_key(key, Instant::now()),
-            _ => Err(BucketKeyError::Locked(key.bucket_id)),
-        };
-        let (secret, _) = unlocked?;
+        // The lease keeps its own key, so a lock after admission does not stop this rewrite.
+        let secret = lease
+            .filter(|lease| lease.key == key && lease.archive == ArchiveKey::of(source))
+            .and_then(LeaseGuard::secret)
+            .ok_or(BucketKeyError::Locked(key.bucket_id))?;
         let bytes = secret.bytes().expose();
         if bytes.len() != 32 {
             return Err(BucketKeyError::WrongKey.into());
