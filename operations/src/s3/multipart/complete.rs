@@ -5,7 +5,7 @@
 use crate::blob::cleanup::schedule_cleanup_effect;
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
-    HeadAliasContext, add_index_effect, blob_location_read, write_head_effect,
+    HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,
     write_location_effect, write_version_effect,
 };
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
@@ -21,15 +21,16 @@ use crate::replication::queue::build_live_obligation;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup, delete_records_effect};
-use aruna_blob::hash::Hasher;
+use aruna_blob::hash::{Hasher, combine_crcs};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, OBJECT_METADATA_KEYSPACE,
-    S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE, PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+    UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
@@ -38,9 +39,11 @@ use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-    CopyOrigin, CurrentVersionPointer, ResolvedBackend, VersionKey, WriteOwner,
+    ArchiveKey, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
+    BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend, VersionKey,
+    WriteOwner,
 };
+use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError};
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
@@ -70,6 +73,7 @@ pub enum CompleteUploadState {
     StartFinalizeTransaction,
     CheckPurgeFinalize,
     ReadBucketDefault,
+    CheckSealSettings,
     FenceBackend,
     CheckHashLookup,
     WriteBlobLocation,
@@ -78,6 +82,7 @@ pub enum CompleteUploadState {
     WriteBlobHead,
     WritePathIndex,
     WriteVersionRecord,
+    WriteCopyOwner,
     RegisterManagedCopy,
     WriteObjectMetadata,
     DeleteUploadRecords,
@@ -160,6 +165,8 @@ pub enum CompleteUploadError {
     CompleteUploadFailed,
     #[error("operation did not finish")]
     NotFinished,
+    #[error(transparent)]
+    BucketKey(#[from] BucketKeyError),
 }
 
 impl From<UploadTargetError> for CompleteUploadError {
@@ -875,6 +882,24 @@ impl CompleteUploadOperation {
         let Some(upload) = self.upload_record.as_ref() else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
+        if let Some(encryption) = upload.encryption {
+            // Sealed pieces compose without a key; the adapter checks every record.
+            if self.resolved_parts.iter().any(|part| part.piece.is_none()) {
+                return self.schedule_error(CompleteUploadError::InvalidPart);
+            }
+            let resolved =
+                ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone())
+                    .with_compression(encryption.compression)
+                    .with_encryption(Some(encryption.plan));
+            self.state = CompleteUploadState::ComposeBlob;
+            return smallvec![Effect::Blob(BlobEffect::ComposePieces {
+                bucket: self.input.bucket.clone(),
+                key: self.input.key.clone(),
+                resolved,
+                created_by: self.input.created_by,
+                parts: self.resolved_parts.clone(),
+            })];
+        }
         if let Some(backend_upload) = upload.backend_upload.clone() {
             self.state = CompleteUploadState::ComposeBlob;
             return smallvec![Effect::Blob(BlobEffect::CompleteUpload {
@@ -907,7 +932,7 @@ impl CompleteUploadOperation {
     }
 
     fn handle_blob_composed(&mut self, event: Event) -> Effects {
-        let location = match event {
+        let mut location = match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
             Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
                 self.cleanup.set_release(location.ulid);
@@ -922,6 +947,14 @@ impl CompleteUploadOperation {
         // a retry and discards it once the upload record is gone.
         if self.compression != Compression::Off && self.in_place_target(&location) {
             return self.compose_parts(vec![location]);
+        }
+        // A sealed object has no full-object digest; its CRCs combine from the parts.
+        if location.format.bucket_key().is_some() {
+            let parts = self.resolved_parts.iter();
+            let parts = parts.map(|part| (&part.location.hashes, part.location.blob_size));
+            location
+                .hashes
+                .extend(combine_crcs(parts).unwrap_or_default());
         }
         self.composed_location = Some(location.clone());
         self.final_location = None;
@@ -993,6 +1026,15 @@ impl CompleteUploadOperation {
         let Some(location) = self.composed_location.clone() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
+        // A sealed copy must still match the bucket's seal plan instead.
+        if location.format.bucket_key().is_some() {
+            self.state = CompleteUploadState::CheckSealSettings;
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                key: self.input.bucket.as_bytes().into(),
+                txn_id: self.txn_id,
+            })];
+        }
         // A copy encoded under an older setting is never published: the bucket's
         // migration may already have passed this key.
         if bucket.as_ref().is_some_and(|bucket| {
@@ -1000,6 +1042,31 @@ impl CompleteUploadOperation {
         }) {
             return self.schedule_error(StorageError::TransactionConflict.into());
         }
+        self.fence_composed(&location)
+    }
+
+    /// A rotation or mode change since the upload started never publishes its old plan.
+    fn seal_settings_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        let plan = self
+            .upload_record
+            .as_ref()
+            .and_then(|upload| upload.encryption);
+        let (Some(encryption), Some(location)) = (plan, self.composed_location.clone()) else {
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
+        };
+        let current = BucketEncryption::from_row(value.as_deref())
+            .map_err(CompleteUploadError::from)
+            .and_then(|settings| Ok(encryption.plan.still_current(&settings)?));
+        match current {
+            Ok(()) => self.fence_composed(&location),
+            Err(error) => self.schedule_error(error),
+        }
+    }
+
+    fn fence_composed(&mut self, location: &BackendLocation) -> Effects {
         // The compose already ran on the pinned backend, so the finalize must
         // prove it is still enabled or roll the composed object back.
         match fence_backend(&location.backend, self.txn_id) {
@@ -1023,7 +1090,7 @@ impl CompleteUploadOperation {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let Some(blake3_hash) = location.get_blake3() else {
-            return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
+            return self.write_pending_location(location);
         };
         // Only the copy on the upload's pinned backend may be deduplicated.
         let key = match BlobLocationKey::from_blake3(
@@ -1036,6 +1103,28 @@ impl CompleteUploadOperation {
         };
         self.state = CompleteUploadState::CheckHashLookup;
         smallvec![blob_location_read(&key, self.txn_id)]
+    }
+
+    /// A sealed archive whose trees did not line up publishes without a content hash: its
+    /// location waits in `pending_locations` until a verified read records the hash.
+    fn write_pending_location(&mut self, location: BackendLocation) -> Effects {
+        if location.format.bucket_key().is_none() {
+            return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
+        }
+        let value = match location.to_bytes() {
+            Ok(value) => value,
+            Err(err) => return self.schedule_error(err.into()),
+        };
+        let key = ArchiveKey::of(&location).to_bytes();
+        self.new_blob = true;
+        self.final_location = Some(location);
+        self.state = CompleteUploadState::WriteBlobLocation;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: PENDING_LOCATION_KEYSPACE.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: self.txn_id,
+        })]
     }
 
     fn hash_checked(&mut self, event: Event) -> Effects {
@@ -1181,8 +1270,9 @@ impl CompleteUploadOperation {
         let Some(location) = self.final_location.clone() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
+        // A pending archive has no content hash to index yet.
         let Some(blake3_hash) = location.get_blake3() else {
-            return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
+            return self.write_version();
         };
         let alias_context = match self.alias_context() {
             Ok(context) => context,
@@ -1216,15 +1306,15 @@ impl CompleteUploadOperation {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
+        self.write_version()
+    }
 
+    fn write_version(&mut self) -> Effects {
         let Some(location) = self.final_location.clone() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let Some(version_id) = self.version_id else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
-        };
-        let Some(blake3_hash) = location.get_blake3() else {
-            return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
         };
         let created_at = self
             .version_created_at
@@ -1233,19 +1323,25 @@ impl CompleteUploadOperation {
         let Some(upload_record) = self.upload_record.as_ref() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
-        let version = BlobVersion::materialized(
-            match blake3_hash.try_into() {
-                Ok(hash) => hash,
-                Err(err) => {
-                    return self.schedule_error(CompleteUploadError::ConversionError(err.into()));
-                }
-            },
-            location.backend.clone(),
-            location.format.encoding(),
-            created_at,
-            self.input.created_by,
-            None,
-        )
+        let version = match location.get_blake3().map(<[u8; 32]>::try_from) {
+            Some(Ok(hash)) => BlobVersion::materialized(
+                hash,
+                location.backend.clone(),
+                location.format.encoding(),
+                created_at,
+                self.input.created_by,
+                None,
+            ),
+            Some(Err(err)) => {
+                return self.schedule_error(CompleteUploadError::ConversionError(err.into()));
+            }
+            None => BlobVersion::pending(
+                ArchiveKey::of(&location),
+                created_at,
+                self.input.created_by,
+                None,
+            ),
+        }
         .with_metadata(upload_record.metadata.clone());
         // Union with what part copies inherited: a part-wise copy of a governed
         // source can only add refs to the composed object.
@@ -1270,7 +1366,29 @@ impl CompleteUploadOperation {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
+        let (Some(version_id), Some(location)) = (self.version_id, self.final_location.as_ref())
+        else {
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
+        };
+        if location.format.bucket_key().is_none() {
+            return self.register_managed_copy();
+        }
+        // The archive's owner row commits with the version and its first physical credit.
+        let version = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
+        let owner = CopyOwner::new(ArchiveKey::of(location), version);
+        match owner_write_effect(&owner, self.txn_id) {
+            Ok(effect) => {
+                self.state = CompleteUploadState::WriteCopyOwner;
+                smallvec![effect]
+            }
+            Err(err) => self.schedule_error(err.into()),
+        }
+    }
 
+    fn owner_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
         self.register_managed_copy()
     }
 
@@ -1811,6 +1929,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::StartFinalizeTransaction => self.finalize_started(event),
             CompleteUploadState::CheckPurgeFinalize => self.finalize_fence_checked(event),
             CompleteUploadState::ReadBucketDefault => self.handle_default_read(event),
+            CompleteUploadState::CheckSealSettings => self.seal_settings_read(event),
             CompleteUploadState::FenceBackend => self.handle_backend_fenced(event),
             CompleteUploadState::CheckHashLookup => self.hash_checked(event),
             CompleteUploadState::WriteBlobLocation => self.location_written(event),
@@ -1819,6 +1938,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::WriteBlobHead => self.head_written(event),
             CompleteUploadState::WritePathIndex => self.path_index_written(event),
             CompleteUploadState::WriteVersionRecord => self.version_written(event),
+            CompleteUploadState::WriteCopyOwner => self.owner_written(event),
             CompleteUploadState::RegisterManagedCopy => self.handle_copy_registered(event),
             CompleteUploadState::WriteObjectMetadata => self.metadata_written(event),
             CompleteUploadState::DeleteUploadRecords => self.records_deleted(event),
