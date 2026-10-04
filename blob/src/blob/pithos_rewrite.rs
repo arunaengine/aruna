@@ -130,7 +130,7 @@ impl BlobHandler {
     }
 
     /// The key of a sealed source, only through a lease admitted for exactly this archive.
-    fn lease_keys(
+    pub(super) fn lease_keys(
         &self,
         source: &BackendLocation,
         lease: Option<&ReadLease>,
