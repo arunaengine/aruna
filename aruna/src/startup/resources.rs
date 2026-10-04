@@ -480,7 +480,7 @@ async fn fill(
     stopped(stop)?;
 
     // Node-managed bucket keys open before content work; vault-locked keys stay locked.
-    open_managed_keys(driver_ctx.as_ref()).await?;
+    open_managed_keys(driver_ctx.as_ref(), config).await?;
     stopped(stop)?;
 
     // Bind compute reconciliation before startup recovery.
@@ -503,9 +503,15 @@ async fn fill(
     Ok(())
 }
 
-/// Opens the node-managed bucket keys; a key that fails stays locked and is reported.
-async fn open_managed_keys(driver_ctx: &DriverContext) -> Result<(), Box<dyn std::error::Error>> {
+/// Opens the node-managed bucket keys, then resumes the work that waited for them. A key that
+/// fails stays locked and is reported.
+async fn open_managed_keys(
+    driver_ctx: &DriverContext,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::time::unix_timestamp_millis;
     use aruna_operations::driver::drive;
+    use aruna_operations::jobs::key_wake::wake_unlocked;
     use aruna_operations::s3::bucket::key_startup::OpenManagedOperation;
 
     let keys = drive(OpenManagedOperation::new(), driver_ctx).await?;
@@ -524,6 +530,19 @@ async fn open_managed_keys(driver_ctx: &DriverContext) -> Result<(), Box<dyn std
         opened = keys.opened.len(),
         "Opened node-managed bucket keys"
     );
+    let origin = (config.realm_id, config.node_id);
+    for key in keys.opened {
+        let now_ms = unix_timestamp_millis();
+        let limits = &config.rocrate_limits;
+        if let Err(error) = wake_unlocked(driver_ctx, key, now_ms, origin, limits).await {
+            warn!(
+                bucket_id = %key.bucket_id,
+                generation = key.generation,
+                error = %error,
+                "Failed to resume work waiting for a node-managed key"
+            );
+        }
+    }
     Ok(())
 }
 
