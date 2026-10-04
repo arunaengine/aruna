@@ -6,6 +6,7 @@ use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     routing_snapshot,
 };
+use crate::s3::object::copy_sealed::{SealedCopyError, SealedCopyInput, SealedCopyOperation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
@@ -23,7 +24,7 @@ use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::BackendLocation;
+use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation};
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::resolve_backend;
 use aruna_core::types::GroupId;
@@ -101,6 +102,22 @@ pub enum CopyObjectError {
     Reference(#[from] MaterializeReferenceError),
     #[error("At least one of the preconditions you specified did not hold.")]
     PreconditionFailed,
+}
+
+/// A sealed copy fails like the write it stands in for, or like a missing source.
+fn sealed_error(error: SealedCopyError) -> CopyObjectError {
+    let put = |error| CopyObjectError::Put(error);
+    match error {
+        SealedCopyError::Storage(error) => put(PutObjectError::StorageError(error)),
+        SealedCopyError::Conversion(error) => put(PutObjectError::ConversionError(error)),
+        SealedCopyError::PurgeFence(error) => put(PutObjectError::PurgeFence(error)),
+        SealedCopyError::Quota(error) => put(PutObjectError::QuotaGateError(error)),
+        SealedCopyError::QuotaExceeded { limit, usage } => {
+            put(PutObjectError::QuotaExceeded { limit, usage })
+        }
+        SealedCopyError::NoSuchVersion => CopyObjectError::Get(GetObjectError::NoSuchVersion),
+        error => put(PutObjectError::WriteFailed(error.to_string())),
+    }
 }
 
 /// A description failure reads like the read it stands in for.
@@ -235,6 +252,12 @@ pub async fn copy_object_tracked(
     if head.location.is_none() && input.references == CopyReferences::Preserve {
         return preserve_reference(context, input, head, source_last_modified).await;
     }
+    // A sealed source in the same bucket is aliased, never read, so it copies while locked.
+    if let Some(location) = head.location.clone().filter(|location| {
+        location.format.bucket_key().is_some() && input.source_bucket == input.dest_bucket
+    }) {
+        return sealed_copy(context, input, head, location, source_last_modified).await;
+    }
 
     let source = drive(
         GetObjectOperation::new(GetObjectInput {
@@ -326,6 +349,46 @@ pub async fn copy_object_tracked(
         version_id: put_result.version_id,
         created_at,
         source_version_id,
+        source_last_modified,
+    })
+}
+
+/// Publishes the destination as a new version of the source's archive and grants.
+async fn sealed_copy(
+    context: &DriverContext,
+    input: CopyObjectInput,
+    head: HeadObjectResult,
+    location: BackendLocation,
+    source_last_modified: Option<SystemTime>,
+) -> Result<CopyResultData, CopyObjectError> {
+    let source_version_id = head
+        .version_id
+        .ok_or(CopyObjectError::Get(GetObjectError::NoSuchVersion))?;
+    let operation = SealedCopyOperation::new(SealedCopyInput {
+        bucket: input.dest_bucket,
+        source_key: input.source_key,
+        source_version_id,
+        archive: ArchiveKey::of(&location),
+        size: location.blob_size,
+        dest_key: input.dest_key,
+        metadata: input.metadata,
+        user_id: input.user_id,
+        group_id: input.group_id,
+        realm_id: input.realm_id,
+        node_id: input.node_id,
+        quota_ceiling: input.quota_ceiling,
+    });
+    let version_id = drive(operation, context)
+        .await
+        .map_err(sealed_error)?
+        .version_id;
+    Ok(CopyResultData {
+        size: location.blob_size,
+        location: Some(location),
+        source_metadata: None,
+        version_id,
+        created_at: UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms()),
+        source_version_id: Some(source_version_id),
         source_last_modified,
     })
 }
