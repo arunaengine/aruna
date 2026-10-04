@@ -13,6 +13,7 @@ use crate::structs::execution::job::{
     JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState, KeyWait,
     StagingJobCheckpoint, WorkspaceMode,
 };
+use crate::structs::storage::encryption::BucketKeyRef;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobKind {
@@ -215,6 +216,19 @@ pub enum JobRequest {
         auth_token: AuthToken,
         job_id: JobId,
     },
+    /// Registers `job_id` of the sending node as waiting for the keys of these local contents.
+    /// The answer lists only keys still locked after the registration, closing the unlock race.
+    AwaitKeys {
+        auth_token: AuthToken,
+        job_id: JobId,
+        contents: Vec<[u8; 32]>,
+    },
+    /// Tells the waiting node that `key` of the sending node is unlocked. Grants no read.
+    KeyWake {
+        auth_token: AuthToken,
+        job_id: JobId,
+        key: BucketKeyRef,
+    },
 }
 
 impl JobRequest {
@@ -224,7 +238,9 @@ impl JobRequest {
             | Self::Report { auth_token, .. }
             | Self::Artifact { auth_token, .. }
             | Self::Cancel { auth_token, .. }
-            | Self::Record { auth_token, .. } => auth_token.clone(),
+            | Self::Record { auth_token, .. }
+            | Self::AwaitKeys { auth_token, .. }
+            | Self::KeyWake { auth_token, .. } => auth_token.clone(),
         }
     }
 }
@@ -260,4 +276,7 @@ pub enum JobResponse {
         record: Box<JobRecord>,
         checkpoint: Option<StagingJobCheckpoint>,
     },
+    /// Keys still locked on the answering node; empty means every content is readable.
+    KeysLocked(Vec<KeyWait>),
+    KeyWakeAcked,
 }

@@ -43,6 +43,11 @@ pub async fn wake_unlocked(
 ) -> Result<(usize, usize), KeyWakeError> {
     let woken = wake_key_waits(&context.storage_handle, key, now_ms).await?;
     let promoted = promote_unlocked(context, key, origin, limits).await?;
+    // Remote waiters get owed wakes; a failed delivery stays owed for the next one.
+    super::remote_key::queue_wakes(context, key)
+        .await
+        .map_err(|error| KeyWakeError::Jobs(JobMutationError::Storage(error)))?;
+    super::remote_key::deliver_owed_wakes(context).await;
     Ok((woken, promoted))
 }
 
@@ -53,13 +58,24 @@ pub(crate) async fn locked_inputs(
     inputs: &[CapturedInput],
     node_id: NodeId,
 ) -> Result<Vec<KeyWait>, String> {
-    let storage = &context.storage_handle;
-    let mut locked = BTreeSet::new();
-    for input in inputs
+    let local = inputs
         .iter()
         .filter(|input| input.source_node_id == node_id)
-    {
-        let prefix = ByteView::from(input.blake3.to_vec());
+        .map(|input| input.blake3);
+    locked_contents(context, local, node_id).await
+}
+
+/// Locked keys of contents stored here: a content waits only when every local copy is sealed
+/// with a key generation that is locked here. Contents without a copy are left out.
+pub(crate) async fn locked_contents(
+    context: &DriverContext,
+    contents: impl Iterator<Item = [u8; 32]>,
+    node_id: NodeId,
+) -> Result<Vec<KeyWait>, String> {
+    let storage = &context.storage_handle;
+    let mut locked = BTreeSet::new();
+    for content in contents {
+        let prefix = ByteView::from(content.to_vec());
         let (rows, _) = iter_prefix_page(
             storage,
             BLOB_LOCATIONS_KEYSPACE,
@@ -109,8 +125,13 @@ pub(crate) async fn park_locked(
 ) -> bool {
     let job_id = record.job_id;
     let waits = match locked_inputs(context, &record.captured_inputs, node_id).await {
-        Ok(waits) if !waits.is_empty() => waits,
-        Ok(_) => return false,
+        Ok(mut waits) => {
+            waits.extend(super::remote_key::remote_waits(context, record, node_id).await);
+            if waits.is_empty() {
+                return false;
+            }
+            waits
+        }
         Err(error) => {
             warn!(job_id = %job_id, %error, "Input key check failed; staging decides");
             return false;

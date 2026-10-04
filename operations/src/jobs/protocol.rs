@@ -284,6 +284,22 @@ async fn prepare_response(
             }
             prepare_record(context, auth.user_id, job_id).await
         }
+        // Key waits address the node that holds the content or the job, not the job owner.
+        JobRequest::AwaitKeys {
+            job_id, contents, ..
+        } => PreparedResponse::new(
+            match super::remote_key::register_waits(context, peer, &auth, job_id, &contents).await {
+                Ok(locked) => JobResponse::KeysLocked(locked),
+                Err(error) => JobResponse::Unavailable(error),
+            },
+        ),
+        JobRequest::KeyWake { job_id, key, .. } => PreparedResponse::new(
+            match super::remote_key::accept_wake(context, peer, &auth, job_id, key).await {
+                Ok(true) => JobResponse::KeyWakeAcked,
+                Ok(false) => JobResponse::Unavailable("job is still parking".to_string()),
+                Err(error) => JobResponse::Unavailable(error),
+            },
+        ),
     }
 }
 

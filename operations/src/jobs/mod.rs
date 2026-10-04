@@ -20,6 +20,7 @@ pub(crate) mod protocol;
 pub mod prune;
 pub mod quota;
 pub mod reconcile;
+pub mod remote_key;
 pub mod records;
 pub mod repository;
 mod rocrate_jsonld;

@@ -861,6 +861,11 @@ impl OperationsTaskHandler {
         if !self.jobs_runtime.is_started() {
             return;
         }
+        // Owed key wakes retry on every pass, detached so an offline waiter never stalls it.
+        let context = self.context.clone();
+        tokio::spawn(async move {
+            crate::jobs::remote_key::deliver_owed_wakes(&context).await;
+        });
         let Some(owner_node_id) = self.context.net_handle.as_ref().map(|net| net.node_id()) else {
             warn!(task_id = ?TaskKey::DrainJobQueue, "Cannot drain job queue without net handle");
             self.reschedule_timer(TaskKey::DrainJobQueue, DRAIN_RETRY_AFTER)

@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 
 use super::*;
@@ -46,18 +47,33 @@ fn parse_delivery(row: &[u8]) -> Option<(NodeId, JobId, BucketKeyRef)> {
     Some((waiter, JobId::from_bytes(*job), key))
 }
 
-/// Records that `waiter` parks `job_id` on `key`. The caller checks the registry afterwards and
-/// answers "already available" when the key is unlocked, so a racing unlock is never missed.
+/// One wake owed to a waiting node, with the user its node vouched for at registration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwedWake {
+    pub waiter: NodeId,
+    pub job_id: JobId,
+    pub key: BucketKeyRef,
+    pub auth: AuthContext,
+}
+
+/// Records that `waiter` parks `job_id` on `key` for `auth`. The caller checks the registry
+/// afterwards and answers "already available" when the key is unlocked, so no unlock is missed.
 pub async fn register_remote_wait(
     storage: &StorageHandle,
     key: BucketKeyRef,
     waiter: NodeId,
     job_id: JobId,
+    auth: &AuthContext,
 ) -> Result<(), String> {
     let row = registration_key(key, waiter, job_id);
+    let value = postcard::to_allocvec(auth).map_err(|error| error.to_string())?;
     batch_write(
         storage,
-        vec![(JOB_KEY_WAIT_KEYSPACE.to_string(), row, empty_value())],
+        vec![(
+            JOB_KEY_WAIT_KEYSPACE.to_string(),
+            row,
+            ByteView::from(value),
+        )],
         None,
     )
     .await
@@ -92,7 +108,7 @@ pub async fn queue_remote_wakes(
         };
         let mut writes = Vec::new();
         let mut deletes = Vec::new();
-        for (row, _) in &rows {
+        for (row, value) in &rows {
             let rest = &row[prefix.len()..];
             let parsed = rest.split_first_chunk::<32>().and_then(|(node, job)| {
                 let job: [u8; 16] = job.try_into().ok()?;
@@ -100,7 +116,7 @@ pub async fn queue_remote_wakes(
             });
             if let Some((waiter, job_id)) = parsed {
                 let owed = delivery_key(waiter, job_id, key);
-                writes.push((JOB_KEY_WAIT_KEYSPACE.to_string(), owed, empty_value()));
+                writes.push((JOB_KEY_WAIT_KEYSPACE.to_string(), owed, value.clone()));
             }
             deletes.push((JOB_KEY_WAIT_KEYSPACE.to_string(), row.clone()));
         }
@@ -122,10 +138,8 @@ pub async fn queue_remote_wakes(
     ))
 }
 
-/// One page of owed wakes, oldest waiting node first.
-pub async fn owed_wakes(
-    storage: &StorageHandle,
-) -> Result<Vec<(NodeId, JobId, BucketKeyRef)>, String> {
+/// One page of owed wakes, ordered by waiting node. Undecodable rows are skipped.
+pub async fn owed_wakes(storage: &StorageHandle) -> Result<Vec<OwedWake>, String> {
     let prefix = ByteView::from(vec![DELIVERY_PREFIX]);
     let (rows, _) = iter_prefix_page(
         storage,
@@ -138,7 +152,16 @@ pub async fn owed_wakes(
     .await?;
     Ok(rows
         .iter()
-        .filter_map(|(row, _)| parse_delivery(row))
+        .filter_map(|(row, value)| {
+            let (waiter, job_id, key) = parse_delivery(row)?;
+            let auth = postcard::from_bytes(value).ok()?;
+            Some(OwedWake {
+                waiter,
+                job_id,
+                key,
+                auth,
+            })
+        })
         .collect())
 }
 
@@ -161,6 +184,7 @@ pub async fn ack_wake(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::FjallStorage;
 
     #[tokio::test]
@@ -171,18 +195,27 @@ mod tests {
         let key = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1);
         let other = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 2);
         let job_id = JobId::from_bytes([5; 16]);
-        register_remote_wait(&storage, key, waiter, job_id)
+        let auth = AuthContext {
+            user_id: aruna_core::UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),
+            realm_id: RealmId([1; 32]),
+            path_restrictions: None,
+            session: None,
+        };
+        register_remote_wait(&storage, key, waiter, job_id, &auth)
             .await
             .unwrap();
-        register_remote_wait(&storage, other, waiter, job_id)
+        register_remote_wait(&storage, other, waiter, job_id, &auth)
             .await
             .unwrap();
 
         assert!(!queue_remote_wakes(&storage, key).await.unwrap());
-        assert_eq!(
-            owed_wakes(&storage).await.unwrap(),
-            vec![(waiter, job_id, key)]
-        );
+        let owed = OwedWake {
+            waiter,
+            job_id,
+            key,
+            auth,
+        };
+        assert_eq!(owed_wakes(&storage).await.unwrap(), vec![owed]);
         // A repeated unlock finds nothing left to queue for this key.
         assert!(!queue_remote_wakes(&storage, key).await.unwrap());
         assert_eq!(owed_wakes(&storage).await.unwrap().len(), 1);
