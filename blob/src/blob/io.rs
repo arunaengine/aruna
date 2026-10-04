@@ -895,6 +895,7 @@ impl BlobHandler {
                 // Metadata is admitted only after the finalized marker is durable.
                 let operator = self.operator_from_location(&location)?;
                 let storage_path = location.get_storage_path()?;
+                let _claim = self.claim_archive(&location)?;
                 self.delete_path(&operator, &storage_path).await?;
                 self.release_reservation(&location).await?;
                 return Ok(true);
@@ -948,9 +949,22 @@ impl BlobHandler {
         if active {
             return Ok(false);
         }
+        let _claim = self.claim_archive(&location)?;
         self.delete_path(&operator, &storage_path).await?;
         self.release_reservation(&location).await?;
         Ok(true)
+    }
+
+    /// Claims a Pithos archive for deletion, so no lease starts while its backend copy goes.
+    /// A pinned archive fails the claim and stays for a later pass.
+    fn claim_archive(
+        &self,
+        location: &BackendLocation,
+    ) -> Result<Option<super::unlock::DeleteClaim>, BlobError> {
+        match location.format.layout {
+            StoredLayout::Pithos(_) => self.claim_delete(&ArchiveKey::of(location)).map(Some),
+            _ => Ok(None),
+        }
     }
 
     /// Whether committed records keep a Pithos archive: its pending location names this exact

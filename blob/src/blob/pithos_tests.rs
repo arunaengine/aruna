@@ -667,3 +667,45 @@ async fn reads_with_lease() {
     let refused = handler.read_sealed(location, None, lease).await;
     assert!(matches!(refused, BlobEvent::Error(BlobError::BucketKey(_))));
 }
+
+#[tokio::test]
+async fn reconcile_claims_archives() {
+    use aruna_core::structs::checksum::HASH_BLAKE3;
+    use aruna_core::structs::storage::blob::ArchiveKey;
+
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let stream = stream_from_bytes(b"sealed bytes");
+    let backend = ResolvedBackend::node_default();
+    let written = handler
+        .write_blob("bucket", "sealed.bin", backend, test_user_id(), stream)
+        .await;
+    let BlobEvent::WriteFinished { mut location } = written else {
+        panic!("write failed: {written:?}")
+    };
+    // An abandoned archive without owners or hash, as an interrupted sealed write leaves it.
+    location.hashes.remove(HASH_BLAKE3);
+    let layout = PithosLayout {
+        stored_size: 12,
+        metadata_digest: [3; 32],
+    };
+    location.format = StoredFormat::pithos(layout, BucketKeyRef::new(ulid::Ulid::generate(), 1));
+    handler.finalize_reservation(&location).await.unwrap();
+    handler.clear_active(location.ulid);
+    let operator = handler.operator_from_location(&location).unwrap();
+    let path = location.get_storage_path().unwrap();
+
+    // A pinned archive is kept; the reservation stays for a later pass.
+    let pin = handler
+        .unlocks
+        .lock()
+        .unwrap()
+        .pin(ArchiveKey::of(&location))
+        .unwrap();
+    let refused = handler.reconcile_reservation(location.clone()).await;
+    assert!(matches!(refused, Err(BlobError::DeleteError(_))));
+    assert!(operator.exists(&path).await.unwrap());
+    drop(pin);
+    assert!(handler.reconcile_reservation(location).await.unwrap());
+    assert!(!operator.exists(&path).await.unwrap());
+}
