@@ -732,8 +732,7 @@ mod tests {
         };
         operation.step(read(Some(location.to_bytes().unwrap())));
         operation.step(read(None));
-        let found =
-            matches!(&operation.output, Some(Ok(output)) if output.location == Some(location));
+        let found = matches!(&operation.output, Some(Ok(output)) if output.location == Some(location.clone()));
         assert!(found);
 
         // A governed archive is described only through the registration of exactly it.

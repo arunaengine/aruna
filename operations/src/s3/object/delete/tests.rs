@@ -11,6 +11,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NODE_STATS_KEYSPACE, PATHS_INDEX_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::source_access::SourceMetadata;
