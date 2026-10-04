@@ -1,13 +1,16 @@
-//! Pithos copies through the reader: ranges, metadata digests, keys and changed blocks.
+//! Pithos copies through the writer and reader: ranges, metadata digests, keys, changed blocks
+//! and failed writes.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{setup_two_backends, stream_from_bytes, test_user_id};
-use crate::blob::pithos::{OBJECT_PATH, read};
+use super::{failing_close, setup_two_backends, stream_from_bytes, test_user_id};
+use crate::blob::pithos::{OBJECT_PATH, PithosWrite, read};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
+use aruna_core::stream::BackendStream;
 use aruna_core::structs::storage::blob::ResolvedBackend;
-use aruna_core::structs::storage::format::{PithosLayout, StoredLayout};
+use aruna_core::structs::storage::format::{Compression, PithosLayout, StoredLayout};
+use bytes::Bytes;
 use futures::TryStreamExt;
 use opendal::Operator;
 use pithos_lib::archive::{
@@ -18,11 +21,12 @@ use pithos_lib::crypto::PrivateKey;
 use std::time::Duration;
 
 const IDLE: Duration = Duration::from_secs(30);
+const MIB: usize = 1 << 20;
 
 /// Seeded bytes that neither compress nor repeat, so FastCDC cuts many distinct blocks.
-fn content() -> Vec<u8> {
+fn content(len: usize) -> Vec<u8> {
     let mut seed = 7u64;
-    (0..200_000)
+    (0..len)
         .map(|_| {
             seed ^= seed << 13;
             seed ^= seed >> 7;
@@ -58,12 +62,17 @@ fn sealed_archive(bucket: &PrivateKey, data: &[u8]) -> (Vec<u8>, PithosLayout) {
     (archive, layout)
 }
 
-async fn stored(archive: &[u8]) -> (tempfile::TempDir, Operator) {
+fn empty_store() -> (tempfile::TempDir, Operator) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap().to_string();
     let operator = Operator::from_iter::<opendal::services::Fs>([("root".to_string(), root)])
         .unwrap()
         .finish();
+    (dir, operator)
+}
+
+async fn stored(archive: &[u8]) -> (tempfile::TempDir, Operator) {
+    let (dir, operator) = empty_store();
     operator
         .write("object.pith", archive.to_vec())
         .await
@@ -87,7 +96,7 @@ async fn read_all(
 #[tokio::test]
 async fn reads_whole_ranges() {
     let bucket = PrivateKey::generate();
-    let data = content();
+    let data = content(200_000);
     let (archive, layout) = sealed_archive(&bucket, &data);
     let (_dir, operator) = stored(&archive).await;
 
@@ -110,7 +119,7 @@ async fn reads_whole_ranges() {
 #[tokio::test]
 async fn needs_granted_key() {
     let bucket = PrivateKey::generate();
-    let (archive, layout) = sealed_archive(&bucket, &content());
+    let (archive, layout) = sealed_archive(&bucket, &content(200_000));
     let (_dir, operator) = stored(&archive).await;
 
     let other = PrivateKey::generate();
@@ -121,7 +130,7 @@ async fn needs_granted_key() {
 #[tokio::test]
 async fn rejects_changed_archives() {
     let bucket = PrivateKey::generate();
-    let (mut archive, layout) = sealed_archive(&bucket, &content());
+    let (mut archive, layout) = sealed_archive(&bucket, &content(200_000));
 
     let (_dir, operator) = stored(&archive).await;
     let mut other = layout.clone();
@@ -159,4 +168,109 @@ async fn refuses_unkeyed_reads() {
     assert!(matches!(range, BlobEvent::Error(BlobError::ReadError(_))));
     let slice = handler.slice_reader(&location).await;
     assert!(matches!(slice, Err(BlobError::ReadError(_))));
+}
+
+/// Writes `data` into a fresh store and checks the reported size, hash and stored size.
+async fn written(
+    data: &[u8],
+    key: &PrivateKey,
+    compression: Compression,
+) -> (tempfile::TempDir, Operator, PithosWrite) {
+    let context = setup_two_backends().await;
+    let (dir, operator) = empty_store();
+    let stream = stream_from_bytes(data);
+    let write = context
+        .blob_handle
+        .handler
+        .write_pithos(
+            &operator,
+            "object.pith",
+            key.public_key(),
+            compression,
+            stream,
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.size, data.len() as u64);
+    assert_eq!(write.content_hash, *blake3::hash(data).as_bytes());
+    let stat = operator.stat("object.pith").await.unwrap();
+    assert_eq!(stat.content_length(), write.layout.stored_size);
+    (dir, operator, write)
+}
+
+#[tokio::test]
+async fn writes_read_back() {
+    let bucket = PrivateKey::generate();
+    // Pithos probes the first 4 KiB of a block, so the compressible text comes first.
+    let data = [b"aruna pithos ".repeat(16_000), content(200_000)].concat();
+    let zstd = Compression::Zstd { level: 3 };
+    let (_dir, operator, write) = written(&data, &bucket, zstd).await;
+    assert!(write.layout.stored_size < write.size);
+
+    let size = write.size;
+    for range in [
+        0..size,
+        0..1,
+        4_000..70_000,
+        199_990..210_000,
+        size - 1..size,
+        5..5,
+    ] {
+        let expected = &data[range.start as usize..range.end as usize];
+        let actual = read_all(&operator, &write.layout, &bucket, range.clone()).await;
+        assert_eq!(actual.unwrap(), expected, "{range:?}");
+    }
+}
+
+#[tokio::test]
+async fn writes_empty_object() {
+    let bucket = PrivateKey::generate();
+    let (_dir, operator, write) = written(b"", &bucket, Compression::Off).await;
+    let actual = read_all(&operator, &write.layout, &bucket, 0..0).await;
+    assert!(actual.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn writes_large_object() {
+    // Larger than the 16 MiB FastCDC maximum, so the piece holds several blocks.
+    let bucket = PrivateKey::generate();
+    let data = content(40 * MIB);
+    let (_dir, operator, write) = written(&data, &bucket, Compression::Off).await;
+
+    let whole = read_all(&operator, &write.layout, &bucket, 0..write.size).await;
+    assert!(whole.unwrap() == data);
+    let range = (15 * MIB) as u64..(33 * MIB) as u64;
+    let part = read_all(&operator, &write.layout, &bucket, range).await;
+    assert!(part.unwrap() == data[15 * MIB..33 * MIB]);
+}
+
+#[tokio::test]
+async fn aborts_failed_writes() {
+    let context = setup_two_backends().await;
+    let handler = &context.blob_handle.handler;
+    let key = PrivateKey::generate().public_key();
+
+    let (operator, aborts) = failing_close::operator_with_aborts();
+    let stream = stream_from_bytes(b"payload");
+    let closed = handler
+        .write_pithos(&operator, "object.pith", key, Compression::Off, stream)
+        .await;
+    assert!(matches!(
+        closed,
+        Err(BlobError::WriteError(message)) if message.contains("injected finalization failure")
+    ));
+    assert_eq!(aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Filesystems cannot abort writers, so the partial object with its first block is deleted.
+    let (_dir, operator) = empty_store();
+    let chunks = [
+        Ok(Bytes::from(content(17 * MIB))),
+        Err(std::io::Error::other("gone")),
+    ];
+    let stream = BackendStream::new(futures::stream::iter(chunks));
+    let failed = handler
+        .write_pithos(&operator, "object.pith", key, Compression::Off, stream)
+        .await;
+    assert!(matches!(failed, Err(BlobError::StreamFailed(_))));
+    assert!(!operator.exists("object.pith").await.unwrap());
 }
