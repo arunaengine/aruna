@@ -15,8 +15,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion, HashIndex,
-    VersionKey,
+    ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion,
+    HashIndex, VersionKey,
 };
 use aruna_core::structs::storage::cleanup::{
     CleanupStrategy, ReclaimCandidate, ReclaimCandidateKey,
@@ -32,7 +32,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::blob::cleanup::schedule_cleanup_effect;
-use crate::blob::records::{blob_location_read, iter_index_effect};
+use crate::blob::records::{blob_location_read, iter_index_effect, owners_scan_effect};
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::backends::{RecordReadError, backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
@@ -350,6 +350,7 @@ enum ReclaimState {
     ReadLocation,
     ScanAliases,
     ReadVersions,
+    ReadOwners,
     DeleteRows,
     QueueCleanup,
     UpdateUsage,
@@ -618,7 +619,34 @@ impl ReclaimBlobOperation {
     fn continue_scan(&mut self) -> Effects {
         match self.next_alias_page.take() {
             Some(start) => self.scan_aliases(Some(start)),
-            None => self.free_copy(),
+            None => self.read_owners(),
+        }
+    }
+
+    /// Versions still pending or mid-promotion own a Pithos archive without a hash alias.
+    fn read_owners(&mut self) -> Effects {
+        let Some(location) = self.location.as_ref() else {
+            return self.fail(ReclaimBlobError::Failed);
+        };
+        let archive = ArchiveKey::of(location);
+        self.state = ReclaimState::ReadOwners;
+        smallvec![owners_scan_effect(&archive, self.txn_id)]
+    }
+
+    fn handle_owners(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::IterResult { values, .. }) if values.is_empty() => {
+                self.free_copy()
+            }
+            Event::Storage(StorageEvent::IterResult { .. }) => {
+                self.drop_candidate(ReclaimVerdict::Pinned)
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+            event => self.unexpected(
+                "ReadOwners",
+                "Event::Storage(StorageEvent::IterResult)",
+                event,
+            ),
         }
     }
 
@@ -783,6 +811,7 @@ impl Operation for ReclaimBlobOperation {
             ReclaimState::ReadLocation => self.handle_location(event),
             ReclaimState::ScanAliases => self.handle_alias_page(event),
             ReclaimState::ReadVersions => self.handle_versions(event),
+            ReclaimState::ReadOwners => self.handle_owners(event),
             ReclaimState::DeleteRows => self.handle_rows_deleted(event),
             ReclaimState::QueueCleanup => self.handle_cleanup_queued(event),
             ReclaimState::UpdateUsage => self.handle_usage(event),
@@ -820,6 +849,7 @@ mod tests {
     use super::*;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::CopyOwner;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key, usage_hash_key};
@@ -1041,6 +1071,34 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(queued.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn archive_owner_pins() {
+        // A pending or mid-promotion version owns the archive without any hash alias.
+        let dir = tempdir().unwrap();
+        let context = context(dir.path().to_str().unwrap());
+        seed(&context, 10).await;
+        let version = VersionKey::new("bucket", "key", Ulid::from_bytes([6u8; 16]));
+        let owner = CopyOwner::new(ArchiveKey::of(&location(10)), version);
+        write(
+            &context,
+            aruna_core::keyspaces::COPY_OWNER_KEYSPACE,
+            owner.key().unwrap(),
+            Vec::new(),
+        )
+        .await;
+
+        let verdict = drive(reclaim_op(candidate_key()), &context).await.unwrap();
+
+        assert_eq!(verdict, ReclaimVerdict::Pinned);
+        let location_key =
+            BlobLocationKey::new(HASH, EncodingClass::Raw, BackendRef::node_default());
+        assert!(
+            read(&context, BLOB_LOCATIONS_KEYSPACE, location_key.to_bytes())
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]

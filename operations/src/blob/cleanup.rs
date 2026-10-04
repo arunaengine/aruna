@@ -10,13 +10,14 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, COPY_OWNER_KEYSPACE, PENDING_LOCATION_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
+    ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, CopyOwner,
+    WriteOwner,
 };
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::multipart::{
@@ -552,6 +553,10 @@ async fn owns_write(
         return None;
     };
     let Some(value) = value else {
+        // A promoted archive has no pending row; its versions still own it.
+        if matches!(owner, WriteOwner::Pending) {
+            return archive_owned(context, location).await;
+        }
         return Some(false);
     };
     let owned = match owner {
@@ -572,6 +577,24 @@ async fn owns_write(
         }
     };
     Some(owned.same_object(location))
+}
+
+/// Whether any committed version owns the Pithos archive of `location`.
+async fn archive_owned(context: &DriverContext, location: &BackendLocation) -> Option<bool> {
+    let scan = StorageEffect::Iter {
+        key_space: COPY_OWNER_KEYSPACE.to_string(),
+        prefix: Some(CopyOwner::prefix(&ArchiveKey::of(location)).into()),
+        start: None,
+        limit: 1,
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(scan).await {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Some(!values.is_empty()),
+        event => {
+            warn!(?event, "Archive owners could not be read");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -894,16 +917,35 @@ mod tests {
     #[tokio::test]
     async fn pending_write_owned() {
         // The pending location row is the commit of an archive without a hash.
+        use aruna_core::keyspaces::COPY_OWNER_KEYSPACE;
         use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
         use aruna_core::structs::storage::blob::ArchiveKey;
-        for owned in [true, false] {
+        use aruna_core::structs::storage::blob::{CopyOwner, VersionKey};
+        use ulid::Ulid;
+        for (owned, promoted) in [(true, false), (false, false), (true, true)] {
             let (_dir, storage, context) = setup_context();
             let BlobCleanupWork::DeleteBlob { location } =
                 BlobCleanupWork::from_bytes(&delete_work()).unwrap()
             else {
                 panic!("expected a delete row")
             };
-            if owned {
+            // A promoted archive lost its pending row, but a version still owns it.
+            if promoted {
+                let version = VersionKey::new("bucket", "key", Ulid::from_bytes([6; 16]));
+                let owner = CopyOwner::new(ArchiveKey::of(&location), version);
+                let event = storage
+                    .send_storage_effect(StorageEffect::Write {
+                        key_space: COPY_OWNER_KEYSPACE.to_string(),
+                        key: owner.key().unwrap().into(),
+                        value: Vec::new().into(),
+                        txn_id: None,
+                    })
+                    .await;
+                assert!(matches!(
+                    event,
+                    Event::Storage(StorageEvent::WriteResult { .. })
+                ));
+            } else if owned {
                 let event = storage
                     .send_storage_effect(StorageEffect::Write {
                         key_space: PENDING_LOCATION_KEYSPACE.to_string(),
