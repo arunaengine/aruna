@@ -40,6 +40,15 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+#[derive(OpenApi)]
+#[openapi()]
+pub struct StorageEncryptionDoc;
+
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(StorageEncryptionDoc::openapi())
+        .routes(routes!(get_bucket_encryption, put_bucket_encryption))
+}
+
 /// Unlock state of one key generation on this node.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct UnlockView {
@@ -414,6 +423,202 @@ pub(crate) async fn current_status(
         caller,
         now_ms(),
     ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/buckets/{bucket}/storage/encryption",
+    tag = "data/storage",
+    summary = "Read a bucket's encryption status",
+    description = r#"Returns how this node encrypts a bucket, its key generations and their unlock state.
+
+**Authentication**: realm bearer token with READ on the bucket.
+
+**Behavior**
+- `mode` is `off`, `node_managed` or `vault_locked`; a plain bucket reports `off` with null keys.
+- `generations` lists every key generation this node still needs; `unlock`, `public_key` and
+  `fingerprint` describe the active one.
+- `holders` and `recovery` come from the key directory; a failed lookup reads as unknown.
+- `caller` is for display only; every key route checks the caller again."#,
+    params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
+    responses(
+        (
+            status = 200,
+            description = "The bucket's encryption status",
+            body = EncryptionStatus,
+            example = json!({
+                "bucket": "research-raw",
+                "mode": "vault_locked",
+                "bucket_id": "01JAMXQ7B1D7Q8E7Q2F3R8Z9KC",
+                "storage_generation": 1,
+                "key_generation": 1,
+                "public_key": "qL3UuCZ0XkWbQZ2yZ8m1qL3UuCZ0XkWbQZ2yZ8m1qL0=",
+                "fingerprint": "5d1c0a6f9e1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5",
+                "cipher": "chacha20_poly1305",
+                "block_keys": "content_derived",
+                "max_unlock_ms": 3600000,
+                "unlock": {
+                    "state": "locked", "lock_reason": null, "locked_at_ms": null,
+                    "session_id": null, "unlocked_at_ms": null, "deadline_ms": null,
+                    "max_deadline_ms": null
+                },
+                "generations": [],
+                "holders": { "ready": 2, "pending": 0, "missing_key": 0 },
+                "recovery": { "state": "met", "ready_holders": 2, "ready_with_recovery": 1 },
+                "transition": null,
+                "caller": { "holder": true, "ready_copy": true, "admin": true }
+            })
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
+        (status = 503, description = "An authorization document of the bucket is missing", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_bucket_encryption(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+) -> ServerResult<Json<EncryptionStatus>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = bucket_group(&state, &bucket).await?;
+    ensure_bucket_read(&state, &auth, group_id, &bucket).await?;
+    let status = current_status(&state, bucket, group_id, auth.user_id).await?;
+    Ok(Json(status))
+}
+
+#[utoipa::path(
+    put,
+    path = "/data/buckets/{bucket}/storage/encryption",
+    tag = "data/storage",
+    summary = "Change a bucket's encryption mode",
+    description = r#"Enables encryption of new writes of a bucket on this node.
+
+**Authentication**: realm bearer token with WRITE on the owning group's admin path.
+
+**Behavior**
+- `node_managed` or `vault_locked` on a plain bucket creates key generation 1 and seals a copy of
+  its private key to every holder with a published user key. The new key starts unlocked.
+- `expected_generation` must equal the current `storage_generation`.
+- Other mode changes and setting changes of an encrypted bucket answer 501 `not_supported`."#,
+    params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
+    request_body(
+        content = EncryptionRequest,
+        description = "The new mode with optional cipher, block keys and unlock maximum",
+        example = json!({ "mode": "vault_locked", "max_unlock_ms": 3600000, "expected_generation": 0 })
+    ),
+    responses(
+        (status = 200, description = "The status after the change", body = EncryptionStatus),
+        (status = 400, description = "An invalid mode, cipher or unlock maximum", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
+        (status = 409, description = "`stale_generation`, `open_uploads` or `recovery_unmet`", body = ErrorResponse),
+        (status = 501, description = "`not_supported`: this change is not available yet", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn put_bucket_encryption(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+    Json(request): Json<EncryptionRequest>,
+) -> ServerResult<Json<EncryptionStatus>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = bucket_group(&state, &bucket).await?;
+    ensure_group_admin(&state, &auth, group_id).await?;
+    let snapshot = read_snapshot(&state, &bucket, group_id).await?;
+    let current = &snapshot.settings;
+    if current.storage_generation != request.expected_generation {
+        return Err(key_refusal(&BucketKeyError::StaleGeneration {
+            requested: request.expected_generation,
+            current: current.storage_generation,
+        }));
+    }
+    if current.is_encrypted() || request.mode == EncryptionMode::Off {
+        return Err(refused(
+            StatusCode::NOT_IMPLEMENTED,
+            "not_supported",
+            "only enabling encryption on a plain bucket is available",
+        ));
+    }
+    let context = state.get_ctx();
+    let target = (state.get_realm_id(), state.get_node_id(), group_id);
+    enable_bucket(&context, target, &bucket, &snapshot, &request)
+        .await
+        .map_err(enable_refusal)?;
+    let status = current_status(&state, bucket, group_id, auth.user_id).await?;
+    Ok(Json(status))
+}
+
+/// Creates key generation 1 sealed to the creator and admins, then installs the new key.
+pub(crate) async fn enable_bucket(
+    context: &DriverContext,
+    (realm_id, node_id, group_id): (RealmId, NodeId, GroupId),
+    bucket: &str,
+    snapshot: &KeySnapshot,
+    request: &EncryptionRequest,
+) -> Result<(), EnableError> {
+    let creator = snapshot.info.as_ref().map(|info| info.created_by);
+    let users = creator
+        .into_iter()
+        .chain(snapshot.admins.iter().copied())
+        .collect::<Vec<_>>();
+    let lookups = lookup_keys(context, node_id, users).await;
+    let input = EnableInput {
+        bucket: bucket.to_string(),
+        group_id,
+        realm_id,
+        node_id,
+        mode: request.mode,
+        cipher: request.cipher.unwrap_or_default(),
+        block_keys: request.block_keys.unwrap_or_default(),
+        max_unlock_ms: request.max_unlock_ms,
+        expected_generation: request.expected_generation,
+        lookups,
+        now_ms: now_ms(),
+    };
+    let enabled = drive(EnableEncryptionOperation::new(input), context).await?;
+    let install = InstallInput {
+        key: enabled.key.key,
+        public_key: enabled.key.public_key,
+        private_key: enabled.private_key,
+        duration: None,
+        max: enabled.settings.max_unlock_ms.map(Duration::from_millis),
+    };
+    // The bucket is encrypted either way; a failed install only leaves it locked.
+    if let Err(error) = drive(InstallKeyOperation::new(install), context).await {
+        tracing::warn!(%bucket, ?error, "new bucket key stays locked");
+    }
+    Ok(())
+}
+
+pub(crate) fn enable_refusal(error: EnableError) -> ServerError {
+    match error {
+        EnableError::Settings(error) => settings_refusal(error),
+        EnableError::Key(error) => key_refusal(&error),
+        EnableError::Blob(error) => blob_refusal(error),
+        EnableError::AlreadyEncrypted => refused(
+            StatusCode::CONFLICT,
+            "stale_generation",
+            "the bucket already encrypts its writes",
+        ),
+        EnableError::InvalidMode | EnableError::Conversion(_) => {
+            ServerError::BadRequestReason(error.to_string())
+        }
+        EnableError::OpenUploads => refused(
+            StatusCode::CONFLICT,
+            "open_uploads",
+            "the bucket has open multipart uploads",
+        ),
+        EnableError::RecoveryUnmet => refused(
+            StatusCode::CONFLICT,
+            "recovery_unmet",
+            "the key holders do not meet the recovery rule",
+        ),
+        other => ServerError::InternalError(other.to_string()),
+    }
 }
 
 #[cfg(test)]
