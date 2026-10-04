@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use aruna_core::structs::execution::job::{
-    CompositionError, ExportReportRow, ImportReportRow, JobId, JobRecord, JobState,
+    CompositionError, ExportReportRow, ImportReportRow, JobId, JobRecord, JobState, KeyWait,
     SYSTEM_ENTRY_PREFIX,
 };
 use aruna_core::structs::identity::auth::AuthContext;
@@ -666,6 +666,10 @@ pub struct JobStatusResponse {
     /// replicated family rather than this node's own row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub family: Option<JobFamilyResponse>,
+    /// Present while `awaiting_key`: the locked bucket keys the job waits for, as
+    /// `{node_id, bucket, group_id?}` objects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub awaiting_keys: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -711,6 +715,11 @@ pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
         session_runtime: job.session_runtime.clone(),
         run_crate: None,
         family: None,
+        awaiting_keys: job
+            .awaiting_keys
+            .iter()
+            .map(KeyWait::to_public_json)
+            .collect(),
     }
 }
 
@@ -839,6 +848,7 @@ pub(crate) fn parse_state(value: &str) -> ServerResult<JobState> {
         "succeeded" => Ok(JobState::Succeeded),
         "failed" => Ok(JobState::Failed),
         "cancelled" => Ok(JobState::Cancelled),
+        "awaiting_key" => Ok(JobState::AwaitingKey),
         _ => Err(ServerError::BadRequest),
     }
 }

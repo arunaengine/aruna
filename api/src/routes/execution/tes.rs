@@ -1582,6 +1582,7 @@ fn tes_state(record: &JobRecord) -> TesState {
         JobState::Preparing | JobState::Ready => TesState::Initializing,
         JobState::Running => TesState::Running,
         JobState::Cancelling => TesState::Canceling,
+        JobState::AwaitingKey => TesState::Paused,
         JobState::Indeterminate => TesState::Unknown,
         JobState::Succeeded => TesState::Complete,
         JobState::Failed => match &record.result {

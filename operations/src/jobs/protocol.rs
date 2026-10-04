@@ -728,6 +728,7 @@ mod pure_tests {
                 workspace_mode: WorkspaceMode::None,
                 locally_exhausted: false,
                 session_runtime: None,
+                awaiting_keys: Vec::new(),
             },
             run_crate: Some(r#"{"status":"pending"}"#.to_string()),
         };

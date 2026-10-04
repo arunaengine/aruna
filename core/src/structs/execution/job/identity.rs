@@ -108,6 +108,8 @@ pub enum JobState {
     Succeeded,
     Failed,
     Cancelled,
+    /// Parked until every bucket key it needs is unlocked; holds no claim and no schedule entry.
+    AwaitingKey,
 }
 
 impl JobState {
@@ -131,6 +133,7 @@ impl JobState {
             JobState::Succeeded => "succeeded",
             JobState::Failed => "failed",
             JobState::Cancelled => "cancelled",
+            JobState::AwaitingKey => "awaiting_key",
         }
     }
 }

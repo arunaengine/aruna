@@ -314,6 +314,7 @@ pub(crate) fn status_view(
         workspace_mode: mode,
         locally_exhausted: false,
         session_runtime: spec.payload.session_runtime(),
+        awaiting_keys: Vec::new(),
     }
 }
 

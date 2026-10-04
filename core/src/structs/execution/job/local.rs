@@ -676,6 +676,10 @@ fn in_process_transition(from: JobState, to: JobState) -> bool {
             // Local retry exhaustion without a job-specific verdict parks here too.
             | (Claimed, Indeterminate)
             | (Running, Indeterminate)
+            | (Claimed, AwaitingKey)
+            | (Running, AwaitingKey)
+            | (AwaitingKey, Queued)
+            | (AwaitingKey, Cancelled)
     )
 }
 
@@ -719,6 +723,11 @@ fn external_attempt_transition(from: JobState, to: JobState) -> bool {
             | (Indeterminate, Succeeded)
             | (Indeterminate, Failed)
             | (Indeterminate, Cancelled)
+            // Parking happens before staging and before any attempt intent exists.
+            | (Claimed, AwaitingKey)
+            | (Preparing, AwaitingKey)
+            | (AwaitingKey, Queued)
+            | (AwaitingKey, Cancelled)
     )
 }
 

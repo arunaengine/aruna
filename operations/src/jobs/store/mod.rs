@@ -10,9 +10,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, ARTIFACT_TOMBSTONE_KEYSPACE, ATTEMPT_CONTROL_KEYSPACE,
-    DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE,
-    OUTPUT_RECORD_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE, RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
-    STAGING_STATE_KEYSPACE,
+    DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEY_WAIT_KEYSPACE,
+    JOB_KEYSPACE, JOB_STATE_KEYSPACE, OUTPUT_RECORD_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE,
+    RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{
     ActiveJobKind, AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError,
@@ -20,9 +20,9 @@ use aruna_core::structs::execution::job::{
     JobRecordError, JobResultPayload, JobState, JobTransitionError, RunCrateStatus,
     attempt_control_key, cleanup_dedup_key, cleanup_job_id, crate_dedup_key, crate_job_id,
     due_index_key, encode_dedup_value, job_active_key, job_entry_key, job_entry_prefix,
-    job_owner_cursor, job_prune_key, job_record_key, lease_index_key, owner_index_key,
-    owner_index_prefix, parse_dedup_value, parse_entry_key, parse_owner_key, rocrate_plan_key,
-    run_crate_key, validate_transition, workspace_credential_id,
+    job_owner_cursor, job_prune_key, job_record_key, job_wait_key, lease_index_key,
+    owner_index_key, owner_index_prefix, parse_dedup_value, parse_entry_key, parse_owner_key,
+    rocrate_plan_key, run_crate_key, validate_transition, workspace_credential_id,
 };
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::storage_purge::StoragePurgeCheckpoint;
@@ -90,13 +90,18 @@ pub enum JobMutationError {
 }
 
 /// Schedule-index key by state: queued -> due/, claimed/running -> lease/, settled -> prune/.
-fn job_schedule_key(record: &JobRecord) -> Key {
+/// A job awaiting a key has none: only an unlock wakes it.
+fn job_schedule_key(record: &JobRecord) -> Option<Key> {
     // A locally exhausted job earns no further sweep: it is scheduled for pruning.
     if record.locally_exhausted {
         let finished = record.finished_at_ms.unwrap_or(record.updated_at_ms);
-        return job_prune_key(finished.saturating_add(record.retention_ms), record.job_id);
+        return Some(job_prune_key(
+            finished.saturating_add(record.retention_ms),
+            record.job_id,
+        ));
     }
-    match record.state {
+    Some(match record.state {
+        JobState::AwaitingKey => return None,
         JobState::Queued => due_index_key(record.due_at_ms, record.job_id),
         JobState::Claimed
         | JobState::Preparing
@@ -115,7 +120,7 @@ fn job_schedule_key(record: &JobRecord) -> Key {
             let finished = record.finished_at_ms.unwrap_or(record.updated_at_ms);
             job_prune_key(finished.saturating_add(record.retention_ms), record.job_id)
         }
-    }
+    })
 }
 
 /// Dedup index path. A user-scoped key is prefixed with the submitting user so a
@@ -136,18 +141,14 @@ fn empty_value() -> Value {
 
 /// Writes creating a fresh job (<=5 keys); composable into a producer transaction.
 pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionError> {
-    let mut writes = vec![
-        (
-            JOB_KEYSPACE.to_string(),
-            job_record_key(record.job_id),
-            ByteView::from(record.to_bytes()?),
-        ),
-        (
-            SCHEDULE_INDEX_KEYSPACE.to_string(),
-            job_schedule_key(record),
-            empty_value(),
-        ),
-    ];
+    let mut writes = vec![(
+        JOB_KEYSPACE.to_string(),
+        job_record_key(record.job_id),
+        ByteView::from(record.to_bytes()?),
+    )];
+    if let Some(schedule) = job_schedule_key(record) {
+        writes.push((SCHEDULE_INDEX_KEYSPACE.to_string(), schedule, empty_value()));
+    }
     if !record.payload.is_internal() {
         writes.push((
             JOB_INDEX_KEYSPACE.to_string(),
@@ -189,10 +190,6 @@ pub fn prune_delete_entries(record: &JobRecord) -> JobDeletes {
             owner_index_key(record.created_by, record.created_at_ms, record.job_id),
         ),
         (
-            SCHEDULE_INDEX_KEYSPACE.to_string(),
-            job_schedule_key(record),
-        ),
-        (
             STAGING_STATE_KEYSPACE.to_string(),
             ByteView::from(record.job_id.to_bytes().to_vec()),
         ),
@@ -205,6 +202,9 @@ pub fn prune_delete_entries(record: &JobRecord) -> JobDeletes {
             rocrate_plan_key(record.job_id),
         ),
     ];
+    if let Some(schedule) = job_schedule_key(record) {
+        deletes.push((SCHEDULE_INDEX_KEYSPACE.to_string(), schedule));
+    }
     if let Some(kind) = ActiveJobKind::of(&record.payload) {
         deletes.push((
             ACTIVE_USER_KEYSPACE.to_string(),
@@ -249,14 +249,22 @@ pub(super) fn index_deltas(
 
     let old_schedule = job_schedule_key(old);
     let new_schedule = job_schedule_key(new);
-    if old_schedule != new_schedule {
+    if let Some(old_schedule) = old_schedule
+        && Some(&old_schedule) != new_schedule.as_ref()
+    {
         deletes.push((SCHEDULE_INDEX_KEYSPACE.to_string(), old_schedule));
     }
-    writes.push((
-        SCHEDULE_INDEX_KEYSPACE.to_string(),
-        new_schedule,
-        empty_value(),
-    ));
+    if let Some(new_schedule) = new_schedule {
+        writes.push((
+            SCHEDULE_INDEX_KEYSPACE.to_string(),
+            new_schedule,
+            empty_value(),
+        ));
+    }
+    // Leaving the parked state drops its wait list; stale wake rows are skipped on wake.
+    if old.state == JobState::AwaitingKey && new.state != JobState::AwaitingKey {
+        deletes.push((JOB_KEY_WAIT_KEYSPACE.to_string(), job_wait_key(new.job_id)));
+    }
     if let Some(kind) = ActiveJobKind::of(&old.payload)
         && !old.is_settled()
         && new.is_settled()

@@ -36,11 +36,13 @@ use crate::types::{GroupId, Key};
 mod family;
 mod identity;
 mod input;
+mod key_wait;
 mod local;
 
 pub use family::*;
 pub use identity::*;
 pub use input::*;
+pub use key_wait::*;
 pub use local::*;
 
 #[cfg(test)]

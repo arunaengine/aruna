@@ -10,7 +10,7 @@ use serde_json::Value as JsonValue;
 use crate::UserId;
 use crate::metadata::AuthToken;
 use crate::structs::execution::job::{
-    JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState,
+    JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState, KeyWait,
     StagingJobCheckpoint, WorkspaceMode,
 };
 
@@ -101,6 +101,8 @@ pub struct JobStatusView {
     pub locally_exhausted: bool,
     /// Set for a notebook session: the catalog runtime it runs.
     pub session_runtime: Option<String>,
+    /// Bucket keys an `awaiting_key` job still needs; filled by the owning node.
+    pub awaiting_keys: Vec<KeyWait>,
 }
 
 mod json_value {
@@ -146,6 +148,7 @@ impl From<&JobRecord> for JobStatusView {
                 JobPayload::Execution(spec) => spec.session_runtime(),
                 _ => None,
             },
+            awaiting_keys: Vec::new(),
         }
     }
 }

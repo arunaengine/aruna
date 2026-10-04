@@ -119,6 +119,8 @@ pub const TRANSITION_KEYSPACE: &str = "encryption_transitions";
 pub const TRANSITION_QUEUE_KEYSPACE: &str = "encryption_transition_queue";
 /// Old copies a transition still waits to see removed, keyed by bucket and location key.
 pub const TRANSITION_CLEANUP_KEYSPACE: &str = "encryption_transition_cleanups";
+/// Bucket keys parked jobs wait for: per-job lists and a wake index by key reference.
+pub const JOB_KEY_WAIT_KEYSPACE: &str = "job_key_waits";
 /// Durable evidence of a copy that failed hash/bao verification (§8.2), keyed
 /// per (hash, backend) so re-hitting the same corrupt copy overwrites its row.
 pub const BLOB_QUARANTINE_KEYSPACE: &str = "blob_quarantine";
@@ -481,6 +483,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     TRANSITION_KEYSPACE,
     TRANSITION_QUEUE_KEYSPACE,
     TRANSITION_CLEANUP_KEYSPACE,
+    JOB_KEY_WAIT_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,
