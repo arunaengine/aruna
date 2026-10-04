@@ -92,7 +92,7 @@ struct FrameCursor {
 }
 
 /// Reads one byte range on its own task, so the stream that awaits it stays `Sync`.
-async fn read_range(
+pub(super) async fn read_range(
     operator: &Operator,
     path: &str,
     range: Range<u64>,
@@ -345,6 +345,9 @@ impl BlobHandler {
         &self,
         location: &BackendLocation,
     ) -> Result<SliceReader, BlobError> {
+        if let StoredLayout::Pithos(_) = &location.format.layout {
+            return Err(super::pithos::needs_bucket_key());
+        }
         if let StoredLayout::Frames(layout) = &location.format.layout {
             let reader = self.frame_reader(location, layout).await?;
             return Ok(SliceReader::Framed(reader));

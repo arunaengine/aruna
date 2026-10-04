@@ -21,6 +21,7 @@ mod frames;
 mod group;
 mod in_place;
 mod io;
+pub mod pithos;
 mod registry;
 mod replication;
 mod runtime;

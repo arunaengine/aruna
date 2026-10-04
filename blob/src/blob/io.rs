@@ -1305,6 +1305,9 @@ impl BlobHandler {
     }
 
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
+        if let StoredLayout::Pithos(_) = &location.format.layout {
+            return BlobEvent::Error(super::pithos::needs_bucket_key());
+        }
         if let StoredLayout::Frames(layout) = &location.format.layout {
             let range = 0..location.blob_size;
             return Box::pin(self.read_frames(&location, layout, range)).await;
@@ -1399,6 +1402,9 @@ impl BlobHandler {
         location: BackendLocation,
         range: impl RangeBounds<u64>,
     ) -> BlobEvent {
+        if let StoredLayout::Pithos(_) = &location.format.layout {
+            return BlobEvent::Error(super::pithos::needs_bucket_key());
+        }
         if let StoredLayout::Frames(layout) = &location.format.layout {
             let range = clamped_range(&range, location.blob_size);
             return Box::pin(self.read_frames(&location, layout, range)).await;
