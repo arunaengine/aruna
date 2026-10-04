@@ -99,6 +99,12 @@ pub const COMPRESSION_MIGRATION_KEYSPACE: &str = "compression_migrations";
 /// Buckets whose compression migration is unfinished; the worker scans only these.
 pub const COMPRESSION_QUEUE_KEYSPACE: &str = "compression_migration_queue";
 pub const HIDDEN_RESERVATION_KEYSPACE: &str = "blob_hidden_reservations";
+/// Key generations of encrypted buckets, keyed by bucket id and generation. Public keys only.
+pub const BUCKET_KEY_KEYSPACE: &str = "bucket_keys";
+/// Key holders of encrypted buckets, keyed by bucket id and user.
+pub const BUCKET_HOLDER_KEYSPACE: &str = "bucket_holders";
+/// Bucket private keys sealed to user keys, keyed by bucket id, generation and holder.
+pub const KEY_COPY_KEYSPACE: &str = "bucket_key_copies";
 /// Durable evidence of a copy that failed hash/bao verification (§8.2), keyed
 /// per (hash, backend) so re-hitting the same corrupt copy overwrites its row.
 pub const BLOB_QUARANTINE_KEYSPACE: &str = "blob_quarantine";
@@ -355,6 +361,9 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BLOB_RECLAIM_KEYSPACE,
     COMPRESSION_MIGRATION_KEYSPACE,
     COMPRESSION_QUEUE_KEYSPACE,
+    BUCKET_KEY_KEYSPACE,
+    BUCKET_HOLDER_KEYSPACE,
+    KEY_COPY_KEYSPACE,
     HIDDEN_RESERVATION_KEYSPACE,
     BLOB_QUARANTINE_KEYSPACE,
     MANAGED_COPY_KEYSPACE,
