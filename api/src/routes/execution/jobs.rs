@@ -1021,6 +1021,28 @@ caller's own jobs.
                             "unit": "phases"
                         },
                         "workspace_mode": "none"
+                    },
+                    {
+                        "job_id": "01JJRSTVWXYZ0123456789ABCE",
+                        "kind": "execution",
+                        "state": "awaiting_key",
+                        "attempts": 0,
+                        "cancel_requested": false,
+                        "created_at": "2026-04-09T14:20:03.512+00:00",
+                        "updated_at": "2026-04-09T14:20:04.077+00:00",
+                        "progress": {
+                            "current": 0,
+                            "total": 5,
+                            "unit": "phases"
+                        },
+                        "workspace_mode": "none",
+                        "awaiting_keys": [
+                            {
+                                "node_id": "b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c",
+                                "bucket": "research-raw",
+                                "group_id": "01JJRSGROUP0123456789ABCDE"
+                            }
+                        ]
                     }
                 ],
                 "next_cursor": "RqTuvSDYgez8DstU9tg0ZST62xQ3JtJW"
