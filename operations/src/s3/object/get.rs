@@ -21,10 +21,13 @@ use crate::s3::object::lookup::{
 };
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
-    ConversionError, SourceResolutionError, StagingSourceError, StorageError,
+    BlobError, ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, OBJECT_METADATA_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE,
+};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
@@ -33,10 +36,10 @@ use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
-use aruna_core::structs::storage::encryption::BucketKeyError;
+use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, BucketKeyRef};
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectKey, MultipartObjectSummary,
 };
@@ -83,6 +86,11 @@ pub enum GetObjectState {
     RestartReference,
     GetBlob,
     ReadReferenceSource,
+    /// A sealed copy waits for a read lease of its bucket key.
+    AdmitRead,
+    /// A reference version of an encrypting bucket needs its bucket unlocked.
+    ReadReferenceSettings,
+    CheckReferenceKey,
     Finish,
     Error,
 }
@@ -305,6 +313,8 @@ pub struct GetObjectOperation {
     /// Refs of the version being read, carried to copy and advance writes.
     source_policies: Vec<PlacementPolicyRef>,
     output: Option<Result<GetObjectResult, GetObjectError>>,
+    /// Active key of an encrypting bucket whose reference version is read.
+    reference_key: Option<BucketKeyRef>,
 }
 
 impl GetObjectOperation {
@@ -342,6 +352,7 @@ impl GetObjectOperation {
             pending_copy: None,
             source_policies: Vec::new(),
             output: None,
+            reference_key: None,
         }
     }
 
@@ -707,6 +718,8 @@ impl GetObjectOperation {
         };
         self.resolved_range = resolved_range.clone();
 
+        let sealed = location.format.bucket_key();
+        let archive = ArchiveKey::of(&location);
         let read_effect = match resolved_range {
             Some(range) => BlobEffect::ReadRange {
                 location,
@@ -716,10 +729,56 @@ impl GetObjectOperation {
         };
 
         self.state = GetObjectState::CommitTransaction;
+        // A sealed copy is read only under a lease of its key, admitted after the commit.
+        if let Some(key) = sealed {
+            return smallvec![
+                Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
+                Effect::Blob(BlobEffect::AdmitRead { key, archive })
+            ];
+        }
         smallvec![
             Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
             Effect::Blob(read_effect)
         ]
+    }
+
+    /// Reads the sealed copy with the admitted lease; a locked key ends the read typed.
+    fn read_admitted(&mut self, event: Event) -> Effects {
+        let Some(location) = self.location.clone() else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        let lease = match event {
+            Event::Blob(BlobEvent::ReadAdmitted { lease })
+                if Some(lease.key) == location.format.bucket_key()
+                    && lease.archive == ArchiveKey::of(&location) =>
+            {
+                lease
+            }
+            // A locked key stays typed: `BucketKeyError::Locked` names the bucket.
+            Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
+                return self.emit_error(locked(error));
+            }
+            Event::Blob(BlobEvent::Error(_)) => {
+                return self.emit_error(GetObjectError::GetObjectFailed);
+            }
+            other => {
+                return self.emit_error(GetObjectError::InvalidStateEvent {
+                    state: self.state.clone(),
+                    expected: "Event::Blob(BlobEvent::ReadAdmitted)",
+                    received: other,
+                });
+            }
+        };
+        let range = self
+            .resolved_range
+            .as_ref()
+            .map(|range| range.range.clone());
+        self.state = GetObjectState::GetBlob;
+        smallvec![Effect::Blob(BlobEffect::ReadSealed {
+            location,
+            range,
+            lease
+        })]
     }
 
     fn read_reference(&mut self) -> Effects {
@@ -730,20 +789,87 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::GetObjectFailed);
         }
 
-        // Release the read snapshot, then HEAD the source: the fresh observation
-        // decides whether this read serves, advances the binding, or 404s.
+        // An encrypting bucket gates plaintext of every version, not only of sealed copies.
+        self.state = GetObjectState::ReadReferenceSettings;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            key: self.input.bucket.as_bytes().into(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    /// Release the read snapshot, then HEAD the source: the fresh observation decides whether
+    /// this read serves, advances the binding, or 404s. A locked bucket refuses first.
+    fn reference_settings_read(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(GetObjectError::NoTransactionFound);
+        };
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let settings = match BucketEncryption::from_row(value.as_deref()) {
+            Ok(settings) => settings,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        self.reference_key = settings.active_key();
         self.state = GetObjectState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        let mut effects: Effects =
+            smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        if let Some(key) = self.reference_key {
+            effects.push(Effect::Blob(BlobEffect::ReadKeyStatus {
+                bucket_id: key.bucket_id,
+            }));
+        }
+        effects
+    }
+
+    fn reference_key_checked(&mut self, event: Event) -> Effects {
+        let (Some(key), Some(access)) = (self.reference_key, self.reference_access.clone()) else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        match event {
+            Event::Blob(BlobEvent::KeyStatus { generations })
+                if generations
+                    .iter()
+                    .any(|status| status.key == key && status.active) =>
+            {
+                self.state = GetObjectState::HeadReferenceSource;
+                smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })]
+            }
+            Event::Blob(BlobEvent::KeyStatus { .. }) => {
+                self.emit_error(locked(BucketKeyError::Locked(key.bucket_id)))
+            }
+            other => self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Blob(BlobEvent::KeyStatus)",
+                received: other,
+            }),
+        }
     }
 
     pub fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event {
             self.txn_id = None;
+            if self.reference_access.is_some() && self.reference_key.is_some() {
+                self.state = GetObjectState::CheckReferenceKey;
+                return smallvec![];
+            }
             if let Some(access) = self.reference_access.clone() {
                 self.state = GetObjectState::HeadReferenceSource;
                 return smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })];
             }
-            self.state = GetObjectState::GetBlob;
+            let sealed = self
+                .location
+                .as_ref()
+                .is_some_and(|location| location.format.bucket_key().is_some());
+            self.state = match sealed {
+                true => GetObjectState::AdmitRead,
+                false => GetObjectState::GetBlob,
+            };
             smallvec![]
         } else {
             self.emit_error(GetObjectError::InvalidStateEvent {
@@ -1287,6 +1413,10 @@ impl GetObjectOperation {
     }
 }
 
+fn locked(error: BucketKeyError) -> GetObjectError {
+    GetObjectError::ConversionError(ConversionError::BucketKey(error))
+}
+
 impl Operation for GetObjectOperation {
     type Output = GetObjectResult;
     type Error = GetObjectError;
@@ -1317,6 +1447,9 @@ impl Operation for GetObjectOperation {
             GetObjectState::RestartReference => self.handle_restart_reference(event),
             GetObjectState::GetBlob => self.handle_received_blob(event),
             GetObjectState::ReadReferenceSource => self.reference_source_received(event),
+            GetObjectState::AdmitRead => self.read_admitted(event),
+            GetObjectState::ReadReferenceSettings => self.reference_settings_read(event),
+            GetObjectState::CheckReferenceKey => self.reference_key_checked(event),
             GetObjectState::Finish => smallvec![],
             GetObjectState::Error => self.abort(),
         }

@@ -422,7 +422,12 @@ fn reference_range_reads() {
     operation.txn_id = Some(txn_id);
     operation.reference_access = Some(access.clone());
 
-    let effects = operation.read_reference();
+    operation.read_reference();
+    // The bucket has no encryption settings, so the read commits without a key check.
+    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"s3test".to_vec().into(),
+        value: None,
+    }));
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::CommitTransaction { txn_id: committed_txn_id })]
@@ -1899,4 +1904,202 @@ async fn historical_drift_fails() {
     .unwrap_err();
 
     assert_eq!(error, GetObjectError::HistoricalReferenceUnavailable);
+}
+
+mod sealed {
+    use super::test_node_id;
+    use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+    use aruna_core::UserId;
+    use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+    use aruna_core::errors::{BlobError, ConversionError};
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation, BackendRef};
+    use aruna_core::structs::storage::encryption::{
+        BucketEncryption, BucketKeyError, BucketKeyRef, EncryptionMode, ReadLease, UnlockStatus,
+    };
+    use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+    use ulid::Ulid;
+
+    fn key() -> BucketKeyRef {
+        BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1)
+    }
+
+    fn operation() -> GetObjectOperation {
+        let mut operation = GetObjectOperation::new(GetObjectInput {
+            bucket: "bucket".to_string(),
+            key: "sealed.bin".to_string(),
+            version_id: None,
+            range: None,
+            group_id: Ulid::generate(),
+            user_identity: UserId::nil(RealmId::from_bytes([3u8; 32])),
+            node_id: test_node_id(),
+        });
+        operation.txn_id = Some(Ulid::generate());
+        operation
+    }
+
+    fn sealed_location() -> BackendLocation {
+        let layout = PithosLayout {
+            stored_size: 64,
+            metadata_digest: [1; 32],
+        };
+        BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/tmp".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "sealed".to_string(),
+            ulid: Ulid::from_bytes([7; 16]),
+            format: StoredFormat::pithos(layout, key()),
+            created_by: UserId::nil(RealmId::from_bytes([3u8; 32])),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 10,
+            hashes: HashMap::new(),
+        }
+    }
+
+    fn committed() -> Event {
+        Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: Ulid::generate(),
+        })
+    }
+
+    #[test]
+    fn sealed_reads_leased() {
+        let mut operation = operation();
+        let location = sealed_location();
+        operation.location = Some(location.clone());
+        let effects = operation.read_blob();
+        let archive = ArchiveKey::of(&location);
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::Storage(StorageEffect::CommitTransaction { .. }),
+                Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: pinned }),
+            ] if *admitted == key() && *pinned == archive
+        ));
+        assert!(operation.step(committed()).is_empty());
+        let lease = ReadLease::new(key(), archive, Ulid::generate(), Arc::new(()));
+        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReadSealed { range: None, .. })]
+        ));
+    }
+
+    #[test]
+    fn locked_read_typed() {
+        let mut operation = operation();
+        operation.location = Some(sealed_location());
+        operation.read_blob();
+        operation.step(committed());
+        let locked = BlobError::BucketKey(BucketKeyError::Locked(key().bucket_id));
+        operation.step(Event::Blob(BlobEvent::Error(locked)));
+        assert_eq!(
+            operation.finalize().err(),
+            Some(GetObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::Locked(key().bucket_id)
+            )))
+        );
+    }
+
+    #[test]
+    fn foreign_lease_refused() {
+        let mut operation = operation();
+        operation.location = Some(sealed_location());
+        operation.read_blob();
+        operation.step(committed());
+        let other = ArchiveKey::new(Ulid::generate(), BackendRef::node_default());
+        let lease = ReadLease::new(key(), other, Ulid::generate(), Arc::new(()));
+        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Blob(BlobEffect::ReadSealed { .. })))
+        );
+        assert!(operation.is_complete());
+    }
+
+    /// Steps a reference read of a bucket with `settings` up to its key check.
+    fn reference(settings: &BucketEncryption) -> (GetObjectOperation, Vec<Effect>) {
+        let mut operation = operation();
+        operation.reference_access = Some(ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::S3,
+            config: HashMap::new(),
+            path: "source".to_string(),
+            version: None,
+        });
+        operation.read_reference();
+        let row = Some(settings.to_bytes().unwrap().into());
+        let mut effects: Vec<Effect> = operation
+            .step(Event::Storage(StorageEvent::ReadResult {
+                key: b"bucket".to_vec().into(),
+                value: row,
+            }))
+            .into_vec();
+        effects.extend(operation.step(committed()));
+        (operation, effects)
+    }
+
+    #[test]
+    fn reference_needs_unlock() {
+        let settings = BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(key().bucket_id),
+            key_generation: 1,
+            ..Default::default()
+        };
+        let (mut operation, effects) = reference(&settings);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Blob(BlobEffect::ReadKeyStatus { bucket_id }) if *bucket_id == key().bucket_id
+        )));
+        operation.step(Event::Blob(BlobEvent::KeyStatus {
+            generations: Vec::new(),
+        }));
+        assert_eq!(
+            operation.finalize().err(),
+            Some(GetObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::Locked(key().bucket_id)
+            )))
+        );
+
+        let (mut operation, _) = reference(&settings);
+        let unlocked = UnlockStatus {
+            key: key(),
+            session_id: Ulid::generate(),
+            active: true,
+            unlocked_at: SystemTime::UNIX_EPOCH,
+            remaining: None,
+            max_remaining: None,
+        };
+        let effects = operation.step(Event::Blob(BlobEvent::KeyStatus {
+            generations: vec![unlocked],
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StagingSource(StagingSourceEffect::Head { .. })]
+        ));
+    }
+
+    #[test]
+    fn plain_reference_unchanged() {
+        let (_, effects) = reference(&BucketEncryption::default());
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::Storage(StorageEffect::CommitTransaction { .. }),
+                Effect::StagingSource(StagingSourceEffect::Head { .. }),
+            ]
+        ));
+    }
 }
