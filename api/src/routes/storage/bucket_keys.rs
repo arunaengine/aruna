@@ -54,6 +54,11 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(unlock_bucket))
         .routes(routes!(extend_unlock))
         .routes(routes!(lock_bucket))
+        .routes(routes!(list_holders, grant_holder))
+        .routes(routes!(remove_holder))
+        .routes(routes!(my_copies))
+        .routes(routes!(rotate_key))
+        .routes(routes!(bucket_audit))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -423,6 +428,365 @@ pub async fn lock_bucket(
         view.locked_at_ms = Some(now_ms);
     }
     Ok(Json(view))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/buckets/{bucket}/storage/encryption/holders",
+    tag = "data/storage",
+    summary = "List a bucket's key holders",
+    description = r#"Returns the holders of the active key generation and their readiness.
+
+**Authentication**: realm bearer token without path restrictions of a key holder or group admin.
+
+**Behavior**
+- `complete` is false when a key directory lookup failed; the list is then partial and
+  `recovery` reads `unknown` unless resolved holders already meet it.
+- `revision` names this list in a later removal."#,
+    params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
+    responses(
+        (status = 200, description = "The holders", body = HoldersResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Neither a key holder nor a group admin", body = ErrorResponse),
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
+        (status = 409, description = "`not_encrypted`", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_holders(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+) -> ServerResult<Json<HoldersResponse>> {
+    let auth = require_unrestricted_auth(&state, auth)?;
+    let snapshot = holder_snapshot(&state, &auth, &bucket).await?;
+    let report = holder_report(&state, &snapshot)
+        .await
+        .ok_or_else(not_encrypted)?;
+    Ok(Json(HoldersResponse {
+        holders: report.holders.iter().map(HolderView::from).collect(),
+        complete: report.complete,
+        unresolved: report.unresolved,
+        recovery: RecoveryView::from(&report.recovery),
+        revision: hex::encode(holder_revision(&snapshot.grants, &snapshot.copies)),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/buckets/{bucket}/storage/encryption/holders",
+    tag = "data/storage",
+    summary = "Grant a bucket key to a user",
+    description = r#"Adds an explicit key holder and seals a key copy to the user's published keys.
+
+**Authentication**: realm bearer token without path restrictions, with WRITE on the owning
+group's admin path.
+
+**Behavior**
+- While the active generation is locked, or the user has no published key, the holder is
+  `pending` and receives a copy at the next unlock."#,
+    params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
+    request_body(content = GrantRequest, example = json!({ "user_id": "01JAMXS1P3T9V6Q8W2Y4Z7B5CD@realm" })),
+    responses(
+        (status = 200, description = "The new holder", body = HolderView),
+        (status = 400, description = "Invalid user id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
+        (status = 409, description = "`not_encrypted`", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn grant_holder(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+    Json(request): Json<GrantRequest>,
+) -> ServerResult<Json<HolderView>> {
+    let auth = require_unrestricted_auth(&state, auth)?;
+    let user_id = parse_user(&request.user_id)?;
+    let group_id = bucket_group(&state, &bucket).await?;
+    ensure_group_admin(&state, &auth, group_id).await?;
+    let mut lookups = lookup_keys(&state.get_ctx(), state.get_node_id(), [user_id]).await;
+    let lookup = lookups.remove(&user_id).unwrap_or(KeyLookup::Unavailable);
+    let has_recovery = match &lookup {
+        KeyLookup::Keys(keys) => Some(keys.iter().any(|key| key.has_recovery)),
+        KeyLookup::Missing => Some(false),
+        KeyLookup::Unavailable => None,
+    };
+    let input = GrantInput {
+        bucket,
+        group_id,
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        user_id,
+        granted_by: auth.user_id,
+        lookup,
+        now_ms: now_ms(),
+    };
+    let result = drive(GrantHolderOperation::new(input), &state.get_ctx())
+        .await
+        .map_err(|error| match error {
+            GrantError::Settings(error) => settings_refusal(error),
+            GrantError::Blob(error) => blob_refusal(error),
+            GrantError::NotEncrypted => not_encrypted(),
+            other => ServerError::InternalError(other.to_string()),
+        })?;
+    let grant = result.grant;
+    Ok(Json(HolderView {
+        user_id: grant.user_id.to_string(),
+        name: None,
+        origin: grant.origin,
+        state: result.state,
+        has_recovery,
+        granted_by: Some(grant.granted_by.to_string()),
+        granted_at_ms: Some(grant.granted_at_ms),
+    }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/data/buckets/{bucket}/storage/encryption/holders/{user}",
+    tag = "data/storage",
+    summary = "Remove an explicit key holder",
+    description = r#"Removes an explicit grant and the key copies it gave.
+
+**Authentication**: realm bearer token without path restrictions, with WRITE on the owning
+group's admin path.
+
+**Behavior**
+- `revision` must match the current holder list, otherwise 409 `stale_holders`.
+- A removal that breaks the recovery rule needs `confirm_recovery=true`, otherwise 409
+  `recovery_confirmation_required`.
+- The removal does not lock the bucket and does not rotate its key."#,
+    params(
+        ("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash"),
+        ("user" = String, Path, description = "User id as `<ULID>@<realm>`"),
+        RemovalQuery
+    ),
+    responses(
+        (status = 204, description = "The grant was removed"),
+        (status = 400, description = "Invalid user id or revision", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
+        (status = 404, description = "Bucket or explicit grant not found", body = ErrorResponse),
+        (status = 409, description = "`stale_holders`, `recovery_confirmation_required` or `not_encrypted`", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn remove_holder(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((bucket, user)): Path<(String, String)>,
+    Query(query): Query<RemovalQuery>,
+) -> ServerResult<StatusCode> {
+    let auth = require_unrestricted_auth(&state, auth)?;
+    let user_id = parse_user(&user)?;
+    let revision: [u8; 32] = hex::decode(&query.revision)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| ServerError::BadRequestReason("invalid revision".into()))?;
+    let group_id = bucket_group(&state, &bucket).await?;
+    ensure_group_admin(&state, &auth, group_id).await?;
+    let snapshot = read_snapshot(&state, &bucket, group_id).await?;
+    let creator = snapshot.info.as_ref().map(|info| info.created_by);
+    let users = creator
+        .into_iter()
+        .chain(snapshot.admins.iter().copied())
+        .chain(snapshot.grants.iter().map(|grant| grant.user_id))
+        .collect::<Vec<_>>();
+    let lookups = lookup_keys(&state.get_ctx(), state.get_node_id(), users).await;
+    let input = RemovalInput {
+        bucket,
+        group_id,
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        user_id,
+        removed_by: auth.user_id,
+        revision,
+        confirm_recovery: query.confirm_recovery,
+        lookups,
+        now_ms: now_ms(),
+    };
+    drive(RemoveHolderOperation::new(input), &state.get_ctx())
+        .await
+        .map_err(|error| match error {
+            RemovalError::Settings(error) => settings_refusal(error),
+            RemovalError::NotEncrypted => not_encrypted(),
+            RemovalError::NoSuchGrant => ServerError::NotFound,
+            RemovalError::StaleHolders => refused(
+                StatusCode::CONFLICT,
+                "stale_holders",
+                "the holders changed since they were read",
+            ),
+            RemovalError::RecoveryConfirmationRequired => refused(
+                StatusCode::CONFLICT,
+                "recovery_confirmation_required",
+                "removing this holder breaks the recovery rule",
+            ),
+            other => ServerError::InternalError(other.to_string()),
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/buckets/{bucket}/storage/encryption/copies/me",
+    tag = "data/storage",
+    summary = "Read the caller's sealed key copies",
+    description = r#"Returns the bucket private key copies sealed to the caller's user keys.
+
+**Authentication**: realm bearer token without path restrictions of a current key holder.
+
+**Behavior**
+- Only copies of the requested `generation`. A generation without a copy for the caller
+  returns an empty list.
+- The copies are sealed; only the caller's vault opens them."#,
+    params(
+        ("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash"),
+        CopiesQuery
+    ),
+    responses(
+        (status = 200, description = "The caller's copies", body = CopiesResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The caller holds no key of this bucket", body = ErrorResponse),
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn my_copies(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+    Query(query): Query<CopiesQuery>,
+) -> ServerResult<Json<CopiesResponse>> {
+    let auth = require_unrestricted_auth(&state, auth)?;
+    let snapshot = holder_snapshot(&state, &auth, &bucket).await?;
+    let copies = snapshot
+        .copies
+        .iter()
+        .filter(|copy| copy.user_id == auth.user_id && copy.key.generation == query.generation)
+        .map(|copy| CopyView {
+            bucket_id: copy.key.bucket_id.to_string(),
+            generation: copy.key.generation,
+            key_record: copy.key_record.to_string(),
+            key_id: copy.key_id.clone(),
+            enc: BASE64_STANDARD.encode(copy.enc),
+            ciphertext: BASE64_STANDARD.encode(&copy.ciphertext),
+            created_at_ms: copy.created_at_ms,
+        })
+        .collect();
+    Ok(Json(CopiesResponse { copies }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/buckets/{bucket}/storage/encryption/rotate",
+    tag = "data/storage",
+    summary = "Rotate a bucket key",
+    description = r#"Starts a new key generation and moves this node's copies to it.
+
+**Authentication**: realm bearer token without path restrictions, with WRITE on the owning
+group's admin path.
+
+**Behavior**
+- Not available yet: answers 501 `not_supported` after the authorization checks."#,
+    params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
+    request_body(content = RotateRequest, example = json!({ "expected_generation": 1 })),
+    responses(
+        (status = 200, description = "The status after the rotation started", body = EncryptionStatus),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
+        (status = 409, description = "`stale_generation` or `bucket_locked`", body = ErrorResponse),
+        (status = 501, description = "`not_supported`: rotation is not available yet", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn rotate_key(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+    Json(_request): Json<RotateRequest>,
+) -> ServerResult<Json<EncryptionStatus>> {
+    let auth = require_unrestricted_auth(&state, auth)?;
+    let group_id = bucket_group(&state, &bucket).await?;
+    ensure_group_admin(&state, &auth, group_id).await?;
+    Err(refused(
+        StatusCode::NOT_IMPLEMENTED,
+        "not_supported",
+        "key rotation is not available yet",
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/buckets/{bucket}/storage/encryption/audit",
+    tag = "data/storage",
+    summary = "Read a bucket's key audit",
+    description = r#"Returns the bucket's key state events on this node, oldest first.
+
+**Authentication**: realm bearer token without path restrictions of a key holder or group admin.
+
+**Behavior**
+- Events never contain key bytes, grants or vault payloads.
+- An `intent` without a later `applied` event is not a successful change.
+- Pass `next_cursor` as `cursor` to read the next page."#,
+    params(
+        ("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash"),
+        AuditQuery
+    ),
+    responses(
+        (status = 200, description = "One page of events", body = AuditResponse),
+        (status = 400, description = "Invalid cursor", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Neither a key holder nor a group admin", body = ErrorResponse),
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn bucket_audit(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+    Query(query): Query<AuditQuery>,
+) -> ServerResult<Json<AuditResponse>> {
+    let auth = require_unrestricted_auth(&state, auth)?;
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(|cursor| parse_ulid(cursor, "cursor"))
+        .transpose()?;
+    let limit = query.limit.unwrap_or(AUDIT_PAGE).clamp(1, AUDIT_MAX);
+    let snapshot = holder_snapshot(&state, &auth, &bucket).await?;
+    let Some(bucket_id) = snapshot.settings.bucket_id else {
+        return Ok(Json(AuditResponse {
+            events: Vec::new(),
+            next_cursor: None,
+        }));
+    };
+    let operation = AuditPageOperation::new(bucket_id, cursor, limit);
+    let (events, next) = drive(operation, &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let events = events
+        .into_iter()
+        .map(|event| AuditEventView {
+            event_id: event.event_id.to_string(),
+            at_ms: event.at_ms,
+            action: wire_name(event.action),
+            actor_user_id: event.actor.map(|actor| actor.to_string()),
+            node_id: event.node_id.to_string(),
+            generation: event.generation,
+            deadline_ms: event.deadline_ms,
+            reason: event.reason,
+            outcome: wire_name(event.outcome),
+        })
+        .collect();
+    Ok(Json(AuditResponse {
+        events,
+        next_cursor: next.map(|next| next.to_string()),
+    }))
 }
 
 #[cfg(test)]
