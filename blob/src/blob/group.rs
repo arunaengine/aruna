@@ -118,7 +118,17 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         | BlobEffect::ReadMessage { .. }
         | BlobEffect::CloseConnection { .. }
         | BlobEffect::ReceiveRead { .. }
-        | BlobEffect::CheckGroupBackend { .. } => {}
+        | BlobEffect::CheckGroupBackend { .. }
+        // Key effects touch no backend; the read that uses a lease claims its own.
+        | BlobEffect::GenerateBucketKey
+        | BlobEffect::SealHolderCopies { .. }
+        | BlobEffect::PrepareKey { .. }
+        | BlobEffect::ActivateKey { .. }
+        | BlobEffect::DiscardKey { .. }
+        | BlobEffect::ReadKeyStatus { .. }
+        | BlobEffect::ExtendKey { .. }
+        | BlobEffect::LockKey { .. }
+        | BlobEffect::AdmitRead { .. } => {}
     }
     ids
 }

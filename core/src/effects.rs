@@ -22,7 +22,8 @@ use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::structs::placement::policy::document::PolicyPublicationClaim;
 use crate::structs::placement::record::PlacementRef;
-use crate::structs::storage::blob::{BackendLocation, HiddenBlobKey, ResolvedBackend};
+use crate::structs::storage::blob::{ArchiveKey, BackendLocation, HiddenBlobKey, ResolvedBackend};
+use crate::structs::storage::encryption::{BucketKeyRef, CopyTarget, KeyTicket};
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use crate::structs::storage::multipart::{BackendUpload, MultipartPart};
 use crate::structs::storage::usage::UsageDelta;
@@ -180,6 +181,51 @@ pub enum BlobEffect {
     CheckGroupBackend {
         record: GroupStorage,
         secret: GroupStorageSecret,
+    },
+    // ----- Bucket keys -----
+    /// A fresh X25519 keypair for a bucket key generation.
+    GenerateBucketKey,
+    /// Seals the private key of `key` to each user key; the plain key is not returned.
+    SealHolderCopies {
+        key: BucketKeyRef,
+        private_key: SecretBytes,
+        realm_id: RealmId,
+        node_id: NodeId,
+        holders: Vec<CopyTarget>,
+    },
+    /// Holds a key checked against `public_key`; no read may use it before activation.
+    /// `max` bounds the session from its start, including every extension.
+    PrepareKey {
+        key: BucketKeyRef,
+        public_key: [u8; 32],
+        private_key: SecretBytes,
+        duration: Option<Duration>,
+        max: Option<Duration>,
+    },
+    ActivateKey {
+        ticket: KeyTicket,
+    },
+    DiscardKey {
+        ticket: KeyTicket,
+    },
+    ReadKeyStatus {
+        bucket_id: Ulid,
+    },
+    /// Moves the timed lock of one session to `duration` from now.
+    ExtendKey {
+        key: BucketKeyRef,
+        session_id: Ulid,
+        duration: Option<Duration>,
+    },
+    /// Locks every generation of a bucket, or only the named session for a timed lock.
+    LockKey {
+        bucket_id: Ulid,
+        session: Option<KeyTicket>,
+    },
+    /// Admits a plaintext read of `archive` while its key generation is unlocked.
+    AdmitRead {
+        key: BucketKeyRef,
+        archive: ArchiveKey,
     },
 }
 

@@ -16,6 +16,7 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::storage::blob::BackendConfig;
+use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::multipart::MultipartPartKey;
 use aruna_core::structs::{BackendState, BlobState, Status};
 use aruna_net::NetHandle;
@@ -92,6 +93,15 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::DeleteHidden { .. } => (EffectClass::Local, "delete_hidden"),
         BlobEffect::ListHidden { .. } => (EffectClass::Local, "list_hidden"),
         BlobEffect::CheckGroupBackend { .. } => (EffectClass::Control, "check_group_backend"),
+        BlobEffect::GenerateBucketKey => (EffectClass::Local, "generate_bucket_key"),
+        BlobEffect::SealHolderCopies { .. } => (EffectClass::Local, "seal_holder_copies"),
+        BlobEffect::PrepareKey { .. } => (EffectClass::Local, "prepare_key"),
+        BlobEffect::ActivateKey { .. } => (EffectClass::Local, "activate_key"),
+        BlobEffect::DiscardKey { .. } => (EffectClass::Local, "discard_key"),
+        BlobEffect::ReadKeyStatus { .. } => (EffectClass::Local, "read_key_status"),
+        BlobEffect::ExtendKey { .. } => (EffectClass::Local, "extend_key"),
+        BlobEffect::LockKey { .. } => (EffectClass::Local, "lock_key"),
+        BlobEffect::AdmitRead { .. } => (EffectClass::Local, "admit_read"),
     }
 }
 
@@ -717,6 +727,17 @@ impl BlobHandler {
             }
             BlobEffect::CheckGroupBackend { record, secret } => {
                 Box::pin(self.check_group_backend(record, secret)).await
+            }
+            BlobEffect::GenerateBucketKey
+            | BlobEffect::SealHolderCopies { .. }
+            | BlobEffect::PrepareKey { .. }
+            | BlobEffect::ActivateKey { .. }
+            | BlobEffect::DiscardKey { .. }
+            | BlobEffect::ReadKeyStatus { .. }
+            | BlobEffect::ExtendKey { .. }
+            | BlobEffect::LockKey { .. }
+            | BlobEffect::AdmitRead { .. } => {
+                BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Unsupported))
             }
             BlobEffect::OpenConnection { node_id } => Box::pin(self.open_connection(node_id)).await,
             BlobEffect::SendMessage { stream_id, payload } => {

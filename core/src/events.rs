@@ -20,6 +20,7 @@ use crate::structs::identity::user::vault::VaultRecords;
 use crate::structs::placement::policy::document::{PlacementPolicyDocument, PolicyPublication};
 use crate::structs::placement::policy::{MAX_REF_INPUT, PlacementDecision};
 use crate::structs::storage::blob::{BackendLocation, HiddenBlobEntry};
+use crate::structs::storage::encryption::{KeyTicket, ReadLease, SealedCopy, UnlockStatus};
 use crate::structs::storage::multipart::BackendUpload;
 use crate::structs::storage::replication::{ReplicationItemError, ReplicationSuboperationResult};
 use crate::structs::storage::routing::GroupRoutingInputs;
@@ -156,6 +157,35 @@ pub enum BlobEvent {
         backend_etag: String,
     },
     UploadAborted,
+    BucketKeyGenerated {
+        public_key: [u8; 32],
+        private_key: SecretBytes,
+    },
+    CopiesSealed {
+        copies: Vec<SealedCopy>,
+    },
+    KeyPrepared {
+        ticket: KeyTicket,
+    },
+    KeyActivated {
+        status: UnlockStatus,
+    },
+    KeyDiscarded {
+        ticket: KeyTicket,
+    },
+    KeyStatus {
+        generations: Vec<UnlockStatus>,
+    },
+    KeyExtended {
+        status: UnlockStatus,
+    },
+    /// The generations whose keys were removed; already locked buckets report none.
+    KeyLocked {
+        locked: Vec<KeyTicket>,
+    },
+    ReadAdmitted {
+        lease: ReadLease,
+    },
     Error(BlobError),
 }
 

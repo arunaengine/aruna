@@ -7,8 +7,13 @@ use crate::UserId;
 use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::blob::ArchiveKey;
 use crate::vault_format::key_fingerprint;
 use serde::{Deserialize, Serialize};
+use std::any::Any;
+use std::fmt;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -341,6 +346,84 @@ impl SealedCopy {
     }
 }
 
+/// A user key a bucket private key is sealed to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CopyTarget {
+    pub user_id: UserId,
+    pub key_record: Ulid,
+    pub key_id: String,
+    pub public_key: [u8; 32],
+}
+
+/// A checked bucket key the adapter holds before reads may use it. Activating it starts the
+/// unlock session; discarding it forgets the key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyTicket {
+    pub key: BucketKeyRef,
+    pub session_id: Ulid,
+}
+
+/// The unlock state of one key generation on this node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnlockStatus {
+    pub key: BucketKeyRef,
+    pub session_id: Ulid,
+    /// False while the key is prepared but no read may use it yet.
+    pub active: bool,
+    pub unlocked_at: SystemTime,
+    /// Time left until the timed lock; none means until lock or restart.
+    pub remaining: Option<Duration>,
+    /// Time left until the session maximum, the limit of every extension.
+    pub max_remaining: Option<Duration>,
+}
+
+/// An admitted plaintext read of one archive. It keeps the bucket key and the archive in use
+/// until dropped, but exposes no key to an operation.
+pub struct ReadLease {
+    pub key: BucketKeyRef,
+    pub archive: ArchiveKey,
+    pub session_id: Ulid,
+    guard: Arc<dyn Any + Send + Sync>,
+}
+
+impl ReadLease {
+    pub fn new(
+        key: BucketKeyRef,
+        archive: ArchiveKey,
+        session_id: Ulid,
+        guard: Arc<dyn Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            key,
+            archive,
+            session_id,
+            guard,
+        }
+    }
+
+    /// The adapter state behind the lease, which only the adapter can interpret.
+    pub fn guard(&self) -> &(dyn Any + Send + Sync) {
+        self.guard.as_ref()
+    }
+}
+
+impl fmt::Debug for ReadLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadLease")
+            .field("key", &self.key)
+            .field("archive", &self.archive)
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ReadLease {
+    fn eq(&self, other: &Self) -> bool {
+        (self.key, &self.archive, self.session_id) == (other.key, &other.archive, other.session_id)
+            && Arc::ptr_eq(&self.guard, &other.guard)
+    }
+}
+
 /// HPKE info of a copy: the purpose label, then the realm, node, bucket, generation, user and
 /// user key record. Every part has a fixed length, so the encoding is canonical.
 pub fn copy_info(
@@ -379,6 +462,8 @@ pub enum BucketKeyError {
     Capacity,
     #[error("the key fingerprint does not match the public key")]
     Fingerprint,
+    #[error("the unlock duration exceeds the bucket maximum")]
+    InvalidDuration,
     #[error("this encrypted bucket operation is not supported yet")]
     Unsupported,
 }
@@ -489,6 +574,50 @@ mod tests {
             ["creator", "admin", "explicit"],
         ]);
         assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn keys_never_formatted() {
+        use crate::compute::SecretBytes;
+        use crate::effects::BlobEffect;
+        use crate::events::BlobEvent;
+        use crate::structs::storage::blob::BackendRef;
+
+        const CANARY: [u8; 32] = *b"canary-bucket-key-6f1d-0000-0000";
+        let key = BucketKeyRef::new(Ulid::from_bytes([1; 16]), 2);
+        let prepare = BlobEffect::PrepareKey {
+            key,
+            public_key: [3; 32],
+            private_key: SecretBytes::new(CANARY.to_vec()),
+            duration: None,
+            max: None,
+        };
+        let generated = BlobEvent::BucketKeyGenerated {
+            public_key: [3; 32],
+            private_key: SecretBytes::new(CANARY.to_vec()),
+        };
+        let archive = ArchiveKey::new(Ulid::from_bytes([4; 16]), BackendRef::node_default());
+        let guard: Arc<dyn Any + Send + Sync> = Arc::new(SecretBytes::new(CANARY.to_vec()));
+        let lease = ReadLease::new(
+            key,
+            archive.clone(),
+            Ulid::from_bytes([5; 16]),
+            guard.clone(),
+        );
+        let canary = String::from_utf8_lossy(&CANARY).to_string();
+        for formatted in [
+            format!("{prepare:?}"),
+            format!("{generated:?}"),
+            format!("{lease:?}"),
+        ] {
+            assert!(!formatted.contains(&canary), "{formatted}");
+            assert!(!formatted.contains("99, 97, 110"), "{formatted}");
+        }
+        // Two leases are equal only when they share one adapter state.
+        let same = ReadLease::new(key, archive.clone(), lease.session_id, guard);
+        let other = ReadLease::new(key, archive, lease.session_id, Arc::new(()));
+        assert_eq!(lease, same);
+        assert_ne!(lease, other);
     }
 
     #[test]
