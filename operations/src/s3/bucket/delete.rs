@@ -1,17 +1,21 @@
 //! Deletes a bucket only when it holds no objects, uploads or sync links, and fixes usage.
+//! Its bucket keys, holders and node vault keys go with it, and its unlocked keys are locked.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
-    RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE,
+    BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE, NODE_VAULT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
+    RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
 };
+use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{BlobHeadKey, BucketInfo, VersionKey};
+use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRecord};
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
@@ -33,6 +37,8 @@ pub enum DeleteBucketState {
     ScanOutRelationships,
     ScanInRelationships,
     WriteRepairs,
+    ReadEncryption,
+    ScanKeyRows,
     DeleteBucket,
     UpdateUsage,
     CommitTransaction,
@@ -75,6 +81,10 @@ pub struct DeleteBucketOperation {
     usage_update: Option<UsageCounterUpdate>,
     relationship_deletes: Vec<(String, Key)>,
     relationships: Vec<SyncRelationship>,
+    /// Stable id of an encrypted bucket, whose key rows go with it.
+    bucket_id: Option<ulid::Ulid>,
+    key_spaces: Vec<&'static str>,
+    key_deletes: Vec<(String, Key)>,
     output: Option<Result<(), DeleteBucketError>>,
 }
 
@@ -90,6 +100,9 @@ impl DeleteBucketOperation {
             usage_update: None,
             relationship_deletes: Vec::new(),
             relationships: Vec::new(),
+            bucket_id: None,
+            key_spaces: Vec::new(),
+            key_deletes: Vec::new(),
             output: None,
         }
     }
@@ -317,7 +330,88 @@ impl DeleteBucketOperation {
             })];
         }
 
-        self.delete_bucket_records()
+        self.read_encryption()
+    }
+
+    fn read_encryption(&mut self) -> Effects {
+        self.state = DeleteBucketState::ReadEncryption;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            key: self.bucket.as_bytes().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn encryption_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(DeleteBucketError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        match BucketEncryption::from_row(value.as_deref()) {
+            Ok(settings) => self.bucket_id = settings.bucket_id,
+            Err(error) => return self.emit_error(error.into()),
+        }
+        self.key_spaces = vec![
+            KEY_COPY_KEYSPACE,
+            BUCKET_HOLDER_KEYSPACE,
+            BUCKET_KEY_KEYSPACE,
+        ];
+        self.scan_key_rows(None)
+    }
+
+    fn scan_key_rows(&mut self, start: Option<Key>) -> Effects {
+        let (Some(bucket_id), Some(key_space)) = (self.bucket_id, self.key_spaces.last()) else {
+            return self.delete_bucket_records();
+        };
+        self.state = DeleteBucketState::ScanKeyRows;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix: Some(bucket_id.to_bytes().to_vec().into()),
+            start: start.map(aruna_core::effects::IterStart::After),
+            limit: Self::SCAN_LIMIT,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn key_rows_scanned(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return self.emit_error(DeleteBucketError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::IterResult)",
+                received: event,
+            });
+        };
+        let Some(&key_space) = self.key_spaces.last() else {
+            return self.emit_error(DeleteBucketError::DeleteBucketFailed);
+        };
+        for (key, value) in values {
+            // A node-managed key also leaves its node vault row.
+            if key_space == BUCKET_KEY_KEYSPACE {
+                match BucketKeyRecord::from_bytes(value.as_ref()) {
+                    Ok(record) => {
+                        let entries = record.vault_entry.into_iter();
+                        let vault = entries.map(|id| VaultEntry::new(VaultPurpose::BucketKey, id));
+                        self.key_deletes
+                            .extend(vault.map(|entry| {
+                                (NODE_VAULT_KEYSPACE.to_string(), entry.key().into())
+                            }));
+                    }
+                    Err(error) => return self.emit_error(error.into()),
+                }
+            }
+            self.key_deletes.push((key_space.to_string(), key));
+        }
+        if next_start_after.is_none() {
+            self.key_spaces.pop();
+        }
+        self.scan_key_rows(next_start_after)
     }
 
     fn delete_bucket_records(&mut self) -> Effects {
@@ -329,6 +423,7 @@ impl DeleteBucketOperation {
             (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.into()),
         ];
         deletes.append(&mut self.relationship_deletes);
+        deletes.append(&mut self.key_deletes);
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
             deletes,
             txn_id: self.txn_id,
@@ -343,7 +438,7 @@ impl DeleteBucketOperation {
                 received: event,
             });
         };
-        self.delete_bucket_records()
+        self.read_encryption()
     }
 
     fn handle_bucket_deleted(&mut self, event: Event) -> Effects {
@@ -405,6 +500,13 @@ impl DeleteBucketOperation {
         self.state = DeleteBucketState::Finish;
         self.output = Some(Ok(()));
         let mut effects = smallvec![schedule_snapshot_publish()];
+        // The registry frees the slots of the deleted bucket id; nothing can read it any more.
+        if let Some(bucket_id) = self.bucket_id {
+            effects.push(Effect::Blob(BlobEffect::LockKey {
+                bucket_id,
+                session: None,
+            }));
+        }
         if !self.relationships.is_empty() {
             effects.push(Effect::Task(TaskEffect::ShortenTimer {
                 key: TaskKey::DrainMirrorRepair,
@@ -438,6 +540,8 @@ impl Operation for DeleteBucketOperation {
                 self.handle_relationship_scan(event)
             }
             DeleteBucketState::WriteRepairs => self.handle_repairs_written(event),
+            DeleteBucketState::ReadEncryption => self.encryption_read(event),
+            DeleteBucketState::ScanKeyRows => self.key_rows_scanned(event),
             DeleteBucketState::DeleteBucket => self.handle_bucket_deleted(event),
             DeleteBucketState::UpdateUsage => self.handle_usage_update(event),
             DeleteBucketState::CommitTransaction => self.handle_transaction_committed(event),
@@ -542,7 +646,7 @@ mod test {
 
     #[tokio::test]
     async fn removes_encryption_settings() {
-        use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+        use aruna_core::structs::storage::encryption::{BucketKeyRef, EncryptionMode};
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -571,36 +675,85 @@ mod test {
         )
         .await
         .unwrap();
+        let (bucket_id, other_id, vault_id) =
+            (Ulid::generate(), Ulid::generate(), Ulid::generate());
         let settings = BucketEncryption {
             mode: EncryptionMode::NodeManaged,
-            bucket_id: Some(Ulid::generate()),
+            bucket_id: Some(bucket_id),
             key_generation: 1,
             ..Default::default()
         };
-        storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-                key: bucket.clone().into(),
-                value: settings.to_bytes().unwrap().into(),
-                txn_id: None,
-            })
-            .await;
+        let mut record =
+            BucketKeyRecord::new(BucketKeyRef::new(bucket_id, 1), vault_id, [5; 32], 1);
+        record.vault_entry = Some(vault_id);
+        let other = BucketKeyRecord::new(BucketKeyRef::new(other_id, 1), vault_id, [5; 32], 1);
+        let vault_key = VaultEntry::new(VaultPurpose::BucketKey, vault_id).key();
+        let suffixed = |id: Ulid| [&id.to_bytes()[..], b"row"].concat();
+        let rows = [
+            (
+                BUCKET_ENCRYPTION_KEYSPACE,
+                bucket.as_bytes().to_vec(),
+                settings.to_bytes().unwrap(),
+            ),
+            (
+                BUCKET_KEY_KEYSPACE,
+                record.key.key(),
+                record.to_bytes().unwrap(),
+            ),
+            (
+                BUCKET_KEY_KEYSPACE,
+                other.key.key(),
+                other.to_bytes().unwrap(),
+            ),
+            (BUCKET_HOLDER_KEYSPACE, suffixed(bucket_id), vec![1]),
+            (KEY_COPY_KEYSPACE, suffixed(bucket_id), vec![1]),
+            (NODE_VAULT_KEYSPACE, vault_key.clone(), vec![1]),
+        ];
+        for (key_space, key, value) in rows.clone() {
+            storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await;
+        }
 
         drive(DeleteBucketOperation::new(bucket.clone()), &driver_ctx)
             .await
             .unwrap();
 
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-                key: bucket.into(),
-                txn_id: None,
-            })
-            .await
-        else {
-            panic!("missing read result");
-        };
-        assert!(value.is_none());
+        // Every row of the bucket goes; the keys of another bucket stay.
+        for (index, (key_space, key, _)) in rows.into_iter().enumerate() {
+            let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: key_space.to_string(),
+                    key: key.into(),
+                    txn_id: None,
+                })
+                .await
+            else {
+                panic!("missing read result");
+            };
+            assert_eq!(value.is_some(), index == 2, "row {index} of {key_space}");
+        }
+    }
+
+    #[test]
+    fn commit_locks_keys() {
+        let mut operation = DeleteBucketOperation::new("bucket".to_string());
+        let bucket_id = Ulid::generate();
+        operation.bucket_id = Some(bucket_id);
+        operation.state = DeleteBucketState::CommitTransaction;
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: Ulid::generate(),
+        }));
+        let lock = Effect::Blob(BlobEffect::LockKey {
+            bucket_id,
+            session: None,
+        });
+        assert!(effects.contains(&lock), "{effects:?}");
     }
 
     #[tokio::test]
