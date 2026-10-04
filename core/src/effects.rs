@@ -245,6 +245,16 @@ pub enum BlobEffect {
         target: ResolvedBackend,
         grants_only: bool,
     },
+    /// Seals one part of an encrypted upload as a Pithos piece with the plan in `resolved`.
+    /// The piece records a content tree at `content_offset` when one is given.
+    WritePiece {
+        upload_id: Ulid,
+        part_number: u16,
+        resolved: ResolvedBackend,
+        created_by: UserId,
+        content_offset: Option<u64>,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
     /// Hands out the unlocked key of `key`, for its node vault copy when a bucket leaves
     /// `vault_locked`. A locked generation answers `Locked`.
     ReadUnlockedKey {

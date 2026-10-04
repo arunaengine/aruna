@@ -23,7 +23,7 @@ use crate::structs::storage::blob::{BackendLocation, HiddenBlobEntry};
 use crate::structs::storage::encryption::{
     BucketKeyRef, KeyTicket, ReadLease, SealedCopy, UnlockStatus,
 };
-use crate::structs::storage::multipart::BackendUpload;
+use crate::structs::storage::multipart::{BackendUpload, PartPiece};
 use crate::structs::storage::replication::{ReplicationItemError, ReplicationSuboperationResult};
 use crate::structs::storage::routing::GroupRoutingInputs;
 use crate::{
@@ -192,6 +192,11 @@ pub enum BlobEvent {
     /// The new copy of a rewrite; its reservation is held until released.
     CopyRewritten {
         location: BackendLocation,
+    },
+    /// A part sealed as a Pithos piece; the location holds the original size and checksums.
+    PieceWritten {
+        location: BackendLocation,
+        piece: PartPiece,
     },
     UnlockedKeyRead {
         key: BucketKeyRef,

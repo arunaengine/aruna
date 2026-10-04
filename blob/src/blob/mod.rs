@@ -24,6 +24,7 @@ mod io;
 pub mod pithos;
 mod pithos_hash;
 mod pithos_rewrite;
+mod pithos_parts;
 mod registry;
 mod replication;
 mod runtime;
