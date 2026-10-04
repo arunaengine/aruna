@@ -14,6 +14,7 @@ pub mod key_grant;
 pub mod key_install;
 pub mod key_removal;
 pub mod key_rows;
+pub mod key_unlock;
 pub mod list;
 pub mod placement;
 pub mod routing;
