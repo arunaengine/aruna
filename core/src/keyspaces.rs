@@ -105,6 +105,8 @@ pub const BUCKET_KEY_KEYSPACE: &str = "bucket_keys";
 pub const BUCKET_HOLDER_KEYSPACE: &str = "bucket_holders";
 /// Bucket private keys sealed to user keys, keyed by bucket id, generation and holder.
 pub const KEY_COPY_KEYSPACE: &str = "bucket_key_copies";
+/// Encryption settings of node-local buckets, keyed by bucket name. No row means off.
+pub const BUCKET_ENCRYPTION_KEYSPACE: &str = "bucket_encryption";
 /// Complete locations of archives whose content hash is unknown, keyed by archive id and backend.
 pub const PENDING_LOCATION_KEYSPACE: &str = "pending_locations";
 /// The versions that use each Pithos archive, keyed by archive and version.
@@ -368,6 +370,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BUCKET_KEY_KEYSPACE,
     BUCKET_HOLDER_KEYSPACE,
     KEY_COPY_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE,
     PENDING_LOCATION_KEYSPACE,
     COPY_OWNER_KEYSPACE,
     HIDDEN_RESERVATION_KEYSPACE,

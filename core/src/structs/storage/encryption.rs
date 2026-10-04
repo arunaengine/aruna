@@ -99,7 +99,8 @@ pub enum BlockKeys {
     Unique,
 }
 
-/// Encryption settings and write fences of one node-local bucket, kept in its `BucketInfo`.
+/// Encryption settings and write fences of one node-local bucket, kept in `bucket_encryption`
+/// under the bucket name. A bucket without a row does not encrypt.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BucketEncryption {
     pub mode: EncryptionMode,
@@ -125,6 +126,22 @@ impl BucketEncryption {
     pub fn active_key(&self) -> Option<BucketKeyRef> {
         let bucket_id = self.bucket_id.filter(|_| self.is_encrypted())?;
         Some(BucketKeyRef::new(bucket_id, self.key_generation))
+    }
+
+    /// The settings of a bucket from its row; no row means encryption off.
+    pub fn from_row(row: Option<&[u8]>) -> Result<Self, ConversionError> {
+        row.map_or_else(|| Ok(Self::default()), Self::from_bytes)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        self.checked()?;
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        let settings: Self = postcard::from_bytes(bytes)?;
+        settings.checked()?;
+        Ok(settings)
     }
 
     /// An encrypting bucket needs its stable id and a key generation.
@@ -540,6 +557,19 @@ mod tests {
         assert_eq!(settings.active_key(), Some(active));
         settings.mode = EncryptionMode::Off;
         assert_eq!(settings.active_key(), None);
+
+        assert_eq!(
+            BucketEncryption::from_row(None).unwrap(),
+            BucketEncryption::default()
+        );
+        settings.mode = EncryptionMode::VaultLocked;
+        settings.max_unlock_ms = Some(60_000);
+        let row = settings.to_bytes().unwrap();
+        assert_eq!(BucketEncryption::from_row(Some(&row)).unwrap(), settings);
+        settings.key_generation = 0;
+        assert!(settings.to_bytes().is_err());
+        let broken = postcard::to_allocvec(&settings).unwrap();
+        assert!(BucketEncryption::from_row(Some(&broken)).is_err());
     }
 
     #[test]

@@ -7,8 +7,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
-    RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+    RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{BlobHeadKey, BucketInfo, VersionKey};
@@ -322,10 +322,12 @@ impl DeleteBucketOperation {
 
     fn delete_bucket_records(&mut self) -> Effects {
         self.state = DeleteBucketState::DeleteBucket;
-        let mut deletes = vec![(
-            S3_BUCKET_KEYSPACE.to_string(),
-            self.bucket.as_bytes().to_vec().into(),
-        )];
+        let bucket = self.bucket.as_bytes().to_vec();
+        let mut deletes = vec![
+            (S3_BUCKET_KEYSPACE.to_string(), bucket.clone().into()),
+            // A bucket created again under this name starts without encryption.
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.into()),
+        ];
         deletes.append(&mut self.relationship_deletes);
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
             deletes,
@@ -528,6 +530,69 @@ mod test {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: bucket.into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing read result");
+        };
+        assert!(value.is_none());
+    }
+
+    #[tokio::test]
+    async fn removes_encryption_settings() {
+        use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let bucket = "bucket-a".to_string();
+        let info = BucketInfo {
+            group_id: Ulid::generate(),
+            created_at: SystemTime::now(),
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+        };
+        drive(
+            CreateBucketOperation::new(bucket.clone(), info),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+        let settings = BucketEncryption {
+            mode: EncryptionMode::NodeManaged,
+            bucket_id: Some(Ulid::generate()),
+            key_generation: 1,
+            ..Default::default()
+        };
+        storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                key: bucket.clone().into(),
+                value: settings.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+
+        drive(DeleteBucketOperation::new(bucket.clone()), &driver_ctx)
+            .await
+            .unwrap();
+
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
                 key: bucket.into(),
                 txn_id: None,
             })
