@@ -193,17 +193,22 @@ impl SealPlan {
         }))
     }
 
-    /// Fails when the bucket moved to another key or stored format since the plan was taken.
+    /// Fails unless the bucket still seals to exactly this key and stored format. Another
+    /// bucket id, mode off or a new generation all count as a different key.
     pub fn still_current(&self, settings: &BucketEncryption) -> Result<(), BucketKeyError> {
-        let (requested, current) = if settings.active_key() != Some(self.key) {
-            (self.key.generation, settings.key_generation)
-        } else {
-            (self.storage_generation, settings.storage_generation)
-        };
-        match requested == current {
-            true => Ok(()),
-            false => Err(BucketKeyError::StaleGeneration { requested, current }),
+        if settings.active_key() != Some(self.key) {
+            return Err(BucketKeyError::StaleGeneration {
+                requested: self.key.generation,
+                current: settings.key_generation,
+            });
         }
+        if settings.storage_generation != self.storage_generation {
+            return Err(BucketKeyError::StaleGeneration {
+                requested: self.storage_generation,
+                current: settings.storage_generation,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -598,6 +603,16 @@ mod tests {
         settings.key_generation = 2;
         assert!(plan.still_current(&settings).is_err());
         assert!(SealPlan::capture(&settings, &record).is_err());
+
+        // Equal numbers do not hide another bucket id or a switch to off.
+        settings.key_generation = 1;
+        plan.still_current(&settings).unwrap();
+        let mut other = settings.clone();
+        other.bucket_id = Some(Ulid::from_bytes([9; 16]));
+        assert!(plan.still_current(&other).is_err());
+        let mut off = settings.clone();
+        off.mode = EncryptionMode::Off;
+        assert!(plan.still_current(&off).is_err());
     }
 
     #[test]
