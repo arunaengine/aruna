@@ -36,10 +36,12 @@ use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
-    ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, ManagedCopyKey, VersionKey,
+    ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
+    BlobVersionState, CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
-use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, BucketKeyRef};
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
+};
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectKey, MultipartObjectSummary,
 };
@@ -47,6 +49,7 @@ use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::Effects;
 use aruna_core::{NodeId, UserId};
 use bytes::Bytes;
+use futures_util::StreamExt;
 use smallvec::{SmallVec, smallvec};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -315,6 +318,8 @@ pub struct GetObjectOperation {
     output: Option<Result<GetObjectResult, GetObjectError>>,
     /// Active key of an encrypting bucket whose reference version is read.
     reference_key: Option<BucketKeyRef>,
+    /// Admitted plaintext read of that bucket; the served stream keeps it until it ends.
+    reference_lease: Option<ReadLease>,
 }
 
 impl GetObjectOperation {
@@ -353,6 +358,7 @@ impl GetObjectOperation {
             source_policies: Vec::new(),
             output: None,
             reference_key: None,
+            reference_lease: None,
         }
     }
 
@@ -820,9 +826,8 @@ impl GetObjectOperation {
         let mut effects: Effects =
             smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
         if let Some(key) = self.reference_key {
-            effects.push(Effect::Blob(BlobEffect::ReadKeyStatus {
-                bucket_id: key.bucket_id,
-            }));
+            let archive = reference_archive(key);
+            effects.push(Effect::Blob(BlobEffect::AdmitRead { key, archive }));
         }
         effects
     }
@@ -832,20 +837,20 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
         match event {
-            Event::Blob(BlobEvent::KeyStatus { generations })
-                if generations
-                    .iter()
-                    .any(|status| status.key == key && status.active) =>
+            Event::Blob(BlobEvent::ReadAdmitted { lease })
+                if lease.key == key && lease.archive == reference_archive(key) =>
             {
+                self.reference_lease = Some(lease);
                 self.state = GetObjectState::HeadReferenceSource;
                 smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })]
             }
-            Event::Blob(BlobEvent::KeyStatus { .. }) => {
-                self.emit_error(locked(BucketKeyError::Locked(key.bucket_id)))
+            Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
+                self.emit_error(locked(error))
             }
+            Event::Blob(BlobEvent::Error(_)) => self.emit_error(GetObjectError::GetObjectFailed),
             other => self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
-                expected: "Event::Blob(BlobEvent::KeyStatus)",
+                expected: "Event::Blob(BlobEvent::ReadAdmitted)",
                 received: other,
             }),
         }
@@ -1385,9 +1390,15 @@ impl GetObjectOperation {
     }
 
     fn finish_reference_output(&mut self) -> Effects {
-        let Some(blob) = self.reference_stream.take() else {
+        let Some(mut blob) = self.reference_stream.take() else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
+        if let Some(lease) = self.reference_lease.take() {
+            blob = BackendStream(Box::pin(blob.0.map(move |chunk| {
+                let _lease = &lease;
+                chunk
+            })));
+        }
         let Some(source_metadata) = self.source_metadata.clone() else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
@@ -1411,6 +1422,11 @@ impl GetObjectOperation {
         }));
         smallvec![]
     }
+}
+
+/// A reference version has no archive, so its lease names the bucket id, which no archive uses.
+fn reference_archive(key: BucketKeyRef) -> ArchiveKey {
+    ArchiveKey::new(key.bucket_id, BackendRef::node_default())
 }
 
 fn locked(error: BucketKeyError) -> GetObjectError {

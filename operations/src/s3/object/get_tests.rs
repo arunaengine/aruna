@@ -1919,7 +1919,7 @@ mod sealed {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation, BackendRef};
     use aruna_core::structs::storage::encryption::{
-        BucketEncryption, BucketKeyError, BucketKeyRef, EncryptionMode, ReadLease, UnlockStatus,
+        BucketEncryption, BucketKeyError, BucketKeyRef, EncryptionMode, ReadLease,
     };
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
     use std::collections::HashMap;
@@ -2059,13 +2059,14 @@ mod sealed {
             ..Default::default()
         };
         let (mut operation, effects) = reference(&settings);
+        let archive = ArchiveKey::new(key().bucket_id, BackendRef::node_default());
         assert!(effects.iter().any(|effect| matches!(
             effect,
-            Effect::Blob(BlobEffect::ReadKeyStatus { bucket_id }) if *bucket_id == key().bucket_id
+            Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: named })
+                if *admitted == key() && *named == archive
         )));
-        operation.step(Event::Blob(BlobEvent::KeyStatus {
-            generations: Vec::new(),
-        }));
+        let locked = BlobError::BucketKey(BucketKeyError::Locked(key().bucket_id));
+        operation.step(Event::Blob(BlobEvent::Error(locked)));
         assert_eq!(
             operation.finalize().err(),
             Some(GetObjectError::ConversionError(ConversionError::BucketKey(
@@ -2073,22 +2074,16 @@ mod sealed {
             )))
         );
 
+        // An unlocked bucket admits the read, and its lease rides with the source stream.
         let (mut operation, _) = reference(&settings);
-        let unlocked = UnlockStatus {
-            key: key(),
-            session_id: Ulid::generate(),
-            active: true,
-            unlocked_at: SystemTime::UNIX_EPOCH,
-            remaining: None,
-            max_remaining: None,
-        };
-        let effects = operation.step(Event::Blob(BlobEvent::KeyStatus {
-            generations: vec![unlocked],
-        }));
+        let guard = Arc::new(());
+        let lease = ReadLease::new(key(), archive, Ulid::generate(), guard.clone());
+        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
         assert!(matches!(
             effects.as_slice(),
             [Effect::StagingSource(StagingSourceEffect::Head { .. })]
         ));
+        assert_eq!(Arc::strong_count(&guard), 2);
     }
 
     #[test]
