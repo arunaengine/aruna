@@ -12,6 +12,7 @@ pub mod get;
 pub mod holders;
 pub mod key_grant;
 pub mod key_install;
+pub mod key_removal;
 pub mod key_rows;
 pub mod list;
 pub mod placement;
