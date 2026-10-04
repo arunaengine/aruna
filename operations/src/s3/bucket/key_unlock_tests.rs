@@ -114,7 +114,7 @@ fn intent_before_activation() {
         key: ticket().key,
         session_id: ticket().session_id,
         active: true,
-        unlocked_at: SystemTime::UNIX_EPOCH,
+        unlocked_at: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
         remaining: Some(Duration::from_secs(60)),
         max_remaining: Some(Duration::from_secs(3_600)),
     };
@@ -131,7 +131,12 @@ fn intent_before_activation() {
     let after = Duration::from_secs(60);
     let event = aruna_core::task::TaskEvent::TimerScheduled { key, after };
     let effects = operation.step(Event::Task(event));
-    assert_eq!(audited(&effects).outcome, AuditOutcome::Applied);
+    // The applied record states the deadline of the session as activated.
+    let applied = audited(&effects);
+    assert_eq!(
+        (applied.outcome, applied.deadline_ms),
+        (AuditOutcome::Applied, Some(65_000))
+    );
     operation.step(Event::Storage(StorageEvent::WriteResult {
         key: Key::from(Vec::new()),
     }));

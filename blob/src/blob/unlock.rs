@@ -38,6 +38,8 @@ struct Session {
     active: bool,
     unlocked_at: SystemTime,
     prepared_at: Instant,
+    /// The requested duration and maximum; they start counting at activation.
+    bounds: (Option<Duration>, Option<Duration>),
     deadline: Option<Instant>,
     max_deadline: Option<Instant>,
 }
@@ -154,18 +156,21 @@ impl UnlockRegistry {
             active: false,
             unlocked_at: now.1,
             prepared_at: now.0,
-            deadline: duration.map(|duration| now.0 + duration),
-            max_deadline: max.map(|max| now.0 + max),
+            bounds: (duration, max),
+            deadline: None,
+            max_deadline: None,
         });
         Ok(KeyTicket { key, session_id })
     }
 
     /// Starts admitting reads with a prepared key; it replaces an older session of the generation.
+    /// The session's bounds start now, after the audit intent was stored.
     pub(super) fn activate(
         &mut self,
         ticket: KeyTicket,
-        now: Instant,
+        now: (Instant, SystemTime),
     ) -> Result<UnlockStatus, BucketKeyError> {
+        let (now, unlocked_at) = now;
         self.purge(now);
         let sessions = self
             .sessions
@@ -176,7 +181,11 @@ impl UnlockRegistry {
             .position(|session| !session.active && session.session_id == ticket.session_id)
             .ok_or(BucketKeyError::SessionMismatch)?;
         let mut session = sessions.swap_remove(index);
+        let (duration, max) = session.bounds;
         session.active = true;
+        session.unlocked_at = unlocked_at;
+        session.deadline = duration.map(|duration| now + duration);
+        session.max_deadline = max.map(|max| now + max);
         let status = session.status(ticket.key, now);
         sessions.clear();
         sessions.push(session);
@@ -363,7 +372,7 @@ impl super::BlobHandler {
                 )
                 .map(|ticket| BlobEvent::KeyPrepared { ticket }),
             BlobEffect::ActivateKey { ticket } => registry
-                .activate(ticket, now)
+                .activate(ticket, (now, SystemTime::now()))
                 .map(|status| BlobEvent::KeyActivated { status }),
             BlobEffect::DiscardKey { ticket } => {
                 registry.discard(ticket);

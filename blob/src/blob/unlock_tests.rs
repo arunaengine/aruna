@@ -41,7 +41,7 @@ fn unlock(
         bounds,
         (now, SystemTime::now()),
     )?;
-    registry.activate(ticket, now)?;
+    registry.activate(ticket, (now, SystemTime::now()))?;
     Ok(ticket)
 }
 
@@ -72,7 +72,7 @@ fn admits_after_activation() {
     // A prepared key admits nothing until it is activated.
     assert!(registry.admit(key, archive(1), now).is_err());
     assert!(!registry.status(key.bucket_id, now)[0].active);
-    registry.activate(ticket, now).unwrap();
+    registry.activate(ticket, (now, SystemTime::now())).unwrap();
     let lease = registry.admit(key, archive(1), now).unwrap();
     assert_eq!(lease.session_id, ticket.session_id);
     let other = reference(1, 2);
@@ -84,6 +84,40 @@ fn admits_after_activation() {
     registry.discard(ticket);
     assert!(registry.status(key.bucket_id, now).is_empty());
     assert!(registry.admit(key, archive(1), now).is_err());
+}
+
+#[test]
+fn bounds_start_at_activation() {
+    let mut registry = UnlockRegistry::new(UNLOCKED_BUCKETS);
+    let prepared_at = Instant::now();
+    let key = reference(1, 1);
+    let public = public_key_of(private(1).bytes()).unwrap();
+    let bounds = (Some(MINUTE), Some(2 * MINUTE));
+    let ticket = registry
+        .prepare(
+            key,
+            &public,
+            private(1),
+            bounds,
+            (prepared_at, SystemTime::now()),
+        )
+        .unwrap();
+    // Audit work before activation does not shorten the unlock.
+    let activated_at = prepared_at + Duration::from_secs(20);
+    let status = registry
+        .activate(ticket, (activated_at, SystemTime::now()))
+        .unwrap();
+    assert_eq!(
+        (status.remaining, status.max_remaining),
+        (Some(MINUTE), Some(2 * MINUTE))
+    );
+    let before = activated_at + Duration::from_secs(59);
+    assert!(registry.admit(key, archive(1), before).is_ok());
+    assert!(
+        registry
+            .admit(key, archive(1), activated_at + MINUTE)
+            .is_err()
+    );
 }
 
 #[test]
