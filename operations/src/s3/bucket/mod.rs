@@ -22,5 +22,6 @@ pub mod placement;
 pub mod routing;
 pub mod search;
 pub mod usage;
+pub mod rotate;
 pub mod key_startup;
 pub mod seal_missing;
