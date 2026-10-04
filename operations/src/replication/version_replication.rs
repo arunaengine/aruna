@@ -624,6 +624,8 @@ pub enum ReplicateObjectError {
     InvalidReferenceAdvance,
     #[error("Missing blob hash")]
     MissingBlobHash,
+    #[error("encrypted versions are not replicated")]
+    EncryptedVersion,
     #[error("Multipart metadata incomplete: expected {expected} parts, found {actual}")]
     PartCountMismatch { expected: usize, actual: usize },
     #[error("operation did not finish")]
@@ -2235,6 +2237,9 @@ impl ReplicateObjectOperation {
                     metadata,
                     advance_count,
                 })
+            }
+            BlobVersionState::PendingContent { .. } => {
+                self.fail(ReplicateObjectError::EncryptedVersion)
             }
         }
     }

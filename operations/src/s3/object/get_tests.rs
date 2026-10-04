@@ -17,6 +17,7 @@ use aruna_blob::hash::Hasher;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
+use aruna_core::errors::ConversionError;
 use aruna_core::events::SubOperationEvent;
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
@@ -34,9 +35,10 @@ use aruna_core::structs::execution::staging::{
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BlobVersionState, CurrentVersionPointer, VersionKey,
+    ArchiveKey, Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey,
+    BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::{MultipartChecksumType, MultipartObjectSummary};
@@ -272,6 +274,42 @@ fn reports_missing_blob() {
             version_id: Some(seen),
             ..
         })) if hash == blake3 && seen == version_id
+    ));
+}
+
+#[test]
+fn pending_content_refused() {
+    let version_id = Ulid::generate();
+    let mut operation = GetObjectOperation::new(GetObjectInput {
+        bucket: "bucket".to_string(),
+        key: "sealed.bin".to_string(),
+        version_id: Some(version_id),
+        range: None,
+        group_id: Ulid::generate(),
+        user_identity: UserId::nil(RealmId::from_bytes([3u8; 32])),
+        node_id: test_node_id(),
+    });
+    operation.txn_id = Some(Ulid::generate());
+    let location = ArchiveKey::new(Ulid::generate(), BackendRef::node_default());
+    let version = BlobVersion::pending(
+        location,
+        SystemTime::UNIX_EPOCH,
+        operation.input.user_identity,
+        None,
+    );
+
+    // Nothing is read for an archive whose content hash is unknown.
+    let effects = operation.read_version(version_id, version, true);
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Blob(_)))
+    );
+    assert!(matches!(
+        operation.output,
+        Some(Err(GetObjectError::ConversionError(
+            ConversionError::BucketKey(BucketKeyError::Unsupported)
+        )))
     ));
 }
 

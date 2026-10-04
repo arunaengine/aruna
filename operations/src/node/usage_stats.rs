@@ -774,7 +774,7 @@ impl RebuildStatsOperation {
                         BlobVersionState::Reference {
                             cached_metadata, ..
                         } => Some((0, cached_metadata.content_length)),
-                        BlobVersionState::Deleted => None,
+                        BlobVersionState::Deleted | BlobVersionState::PendingContent { .. } => None,
                     }) else {
                         continue;
                     };

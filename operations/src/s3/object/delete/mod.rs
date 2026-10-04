@@ -90,7 +90,9 @@ impl VersionSummary {
             BlobVersionState::Reference {
                 cached_metadata, ..
             } => (None, Some(cached_metadata.content_length), true),
-            BlobVersionState::Deleted => (None, None, false),
+            BlobVersionState::Deleted | BlobVersionState::PendingContent { .. } => {
+                (None, None, false)
+            }
         };
         Self {
             version_id,

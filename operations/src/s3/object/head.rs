@@ -24,6 +24,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
+use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -341,6 +342,9 @@ impl HeadObjectOperation {
                 } else {
                     self.finish_lookup()
                 }
+            }
+            BlobVersionState::PendingContent { .. } => {
+                self.emit_error(ConversionError::BucketKey(BucketKeyError::Unsupported).into())
             }
         }
     }

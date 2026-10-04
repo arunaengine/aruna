@@ -152,6 +152,8 @@ pub enum IncomingVersionError {
     ManifestPermissionDenied,
     #[error("Replication hop limit exceeded")]
     HopLimitExceeded,
+    #[error("encrypted versions are not replicated")]
+    EncryptedVersion,
     #[error("Reference replication manifest is missing source metadata")]
     MissingReferenceMetadata,
     #[error("Reference replication manifest is missing source binding")]
@@ -2235,6 +2237,9 @@ impl IncomingVersionOperation {
                         .send_negotiation(ReplicationNegotiationResult::AlreadyReplicatedVersion);
                 }
                 BlobVersionState::Deleted => {}
+                BlobVersionState::PendingContent { .. } => {
+                    return self.reject_negotiation(IncomingVersionError::EncryptedVersion);
+                }
             }
         }
 

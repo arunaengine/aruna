@@ -538,7 +538,9 @@ fn observed_bytes(version: &BlobVersion) -> u64 {
         BlobVersionState::Reference {
             cached_metadata, ..
         } => cached_metadata.content_length,
-        BlobVersionState::Materialized { .. } | BlobVersionState::Deleted => 0,
+        BlobVersionState::Materialized { .. }
+        | BlobVersionState::Deleted
+        | BlobVersionState::PendingContent { .. } => 0,
     }
 }
 

@@ -533,7 +533,7 @@ impl ListBucketOperation {
                         continue;
                     };
                     match version.state {
-                        BlobVersionState::Deleted => {}
+                        BlobVersionState::Deleted | BlobVersionState::PendingContent { .. } => {}
                         BlobVersionState::Reference {
                             source,
                             cached_metadata,

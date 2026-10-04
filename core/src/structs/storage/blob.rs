@@ -1111,6 +1111,22 @@ impl BlobVersion {
         }
     }
 
+    pub fn pending(
+        archive: ArchiveKey,
+        created_at: SystemTime,
+        created_by: UserId,
+        source: Option<VersionSourceBinding>,
+    ) -> Self {
+        Self {
+            created_at,
+            created_by,
+            state: BlobVersionState::PendingContent { archive, source },
+            metadata: HashMap::new(),
+            published_by: None,
+            placement_policies: Vec::new(),
+        }
+    }
+
     pub fn deleted(created_at: SystemTime, created_by: UserId) -> Self {
         Self {
             created_at,
@@ -1232,20 +1248,68 @@ pub enum BlobVersionState {
         advance_count: u16,
     },
     Deleted,
+    /// An encrypted archive whose raw BLAKE3 is not known yet. Its location lives in
+    /// `pending_locations` until a verified read records the content hash.
+    PendingContent {
+        archive: ArchiveKey,
+        source: Option<VersionSourceBinding>,
+    },
+}
+
+/// Names one physical Pithos archive: the per-write id in its path and the backend holding it.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveKey {
+    pub archive_id: Ulid,
+    pub backend: BackendRef,
+}
+
+impl ArchiveKey {
+    pub fn new(archive_id: Ulid, backend: BackendRef) -> Self {
+        Self {
+            archive_id,
+            backend,
+        }
+    }
+
+    /// The archive of a stored location: its write id and backend.
+    pub fn of(location: &BackendLocation) -> Self {
+        Self::new(location.ulid, location.backend.clone())
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        [&self.archive_id.to_bytes()[..], &self.backend.key_bytes()].concat()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        let (id, backend) = bytes.split_first_chunk::<16>().ok_or_else(|| {
+            ConversionError::InvalidLength("archive key is too short".to_string())
+        })?;
+        Ok(Self::new(
+            Ulid::from_bytes(*id),
+            BackendRef::from_key_bytes(backend)?,
+        ))
+    }
 }
 
 impl BlobVersionState {
     pub fn blob_hash(&self) -> Option<&[u8; 32]> {
         match self {
             Self::Materialized { blob_hash, .. } => Some(blob_hash),
-            Self::Reference { .. } | Self::Deleted => None,
+            Self::Reference { .. } | Self::Deleted | Self::PendingContent { .. } => None,
         }
     }
 
     pub fn blob_backend(&self) -> Option<&BackendRef> {
         match self {
             Self::Materialized { backend, .. } => Some(backend),
-            Self::Reference { .. } | Self::Deleted => None,
+            Self::Reference { .. } | Self::Deleted | Self::PendingContent { .. } => None,
+        }
+    }
+
+    pub fn pending_archive(&self) -> Option<&ArchiveKey> {
+        match self {
+            Self::PendingContent { archive, .. } => Some(archive),
+            Self::Materialized { .. } | Self::Reference { .. } | Self::Deleted => None,
         }
     }
 
@@ -1257,13 +1321,15 @@ impl BlobVersionState {
                 encoding,
                 ..
             } => Some(BlobLocationKey::new(*blob_hash, *encoding, backend.clone())),
-            Self::Reference { .. } | Self::Deleted => None,
+            Self::Reference { .. } | Self::Deleted | Self::PendingContent { .. } => None,
         }
     }
 
     pub fn source_binding(&self) -> Option<&VersionSourceBinding> {
         match self {
-            Self::Materialized { source, .. } => source.as_ref(),
+            Self::Materialized { source, .. } | Self::PendingContent { source, .. } => {
+                source.as_ref()
+            }
             Self::Reference { source, .. } => Some(source),
             Self::Deleted => None,
         }
@@ -1272,7 +1338,7 @@ impl BlobVersionState {
     pub fn advance_count(&self) -> Option<u16> {
         match self {
             Self::Reference { advance_count, .. } => Some(*advance_count),
-            Self::Materialized { .. } | Self::Deleted => None,
+            Self::Materialized { .. } | Self::Deleted | Self::PendingContent { .. } => None,
         }
     }
 
@@ -1362,11 +1428,11 @@ impl UserAccess {
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-        BucketCorsConfiguration, BucketCorsRule, BucketInfo, CurrentVersionPointer, HashIndex,
-        HiddenBlobKey, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
-        VersionKey, bucket_permission_path, group_permission_path, key_content_type,
-        object_permission_path,
+        ArchiveKey, Backend, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey,
+        BlobVersion, BucketCorsConfiguration, BucketCorsRule, BucketInfo, CurrentVersionPointer,
+        HashIndex, HiddenBlobKey, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
+        ManagedCopyState, VersionKey, bucket_permission_path, group_permission_path,
+        key_content_type, object_permission_path,
     };
     use crate::NodeId;
     use crate::UserId;
@@ -1968,6 +2034,39 @@ mod tests {
         );
         assert_eq!(version, restored);
         assert_eq!(restored.to_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn pending_versions_roundtrip() {
+        let location = ArchiveKey::new(Ulid::from_bytes([4u8; 16]), BackendRef::node_default());
+        assert_eq!(
+            ArchiveKey::from_bytes(&location.to_bytes()).unwrap(),
+            location
+        );
+        let grouped = ArchiveKey::new(
+            location.archive_id,
+            BackendRef::Group(Ulid::from_bytes([5u8; 16])),
+        );
+        assert_eq!(
+            ArchiveKey::from_bytes(&grouped.to_bytes()).unwrap(),
+            grouped
+        );
+        assert!(ArchiveKey::from_bytes(&[1u8; 8]).is_err());
+
+        let version = BlobVersion::pending(
+            location.clone(),
+            SystemTime::UNIX_EPOCH,
+            UserId::default(),
+            None,
+        );
+        let restored = BlobVersion::from_bytes(&version.to_bytes().unwrap()).unwrap();
+        assert_eq!(restored, version);
+        // A pending archive claims no content identity and no hash-keyed location.
+        assert_eq!(restored.blob_hash(), None);
+        assert_eq!(restored.location_key(), None);
+        assert_eq!(restored.blob_backend(), None);
+        assert!(!restored.is_materialized() && !restored.is_deleted());
+        assert_eq!(restored.state.pending_archive(), Some(&location));
     }
 
     #[test]

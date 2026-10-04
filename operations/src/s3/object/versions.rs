@@ -554,6 +554,7 @@ impl ListVersionsOperation {
                         governed,
                     });
                 }
+                BlobVersionState::PendingContent { .. } => {}
             }
         }
 
