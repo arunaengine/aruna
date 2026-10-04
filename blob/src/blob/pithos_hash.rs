@@ -6,14 +6,10 @@ use super::BlobHandler;
 use crate::hash::Hasher;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
-use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation};
-use aruna_core::structs::storage::encryption::{BucketKeyError, ReadLease};
+use aruna_core::structs::storage::blob::BackendLocation;
+use aruna_core::structs::storage::encryption::ReadLease;
 use aruna_core::structs::storage::format::StoredLayout;
 use futures::StreamExt;
-use pithos_lib::archive::AccessKeys;
-use pithos_lib::crypto::PrivateKey;
-use std::time::Instant;
-use zeroize::Zeroizing;
 
 impl BlobHandler {
     /// Reads every block of `location` through `lease`; each block is checked on read, so the
@@ -37,24 +33,7 @@ impl BlobHandler {
         let StoredLayout::Pithos(layout) = &location.format.layout else {
             return Err(BlobError::ReadError("only sealed copies hash here".into()));
         };
-        let key = location
-            .format
-            .bucket_key()
-            .ok_or_else(super::pithos::needs_bucket_key)?;
-        if lease.key != key || lease.archive != ArchiveKey::of(location) {
-            return Err(BucketKeyError::Locked(key.bucket_id).into());
-        }
-        let (secret, _) = match self.unlocks.lock() {
-            Ok(mut registry) => registry.unlocked_key(key, Instant::now())?,
-            Err(_) => return Err(BucketKeyError::Locked(key.bucket_id).into()),
-        };
-        let bytes = secret.bytes().expose();
-        if bytes.len() != 32 {
-            return Err(BucketKeyError::WrongKey.into());
-        }
-        let mut raw = Zeroizing::new([0u8; 32]);
-        raw.copy_from_slice(bytes);
-        let keys = AccessKeys::new().with_key(PrivateKey::from_raw(raw));
+        let keys = self.lease_keys(location, Some(lease))?;
         let operator = self.operator_from_location(location)?;
         let path = location.get_storage_path()?;
         let idle = self.transfer_idle_timeout();
