@@ -1,5 +1,5 @@
 //! Unlocks one key generation of a bucket with a key a holder opened in their client. The key is
-//! checked and prepared, an audit intent commits, and only then do reads see the key.
+//! checked and prepared, an audit intent commits and syncs, and only then do reads see the key.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -34,6 +34,7 @@ enum UnlockStep {
     PrepareKey,
     WriteIntent,
     CommitIntent,
+    SyncIntent,
     ActivateKey,
     ArmTimer,
     DiscardKey,
@@ -314,6 +315,11 @@ impl Operation for UnlockBucketOperation {
                 Event::Storage(StorageEvent::TransactionCommitted { txn_id }),
             ) if Some(txn_id) == self.txn_id => {
                 self.txn_id = None;
+                // The intent must survive a crash before any read can use the key.
+                self.step = UnlockStep::SyncIntent;
+                smallvec![Effect::Storage(StorageEffect::SyncAll)]
+            }
+            (UnlockStep::SyncIntent, Event::Storage(StorageEvent::SyncAllFinished)) => {
                 let Some(ticket) = self.ticket else {
                     return self.fail(UnlockError::NotFinished);
                 };

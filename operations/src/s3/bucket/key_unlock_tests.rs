@@ -1,4 +1,4 @@
-//! Unlock: holder authority, the audit intent before activation and a discarded failed key.
+//! Unlock: holder authority, the synced audit intent before activation and a discarded failed key.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -102,10 +102,15 @@ fn intent_before_activation() {
     operation.step(Event::Storage(StorageEvent::WriteResult {
         key: Key::from(Vec::new()),
     }));
-    // Reads see the key only after the intent committed.
+    // Reads see the key only after the intent committed and reached the disk.
     let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
         txn_id: Ulid::from_bytes([9; 16]),
     }));
+    assert_eq!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::SyncAll)]
+    );
+    let effects = operation.step(Event::Storage(StorageEvent::SyncAllFinished));
     assert_eq!(
         effects.as_slice(),
         [Effect::Blob(BlobEffect::ActivateKey { ticket: ticket() })]
@@ -153,6 +158,7 @@ fn failed_activation_discards() {
     operation.step(Event::Storage(StorageEvent::TransactionCommitted {
         txn_id: Ulid::from_bytes([9; 16]),
     }));
+    operation.step(Event::Storage(StorageEvent::SyncAllFinished));
     let refused = BlobError::BucketKey(BucketKeyError::Capacity);
     let effects = operation.step(Event::Blob(BlobEvent::Error(refused)));
     assert_eq!(
@@ -210,6 +216,7 @@ fn foreign_events_refused() {
     operation.step(Event::Storage(StorageEvent::TransactionCommitted {
         txn_id: Ulid::from_bytes([9; 16]),
     }));
+    operation.step(Event::Storage(StorageEvent::SyncAllFinished));
     let status = UnlockStatus {
         key: BucketKeyRef::new(BUCKET_ID, 1),
         session_id: ticket().session_id,
@@ -224,4 +231,24 @@ fn foreign_events_refused() {
         operation.finalize(),
         Err(UnlockError::InvalidStateEvent { .. })
     ));
+}
+
+#[test]
+fn unsynced_intent_discards() {
+    let (mut operation, _) = prepared(user(1), &[]);
+    operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket: ticket() }));
+    operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: Key::from(Vec::new()),
+    }));
+    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+        txn_id: Ulid::from_bytes([9; 16]),
+    }));
+    let error = StorageError::PersistError("disk full".to_string());
+    let effects = operation.step(Event::Storage(StorageEvent::Error { error }));
+    // The key never activates when its intent may be lost.
+    assert_eq!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() })]
+    );
+    assert!(matches!(operation.finalize(), Err(UnlockError::Storage(_))));
 }
