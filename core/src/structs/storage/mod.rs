@@ -12,6 +12,7 @@ pub mod encryption;
 pub mod format;
 pub mod group_backend;
 pub mod holders;
+pub mod key_audit;
 pub mod metadata_registry;
 pub mod multipart;
 pub mod node_info;

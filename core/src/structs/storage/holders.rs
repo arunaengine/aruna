@@ -79,6 +79,20 @@ impl HolderReport {
     }
 }
 
+/// Digest of a bucket's stored grants and copies. A removal names the revision it was decided
+/// on, so a concurrent holder change refuses it instead of breaking recovery unseen.
+pub fn holder_revision(grants: &[BucketHolder], copies: &[SealedCopy]) -> [u8; 32] {
+    let mut rows: Vec<Vec<u8>> = grants.iter().map(BucketHolder::key).collect();
+    rows.extend(copies.iter().map(SealedCopy::key));
+    rows.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    for row in rows {
+        hasher.update(&(row.len() as u64).to_be_bytes());
+        hasher.update(&row);
+    }
+    *hasher.finalize().as_bytes()
+}
+
 /// Users with WRITE on `admin_path` through the realm and group roles; a matching deny of the
 /// user wins. Public roles grant no admin rights.
 pub fn admin_users<'a>(

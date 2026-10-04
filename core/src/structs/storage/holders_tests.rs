@@ -160,3 +160,15 @@ fn unavailable_stays_unknown() {
     // The unreached admin might complete the rule, so it is not reported as broken.
     assert_eq!(report.recovery.state, RecoveryState::Unknown);
 }
+
+#[test]
+fn revision_tracks_rows() {
+    let grants = [grant(user(3), HolderOrigin::Explicit)];
+    let copies = [copy(user(1)), copy(user(3))];
+    let revision = holder_revision(&grants, &copies);
+    // Row order does not matter; any added or removed row does.
+    let reordered = [copies[1].clone(), copies[0].clone()];
+    assert_eq!(holder_revision(&grants, &reordered), revision);
+    assert_ne!(holder_revision(&[], &copies), revision);
+    assert_ne!(holder_revision(&grants, &copies[..1]), revision);
+}
