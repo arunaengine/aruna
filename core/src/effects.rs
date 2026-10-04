@@ -187,6 +187,7 @@ pub enum BlobEffect {
     /// Seals the private key of `key` to each user key; the plain key is not returned.
     SealHolderCopies {
         key: BucketKeyRef,
+        public_key: [u8; 32],
         private_key: SharedSecret,
         realm_id: RealmId,
         node_id: NodeId,

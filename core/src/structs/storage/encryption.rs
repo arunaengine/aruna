@@ -4,9 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::UserId;
-use crate::compute::SecretBytes;
+use crate::compute::{SecretBytes, SharedSecret};
 use crate::errors::ConversionError;
 use crate::id::NodeId;
+use crate::key_seal::seal_to;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::ArchiveKey;
 use crate::vault_format::key_fingerprint;
@@ -450,6 +451,48 @@ impl PartialEq for ReadLease {
     }
 }
 
+/// A fresh bucket keypair from the system random number generator.
+pub fn generate_key() -> Result<([u8; 32], SharedSecret), BucketKeyError> {
+    let mut bytes = Zeroizing::new(vec![0u8; 32]);
+    getrandom::fill(&mut bytes).map_err(|_| BucketKeyError::Seal)?;
+    let private = SecretBytes::new(std::mem::take(&mut *bytes));
+    let public = public_key_of(&private).ok_or(BucketKeyError::Seal)?;
+    Ok((public, SharedSecret::new(private)))
+}
+
+/// Seals the private key of `key` to every target, bound to this realm and node by `copy_info`.
+/// The key must match `public_key`, so a wrong key is never handed out.
+pub fn seal_copies(
+    key: BucketKeyRef,
+    public_key: &[u8; 32],
+    private: &SecretBytes,
+    origin: (RealmId, NodeId),
+    targets: &[CopyTarget],
+    now_ms: u64,
+) -> Result<Vec<SealedCopy>, BucketKeyError> {
+    if !key_matches(private, public_key) {
+        return Err(BucketKeyError::WrongKey);
+    }
+    let (realm_id, node_id) = origin;
+    targets
+        .iter()
+        .map(|target| {
+            let info = copy_info(realm_id, node_id, key, target.user_id, target.key_record);
+            let sealed = seal_to(&target.public_key, &info, &[], private.expose())
+                .map_err(|_| BucketKeyError::Seal)?;
+            Ok(SealedCopy {
+                key,
+                user_id: target.user_id,
+                key_record: target.key_record,
+                key_id: target.key_id.clone(),
+                enc: sealed.enc,
+                ciphertext: sealed.ciphertext,
+                created_at_ms: now_ms,
+            })
+        })
+        .collect()
+}
+
 /// The X25519 public key of a 32-byte private key.
 pub fn public_key_of(private: &SecretBytes) -> Option<[u8; 32]> {
     let mut bytes = Zeroizing::new([0u8; 32]);
@@ -506,6 +549,8 @@ pub enum BucketKeyError {
     Fingerprint,
     #[error("the unlock duration exceeds the bucket maximum")]
     InvalidDuration,
+    #[error("a bucket key could not be generated or sealed")]
+    Seal,
     #[error("this encrypted bucket operation is not supported yet")]
     Unsupported,
 }
@@ -513,7 +558,7 @@ pub enum BucketKeyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::key_seal::{KeySealError, open_sealed, seal_to};
+    use crate::key_seal::{KeySealError, SealedSecret, open_sealed, seal_to};
     use iroh::SecretKey;
 
     fn user(seed: u8) -> UserId {
@@ -689,6 +734,46 @@ mod tests {
         let other = ReadLease::new(key, archive, lease.session_id, Arc::new(()));
         assert_eq!(lease, same);
         assert_ne!(lease, other);
+    }
+
+    #[test]
+    fn seals_holder_copies() {
+        let (public, private) = generate_key().unwrap();
+        assert_eq!(public_key_of(private.bytes()), Some(public));
+        let realm = RealmId::from_bytes([1; 32]);
+        let node = SecretKey::from_bytes(&[2; 32]).public();
+        let key = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
+        let holder_keys = [[5u8; 32], [6u8; 32]];
+        let targets: Vec<_> = holder_keys
+            .iter()
+            .enumerate()
+            .map(|(index, secret)| CopyTarget {
+                user_id: user(index as u8 + 5),
+                key_record: Ulid::from_bytes([index as u8 + 7; 16]),
+                key_id: format!("slot-{index}"),
+                public_key: public_key_of(&SecretBytes::new(secret.to_vec())).unwrap(),
+            })
+            .collect();
+
+        let copies =
+            seal_copies(key, &public, private.bytes(), (realm, node), &targets, 9).unwrap();
+        for ((copy, target), secret) in copies.iter().zip(&targets).zip(&holder_keys) {
+            assert_eq!(
+                (copy.user_id, copy.key_record, copy.key),
+                (target.user_id, target.key_record, key)
+            );
+            let info = copy_info(realm, node, key, target.user_id, target.key_record);
+            let sealed = SealedSecret {
+                enc: copy.enc,
+                ciphertext: copy.ciphertext.clone(),
+            };
+            let opened = open_sealed(secret, &sealed, &info, &[]).unwrap();
+            assert_eq!(opened.as_slice(), private.bytes().expose());
+        }
+        // A key that does not match the generation's public key is never sealed.
+        let (other, _) = generate_key().unwrap();
+        let wrong = seal_copies(key, &other, private.bytes(), (realm, node), &targets, 9);
+        assert_eq!(wrong, Err(BucketKeyError::WrongKey));
     }
 
     #[test]

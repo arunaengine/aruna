@@ -16,7 +16,7 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::storage::blob::BackendConfig;
-use aruna_core::structs::storage::encryption::BucketKeyError;
+use aruna_core::structs::storage::encryption::{generate_key, seal_copies};
 use aruna_core::structs::storage::multipart::MultipartPartKey;
 use aruna_core::structs::{BackendState, BlobState, Status};
 use aruna_net::NetHandle;
@@ -731,8 +731,35 @@ impl BlobHandler {
             BlobEffect::CheckGroupBackend { record, secret } => {
                 Box::pin(self.check_group_backend(record, secret)).await
             }
-            BlobEffect::GenerateBucketKey | BlobEffect::SealHolderCopies { .. } => {
-                BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Unsupported))
+            BlobEffect::GenerateBucketKey => match generate_key() {
+                Ok((public_key, private_key)) => BlobEvent::BucketKeyGenerated {
+                    public_key,
+                    private_key,
+                },
+                Err(error) => BlobEvent::Error(error.into()),
+            },
+            BlobEffect::SealHolderCopies {
+                key,
+                public_key,
+                private_key,
+                realm_id,
+                node_id,
+                holders,
+            } => {
+                let now_ms = aruna_core::time::unix_timestamp_millis();
+                let origin = (realm_id, node_id);
+                let sealed = seal_copies(
+                    key,
+                    &public_key,
+                    private_key.bytes(),
+                    origin,
+                    &holders,
+                    now_ms,
+                );
+                match sealed {
+                    Ok(copies) => BlobEvent::CopiesSealed { copies },
+                    Err(error) => BlobEvent::Error(error.into()),
+                }
             }
             effect @ (BlobEffect::PrepareKey { .. }
             | BlobEffect::ActivateKey { .. }

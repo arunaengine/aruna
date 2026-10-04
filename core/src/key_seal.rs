@@ -170,6 +170,62 @@ mod tests {
     }
 
     #[test]
+    fn matches_bucket_copy() {
+        use crate::UserId;
+        use crate::structs::identity::realm::RealmId;
+        use crate::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
+        use crate::vault_format::key_fingerprint;
+        use std::str::FromStr;
+        use ulid::Ulid;
+
+        // Shared with the portal: both sides must produce and open these exact bytes.
+        let all: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/vectors/bucket-copy.json")).unwrap();
+        let text = |name: &str| all[name].as_str().unwrap();
+        let bytes = |name: &str| hex::decode(text(name)).unwrap();
+        let realm_id = RealmId::from_base64(text("realm_id")).unwrap();
+        let node_bytes: [u8; 32] = bytes("node_id").try_into().unwrap();
+        let node_id = iroh::PublicKey::from_bytes(&node_bytes).unwrap();
+        let generation = all["generation"].as_u64().unwrap();
+        let key = BucketKeyRef::new(Ulid::from_str(text("bucket_id")).unwrap(), generation);
+        let user_id = UserId::from_str(text("user_id")).unwrap();
+        let record = Ulid::from_str(text("key_record")).unwrap();
+        let info = copy_info(realm_id, node_id, key, user_id, record);
+        assert_eq!(info, bytes("info"));
+        assert!(info.starts_with(text("purpose").as_bytes()));
+
+        let sealed = SealedSecret {
+            enc: bytes("enc").try_into().unwrap(),
+            ciphertext: bytes("ciphertext"),
+        };
+        let private: [u8; 32] = bytes("recipient_private").try_into().unwrap();
+        let opened = open_sealed(&private, &sealed, &info, &bytes("aad")).unwrap();
+        assert_eq!(opened.as_slice(), bytes("bucket_private").as_slice());
+
+        let public: [u8; 32] = bytes("recipient_public").try_into().unwrap();
+        let reproduced = sealed_secret(
+            hpke::single_shot_seal_with_rng::<AesGcm256, HkdfSha256, Kem>(
+                &OpModeS::Base,
+                &public_key(&public).unwrap(),
+                &info,
+                &bytes("bucket_private"),
+                &bytes("aad"),
+                &mut FixedRng(bytes("ephemeral_ikm")),
+            ),
+        )
+        .unwrap();
+        assert_eq!(reproduced, sealed);
+
+        let bucket_public: [u8; 32] = bytes("bucket_public").try_into().unwrap();
+        let bucket_private = crate::compute::SecretBytes::new(bytes("bucket_private"));
+        assert_eq!(public_key_of(&bucket_private), Some(bucket_public));
+        assert_eq!(
+            key_fingerprint(&bucket_public).to_vec(),
+            bytes("bucket_fingerprint")
+        );
+    }
+
+    #[test]
     fn binds_seal_context() {
         let vector = vector();
         let sealed = seal_to(&vector.public, b"purpose a", b"object a", b"secret").unwrap();

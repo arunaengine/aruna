@@ -1,5 +1,4 @@
-//! Pithos copies through the writer and reader: ranges, metadata digests, keys, changed blocks
-//! and failed writes.
+//! Pithos copies through the writer and reader, and bucket keys through the blob adapter.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -401,4 +400,45 @@ async fn leases_pin_archives() {
         handler.delete_blob(location).await,
         BlobEvent::DeleteFinished
     );
+}
+
+#[tokio::test]
+async fn keys_seal_through_adapter() {
+    use aruna_core::compute::SecretBytes;
+    use aruna_core::effects::BlobEffect;
+    use aruna_core::events::Event;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::encryption::{CopyTarget, public_key_of};
+
+    let context = setup_two_backends().await;
+    let handle = &context.blob_handle;
+    let Event::Blob(BlobEvent::BucketKeyGenerated {
+        public_key,
+        private_key,
+    }) = handle.send_blob_effect(BlobEffect::GenerateBucketKey).await
+    else {
+        panic!("no key generated")
+    };
+    let holder = SecretBytes::new(vec![4; 32]);
+    let target = CopyTarget {
+        user_id: test_user_id(),
+        key_record: ulid::Ulid::generate(),
+        key_id: "slot".to_string(),
+        public_key: public_key_of(&holder).unwrap(),
+    };
+    let seal = |public_key| BlobEffect::SealHolderCopies {
+        key: BucketKeyRef::new(ulid::Ulid::generate(), 1),
+        public_key,
+        private_key: private_key.clone(),
+        realm_id: RealmId::from_bytes([1; 32]),
+        node_id: handle.handler.net.node_id(),
+        holders: vec![target.clone()],
+    };
+    let sealed = handle.send_blob_effect(seal(public_key)).await;
+    assert!(matches!(sealed, Event::Blob(BlobEvent::CopiesSealed { copies }) if copies.len() == 1));
+    let wrong = handle.send_blob_effect(seal([9; 32])).await;
+    assert!(matches!(
+        wrong,
+        Event::Blob(BlobEvent::Error(BlobError::BucketKey(_)))
+    ));
 }
