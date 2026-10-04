@@ -11,7 +11,7 @@ use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_AUDIT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
-    KEY_COPY_KEYSPACE,
+    KEY_COPY_KEYSPACE, TRANSITION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
@@ -19,10 +19,11 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketHolder, BucketKeyRecord, SealedCopy, UnlockStatus,
 };
-use aruna_core::structs::storage::key_audit::BucketAuditRecord;
+use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
+use aruna_core::structs::storage::transition::EncryptionTransition;
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use smallvec::smallvec;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -59,15 +60,21 @@ pub struct KeySnapshot {
     pub copies: Vec<SealedCopy>,
     /// Unlocked generations; a generation without an entry is locked.
     pub unlocks: Vec<UnlockStatus>,
+    /// The latest applied lock of each generation not unlocked since, with its time.
+    pub locks: BTreeMap<u64, (AuditAction, u64)>,
+    /// This node's mode change or rotation of the bucket's copies, if one was started.
+    pub transition: Option<EncryptionTransition>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StatusStep {
     Init,
     ReadBucket,
+    Transition,
     Records,
     Grants,
     Copies,
+    Audit,
     KeyStatus,
     Finish,
     Error,
@@ -112,6 +119,7 @@ impl KeyStatusOperation {
         let key_space = match step {
             StatusStep::Records => BUCKET_KEY_KEYSPACE,
             StatusStep::Grants => BUCKET_HOLDER_KEYSPACE,
+            StatusStep::Audit => BUCKET_AUDIT_KEYSPACE,
             _ => KEY_COPY_KEYSPACE,
         };
         self.step = step;
@@ -132,6 +140,22 @@ impl KeyStatusOperation {
         self.snapshot.info = Some(state.info);
         self.snapshot.settings = state.settings;
         self.snapshot.admins = state.admins;
+        self.step = StatusStep::Transition;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: TRANSITION_KEYSPACE.to_string(),
+            key: self.bucket.as_bytes().to_vec().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn read_transition(&mut self, value: Option<Value>) -> Effects {
+        match value
+            .map(|value| EncryptionTransition::from_bytes(&value))
+            .transpose()
+        {
+            Ok(transition) => self.snapshot.transition = transition,
+            Err(error) => return self.fail(error),
+        }
         match self.bucket_id() {
             Some(_) => self.scan(StatusStep::Records, None),
             None => self.finish(),
@@ -145,6 +169,9 @@ impl KeyStatusOperation {
                     .map(|record| self.snapshot.records.push(record)),
                 StatusStep::Grants => {
                     BucketHolder::from_bytes(&value).map(|grant| self.snapshot.grants.push(grant))
+                }
+                StatusStep::Audit => {
+                    BucketAuditRecord::from_bytes(&value).map(|record| self.track_lock(&record))
                 }
                 // Only user copies; other copy kinds are not part of this stage.
                 _ if SealedCopy::parse_key(&key).is_err() => Ok(()),
@@ -160,7 +187,26 @@ impl KeyStatusOperation {
         match self.step {
             StatusStep::Records => self.scan(StatusStep::Grants, None),
             StatusStep::Grants => self.scan(StatusStep::Copies, None),
+            StatusStep::Copies => self.scan(StatusStep::Audit, None),
             _ => self.read_unlocks(),
+        }
+    }
+
+    /// The trail scans in time order, so a later applied unlock clears an earlier lock.
+    fn track_lock(&mut self, record: &BucketAuditRecord) {
+        let (Some(generation), AuditOutcome::Applied) = (record.generation, record.outcome) else {
+            return;
+        };
+        match record.action {
+            AuditAction::Lock | AuditAction::TimedLock | AuditAction::RestartLock => {
+                self.snapshot
+                    .locks
+                    .insert(generation, (record.action, record.at_ms));
+            }
+            AuditAction::Unlock => {
+                self.snapshot.locks.remove(&generation);
+            }
+            _ => {}
         }
     }
 
@@ -201,8 +247,11 @@ impl Operation for KeyStatusOperation {
             (StatusStep::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.read_bucket(values)
             }
+            (StatusStep::Transition, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.read_transition(value)
+            }
             (
-                StatusStep::Records | StatusStep::Grants | StatusStep::Copies,
+                StatusStep::Records | StatusStep::Grants | StatusStep::Copies | StatusStep::Audit,
                 Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,
@@ -352,7 +401,7 @@ mod tests {
     use crate::s3::bucket::key_rows::authority_rows;
     use aruna_core::structs::storage::encryption::{BucketKeyRef, EncryptionMode};
     use aruna_core::structs::storage::format::Compression;
-    use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome};
+    use aruna_core::structs::storage::transition::{TransitionKind, TransitionTarget};
     use std::time::SystemTime;
 
     const BUCKET_ID: Ulid = Ulid::from_bytes([4; 16]);
@@ -400,8 +449,29 @@ mod tests {
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: rows,
         }));
+        assert!(matches!(
+            &effects[..],
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == TRANSITION_KEYSPACE
+        ));
+        // A decrypt that finished its mode change still reports its transition.
+        let transition = EncryptionTransition::new(
+            TransitionKind::Decrypt,
+            Some(BucketKeyRef::new(BUCKET_ID, 1)),
+            TransitionTarget {
+                compression: Compression::Off,
+                plan: None,
+            },
+            2,
+            7,
+        );
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(Vec::new()),
+            value: Some(Value::from(transition.to_bytes().unwrap())),
+        }));
         assert!(effects.is_empty());
         let snapshot = operation.finalize().unwrap();
+        assert_eq!(snapshot.transition, Some(transition));
         assert_eq!(snapshot.settings.mode, EncryptionMode::Off);
         assert_eq!(snapshot.admins, BTreeSet::from([user(2)]));
         assert!(snapshot.records.is_empty());
@@ -420,6 +490,11 @@ mod tests {
         let rows = authority_rows(&info(), Some(&settings), &[]);
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: rows,
+        }));
+        assert_eq!(effects.len(), 1);
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(Vec::new()),
+            value: None,
         }));
         assert!(matches!(
             &effects[..],
@@ -442,6 +517,34 @@ mod tests {
         ));
         operation.step(iter(Vec::new(), None));
         let effects = operation.step(iter(Vec::new(), None));
+        assert!(matches!(
+            &effects[..],
+            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
+                if key_space == BUCKET_AUDIT_KEYSPACE
+        ));
+        let event = |at_ms: u64, action, generation| BucketAuditRecord {
+            event_id: Ulid::from_parts(at_ms, 1),
+            bucket_id: BUCKET_ID,
+            at_ms,
+            action,
+            actor: None,
+            node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+            generation: Some(generation),
+            deadline_ms: None,
+            reason: None,
+            outcome: AuditOutcome::Applied,
+        };
+        let trail = [
+            event(1, AuditAction::RestartLock, 1),
+            event(2, AuditAction::Lock, 2),
+            event(3, AuditAction::Unlock, 2),
+            event(4, AuditAction::TimedLock, 3),
+        ];
+        let rows = trail
+            .iter()
+            .map(|record| record.to_bytes().unwrap())
+            .collect();
+        let effects = operation.step(iter(rows, None));
         assert_eq!(
             effects[..],
             [Effect::Blob(BlobEffect::ReadKeyStatus {
@@ -453,6 +556,11 @@ mod tests {
         }));
         let snapshot = operation.finalize().unwrap();
         assert_eq!(snapshot.records, vec![record.clone(), record]);
+        let locks = BTreeMap::from([
+            (1, (AuditAction::RestartLock, 1)),
+            (3, (AuditAction::TimedLock, 4)),
+        ]);
+        assert_eq!(snapshot.locks, locks);
     }
 
     #[test]
