@@ -129,3 +129,43 @@ fn intent_before_activation() {
     }));
     assert_eq!(operation.finalize(), Ok(status));
 }
+
+#[test]
+fn failed_activation_discards() {
+    let (mut operation, _) = prepared(user(1), BTreeSet::new());
+    operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket: ticket() }));
+    operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: Key::from(Vec::new()),
+    }));
+    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+        txn_id: Ulid::from_bytes([9; 16]),
+    }));
+    let refused = BlobError::BucketKey(BucketKeyError::Capacity);
+    let effects = operation.step(Event::Blob(BlobEvent::Error(refused)));
+    assert_eq!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() })]
+    );
+    let effects = operation.step(Event::Blob(BlobEvent::KeyDiscarded { ticket: ticket() }));
+    assert_eq!(audited(&effects).outcome, AuditOutcome::Failed);
+    operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: Key::from(Vec::new()),
+    }));
+    assert!(matches!(operation.finalize(), Err(UnlockError::Blob(_))));
+}
+
+#[test]
+fn former_admin_refused() {
+    // Admin rights decide implicit authority at the moment of the unlock (D30).
+    let (operation, effects) = prepared(user(2), BTreeSet::new());
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    assert_eq!(operation.finalize(), Err(UnlockError::NotHolder));
+    let (_, effects) = prepared(user(2), BTreeSet::from([user(2)]));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::PrepareKey { .. })]
+    ));
+}
