@@ -136,6 +136,14 @@ pub async fn run_execution_job(
         return;
     }
     publish_progress(&context, job_id, PhysicalExecutionState::Preparing).await;
+    // Staging reads input plaintext, so a locked input parks the job before any attempt intent.
+    if Box::pin(crate::jobs::key_wake::park_locked(
+        &context, &record, token, node_id,
+    ))
+    .await
+    {
+        return;
+    }
 
     let stop = CancellationToken::new();
     let heartbeat = tokio::spawn(execution_heartbeat(
