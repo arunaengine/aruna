@@ -12,7 +12,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{BucketHolder, HolderOrigin, KeyTicket};
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
-use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
 use smallvec::smallvec;
@@ -273,7 +273,12 @@ impl Operation for LockBucketOperation {
                 self.audit(locked)
             }
             // A timer that cannot be cancelled fires later and finds its session gone.
-            (LockStep::CancelTimers, Event::Task(_)) => {
+            (LockStep::CancelTimers, Event::Task(event))
+                if self
+                    .locked
+                    .iter()
+                    .any(|ticket| answers_timer(&event, &lock_timer(ticket))) =>
+            {
                 self.timers = self.timers.saturating_sub(1);
                 match self.timers {
                     0 => self.complete(),
@@ -300,6 +305,18 @@ impl Operation for LockBucketOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+/// Whether a task event answers an effect on the timer `key`; a failure counts as an answer.
+pub(crate) fn answers_timer(event: &TaskEvent, key: &TaskKey) -> bool {
+    match event {
+        TaskEvent::TimerScheduled { key: answered, .. }
+        | TaskEvent::TimerCancelled { key: answered } => answered == key,
+        TaskEvent::Error { key: answered, .. } => {
+            answered.as_ref().is_none_or(|answered| answered == key)
+        }
+        TaskEvent::RunningHandlersAborted { .. } => false,
     }
 }
 

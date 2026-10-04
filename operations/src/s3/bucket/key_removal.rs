@@ -296,8 +296,8 @@ impl Operation for RemoveHolderOperation {
             }
             (
                 RemovalStep::CommitTransaction,
-                Event::Storage(StorageEvent::TransactionCommitted { .. }),
-            ) => {
+                Event::Storage(StorageEvent::TransactionCommitted { txn_id }),
+            ) if Some(txn_id) == self.txn_id => {
                 self.txn_id = None;
                 self.step = RemovalStep::Finish;
                 smallvec![]

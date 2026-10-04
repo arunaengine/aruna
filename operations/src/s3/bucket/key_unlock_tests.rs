@@ -182,3 +182,46 @@ fn former_admin_refused() {
         [Effect::Blob(BlobEffect::PrepareKey { .. })]
     ));
 }
+
+#[test]
+fn foreign_events_refused() {
+    // A commit of another transaction proves nothing; the prepared key is discarded.
+    let (mut operation, _) = prepared(user(1), &[]);
+    operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket: ticket() }));
+    operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: Key::from(Vec::new()),
+    }));
+    let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+        txn_id: Ulid::from_bytes([7; 16]),
+    }));
+    let discard = Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() });
+    assert!(effects.contains(&discard), "{effects:?}");
+    assert!(matches!(
+        operation.finalize(),
+        Err(UnlockError::InvalidStateEvent { .. })
+    ));
+
+    // An activation answer for another key generation is not this session's.
+    let (mut operation, _) = prepared(user(1), &[]);
+    operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket: ticket() }));
+    operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: Key::from(Vec::new()),
+    }));
+    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+        txn_id: Ulid::from_bytes([9; 16]),
+    }));
+    let status = UnlockStatus {
+        key: BucketKeyRef::new(BUCKET_ID, 1),
+        session_id: ticket().session_id,
+        active: true,
+        unlocked_at: SystemTime::UNIX_EPOCH,
+        remaining: None,
+        max_remaining: None,
+    };
+    let effects = operation.step(Event::Blob(BlobEvent::KeyActivated { status }));
+    assert!(effects.contains(&discard), "{effects:?}");
+    assert!(matches!(
+        operation.finalize(),
+        Err(UnlockError::InvalidStateEvent { .. })
+    ));
+}

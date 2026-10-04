@@ -55,6 +55,7 @@ pub struct InstallKeyOperation {
     input: Option<InstallInput>,
     state: InstallState,
     ticket: Option<KeyTicket>,
+    discarded: Option<KeyTicket>,
     failure: Option<BlobError>,
     output: Option<Result<UnlockStatus, InstallError>>,
 }
@@ -66,20 +67,26 @@ impl InstallKeyOperation {
             input: Some(input),
             state: InstallState::Init,
             ticket: None,
+            discarded: None,
             failure: None,
             output: None,
         }
     }
 
+    /// A failure discards the prepared key this operation still owns.
     fn fail(&mut self, error: impl Into<InstallError>) -> Effects {
         self.output = Some(Err(error.into()));
         self.state = InstallState::Error;
-        smallvec![]
+        self.abort()
     }
 
-    fn discard(&mut self, ticket: KeyTicket, error: BlobError) -> Effects {
+    fn discard(&mut self, error: BlobError) -> Effects {
+        let Some(ticket) = self.ticket.take() else {
+            return self.fail(error);
+        };
         self.failure = Some(error);
         self.state = InstallState::DiscardKey;
+        self.discarded = Some(ticket);
         smallvec![Effect::Blob(BlobEffect::DiscardKey { ticket })]
     }
 }
@@ -105,7 +112,7 @@ impl Operation for InstallKeyOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         let ticket = self.ticket;
-        let issued = |other: &KeyTicket| ticket == Some(*other);
+        let discarded = self.discarded;
         match (self.state, event) {
             (InstallState::PrepareKey, Event::Blob(BlobEvent::KeyPrepared { ticket }))
                 if ticket.key == self.key =>
@@ -119,16 +126,16 @@ impl Operation for InstallKeyOperation {
                     (ticket.key, ticket.session_id) == (status.key, status.session_id)
                 }) =>
             {
+                self.ticket = None;
                 self.state = InstallState::Finish;
                 self.output = Some(Ok(status));
                 smallvec![]
             }
-            (InstallState::ActivateKey, Event::Blob(BlobEvent::Error(error))) => match ticket {
-                Some(ticket) => self.discard(ticket, error),
-                None => self.fail(error),
-            },
+            (InstallState::ActivateKey, Event::Blob(BlobEvent::Error(error))) => {
+                self.discard(error)
+            }
             (InstallState::DiscardKey, Event::Blob(BlobEvent::KeyDiscarded { ticket }))
-                if issued(&ticket) =>
+                if discarded == Some(ticket) =>
             {
                 let error = self.failure.take().unwrap_or(BlobError::InvalidEffect);
                 self.fail(error)
@@ -156,11 +163,9 @@ impl Operation for InstallKeyOperation {
 
     fn abort(&mut self) -> Effects {
         self.input = None;
-        match (self.state, self.ticket) {
-            (InstallState::ActivateKey, Some(ticket)) => {
-                smallvec![Effect::Blob(BlobEffect::DiscardKey { ticket })]
-            }
-            _ => smallvec![],
+        match self.ticket.take() {
+            Some(ticket) => smallvec![Effect::Blob(BlobEffect::DiscardKey { ticket })],
+            None => smallvec![],
         }
     }
 }
@@ -242,6 +247,18 @@ mod tests {
         );
         operation.step(Event::Blob(BlobEvent::KeyDiscarded { ticket }));
         assert_eq!(operation.finalize(), Err(InstallError::Blob(refused())));
+
+        // An unexpected answer discards the prepared key this operation owns.
+        let (mut stray, ticket) = prepared();
+        let effects = stray.step(Event::Blob(BlobEvent::KeyDiscarded { ticket }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::DiscardKey { ticket })]
+        );
+        assert!(matches!(
+            stray.finalize(),
+            Err(InstallError::InvalidStateEvent { .. })
+        ));
 
         // A run stopped before activation discards the prepared key too.
         let (mut stopped, ticket) = prepared();

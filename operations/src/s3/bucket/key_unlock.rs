@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::key_lock::lock_timer;
+use crate::s3::bucket::key_lock::{answers_timer, lock_timer};
 use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -311,8 +311,8 @@ impl Operation for UnlockBucketOperation {
             }
             (
                 UnlockStep::CommitIntent,
-                Event::Storage(StorageEvent::TransactionCommitted { .. }),
-            ) => {
+                Event::Storage(StorageEvent::TransactionCommitted { txn_id }),
+            ) if Some(txn_id) == self.txn_id => {
                 self.txn_id = None;
                 let Some(ticket) = self.ticket else {
                     return self.fail(UnlockError::NotFinished);
@@ -321,9 +321,9 @@ impl Operation for UnlockBucketOperation {
                 smallvec![Effect::Blob(BlobEffect::ActivateKey { ticket })]
             }
             (UnlockStep::ActivateKey, Event::Blob(BlobEvent::KeyActivated { status }))
-                if self
-                    .ticket
-                    .is_some_and(|ticket| ticket.session_id == status.session_id) =>
+                if self.ticket.is_some_and(|ticket| {
+                    (ticket.key, ticket.session_id) == (status.key, status.session_id)
+                }) =>
             {
                 let Some(ticket) = self.ticket.take() else {
                     return self.fail(UnlockError::NotFinished);
@@ -339,10 +339,20 @@ impl Operation for UnlockBucketOperation {
                     after,
                 })]
             }
-            (UnlockStep::ArmTimer, Event::Task(_)) => match self.activated.take() {
-                Some(status) => self.write_outcome(Ok(status)),
-                None => self.fail(UnlockError::NotFinished),
-            },
+            (UnlockStep::ArmTimer, Event::Task(event))
+                if self.activated.as_ref().is_some_and(|status| {
+                    let ticket = KeyTicket {
+                        key: status.key,
+                        session_id: status.session_id,
+                    };
+                    answers_timer(&event, &lock_timer(&ticket))
+                }) =>
+            {
+                match self.activated.take() {
+                    Some(status) => self.write_outcome(Ok(status)),
+                    None => self.fail(UnlockError::NotFinished),
+                }
+            }
             // A failed activation discards the prepared key; the intent stays unconfirmed.
             (UnlockStep::ActivateKey, Event::Blob(BlobEvent::Error(error))) => {
                 let Some(ticket) = self.ticket.take() else {
@@ -360,7 +370,10 @@ impl Operation for UnlockBucketOperation {
                 self.write_outcome(Err(error))
             }
             // The key state is settled; a lost outcome record leaves only the unconfirmed intent.
-            (UnlockStep::WriteOutcome, _) => {
+            (
+                UnlockStep::WriteOutcome,
+                Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::Error { .. }),
+            ) => {
                 self.step = UnlockStep::Finish;
                 smallvec![]
             }

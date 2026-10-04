@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::key_lock::lock_timer;
+use crate::s3::bucket::key_lock::{answers_timer, lock_timer};
 use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -211,7 +211,17 @@ impl Operation for ExtendBucketOperation {
         match (self.step, event) {
             (ExtendStep::WriteAudit, _) => self.finish(),
             // A timer that did not move only records the lock late; admission ends on time.
-            (ExtendStep::MoveTimer, Event::Task(_)) => self.audit(),
+            (ExtendStep::MoveTimer, Event::Task(event))
+                if self.status.as_ref().is_some_and(|status| {
+                    let ticket = KeyTicket {
+                        key: status.key,
+                        session_id: status.session_id,
+                    };
+                    answers_timer(&event, &lock_timer(&ticket))
+                }) =>
+            {
+                self.audit()
+            }
             (_, Event::Storage(StorageEvent::Error { error })) => self.fail(error),
             (ExtendStep::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.authorize(values)
