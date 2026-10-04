@@ -1,20 +1,73 @@
-//! Builds the stored rows of a bucket key generation and the user keys its copies seal to.
+//! Reads a bucket's encryption settings and builds the stored rows of a key generation and the
+//! user keys its copies seal to.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE,
+    S3_BUCKET_KEYSPACE,
 };
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyRecord, CopyTarget, GrantState, HolderOrigin, SealedCopy,
 };
 use aruna_core::structs::storage::holders::{HolderReport, HolderState, KeyLookup};
-use aruna_core::types::{Key, Value};
+use aruna_core::structs::storage::multipart::MultipartUpload;
+use aruna_core::types::{GroupId, Key, TxnId, Value};
 use std::collections::BTreeMap;
+use thiserror::Error;
 
 pub type Row = (String, Key, Value);
+
+#[derive(Debug, Error, PartialEq)]
+pub enum SettingsError {
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error("The specified bucket does not exist.")]
+    NoSuchBucket,
+    #[error("the bucket changed owner")]
+    GroupMismatch,
+}
+
+/// Reads a bucket record and its encryption settings in one transaction.
+pub fn settings_read(bucket: &str, txn_id: Option<TxnId>) -> Effect {
+    let key: Key = bucket.as_bytes().to_vec().into();
+    Effect::Storage(StorageEffect::BatchRead {
+        reads: vec![
+            (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key),
+        ],
+        txn_id,
+    })
+}
+
+/// The bucket record and settings a `settings_read` returned; the bucket must belong to `group_id`.
+pub fn parse_settings(
+    values: Vec<(Key, Option<Value>)>,
+    group_id: GroupId,
+) -> Result<(BucketInfo, BucketEncryption), SettingsError> {
+    let mut values = values.into_iter();
+    let (Some((_, info)), Some((_, settings)), None) =
+        (values.next(), values.next(), values.next())
+    else {
+        return Err(ConversionError::InvalidLength("bucket settings read".to_string()).into());
+    };
+    let info = BucketInfo::from_bytes(&info.ok_or(SettingsError::NoSuchBucket)?)?;
+    if info.group_id != group_id {
+        return Err(SettingsError::GroupMismatch);
+    }
+    Ok((info, BucketEncryption::from_row(settings.as_deref())?))
+}
+
+/// Whether a multipart upload of `bucket` is open; it captured the stored format of its start.
+pub fn uploads_open(uploads: &[(Key, Value)], bucket: &str) -> bool {
+    uploads.iter().any(|(_, value)| {
+        MultipartUpload::from_bytes(value.as_ref()).is_ok_and(|upload| upload.bucket == bucket)
+    })
+}
 
 /// Every published key of every holder, so any key in a holder's vault opens a copy.
 pub fn copy_targets(
@@ -107,6 +160,43 @@ mod tests {
             placement: PlacementRef::NIL,
             created_at_ms: 1,
         }
+    }
+
+    #[test]
+    fn settings_need_bucket() {
+        use aruna_core::structs::storage::encryption::EncryptionMode;
+        use aruna_core::structs::storage::format::Compression;
+        let group_id = Ulid::from_bytes([3; 16]);
+        let info = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user(1),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+        };
+        let row = |value: Option<Vec<u8>>| (Key::from(b"bucket".to_vec()), value.map(Value::from));
+        let read = |settings| vec![row(Some(info.to_bytes().unwrap())), row(settings)];
+        // No settings row means the bucket does not encrypt.
+        let (found, settings) = parse_settings(read(None), group_id).unwrap();
+        assert_eq!(
+            (found, settings),
+            (info.clone(), BucketEncryption::default())
+        );
+        let sealed = BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(Ulid::from_bytes([4; 16])),
+            key_generation: 1,
+            ..Default::default()
+        };
+        let read_sealed = read(Some(sealed.to_bytes().unwrap()));
+        assert_eq!(parse_settings(read_sealed, group_id).unwrap().1, sealed);
+        let other = parse_settings(read(None), Ulid::from_bytes([5; 16]));
+        assert_eq!(other, Err(SettingsError::GroupMismatch));
+        let missing = parse_settings(vec![row(None), row(None)], group_id);
+        assert_eq!(missing, Err(SettingsError::NoSuchBucket));
     }
 
     #[test]
