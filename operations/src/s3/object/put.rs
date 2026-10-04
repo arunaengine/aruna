@@ -7,7 +7,7 @@ use crate::blob::managed_copy::{
     split_serve_reads, validate_registration,
 };
 use crate::blob::records::{
-    HeadAliasContext, add_index_effect, blob_location_read, write_head_effect,
+    HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,
     write_location_effect, write_version_effect,
 };
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
@@ -29,7 +29,8 @@ use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+    BUCKET_KEY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -40,8 +41,12 @@ use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-    CopyOrigin, CurrentVersionPointer, ManagedCopyKey, VersionKey, WriteOwner,
+    ArchiveKey, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
+    BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ManagedCopyKey, VersionKey,
+    WriteOwner,
+};
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
 };
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
@@ -54,6 +59,10 @@ use std::time::{Duration, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
+
+fn seal_error(error: BucketKeyError) -> PutObjectError {
+    PutObjectError::ConversionError(ConversionError::BucketKey(error))
+}
 
 /// Bounded retries for an SSI conflict on the metadata commit. Concurrent
 /// writes in one group contend on the shared usage counters, which is a
@@ -69,6 +78,9 @@ pub enum PutObjectState {
     ReadGateBucket,
     PolicyGate,
     CheckPurgeWrite,
+    /// Reads the bucket's encryption settings, then its active key, to capture the seal plan.
+    ReadSealSettings,
+    ReadSealKey,
     WriteBlob,
     CleanupFailedWrite,
     QueueCleanupRow,
@@ -76,6 +88,8 @@ pub enum PutObjectState {
     StartTransaction,
     CheckPurgeFence,
     CheckBucket,
+    /// Rereads the encryption settings in the version transaction against the captured plan.
+    CheckSealFence,
     FenceBackend,
     CheckHashLookup,
     CreateBlobLocation,
@@ -84,6 +98,7 @@ pub enum PutObjectState {
     WriteBlobHead,
     WritePathIndex,
     CreateVersionRecord,
+    WriteCopyOwner,
     RegisterManagedCopy,
     WriteReplicationObligation,
     EnforceQuota,
@@ -227,6 +242,10 @@ pub struct PutObjectOperation {
     replay_location: Option<BackendLocation>,
     /// Recorded on the registration so a reader learns why the copy is here.
     origin: CopyOrigin,
+    /// Settings read before the write, kept until the active key record is read.
+    seal_settings: Option<BucketEncryption>,
+    /// How the bytes are sealed, captured once before they stream; `None` writes plain bytes.
+    seal_plan: Option<SealPlan>,
 }
 
 impl PutObjectOperation {
@@ -263,6 +282,8 @@ impl PutObjectOperation {
             replay_policies: Vec::new(),
             replay_location: None,
             origin: CopyOrigin::Write,
+            seal_settings: None,
+            seal_plan: None,
         }
     }
 
@@ -533,8 +554,59 @@ impl PutObjectOperation {
 
     fn write_fence_checked(&mut self, event: Event) -> Effects {
         match check_write_fence(event, &self.config.request.bucket, &self.config.request.key) {
-            Ok(()) => self.write_blob(),
+            Ok(()) => self.read_seal_settings(),
             Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn read_seal_settings(&mut self) -> Effects {
+        self.state = PutObjectState::ReadSealSettings;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            key: self.config.request.bucket.as_bytes().into(),
+            txn_id: None,
+        })]
+    }
+
+    /// A plain bucket writes at once; an encrypting one first reads its active key record.
+    fn seal_settings_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let settings = match BucketEncryption::from_row(value.as_deref()) {
+            Ok(settings) => settings,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        let Some(key) = settings.active_key() else {
+            return self.write_blob();
+        };
+        self.seal_settings = Some(settings);
+        self.state = PutObjectState::ReadSealKey;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_KEY_KEYSPACE.to_string(),
+            key: key.key().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn seal_key_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let Some(settings) = self.seal_settings.take() else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let record = match value.map(|value| BucketKeyRecord::from_bytes(value.as_ref())) {
+            Some(Ok(record)) => record,
+            Some(Err(error)) => return self.emit_error(error.into()),
+            None => return self.emit_error(seal_error(BucketKeyError::Unsupported)),
+        };
+        match SealPlan::capture(&settings, &record) {
+            Ok(plan) => {
+                self.seal_plan = plan;
+                self.write_blob()
+            }
+            Err(error) => self.emit_error(seal_error(error)),
         }
     }
 
@@ -548,7 +620,14 @@ impl PutObjectOperation {
             Ok(resolved) => resolved,
             Err(error) => return self.emit_error(error.into()),
         };
+        let resolved = resolved.with_encryption(self.seal_plan);
         if let Some(location) = self.config_adopt() {
+            // Separate encrypted writes never share an archive.
+            if self.seal_plan.is_some() {
+                return self.emit_error(PutObjectError::WriteFailed(
+                    "an encrypting bucket does not adopt another blob".to_string(),
+                ));
+            }
             if location.backend != resolved.backend {
                 return self.emit_error(PutObjectError::WriteFailed(
                     "the adopted blob sits on another backend".to_string(),
@@ -710,15 +789,49 @@ impl PutObjectOperation {
         let written = self
             .get_written_location()
             .map(|location| location.format.encoding());
-        if current
-            .as_ref()
-            .zip(written)
-            .is_some_and(|(bucket, written)| EncodingClass::from(bucket.compression) != written)
+        if self.seal_plan.is_none()
+            && current
+                .as_ref()
+                .zip(written)
+                .is_some_and(|(bucket, written)| EncodingClass::from(bucket.compression) != written)
         {
             return self.emit_error(StorageError::TransactionConflict.into());
         }
         self.bucket_policies = observed.policies;
-        self.start_fence()
+        self.state = PutObjectState::CheckSealFence;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            key: self.config.request.bucket.as_bytes().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// A copy sealed under an older plan, or plain bytes for a bucket that now encrypts, is
+    /// never published.
+    fn seal_fence_checked(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let settings = match BucketEncryption::from_row(value.as_deref()) {
+            Ok(settings) => settings,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        let written = self
+            .get_written_location()
+            .map(|location| location.format.bucket_key());
+        let current = match self.seal_plan {
+            Some(plan) if written != Some(Some(plan.key)) => Err(BucketKeyError::Unsupported),
+            Some(plan) => plan.still_current(&settings),
+            None if settings.is_encrypted() => Err(BucketKeyError::StaleGeneration {
+                requested: 0,
+                current: settings.key_generation,
+            }),
+            None => Ok(()),
+        };
+        match current {
+            Ok(()) => self.start_fence(),
+            Err(error) => self.emit_error(seal_error(error)),
+        }
     }
 
     /// Looks up only the copy on the backend this write resolved to, so
@@ -982,6 +1095,38 @@ impl PutObjectOperation {
     }
 
     fn version_created(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
+            self.write_copy_owner()
+        } else {
+            self.emit_error(PutObjectError::InvalidOperationState)
+        }
+    }
+
+    /// A Pithos archive records its owning version in the version transaction, so cleanup
+    /// never frees an archive a committed version uses.
+    fn write_copy_owner(&mut self) -> Effects {
+        let (Some(version_id), Some(location)) = (self.version_id, self.get_output()) else {
+            return self.emit_error(PutObjectError::MissingOutput);
+        };
+        if location.format.bucket_key().is_none() {
+            return self.register_managed_copy();
+        }
+        let version = VersionKey::new(
+            self.config.request.bucket.clone(),
+            self.config.request.key.clone(),
+            version_id,
+        );
+        let owner = CopyOwner::new(ArchiveKey::of(location), version);
+        match owner_write_effect(&owner, self.txn_id) {
+            Ok(effect) => {
+                self.state = PutObjectState::WriteCopyOwner;
+                smallvec![effect]
+            }
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn copy_owner_written(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
             self.register_managed_copy()
         } else {
@@ -1523,6 +1668,8 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadGateBucket => self.handle_gate_bucket(event),
             PutObjectState::PolicyGate => self.handle_policy_gate(event),
             PutObjectState::CheckPurgeWrite => self.write_fence_checked(event),
+            PutObjectState::ReadSealSettings => self.seal_settings_read(event),
+            PutObjectState::ReadSealKey => self.seal_key_read(event),
             PutObjectState::WriteBlob => self.handle_write_finished(event),
             PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
@@ -1530,6 +1677,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::StartTransaction => self.handle_transaction_started(event),
             PutObjectState::CheckPurgeFence => self.fence_checked(event),
             PutObjectState::CheckBucket => self.handle_bucket_checked(event),
+            PutObjectState::CheckSealFence => self.seal_fence_checked(event),
             PutObjectState::FenceBackend => self.handle_backend_fenced(event),
             PutObjectState::CheckHashLookup => self.hash_checked(event),
             PutObjectState::CreateBlobLocation => self.location_created(event),
@@ -1538,6 +1686,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::WriteBlobHead => self.head_written(event),
             PutObjectState::WritePathIndex => self.path_index_created(event),
             PutObjectState::CreateVersionRecord => self.version_created(event),
+            PutObjectState::WriteCopyOwner => self.copy_owner_written(event),
             PutObjectState::RegisterManagedCopy => self.handle_copy_registered(event),
             PutObjectState::WriteReplicationObligation => self.obligation_written(event),
             PutObjectState::EnforceQuota => self.handle_enforce_quota(event),
@@ -1613,7 +1762,16 @@ mod pure_tests {
             key: Vec::new().into(),
             value: None,
         }));
-        operation.step(fence_clear())
+        operation.step(fence_clear());
+        operation.step(plain_bucket())
+    }
+
+    /// Answers an encryption settings read for a bucket without settings.
+    fn plain_bucket() -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: None,
+        })
     }
 
     fn fence_clear() -> Event {
@@ -1762,6 +1920,7 @@ mod pure_tests {
                 (b"subject".to_vec().into(), None),
             ],
         }));
+        operation.step(plain_bucket());
 
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"x".to_vec().into(),
@@ -1818,6 +1977,7 @@ mod pure_tests {
                 (b"subject".to_vec().into(), None),
             ],
         }));
+        operation.step(plain_bucket());
         operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"x".to_vec().into(),
             value: Some(disabled(backend_id).to_bytes().unwrap().into()),
@@ -2102,7 +2262,8 @@ mod decision_tests {
         let mut operation = operation("eu-west");
         operation.start();
         operation.step(read(Some(bucket(Vec::new(), 0))));
-        let effects = operation.step(fence_clear());
+        operation.step(fence_clear());
+        let effects = operation.step(read(None));
         assert!(materializes(&effects));
     }
 
@@ -2114,6 +2275,7 @@ mod decision_tests {
         operation.start();
         operation.step(read(Some(bucket(Vec::new(), 0))));
         operation.step(fence_clear());
+        operation.step(read(None));
         operation.step(Event::Blob(aruna_core::events::BlobEvent::WriteFinished {
             location: location(),
         }));
@@ -2173,6 +2335,7 @@ mod decision_tests {
         operation.step(read(Some(ByteView::from(cached))));
         operation.step(crate::tests::policy::authority(realm()));
         operation.step(fence_clear());
+        operation.step(read(None));
         operation.step(Event::Blob(aruna_core::events::BlobEvent::WriteFinished {
             location: location(),
         }));
