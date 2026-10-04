@@ -7,6 +7,7 @@ use super::backend::{
     build_backend_path, build_hidden_path, build_part_path, intent_key, intent_value,
 };
 use super::group::GROUP_WRITE_CHUNK;
+use super::pithos::ArchiveEncoder;
 use crate::codec::FrameEncoder;
 use crate::hash::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
@@ -21,10 +22,12 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
+use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, Backend, BackendLocation, BackendRef, BlobLocationKey, CopyOwner,
     HIDDEN_BLOB_PREFIX, HiddenBlobEntry, HiddenBlobKey, ResolvedBackend,
 };
+use aruna_core::structs::storage::encryption::{BucketKeyRef, SealPlan};
 use aruna_core::structs::storage::format::{Compression, FrameLayout, StoredFormat, StoredLayout};
 use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use aruna_core::structs::storage::multipart::MultipartPartKey;
@@ -48,6 +51,43 @@ use ulid::Ulid;
 struct WriteLimits {
     max_bytes: Option<u64>,
     deadline: Option<StdInstant>,
+}
+
+/// Turns original bytes into stored bytes: zstd frames, or one Pithos archive of a bucket key.
+enum Encoder {
+    Frames(FrameEncoder),
+    Pithos(Box<ArchiveEncoder>, BucketKeyRef),
+}
+
+impl Encoder {
+    async fn push(&mut self, bytes: &[u8]) -> Result<Vec<Bytes>, BlobError> {
+        match self {
+            Self::Frames(encoder) => encoder.push(bytes).await,
+            Self::Pithos(encoder, _) => encoder.push(bytes).await,
+        }
+    }
+
+    /// The closing bytes and the stored format; a Pithos content hash must equal `blake3`.
+    async fn finish(self, blake3: &[u8]) -> Result<(Vec<Bytes>, StoredFormat), BlobError> {
+        match self {
+            Self::Frames(encoder) => {
+                let (pieces, layout) = encoder.finish().await?;
+                let format = StoredFormat {
+                    layout: StoredLayout::Frames(Box::new(layout)),
+                    ..StoredFormat::default()
+                };
+                Ok((pieces, format))
+            }
+            Self::Pithos(encoder, key) => {
+                let (pieces, layout, content_hash) = encoder.finish().await?;
+                if content_hash != blake3 {
+                    let message = "the Pithos content hash differs from the original bytes";
+                    return Err(BlobError::IntegrityCheckFailed(message.to_string()));
+                }
+                Ok((pieces, StoredFormat::pithos(layout, key)))
+            }
+        }
+    }
 }
 
 const HIDDEN_LIST_PAGE: usize = 128;
@@ -372,24 +412,30 @@ impl BlobHandler {
         Box::pin(self.write_stream_limit(location, operator, blob, limits, None, None)).await
     }
 
-    /// Writes the original bytes as frames compressed with `compression`.
-    async fn write_encoded(
+    /// Writes the original bytes as frames compressed with `compression`, or as one Pithos
+    /// archive when `seal` names a bucket key.
+    pub(super) async fn write_encoded(
         &self,
         location: BackendLocation,
         operator: Operator,
         blob: BackendStream<Result<Bytes, StreamError>>,
         compression: Compression,
+        seal: Option<SealPlan>,
     ) -> BlobEvent {
-        let encoder = match compression {
-            Compression::Off => None,
-            Compression::Zstd { level } => Some(FrameEncoder::new(level)),
+        let encoder = match (seal, compression) {
+            (Some(plan), _) => match ArchiveEncoder::new(&plan, compression) {
+                Ok(encoder) => Some(Encoder::Pithos(Box::new(encoder), plan.key)),
+                Err(error) => return BlobEvent::Error(error),
+            },
+            (None, Compression::Off) => None,
+            (None, Compression::Zstd { level }) => Some(Encoder::Frames(FrameEncoder::new(level))),
         };
         let limits = WriteLimits::default();
         Box::pin(self.write_stream_limit(location, operator, blob, limits, encoder, None)).await
     }
 
     /// Appends one piece to the open writer, failing the reservation on error.
-    async fn write_piece(
+    async fn write_stored(
         &self,
         reservation: &mut HiddenReservation,
         deadline: Option<StdInstant>,
@@ -431,7 +477,7 @@ impl BlobHandler {
         operator: Operator,
         mut blob: BackendStream<Result<Bytes, StreamError>>,
         limits: WriteLimits,
-        mut encoder: Option<FrameEncoder>,
+        mut encoder: Option<Encoder>,
         reservation: Option<&mut HiddenReservation>,
     ) -> BlobEvent {
         let WriteLimits {
@@ -479,6 +525,13 @@ impl BlobHandler {
             }
         }
 
+        if let Some(Encoder::Pithos(archive, _)) = &encoder
+            && let Err(event) = self
+                .write_stored(reservation, deadline, archive.header())
+                .await
+        {
+            return event;
+        }
         let mut hasher = Hasher::new();
         let mut bytes_written = 0u64;
         loop {
@@ -530,23 +583,27 @@ impl BlobHandler {
                 None => vec![bytes],
             };
             for piece in pieces {
-                if let Err(event) = self.write_piece(reservation, deadline, piece).await {
+                if let Err(event) = self.write_stored(reservation, deadline, piece).await {
                     return event;
                 }
             }
             bytes_written = next_size;
         }
+        let hashes = hasher.to_map();
         if let Some(encoder) = encoder {
-            let (pieces, layout) = match encoder.finish().await {
+            let blake3 = hashes.get(HASH_BLAKE3).map_or(&[][..], Vec::as_slice);
+            let (pieces, format) = match encoder.finish(blake3).await {
                 Ok(finished) => finished,
                 Err(error) => return reservation.fail(error).await,
             };
             for piece in pieces {
-                if let Err(event) = self.write_piece(reservation, deadline, piece).await {
+                if let Err(event) = self.write_stored(reservation, deadline, piece).await {
                     return event;
                 }
             }
-            location.format.layout = StoredLayout::Frames(Box::new(layout));
+            location.format = format;
+            // An uncertain close reports the stored format, so cleanup knows a Pithos archive.
+            reservation.set_location(location.clone());
         }
 
         reservation.mark_abandoned();
@@ -586,7 +643,7 @@ impl BlobHandler {
         }
         reservation.finish();
         location.blob_size = bytes_written;
-        location.hashes = hasher.to_map();
+        location.hashes = hashes;
         BlobEvent::WriteFinished { location }
     }
 
@@ -992,8 +1049,14 @@ impl BlobHandler {
                 return BlobEvent::Error(err);
             }
         };
-        match Box::pin(self.write_encoded(location.clone(), operator, blob, resolved.compression))
-            .await
+        match Box::pin(self.write_encoded(
+            location.clone(),
+            operator,
+            blob,
+            resolved.compression,
+            resolved.encryption,
+        ))
+        .await
         {
             BlobEvent::WriteFinished { location } => {
                 reservation.retain();

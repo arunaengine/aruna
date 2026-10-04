@@ -3,17 +3,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::BlobHandler;
 use super::frames::read_range;
 use aruna_core::errors::BlobError;
-use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::storage::encryption::{BlockCipher, BlockKeys, SealPlan};
 use aruna_core::structs::storage::format::{Compression, PithosLayout};
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use opendal::Operator;
 use pithos_lib::archive::{
-    AccessKeys, ArchivePath, AsyncArchive, BlockingHook, CdcConfig, Chunking, Composition,
-    EntryMetadata, OpenOptions, Piece, PieceEncoder, ProcessingOptions, compose,
+    AccessKeys, ArchivePath, AsyncArchive, BlockKeyMode, BlockingHook, CdcConfig, Chunking,
+    Composition, EntryMetadata, OpenOptions, PayloadCipher, Piece, PieceEncoder, ProcessingOptions,
+    compose,
 };
 use pithos_lib::crypto::PublicKey;
 use pithos_lib::error::PithosError;
@@ -21,7 +21,6 @@ use pithos_lib::source::{AsyncArchiveSource, SourceError};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::timeout;
 
 /// Path of the one file in the archive of an object.
 pub const OBJECT_PATH: &str = "object";
@@ -31,14 +30,6 @@ const MIB: usize = 1 << 20;
 const BATCH: usize = MIB;
 /// Zstd levels that the Pithos compression levels 1 to 7 stand for.
 const PITHOS_ZSTD: [u8; 7] = [1, 4, 8, 11, 15, 18, 22];
-
-/// What a Pithos write stored: the original size, its plaintext BLAKE3 and the copy's record.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PithosWrite {
-    pub size: u64,
-    pub content_hash: [u8; 32],
-    pub layout: PithosLayout,
-}
 
 /// One stored archive. Stored objects never change, so reads need no pinned revision.
 struct StoredArchive {
@@ -120,117 +111,134 @@ pub async fn read(
     Ok(stream.map(|chunk| chunk.map(Bytes::from).map_err(blob_error)))
 }
 
-impl BlobHandler {
-    /// Writes `blob` at `path` as a Pithos archive with one file, granted to `bucket`.
-    ///
-    /// Sealed blocks reach the backend as they are produced; a failed write removes the partial
-    /// object. The content hash is the BLAKE3 of the original bytes.
-    pub async fn write_pithos(
-        &self,
-        operator: &Operator,
-        path: &str,
-        bucket: PublicKey,
-        compression: Compression,
-        blob: BackendStream<Result<Bytes, StreamError>>,
-    ) -> Result<PithosWrite, BlobError> {
-        let encoder = piece_encoder(bucket, compression).map_err(write_error)?;
-        let (mut writer, mut abandoned) = (None, false);
-        let written = self
-            .write_archive(operator, path, &mut writer, &mut abandoned, encoder, blob)
-            .await;
-        if written.is_err() {
-            self.clean_partial(writer.as_mut(), abandoned, Some(operator), Some(path), None)
-                .await?;
-        }
-        written
+/// Seals original bytes into one Pithos archive while a write streams them to the backend.
+/// It yields the header, the sealed blocks and the directory in order.
+pub(super) struct ArchiveEncoder {
+    /// Lent to the blocking pool while a batch is sealed; a failed seal ends the write.
+    encoder: Option<PieceEncoder>,
+    batch: BytesMut,
+    size: u64,
+    stored: u64,
+    header: [u8; 6],
+}
+
+impl ArchiveEncoder {
+    /// One piece of FastCDC blocks from 1 to 16 MiB, granted to the key of `plan` with its
+    /// cipher and key mode. Content hashing stays on in both key modes.
+    pub(super) fn new(plan: &SealPlan, compression: Compression) -> Result<Self, BlobError> {
+        let bucket = PublicKey::from_raw(plan.public_key)
+            .map_err(|error| BlobError::WriteError(error.to_string()))?;
+        let blocks = CdcConfig::new(MIB, 4 * MIB, 16 * MIB).map_err(write_error)?;
+        let processing = ProcessingOptions::new(true, pithos_level(compression))
+            .and_then(|options| options.with_cipher(cipher(plan.cipher)))
+            .and_then(|options| options.with_key_mode(key_mode(plan.block_keys)))
+            .map_err(write_error)?;
+        let encoder = PieceEncoder::new(1, vec![bucket], processing)
+            .and_then(|encoder| encoder.with_chunking(Chunking::ContentDefined(blocks)))
+            .and_then(|encoder| encoder.with_content_hash(true))
+            .map_err(write_error)?;
+        let header = compose_object(&[]).map_err(write_error)?.header();
+        Ok(Self {
+            encoder: Some(encoder),
+            batch: BytesMut::new(),
+            size: 0,
+            stored: header.len() as u64,
+            header,
+        })
     }
 
-    /// Writes the header, the sealed blocks and the directory. `writer` keeps the open writer
-    /// for cleanup; `abandoned` marks a writer whose call a timeout cut off.
-    async fn write_archive(
-        &self,
-        operator: &Operator,
-        path: &str,
-        writer: &mut Option<opendal::Writer>,
-        abandoned: &mut bool,
-        mut encoder: PieceEncoder,
-        mut blob: BackendStream<Result<Bytes, StreamError>>,
-    ) -> Result<PithosWrite, BlobError> {
-        let header = compose_object(&[]).map_err(write_error)?.header();
-        let writer = match timeout(self.io_timeout(), operator.writer(path)).await {
-            Ok(Ok(opened)) => writer.insert(opened),
-            Ok(Err(error)) => return Err(BlobError::OperatorCreationFailed(error.to_string())),
-            Err(_) => return Err(deadline_expired()),
-        };
-        let idle = self.transfer_idle_timeout();
-        settle(abandoned, idle, writer.write(header.to_vec())).await?;
-        let (mut size, mut stored) = (0u64, header.len() as u64);
-        let mut batch = BytesMut::new();
-        loop {
-            let chunk = match timeout(idle, blob.next()).await {
-                Ok(Some(chunk)) => {
-                    chunk.map_err(|error| BlobError::StreamFailed(error.to_string()))?
-                }
-                Ok(None) => break,
-                Err(_) => return Err(deadline_expired()),
-            };
-            size = size
-                .checked_add(chunk.len() as u64)
-                .ok_or(BlobError::SizeLimitExceeded { limit: u64::MAX })?;
-            batch.extend_from_slice(&chunk);
-            if batch.len() < BATCH {
-                continue;
-            }
-            let plain = batch.split().freeze();
-            let sealed = TokioBlocking.spawn_blocking(move || {
-                let mut encoder = encoder;
-                encoder.write(&plain).map(|blocks| (encoder, blocks))
-            });
-            let blocks;
-            (encoder, blocks) = sealed.await.map_err(write_error)?;
-            stored += blocks.len() as u64;
-            if !blocks.is_empty() {
-                settle(abandoned, idle, writer.write(blocks)).await?;
+    /// The archive header, written before any block.
+    pub(super) fn header(&self) -> Bytes {
+        Bytes::copy_from_slice(&self.header)
+    }
+
+    /// Takes `bytes` in slices of at most one batch, sealing each full batch on the blocking pool.
+    pub(super) async fn push(&mut self, mut bytes: &[u8]) -> Result<Vec<Bytes>, BlobError> {
+        let mut out = Vec::new();
+        while !bytes.is_empty() {
+            let take = (BATCH - self.batch.len()).min(bytes.len());
+            self.batch.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.batch.len() == BATCH {
+                let plain = self.batch.split().freeze();
+                out.extend(self.seal(plain).await?);
             }
         }
-        let plain = batch.freeze();
+        Ok(out)
+    }
+
+    async fn seal(&mut self, plain: Bytes) -> Result<Option<Bytes>, BlobError> {
+        self.count(plain.len())?;
+        let mut encoder = self.encoder.take().ok_or_else(sealing_failed)?;
+        let sealed = TokioBlocking.spawn_blocking(move || {
+            let blocks = encoder.write(&plain);
+            (encoder, blocks)
+        });
+        let (encoder, blocks) = sealed.await;
+        let blocks = blocks.map_err(write_error)?;
+        self.encoder = Some(encoder);
+        self.stored += blocks.len() as u64;
+        Ok((!blocks.is_empty()).then(|| Bytes::from(blocks)))
+    }
+
+    /// Seals the last bytes and returns the closing bytes, the layout and the content hash.
+    pub(super) async fn finish(
+        mut self,
+    ) -> Result<(Vec<Bytes>, PithosLayout, [u8; 32]), BlobError> {
+        let plain = std::mem::take(&mut self.batch).freeze();
+        self.count(plain.len())?;
+        let encoder = self.encoder.take().ok_or_else(sealing_failed)?;
         let sealed = TokioBlocking.spawn_blocking(move || finish_piece(encoder, &plain));
         let (blocks, piece, composition) = sealed.await.map_err(write_error)?;
-        stored += blocks.len() as u64;
-        if !blocks.is_empty() {
-            settle(abandoned, idle, writer.write(blocks)).await?;
-        }
-        let start = header.len() as u64;
-        let consistent = composition.header() == header
+        let start = self.header.len() as u64;
+        let stored = self.stored + blocks.len() as u64;
+        let directory = composition.directory().to_vec();
+        let consistent = composition.header() == self.header
             && composition.piece_offsets() == [start]
             && stored == start + piece.stored_len()
-            && piece.original_size() == size;
+            && piece.original_size() == self.size
+            && composition.archive_len() == stored + directory.len() as u64;
         let (true, Some(content_hash)) = (consistent, composition.content_hash()) else {
             let message = "the Pithos archive does not match the written bytes";
             return Err(BlobError::WriteError(message.to_string()));
         };
-        let directory = composition.directory().to_vec();
-        settle(abandoned, idle, writer.write(directory)).await?;
-        settle(abandoned, self.io_timeout(), writer.close()).await?;
         let layout = PithosLayout {
             stored_size: composition.archive_len(),
             metadata_digest: composition.metadata_digest(),
         };
-        Ok(PithosWrite {
-            size,
-            content_hash,
-            layout,
-        })
+        let mut out = Vec::new();
+        if !blocks.is_empty() {
+            out.push(Bytes::from(blocks));
+        }
+        out.push(Bytes::from(directory));
+        Ok((out, layout, content_hash))
+    }
+
+    fn count(&mut self, len: usize) -> Result<(), BlobError> {
+        self.size = self
+            .size
+            .checked_add(len as u64)
+            .ok_or(BlobError::SizeLimitExceeded { limit: u64::MAX })?;
+        Ok(())
     }
 }
 
-/// One piece of FastCDC blocks from 1 to 16 MiB with content-derived keys, granted to `bucket`.
-fn piece_encoder(bucket: PublicKey, compression: Compression) -> Result<PieceEncoder, PithosError> {
-    let blocks = CdcConfig::new(MIB, 4 * MIB, 16 * MIB)?;
-    let processing = ProcessingOptions::new(true, pithos_level(compression))?;
-    PieceEncoder::new(1, vec![bucket], processing)?
-        .with_chunking(Chunking::ContentDefined(blocks))?
-        .with_content_hash(true)
+fn sealing_failed() -> BlobError {
+    BlobError::WriteError("an earlier Pithos batch failed".to_string())
+}
+
+fn cipher(cipher: BlockCipher) -> PayloadCipher {
+    match cipher {
+        BlockCipher::ChaCha20Poly1305 => PayloadCipher::ChaCha20Poly1305,
+        BlockCipher::Aes256Gcm => PayloadCipher::Aes256Gcm,
+    }
+}
+
+fn key_mode(keys: BlockKeys) -> BlockKeyMode {
+    match keys {
+        BlockKeys::ContentDerived => BlockKeyMode::ContentDerived,
+        BlockKeys::Unique => BlockKeyMode::Unique,
+    }
 }
 
 /// Off is level 0; zstd takes the Pithos level with the nearest zstd level, the lower on a tie.
@@ -261,26 +269,6 @@ fn finish_piece(
 fn compose_object(pieces: &[Piece]) -> Result<Composition, PithosError> {
     let path = ArchivePath::new(OBJECT_PATH)?;
     compose(path, EntryMetadata::new(0, 0, 0o644), pieces)
-}
-
-/// Runs one writer call within `limit`. A call cut off by the limit must not be polled again,
-/// so it marks the writer abandoned.
-async fn settle<T>(
-    abandoned: &mut bool,
-    limit: Duration,
-    call: impl Future<Output = opendal::Result<T>>,
-) -> Result<T, BlobError> {
-    match timeout(limit, call).await {
-        Ok(result) => result.map_err(|error| BlobError::WriteError(error.to_string())),
-        Err(_) => {
-            *abandoned = true;
-            Err(deadline_expired())
-        }
-    }
-}
-
-fn deadline_expired() -> BlobError {
-    BlobError::WriteError("blob write deadline expired".to_string())
 }
 
 fn write_error(error: PithosError) -> BlobError {

@@ -2,14 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{failing_close, setup_two_backends, stream_from_bytes, test_user_id};
-use crate::blob::pithos::{OBJECT_PATH, PithosWrite, read};
+use super::{TestContext, failing_close, setup_two_backends, stream_from_bytes, test_user_id};
+use crate::blob::pithos::{OBJECT_PATH, read};
+use crate::hash::Hasher;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::storage::blob::ResolvedBackend;
-use aruna_core::structs::storage::encryption::BucketKeyRef;
-use aruna_core::structs::storage::format::{Compression, PithosLayout, StoredFormat};
+use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, ResolvedBackend};
+use aruna_core::structs::storage::encryption::{BlockCipher, BlockKeys, BucketKeyRef, SealPlan};
+use aruna_core::structs::storage::format::{Compression, PithosLayout, StoredFormat, StoredLayout};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use opendal::Operator;
@@ -86,8 +87,18 @@ async fn read_all(
     key: &PrivateKey,
     range: std::ops::Range<u64>,
 ) -> Result<Vec<u8>, BlobError> {
+    read_at(operator, "object.pith", layout, key, range).await
+}
+
+async fn read_at(
+    operator: &Operator,
+    path: &str,
+    layout: &PithosLayout,
+    key: &PrivateKey,
+    range: std::ops::Range<u64>,
+) -> Result<Vec<u8>, BlobError> {
     let keys = AccessKeys::new().with_key(key.duplicate());
-    let path = "object.pith".to_string();
+    let path = path.to_string();
     let stream = read(operator.clone(), path, layout, keys, range, IDLE).await?;
     let chunks: Vec<_> = stream.try_collect().await?;
     Ok(chunks.concat())
@@ -172,32 +183,46 @@ async fn refuses_unkeyed_reads() {
     assert!(matches!(slice, Err(BlobError::ReadError(_))));
 }
 
-/// Writes `data` into a fresh store and checks the reported size, hash and stored size.
+/// A seal plan for `bucket` with the given cipher and key mode.
+fn plan(bucket: &PrivateKey, cipher: BlockCipher, block_keys: BlockKeys) -> SealPlan {
+    SealPlan {
+        key: BucketKeyRef::new(ulid::Ulid::from_bytes([4; 16]), 1),
+        public_key: *bucket.public_key().as_bytes(),
+        cipher,
+        block_keys,
+        storage_generation: 1,
+    }
+}
+
+/// Writes `data` through `write_blob` and checks the size, the hashes and the stored format.
 async fn written(
     data: &[u8],
-    key: &PrivateKey,
+    seal: SealPlan,
     compression: Compression,
-) -> (tempfile::TempDir, Operator, PithosWrite) {
+) -> (TestContext, Operator, String, PithosLayout) {
     let context = setup_two_backends().await;
-    let (dir, operator) = empty_store();
+    let handler = context.blob_handle.handler.clone();
+    let backend = ResolvedBackend::node_default()
+        .with_compression(compression)
+        .with_encryption(Some(seal));
     let stream = stream_from_bytes(data);
-    let write = context
-        .blob_handle
-        .handler
-        .write_pithos(
-            &operator,
-            "object.pith",
-            key.public_key(),
-            compression,
-            stream,
-        )
-        .await
-        .unwrap();
-    assert_eq!(write.size, data.len() as u64);
-    assert_eq!(write.content_hash, *blake3::hash(data).as_bytes());
-    let stat = operator.stat("object.pith").await.unwrap();
-    assert_eq!(stat.content_length(), write.layout.stored_size);
-    (dir, operator, write)
+    let written = handler
+        .write_blob("bucket", "sealed.bin", backend, test_user_id(), stream)
+        .await;
+    let BlobEvent::WriteFinished { location } = written else {
+        panic!("write failed: {written:?}")
+    };
+    assert_eq!(location.blob_size, data.len() as u64);
+    assert_eq!(location.hashes, Hasher::new_with_bytes(data).to_map());
+    assert_eq!(location.format.bucket_key(), Some(seal.key));
+    let StoredLayout::Pithos(layout) = location.format.layout.clone() else {
+        panic!("not a Pithos copy: {:?}", location.format)
+    };
+    let operator = handler.operator_from_location(&location).unwrap();
+    let path = location.get_storage_path().unwrap();
+    let stat = operator.stat(&path).await.unwrap();
+    assert_eq!(stat.content_length(), layout.stored_size);
+    (context, operator, path, *layout)
 }
 
 #[tokio::test]
@@ -206,10 +231,15 @@ async fn writes_read_back() {
     // Pithos probes the first 4 KiB of a block, so the compressible text comes first.
     let data = [b"aruna pithos ".repeat(16_000), content(200_000)].concat();
     let zstd = Compression::Zstd { level: 3 };
-    let (_dir, operator, write) = written(&data, &bucket, zstd).await;
-    assert!(write.layout.stored_size < write.size);
+    let seal = plan(
+        &bucket,
+        BlockCipher::ChaCha20Poly1305,
+        BlockKeys::ContentDerived,
+    );
+    let (_context, operator, path, layout) = written(&data, seal, zstd).await;
+    assert!(layout.stored_size < data.len() as u64);
 
-    let size = write.size;
+    let size = data.len() as u64;
     for range in [
         0..size,
         0..1,
@@ -219,7 +249,7 @@ async fn writes_read_back() {
         5..5,
     ] {
         let expected = &data[range.start as usize..range.end as usize];
-        let actual = read_all(&operator, &write.layout, &bucket, range.clone()).await;
+        let actual = read_at(&operator, &path, &layout, &bucket, range.clone()).await;
         assert_eq!(actual.unwrap(), expected, "{range:?}");
     }
 }
@@ -227,8 +257,9 @@ async fn writes_read_back() {
 #[tokio::test]
 async fn writes_empty_object() {
     let bucket = PrivateKey::generate();
-    let (_dir, operator, write) = written(b"", &bucket, Compression::Off).await;
-    let actual = read_all(&operator, &write.layout, &bucket, 0..0).await;
+    let seal = plan(&bucket, BlockCipher::ChaCha20Poly1305, BlockKeys::Unique);
+    let (_context, operator, path, layout) = written(b"", seal, Compression::Off).await;
+    let actual = read_at(&operator, &path, &layout, &bucket, 0..0).await;
     assert!(actual.unwrap().is_empty());
 }
 
@@ -237,12 +268,18 @@ async fn writes_large_object() {
     // Larger than the 16 MiB FastCDC maximum, so the piece holds several blocks.
     let bucket = PrivateKey::generate();
     let data = content(40 * MIB);
-    let (_dir, operator, write) = written(&data, &bucket, Compression::Off).await;
+    let seal = plan(
+        &bucket,
+        BlockCipher::ChaCha20Poly1305,
+        BlockKeys::ContentDerived,
+    );
+    let (_context, operator, path, layout) = written(&data, seal, Compression::Off).await;
 
-    let whole = read_all(&operator, &write.layout, &bucket, 0..write.size).await;
+    let size = data.len() as u64;
+    let whole = read_at(&operator, &path, &layout, &bucket, 0..size).await;
     assert!(whole.unwrap() == data);
     let range = (15 * MIB) as u64..(33 * MIB) as u64;
-    let part = read_all(&operator, &write.layout, &bucket, range).await;
+    let part = read_at(&operator, &path, &layout, &bucket, range).await;
     assert!(part.unwrap() == data[15 * MIB..33 * MIB]);
 }
 
@@ -250,31 +287,68 @@ async fn writes_large_object() {
 async fn aborts_failed_writes() {
     let context = setup_two_backends().await;
     let handler = &context.blob_handle.handler;
-    let key = PrivateKey::generate().public_key();
+    let seal = plan(
+        &PrivateKey::generate(),
+        BlockCipher::ChaCha20Poly1305,
+        BlockKeys::ContentDerived,
+    );
+    let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        root: "/tmp".to_string(),
+        storage_bucket: "sealed-bucket".to_string(),
+        backend_path: format!("obj/{}", ulid::Ulid::generate()),
+        ulid: ulid::Ulid::generate(),
+        format: StoredFormat::default(),
+        created_by: test_user_id(),
+        created_at: std::time::SystemTime::now(),
+        staging: false,
+        partial: false,
+        blob_size: 0,
+        hashes: std::collections::HashMap::new(),
+    };
 
+    // An uncertain close keeps the reservation and names the Pithos copy for cleanup.
     let (operator, aborts) = failing_close::operator_with_aborts();
     let stream = stream_from_bytes(b"payload");
     let closed = handler
-        .write_pithos(&operator, "object.pith", key, Compression::Off, stream)
+        .write_encoded(
+            location.clone(),
+            operator,
+            stream,
+            Compression::Off,
+            Some(seal),
+        )
         .await;
-    assert!(matches!(
-        closed,
-        Err(BlobError::WriteError(message)) if message.contains("injected finalization failure")
-    ));
+    let BlobEvent::Error(BlobError::WriteCleanup { location: kept, .. }) = closed else {
+        panic!("close failure must keep the location, got {closed:?}")
+    };
+    assert_eq!(kept.ulid, location.ulid);
+    assert_eq!(kept.format.bucket_key(), Some(seal.key));
     assert_eq!(aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Filesystems cannot abort writers, so the partial object with its first block is deleted.
     let (_dir, operator) = empty_store();
+    let path = location.get_storage_path().unwrap();
     let chunks = [
         Ok(Bytes::from(content(17 * MIB))),
         Err(std::io::Error::other("gone")),
     ];
     let stream = BackendStream::new(futures::stream::iter(chunks));
     let failed = handler
-        .write_pithos(&operator, "object.pith", key, Compression::Off, stream)
+        .write_encoded(
+            location,
+            operator.clone(),
+            stream,
+            Compression::Off,
+            Some(seal),
+        )
         .await;
-    assert!(matches!(failed, Err(BlobError::StreamFailed(_))));
-    assert!(!operator.exists("object.pith").await.unwrap());
+    assert!(matches!(
+        failed,
+        BlobEvent::Error(BlobError::StreamFailed(_))
+    ));
+    assert!(!operator.exists(&path).await.unwrap());
 }
 
 #[tokio::test]
@@ -374,11 +448,8 @@ async fn leases_pin_archives() {
     };
     let activated = handler.unlock_effect(BlobEffect::ActivateKey { ticket });
     assert!(matches!(activated, BlobEvent::KeyActivated { .. }));
-    let admit = BlobEffect::AdmitRead {
-        key,
-        archive: ArchiveKey::of(&location),
-    };
-    let BlobEvent::ReadAdmitted { lease } = handler.unlock_effect(admit) else {
+    let admitted = handler.admit_read(key, ArchiveKey::of(&location)).await;
+    let BlobEvent::ReadAdmitted { lease } = admitted else {
         panic!("admission failed")
     };
 
