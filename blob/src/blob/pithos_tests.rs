@@ -403,7 +403,7 @@ async fn leases_pin_archives() {
 }
 
 #[tokio::test]
-async fn keys_seal_through_adapter() {
+async fn adapter_seals_keys() {
     use aruna_core::compute::SecretBytes;
     use aruna_core::effects::BlobEffect;
     use aruna_core::events::Event;

@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn timed_lock_names_session() {
+    fn locks_named_session() {
         let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
         let mut operation = LockBucketOperation::timed(ticket(2), node);
         // The node locks by session alone, without reading the bucket.

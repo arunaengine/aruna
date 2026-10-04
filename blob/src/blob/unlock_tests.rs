@@ -87,7 +87,7 @@ fn admits_after_activation() {
 }
 
 #[test]
-fn bounds_start_at_activation() {
+fn activation_starts_bounds() {
     let mut registry = UnlockRegistry::new(UNLOCKED_BUCKETS);
     let prepared_at = Instant::now();
     let key = reference(1, 1);

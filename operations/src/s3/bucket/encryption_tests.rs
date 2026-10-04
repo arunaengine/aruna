@@ -169,7 +169,7 @@ fn managed_enable_writes() {
 }
 
 #[test]
-fn locked_enable_needs_recovery() {
+fn locked_needs_recovery() {
     // One ready holder without a recovery code does not meet the rule.
     let lookups = BTreeMap::from([
         (user(1), keys(user(1), false)),
