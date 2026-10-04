@@ -8,5 +8,6 @@ pub mod bucket_usage;
 pub mod compression;
 pub mod connectors;
 pub mod deletion;
+pub mod encryption;
 pub mod group_backends;
 pub mod routing;
