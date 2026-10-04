@@ -20,7 +20,9 @@ use crate::structs::identity::user::vault::VaultRecords;
 use crate::structs::placement::policy::document::{PlacementPolicyDocument, PolicyPublication};
 use crate::structs::placement::policy::{MAX_REF_INPUT, PlacementDecision};
 use crate::structs::storage::blob::{BackendLocation, HiddenBlobEntry};
-use crate::structs::storage::encryption::{KeyTicket, ReadLease, SealedCopy, UnlockStatus};
+use crate::structs::storage::encryption::{
+    BucketKeyRef, KeyTicket, ReadLease, SealedCopy, UnlockStatus,
+};
 use crate::structs::storage::multipart::BackendUpload;
 use crate::structs::storage::replication::{ReplicationItemError, ReplicationSuboperationResult};
 use crate::structs::storage::routing::GroupRoutingInputs;
@@ -190,6 +192,10 @@ pub enum BlobEvent {
     /// The new copy of a rewrite; its reservation is held until released.
     CopyRewritten {
         location: BackendLocation,
+    },
+    UnlockedKeyRead {
+        key: BucketKeyRef,
+        private_key: SharedSecret,
     },
 }
 

@@ -245,6 +245,11 @@ pub enum BlobEffect {
         target: ResolvedBackend,
         grants_only: bool,
     },
+    /// Hands out the unlocked key of `key`, for its node vault copy when a bucket leaves
+    /// `vault_locked`. A locked generation answers `Locked`.
+    ReadUnlockedKey {
+        key: BucketKeyRef,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

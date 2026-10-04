@@ -10,7 +10,7 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation, ResolvedBackend};
-use aruna_core::structs::storage::encryption::{BucketKeyError, ReadLease};
+use aruna_core::structs::storage::encryption::{BucketKeyError, BucketKeyRef, ReadLease};
 use aruna_core::structs::storage::format::{PithosLayout, StoredFormat, StoredLayout};
 use bytes::Bytes;
 use futures::Stream;
@@ -150,6 +150,18 @@ impl BlobHandler {
         let mut raw = Zeroizing::new([0u8; 32]);
         raw.copy_from_slice(bytes);
         Ok(AccessKeys::new().with_key(PrivateKey::from_raw(raw)))
+    }
+
+    /// The unlocked key of `key`, for the node vault copy of a bucket leaving `vault_locked`.
+    pub(super) fn read_unlocked(&self, key: BucketKeyRef) -> BlobEvent {
+        let unlocked = match self.unlocks.lock() {
+            Ok(mut registry) => registry.unlocked_key(key, Instant::now()),
+            Err(_) => Err(BucketKeyError::Locked(key.bucket_id)),
+        };
+        match unlocked {
+            Ok((private_key, _)) => BlobEvent::UnlockedKeyRead { key, private_key },
+            Err(error) => BlobEvent::Error(error.into()),
+        }
     }
 
     /// Opens `source` with its key, grants its piece keys only to the target key and writes the
