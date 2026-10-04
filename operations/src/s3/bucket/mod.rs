@@ -25,3 +25,4 @@ pub mod usage;
 pub mod rotate;
 pub mod key_startup;
 pub mod seal_missing;
+pub mod key_restart;

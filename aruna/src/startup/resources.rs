@@ -481,6 +481,7 @@ async fn fill(
 
     // Node-managed bucket keys open before content work; vault-locked keys stay locked.
     open_managed_keys(driver_ctx.as_ref(), config).await?;
+    record_restart_locks(driver_ctx.as_ref(), config).await?;
     stopped(stop)?;
 
     // Bind compute reconciliation before startup recovery.
@@ -543,6 +544,34 @@ async fn open_managed_keys(
             );
         }
     }
+    Ok(())
+}
+
+/// Records the restart lock of vault-locked buckets that were unlocked before this start and
+/// tells their holders.
+async fn record_restart_locks(
+    driver_ctx: &DriverContext,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_operations::driver::drive;
+    use aruna_operations::s3::bucket::key_restart::RestartScanOperation;
+    use aruna_operations::s3::restart_notice::RestartNoticeOperation;
+
+    let buckets = drive(RestartScanOperation::new(), driver_ctx).await?;
+    if buckets.is_empty() {
+        return Ok(());
+    }
+    let count = buckets.len();
+    let boot_id = ulid::Ulid::generate();
+    drive(
+        RestartNoticeOperation::new(config.node_id, boot_id, buckets),
+        driver_ctx,
+    )
+    .await?;
+    info!(
+        buckets = count,
+        "Recorded the restart lock of unlocked buckets"
+    );
     Ok(())
 }
 
