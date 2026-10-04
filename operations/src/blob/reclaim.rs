@@ -11,7 +11,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    STORAGE_BACKEND_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{
@@ -32,6 +32,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::blob::cleanup::schedule_cleanup_effect;
+use crate::blob::pending_reclaim::ReclaimPendingOperation;
 use crate::blob::records::{blob_location_read, iter_index_effect, owners_scan_effect};
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::backends::{RecordReadError, backend_key, parse_read};
@@ -176,6 +177,52 @@ async fn sweep_at(
         match next {
             Some(next) if !outcome.capped => start_after = Some(next),
             _ => break,
+        }
+    }
+
+    if !outcome.capped {
+        let mut start = None;
+        loop {
+            let (rows, next) = iter_prefix_page(
+                &context.storage_handle,
+                PENDING_LOCATION_KEYSPACE,
+                None,
+                start,
+                RECLAIM_PAGE_SIZE,
+                None,
+            )
+            .await?;
+            for (key, _) in &rows {
+                let Ok(archive) = ArchiveKey::from_bytes(key) else {
+                    continue;
+                };
+                // Retain keeps ownerless pending archives; only a reclaim grace frees them.
+                let strategy = match &archive.backend {
+                    BackendRef::Node(name) => catalog.cleanup_of(name).unwrap_or_default(),
+                    BackendRef::Group(id) => group_strategy(context, &mut records, *id)
+                        .await?
+                        .unwrap_or_default(),
+                };
+                let Some(grace) = strategy.grace() else {
+                    continue;
+                };
+                let operation = ReclaimPendingOperation::new(archive, grace, now);
+                match drive(operation, context).await {
+                    Ok(ReclaimVerdict::Freed { bytes }) => {
+                        outcome.freed = outcome.freed.saturating_add(1);
+                        outcome.freed_bytes = outcome.freed_bytes.saturating_add(bytes);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(error = %error, "Pending archive reclaim failed");
+                        outcome.failed = outcome.failed.saturating_add(1);
+                    }
+                }
+            }
+            match next {
+                Some(next) if !rows.is_empty() => start = Some(next),
+                _ => break,
+            }
         }
     }
 
