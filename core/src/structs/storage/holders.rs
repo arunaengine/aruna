@@ -154,7 +154,8 @@ pub fn resolve_holders(
     let holders: Vec<_> = eligible
         .into_iter()
         .map(|(user_id, (origin, grant))| {
-            let ready = copies.iter().any(|copy| copy.user_id == user_id);
+            let own = |copy: &&SealedCopy| copy.user_id == user_id;
+            let ready = copies.iter().any(|copy| own(&copy));
             let lookup = lookups.get(&user_id).unwrap_or(&KeyLookup::Unavailable);
             let (state, has_recovery) = match lookup {
                 KeyLookup::Keys(keys) if !keys.is_empty() => {
@@ -163,7 +164,18 @@ pub fn resolve_holders(
                     } else {
                         HolderState::Pending
                     };
-                    (state, Some(keys.iter().any(|key| key.has_recovery)))
+                    // A ready holder recovers only through a key that has a copy of the bucket key.
+                    let sealed = |key: &&UserKeyRecord| {
+                        !ready
+                            || copies
+                                .iter()
+                                .filter(own)
+                                .any(|c| c.key_record == key.record_id)
+                    };
+                    (
+                        state,
+                        Some(keys.iter().filter(sealed).any(|key| key.has_recovery)),
+                    )
                 }
                 KeyLookup::Keys(_) | KeyLookup::Missing => match ready {
                     true => (HolderState::Ready, Some(false)),

@@ -28,10 +28,15 @@ fn role(users: &[UserId], permissions: &[(&str, Permission)]) -> Role {
     }
 }
 
+/// The key record id of a user's first key, which `copy` seals to.
+fn record(user_id: UserId) -> Ulid {
+    Ulid::from_bytes([user_id.user_ulid.to_bytes()[0]; 16])
+}
+
 fn keys(user_id: UserId, recovery: bool) -> KeyLookup {
     KeyLookup::Keys(vec![UserKeyRecord {
         user_id,
-        record_id: Ulid::generate(),
+        record_id: record(user_id),
         key_id: "slot".to_string(),
         public_key: [7; 32],
         fingerprint: key_fingerprint(&[7; 32]),
@@ -46,7 +51,7 @@ fn copy(user_id: UserId) -> SealedCopy {
     SealedCopy {
         key: BucketKeyRef::new(Ulid::from_bytes([9; 16]), 1),
         user_id,
-        key_record: Ulid::generate(),
+        key_record: record(user_id),
         key_id: "slot".to_string(),
         enc: [0; 32],
         ciphertext: vec![0; 48],
@@ -141,6 +146,23 @@ fn recovery_counts_users() {
     let report = resolve_holders(creator, &admins, &[], &lookups, &one_user);
     assert_eq!(report.recovery.state, RecoveryState::Met);
     assert_eq!(report.recovery.ready_with_recovery, 1);
+}
+
+#[test]
+fn recovery_needs_copy() {
+    let creator = user(1);
+    let KeyLookup::Keys(mut records) = keys(creator, false) else {
+        unreachable!()
+    };
+    // A second key declares a recovery code, but the bucket key is sealed only to the first.
+    let mut second = records[0].clone();
+    second.record_id = Ulid::generate();
+    second.has_recovery = true;
+    records.push(second);
+    let lookups = BTreeMap::from([(creator, KeyLookup::Keys(records))]);
+    let report = resolve_holders(creator, &BTreeSet::new(), &[], &lookups, &[copy(creator)]);
+    assert_eq!(report.holder(creator).unwrap().has_recovery, Some(false));
+    assert_eq!(report.recovery.state, RecoveryState::Degraded);
 }
 
 #[test]
