@@ -156,6 +156,7 @@ async fn seed_version(state: &ServerState) -> (AuthContext, AuthContext, Version
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        encryption: Default::default(),
     };
     write_fixture(
         state,

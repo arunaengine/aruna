@@ -50,6 +50,7 @@ async fn bucket(test: &TestState, name: &str) {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        encryption: Default::default(),
     };
     let operation = CreateBucketOperation::new(name.to_string(), info);
     drive(operation, &test.state.get_ctx())

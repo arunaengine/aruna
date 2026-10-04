@@ -2046,6 +2046,7 @@ mod tests {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    encryption: Default::default(),
                 },
             ),
             &ctx,
@@ -2143,6 +2144,7 @@ mod tests {
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: Compression::Off,
+                encryption: Default::default(),
             };
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::Write {
@@ -2484,6 +2486,7 @@ mod tests {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    encryption: Default::default(),
                 },
             ),
             &ctx,

@@ -676,6 +676,7 @@ mod pure_tests {
             placement_policies: policies,
             placement_policy_generation: 7,
             compression: Compression::Off,
+            encryption: Default::default(),
         }
     }
 

@@ -59,6 +59,72 @@ impl BucketKeyRef {
     }
 }
 
+/// Encryption setting of a bucket.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum EncryptionMode {
+    #[default]
+    Off,
+    /// The node vault holds a copy of the bucket key, so the bucket unlocks at startup.
+    NodeManaged,
+    /// Only key holders unlock the bucket; a restart locks it.
+    VaultLocked,
+}
+
+/// Cipher of new Pithos block payloads.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BlockCipher {
+    #[default]
+    ChaCha20Poly1305,
+    Aes256Gcm,
+}
+
+/// How Pithos keys new blocks: from their content, or with a fresh random key each.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BlockKeys {
+    #[default]
+    ContentDerived,
+    Unique,
+}
+
+/// Encryption settings and write fences of one node-local bucket, kept in its `BucketInfo`.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BucketEncryption {
+    pub mode: EncryptionMode,
+    /// Stable id the bucket keys bind to, set when encryption is first enabled.
+    pub bucket_id: Option<Ulid>,
+    /// Generation new writes seal to; zero until the first key exists.
+    pub key_generation: u64,
+    /// Advances whenever the stored format of new writes changes, so a write that captured an
+    /// older plan fails its final publication.
+    pub storage_generation: u64,
+    pub cipher: BlockCipher,
+    pub block_keys: BlockKeys,
+    /// Longest unlock a holder may request; none means until lock or restart.
+    pub max_unlock_ms: Option<u64>,
+}
+
+impl BucketEncryption {
+    pub fn is_encrypted(&self) -> bool {
+        self.mode != EncryptionMode::Off
+    }
+
+    /// The generation new writes seal to, if the bucket encrypts them.
+    pub fn active_key(&self) -> Option<BucketKeyRef> {
+        let bucket_id = self.bucket_id.filter(|_| self.is_encrypted())?;
+        Some(BucketKeyRef::new(bucket_id, self.key_generation))
+    }
+
+    /// An encrypting bucket needs its stable id and a key generation.
+    pub fn checked(&self) -> Result<(), ConversionError> {
+        if self.is_encrypted() && (self.bucket_id.is_none() || self.key_generation == 0) {
+            return Err(ConversionError::InvalidLength(
+                "an encrypted bucket needs a bucket id and a key generation".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Lifecycle of one key generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum KeyState {
@@ -295,6 +361,23 @@ mod tests {
             SealedCopy::from_bytes(&copy.to_bytes().unwrap()).unwrap(),
             copy
         );
+    }
+
+    #[test]
+    fn settings_need_identity() {
+        let mut settings = BucketEncryption::default();
+        assert_eq!(settings.active_key(), None);
+        settings.checked().unwrap();
+        settings.mode = EncryptionMode::VaultLocked;
+        assert!(settings.checked().is_err());
+        settings.bucket_id = Some(Ulid::from_bytes([2; 16]));
+        assert!(settings.checked().is_err());
+        settings.key_generation = 1;
+        settings.checked().unwrap();
+        let active = BucketKeyRef::new(Ulid::from_bytes([2; 16]), 1);
+        assert_eq!(settings.active_key(), Some(active));
+        settings.mode = EncryptionMode::Off;
+        assert_eq!(settings.active_key(), None);
     }
 
     #[test]

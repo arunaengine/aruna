@@ -284,6 +284,7 @@ mod test {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            encryption: Default::default(),
         };
 
         let result = drive(
@@ -319,6 +320,7 @@ mod test {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            encryption: Default::default(),
         };
 
         drive(

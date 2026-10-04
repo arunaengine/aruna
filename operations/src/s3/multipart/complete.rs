@@ -2099,6 +2099,7 @@ mod decision_tests {
             placement_policies: refs,
             placement_policy_generation: generation,
             compression: Compression::Off,
+            encryption: Default::default(),
         };
         info.to_bytes().expect("bucket encodes").into()
     }

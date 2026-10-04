@@ -99,6 +99,7 @@ pub(crate) async fn create_test_bucket(
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        encryption: Default::default(),
     };
     drive(
         CreateBucketOperation::new(bucket.to_string(), info.clone()),

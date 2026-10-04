@@ -69,6 +69,7 @@ pub async fn bucket(
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        encryption: Default::default(),
     };
     match drive(CreateBucketOperation::new(name.clone(), info), context).await {
         Ok(_) | Err(CreateBucketError::BucketAlreadyExists) => {}

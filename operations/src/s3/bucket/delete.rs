@@ -514,6 +514,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    encryption: Default::default(),
                 },
             ),
             &driver_ctx,
@@ -565,6 +566,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    encryption: Default::default(),
                 },
             ),
             &driver_ctx,
@@ -615,6 +617,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    encryption: Default::default(),
                 },
             ),
             &driver_ctx,
@@ -736,6 +739,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    encryption: Default::default(),
                 }
                 .to_bytes()
                 .unwrap()
@@ -803,6 +807,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    encryption: Default::default(),
                 }
                 .to_bytes()
                 .unwrap()

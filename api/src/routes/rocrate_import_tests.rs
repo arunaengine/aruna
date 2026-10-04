@@ -464,6 +464,7 @@ async fn seed_bucket(state: &ServerState, bucket: &str, group: Ulid, user: UserI
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        encryption: Default::default(),
     };
     write_doc(
         state,

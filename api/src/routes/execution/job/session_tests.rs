@@ -687,6 +687,7 @@ async fn seed_bucket(state: &Arc<ServerState>, bucket: &str, group_id: Ulid, own
         placement_policies: Vec::new(),
         placement_policy_generation: 1,
         compression: Compression::Off,
+        encryption: Default::default(),
     };
     write_row(
         &state.get_ctx().storage_handle,

@@ -34,6 +34,7 @@ impl From<LegacyBucket> for BucketInfo {
             placement_policies: old.placement_policies,
             placement_policy_generation: old.placement_policy_generation,
             compression: Compression::Off,
+            encryption: Default::default(),
         }
     }
 }

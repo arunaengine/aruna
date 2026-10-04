@@ -591,6 +591,7 @@ mod pure_tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Zstd { level: 3 },
+            encryption: Default::default(),
         };
         operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
