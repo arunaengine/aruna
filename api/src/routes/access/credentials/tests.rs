@@ -185,6 +185,7 @@ async fn create_credential(
             group_id: group_id.to_string(),
             expires_in_seconds: None,
             path_restrictions,
+            encrypted_buckets: None,
         }),
     )
     .await

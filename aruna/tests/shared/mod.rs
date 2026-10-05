@@ -471,6 +471,7 @@ pub(crate) async fn request_credentials(
                 group_id: group_id.to_string(),
                 expires_in_seconds: Some(600),
                 path_restrictions: path_restrictions.clone(),
+                encrypted_buckets: None,
             })
             .send()
             .await?;

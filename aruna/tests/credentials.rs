@@ -38,6 +38,7 @@ async fn post_credentials(
             group_id: group_id.to_string(),
             expires_in_seconds: Some(600),
             path_restrictions,
+            encrypted_buckets: None,
         })
         .send()
         .await?)

@@ -8,18 +8,23 @@ use crate::server::state::ServerState;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{UserAccess, group_permission_path};
+use aruna_core::structs::storage::encryption::TokenCredential;
 use aruna_operations::driver::drive;
+use aruna_operations::driver::now_ms;
 use aruna_operations::s3::access::create::{
-    CreateUserConfig, CreateUserError, CreateUserOperation, DEFAULT_CREDENTIAL_TTL,
+    CreateTokenOperation, CreateUserConfig, CreateUserError, CreateUserOperation,
+    DEFAULT_CREDENTIAL_TTL,
 };
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
 use aruna_operations::s3::access::list::{ListUserInput, ListUserOperation};
 use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
+use aruna_operations::s3::bucket::key_rows::SettingsError;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 use std::{str::FromStr, sync::Arc};
 use ulid::Ulid;
@@ -56,6 +61,9 @@ pub struct CreateS3Request {
     #[schema(default = 31536000)]
     pub expires_in_seconds: Option<u64>,
     pub path_restrictions: Option<Vec<CreatePathRestriction>>,
+    /// Encrypted buckets on this node the credential may read while they are locked.
+    #[serde(default)]
+    pub encrypted_buckets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -63,7 +71,13 @@ pub struct CreateS3Request {
 pub struct CreateS3Response {
     pub access_key_id: String,
     pub access_secret: String,
+    /// The token S3 clients send as `aws_session_token`; present only with encrypted buckets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
 }
+
+/// Most encrypted buckets one token credential may name.
+const MAX_TOKEN_BUCKETS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[schema(as = S3PathRestrictionResponse)]
@@ -308,9 +322,15 @@ to the group data root and can never widen them.
   only the access key id, and a lost secret means creating a new credential.
 - The credential is stored on the node that served the request and is accepted by that node's S3
   endpoint.
+- `encrypted_buckets` names encrypted buckets on this node. The caller must be a current key holder
+  of each, and each must be unlocked now. The node seals each bucket key with a new random token
+  and returns that token once as `session_token`; it never stores the token. S3 clients send it as
+  `aws_session_token` in the signed `x-amz-security-token` header, and then read these buckets
+  while they are locked. Token credentials do not work in presigned URLs.
 
 **Limits**
 - The optional lifetime is given in seconds between 60 and 31536000 and defaults to 31536000.
+- `encrypted_buckets` names at most 64 buckets.
 - A restriction pattern is relative to the group data root or an absolute path inside it, may name
   an exact path or a subtree with a trailing `/**`, and takes `READ`, `WRITE` or `DENY` case
   insensitively; at most 50 restrictions are accepted.
@@ -326,23 +346,42 @@ to the group data root and can never widen them.
                     "pattern": "shared/**",
                     "permission": "READ"
                 }
-            ]
+            ],
+            "encrypted_buckets": ["research-raw"]
         })
     ),
     responses(
         (
             status = 201,
-            description = "Credential created; `access_secret` is the plaintext secret access key and is shown only here",
+            description = "Credential created; `access_secret` is the plaintext secret access key and `session_token` the token of `encrypted_buckets`, both shown only here",
             body = CreateS3Response,
             example = json!({
                 "access_key_id": "01JAKEY0123456789ABCDEFGHJ",
-                "access_secret": "<one-time-secret-shown-only-in-this-response>"
+                "access_secret": "<one-time-secret-shown-only-in-this-response>",
+                "session_token": "<one-time-token-shown-only-in-this-response>"
             })
         ),
-        (status = 400, description = "The group id is not a ULID, the lifetime is out of range, or a restriction is malformed or exceeds the count limit", body = ErrorResponse),
+        (
+            status = 400,
+            description = "The group id is not a ULID, the lifetime is out of range, a restriction is malformed or exceeds the count limit, too many encrypted buckets are named, or `bucket_not_encrypted` when a named bucket does not encrypt",
+            body = ErrorResponse,
+            example = json!({"error": "bucket research-raw is not encrypted", "code": "bucket_not_encrypted"})
+        ),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, the caller may read no part of the group data path, or a restriction reaches outside the group root or the caller's own grant", body = ErrorResponse),
-        (status = 409, description = "The caller already holds 16 active credentials; revoke or let one expire first", body = ErrorResponse)
+        (
+            status = 403,
+            description = "Token belongs to another realm, the caller may read no part of the group data path, a restriction reaches outside the group root or the caller's own grant, or `not_holder` when the caller is no current key holder of a named bucket",
+            body = ErrorResponse,
+            example = json!({"error": "the caller holds no key of bucket research-raw", "code": "not_holder"})
+        ),
+        (status = 404, description = "A named encrypted bucket does not exist on this node", body = ErrorResponse),
+        (
+            status = 409,
+            description = "The caller already holds 16 active credentials, or `bucket_locked` when a named bucket is not unlocked on this node",
+            body = ErrorResponse,
+            example = json!({"error": "bucket research-raw is locked", "code": "bucket_locked"})
+        ),
+        (status = 503, description = "An authorization document of a named bucket is missing", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -386,33 +425,73 @@ pub async fn create_s3_credentials(
         return Err(ServerError::BadRequest);
     }
     let expiry = credential_expiry(SystemTime::now(), request.expires_in_seconds)?;
-    let result = drive(
-        CreateUserOperation::new(
-            CreateUserConfig {
-                user_identity,
-                group_id,
-                expiry,
-                path_restrictions,
-                issued_by: *node_id.as_bytes(),
-            },
-            state.credential_encryption_key().clone(),
-        ),
-        &state.get_ctx(),
-    )
-    .await;
+    let buckets: BTreeSet<String> = request
+        .encrypted_buckets
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if buckets.len() > MAX_TOKEN_BUCKETS {
+        return Err(ServerError::BadRequest);
+    }
+    let operation = CreateUserOperation::new(
+        CreateUserConfig {
+            user_identity,
+            group_id,
+            expiry,
+            path_restrictions,
+            issued_by: *node_id.as_bytes(),
+        },
+        state.credential_encryption_key().clone(),
+    );
+    let result = match buckets.is_empty() {
+        true => drive(operation, &state.get_ctx())
+            .await
+            .map(|(access_key, secret, _)| (access_key, secret, None)),
+        false => {
+            let buckets = buckets.into_iter().collect();
+            let tokens =
+                CreateTokenOperation::new(operation, buckets, (realm_id, node_id), now_ms());
+            drive(tokens, &state.get_ctx())
+                .await
+                .map(|(access_key, secret, _, token)| (access_key, secret, Some(token)))
+        }
+    };
 
     match result {
-        Ok((access_key_id, access_secret, _)) => Ok((
+        Ok((access_key_id, access_secret, token)) => Ok((
             StatusCode::CREATED,
             Json(CreateS3Response {
                 access_key_id,
                 access_secret: access_secret.expose().to_string(),
+                session_token: token
+                    .map(|token| TokenCredential::encode(token.bytes()).to_string()),
             }),
         )),
         Err(CreateUserError::LimitReached) => Err(ServerError::Conflict(
             "active credential limit reached".to_string(),
         )),
-        Err(err) => Err(ServerError::InternalError(err.to_string())),
+        Err(error) => Err(token_refusal(error)),
+    }
+}
+
+/// The REST answer to a failed credential creation; token failures carry their own codes.
+fn token_refusal(error: CreateUserError) -> ServerError {
+    let message = error.to_string();
+    match error {
+        CreateUserError::NoSuchBucket(_) => ServerError::NotFound,
+        CreateUserError::NotEncrypted(_) => {
+            ServerError::Refused(StatusCode::BAD_REQUEST, "bucket_not_encrypted", message)
+        }
+        CreateUserError::NotHolder(_) => {
+            ServerError::Refused(StatusCode::FORBIDDEN, "not_holder", message)
+        }
+        CreateUserError::BucketLocked(_) => {
+            ServerError::Refused(StatusCode::CONFLICT, "bucket_locked", message)
+        }
+        CreateUserError::Settings(SettingsError::MissingAuthority) => {
+            ServerError::ServiceUnavailable
+        }
+        _ => ServerError::InternalError(message),
     }
 }
 
