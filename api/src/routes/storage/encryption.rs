@@ -762,7 +762,9 @@ pub(crate) async fn change_bucket(
             max: changed.settings.max_unlock_ms.map(Duration::from_millis),
         };
         // The change is committed either way; a failed install only leaves the key locked.
-        if let Err(error) = drive(InstallKeyOperation::new(install), &context).await {
+        let node_id = state.get_node_id();
+        let install = InstallKeyOperation::new(install).audited(node_id, Some(caller), now_ms());
+        if let Err(error) = drive(install, &context).await {
             tracing::warn!(%bucket, ?error, "new bucket key stays locked");
         }
     }
