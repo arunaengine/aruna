@@ -70,10 +70,11 @@ fn generated(operation: &mut EnableEncryptionOperation) -> (Effects, [u8; 32]) {
     operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
     let values = authority_rows(&bucket(), None, &[user(2)]);
     operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+    operation.step(Event::Storage(StorageEvent::IterResult {
         values: Vec::new(),
         next_start_after: None,
     }));
+    let effects = no_versions(operation);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Blob(BlobEffect::GenerateBucketKey)]
@@ -85,6 +86,14 @@ fn generated(operation: &mut EnableEncryptionOperation) -> (Effects, [u8; 32]) {
         private_key: SharedSecret::new(private),
     }));
     (effects, public)
+}
+
+/// Answers the scan of the bucket's versions with an empty page.
+fn no_versions(operation: &mut EnableEncryptionOperation) -> Effects {
+    operation.step(Event::Storage(StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: None,
+    }))
 }
 
 fn sealed(effects: &Effects) -> Vec<SealedCopy> {
@@ -259,10 +268,11 @@ fn decryption_blocks_enable() {
     let mut decrypt = EncryptionTransition::new(kind, Some(source), target, 1, 1);
     let read = |operation: &mut EnableEncryptionOperation, transition: &EncryptionTransition| {
         bucket_read(operation, Some(decrypted.clone()));
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+        operation.step(Event::Storage(StorageEvent::IterResult {
             values: Vec::new(),
             next_start_after: None,
         }));
+        let effects = no_versions(operation);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == TRANSITION_KEYSPACE
@@ -368,4 +378,89 @@ fn revoked_enabler_refused() {
         [Effect::Storage(StorageEffect::AbortTransaction { .. })]
     ));
     assert!(matches!(operation.finalize(), Err(EnableError::NotAdmin)));
+}
+
+#[test]
+fn oversized_copy_refused() {
+    use aruna_blob::blob::pithos::MAX_SIZE;
+    use aruna_core::errors::BlobError;
+    use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
+    use aruna_core::structs::checksum::HASH_BLAKE3;
+    use aruna_core::structs::storage::blob::{
+        BackendLocation, BackendRef, BlobVersion, VersionKey,
+    };
+    use aruna_core::structs::storage::format::{EncodingClass, StoredFormat};
+    use std::collections::HashMap;
+
+    // A plain copy larger than any Pithos copy could never be moved by the encryption transition.
+    let run = |size: u64| {
+        let mut operation =
+            EnableEncryptionOperation::new(input(EncryptionMode::NodeManaged, BTreeMap::new()));
+        bucket_read(&mut operation, None);
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        let hash = [7u8; 32];
+        let version = BlobVersion::materialized(
+            hash,
+            BackendRef::node_default(),
+            EncodingClass::Raw,
+            SystemTime::UNIX_EPOCH,
+            user(1),
+            None,
+        );
+        let key = VersionKey::new("bucket", "large", Ulid::from_bytes([8; 16]));
+        let values = vec![(
+            key.to_bytes().unwrap().into(),
+            version.to_bytes().unwrap().into(),
+        )];
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        }));
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+            panic!("expected the size reads, got {effects:?}")
+        };
+        assert_eq!(reads[0].0, BLOB_LOCATIONS_KEYSPACE);
+        let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/tmp".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "large".to_string(),
+            ulid: Ulid::from_bytes([9; 16]),
+            format: StoredFormat::default(),
+            created_by: user(1),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: size,
+            hashes: HashMap::from([(HASH_BLAKE3.to_string(), hash.to_vec())]),
+        };
+        let values = vec![(
+            reads[0].1.clone(),
+            Some(location.to_bytes().unwrap().into()),
+        )];
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        (operation, effects)
+    };
+
+    let (operation, effects) = run(MAX_SIZE + 1);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    assert_eq!(
+        operation.finalize(),
+        Err(EnableError::Blob(BlobError::SizeLimitExceeded {
+            limit: MAX_SIZE
+        }))
+    );
+    // A copy at the supported size still lets the bucket enable.
+    let (_, effects) = run(MAX_SIZE);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::GenerateBucketKey)]
+    ));
 }

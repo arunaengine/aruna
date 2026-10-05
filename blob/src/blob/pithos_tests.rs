@@ -1149,15 +1149,59 @@ async fn framed_reads_pin_copies() {
 
 #[tokio::test]
 async fn over_budget_refused() {
-    use crate::blob::pithos::{MAX_SIZE, WORKING_SET, budget_permits, working_set};
+    use crate::blob::pithos::{WORKING_SET, budget_permits, working_set};
 
-    // The largest object's working set exceeds the node budget: refused, never clipped.
+    // A 5 TiB working set exceeds the node budget: refused, never clipped.
     let context = setup_two_backends().await;
     let handler = context.blob_handle.handler.clone();
-    let refused = handler.reserve_pithos(working_set(MAX_SIZE)).await;
+    let refused = handler.reserve_pithos(working_set(5 << 40)).await;
     assert_eq!(
         refused.err(),
         Some(BlobError::SizeLimitExceeded { limit: WORKING_SET })
     );
     assert_eq!(handler.pithos_budget.available_permits(), budget_permits());
+}
+
+#[tokio::test]
+async fn oversized_seal_refused() {
+    use crate::blob::pithos::MAX_SIZE;
+
+    // A sealed copy larger than every copy that can be re-encoded is refused before writing.
+    let context = setup_two_backends().await;
+    let handler = &context.blob_handle.handler;
+    let seal = plan(
+        &PrivateKey::generate(),
+        BlockCipher::ChaCha20Poly1305,
+        BlockKeys::ContentDerived,
+    );
+    let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        root: "/tmp".to_string(),
+        storage_bucket: "sealed-bucket".to_string(),
+        backend_path: format!("obj/{}", ulid::Ulid::generate()),
+        ulid: ulid::Ulid::generate(),
+        format: StoredFormat::default(),
+        created_by: test_user_id(),
+        created_at: std::time::SystemTime::now(),
+        staging: false,
+        partial: false,
+        blob_size: 0,
+        hashes: std::collections::HashMap::new(),
+    };
+    let (_dir, operator) = empty_store();
+    let refused = handler
+        .write_encoded(
+            location,
+            operator,
+            stream_from_bytes(b"data"),
+            Compression::Off,
+            (Some(seal), None),
+            Some(MAX_SIZE + 1),
+        )
+        .await;
+    assert_eq!(
+        refused,
+        BlobEvent::Error(BlobError::SizeLimitExceeded { limit: MAX_SIZE })
+    );
 }

@@ -8,14 +8,20 @@ use crate::s3::bucket::key_rows::{
     SettingsError, audit_row, authority_read, copy_targets, generation_rows, parse_authority,
     uploads_open,
 };
+use aruna_blob::blob::pithos::MAX_SIZE;
 use aruna_core::compute::SharedSecret;
+use aruna_core::effects::IterStart;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{BUCKET_HOLDER_KEYSPACE, TRANSITION_KEYSPACE, UPLOAD_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_HOLDER_KEYSPACE, TRANSITION_KEYSPACE,
+    UPLOAD_KEYSPACE,
+};
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKey};
 use aruna_core::structs::storage::encryption::{
     BlockCipher, BlockKeys, BucketEncryption, BucketHolder, BucketKeyError, BucketKeyRecord,
     BucketKeyRef, EncryptionMode, SealedCopy,
@@ -34,12 +40,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use ulid::Ulid;
 
+/// Versions read per page while checking copy sizes before encryption is enabled.
+const SIZE_PAGE: usize = 256;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EnableState {
     Init,
     StartTransaction,
     ReadBucket,
     CheckUploads,
+    /// Pages through the bucket's versions and reads their copies' sizes.
+    ScanVersions,
+    ReadSizes,
     ReadTransition,
     ReadGrants,
     GenerateKey,
@@ -131,6 +143,9 @@ pub struct EnableEncryptionOperation {
     private_key: Option<SharedSecret>,
     result: Option<EnableResult>,
     output: Option<Result<EnableResult, EnableError>>,
+    /// Last version key of the current size page, and whether another page may follow.
+    size_cursor: Option<Key>,
+    more_sizes: bool,
 }
 
 impl EnableEncryptionOperation {
@@ -148,6 +163,8 @@ impl EnableEncryptionOperation {
             private_key: None,
             result: None,
             output: None,
+            size_cursor: None,
+            more_sizes: false,
         }
     }
 
@@ -199,6 +216,68 @@ impl EnableEncryptionOperation {
     fn check_uploads(&mut self, uploads: &[(Key, Value)]) -> Effects {
         if uploads_open(uploads, &self.input.bucket) {
             return self.fail(EnableError::OpenUploads);
+        }
+        self.scan_versions()
+    }
+
+    /// Every copy must fit a Pithos archive, or the encryption transition could never move it.
+    /// The scan reads in the enable transaction, so a concurrent larger write conflicts.
+    fn scan_versions(&mut self) -> Effects {
+        let prefix = match VersionKey::bucket_prefix(&self.input.bucket) {
+            Ok(prefix) => prefix,
+            Err(error) => return self.fail(error),
+        };
+        self.state = EnableState::ScanVersions;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: self.size_cursor.clone().map(IterStart::After),
+            limit: SIZE_PAGE,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn versions_scanned(&mut self, values: Vec<(Key, Value)>) -> Effects {
+        self.more_sizes = values.len() == SIZE_PAGE;
+        self.size_cursor = values.last().map(|(key, _)| key.clone());
+        let mut locations = BTreeSet::new();
+        for (_, value) in &values {
+            match BlobVersion::from_bytes(value.as_ref()) {
+                Ok(version) => locations.extend(version.location_key().map(|key| key.to_bytes())),
+                Err(error) => return self.fail(error),
+            }
+        }
+        if locations.is_empty() {
+            return self.after_sizes();
+        }
+        self.state = EnableState::ReadSizes;
+        let reads = locations
+            .into_iter()
+            .map(|key| (BLOB_LOCATIONS_KEYSPACE.to_string(), key.into()))
+            .collect();
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn sizes_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+        for value in values.into_iter().filter_map(|(_, value)| value) {
+            match BackendLocation::from_bytes(value.as_ref()) {
+                Ok(location) if location.blob_size > MAX_SIZE => {
+                    let limit = MAX_SIZE;
+                    return self.fail(BlobError::SizeLimitExceeded { limit });
+                }
+                Ok(_) => {}
+                Err(error) => return self.fail(error),
+            }
+        }
+        self.after_sizes()
+    }
+
+    fn after_sizes(&mut self) -> Effects {
+        if self.more_sizes {
+            return self.scan_versions();
         }
         if self.settings.bucket_id.is_none() {
             return self.generate();
@@ -327,6 +406,7 @@ impl EnableEncryptionOperation {
             node_id: self.input.node_id,
             generation: Some(key.generation),
             session_id: None,
+            intent_id: None,
             deadline_ms: None,
             reason: Some(format!("enabled {:?}", self.input.mode)),
             outcome: AuditOutcome::Applied,
@@ -421,6 +501,13 @@ impl Operation for EnableEncryptionOperation {
                 EnableState::CheckUploads,
                 Event::Storage(StorageEvent::IterResult { values, .. }),
             ) => self.check_uploads(&values),
+            (
+                EnableState::ScanVersions,
+                Event::Storage(StorageEvent::IterResult { values, .. }),
+            ) => self.versions_scanned(values),
+            (EnableState::ReadSizes, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                self.sizes_read(values)
+            }
             (
                 EnableState::ReadTransition,
                 Event::Storage(StorageEvent::ReadResult { value, .. }),

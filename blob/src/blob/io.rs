@@ -442,6 +442,11 @@ impl BlobHandler {
         }
         let encoder = match (seal, compression) {
             (Some(plan), _) => {
+                // One supported size for every sealed copy, so any of them can be re-encoded later.
+                if size.is_some_and(|size| size > super::pithos::MAX_SIZE) {
+                    let limit = super::pithos::MAX_SIZE;
+                    return BlobEvent::Error(BlobError::SizeLimitExceeded { limit });
+                }
                 let covered = size.unwrap_or(super::pithos::GROWTH);
                 // A caller that already holds the share of this write passes it in.
                 let permit = match reserved {

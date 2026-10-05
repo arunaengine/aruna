@@ -41,8 +41,9 @@ const MIB: usize = 1 << 20;
 const BATCH: usize = MIB;
 /// Zstd levels that the Pithos compression levels 1 to 7 stand for.
 const PITHOS_ZSTD: [u8; 7] = [1, 4, 8, 11, 15, 18, 22];
-/// Largest original object a Pithos write accepts: 5 TiB.
-pub const MAX_SIZE: u64 = 5 << 40;
+/// Largest original object a Pithos copy holds, about 0.93 TiB: a re-encode reserves the read and
+/// the write of such an object together, and that still fits the node budget.
+pub const MAX_SIZE: u64 = ((WORKING_SET / 2 - BASE_SHARE) / BLOCK_MEMORY - MAX_PIECES) * MIN_BLOCK;
 /// Largest decoded block: the FastCDC maximum of single uploads.
 const MAX_BLOCK: u64 = 16 << 20;
 /// Pithos metadata, encoder state and read buffers that may be in use at once on one node.
@@ -740,9 +741,9 @@ fn blob_error(error: PithosError) -> BlobError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArchiveEncoder, BASE_SHARE, BATCH, BLOCK_MEMORY, GROWTH, MAX_PIECES, MAX_SIZE, OBJECT_PATH,
-        Share, TokioBlocking, WORKING_SET, budget_permits, compose_object, open_limits,
-        working_set,
+        ArchiveEncoder, BASE_SHARE, BATCH, BLOCK_MEMORY, GROWTH, MAX_PIECES, MAX_SIZE, MIN_BLOCK,
+        OBJECT_PATH, Share, TokioBlocking, WORKING_SET, budget_permits, compose_object,
+        open_limits, working_set,
     };
     use aruna_core::errors::BlobError;
     use aruna_core::structs::storage::encryption::{BucketKeyRef, SealPlan};
@@ -789,9 +790,11 @@ mod tests {
     #[test]
     fn working_sets_bound() {
         assert_eq!(working_set(0), BASE_SHARE + MAX_PIECES * BLOCK_MEMORY);
-        // Nothing is clipped: the largest object needs more than the node budget, so it is
-        // refused when reserved instead of running with too small a share.
-        assert!(working_set(MAX_SIZE) > WORKING_SET);
+        // One supported size: a re-encode of the largest copy holds its read and write at once
+        // within the budget, and one more block would not fit. Writes and reads fit alone.
+        assert!(2 * working_set(MAX_SIZE) <= WORKING_SET);
+        assert!(2 * working_set(MAX_SIZE + MIN_BLOCK) > WORKING_SET);
+        assert!(working_set(MAX_SIZE) <= WORKING_SET);
         let limits = open_limits(1 << 30);
         assert_eq!(limits.max_descriptors, 1024 + MAX_PIECES);
         assert!(limits.max_total_directory_bytes < working_set(1 << 30));
