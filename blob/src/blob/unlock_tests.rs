@@ -325,7 +325,7 @@ fn leases_hold_slots() {
     unlock(&mut registry, key, 1, (None, None), now).unwrap();
     let lease = admit(&mut registry, key, archive(1), now).unwrap();
     // The only slot stays with the lease while its stream lives, even after a lock.
-    registry.lock(key.bucket_id, None, now).0;
+    registry.lock(key.bucket_id, None, now);
     assert!(registry.lease_slots().try_acquire_owned().is_err());
     drop(lease);
     assert!(registry.lease_slots().try_acquire_owned().is_ok());

@@ -78,7 +78,7 @@ mod tests {
         let key = BucketKeyRef::new(Ulid::from_parts(7, 9), 3);
         let job_id = JobId::from_bytes([4; 16]);
         let row = key_wait_key(key, job_id);
-        assert!(row.starts_with(&bucket_wait_prefix(key.bucket_id)));
+        assert!(row.starts_with(bucket_wait_prefix(key.bucket_id)));
         assert_eq!(parse_wait_key(&row), Some((key, job_id)));
         assert_eq!(parse_wait_key(&job_wait_key(job_id)), None);
     }

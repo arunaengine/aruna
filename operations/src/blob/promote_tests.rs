@@ -297,7 +297,7 @@ fn promotes_pending_alias() {
     };
     operation.step(Event::Net(aruna_core::events::NetEvent::Dht(
         aruna_core::events::DhtEvent::PutComplete {
-            key: key.clone(),
+            key: *key,
             remote_attempt_count: 0,
             remote_store_count: 0,
         },
