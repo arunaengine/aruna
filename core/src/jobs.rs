@@ -6,13 +6,15 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use ulid::Ulid;
 
 use crate::UserId;
 use crate::metadata::AuthToken;
 use crate::structs::execution::job::{
-    JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState,
+    JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState, KeyWait,
     StagingJobCheckpoint, WorkspaceMode,
 };
+use crate::structs::storage::encryption::BucketKeyRef;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobKind {
@@ -101,6 +103,8 @@ pub struct JobStatusView {
     pub locally_exhausted: bool,
     /// Set for a notebook session: the catalog runtime it runs.
     pub session_runtime: Option<String>,
+    /// Bucket keys an `awaiting_key` job still needs; filled by the owning node.
+    pub awaiting_keys: Vec<KeyWait>,
 }
 
 mod json_value {
@@ -146,6 +150,7 @@ impl From<&JobRecord> for JobStatusView {
                 JobPayload::Execution(spec) => spec.session_runtime(),
                 _ => None,
             },
+            awaiting_keys: Vec::new(),
         }
     }
 }
@@ -212,6 +217,34 @@ pub enum JobRequest {
         auth_token: AuthToken,
         job_id: JobId,
     },
+    /// Registers `job_id` of the sending node as waiting for the keys of these exact sources.
+    /// The answer lists only keys still locked after the registration, closing the unlock race.
+    AwaitKeys {
+        auth_token: AuthToken,
+        job_id: JobId,
+        targets: Vec<WaitTarget>,
+    },
+    /// Tells the waiting node that `key` of the sending node is unlocked. Grants no read.
+    KeyWake {
+        auth_token: AuthToken,
+        job_id: JobId,
+        key: BucketKeyRef,
+    },
+}
+
+/// The exact source a remote key wait names; the key node authorizes and admits only that.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WaitTarget {
+    /// One object version, also a reference whose content hash is not known.
+    Object {
+        bucket: String,
+        key: String,
+        version_id: Ulid,
+    },
+    /// The version a captured input names among the aliases of its content.
+    Captured { blake3: [u8; 32], version_id: Ulid },
+    /// Any readable version of a content; it waits only while none is readable.
+    Content { blake3: [u8; 32] },
 }
 
 impl JobRequest {
@@ -221,7 +254,9 @@ impl JobRequest {
             | Self::Report { auth_token, .. }
             | Self::Artifact { auth_token, .. }
             | Self::Cancel { auth_token, .. }
-            | Self::Record { auth_token, .. } => auth_token.clone(),
+            | Self::Record { auth_token, .. }
+            | Self::AwaitKeys { auth_token, .. }
+            | Self::KeyWake { auth_token, .. } => auth_token.clone(),
         }
     }
 }
@@ -257,4 +292,7 @@ pub enum JobResponse {
         record: Box<JobRecord>,
         checkpoint: Option<StagingJobCheckpoint>,
     },
+    /// Keys still locked on the answering node; empty means every content is readable.
+    KeysLocked(Vec<KeyWait>),
+    KeyWakeAcked,
 }

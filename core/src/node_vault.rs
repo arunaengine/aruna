@@ -18,6 +18,8 @@ const NONCE_LEN: usize = 12;
 pub enum VaultPurpose {
     SourceConnector,
     GroupBackend,
+    /// The node copy of a `node_managed` bucket key, under its key record id.
+    BucketKey,
 }
 
 impl VaultPurpose {
@@ -25,6 +27,7 @@ impl VaultPurpose {
         match self {
             Self::SourceConnector => 1,
             Self::GroupBackend => 2,
+            Self::BucketKey => 3,
         }
     }
 }
@@ -137,8 +140,10 @@ mod tests {
 
         let other_id = VaultEntry::new(entry.purpose, Ulid::from_bytes([2u8; 16]));
         let other_purpose = VaultEntry::new(VaultPurpose::GroupBackend, entry.id);
+        let bucket_key = VaultEntry::new(VaultPurpose::BucketKey, entry.id);
         assert_eq!(key.open(other_id, &sealed), Err(VaultError::Open));
         assert_eq!(key.open(other_purpose, &sealed), Err(VaultError::Open));
+        assert_eq!(key.open(bucket_key, &sealed), Err(VaultError::Open));
         let other_node = NodeVaultKey::derive(&[8u8; 32]);
         assert_eq!(other_node.open(entry, &sealed), Err(VaultError::Open));
         // The S3 credential key comes from the same node secret but never opens a vault record.

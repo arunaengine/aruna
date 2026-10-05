@@ -79,6 +79,8 @@ pub enum JobRunOutcome {
     Deferred(JobError),
     Cancelled,
     Interrupted,
+    /// Needs these locked bucket keys; the runtime parks the job without spending an attempt.
+    AwaitingKey(Vec<aruna_core::structs::execution::job::KeyWait>),
 }
 
 /// Payload dispatch, mirroring how the task handler matches `TaskKey`. Execution

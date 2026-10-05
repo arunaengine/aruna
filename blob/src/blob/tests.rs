@@ -960,6 +960,7 @@ async fn reuses_current_bucket() {
             key: "one.bin".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"one"),
+            size: None,
         })
         .await
     else {
@@ -974,6 +975,7 @@ async fn reuses_current_bucket() {
             key: "two.bin".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"two"),
+            size: None,
         })
         .await
     else {
@@ -1029,6 +1031,7 @@ async fn starts_fresh_bucket() {
             key: "one.bin".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"one"),
+            size: None,
         })
         .await
     else {
@@ -1043,6 +1046,7 @@ async fn starts_fresh_bucket() {
             key: "two.bin".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"two"),
+            size: None,
         })
         .await
     else {
@@ -1082,6 +1086,7 @@ async fn keeps_bucket_reusable() {
             key: "one.bin".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"one"),
+            size: None,
         })
         .await
     else {
@@ -1116,6 +1121,7 @@ async fn keeps_bucket_reusable() {
             key: "two.bin".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"two"),
+            size: None,
         })
         .await
     else {
@@ -1430,6 +1436,7 @@ async fn range_passes_writes() {
                 key: "object".to_string(),
                 created_by: test_user_id(),
                 blob: body,
+                size: None,
             })
             .await
     });
@@ -1574,6 +1581,7 @@ async fn interlocked_writes_complete() {
                     key: format!("object-{index}"),
                     created_by: test_user_id(),
                     blob: body,
+                    size: None,
                 })
                 .await
         }));
@@ -1602,6 +1610,7 @@ async fn tracks_concurrent_loads() {
             key: "seed".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"seed"),
+            size: None,
         })
         .await
     else {
@@ -1625,6 +1634,7 @@ async fn tracks_concurrent_loads() {
                     key: format!("object-{index}"),
                     created_by: test_user_id(),
                     blob: body,
+                    size: None,
                 })
                 .await
         }));
@@ -2131,6 +2141,7 @@ async fn compose_close_fails() {
             key: "part.bin".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"part-data"),
+            size: None,
         })
         .await
     else {
@@ -2531,6 +2542,7 @@ async fn read_holds_permit() {
             key: "object".to_string(),
             created_by: test_user_id(),
             blob: stream_from_bytes(b"payload"),
+            size: None,
         })
         .await
     else {
@@ -2575,6 +2587,7 @@ async fn reservation_forces_rollover() {
                     key: format!("object-{index}"),
                     created_by: test_user_id(),
                     blob: body,
+                    size: None,
                 })
                 .await
         }));
@@ -2853,6 +2866,7 @@ async fn in_place_part(
         location,
         created_at: SystemTime::now(),
         backend_etag: Some(backend_etag),
+        piece: None,
     }
 }
 
@@ -3005,6 +3019,7 @@ async fn s3_staged_replacement() {
         location,
         created_at: SystemTime::now(),
         backend_etag: None,
+        piece: None,
     };
 
     let BlobEvent::WriteFinished { location } =
@@ -3252,6 +3267,7 @@ async fn s3_overlapping_writes() {
         location,
         created_at: SystemTime::now(),
         backend_etag: None,
+        piece: None,
     };
 
     let BlobEvent::WriteFinished { location } =
@@ -3501,7 +3517,7 @@ async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bo
         };
         let write = StorageEffect::VaultWrite {
             entry: GroupStorageSecret::vault_entry(backend_id),
-            secret: secret.to_secret().unwrap(),
+            secret: aruna_core::compute::SharedSecret::new(secret.to_secret().unwrap()),
             txn_id: None,
         };
         context.storage_handle.send_storage_effect(write).await;
@@ -3786,3 +3802,12 @@ async fn hold_excludes_claim() {
 
 #[path = "frames_tests.rs"]
 mod frames;
+
+#[path = "pithos/tests.rs"]
+mod pithos;
+
+#[path = "parts_tests.rs"]
+mod parts;
+
+#[path = "rewrite_tests.rs"]
+mod rewrite;

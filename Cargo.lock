@@ -57,6 +57,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpubits",
  "cpufeatures 0.3.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -85,6 +86,7 @@ dependencies = [
  "ctr 0.10.1",
  "ctutils",
  "ghash 0.6.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -291,7 +293,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.103"
+version = "3.0.0-alpha.104"
 dependencies = [
  "aruna-api",
  "aruna-blob",
@@ -341,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.103"
+version = "3.0.0-alpha.104"
 dependencies = [
  "ahash 0.8.12",
  "aruna-blob",
@@ -399,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.103"
+version = "3.0.0-alpha.104"
 dependencies = [
  "aruna-core",
  "aruna-net",
@@ -426,6 +428,7 @@ dependencies = [
  "md5",
  "opendal",
  "percent-encoding",
+ "pithos_lib",
  "postcard",
  "reqwest 0.13.5",
  "rustix",
@@ -440,12 +443,13 @@ dependencies = [
  "tracing",
  "ulid 3.0.0",
  "windows-sys 0.61.2",
+ "zeroize",
  "zstd",
 ]
 
 [[package]]
 name = "aruna-compute"
-version = "3.0.0-alpha.103"
+version = "3.0.0-alpha.104"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -475,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute-helper"
-version = "3.0.0-alpha.103"
+version = "3.0.0-alpha.104"
 dependencies = [
  "rustix",
  "serde_json",
@@ -485,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.103"
+version = "3.0.0-alpha.104"
 dependencies = [
  "aes-gcm 0.11.1",
  "async-trait",
@@ -533,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.103"
+version = "3.0.0-alpha.104"
 dependencies = [
  "ahash 0.8.12",
  "aruna",
@@ -575,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-net"
-version = "3.0.0-alpha.103"
+version = "3.0.0-alpha.104"
 dependencies = [
  "aruna-core",
  "aruna-storage",
@@ -603,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-operations"
-version = "3.0.0-alpha.103"
+version = "3.0.0-alpha.104"
 dependencies = [
  "aruna-blob",
  "aruna-compute",
@@ -661,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.103"
+version = "3.0.0-alpha.104"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -678,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-tasks"
-version = "3.0.0-alpha.103"
+version = "3.0.0-alpha.104"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -1792,6 +1796,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -1804,6 +1809,7 @@ dependencies = [
  "chacha20",
  "cipher 0.5.2",
  "poly1305 0.9.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -2904,6 +2910,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastcdc"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77af40d8a8dadb92dc178569a5f5edb5f3056e98255c2de48ab5d59a52892e0c"
+
+[[package]]
 name = "fastdivide"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3307,6 +3319,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2eecf2d5dc9b66b732b97707a0210906b1d30523eb773193ab777c0c84b3e8d5"
 dependencies = [
  "polyval 0.7.3",
+ "zeroize",
 ]
 
 [[package]]
@@ -3990,6 +4003,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "integer-encoding"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14c00403deb17c3221a1fe4fb571b9ed0370b3dcd116553c77fa294a3d918699"
+
+[[package]]
 name = "interval-heap"
 version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4501,6 +4520,16 @@ dependencies = [
  "jiff",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "keccak"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8f198d1db720e4940b5a493201d199d9f24f568f8f746bd13706243a2f71598"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
 ]
 
 [[package]]
@@ -6282,6 +6311,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
+name = "pithos_lib"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "344739af0ec94bb61014f8123a76ed3ff1b6f593c6cb5739a0f6e7cab74356ad"
+dependencies = [
+ "aes-gcm 0.11.1",
+ "blake3",
+ "byteorder",
+ "cap-std",
+ "chacha20poly1305",
+ "crc32fast",
+ "digest 0.11.3",
+ "fastcdc",
+ "futures-core",
+ "hkdf 0.13.0",
+ "indexmap",
+ "integer-encoding",
+ "libc",
+ "pkcs8 0.11.0",
+ "rustix",
+ "sha2 0.11.0",
+ "shake",
+ "thiserror 2.0.20",
+ "tracing",
+ "x25519-dalek",
+ "zeroize",
+ "zstd",
+]
+
+[[package]]
 name = "pkcs1"
 version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6396,6 +6455,7 @@ dependencies = [
  "cpubits",
  "cpufeatures 0.3.1",
  "universal-hash 0.6.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -8160,6 +8220,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "shake"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09057cb2149ad4cbd2da1e26b351f9a4c354219421229c69c3063e6f61947c4a"
+dependencies = [
+ "digest 0.11.3",
+ "keccak",
+ "sponge-cursor",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8404,6 +8475,12 @@ dependencies = [
  "base64ct",
  "der 0.8.1",
 ]
+
+[[package]]
+name = "sponge-cursor"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
 name = "sse-stream"
@@ -10162,6 +10239,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
 dependencies = [
  "curve25519-dalek 5.0.0",
+ "getrandom 0.4.3",
  "rand_core 0.10.1",
  "zeroize",
 ]

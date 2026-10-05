@@ -1145,3 +1145,109 @@ async fn markers_skipped() {
 
     assert_eq!(pages, vec![vec!["a", "c"], vec!["e"]]);
 }
+
+#[tokio::test]
+async fn pending_archives_listed() {
+    use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
+    use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
+    use aruna_core::structs::storage::blob::ArchiveKey;
+    use aruna_core::structs::storage::encryption::BucketKeyRef;
+    use aruna_core::structs::storage::format::PithosLayout;
+
+    let (_temp_handle, storage_handle) = test_storage();
+    let driver_ctx = test_context(storage_handle.clone());
+    let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
+    let created_at = UNIX_EPOCH + Duration::from_secs(5);
+    let version_id = Ulid::generate();
+    let layout = PithosLayout {
+        stored_size: 90,
+        metadata_digest: [6u8; 32],
+        storage_generation: 0,
+    };
+    let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        root: "/tmp".to_string(),
+        storage_bucket: "objects".to_string(),
+        backend_path: "sealed".to_string(),
+        ulid: Ulid::generate(),
+        format: StoredFormat::pithos(layout, BucketKeyRef::new(Ulid::generate(), 1)),
+        created_by,
+        created_at,
+        staging: false,
+        partial: false,
+        blob_size: 64,
+        hashes: HashMap::new(),
+    };
+    let archive = ArchiveKey::of(&location);
+    let version = BlobVersion::pending(archive.clone(), created_at, created_by, None);
+    let rows = [
+        (
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new("bucket", "sealed").to_bytes().unwrap(),
+            CurrentVersionPointer::new(version_id).to_bytes().unwrap(),
+        ),
+        (
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new("bucket", "sealed", version_id)
+                .to_bytes()
+                .unwrap(),
+            version.to_bytes().unwrap(),
+        ),
+        (
+            PENDING_LOCATION_KEYSPACE,
+            archive.to_bytes(),
+            location.to_bytes().unwrap(),
+        ),
+    ];
+    for (key_space, key, value) in rows {
+        let event = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    let listed = drive(
+        ListBucketOperation::new(ListBucketInput {
+            bucket: "bucket".to_string(),
+            group_id: Ulid::generate(),
+            continuation_token: None,
+            max_keys: Some(10),
+            prefix: None,
+            delimiter: None,
+            start_after: None,
+        }),
+        &driver_ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed.objects.len(), 1);
+    assert_eq!(listed.objects[0].location, Some(location.clone()));
+
+    let versions = drive(
+        ListVersionsOperation::new(ListVersionsInput {
+            bucket: "bucket".to_string(),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: Some(10),
+        }),
+        &driver_ctx,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        versions.items.as_slice(),
+        [ListVersionsItem::Version { location: Some(found), version_id: id, .. }]
+            if *found == location && *id == version_id
+    ));
+}

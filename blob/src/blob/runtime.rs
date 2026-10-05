@@ -16,6 +16,7 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::storage::blob::BackendConfig;
+use aruna_core::structs::storage::encryption::{generate_key, seal_copies};
 use aruna_core::structs::storage::multipart::MultipartPartKey;
 use aruna_core::structs::{BackendState, BlobState, Status};
 use aruna_net::NetHandle;
@@ -92,6 +93,24 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::DeleteHidden { .. } => (EffectClass::Local, "delete_hidden"),
         BlobEffect::ListHidden { .. } => (EffectClass::Local, "list_hidden"),
         BlobEffect::CheckGroupBackend { .. } => (EffectClass::Control, "check_group_backend"),
+        BlobEffect::GenerateBucketKey => (EffectClass::Local, "generate_bucket_key"),
+        BlobEffect::SealHolderCopies { .. } => (EffectClass::Local, "seal_holder_copies"),
+        BlobEffect::SealUnlocked { .. } => (EffectClass::Local, "seal_unlocked"),
+        BlobEffect::PrepareKey { .. } => (EffectClass::Local, "prepare_key"),
+        BlobEffect::ActivateKey { .. } => (EffectClass::Local, "activate_key"),
+        BlobEffect::DiscardKey { .. } => (EffectClass::Local, "discard_key"),
+        BlobEffect::ReadKeyStatus { .. } => (EffectClass::Local, "read_key_status"),
+        BlobEffect::ExtendKey { .. } => (EffectClass::Local, "extend_key"),
+        BlobEffect::LockKey { .. } => (EffectClass::Local, "lock_key"),
+        BlobEffect::AdmitRead { .. } => (EffectClass::Local, "admit_read"),
+        BlobEffect::RewriteCopy { .. } => (EffectClass::Transfer, "rewrite_copy"),
+        BlobEffect::ReadUnlockedKey { .. } => (EffectClass::Local, "read_unlocked_key"),
+        BlobEffect::WritePiece { .. } => (EffectClass::Transfer, "write_piece"),
+        BlobEffect::ComposePieces { .. } => (EffectClass::Transfer, "compose_pieces"),
+        BlobEffect::HashArchive { .. } => (EffectClass::Transfer, "hash_archive"),
+        BlobEffect::ReadSealed { .. } => (EffectClass::Read, "read_sealed"),
+        BlobEffect::ServeSealedRead { .. } => (EffectClass::Transfer, "serve_sealed_read"),
+        BlobEffect::ReserveCompose { .. } => (EffectClass::Local, "reserve_compose"),
     }
 }
 
@@ -112,6 +131,9 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::ReceiveRead { .. }
             | BlobEffect::Delete { .. }
             | BlobEffect::DeleteHidden { .. }
+            | BlobEffect::RewriteCopy { .. }
+            | BlobEffect::WritePiece { .. }
+            | BlobEffect::ComposePieces { .. }
     )
 }
 
@@ -247,7 +269,10 @@ impl BlobHandle {
             BlobEffect::SpoolHidden { deadline, .. } => *deadline,
             _ => None,
         };
+        // A composition runs on the transfer slot its reservation already holds.
+        let reserved = matches!(effect, BlobEffect::ComposePieces { .. });
         let slots = match class {
+            EffectClass::Transfer if reserved => None,
             EffectClass::Transfer => Some(self.handler.transfer_slots.clone()),
             EffectClass::Read => Some(self.handler.read_slots.clone()),
             EffectClass::Spool => Some(self.handler.spool_slots.clone()),
@@ -545,6 +570,10 @@ impl BlobHandler {
             writes_drained: Arc::new(tokio::sync::Notify::new()),
             monitor_cancel: CancellationToken::new(),
             monitor_task: Arc::new(StdMutex::new(None)),
+            unlocks: Arc::new(StdMutex::new(super::unlock::UnlockRegistry::new(
+                super::unlock::UNLOCKED_BUCKETS,
+            ))),
+            pithos_budget: Arc::new(Semaphore::new(super::pithos::budget_permits())),
         };
         blob_handler.ensure_multipart_bucket().await?;
         blob_handler.probe_all_backends().await;
@@ -629,7 +658,11 @@ impl BlobHandler {
                 resolved,
                 created_by,
                 blob,
-            } => Box::pin(self.write_blob(&bucket, &key, resolved, created_by, blob)).await,
+                size,
+            } => {
+                let write = self.write_sized_blob(&bucket, &key, resolved, created_by, blob, size);
+                Box::pin(write).await
+            }
             BlobEffect::WritePart {
                 upload_id,
                 part_number,
@@ -717,6 +750,103 @@ impl BlobHandler {
             }
             BlobEffect::CheckGroupBackend { record, secret } => {
                 Box::pin(self.check_group_backend(record, secret)).await
+            }
+            BlobEffect::GenerateBucketKey => match generate_key() {
+                Ok((public_key, private_key)) => BlobEvent::BucketKeyGenerated {
+                    public_key,
+                    private_key,
+                },
+                Err(error) => BlobEvent::Error(error.into()),
+            },
+            BlobEffect::SealHolderCopies {
+                key,
+                public_key,
+                private_key,
+                realm_id,
+                node_id,
+                holders,
+            } => {
+                let now_ms = aruna_core::time::unix_timestamp_millis();
+                let origin = (realm_id, node_id);
+                let sealed = seal_copies(
+                    key,
+                    &public_key,
+                    private_key.bytes(),
+                    origin,
+                    &holders,
+                    now_ms,
+                );
+                match sealed {
+                    Ok(copies) => BlobEvent::CopiesSealed { copies },
+                    Err(error) => BlobEvent::Error(error.into()),
+                }
+            }
+            BlobEffect::SealUnlocked {
+                key,
+                realm_id,
+                node_id,
+                holders,
+            } => self.seal_unlocked(key, (realm_id, node_id), &holders),
+            effect @ (BlobEffect::PrepareKey { .. }
+            | BlobEffect::ActivateKey { .. }
+            | BlobEffect::DiscardKey { .. }
+            | BlobEffect::ReadKeyStatus { .. }
+            | BlobEffect::ExtendKey { .. }
+            | BlobEffect::LockKey { .. }) => self.unlock_effect(effect),
+            BlobEffect::AdmitRead { key, archive } => self.admit_read(key, archive).await,
+            BlobEffect::RewriteCopy {
+                bucket,
+                key,
+                source,
+                lease,
+                target,
+                grants_only,
+            } => {
+                let (lease, target) = (lease.map(|lease| *lease), *target);
+                let rewrite = self.rewrite_copy(&bucket, &key, source, lease, target, grants_only);
+                Box::pin(rewrite).await
+            }
+            BlobEffect::ReadUnlockedKey { key } => self.read_unlocked(key),
+            BlobEffect::WritePiece {
+                upload_id,
+                part_number,
+                resolved,
+                created_by,
+                content_offset,
+                blob,
+            } => {
+                let part = MultipartPartKey::new(upload_id, part_number);
+                Box::pin(self.seal_piece(part, resolved, created_by, content_offset, blob)).await
+            }
+            BlobEffect::ComposePieces {
+                bucket,
+                key,
+                resolved,
+                created_by,
+                parts,
+                share,
+            } => {
+                let composed =
+                    self.compose_pieces(&bucket, &key, resolved, created_by, parts, share);
+                Box::pin(composed).await
+            }
+            BlobEffect::ReserveCompose { content } => self.reserve_compose(content).await,
+            BlobEffect::HashArchive { location, lease } => {
+                Box::pin(self.hash_archive(location, *lease)).await
+            }
+            BlobEffect::ReadSealed {
+                location,
+                range,
+                lease,
+            } => Box::pin(self.read_sealed(location, range, *lease)).await,
+            BlobEffect::ServeSealedRead {
+                stream_id,
+                location,
+                expected_blake3,
+                lease,
+            } => {
+                let serve = self.serve_sealed_read(stream_id, location, expected_blake3, *lease);
+                Box::pin(serve).await
             }
             BlobEffect::OpenConnection { node_id } => Box::pin(self.open_connection(node_id)).await,
             BlobEffect::SendMessage { stream_id, payload } => {

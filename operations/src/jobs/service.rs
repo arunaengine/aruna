@@ -41,7 +41,7 @@ use super::staging::read_staging_checkpoint;
 use super::store::{
     CancelRequestOutcome, JobMutationError, RunDelete, delete_finished_run, find_dedup_plan,
     list_job_entries, list_user_jobs, read_artifact_tombstone, read_crate_status, read_job_record,
-    set_cancel_requested,
+    read_key_waits, set_cancel_requested,
 };
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
@@ -722,10 +722,13 @@ pub(crate) async fn local_status(
         .await
         .map_err(JobRouteError::Internal)?
         .map(|status| status.to_public_json());
-    Ok(RoutedJobStatus {
-        job: JobStatusView::from(&record),
-        run_crate,
-    })
+    let mut job = JobStatusView::from(&record);
+    if record.state == JobState::AwaitingKey {
+        job.awaiting_keys = read_key_waits(&context.storage_handle, job_id)
+            .await
+            .map_err(JobRouteError::Internal)?;
+    }
+    Ok(RoutedJobStatus { job, run_crate })
 }
 
 /// The caller's own job, or the PID mint job it joined. A joined job is served as

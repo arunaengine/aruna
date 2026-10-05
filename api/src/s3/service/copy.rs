@@ -6,6 +6,7 @@ use super::{ArunaS3Service, reference_etag};
 use crate::s3::auth::map_authorize_error;
 use crate::s3::checksum::{ApplyChecksums, ChecksumSelection, encode_checksums};
 use crate::s3::error::IntoS3Error;
+use crate::s3::util::{location_sse, sse_header, stored_encrypted};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, object_permission_path};
@@ -90,6 +91,7 @@ pub(super) fn copy_object_response(result: CopyResultData) -> S3Response<CopyObj
     }
 
     S3Response::new(CopyObjectOutput {
+        server_side_encryption: location_sse(result.location.as_ref()),
         copy_object_result: Some(copy_object_result),
         version_id: Some(result.version_id.to_string()),
         copy_source_version_id: result
@@ -117,6 +119,7 @@ pub(super) fn copy_part_response(result: PartCopyResult) -> S3Response<UploadPar
     ));
 
     S3Response::new(UploadPartCopyOutput {
+        server_side_encryption: sse_header(stored_encrypted(&result.part_location.format)),
         copy_part_result: Some(copy_part_result),
         copy_source_version_id: result
             .source_version_id

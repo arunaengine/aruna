@@ -92,7 +92,7 @@ struct FrameCursor {
 }
 
 /// Reads one byte range on its own task, so the stream that awaits it stays `Sync`.
-async fn read_range(
+pub(super) async fn read_range(
     operator: &Operator,
     path: &str,
     range: Range<u64>,
@@ -210,10 +210,12 @@ impl AsyncSliceReader for FrameReader {
     }
 }
 
-/// Source of a bao transfer: the stored bytes of a raw copy, or decoded frames.
+/// Source of a bao transfer: the stored bytes of a raw copy, decoded frames, or the plaintext
+/// of a sealed copy under a read lease.
 pub(super) enum SliceReader {
     Raw(OpenDalReader),
     Framed(FrameReader),
+    Sealed(super::pithos::SealedReader),
 }
 
 impl AsyncSliceReader for SliceReader {
@@ -221,6 +223,7 @@ impl AsyncSliceReader for SliceReader {
         match self {
             Self::Raw(reader) => reader.read_at(offset, len).await,
             Self::Framed(reader) => reader.read_at(offset, len).await,
+            Self::Sealed(reader) => reader.read_at(offset, len).await,
         }
     }
 
@@ -228,6 +231,7 @@ impl AsyncSliceReader for SliceReader {
         match self {
             Self::Raw(reader) => reader.read_exact_at(offset, len).await,
             Self::Framed(reader) => reader.read_exact_at(offset, len).await,
+            Self::Sealed(reader) => reader.read_exact_at(offset, len).await,
         }
     }
 
@@ -235,6 +239,7 @@ impl AsyncSliceReader for SliceReader {
         match self {
             Self::Raw(reader) => reader.size().await,
             Self::Framed(reader) => reader.size().await,
+            Self::Sealed(reader) => reader.size().await,
         }
     }
 }
@@ -345,6 +350,9 @@ impl BlobHandler {
         &self,
         location: &BackendLocation,
     ) -> Result<SliceReader, BlobError> {
+        if let StoredLayout::Pithos(_) = &location.format.layout {
+            return Err(super::pithos::needs_bucket_key());
+        }
         if let StoredLayout::Frames(layout) = &location.format.layout {
             let reader = self.frame_reader(location, layout).await?;
             return Ok(SliceReader::Framed(reader));

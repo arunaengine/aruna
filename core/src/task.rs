@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
@@ -59,6 +60,26 @@ pub enum TaskKey {
     SettleJobTerminals,
     DrainLinkQueue,
     MigrateCompression,
+    /// The timed lock of one unlock session. In memory only: a restart locks every
+    /// `vault_locked` bucket anyway, so the timer is never persisted.
+    LockBucket {
+        bucket_id: Ulid,
+        generation: u64,
+        session_id: Ulid,
+    },
+    /// Hashes the pending archives of one key generation if it is unlocked. Persisted, so a
+    /// completion during an unlock session is promoted even across a restart.
+    PromotePending {
+        bucket_id: Ulid,
+        generation: u64,
+    },
+    /// Delivers wakes owed to nodes waiting on this node's keys; re-armed while any remain.
+    DeliverKeyWakes,
+    /// Writes a bucket key audit record whose write failed, until it is stored. Persisted when
+    /// storage allows; startup stores these records before it rebuilds the unlock state.
+    RecordAudit {
+        record: Box<crate::structs::storage::key_audit::BucketAuditRecord>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

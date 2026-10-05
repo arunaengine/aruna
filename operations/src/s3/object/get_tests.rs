@@ -17,6 +17,7 @@ use aruna_blob::hash::Hasher;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
+use aruna_core::errors::ConversionError;
 use aruna_core::events::SubOperationEvent;
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
@@ -34,9 +35,10 @@ use aruna_core::structs::execution::staging::{
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BlobVersionState, CurrentVersionPointer, VersionKey,
+    ArchiveKey, Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey,
+    BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::{MultipartChecksumType, MultipartObjectSummary};
@@ -276,6 +278,42 @@ fn reports_missing_blob() {
 }
 
 #[test]
+fn pending_content_refused() {
+    let version_id = Ulid::generate();
+    let mut operation = GetObjectOperation::new(GetObjectInput {
+        bucket: "bucket".to_string(),
+        key: "sealed.bin".to_string(),
+        version_id: Some(version_id),
+        range: None,
+        group_id: Ulid::generate(),
+        user_identity: UserId::nil(RealmId::from_bytes([3u8; 32])),
+        node_id: test_node_id(),
+    });
+    operation.txn_id = Some(Ulid::generate());
+    let location = ArchiveKey::new(Ulid::generate(), BackendRef::node_default());
+    let version = BlobVersion::pending(
+        location,
+        SystemTime::UNIX_EPOCH,
+        operation.input.user_identity,
+        None,
+    );
+
+    // Nothing is read for an archive whose content hash is unknown.
+    let effects = operation.read_version(version_id, version, true);
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Blob(_)))
+    );
+    assert!(matches!(
+        operation.output,
+        Some(Err(GetObjectError::ConversionError(
+            ConversionError::BucketKey(BucketKeyError::Unsupported)
+        )))
+    ));
+}
+
+#[test]
 fn explicit_range_resolves() {
     let resolved = ObjectRangeRequest::StartEnd { start: 2, end: 5 }
         .resolve(10)
@@ -352,7 +390,12 @@ fn materialized_range_reads() {
     operation.txn_id = Some(txn_id);
     operation.location = Some(location.clone());
 
-    let effects = operation.read_blob();
+    operation.read_blob();
+    // The bucket has no encryption settings, so the plain copy is read without a lease.
+    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"s3test".to_vec().into(),
+        value: None,
+    }));
 
     assert!(matches!(
         effects.as_slice(),
@@ -384,7 +427,12 @@ fn reference_range_reads() {
     operation.txn_id = Some(txn_id);
     operation.reference_access = Some(access.clone());
 
-    let effects = operation.read_reference();
+    operation.read_reference();
+    // The bucket has no encryption settings, so the read commits without a key check.
+    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"s3test".to_vec().into(),
+        value: None,
+    }));
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::CommitTransaction { txn_id: committed_txn_id })]
@@ -1861,4 +1909,303 @@ async fn historical_drift_fails() {
     .unwrap_err();
 
     assert_eq!(error, GetObjectError::HistoricalReferenceUnavailable);
+}
+
+mod sealed {
+    use super::test_node_id;
+    use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+    use aruna_core::UserId;
+    use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+    use aruna_core::errors::{BlobError, ConversionError};
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation, BackendRef};
+    use aruna_core::structs::storage::encryption::{
+        BucketEncryption, BucketKeyError, BucketKeyRef, EncryptionMode, ReadLease,
+    };
+    use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+    use ulid::Ulid;
+
+    fn key() -> BucketKeyRef {
+        BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1)
+    }
+
+    fn operation() -> GetObjectOperation {
+        let mut operation = GetObjectOperation::new(GetObjectInput {
+            bucket: "bucket".to_string(),
+            key: "sealed.bin".to_string(),
+            version_id: None,
+            range: None,
+            group_id: Ulid::generate(),
+            user_identity: UserId::nil(RealmId::from_bytes([3u8; 32])),
+            node_id: test_node_id(),
+        });
+        operation.txn_id = Some(Ulid::generate());
+        operation
+    }
+
+    fn sealed_location() -> BackendLocation {
+        let layout = PithosLayout {
+            stored_size: 64,
+            metadata_digest: [1; 32],
+            storage_generation: 0,
+        };
+        BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/tmp".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "sealed".to_string(),
+            ulid: Ulid::from_bytes([7; 16]),
+            format: StoredFormat::pithos(layout, key()),
+            created_by: UserId::nil(RealmId::from_bytes([3u8; 32])),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 10,
+            hashes: HashMap::new(),
+        }
+    }
+
+    fn committed() -> Event {
+        Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: Ulid::generate(),
+        })
+    }
+
+    #[test]
+    fn sealed_reads_leased() {
+        let mut operation = operation();
+        let location = sealed_location();
+        operation.location = Some(location.clone());
+        let effects = operation.read_blob();
+        let archive = ArchiveKey::of(&location);
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::Storage(StorageEffect::CommitTransaction { .. }),
+                Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: pinned }),
+            ] if *admitted == key() && *pinned == archive
+        ));
+        assert!(operation.step(committed()).is_empty());
+        let lease = ReadLease::new(key(), archive, Ulid::generate(), Arc::new(()));
+        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReadSealed { range: None, .. })]
+        ));
+    }
+
+    #[test]
+    fn locked_read_typed() {
+        let mut operation = operation();
+        operation.location = Some(sealed_location());
+        operation.read_blob();
+        operation.step(committed());
+        let locked = BlobError::BucketKey(BucketKeyError::Locked(key().bucket_id));
+        operation.step(Event::Blob(BlobEvent::Error(locked)));
+        assert_eq!(
+            operation.finalize().err(),
+            Some(GetObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::Locked(key().bucket_id)
+            )))
+        );
+    }
+
+    #[test]
+    fn foreign_lease_refused() {
+        let mut operation = operation();
+        operation.location = Some(sealed_location());
+        operation.read_blob();
+        operation.step(committed());
+        let other = ArchiveKey::new(Ulid::generate(), BackendRef::node_default());
+        let lease = ReadLease::new(key(), other, Ulid::generate(), Arc::new(()));
+        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Blob(BlobEffect::ReadSealed { .. })))
+        );
+        assert!(operation.is_complete());
+    }
+
+    /// Steps a reference read of a bucket with `settings` up to its key check.
+    fn reference(settings: &BucketEncryption) -> (GetObjectOperation, Vec<Effect>) {
+        let mut operation = operation();
+        operation.reference_access = Some(ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::S3,
+            config: HashMap::new(),
+            path: "source".to_string(),
+            version: None,
+        });
+        operation.read_reference();
+        let row = Some(settings.to_bytes().unwrap().into());
+        let mut effects: Vec<Effect> = operation
+            .step(Event::Storage(StorageEvent::ReadResult {
+                key: b"bucket".to_vec().into(),
+                value: row,
+            }))
+            .into_vec();
+        effects.extend(operation.step(committed()));
+        (operation, effects)
+    }
+
+    #[test]
+    fn reference_needs_unlock() {
+        let settings = BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(key().bucket_id),
+            key_generation: 1,
+            ..Default::default()
+        };
+        let (mut operation, effects) = reference(&settings);
+        let archive = ArchiveKey::new(key().bucket_id, BackendRef::node_default());
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: named })
+                if *admitted == key() && *named == archive
+        )));
+        let locked = BlobError::BucketKey(BucketKeyError::Locked(key().bucket_id));
+        operation.step(Event::Blob(BlobEvent::Error(locked)));
+        assert_eq!(
+            operation.finalize().err(),
+            Some(GetObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::Locked(key().bucket_id)
+            )))
+        );
+
+        // An unlocked bucket admits the read, and its lease rides with the source stream.
+        let (mut operation, _) = reference(&settings);
+        let guard = Arc::new(());
+        let lease = ReadLease::new(key(), archive, Ulid::generate(), guard.clone());
+        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StagingSource(StagingSourceEffect::Head { .. })]
+        ));
+        assert_eq!(Arc::strong_count(&guard), 2);
+    }
+
+    #[test]
+    fn plain_reference_unchanged() {
+        let (_, effects) = reference(&BucketEncryption::default());
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::Storage(StorageEffect::CommitTransaction { .. }),
+                Effect::StagingSource(StagingSourceEffect::Head { .. }),
+            ]
+        ));
+    }
+
+    #[test]
+    fn remote_lock_typed() {
+        use crate::replication::bao_read::BaoReadError;
+        use crate::replication::protocol::BaoReadRefusal;
+        use crate::s3::object::get::HolderFailures;
+
+        let mut failures = HolderFailures::default();
+        failures.record(BaoReadError::Refused(BaoReadRefusal::NotFound));
+        failures.record(BaoReadError::Refused(BaoReadRefusal::BucketLocked(
+            key().bucket_id,
+        )));
+        assert_eq!(
+            failures.into_error(),
+            GetObjectError::ConversionError(ConversionError::BucketKey(BucketKeyError::Locked(
+                key().bucket_id
+            )))
+        );
+    }
+
+    fn encrypting() -> BucketEncryption {
+        BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(key().bucket_id),
+            key_generation: 1,
+            ..Default::default()
+        }
+    }
+
+    /// A raw copy still waiting for conversion, read with the bucket's current `settings`.
+    fn plain_read(settings: &BucketEncryption) -> (GetObjectOperation, Vec<Effect>) {
+        let mut operation = operation();
+        let mut location = sealed_location();
+        location.format = StoredFormat::default();
+        operation.location = Some(location);
+        operation.read_blob();
+        let row = Some(settings.to_bytes().unwrap().into());
+        let effects = operation
+            .step(Event::Storage(StorageEvent::ReadResult {
+                key: b"bucket".to_vec().into(),
+                value: row,
+            }))
+            .into_vec();
+        (operation, effects)
+    }
+
+    #[test]
+    fn unconverted_copy_gated() {
+        // The lease pins the physical copy, not a bucket-wide placeholder.
+        let archive = ArchiveKey::of(&sealed_location());
+        let (mut operation, effects) = plain_read(&encrypting());
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::Storage(StorageEffect::CommitTransaction { .. }),
+                Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: named }),
+            ] if *admitted == key() && *named == archive
+        ));
+        assert!(operation.step(committed()).is_empty());
+        let locked = BlobError::BucketKey(BucketKeyError::Locked(key().bucket_id));
+        operation.step(Event::Blob(BlobEvent::Error(locked)));
+        assert_eq!(
+            operation.finalize().err(),
+            Some(GetObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::Locked(key().bucket_id)
+            )))
+        );
+
+        // Unlocked, the raw bytes are read and the stream keeps the bucket lease.
+        let (mut operation, _) = plain_read(&encrypting());
+        operation.step(committed());
+        let guard = Arc::new(());
+        let lease = ReadLease::new(key(), archive, Ulid::generate(), guard.clone());
+        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Read { .. })]
+        ));
+        let blob = aruna_core::stream::BackendStream::new(futures_util::stream::iter([Ok::<
+            _,
+            std::io::Error,
+        >(
+            bytes::Bytes::from_static(b"plain"),
+        )]));
+        operation.step(Event::Blob(BlobEvent::ReadFinished {
+            blob,
+            stream_size: 5,
+        }));
+        let output = operation.finalize().unwrap();
+        assert_eq!(Arc::strong_count(&guard), 2);
+        drop(output);
+        assert_eq!(Arc::strong_count(&guard), 1);
+    }
+
+    #[test]
+    fn plain_bucket_ungated() {
+        let (_, effects) = plain_read(&BucketEncryption::default());
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::Storage(StorageEffect::CommitTransaction { .. }),
+                Effect::Blob(BlobEffect::Read { .. }),
+            ]
+        ));
+    }
 }

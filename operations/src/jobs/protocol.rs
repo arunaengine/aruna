@@ -284,6 +284,28 @@ async fn prepare_response(
             }
             prepare_record(context, auth.user_id, job_id).await
         }
+        // Key waits address the node that holds the content or the job, not the job owner.
+        JobRequest::AwaitKeys {
+            job_id, targets, ..
+        } => PreparedResponse::new(match local_node {
+            Some(node) => {
+                let nodes = (node, peer);
+                let waits =
+                    super::remote_key::register_waits(context, nodes, &auth, job_id, &targets);
+                match waits.await {
+                    Ok(locked) => JobResponse::KeysLocked(locked),
+                    Err(error) => JobResponse::Unavailable(error),
+                }
+            }
+            None => JobResponse::Unavailable("job-control network handle unavailable".into()),
+        }),
+        JobRequest::KeyWake { job_id, key, .. } => PreparedResponse::new(
+            match super::remote_key::accept_wake(context, peer, &auth, job_id, key).await {
+                Ok(true) => JobResponse::KeyWakeAcked,
+                Ok(false) => JobResponse::Unavailable("job is still parking".to_string()),
+                Err(error) => JobResponse::Unavailable(error),
+            },
+        ),
     }
 }
 
@@ -728,6 +750,7 @@ mod pure_tests {
                 workspace_mode: WorkspaceMode::None,
                 locally_exhausted: false,
                 session_runtime: None,
+                awaiting_keys: Vec::new(),
             },
             run_crate: Some(r#"{"status":"pending"}"#.to_string()),
         };

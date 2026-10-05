@@ -117,6 +117,14 @@ fn fence_clear() -> Event {
     })
 }
 
+/// Answers an encryption settings read for a bucket without settings.
+fn no_settings() -> Event {
+    Event::Storage(StorageEvent::ReadResult {
+        key: b"mybucket".to_vec().into(),
+        value: None,
+    })
+}
+
 #[test]
 fn guard_allows_edit() {
     // A routing or CORS edit is prospective policy, not a different bucket:
@@ -158,6 +166,8 @@ fn guard_allows_edit() {
             (b"subject".to_vec().into(), None),
         ],
     }));
+    let mut effects = effects;
+    effects.extend(op.step(no_settings()));
 
     // Past the guard the minimal fixture fails at the hash step; a recreate
     // would have ended here with a transaction conflict instead.
@@ -1831,4 +1841,192 @@ async fn mismatch_cleans_blob() {
         crate::s3::object::put::PutObjectError::ChecksumMismatch("SHA256")
     ));
     assert_eq!(count_files(Path::new(&blob_root)), 0);
+}
+
+mod sealed {
+    use super::{fence_clear, put_config, test_location};
+    use crate::s3::object::put::{PutObjectError, PutObjectOperation, PutObjectState};
+    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::errors::ConversionError;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE};
+    use aruna_core::operation::Operation;
+    use aruna_core::stream::BackendStream;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::encryption::{
+        BucketEncryption, BucketKeyError, BucketKeyRecord, BucketKeyRef, EncryptionMode, SealPlan,
+    };
+    use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
+    use ulid::Ulid;
+
+    fn settings() -> BucketEncryption {
+        BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(Ulid::from_bytes([4; 16])),
+            key_generation: 1,
+            storage_generation: 2,
+            ..Default::default()
+        }
+    }
+
+    fn record() -> BucketKeyRecord {
+        let key = settings().active_key().unwrap();
+        BucketKeyRecord::new(key, Ulid::from_bytes([5; 16]), [6; 32], 1)
+    }
+
+    fn row(value: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: b"mybucket".to_vec().into(),
+            value: value.map(Into::into),
+        })
+    }
+
+    fn operation() -> PutObjectOperation {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = iroh::SecretKey::generate().public();
+        let mut config = put_config(realm_id, Ulid::generate(), node_id);
+        config.request.body = Some(BackendStream::new(futures_util::stream::iter([Ok::<
+            _,
+            std::io::Error,
+        >(
+            bytes::Bytes::from_static(b"data"),
+        )])));
+        PutObjectOperation::new(config)
+    }
+
+    #[test]
+    fn captures_seal_plan() {
+        let mut op = operation();
+        op.start();
+        op.step(row(None));
+        let effects = op.step(fence_clear());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+        let effects = op.step(row(Some(settings().to_bytes().unwrap())));
+        let [Effect::Storage(StorageEffect::Read { key_space, key, .. })] = effects.as_slice()
+        else {
+            panic!("expected the key record read, got {effects:?}")
+        };
+        assert_eq!(key_space, BUCKET_KEY_KEYSPACE);
+        assert_eq!(key.as_ref(), record().key.key().as_slice());
+        let effects = op.step(row(Some(record().to_bytes().unwrap())));
+        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
+            panic!("expected the write, got {effects:?}")
+        };
+        let plan = SealPlan::capture(&settings(), &record()).unwrap();
+        assert_eq!(resolved.encryption, plan);
+    }
+
+    #[test]
+    fn missing_key_refused() {
+        let mut op = operation();
+        op.start();
+        op.step(row(None));
+        op.step(fence_clear());
+        op.step(row(Some(settings().to_bytes().unwrap())));
+        let effects = op.step(row(None));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Blob(BlobEffect::Write { .. })))
+        );
+        assert!(op.is_complete());
+    }
+
+    /// Runs the version transaction up to the seal fence with `settings` as the current row.
+    fn fenced(plan: Option<SealPlan>, current: &BucketEncryption) -> PutObjectOperation {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = iroh::SecretKey::generate().public();
+        let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
+        let mut location = test_location(op.config.user_id);
+        if let Some(plan) = plan {
+            let layout = PithosLayout {
+                stored_size: 10,
+                metadata_digest: [1; 32],
+                storage_generation: plan.storage_generation,
+            };
+            location.format = StoredFormat::pithos(layout, plan.key);
+        }
+        op.seal_plan = plan;
+        op.state = PutObjectState::StartTransaction;
+        op.written_location = Some(location);
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::generate(),
+        }));
+        op.step(fence_clear());
+        op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (b"mybucket".to_vec().into(), None),
+                (b"subject".to_vec().into(), None),
+            ],
+        }));
+        op.step(row(Some(current.to_bytes().unwrap())));
+        op
+    }
+
+    #[test]
+    fn stale_seal_refused() {
+        let plan = SealPlan::capture(&settings(), &record()).unwrap();
+        // The bucket changed its stored format while the bytes streamed.
+        let mut moved = settings();
+        moved.storage_generation += 1;
+        let outcome = fenced(plan, &moved).finalize();
+        assert!(matches!(
+            outcome,
+            Err(PutObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::StaleGeneration { .. }
+            )))
+        ));
+        // The current plan passes the fence and reaches the hash step.
+        let outcome = fenced(plan, &settings()).finalize();
+        assert!(
+            matches!(outcome, Err(PutObjectError::MissingHash(_))),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn plain_into_sealed() {
+        let outcome = fenced(None, &settings()).finalize();
+        assert!(matches!(
+            outcome,
+            Err(PutObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::StaleGeneration { .. }
+            )))
+        ));
+    }
+
+    #[test]
+    fn records_copy_owner() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = iroh::SecretKey::generate().public();
+        let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
+        let mut location = test_location(op.config.user_id);
+        let key = BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1);
+        let layout = PithosLayout {
+            stored_size: 10,
+            metadata_digest: [1; 32],
+            storage_generation: 0,
+        };
+        location.format = StoredFormat::pithos(layout, key);
+        op.version_id = Some(Ulid::generate());
+        op.txn_id = Some(Ulid::generate());
+        op.output = Some(Ok(location));
+        op.state = PutObjectState::CreateVersionRecord;
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"version".to_vec().into(),
+        }));
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, txn_id, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the owner row, got {effects:?}")
+        };
+        assert_eq!(key_space, COPY_OWNER_KEYSPACE);
+        assert_eq!(*txn_id, op.txn_id);
+    }
 }

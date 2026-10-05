@@ -19,7 +19,9 @@ use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubject
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, ResolvedBackend, WriteOwner,
 };
-use aruna_core::structs::storage::multipart::{MultipartPart, MultipartPartKey, MultipartUpload};
+use aruna_core::structs::storage::multipart::{
+    MultipartPart, MultipartPartKey, MultipartUpload, PartPiece, content_offset,
+};
 use aruna_core::types::{Effects, Key, TxnId};
 use bytes::Bytes;
 use smallvec::smallvec;
@@ -37,6 +39,7 @@ pub enum UploadPartState {
     Init,
     CheckPurgeWrite,
     ReadUpload,
+    ReadSavedParts,
     WritePart,
     CleanupFailedWrite,
     QueueCleanupRow,
@@ -133,6 +136,10 @@ pub struct UploadPartOperation {
     written_location: Option<BackendLocation>,
     /// The provider's ETag of a part written into its multipart upload.
     backend_etag: Option<String>,
+    /// An encrypted upload's part waits here while the saved parts give its content offset.
+    sealing: Option<(ResolvedBackend, BackendStream<Result<Bytes, StreamError>>)>,
+    /// The piece record of a part of an encrypted upload.
+    piece: Option<PartPiece>,
     replaced_location: Option<BackendLocation>,
     rollback_location: Option<BackendLocation>,
     cleanup: WriteCleanup<UploadPartError>,
@@ -148,6 +155,8 @@ impl UploadPartOperation {
             conflicts: 0,
             written_location: None,
             backend_etag: None,
+            sealing: None,
+            piece: None,
             replaced_location: None,
             rollback_location: None,
             cleanup: WriteCleanup::default(),
@@ -247,6 +256,12 @@ impl UploadPartOperation {
         let Some(blob) = self.input.body.take() else {
             return self.emit_error(UploadPartError::MissingBody);
         };
+        if let Some(encryption) = record.encryption {
+            let resolved = ResolvedBackend::new(record.backend, record.storage_class)
+                .with_compression(encryption.compression)
+                .with_encryption(Some(encryption.plan));
+            return self.read_saved_parts(resolved, blob);
+        }
         self.state = UploadPartState::WritePart;
         smallvec![Effect::Blob(BlobEffect::WritePart {
             upload_id: self.input.upload_id,
@@ -264,9 +279,62 @@ impl UploadPartOperation {
         })]
     }
 
+    /// The content offset of a sealed part comes from the parts saved before its bytes arrive.
+    fn read_saved_parts(
+        &mut self,
+        resolved: ResolvedBackend,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    ) -> Effects {
+        let prefix = match MultipartPartKey::prefix(self.input.upload_id) {
+            Ok(prefix) => prefix,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        self.sealing = Some((resolved, blob));
+        self.state = UploadPartState::ReadSavedParts;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: UPLOAD_PART_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: None,
+            limit: 10_000,
+            txn_id: None,
+        })]
+    }
+
+    fn write_piece(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+            return self.emit_error(UploadPartError::InvalidOperationState);
+        };
+        let saved: Result<Vec<_>, _> = values
+            .iter()
+            .map(|(_, value)| MultipartPart::from_bytes(value.as_ref()))
+            .map(|part| part.map(|part| (part.part_number, part.location.blob_size)))
+            .collect();
+        let saved = match saved {
+            Ok(saved) => saved,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        let Some((resolved, blob)) = self.sealing.take() else {
+            return self.emit_error(UploadPartError::InvalidOperationState);
+        };
+        let number = self.input.part_number;
+        self.state = UploadPartState::WritePart;
+        smallvec![Effect::Blob(BlobEffect::WritePiece {
+            upload_id: self.input.upload_id,
+            part_number: number,
+            resolved,
+            created_by: self.input.created_by,
+            content_offset: content_offset(number, &saved, self.input.content_length),
+            blob,
+        })]
+    }
+
     fn handle_write_finished(&mut self, event: Event) -> Effects {
         let location = match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
+            Event::Blob(BlobEvent::PieceWritten { location, piece }) => {
+                self.piece = Some(piece);
+                location
+            }
             Event::Blob(BlobEvent::PartWritten {
                 location,
                 backend_etag,
@@ -541,6 +609,7 @@ impl UploadPartOperation {
             location,
             created_at: SystemTime::now(),
             backend_etag: self.backend_etag.clone(),
+            piece: self.piece.clone(),
         };
         let key =
             match MultipartPartKey::new(self.input.upload_id, self.input.part_number).to_bytes() {
@@ -732,6 +801,7 @@ impl Operation for UploadPartOperation {
             UploadPartState::Init => self.handle_init(),
             UploadPartState::CheckPurgeWrite => self.check_write_fence(event),
             UploadPartState::ReadUpload => self.handle_upload_read(event),
+            UploadPartState::ReadSavedParts => self.write_piece(event),
             UploadPartState::WritePart => self.handle_write_finished(event),
             UploadPartState::CleanupFailedWrite => self.write_cleanup_failed(event),
             UploadPartState::QueueCleanupRow => self.handle_cleanup_queued(event),
@@ -867,6 +937,7 @@ mod test {
             subject_generation: 0,
             completing_since_ms: None,
             backend_upload: None,
+            encryption: None,
         };
 
         let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
@@ -885,6 +956,109 @@ mod test {
         };
         assert_eq!(resolved.backend, record.backend);
         assert_eq!(resolved.storage_class, record.storage_class);
+    }
+
+    fn saved_part(
+        upload_id: Ulid,
+        part_number: u16,
+        blob_size: u64,
+    ) -> (Key, aruna_core::types::Value) {
+        let mut location = part_location(Ulid::from_bytes([5u8; 16]));
+        location.blob_size = blob_size;
+        let part = MultipartPart {
+            part_number,
+            location,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            backend_etag: None,
+            piece: None,
+        };
+        let key = MultipartPartKey::new(upload_id, part_number)
+            .to_bytes()
+            .unwrap();
+        (key.into(), part.to_bytes().unwrap().into())
+    }
+
+    #[test]
+    fn sealed_part_offset() {
+        // A sealed part takes its tree offset from the saved parts and keeps its piece record.
+        use aruna_core::structs::storage::encryption::{BucketKeyRef, SealPlan};
+        use aruna_core::structs::storage::multipart::UploadEncryption;
+        const MIB: u64 = 1 << 20;
+        let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
+        let upload_id = op.input.upload_id;
+        op.input.part_number = 3;
+        op.input.content_length = Some(5 * MIB);
+        op.input.body = Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+            &b"x"[..],
+        )));
+        op.written_location = None;
+        op.state = UploadPartState::ReadUpload;
+        let plan = SealPlan {
+            key: BucketKeyRef::new(Ulid::from_bytes([7u8; 16]), 1),
+            public_key: [3; 32],
+            cipher: Default::default(),
+            block_keys: Default::default(),
+            storage_generation: 1,
+        };
+        let mut record = in_place_op(None).1;
+        record.upload_id = upload_id;
+        record.backend_upload = None;
+        record.encryption = Some(UploadEncryption {
+            plan,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+        });
+        let effects = op.step(read_record(&record, None));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, .. })] if key_space == UPLOAD_PART_KEYSPACE
+        ));
+
+        let values = vec![
+            saved_part(upload_id, 1, 8 * MIB),
+            saved_part(upload_id, 2, 8 * MIB),
+            saved_part(upload_id, 3, 2 * MIB),
+        ];
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        }));
+        let [
+            Effect::Blob(BlobEffect::WritePiece {
+                resolved,
+                content_offset,
+                part_number: 3,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected one piece write, got {effects:?}")
+        };
+        assert_eq!(*content_offset, Some(16 * MIB));
+        assert_eq!(resolved.encryption, Some(plan));
+
+        let mut location = part_location(Ulid::from_bytes([5u8; 16]));
+        location.blob_size = 5 * MIB;
+        let piece = PartPiece {
+            record: vec![1, 2, 3],
+            stored_len: 5 * MIB + 64,
+            content_offset: Some(16 * MIB),
+        };
+        let event = BlobEvent::PieceWritten {
+            location,
+            piece: piece.clone(),
+        };
+        op.step(Event::Blob(event));
+        op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
+        op.state = UploadPartState::ReadExistingPart;
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"part".to_vec().into(),
+            value: None,
+        }));
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected the part record, got {effects:?}")
+        };
+        let stored = MultipartPart::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(stored.piece, Some(piece));
     }
 
     /// An operation about to read the record of an in-place upload, with that record.
@@ -916,6 +1090,7 @@ mod test {
             subject_generation: 0,
             completing_since_ms: None,
             backend_upload: Some(upload),
+            encryption: None,
         };
         (op, record)
     }

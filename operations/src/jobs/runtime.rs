@@ -29,9 +29,10 @@ use tracing::{info, warn};
 use super::executor::{JobContext, JobRunOutcome, ProgressReporter, dispatch_payload, run_cleanup};
 use super::reconcile::ExternalReconciler;
 use super::store::{
-    JobMutationError, ReleaseOutcome, RequeueOutcome, cancel_running_job, complete_job, defer_job,
-    fail_job, flush_progress, handoff_external_attempt, iter_prefix_page, read_job_record,
-    release_job, renew_lease, requeue_job, transition_to_running,
+    AwaitOutcome, JobMutationError, ReleaseOutcome, RequeueOutcome, cancel_running_job,
+    complete_job, defer_job, fail_job, flush_progress, handoff_external_attempt, iter_prefix_page,
+    park_job, read_job_record, release_job, renew_lease, requeue_job, satisfy_key_wait,
+    transition_to_running,
 };
 use super::submit::schedule_drain_effect;
 use super::{
@@ -741,6 +742,73 @@ async fn run_job(
                 }
             }
         }
+        SuperviseResult::Outcome(JobRunOutcome::AwaitingKey(waits)) => {
+            await_keys(&context, &record, token, waits).await;
+        }
+    }
+}
+
+/// Parks a job that needs locked keys, then wakes it for any key unlocked meanwhile.
+async fn await_keys(
+    context: &Arc<DriverContext>,
+    record: &JobRecord,
+    token: ulid::Ulid,
+    waits: Vec<aruna_core::structs::execution::job::KeyWait>,
+) {
+    let storage = &context.storage_handle;
+    let job_id = record.job_id;
+    let keys: Vec<_> = waits.iter().map(|wait| wait.key).collect();
+    match park_job(storage, job_id, token, unix_timestamp_millis(), waits).await {
+        Ok(AwaitOutcome::Parked(_)) => {}
+        Ok(AwaitOutcome::Skipped) => {
+            let terminal = retry_terminal(|| {
+                cancel_running_job(storage, job_id, token, unix_timestamp_millis())
+            })
+            .await;
+            if !matches!(&terminal, Err(JobMutationError::TokenMismatch)) {
+                run_cleanup(&record.payload);
+            }
+            terminal_or_none(terminal, job_id);
+            return;
+        }
+        Err(JobMutationError::TokenMismatch) => return,
+        Err(error) => {
+            warn!(job_id = %job_id, error = %error, "Failed to park job for a bucket key");
+            let error = JobError::retryable("bucket key is locked");
+            let now = unix_timestamp_millis();
+            if let Err(error) = defer_job(storage, job_id, token, now, RETRY_AFTER_MS, error).await
+            {
+                warn!(job_id = %job_id, error = %error, "Failed to defer job");
+            }
+            return;
+        }
+    }
+    for key in keys {
+        if key_unlocked(context, key).await
+            && let Err(error) =
+                satisfy_key_wait(storage, job_id, key, unix_timestamp_millis()).await
+        {
+            warn!(job_id = %job_id, error = %error, "Failed to wake parked job");
+        }
+    }
+}
+
+/// Whether this node holds an active unlock of `key`.
+pub(crate) async fn key_unlocked(
+    context: &DriverContext,
+    key: aruna_core::structs::storage::encryption::BucketKeyRef,
+) -> bool {
+    let Some(blob) = context.blob_handle.as_ref() else {
+        return false;
+    };
+    let effect = aruna_core::effects::BlobEffect::ReadKeyStatus {
+        bucket_id: key.bucket_id,
+    };
+    match blob.send_blob_effect(effect).await {
+        Event::Blob(aruna_core::events::BlobEvent::KeyStatus { generations }) => generations
+            .iter()
+            .any(|status| status.key == key && status.active),
+        _ => false,
     }
 }
 

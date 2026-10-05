@@ -1957,3 +1957,23 @@ async fn changed_count_wakes() {
     // this emptiness check after any wake the no-op mark-read could send.
     assert!(wakes.is_empty(), "no-op mark-read must not wake");
 }
+
+#[test]
+fn restart_notice_origin() {
+    let origin = iroh::SecretKey::from_bytes(&[3; 32]).public();
+    let other = iroh::SecretKey::from_bytes(&[4; 32]).public();
+    let recipient = UserId::new(Ulid::from_bytes([5; 16]), RealmId::from_bytes([1; 32]));
+    let kind = NotificationKind::BucketRestartLocked {
+        bucket: "raw".to_string(),
+        node_id: origin,
+        group_id: Ulid::from_bytes([6; 16]),
+    };
+    let records = vec![NotificationRecord::new(
+        recipient,
+        NotificationClass::Direct,
+        kind,
+        1,
+    )];
+    assert!(verify_node_origin(&records, origin).is_ok());
+    assert!(verify_node_origin(&records, other).is_err());
+}

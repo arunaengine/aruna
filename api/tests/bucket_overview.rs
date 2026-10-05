@@ -265,6 +265,7 @@ async fn setup() -> Fixture {
             placement_policies: Vec::new(),
             subject_generation: 0,
             backend_upload: None,
+            encryption: None,
         }
         .to_bytes()
         .unwrap(),

@@ -118,7 +118,36 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         | BlobEffect::ReadMessage { .. }
         | BlobEffect::CloseConnection { .. }
         | BlobEffect::ReceiveRead { .. }
-        | BlobEffect::CheckGroupBackend { .. } => {}
+        | BlobEffect::CheckGroupBackend { .. }
+        // Key effects touch no backend; the read that uses a lease claims its own.
+        | BlobEffect::GenerateBucketKey
+        | BlobEffect::SealHolderCopies { .. }
+        | BlobEffect::SealUnlocked { .. }
+        | BlobEffect::PrepareKey { .. }
+        | BlobEffect::ActivateKey { .. }
+        | BlobEffect::DiscardKey { .. }
+        | BlobEffect::ReadKeyStatus { .. }
+        | BlobEffect::ExtendKey { .. }
+        | BlobEffect::LockKey { .. }
+        | BlobEffect::AdmitRead { .. } => {}
+        BlobEffect::ReadUnlockedKey { .. } => {}
+        BlobEffect::RewriteCopy { source, target, .. } => {
+            push(&mut ids, &source.backend);
+            push(&mut ids, &target.backend);
+        }
+        BlobEffect::WritePiece { resolved, .. } => push(&mut ids, &resolved.backend),
+        BlobEffect::ComposePieces {
+            resolved, parts, ..
+        } => {
+            push(&mut ids, &resolved.backend);
+            for part in parts {
+                push(&mut ids, &part.location.backend);
+            }
+        }
+        BlobEffect::HashArchive { location, .. } => push(&mut ids, &location.backend),
+        BlobEffect::ReadSealed { location, .. } => push(&mut ids, &location.backend),
+        BlobEffect::ServeSealedRead { location, .. } => push(&mut ids, &location.backend),
+        BlobEffect::ReserveCompose { .. } => {}
     }
     ids
 }

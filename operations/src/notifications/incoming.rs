@@ -106,6 +106,9 @@ async fn build_response(
             if let Err(reason) = validate_inbound_batch(&records, unix_timestamp_millis()) {
                 return NotificationTransportMessage::Reject(reason);
             }
+            if let Err(reason) = verify_node_origin(&records, peer) {
+                return NotificationTransportMessage::Reject(reason);
+            }
             if let Err(reason) = verify_batch_holder(&records, &realm_config, local_node_id) {
                 return NotificationTransportMessage::Reject(reason);
             }
@@ -287,6 +290,20 @@ async fn build_response(
                 "unexpected notification control message".to_string(),
             )
         }
+    }
+}
+
+/// A restart or recovery notice speaks for the node that holds the bucket, so only that node
+/// may deliver it.
+fn verify_node_origin(records: &[NotificationRecord], peer: NodeId) -> Result<(), String> {
+    let foreign = records.iter().any(|record| match &record.kind {
+        NotificationKind::BucketRestartLocked { node_id, .. }
+        | NotificationKind::BucketRecoveryDegraded { node_id, .. } => *node_id != peer,
+        _ => false,
+    });
+    match foreign {
+        true => Err("restart lock notification from another node".to_string()),
+        false => Ok(()),
     }
 }
 
@@ -564,6 +581,16 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
                 return Err("notification record has empty sync error".to_string());
             }
             validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
+        }
+        NotificationKind::BucketRestartLocked {
+            bucket, group_id, ..
+        }
+        | NotificationKind::BucketRecoveryDegraded {
+            bucket, group_id, ..
+        } => {
+            if bucket.is_empty() || group_id.is_nil() {
+                return Err("bucket key notification has empty bucket or group".to_string());
+            }
         }
     }
     Ok(())

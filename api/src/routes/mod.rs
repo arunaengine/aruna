@@ -39,7 +39,8 @@ pub mod sync;
 // and storage families own these modules now. Remove once consumers migrate.
 pub use access::{credentials, group_join, groups, sessions, tokens, users};
 pub use execution::{compute, device_compute, jobs, tes};
-pub use storage::{blobs, bucket_usage, connectors, group_backends};
+pub use storage::bucket::usage as bucket_usage;
+pub use storage::{blobs, connectors, group_backends};
 
 /// The single REST source: every route is registered from a `#[utoipa::path]`
 /// handler, so the runtime router and the generated document cannot diverge.
@@ -50,8 +51,10 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(info::router())
         .merge(onboarding::router())
         .merge(storage::blobs::router())
-        .merge(storage::bucket_usage::router())
+        .merge(storage::bucket::usage::router())
         .merge(storage::compression::router())
+        .merge(storage::encryption::router())
+        .merge(storage::bucket::keys::router())
         .merge(drs::router())
         .merge(staging::router())
         .merge(storage::deletion::router())
@@ -229,6 +232,10 @@ pub(crate) mod tests {
         ("GET", "/data/buckets/{bucket}/placement/coverage"),
         ("GET", "/data/buckets/{bucket}/placement/objects"),
         ("GET", "/data/buckets/{bucket}/storage/compression"),
+        ("GET", "/data/buckets/{bucket}/storage/encryption"),
+        ("GET", "/data/buckets/{bucket}/storage/encryption/audit"),
+        ("GET", "/data/buckets/{bucket}/storage/encryption/copies/me"),
+        ("GET", "/data/buckets/{bucket}/storage/encryption/holders"),
         ("GET", "/data/buckets/{bucket}/storage/routing"),
         ("GET", "/data/buckets/{bucket}/usage"),
         ("GET", "/data/sync/relationships"),
@@ -480,6 +487,16 @@ pub(crate) mod tests {
         ("PUT", "/compute/config"),
         ("PUT", "/data/buckets/{bucket}/placement"),
         ("PUT", "/data/buckets/{bucket}/storage/compression"),
+        ("PUT", "/data/buckets/{bucket}/storage/encryption"),
+        ("POST", "/data/buckets/{bucket}/storage/encryption/extend"),
+        ("POST", "/data/buckets/{bucket}/storage/encryption/holders"),
+        ("POST", "/data/buckets/{bucket}/storage/encryption/lock"),
+        ("POST", "/data/buckets/{bucket}/storage/encryption/rotate"),
+        ("POST", "/data/buckets/{bucket}/storage/encryption/unlock"),
+        (
+            "DELETE",
+            "/data/buckets/{bucket}/storage/encryption/holders/{user}",
+        ),
         ("PUT", "/data/buckets/{bucket}/storage/routing"),
         ("PUT", "/device/documents/{document_id}/selection"),
         ("PUT", "/data/groups/{group_id}/connectors/{connector_id}"),

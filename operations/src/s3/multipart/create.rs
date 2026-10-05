@@ -6,17 +6,23 @@ use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
 };
+use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE};
+use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, UPLOAD_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{BucketInfo, ResolvedBackend};
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
+};
 use aruna_core::structs::storage::multipart::{
-    BackendUpload, MultipartChecksumHint, MultipartUpload, MultipartUploadStatus,
+    BackendUpload, MultipartChecksumHint, MultipartChecksumType, MultipartUpload,
+    MultipartUploadStatus, UploadEncryption,
 };
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::types::{Effects, GroupId, TxnId};
@@ -30,12 +36,14 @@ use ulid::Ulid;
 pub enum CreateMultipartState {
     Init,
     ReadGateBucket,
+    ReadBucketKey,
     PolicyGate,
     CheckOpenFence,
     OpenUpload,
     StartTransaction,
     CheckPurgeFence,
     FenceBackend,
+    CheckSettings,
     WriteUpload,
     CommitTransaction,
     AbortBackendUpload,
@@ -69,6 +77,10 @@ pub enum CreateMultipartError {
     CreateUploadFailed,
     #[error(transparent)]
     BlobError(#[from] BlobError),
+    #[error(transparent)]
+    BucketKey(#[from] BucketKeyError),
+    #[error("an encrypted upload cannot check a full-object {0} checksum")]
+    UnsupportedChecksum(&'static str),
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -110,6 +122,9 @@ pub struct CreateMultipartOperation {
     stored_subject: u64,
     /// The provider upload opened for this record; aborted unless a commit may own it.
     backend_upload: Option<BackendUpload>,
+    /// Bucket and settings read before the gate, kept until the key record completes the plan.
+    settings: Option<(Option<BucketInfo>, BucketEncryption)>,
+    encryption: Option<UploadEncryption>,
     pending_error: Option<CreateMultipartError>,
     output: Option<Result<CreateMultipartResult, CreateMultipartError>>,
 }
@@ -129,6 +144,8 @@ impl CreateMultipartOperation {
             stored_policies: Vec::new(),
             stored_subject: 0,
             backend_upload: None,
+            settings: None,
+            encryption: None,
             pending_error: None,
             output: None,
         }
@@ -187,6 +204,10 @@ impl CreateMultipartOperation {
         if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
             return self.emit_error(error.into());
         }
+        // Encrypted parts are sealed pieces of their own; completion composes them.
+        if self.encryption.is_some() {
+            return self.start_transaction();
+        }
         let Some(resolved) = self.resolved.clone() else {
             return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
@@ -227,25 +248,73 @@ impl CreateMultipartOperation {
         // The destination default is read before the upload exists, so no part
         // can ever be written under a rule this node was never admitted for.
         self.state = CreateMultipartState::ReadGateBucket;
+        smallvec![settings_read(&self.input.bucket, None)]
+    }
+
+    /// Reads the bucket and its encryption settings; an encrypted bucket also needs its key.
+    fn handle_gate_bucket(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+        };
+        let [(_, bucket), (_, settings)] = match <[_; 2]>::try_from(values) {
+            Ok(values) => values,
+            Err(_) => return self.emit_error(CreateMultipartError::CreateUploadFailed),
+        };
+        let parsed = bucket
+            .as_ref()
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()
+            .and_then(|bucket| Ok((bucket, BucketEncryption::from_row(settings.as_deref())?)));
+        let (bucket, settings) = match parsed {
+            Ok(parsed) => parsed,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        let Some(key) = settings.active_key() else {
+            return self.gate_bucket(bucket);
+        };
+        self.settings = Some((bucket, settings));
+        self.state = CreateMultipartState::ReadBucketKey;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.input.bucket.as_bytes().into(),
+            key_space: BUCKET_KEY_KEYSPACE.to_string(),
+            key: key.key().into(),
             txn_id: None,
         })]
     }
 
-    fn handle_gate_bucket(&mut self, event: Event) -> Effects {
+    /// Captures the seal plan from the active key record, then gates the bucket.
+    fn handle_bucket_key(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
-        let bucket = match value
-            .as_ref()
-            .map(|value| BucketInfo::from_bytes(value.as_ref()))
-            .transpose()
-        {
-            Ok(bucket) => bucket,
-            Err(error) => return self.emit_error(error.into()),
+        let Some((bucket, settings)) = self.settings.take() else {
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
+        let Some(value) = value else {
+            return self.emit_error(BucketKeyError::Unsupported.into());
+        };
+        let plan = BucketKeyRecord::from_bytes(value.as_ref())
+            .map_err(CreateMultipartError::from)
+            .and_then(|record| Ok(SealPlan::capture(&settings, &record)?));
+        if let Some(algorithm) = self.input.checksum_hint.as_ref().and_then(full_digest) {
+            return self.emit_error(CreateMultipartError::UnsupportedChecksum(
+                algorithm.s3_name(),
+            ));
+        }
+        match plan {
+            Ok(Some(plan)) => {
+                let compression = bucket.as_ref().map(|bucket| bucket.compression);
+                self.encryption = Some(UploadEncryption {
+                    plan,
+                    compression: compression.unwrap_or_default(),
+                });
+                self.gate_bucket(bucket)
+            }
+            Ok(None) => self.emit_error(BucketKeyError::Unsupported.into()),
+            Err(error) => self.emit_error(error),
+        }
+    }
+
+    fn gate_bucket(&mut self, bucket: Option<BucketInfo>) -> Effects {
         self.stored_policies = GatedBucket::observe(bucket.as_ref()).policies;
         let compression = bucket.as_ref().map(|bucket| bucket.compression);
         self.resolved = self
@@ -339,14 +408,39 @@ impl CreateMultipartOperation {
                 self.state = CreateMultipartState::FenceBackend;
                 smallvec![effect]
             }
-            None => self.write_upload(),
+            None => self.check_settings(),
         }
     }
 
     fn handle_backend_fenced(&mut self, event: Event) -> Effects {
         match check_fence(event) {
-            Ok(()) => self.write_upload(),
+            Ok(()) => self.check_settings(),
             Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    /// Rereads the settings in the transaction, so a mode change or rotation that started
+    /// meanwhile conflicts instead of leaving an upload with a stale plan.
+    fn check_settings(&mut self) -> Effects {
+        self.state = CreateMultipartState::CheckSettings;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            key: self.input.bucket.as_bytes().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn settings_checked(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+        };
+        let plan = self.encryption.map(|encryption| encryption.plan);
+        let current = BucketEncryption::from_row(value.as_deref())
+            .map_err(CreateMultipartError::from)
+            .and_then(|settings| Ok(storage_current(plan.as_ref(), &settings)?));
+        match current {
+            Ok(()) => self.write_upload(),
+            Err(error) => self.emit_error(error),
         }
     }
 
@@ -370,6 +464,7 @@ impl CreateMultipartOperation {
             subject_generation: self.stored_subject,
             completing_since_ms: None,
             backend_upload: self.backend_upload.clone(),
+            encryption: self.encryption,
         };
         let value = match record.to_bytes() {
             Ok(value) => value,
@@ -423,6 +518,31 @@ impl CreateMultipartOperation {
     }
 }
 
+/// A plain upload needs a bucket that still stores plain bytes; a sealed one its exact plan.
+pub(crate) fn storage_current(
+    plan: Option<&SealPlan>,
+    settings: &BucketEncryption,
+) -> Result<(), BucketKeyError> {
+    match plan {
+        Some(plan) => plan.still_current(settings),
+        None if settings.is_encrypted() => Err(BucketKeyError::StaleGeneration {
+            requested: 0,
+            current: settings.key_generation,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Sealed parts are combined without their plaintext, so only CRCs give a full-object checksum.
+fn full_digest(hint: &MultipartChecksumHint) -> Option<ChecksumAlgorithm> {
+    let algorithm = hint.algorithm?;
+    let crc = matches!(
+        algorithm,
+        ChecksumAlgorithm::Crc32 | ChecksumAlgorithm::Crc32c | ChecksumAlgorithm::Crc64Nvme
+    );
+    (hint.checksum_type == MultipartChecksumType::FullObject && !crc).then_some(algorithm)
+}
+
 impl Operation for CreateMultipartOperation {
     type Output = CreateMultipartResult;
     type Error = CreateMultipartError;
@@ -445,12 +565,14 @@ impl Operation for CreateMultipartOperation {
         match self.state {
             CreateMultipartState::Init => self.handle_init(),
             CreateMultipartState::ReadGateBucket => self.handle_gate_bucket(event),
+            CreateMultipartState::ReadBucketKey => self.handle_bucket_key(event),
             CreateMultipartState::PolicyGate => self.handle_policy_gate(event),
             CreateMultipartState::CheckOpenFence => self.open_upload(event),
             CreateMultipartState::OpenUpload => self.upload_opened(event),
             CreateMultipartState::StartTransaction => self.handle_transaction_started(event),
             CreateMultipartState::CheckPurgeFence => self.fence_checked(event),
             CreateMultipartState::FenceBackend => self.handle_backend_fenced(event),
+            CreateMultipartState::CheckSettings => self.settings_checked(event),
             CreateMultipartState::WriteUpload => self.handle_record_written(event),
             CreateMultipartState::CommitTransaction => self.handle_transaction_committed(event),
             CreateMultipartState::AbortBackendUpload => self.backend_aborted(event),
@@ -496,15 +618,22 @@ mod pure_tests {
     use crate::groups::backends::BackendFenceError;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
+    use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE};
     use aruna_core::operation::Operation;
+    use aruna_core::structs::checksum::ChecksumAlgorithm;
     use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::encryption::{
+        BucketEncryption, BucketKeyRecord, EncryptionMode, SealPlan,
+    };
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::structs::storage::multipart::{BackendUpload, MultipartUpload};
+    use aruna_core::structs::storage::multipart::{MultipartChecksumHint, MultipartChecksumType};
     use aruna_core::structs::storage::routing::{
         BackendCatalog, GroupRoutingInputs, RoutingError, RoutingSnapshot, RoutingTarget,
         StorageRoutingRule,
     };
+    use aruna_core::types::Effects;
     use aruna_core::types::TxnId;
     use std::collections::BTreeSet;
     use ulid::Ulid;
@@ -522,9 +651,16 @@ mod pure_tests {
 
     /// A bucket with no default refs, so the gate is skipped entirely.
     fn ungoverned_bucket() -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: None,
+        bucket_read(None, None)
+    }
+
+    /// Answers the bucket and settings read.
+    fn bucket_read(bucket: Option<Vec<u8>>, settings: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (b"bucket".to_vec().into(), bucket.map(Into::into)),
+                (b"bucket".to_vec().into(), settings.map(Into::into)),
+            ],
         })
     }
 
@@ -566,7 +702,8 @@ mod pure_tests {
             txn_id: TxnId::default(),
         }));
 
-        let effects = operation.step(fence_clear());
+        operation.step(fence_clear());
+        let effects = operation.step(plain_settings());
 
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected one record write, got {effects:?}")
@@ -592,10 +729,7 @@ mod pure_tests {
             placement_policy_generation: 0,
             compression: Compression::Zstd { level: 3 },
         };
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: Some(bucket.to_bytes().unwrap().into()),
-        }));
+        operation.step(bucket_read(Some(bucket.to_bytes().unwrap()), None));
 
         let effects = operation.step(fence_clear());
 
@@ -603,6 +737,127 @@ mod pure_tests {
             panic!("expected the upload to open, got {effects:?}")
         };
         assert_eq!(resolved.compression, Compression::Zstd { level: 3 });
+    }
+
+    fn sealed_settings() -> (BucketEncryption, BucketKeyRecord) {
+        let settings = BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(Ulid::from_bytes([7; 16])),
+            key_generation: 2,
+            storage_generation: 4,
+            ..Default::default()
+        };
+        let key = settings.active_key().unwrap();
+        (
+            settings,
+            BucketKeyRecord::new(key, Ulid::from_bytes([8; 16]), [5; 32], 0),
+        )
+    }
+
+    /// Runs a sealed upload up to its record write and returns the effects of that step.
+    fn sealed_create(hint: Option<MultipartChecksumHint>) -> (CreateMultipartOperation, Effects) {
+        let (settings, record) = sealed_settings();
+        let mut input = input(snapshot());
+        input.checksum_hint = hint;
+        let mut operation = CreateMultipartOperation::new(input);
+        operation.start();
+        let effects = operation.step(bucket_read(None, Some(settings.to_bytes().unwrap())));
+        let [Effect::Storage(StorageEffect::Read { key_space, key, .. })] = effects.as_slice()
+        else {
+            panic!("expected the key record read, got {effects:?}")
+        };
+        assert_eq!(key_space, BUCKET_KEY_KEYSPACE);
+        assert_eq!(key.as_ref(), settings.active_key().unwrap().key());
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: key.clone(),
+            value: Some(record.to_bytes().unwrap().into()),
+        }));
+        (operation, effects)
+    }
+
+    #[test]
+    fn sealed_upload_snapshot() {
+        // An encrypted upload opens no provider upload and records its plan after a reread.
+        let (settings, record) = sealed_settings();
+        let (mut operation, _) = sealed_create(None);
+        let effects = operation.step(fence_clear());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+        let txn_id = TxnId::from_bytes([3u8; 16]);
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = operation.step(fence_clear());
+        let [
+            Effect::Storage(StorageEffect::Read {
+                key_space,
+                txn_id: read_txn,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the settings reread, got {effects:?}")
+        };
+        assert_eq!(key_space, BUCKET_ENCRYPTION_KEYSPACE);
+        assert_eq!(*read_txn, Some(txn_id));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(settings.to_bytes().unwrap().into()),
+        }));
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected the upload record, got {effects:?}")
+        };
+        let upload = MultipartUpload::from_bytes(value.as_ref()).unwrap();
+        let plan = SealPlan::capture(&settings, &record).unwrap().unwrap();
+        assert_eq!(
+            upload.encryption.map(|encryption| encryption.plan),
+            Some(plan)
+        );
+        assert_eq!(upload.backend_upload, None);
+    }
+
+    #[test]
+    fn sealed_rotation_conflicts() {
+        // A key generation that moved before the record commits fails the upload.
+        let (mut settings, _) = sealed_settings();
+        let (mut operation, _) = sealed_create(None);
+        operation.step(fence_clear());
+        let txn_id = TxnId::from_bytes([3u8; 16]);
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(fence_clear());
+        settings.key_generation = 3;
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(settings.to_bytes().unwrap().into()),
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        );
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateMultipartError::BucketKey(_))
+        ));
+    }
+
+    #[test]
+    fn sealed_refuses_digest() {
+        // Full-object SHA and MD5 cannot be checked without the plaintext; CRCs combine.
+        let hint = |algorithm| MultipartChecksumHint {
+            algorithm: Some(algorithm),
+            checksum_type: MultipartChecksumType::FullObject,
+        };
+        let (operation, _) = sealed_create(Some(hint(ChecksumAlgorithm::Sha256)));
+        assert_eq!(
+            operation.finalize(),
+            Err(CreateMultipartError::UnsupportedChecksum("SHA256"))
+        );
+        let (mut operation, _) = sealed_create(Some(hint(ChecksumAlgorithm::Crc64Nvme)));
+        let effects = operation.step(fence_clear());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
     }
 
     #[test]
@@ -619,7 +874,8 @@ mod pure_tests {
             txn_id: TxnId::default(),
         }));
 
-        let effects = operation.step(fence_clear());
+        operation.step(fence_clear());
+        let effects = operation.step(plain_settings());
 
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected one record write, got {effects:?}")
@@ -664,6 +920,67 @@ mod pure_tests {
             Err(CreateMultipartError::BackendFenceError(
                 BackendFenceError::Unavailable
             ))
+        ));
+    }
+
+    /// The settings reread inside the record transaction, for a bucket without encryption.
+    fn plain_settings() -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: None,
+        })
+    }
+
+    #[test]
+    fn plain_create_refused() {
+        // Encryption enabled while the provider upload opened, before any upload row existed:
+        // the plain upload never records and its provider upload is aborted.
+        let mut operation = CreateMultipartOperation::new(input(snapshot()));
+        operation.start();
+        operation.step(ungoverned_bucket());
+        operation.step(fence_clear());
+        let upload = BackendUpload {
+            location: aruna_core::structs::storage::blob::BackendLocation {
+                backend: BackendRef::node_default(),
+                storage_class: None,
+                root: "/".to_string(),
+                storage_bucket: "bucket".to_string(),
+                backend_path: "bucket/key".to_string(),
+                ulid: Ulid::from_bytes([6u8; 16]),
+                format: aruna_core::structs::storage::format::StoredFormat::default(),
+                created_by: aruna_core::UserId::default(),
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+                staging: false,
+                partial: false,
+                blob_size: 0,
+                hashes: std::collections::HashMap::new(),
+            },
+            upload_id: "provider".to_string(),
+            record_id: Ulid::from_bytes([9u8; 16]),
+        };
+        operation.step(opened(Some(upload.clone())));
+        let txn_id = TxnId::from_bytes([3u8; 16]);
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(fence_clear());
+        let (settings, _) = sealed_settings();
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(settings.to_bytes().unwrap().into()),
+        }));
+
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::Storage(StorageEffect::AbortTransaction { .. }),
+                    Effect::Blob(BlobEffect::AbortUpload { backend_upload }),
+                ] if **backend_upload == upload
+            ),
+            "expected the record and provider upload to be dropped, got {effects:?}"
+        );
+        assert!(matches!(
+            operation.pending_error,
+            Some(CreateMultipartError::BucketKey(_))
         ));
     }
 

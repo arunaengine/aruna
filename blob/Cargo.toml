@@ -36,6 +36,7 @@ iroh-io = { workspace = true }
 md5 = { workspace = true }
 opendal = { workspace = true }
 percent-encoding = { workspace = true }
+pithos_lib = { workspace = true }
 postcard = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -49,6 +50,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 ulid = { workspace = true }
 zstd = { workspace = true }
+zeroize = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 rustix = { workspace = true }

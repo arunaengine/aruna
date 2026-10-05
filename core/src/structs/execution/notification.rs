@@ -90,6 +90,20 @@ pub enum NotificationKind {
         request_id: Ulid,
         actor_user_id: UserId,
     },
+    /// A node restart locked an unlocked encrypted bucket; a holder must unlock it again.
+    #[serde(rename = "BucketLockedByRestart")]
+    BucketRestartLocked {
+        bucket: String,
+        node_id: NodeId,
+        group_id: GroupId,
+    },
+    /// The holders of an encrypted bucket no longer meet the recovery rule, for example after
+    /// an admin lost the group admin role.
+    BucketRecoveryDegraded {
+        bucket: String,
+        node_id: NodeId,
+        group_id: GroupId,
+    },
 }
 
 impl NotificationKind {
@@ -106,6 +120,8 @@ impl NotificationKind {
             | NotificationKind::DataUploaded { .. }
             | NotificationKind::SyncCompleted { .. }
             | NotificationKind::SyncFailed { .. } => "resource.watch",
+            NotificationKind::BucketRestartLocked { .. }
+            | NotificationKind::BucketRecoveryDegraded { .. } => "bucket.encryption",
         }
     }
 
@@ -121,6 +137,8 @@ impl NotificationKind {
             NotificationKind::DataUploaded { .. } => "data_uploaded",
             NotificationKind::SyncCompleted { .. } => "sync_completed",
             NotificationKind::SyncFailed { .. } => "sync_failed",
+            NotificationKind::BucketRestartLocked { .. } => "bucket_locked_by_restart",
+            NotificationKind::BucketRecoveryDegraded { .. } => "bucket_recovery_degraded",
         }
     }
 }
@@ -363,6 +381,16 @@ mod tests {
         let data_group_id = Ulid::generate();
         let data_node_id = make_node_id(8);
         for kind in [
+            NotificationKind::BucketRestartLocked {
+                bucket: "raw".to_string(),
+                node_id: make_node_id(9),
+                group_id: Ulid::generate(),
+            },
+            NotificationKind::BucketRecoveryDegraded {
+                bucket: "raw".to_string(),
+                node_id: make_node_id(9),
+                group_id: Ulid::generate(),
+            },
             NotificationKind::GroupJoinRequested {
                 group_id: Ulid::generate(),
                 request_id: Ulid::generate(),

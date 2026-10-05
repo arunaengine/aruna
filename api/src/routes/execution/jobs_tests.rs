@@ -95,6 +95,7 @@ fn family_report_fixture() -> FamilyReport {
             workspace_mode: WorkspaceMode::None,
             locally_exhausted: false,
             session_runtime: None,
+            awaiting_keys: Vec::new(),
         },
         spec: LogicalJobSpec {
             submission_id,

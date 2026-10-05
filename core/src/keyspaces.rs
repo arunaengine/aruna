@@ -99,6 +99,32 @@ pub const COMPRESSION_MIGRATION_KEYSPACE: &str = "compression_migrations";
 /// Buckets whose compression migration is unfinished; the worker scans only these.
 pub const COMPRESSION_QUEUE_KEYSPACE: &str = "compression_migration_queue";
 pub const HIDDEN_RESERVATION_KEYSPACE: &str = "blob_hidden_reservations";
+/// Key generations of encrypted buckets, keyed by bucket id and generation. Public keys only.
+pub const BUCKET_KEY_KEYSPACE: &str = "bucket_keys";
+/// Key holders of encrypted buckets, keyed by bucket id and user.
+pub const BUCKET_HOLDER_KEYSPACE: &str = "bucket_holders";
+/// Bucket private keys sealed to user keys, keyed by bucket id, generation and holder.
+pub const KEY_COPY_KEYSPACE: &str = "bucket_key_copies";
+/// Encryption settings of node-local buckets, keyed by bucket name. No row means off.
+pub const BUCKET_ENCRYPTION_KEYSPACE: &str = "bucket_encryption";
+/// Key state audit of encrypted buckets, keyed by bucket id and time-ordered event id.
+pub const BUCKET_AUDIT_KEYSPACE: &str = "bucket_audit";
+/// Complete locations of archives whose content hash is unknown, keyed by archive id and backend.
+pub const PENDING_LOCATION_KEYSPACE: &str = "pending_locations";
+/// The versions that use each Pithos archive, keyed by archive and version.
+pub const COPY_OWNER_KEYSPACE: &str = "blob_copy_owners";
+/// Node-local progress of moving a bucket's copies to new encryption, keyed by bucket name.
+pub const TRANSITION_KEYSPACE: &str = "encryption_transitions";
+/// Buckets whose encryption transition is unfinished; the worker scans only these.
+pub const TRANSITION_QUEUE_KEYSPACE: &str = "encryption_transition_queue";
+/// Old copies a transition still waits to see removed, keyed by bucket and location key.
+pub const TRANSITION_CLEANUP_KEYSPACE: &str = "encryption_transition_cleanups";
+/// Bucket keys parked jobs wait for: per-job lists and a wake index by key reference.
+pub const KEY_WAIT_KEYSPACE: &str = "job_key_waits";
+/// When each pending archive was first seen without owners, keyed by archive.
+pub const PENDING_RECLAIM_KEYSPACE: &str = "pending_reclaims";
+/// The weakened recovery each encrypted bucket's holders were last told about, by bucket id.
+pub const BUCKET_RECOVERY_KEYSPACE: &str = "bucket_recovery";
 /// Durable evidence of a copy that failed hash/bao verification (§8.2), keyed
 /// per (hash, backend) so re-hitting the same corrupt copy overwrites its row.
 pub const BLOB_QUARANTINE_KEYSPACE: &str = "blob_quarantine";
@@ -355,6 +381,13 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BLOB_RECLAIM_KEYSPACE,
     COMPRESSION_MIGRATION_KEYSPACE,
     COMPRESSION_QUEUE_KEYSPACE,
+    BUCKET_KEY_KEYSPACE,
+    BUCKET_HOLDER_KEYSPACE,
+    KEY_COPY_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE,
+    BUCKET_AUDIT_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE,
+    COPY_OWNER_KEYSPACE,
     HIDDEN_RESERVATION_KEYSPACE,
     BLOB_QUARANTINE_KEYSPACE,
     MANAGED_COPY_KEYSPACE,
@@ -451,6 +484,12 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     CRAQLE_QUADS_KEYSPACE,
     CRAQLE_GRAPHS_KEYSPACE,
     CRAQLE_LOG_KEYSPACE,
+    TRANSITION_KEYSPACE,
+    TRANSITION_QUEUE_KEYSPACE,
+    TRANSITION_CLEANUP_KEYSPACE,
+    KEY_WAIT_KEYSPACE,
+    PENDING_RECLAIM_KEYSPACE,
+    BUCKET_RECOVERY_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

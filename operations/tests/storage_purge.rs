@@ -754,6 +754,7 @@ fn purge_result(
         JobRunOutcome::Deferred(error) => panic!("purge was deferred: {}", error.message),
         JobRunOutcome::Cancelled => panic!("purge was cancelled"),
         JobRunOutcome::Interrupted => panic!("purge was interrupted"),
+        JobRunOutcome::AwaitingKey(_) => panic!("purge was awaiting a key"),
     }
 }
 
@@ -809,6 +810,7 @@ async fn seed_upload(
         subject_generation: 0,
         completing_since_ms: None,
         backend_upload: None,
+        encryption: None,
     };
     write_value(
         storage,

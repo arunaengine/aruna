@@ -1699,6 +1699,7 @@ mod tests {
             subject_generation: 0,
             completing_since_ms: None,
             backend_upload: None,
+            encryption: None,
         };
 
         let decoded = decode_entry(
@@ -1742,6 +1743,7 @@ mod tests {
             },
             created_at: SystemTime::UNIX_EPOCH,
             backend_etag: None,
+            piece: None,
         };
 
         let decoded = decode_entry(

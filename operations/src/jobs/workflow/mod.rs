@@ -136,6 +136,14 @@ pub async fn run_execution_job(
         return;
     }
     publish_progress(&context, job_id, PhysicalExecutionState::Preparing).await;
+    // Staging reads input plaintext, so a locked input parks the job before any attempt intent.
+    if Box::pin(crate::jobs::key_wake::park_locked(
+        &context, &record, token, node_id,
+    ))
+    .await
+    {
+        return;
+    }
 
     let stop = CancellationToken::new();
     let heartbeat = tokio::spawn(execution_heartbeat(
@@ -149,17 +157,22 @@ pub async fn run_execution_job(
 
     // Boxed so the large per-stage futures never inflate caller stacks.
     let mut prepare_and_submit = Box::pin(async {
-        let prepared =
-            match Box::pin(prepare_task(&context, &spec, &record, node_id, &bucket)).await {
-                Ok(prepared) => prepared,
-                Err(error) => {
+        let prepared = match Box::pin(prepare_task(&context, &spec, &record, node_id, &bucket))
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let parked =
+                    crate::jobs::key_wake::park_on_lock(&context, &record, token, node_id, &error);
+                if !Box::pin(parked).await {
                     Box::pin(pre_submit_failure(
                         &context, job_id, token, &record, error, false,
                     ))
                     .await;
-                    return AttemptOutcome::Stopped;
                 }
-            };
+                return AttemptOutcome::Stopped;
+            }
+        };
 
         // Preparing -> Ready.
         if transition_to_ready(storage, job_id, token, unix_timestamp_millis())

@@ -5,15 +5,18 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path};
 
+use crate::s3::object::get::leased;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, BlobError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, JOB_STATE_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+    JOB_STATE_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::execution::job::KeyWait;
 use aruna_core::structs::execution::job::{
     ArtifactRef, ExportOmissionCounts, ExportReportDetail, ExportReportRow, ExportReportSource,
     ExportRoCrateResult, ExportRoCrateSpec, JobError, JobId, JobResultPayload, ReasonCode,
@@ -22,10 +25,13 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobVersion, BucketInfo, HashIndex, ManagedCopyKey, VersionKey,
+    ArchiveKey, BackendLocation, BlobVersion, BucketInfo, HashIndex, ManagedCopyKey, VersionKey,
     ensure_confined_path, object_permission_path,
 };
 use aruna_core::structs::storage::data_identity::DataIdentity;
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
+};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
@@ -70,6 +76,7 @@ use crate::metadata::api::{
 use crate::metadata::forward::export_rocrate_routed;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use aruna_core::jobs::WaitTarget;
 use aruna_core::structs::identity::auth::AuthContext;
 
 mod archive;
@@ -288,6 +295,15 @@ enum PlannedSource {
 enum ExportFailure {
     Permanent(String),
     Retryable(String),
+    /// A local input's bucket key is locked; the job waits for it.
+    KeyLocked(KeyWait),
+    /// A remote holder refused because its bucket key is locked; the job registers there.
+    RemoteLocked {
+        node_id: NodeId,
+        /// The exact source the refused read named, so the holder admits only that.
+        target: WaitTarget,
+        auth: Box<AuthContext>,
+    },
     Validation(Vec<MetadataValidationViolation>),
     Candidate {
         entity_index: usize,
@@ -1907,13 +1923,39 @@ async fn open_local_txn(
             "blob handle unavailable".to_string(),
         ));
     };
-    match blob_handle
-        .send_blob_effect(BlobEffect::Read {
-            location: location.clone(),
-        })
-        .await
-    {
+    // An encrypting bucket admits plaintext only under a read lease; a locked key parks the job.
+    let lease = match read_admission(driver, location, bucket, txn_id).await? {
+        Ok(lease) => lease,
+        Err(key) => {
+            return Err(ExportFailure::KeyLocked(KeyWait {
+                node_id,
+                bucket: bucket.to_string(),
+                group_id: Some(group_id),
+                key,
+            }));
+        }
+    };
+    let (effect, held) = match (lease, location.format.bucket_key()) {
+        (Some(lease), Some(_)) => {
+            let location = location.clone();
+            let read = BlobEffect::ReadSealed {
+                location,
+                range: None,
+                lease: Box::new(lease),
+            };
+            (read, None)
+        }
+        (lease, _) => {
+            let location = location.clone();
+            (BlobEffect::Read { location }, lease)
+        }
+    };
+    match blob_handle.send_blob_effect(effect).await {
         Event::Blob(BlobEvent::ReadFinished { blob, stream_size }) => {
+            let blob = match held {
+                Some(lease) => leased(blob, lease),
+                None => blob,
+            };
             Ok(CandidateOpen::Opened(if metadata_only {
                 BaoReadOutput::Metadata {
                     size: stream_size,
@@ -1937,6 +1979,46 @@ async fn open_local_txn(
         Event::Blob(BlobEvent::Error(_)) => Ok(CandidateOpen::Status(OpenStatus::Offline)),
         event => Err(ExportFailure::Retryable(format!(
             "unexpected local blob read event: {event:?}"
+        ))),
+    }
+}
+
+/// The read lease an input of `bucket` needs: none for a plain bucket, the copy's own key for a
+/// sealed copy, the bucket lease for a plain copy of an encrypting bucket. `Err` is a locked key.
+async fn read_admission(
+    driver: &DriverContext,
+    location: &BackendLocation,
+    bucket: &str,
+    txn_id: TxnId,
+) -> Result<Result<Option<ReadLease>, BucketKeyRef>, ExportFailure> {
+    let (key, archive) = match location.format.bucket_key() {
+        Some(key) => (key, ArchiveKey::of(location)),
+        None => {
+            let key = bucket.as_bytes().to_vec().into();
+            let row = storage_value(driver, BUCKET_ENCRYPTION_KEYSPACE, key, Some(txn_id)).await?;
+            let settings = BucketEncryption::from_row(row.as_deref())
+                .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+            match settings.active_key() {
+                Some(key) => (key, ArchiveKey::of(location)),
+                None => return Ok(Ok(None)),
+            }
+        }
+    };
+    let Some(blob_handle) = driver.blob_handle.as_ref() else {
+        return Err(ExportFailure::Retryable(
+            "blob handle unavailable".to_string(),
+        ));
+    };
+    match blob_handle
+        .send_blob_effect(BlobEffect::AdmitRead { key, archive })
+        .await
+    {
+        Event::Blob(BlobEvent::ReadAdmitted { lease }) => Ok(Ok(Some(lease))),
+        Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
+            Ok(Err(key))
+        }
+        event => Err(ExportFailure::Retryable(format!(
+            "read admission failed: {event:?}"
         ))),
     }
 }
@@ -1991,6 +2073,14 @@ async fn open_remote(
     expected_blake3: Option<[u8; 32]>,
     metadata_only: bool,
 ) -> Result<CandidateOpen, ExportFailure> {
+    let wait_target = match &target {
+        BaoReadTarget::ExactVersion(arn) => WaitTarget::Object {
+            bucket: arn.bucket.clone(),
+            key: arn.key.clone(),
+            version_id: arn.version,
+        },
+        BaoReadTarget::Blake3(blake3) => WaitTarget::Content { blake3: *blake3 },
+    };
     // The challenge loop fills in this node's advertised subject and the refs
     // it learns, so a governed copy can be staged instead of dead-ending.
     match managed_read(
@@ -2017,6 +2107,13 @@ async fn open_remote(
         }
         Err(BaoReadError::Refused(BaoReadRefusal::HashMismatch)) => {
             Ok(CandidateOpen::Status(OpenStatus::Corrupt))
+        }
+        Err(BaoReadError::Refused(BaoReadRefusal::BucketLocked(_))) => {
+            Err(ExportFailure::RemoteLocked {
+                node_id,
+                target: wait_target,
+                auth: Box::new(spec.auth_context.clone()),
+            })
         }
         Err(
             BaoReadError::Refused(BaoReadRefusal::BackendFailure)

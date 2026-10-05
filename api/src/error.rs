@@ -89,6 +89,9 @@ pub enum ServerError {
     /// applied it, so it must not be re-sent to another node.
     #[error("Relaying to a management node failed")]
     RelayFailed,
+    /// A refusal with its own status and machine-readable code, such as `bucket_locked`.
+    #[error("{2}")]
+    Refused(StatusCode, &'static str, String),
 }
 
 #[derive(Debug, Error)]
@@ -421,6 +424,7 @@ impl ServerError {
             ServerError::ServiceUnavailable
             | ServerError::ServiceUnavailableReason(_)
             | ServerError::NoManagementNode => StatusCode::SERVICE_UNAVAILABLE,
+            ServerError::Refused(status, ..) => *status,
         }
     }
 
@@ -455,6 +459,7 @@ impl ServerError {
             }
             ServerError::NoManagementNode => "no_management_node".to_string(),
             ServerError::RelayFailed => "relay_failed".to_string(),
+            ServerError::Refused(_, code, _) => (*code).to_string(),
         }
     }
 

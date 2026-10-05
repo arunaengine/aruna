@@ -11,7 +11,11 @@ use crate::driver::DriverContext;
 use crate::tasks::task_persistence::persist_task_effect;
 
 pub(super) async fn dispatch_task(effect: TaskEffect, context: &DriverContext) -> Event {
-    if let Err(message) = persist_task_effect(&context.storage_handle, &effect).await {
+    // An audit record retry runs from memory when storage cannot persist it.
+    let kept = matches!(task_effect_key(&effect), Some(TaskKey::RecordAudit { .. }));
+    if let Err(message) = persist_task_effect(&context.storage_handle, &effect).await
+        && !kept
+    {
         return Event::Task(TaskEvent::Error {
             key: task_effect_key(&effect),
             message,

@@ -779,10 +779,12 @@ fn successor_usage(successor: &BlobVersion, location: Option<&BackendLocation>) 
             referenced_bytes: i128::from(cached_metadata.content_length),
             ..Default::default()
         },
-        BlobVersionState::Materialized { .. } => UsageDelta {
-            logical_bytes: location.map_or(0, |location| i128::from(location.blob_size)),
-            ..Default::default()
-        },
+        BlobVersionState::Materialized { .. } | BlobVersionState::PendingContent { .. } => {
+            UsageDelta {
+                logical_bytes: location.map_or(0, |location| i128::from(location.blob_size)),
+                ..Default::default()
+            }
+        }
         BlobVersionState::Deleted => UsageDelta::default(),
     }
 }

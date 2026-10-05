@@ -7,6 +7,7 @@ use super::backend::rebuild_backend_path;
 use super::control_plane::{
     parse_replication_init, read_replication_message, send_replication_message, validate_init_ack,
 };
+use super::frames::SliceReader;
 use crate::bao_tree::{BaoReadWriter, OpenDalWriter, RecvStreamWrapper, SendStreamWrapper};
 use crate::error::BlobLibError;
 use crate::messages::{MessageType, ReplicationMessage};
@@ -19,6 +20,7 @@ use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobQuarantineRecord, ResolvedBackend,
 };
+use aruna_core::structs::storage::encryption::ReadLease;
 use aruna_core::structs::storage::format::{StoredFormat, StoredLayout};
 use aruna_core::time::unix_timestamp_millis;
 use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
@@ -82,10 +84,50 @@ impl BlobHandler {
             ));
         }
         // Framed copies are decoded, so the peer always receives original bytes.
-        let mut reader = match self.slice_reader(&location).await {
+        let reader = match self.slice_reader(&location).await {
             Ok(reader) => reader,
             Err(error) => return BlobEvent::Error(error),
         };
+        self.serve_from(stream_id, location, expected_blake3, reader)
+            .await
+    }
+
+    /// Serves the plaintext of a copy of an encrypting bucket to an authorized reader. The lease
+    /// keeps the key and the archive in use until the transfer ends; replication never does this.
+    pub async fn serve_sealed_read(
+        &self,
+        stream_id: Ulid,
+        location: BackendLocation,
+        expected_blake3: [u8; 32],
+        lease: ReadLease,
+    ) -> BlobEvent {
+        if location.get_blake3() != Some(expected_blake3.as_slice()) {
+            return BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                "bao read location hash mismatch".to_string(),
+            ));
+        }
+        // A plain copy of an encrypting bucket keeps its bucket lease until the transfer ends.
+        let (reader, _lease) = match location.format.layout {
+            StoredLayout::Pithos(_) => match self.sealed_reader(&location, lease).await {
+                Ok(reader) => (SliceReader::Sealed(reader), None),
+                Err(error) => return BlobEvent::Error(error),
+            },
+            _ => match self.slice_reader(&location).await {
+                Ok(reader) => (reader, Some(lease)),
+                Err(error) => return BlobEvent::Error(error),
+            },
+        };
+        self.serve_from(stream_id, location, expected_blake3, reader)
+            .await
+    }
+
+    async fn serve_from(
+        &self,
+        stream_id: Ulid,
+        location: BackendLocation,
+        expected_blake3: [u8; 32],
+        mut reader: SliceReader,
+    ) -> BlobEvent {
         let mut outboard =
             match PreOrderOutboard::<BytesMut>::create(&mut reader, BAO_BLOCK_SIZE).await {
                 Ok(outboard) if outboard.root.as_bytes() == &expected_blake3 => outboard,

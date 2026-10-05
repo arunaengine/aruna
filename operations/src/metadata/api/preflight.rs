@@ -138,7 +138,8 @@ pub(super) async fn resolve_preflight_targets(
             for (version_key, version) in versions {
                 let content_hash = match version.state {
                     BlobVersionState::Materialized { blob_hash, .. } => blob_hash,
-                    BlobVersionState::Reference { .. } => {
+                    BlobVersionState::Reference { .. }
+                    | BlobVersionState::PendingContent { .. } => {
                         complete = false;
                         continue;
                     }

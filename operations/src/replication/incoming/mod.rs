@@ -26,6 +26,7 @@ use crate::replication::queue::{
     LiveObligationRecord, live_obligation_effect, schedule_blob_drain,
 };
 use crate::s3::bucket::create::CreateBucketOperation;
+use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -34,7 +35,7 @@ use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, Sub
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -46,6 +47,7 @@ use aruna_core::structs::storage::blob::{
     bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
+use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
 use aruna_core::structs::storage::replication::{
@@ -152,6 +154,8 @@ pub enum IncomingVersionError {
     ManifestPermissionDenied,
     #[error("Replication hop limit exceeded")]
     HopLimitExceeded,
+    #[error("encrypted versions are not replicated")]
+    EncryptedVersion,
     #[error("Reference replication manifest is missing source metadata")]
     MissingReferenceMetadata,
     #[error("Reference replication manifest is missing source binding")]
@@ -194,6 +198,8 @@ pub enum IncomingVersionError {
         expected: &'static str,
         received: Event,
     },
+    #[error("the destination bucket encrypts its objects, so it accepts no replicas")]
+    EncryptedDestination,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -917,13 +923,11 @@ impl IncomingVersionOperation {
         self.write_version()
     }
 
+    /// Reads the bucket with its encryption settings, so an encrypting bucket is refused
+    /// before any byte arrives.
     fn read_destination_bucket(&mut self) -> Effects {
         self.state = IncomingVersionState::ReadDestinationBucket;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.manifest.bucket.as_bytes().to_vec().into(),
-            txn_id: None,
-        })]
+        smallvec![settings_read(&self.manifest.bucket, None)]
     }
 
     fn destination_bucket_info(&self) -> BucketInfo {
@@ -1238,7 +1242,13 @@ impl IncomingVersionOperation {
     /// transaction that exposes the replica.
     fn check_drift(&mut self) -> Effects {
         self.state = IncomingVersionState::CheckDrift;
-        smallvec![drift_reads(&self.manifest.bucket, self.txn_id)]
+        let mut effect = drift_reads(&self.manifest.bucket, self.txn_id);
+        // Encryption enabled since the negotiation must still refuse the replica.
+        if let Effect::Storage(StorageEffect::BatchRead { reads, .. }) = &mut effect {
+            let key = self.manifest.bucket.as_bytes().to_vec().into();
+            reads.push((BUCKET_ENCRYPTION_KEYSPACE.to_string(), key));
+        }
+        smallvec![effect]
     }
 
     /// Why this replica lands here, from what this node itself observed: an
@@ -2069,13 +2079,24 @@ impl IncomingVersionOperation {
 // together decide the reply sent to the sender.
 impl IncomingVersionOperation {
     fn accept_destination_bucket(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
                 received: event,
             });
         };
+        let [(_, value), (_, settings)] = match <[_; 2]>::try_from(values) {
+            Ok(values) => values,
+            Err(_) => return self.fail(PolicyGateError::InvalidEvent.into()),
+        };
+        match BucketEncryption::from_row(settings.as_deref()) {
+            Ok(settings) if settings.is_encrypted() => {
+                return self.reject_negotiation(IncomingVersionError::EncryptedDestination);
+            }
+            Ok(_) => {}
+            Err(err) => return self.fail(err.into()),
+        }
 
         let Some(value) = value else {
             if self.create_attempted {
@@ -2234,6 +2255,9 @@ impl IncomingVersionOperation {
                         .send_negotiation(ReplicationNegotiationResult::AlreadyReplicatedVersion);
                 }
                 BlobVersionState::Deleted => {}
+                BlobVersionState::PendingContent { .. } => {
+                    return self.reject_negotiation(IncomingVersionError::EncryptedVersion);
+                }
             }
         }
 
@@ -2515,13 +2539,23 @@ impl IncomingVersionOperation {
     }
 
     fn accept_drift_check(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { mut values }) = event else {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
                 received: event,
             });
         };
+        let Some((_, settings)) = values.pop().filter(|_| values.len() == 2) else {
+            return self.fail(PolicyGateError::InvalidEvent.into());
+        };
+        match BucketEncryption::from_row(settings.as_deref()) {
+            Ok(settings) if settings.is_encrypted() => {
+                return self.fail(IncomingVersionError::EncryptedDestination);
+            }
+            Ok(_) => {}
+            Err(err) => return self.fail(err.into()),
+        }
         let (bucket, subject) = match split_drift_reads(values) {
             Ok(split) => split,
             Err(error) => return self.fail(error.into()),

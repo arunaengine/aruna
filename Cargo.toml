@@ -21,7 +21,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.103"
+version = "3.0.0-alpha.104"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -152,6 +152,7 @@ oxttl = "0.2.4"
 parking_lot = { version = "0.12.5", features = ["deadlock_detection"] }
 pbkdf2 = "0.13.0"
 percent-encoding = "2.3.2"
+pithos_lib = { version = "0.8.0", default-features = false, features = ["async"] }
 postcard = { version = "1.1.3", features = ["alloc"] }
 prometheus-client = "0.25"
 proptest = "1.11.0"

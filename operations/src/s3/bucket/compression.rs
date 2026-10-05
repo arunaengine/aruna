@@ -3,17 +3,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
+    COMPRESSION_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, TRANSITION_KEYSPACE, TRANSITION_QUEUE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan, UnlockStatus,
+};
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
+use aruna_core::structs::storage::transition::{
+    EncryptionTransition, TransitionKind, TransitionTarget,
+};
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::time::Duration;
 use thiserror::Error;
@@ -24,6 +31,8 @@ enum PutCompressionState {
     StartTransaction,
     ReadBucket,
     ReadMigration,
+    CheckUnlocked,
+    ReadKey,
     WriteBucket,
     CommitTransaction,
     Finish,
@@ -40,6 +49,11 @@ pub enum PutCompressionError {
     NoSuchBucket,
     #[error("The bucket changed owner while the setting was written")]
     GroupMismatch,
+    #[error(transparent)]
+    Key(#[from] BucketKeyError),
+    /// Replacing an unfinished encryption transition would strand its source key.
+    #[error("the bucket's stored copies are still moving to a new encryption")]
+    TransitionRunning,
     #[error("PutBucketCompression did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
@@ -58,6 +72,8 @@ pub struct PutCompressionOperation {
     compression: Compression,
     now_ms: u64,
     info: Option<BucketInfo>,
+    /// The encryption settings of an encrypted bucket, read with the migration record.
+    settings: Option<BucketEncryption>,
     /// Set when the commit must wake the migration task.
     wake: bool,
     state: PutCompressionState,
@@ -73,6 +89,7 @@ impl PutCompressionOperation {
             compression,
             now_ms,
             info: None,
+            settings: None,
             wake: false,
             state: PutCompressionState::Init,
             txn_id: None,
@@ -96,6 +113,8 @@ impl PutCompressionOperation {
             PutCompressionState::StartTransaction => "StartTransaction",
             PutCompressionState::ReadBucket => "ReadBucket",
             PutCompressionState::ReadMigration => "ReadMigration",
+            PutCompressionState::CheckUnlocked => "CheckUnlocked",
+            PutCompressionState::ReadKey => "ReadKey",
             PutCompressionState::WriteBucket => "WriteBucket",
             PutCompressionState::CommitTransaction => "CommitTransaction",
             PutCompressionState::Finish => "Finish",
@@ -121,11 +140,126 @@ impl PutCompressionOperation {
         }
         self.info = Some(info);
         self.state = PutCompressionState::ReadMigration;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
-            key: self.key(),
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (COMPRESSION_MIGRATION_KEYSPACE.to_string(), self.key()),
+                (BUCKET_ENCRYPTION_KEYSPACE.to_string(), self.key()),
+                (TRANSITION_KEYSPACE.to_string(), self.key()),
+            ],
             txn_id: self.txn_id,
         })]
+    }
+
+    /// An encrypted bucket re-encodes its archives through a transition instead of a migration.
+    fn read_rows(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+        let mut rows = values.into_iter().map(|(_, value)| value);
+        let (Some(migration), Some(settings), Some(transition), None) =
+            (rows.next(), rows.next(), rows.next(), rows.next())
+        else {
+            return self.fail(PutCompressionError::NotFinished);
+        };
+        let transition = transition.map(|row| EncryptionTransition::from_bytes(&row));
+        match transition.transpose() {
+            Ok(Some(transition)) if transition.finished_at_ms.is_none() => {
+                return self.fail(PutCompressionError::TransitionRunning);
+            }
+            Ok(_) => {}
+            Err(error) => return self.fail(error.into()),
+        }
+        let settings = match BucketEncryption::from_row(settings.as_deref()) {
+            Ok(settings) => settings,
+            Err(error) => return self.fail(error.into()),
+        };
+        let changed = self.info.as_ref().map(|info| info.compression) != Some(self.compression);
+        let Some(active) = settings.active_key().filter(|_| changed) else {
+            return self.write_bucket(migration.map(|value| value.to_vec()));
+        };
+        self.settings = Some(settings);
+        // Re-encoding opens every archive, so the active key must be unlocked before anything commits.
+        self.state = PutCompressionState::CheckUnlocked;
+        smallvec![Effect::Blob(BlobEffect::ReadKeyStatus {
+            bucket_id: active.bucket_id
+        })]
+    }
+
+    fn check_unlocked(&mut self, generations: &[UnlockStatus]) -> Effects {
+        let Some(active) = self
+            .settings
+            .as_ref()
+            .and_then(BucketEncryption::active_key)
+        else {
+            return self.fail(PutCompressionError::NotFinished);
+        };
+        if !generations
+            .iter()
+            .any(|status| status.key == active && status.active)
+        {
+            return self.fail(BucketKeyError::Locked(active.bucket_id).into());
+        }
+        self.state = PutCompressionState::ReadKey;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_KEY_KEYSPACE.to_string(),
+            key: active.key().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// Writes the setting, the next storage generation and a re-encode of every archive.
+    fn write_sealed(&mut self, value: Option<Vec<u8>>) -> Effects {
+        match self.sealed_rows(value) {
+            Ok(writes) => {
+                self.wake = true;
+                self.output = Some(Ok(None));
+                self.state = PutCompressionState::WriteBucket;
+                smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: self.txn_id,
+                })]
+            }
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn sealed_rows(
+        &mut self,
+        value: Option<Vec<u8>>,
+    ) -> Result<Vec<(String, Key, Value)>, PutCompressionError> {
+        let record = BucketKeyRecord::from_bytes(&value.ok_or(PutCompressionError::NotFinished)?)?;
+        let (Some(mut info), Some(mut settings)) = (self.info.take(), self.settings.take()) else {
+            return Err(PutCompressionError::NotFinished);
+        };
+        info.compression = self.compression;
+        settings.storage_generation += 1;
+        let plan = SealPlan::capture(&settings, &record)?;
+        let target = TransitionTarget {
+            compression: self.compression,
+            plan,
+        };
+        let (kind, generation) = (TransitionKind::Reencode, settings.storage_generation);
+        let transition =
+            EncryptionTransition::new(kind, Some(record.key), target, generation, self.now_ms);
+        Ok(vec![
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                self.key(),
+                info.to_bytes()?.into(),
+            ),
+            (
+                BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                self.key(),
+                settings.to_bytes()?.into(),
+            ),
+            (
+                TRANSITION_KEYSPACE.to_string(),
+                self.key(),
+                transition.to_bytes()?.into(),
+            ),
+            (
+                TRANSITION_QUEUE_KEYSPACE.to_string(),
+                self.key(),
+                Vec::new().into(),
+            ),
+        ])
     }
 
     fn write_bucket(&mut self, value: Option<Vec<u8>>) -> Effects {
@@ -221,10 +355,22 @@ impl Operation for PutCompressionOperation {
                 self.read_migration(value.map(|value| value.to_vec()))
             }
             PutCompressionState::ReadMigration => {
+                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+                    return self.unexpected("BatchReadResult", event);
+                };
+                self.read_rows(values)
+            }
+            PutCompressionState::CheckUnlocked => {
+                let Event::Blob(BlobEvent::KeyStatus { generations }) = event else {
+                    return self.unexpected("KeyStatus", event);
+                };
+                self.check_unlocked(&generations)
+            }
+            PutCompressionState::ReadKey => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return self.unexpected("ReadResult", event);
                 };
-                self.write_bucket(value.map(|value| value.to_vec()))
+                self.write_sealed(value.map(|value| value.to_vec()))
             }
             PutCompressionState::WriteBucket => {
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
@@ -381,10 +527,164 @@ mod tests {
         if operation.state != PutCompressionState::ReadMigration {
             return effects;
         }
+        let migration = migration.map(|record| record.to_bytes().unwrap().into());
+        operation.step(rows(migration, None, None))
+    }
+
+    /// The answer to the read of migration, encryption settings and transition rows.
+    fn rows(migration: Option<Value>, settings: Option<Value>, transition: Option<Value>) -> Event {
+        let values = [migration, settings, transition];
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: values
+                .into_iter()
+                .map(|value| (b"b".to_vec().into(), value))
+                .collect(),
+        })
+    }
+
+    fn encrypted() -> (BucketEncryption, BucketKeyRecord) {
+        use aruna_core::structs::storage::encryption::{BucketKeyRef, EncryptionMode};
+        let settings = BucketEncryption {
+            mode: EncryptionMode::NodeManaged,
+            bucket_id: Some(Ulid::from_bytes([6; 16])),
+            key_generation: 2,
+            storage_generation: 7,
+            ..BucketEncryption::default()
+        };
+        let key = BucketKeyRef::new(Ulid::from_bytes([6; 16]), 2);
+        (
+            settings,
+            BucketKeyRecord::new(key, Ulid::from_bytes([8; 16]), [9; 32], 1),
+        )
+    }
+
+    /// The registry's answer: the active generation unlocked, or nothing unlocked.
+    fn status(record: &BucketKeyRecord, unlocked: bool) -> Event {
+        let session = UnlockStatus {
+            key: record.key,
+            session_id: Ulid::from_bytes([5; 16]),
+            sequence: ulid::Ulid::from_parts(1, 1),
+            deadline_ms: None,
+            active: true,
+            unlocked_at: SystemTime::UNIX_EPOCH,
+            remaining: None,
+            max_remaining: None,
+        };
+        let generations = if unlocked { vec![session] } else { Vec::new() };
+        Event::Blob(BlobEvent::KeyStatus { generations })
+    }
+
+    #[test]
+    fn locked_key_refuses() {
+        // Nothing is written while the archives' key is locked on this node.
+        let zstd = Compression::Zstd { level: 7 };
+        let mut operation = PutCompressionOperation::new("b".to_string(), group(), zstd, 5);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
         operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"b".to_vec().into(),
-            value: migration.map(|record| record.to_bytes().unwrap().into()),
-        }))
+            value: Some(bucket(group()).to_bytes().unwrap().into()),
+        }));
+        let (settings, record) = encrypted();
+        operation.step(rows(None, Some(settings.to_bytes().unwrap().into()), None));
+
+        let effects = operation.step(status(&record, false));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        let locked = BucketKeyError::Locked(record.key.bucket_id);
+        assert_eq!(operation.finalize(), Err(PutCompressionError::Key(locked)));
+    }
+
+    #[test]
+    fn encrypted_change_reencodes() {
+        // Archives re-encode through a transition; no plain migration would read them.
+        let zstd = Compression::Zstd { level: 7 };
+        let mut operation = PutCompressionOperation::new("b".to_string(), group(), zstd, 5);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"b".to_vec().into(),
+            value: Some(bucket(group()).to_bytes().unwrap().into()),
+        }));
+        let (settings, record) = encrypted();
+        let effects = operation.step(rows(None, Some(settings.to_bytes().unwrap().into()), None));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReadKeyStatus { .. })]
+        ));
+        let effects = operation.step(status(&record, true));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == BUCKET_KEY_KEYSPACE
+        ));
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"b".to_vec().into(),
+            value: Some(record.to_bytes().unwrap().into()),
+        }));
+
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one batch write, got {effects:?}")
+        };
+        let spaces: Vec<&str> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
+        assert_eq!(
+            spaces,
+            [
+                S3_BUCKET_KEYSPACE,
+                BUCKET_ENCRYPTION_KEYSPACE,
+                TRANSITION_KEYSPACE,
+                TRANSITION_QUEUE_KEYSPACE
+            ]
+        );
+        let stored = BucketEncryption::from_bytes(&writes[1].2).unwrap();
+        assert_eq!(stored.storage_generation, 8);
+        let transition = EncryptionTransition::from_bytes(&writes[2].2).unwrap();
+        assert_eq!(transition.kind, TransitionKind::Reencode);
+        assert_eq!(transition.source, Some(record.key));
+        assert_eq!(transition.target.compression, zstd);
+        assert_eq!(transition.target.plan.unwrap().storage_generation, 8);
+        assert!(matches!(
+            commit(&mut operation).as_slice(),
+            [Effect::Task(TaskEffect::ShortenTimer { .. })]
+        ));
+        assert_eq!(operation.finalize(), Ok(None));
+    }
+
+    #[test]
+    fn running_transition_conflicts() {
+        let zstd = Compression::Zstd { level: 7 };
+        let mut operation = PutCompressionOperation::new("b".to_string(), group(), zstd, 5);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"b".to_vec().into(),
+            value: Some(bucket(group()).to_bytes().unwrap().into()),
+        }));
+        let target = TransitionTarget {
+            compression: Compression::Off,
+            plan: None,
+        };
+        let running = EncryptionTransition::new(TransitionKind::Decrypt, None, target, 3, 1);
+
+        let effects = operation.step(rows(None, None, Some(running.to_bytes().unwrap().into())));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert_eq!(
+            operation.finalize(),
+            Err(PutCompressionError::TransitionRunning)
+        );
     }
 
     fn commit(operation: &mut PutCompressionOperation) -> Effects {

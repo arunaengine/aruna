@@ -5,7 +5,7 @@
 use crate::blob::cleanup::schedule_cleanup_effect;
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
-    HeadAliasContext, add_index_effect, blob_location_read, write_head_effect,
+    HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,
     write_location_effect, write_version_effect,
 };
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
@@ -18,18 +18,20 @@ use crate::placement::policy::{
     split_drift_reads, union_refs, write_gate,
 };
 use crate::replication::queue::build_live_obligation;
+use crate::s3::multipart::create::storage_current;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup, delete_records_effect};
-use aruna_blob::hash::Hasher;
+use aruna_blob::hash::{Hasher, combine_crcs};
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, OBJECT_METADATA_KEYSPACE,
-    S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE, PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+    UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
@@ -38,15 +40,19 @@ use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-    CopyOrigin, CurrentVersionPointer, ResolvedBackend, VersionKey, WriteOwner,
+    ArchiveKey, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
+    BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend, VersionKey,
+    WriteOwner,
 };
+use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError};
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use aruna_core::structs::storage::multipart::{
-    MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
-    MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
+    MAX_PART_SIZE, MultipartChecksumType, MultipartObjectKey, MultipartObjectPart,
+    MultipartObjectSummary, MultipartPart, MultipartPartKey, MultipartUpload,
+    MultipartUploadStatus, WorkingShare,
 };
 use aruna_core::structs::storage::usage::UsageDelta;
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -54,6 +60,9 @@ use std::time::SystemTime;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
+
+/// Part rows read per page.
+const PART_PAGE: usize = 256;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum CompleteUploadState {
@@ -63,6 +72,7 @@ pub enum CompleteUploadState {
     ReadUploadMark,
     WriteUploadCompleting,
     CommitMarkTransaction,
+    ReserveCompose,
     ReadUploadParts,
     ReadGateBucket,
     PolicyGate,
@@ -70,6 +80,7 @@ pub enum CompleteUploadState {
     StartFinalizeTransaction,
     CheckPurgeFinalize,
     ReadBucketDefault,
+    CheckSealSettings,
     FenceBackend,
     CheckHashLookup,
     WriteBlobLocation,
@@ -78,6 +89,7 @@ pub enum CompleteUploadState {
     WriteBlobHead,
     WritePathIndex,
     WriteVersionRecord,
+    WriteCopyOwner,
     RegisterManagedCopy,
     WriteObjectMetadata,
     DeleteUploadRecords,
@@ -160,6 +172,8 @@ pub enum CompleteUploadError {
     CompleteUploadFailed,
     #[error("operation did not finish")]
     NotFinished,
+    #[error(transparent)]
+    BucketKey(#[from] BucketKeyError),
 }
 
 impl From<UploadTargetError> for CompleteUploadError {
@@ -254,6 +268,12 @@ pub struct CompleteUploadOperation {
     /// The reset that returns the record to `Open` has already been taken, so
     /// no later cleanup step may take it a second time.
     reset_done: bool,
+    /// Working set of a sealed composition, reserved before the piece records load. It stays
+    /// until the operation drops the selected piece records.
+    compose_share: Option<WorkingShare>,
+    /// Selected parts with their piece records, gathered while the part rows are paged.
+    selected_parts: HashMap<u16, MultipartPart>,
+    selected_bytes: u64,
 }
 
 impl CompleteUploadOperation {
@@ -290,6 +310,9 @@ impl CompleteUploadOperation {
             gated_bucket: None,
             compression: Compression::Off,
             reset_done: false,
+            compose_share: None,
+            selected_parts: HashMap::new(),
+            selected_bytes: 0,
         }
     }
 
@@ -493,7 +516,22 @@ impl CompleteUploadOperation {
 
     fn finish_commit(&mut self) -> Effects {
         self.state = CompleteUploadState::Finish;
-        smallvec![schedule_snapshot_publish(), schedule_cleanup_effect()]
+        let mut effects = smallvec![schedule_snapshot_publish(), schedule_cleanup_effect()];
+        // A pending archive is hashed at once when its key is unlocked, also in this session.
+        let pending = self
+            .final_location
+            .as_ref()
+            .filter(|location| location.get_blake3().is_none());
+        if let Some(key) = pending.and_then(|location| location.format.bucket_key()) {
+            effects.push(Effect::Task(TaskEffect::ShortenTimer {
+                key: TaskKey::PromotePending {
+                    bucket_id: key.bucket_id,
+                    generation: key.generation,
+                },
+                after: std::time::Duration::ZERO,
+            }));
+        }
+        effects
     }
 
     fn abort_finalize(&mut self, event: Event) -> Effects {
@@ -683,17 +721,15 @@ impl CompleteUploadOperation {
         match event {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                 self.txn_id = None;
-                self.state = CompleteUploadState::ReadUploadParts;
-                let prefix = match MultipartPartKey::prefix(self.input.upload_id) {
-                    Ok(prefix) => prefix,
-                    Err(err) => return self.schedule_error(err.into()),
-                };
-                smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: UPLOAD_PART_KEYSPACE.to_string(),
-                    prefix: Some(prefix.into()),
-                    start: None,
-                    limit: 10_000,
-                    txn_id: None,
+                let sealed = (self.upload_record.as_ref()).is_some_and(|u| u.encryption.is_some());
+                if !sealed {
+                    return self.read_parts(None);
+                }
+                // Piece records are large, so the composition's share comes before they load.
+                let parts = self.input.completed_parts.len() as u64;
+                self.state = CompleteUploadState::ReserveCompose;
+                smallvec![Effect::Blob(BlobEffect::ReserveCompose {
+                    content: parts.saturating_mul(MAX_PART_SIZE),
                 })]
             }
             Event::Storage(StorageEvent::Error { error }) if error.proves_no_commit() => {
@@ -707,22 +743,73 @@ impl CompleteUploadOperation {
         }
     }
 
+    fn compose_reserved(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Blob(BlobEvent::ComposeReserved { share }) => {
+                self.compose_share = Some(share);
+                self.read_parts(None)
+            }
+            Event::Blob(BlobEvent::Error(error)) => self.schedule_error(error.into()),
+            _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
+        }
+    }
+
+    /// Reads one page of part rows; only the selected parts keep their piece records.
+    fn read_parts(&mut self, after: Option<aruna_core::types::Key>) -> Effects {
+        self.state = CompleteUploadState::ReadUploadParts;
+        let prefix = match MultipartPartKey::prefix(self.input.upload_id) {
+            Ok(prefix) => prefix,
+            Err(err) => return self.schedule_error(err.into()),
+        };
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: UPLOAD_PART_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: after.map(IterStart::After),
+            limit: PART_PAGE,
+            txn_id: None,
+        })]
+    }
+
+    /// Keeps every part as cleanup metadata without its piece record, and the selected parts
+    /// in full.
+    fn collect_parts(
+        &mut self,
+        values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>,
+    ) -> Result<(), CompleteUploadError> {
+        let requested: std::collections::HashSet<u16> = (self.input.completed_parts.iter())
+            .map(|part| part.part_number)
+            .collect();
+        for (key, value) in values {
+            let part_key = MultipartPartKey::from_bytes(key.as_ref())?;
+            let mut part_record = MultipartPart::from_bytes(value.as_ref())?;
+            if requested.contains(&part_key.part_number) {
+                if self.compose_share.is_some() {
+                    let limit = aruna_blob::blob::pithos::MAX_SIZE;
+                    self.selected_bytes = self
+                        .selected_bytes
+                        .checked_add(part_record.location.blob_size)
+                        .filter(|size| *size <= limit)
+                        .ok_or(BlobError::SizeLimitExceeded { limit })?;
+                }
+                self.selected_parts
+                    .insert(part_key.part_number, part_record.clone());
+            }
+            part_record.piece = None;
+            self.upload_parts.push(part_record);
+        }
+        Ok(())
+    }
+
     fn extract_requested_parts(
-        &self,
+        &mut self,
         values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>,
     ) -> Result<(Vec<MultipartPart>, Vec<MultipartPart>), CompleteUploadError> {
         if self.input.completed_parts.is_empty() {
             return Err(CompleteUploadError::MissingParts);
         }
-
-        let mut all_parts = HashMap::new();
-        let mut upload_parts = Vec::new();
-        for (key, value) in values {
-            let part_key = MultipartPartKey::from_bytes(key.as_ref())?;
-            let part_record = MultipartPart::from_bytes(value.as_ref())?;
-            upload_parts.push(part_record.clone());
-            all_parts.insert(part_key.part_number, part_record);
-        }
+        self.collect_parts(values)?;
+        let mut all_parts = std::mem::take(&mut self.selected_parts);
+        let upload_parts = std::mem::take(&mut self.upload_parts);
 
         let mut previous = None;
         let mut resolved = Vec::with_capacity(self.input.completed_parts.len());
@@ -738,7 +825,7 @@ impl CompleteUploadOperation {
             }
             previous = Some(requested.part_number);
 
-            let Some(record) = all_parts.get(&requested.part_number).cloned() else {
+            let Some(record) = all_parts.remove(&requested.part_number) else {
                 return Err(CompleteUploadError::InvalidPart);
             };
             // Compose stays same-backend: a part elsewhere means a routing bug.
@@ -772,9 +859,19 @@ impl CompleteUploadOperation {
     }
 
     fn upload_parts_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
+        if let Some(next) = next_start_after.filter(|_| values.len() == PART_PAGE) {
+            if let Err(err) = self.collect_parts(values) {
+                return self.schedule_error(err);
+            }
+            return self.read_parts(Some(next));
+        }
 
         let (resolved, upload_parts) = match self.extract_requested_parts(values) {
             Ok(parts) => parts,
@@ -875,6 +972,29 @@ impl CompleteUploadOperation {
         let Some(upload) = self.upload_record.as_ref() else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
+        if let Some(encryption) = upload.encryption {
+            // Sealed pieces compose without a key; the adapter checks every record.
+            if self.resolved_parts.iter().any(|part| part.piece.is_none()) {
+                return self.schedule_error(CompleteUploadError::InvalidPart);
+            }
+            let resolved =
+                ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone())
+                    .with_compression(encryption.compression)
+                    .with_encryption(Some(encryption.plan));
+            // The operation keeps its clone while it holds the piece records.
+            let Some(share) = self.compose_share.clone() else {
+                return self.schedule_error(CompleteUploadError::InvalidOperationState);
+            };
+            self.state = CompleteUploadState::ComposeBlob;
+            return smallvec![Effect::Blob(BlobEffect::ComposePieces {
+                bucket: self.input.bucket.clone(),
+                key: self.input.key.clone(),
+                resolved,
+                created_by: self.input.created_by,
+                parts: self.resolved_parts.clone(),
+                share,
+            })];
+        }
         if let Some(backend_upload) = upload.backend_upload.clone() {
             self.state = CompleteUploadState::ComposeBlob;
             return smallvec![Effect::Blob(BlobEffect::CompleteUpload {
@@ -907,7 +1027,7 @@ impl CompleteUploadOperation {
     }
 
     fn handle_blob_composed(&mut self, event: Event) -> Effects {
-        let location = match event {
+        let mut location = match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
             Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
                 self.cleanup.set_release(location.ulid);
@@ -922,6 +1042,14 @@ impl CompleteUploadOperation {
         // a retry and discards it once the upload record is gone.
         if self.compression != Compression::Off && self.in_place_target(&location) {
             return self.compose_parts(vec![location]);
+        }
+        // A sealed object has no full-object digest; its CRCs combine from the parts.
+        if location.format.bucket_key().is_some() {
+            let parts = self.resolved_parts.iter();
+            let parts = parts.map(|part| (&part.location.hashes, part.location.blob_size));
+            location
+                .hashes
+                .extend(combine_crcs(parts).unwrap_or_default());
         }
         self.composed_location = Some(location.clone());
         self.final_location = None;
@@ -994,12 +1122,46 @@ impl CompleteUploadOperation {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         // A copy encoded under an older setting is never published: the bucket's
-        // migration may already have passed this key.
-        if bucket.as_ref().is_some_and(|bucket| {
-            EncodingClass::from(bucket.compression) != location.format.encoding()
-        }) {
+        // migration may already have passed this key. A sealed copy checks its plan instead.
+        if location.format.bucket_key().is_none()
+            && bucket.as_ref().is_some_and(|bucket| {
+                EncodingClass::from(bucket.compression) != location.format.encoding()
+            })
+        {
             return self.schedule_error(StorageError::TransactionConflict.into());
         }
+        self.state = CompleteUploadState::CheckSealSettings;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            key: self.input.bucket.as_bytes().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// A rotation or mode change since the upload started never publishes its old plan, and a
+    /// plain upload never publishes into a bucket that encrypts now.
+    fn seal_settings_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        let plan = self
+            .upload_record
+            .as_ref()
+            .and_then(|upload| upload.encryption)
+            .map(|encryption| encryption.plan);
+        let Some(location) = self.composed_location.clone() else {
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
+        };
+        let current = BucketEncryption::from_row(value.as_deref())
+            .map_err(CompleteUploadError::from)
+            .and_then(|settings| Ok(storage_current(plan.as_ref(), &settings)?));
+        match current {
+            Ok(()) => self.fence_composed(&location),
+            Err(error) => self.schedule_error(error),
+        }
+    }
+
+    fn fence_composed(&mut self, location: &BackendLocation) -> Effects {
         // The compose already ran on the pinned backend, so the finalize must
         // prove it is still enabled or roll the composed object back.
         match fence_backend(&location.backend, self.txn_id) {
@@ -1023,7 +1185,7 @@ impl CompleteUploadOperation {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let Some(blake3_hash) = location.get_blake3() else {
-            return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
+            return self.write_pending_location(location);
         };
         // Only the copy on the upload's pinned backend may be deduplicated.
         let key = match BlobLocationKey::from_blake3(
@@ -1036,6 +1198,28 @@ impl CompleteUploadOperation {
         };
         self.state = CompleteUploadState::CheckHashLookup;
         smallvec![blob_location_read(&key, self.txn_id)]
+    }
+
+    /// A sealed archive whose trees did not line up publishes without a content hash: its
+    /// location waits in `pending_locations` until a verified read records the hash.
+    fn write_pending_location(&mut self, location: BackendLocation) -> Effects {
+        if location.format.bucket_key().is_none() {
+            return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
+        }
+        let value = match location.to_bytes() {
+            Ok(value) => value,
+            Err(err) => return self.schedule_error(err.into()),
+        };
+        let key = ArchiveKey::of(&location).to_bytes();
+        self.new_blob = true;
+        self.final_location = Some(location);
+        self.state = CompleteUploadState::WriteBlobLocation;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: PENDING_LOCATION_KEYSPACE.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: self.txn_id,
+        })]
     }
 
     fn hash_checked(&mut self, event: Event) -> Effects {
@@ -1181,8 +1365,9 @@ impl CompleteUploadOperation {
         let Some(location) = self.final_location.clone() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
+        // A pending archive has no content hash to index yet.
         let Some(blake3_hash) = location.get_blake3() else {
-            return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
+            return self.write_version();
         };
         let alias_context = match self.alias_context() {
             Ok(context) => context,
@@ -1216,15 +1401,15 @@ impl CompleteUploadOperation {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
+        self.write_version()
+    }
 
+    fn write_version(&mut self) -> Effects {
         let Some(location) = self.final_location.clone() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let Some(version_id) = self.version_id else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
-        };
-        let Some(blake3_hash) = location.get_blake3() else {
-            return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
         };
         let created_at = self
             .version_created_at
@@ -1233,19 +1418,25 @@ impl CompleteUploadOperation {
         let Some(upload_record) = self.upload_record.as_ref() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
-        let version = BlobVersion::materialized(
-            match blake3_hash.try_into() {
-                Ok(hash) => hash,
-                Err(err) => {
-                    return self.schedule_error(CompleteUploadError::ConversionError(err.into()));
-                }
-            },
-            location.backend.clone(),
-            location.format.encoding(),
-            created_at,
-            self.input.created_by,
-            None,
-        )
+        let version = match location.get_blake3().map(<[u8; 32]>::try_from) {
+            Some(Ok(hash)) => BlobVersion::materialized(
+                hash,
+                location.backend.clone(),
+                location.format.encoding(),
+                created_at,
+                self.input.created_by,
+                None,
+            ),
+            Some(Err(err)) => {
+                return self.schedule_error(CompleteUploadError::ConversionError(err.into()));
+            }
+            None => BlobVersion::pending(
+                ArchiveKey::of(&location),
+                created_at,
+                self.input.created_by,
+                None,
+            ),
+        }
         .with_metadata(upload_record.metadata.clone());
         // Union with what part copies inherited: a part-wise copy of a governed
         // source can only add refs to the composed object.
@@ -1270,7 +1461,29 @@ impl CompleteUploadOperation {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
+        let (Some(version_id), Some(location)) = (self.version_id, self.final_location.as_ref())
+        else {
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
+        };
+        if location.format.bucket_key().is_none() {
+            return self.register_managed_copy();
+        }
+        // The archive's owner row commits with the version and its first physical credit.
+        let version = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
+        let owner = CopyOwner::new(ArchiveKey::of(location), version);
+        match owner_write_effect(&owner, self.txn_id) {
+            Ok(effect) => {
+                self.state = CompleteUploadState::WriteCopyOwner;
+                smallvec![effect]
+            }
+            Err(err) => self.schedule_error(err.into()),
+        }
+    }
 
+    fn owner_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
         self.register_managed_copy()
     }
 
@@ -1804,6 +2017,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::ReadUploadMark => self.mark_upload_read(event),
             CompleteUploadState::WriteUploadCompleting => self.handle_upload_marked(event),
             CompleteUploadState::CommitMarkTransaction => self.handle_mark_committed(event),
+            CompleteUploadState::ReserveCompose => self.compose_reserved(event),
             CompleteUploadState::ReadUploadParts => self.upload_parts_read(event),
             CompleteUploadState::ReadGateBucket => self.handle_gate_bucket(event),
             CompleteUploadState::PolicyGate => self.handle_policy_gate(event),
@@ -1811,6 +2025,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::StartFinalizeTransaction => self.finalize_started(event),
             CompleteUploadState::CheckPurgeFinalize => self.finalize_fence_checked(event),
             CompleteUploadState::ReadBucketDefault => self.handle_default_read(event),
+            CompleteUploadState::CheckSealSettings => self.seal_settings_read(event),
             CompleteUploadState::FenceBackend => self.handle_backend_fenced(event),
             CompleteUploadState::CheckHashLookup => self.hash_checked(event),
             CompleteUploadState::WriteBlobLocation => self.location_written(event),
@@ -1819,6 +2034,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::WriteBlobHead => self.head_written(event),
             CompleteUploadState::WritePathIndex => self.path_index_written(event),
             CompleteUploadState::WriteVersionRecord => self.version_written(event),
+            CompleteUploadState::WriteCopyOwner => self.owner_written(event),
             CompleteUploadState::RegisterManagedCopy => self.handle_copy_registered(event),
             CompleteUploadState::WriteObjectMetadata => self.metadata_written(event),
             CompleteUploadState::DeleteUploadRecords => self.records_deleted(event),
@@ -2086,6 +2302,7 @@ mod decision_tests {
             subject_generation: 0,
             completing_since_ms: None,
             backend_upload: None,
+            encryption: None,
         }
     }
 

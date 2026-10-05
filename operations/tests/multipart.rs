@@ -2019,6 +2019,7 @@ async fn stored_blob(context: &TestContext, key: &str) -> BackendLocation {
             resolved: aruna_core::structs::storage::blob::ResolvedBackend::node_default(),
             created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
             blob: stream_from_bytes(b"target"),
+            size: None,
         })
         .await
     else {

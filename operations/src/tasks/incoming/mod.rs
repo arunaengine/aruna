@@ -105,6 +105,7 @@ use crate::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
 };
 use crate::replication::queue::{REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer};
+use crate::s3::bucket::key::lock::LockBucketOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::sync::document_outbox::{
     OUTBOX_DRAIN_SIZE, read_outbox_records, read_outbox_tails, restore_outbox_timers,
@@ -119,6 +120,7 @@ use crate::tasks::queue_backoff::{retry_after_ms, retry_delay_ms};
 use crate::tasks::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_task_timers,
 };
+use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
 
 mod outbox;
 mod restore;
@@ -194,6 +196,7 @@ pub(crate) struct OperationsTaskHandler {
     // Queued bucket the next migration run resumes after. Loss on restart is fine: the
     // next run starts at the head of the queue.
     migration_cursor: std::sync::Mutex<Option<Key>>,
+    wake_cursor: std::sync::Mutex<Option<Key>>,
     // Rotation state of the bounded outbox drain. Loss on restart is fine: the
     // next rotation opens at the head.
     rotation: std::sync::Mutex<OutboxRotation>,
@@ -330,6 +333,7 @@ impl OperationsTaskHandler {
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
             reclaim_cursor: std::sync::Mutex::new(None),
             migration_cursor: std::sync::Mutex::new(None),
+            wake_cursor: std::sync::Mutex::new(None),
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
             drain_guard: tokio::sync::Mutex::new(()),
             outbox_limits: OutboxLimits::default(),
@@ -628,6 +632,21 @@ impl OperationsTaskHandler {
         }
     }
 
+    /// Re-arms a timer in memory even when storage cannot persist it, so an outage does not end
+    /// the retries; the persisted copy is best effort.
+    async fn keep_retrying(&self, key: TaskKey, after: std::time::Duration) {
+        let effect = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after,
+        };
+        if let Err(message) = persist_task_effect(&self.context.storage_handle, &effect).await {
+            warn!(task_id = ?key, message = %message, "Retry timer kept in memory only");
+        }
+        if let Some(task_handle) = self.context.task_handle.as_ref() {
+            task_handle.send_effect(Effect::Task(effect)).await;
+        }
+    }
+
     // Kicks the placement reconciler immediately (not persisted; it is re-derived
     // from the realm config at startup by `restore_shard_subscriptions`).
     async fn schedule_sync_placements(&self, realm_id: RealmId, node_id: aruna_core::NodeId) {
@@ -816,6 +835,68 @@ impl OperationsTaskHandler {
             TaskKey::RefreshBlobHolders => Box::pin(async move {
                 self.refresh_blob_holders().await;
             }),
+            TaskKey::LockBucket {
+                bucket_id,
+                generation,
+                session_id,
+            } => Box::pin(async move {
+                let key = BucketKeyRef::new(bucket_id, generation);
+                let ticket = KeyTicket { key, session_id };
+                let Some(net_handle) = self.context.net_handle.as_ref() else {
+                    warn!("Cannot record a timed bucket lock without net handle");
+                    return;
+                };
+                let operation = LockBucketOperation::timed(ticket, net_handle.node_id());
+                if let Err(error) = drive(operation, &self.context).await {
+                    warn!(error = %error, "Timed bucket lock failed");
+                }
+            }),
+            TaskKey::PromotePending {
+                bucket_id,
+                generation,
+            } => Box::pin(async move {
+                let Some(net_handle) = self.context.net_handle.as_ref() else {
+                    warn!("Cannot promote pending archives without net handle");
+                    return;
+                };
+                let key = BucketKeyRef::new(bucket_id, generation);
+                let origin = (*net_handle.realm_id(), net_handle.node_id());
+                let promoted = crate::blob::promote::promote_unlocked(
+                    &self.context,
+                    key,
+                    origin,
+                    &self.rocrate_limits,
+                );
+                // A locked key leaves the archives pending; its next unlock promotes them.
+                if let Err(error) = promoted.await {
+                    warn!(bucket_id = %bucket_id, error = %error, "Pending promotion failed");
+                }
+            }),
+            key @ TaskKey::RecordAudit { .. } => Box::pin(async move {
+                use crate::s3::bucket::audit_retry::{AUDIT_RETRY, store_record};
+                // The key change already applies; only its record waits for storage.
+                if let Err(error) = store_record(&self.context, &key).await {
+                    warn!(error = %error, "Bucket key audit record still not stored");
+                    self.keep_retrying(key, AUDIT_RETRY).await;
+                }
+            }),
+            TaskKey::DeliverKeyWakes => Box::pin(async move {
+                let start = (self.wake_cursor.lock())
+                    .expect("wake cursor mutex poisoned")
+                    .clone();
+                let delivery =
+                    crate::jobs::remote_key::deliver_owed_wakes(&self.context, start).await;
+                *(self.wake_cursor.lock()).expect("wake cursor mutex poisoned") =
+                    delivery.next.clone();
+                if delivery.owed {
+                    // A further page follows at once; a finished round waits before retrying.
+                    let after = match delivery.next {
+                        Some(_) => Duration::ZERO,
+                        None => crate::jobs::remote_key::WAKE_RETRY,
+                    };
+                    self.reschedule_timer(TaskKey::DeliverKeyWakes, after).await;
+                }
+            }),
             TaskKey::DrainFamilyOutbox => Box::pin(async move {
                 self.drain_family_outbox().await;
             }),
@@ -886,7 +967,10 @@ pub struct OutboxDrainer {
 #[async_trait]
 impl InboundTaskHandler for OperationsTaskHandler {
     async fn handle_timer(&self, key: TaskKey) {
-        delete_persisted_timer(&self.context.storage_handle, &key).await;
+        // An audit record retry keeps its row until the record is stored, in one transaction.
+        if !matches!(key, TaskKey::RecordAudit { .. }) {
+            delete_persisted_timer(&self.context.storage_handle, &key).await;
+        }
         self.timer_work(key).await;
     }
 }

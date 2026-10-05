@@ -436,6 +436,8 @@ impl PolicyCoverageOperation {
                 }
                 BlobVersionState::Reference { .. } => CopyState::ReferenceOnly,
                 BlobVersionState::Materialized { .. } => copies.next().unwrap_or(CopyState::Absent),
+                // No managed copy is read for an archive whose content hash is still pending.
+                BlobVersionState::PendingContent { .. } => CopyState::Absent,
             };
             match copy {
                 CopyState::Registered => self.copies.registered += 1,

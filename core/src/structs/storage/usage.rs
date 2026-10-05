@@ -8,6 +8,7 @@ use crate::structs::storage::blob::BackendRef;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use ulid::Ulid;
 
 pub const USAGE_GLOBAL_KEY: &[u8] = b"global";
 pub const GLOBAL_SHARD_COUNT: usize = 64;
@@ -125,6 +126,12 @@ pub fn global_shard_keys() -> Vec<Vec<u8>> {
 /// structurally impossible.
 pub fn shard_for_hash(blake3: &[u8; 32]) -> usize {
     blake3.iter().fold(0u8, |shard, byte| shard ^ byte) as usize % GLOBAL_SHARD_COUNT
+}
+
+/// Shard of the `stored_*` counters of a Pithos archive. Keyed by its archive id, so the charge
+/// never moves when a pending content hash becomes known.
+pub fn shard_for_archive(archive_id: Ulid) -> usize {
+    shard_for_hash(blake3::hash(&archive_id.to_bytes()).as_bytes())
 }
 
 pub fn usage_hash_key(blake3: &[u8; 32]) -> Vec<u8> {

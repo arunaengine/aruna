@@ -10,13 +10,14 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
-    UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, COPY_OWNER_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
+    ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, CopyOwner,
+    WriteOwner,
 };
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::multipart::{
@@ -383,7 +384,8 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
                         } => register_dht(context, blake3, realm_id, ttl_ms).await,
                         WriteOwner::UploadPart { .. }
                         | WriteOwner::Upload { .. }
-                        | WriteOwner::CompletedUpload { .. } => true,
+                        | WriteOwner::CompletedUpload { .. }
+                        | WriteOwner::Pending => true,
                     }
                 }
                 Some(false) => delete_blob(context, location).await,
@@ -533,6 +535,10 @@ async fn owns_write(
         WriteOwner::Upload { upload_id } | WriteOwner::CompletedUpload { upload_id, .. } => {
             (UPLOAD_KEYSPACE, upload_id.to_bytes().to_vec().into())
         }
+        WriteOwner::Pending => (
+            PENDING_LOCATION_KEYSPACE,
+            ArchiveKey::of(location).to_bytes().into(),
+        ),
     };
     let event = context
         .storage_handle
@@ -547,10 +553,16 @@ async fn owns_write(
         return None;
     };
     let Some(value) = value else {
+        // A promoted archive has no pending row; its versions still own it.
+        if matches!(owner, WriteOwner::Pending) {
+            return archive_owned(context, location).await;
+        }
         return Some(false);
     };
     let owned = match owner {
-        WriteOwner::Blob { .. } => BackendLocation::from_bytes(&value).ok()?,
+        WriteOwner::Blob { .. } | WriteOwner::Pending => {
+            BackendLocation::from_bytes(&value).ok()?
+        }
         WriteOwner::UploadPart { .. } => MultipartPart::from_bytes(&value).ok()?.location,
         WriteOwner::Upload { .. } | WriteOwner::CompletedUpload { .. } => {
             let record = MultipartUpload::from_bytes(&value).ok()?;
@@ -565,6 +577,24 @@ async fn owns_write(
         }
     };
     Some(owned.same_object(location))
+}
+
+/// Whether any committed version owns the Pithos archive of `location`.
+async fn archive_owned(context: &DriverContext, location: &BackendLocation) -> Option<bool> {
+    let scan = StorageEffect::Iter {
+        key_space: COPY_OWNER_KEYSPACE.to_string(),
+        prefix: Some(CopyOwner::prefix(&ArchiveKey::of(location)).into()),
+        start: None,
+        limit: 1,
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(scan).await {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Some(!values.is_empty()),
+        event => {
+            warn!(?event, "Archive owners could not be read");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -834,6 +864,7 @@ mod tests {
                     upload_id: "provider".to_string(),
                     record_id: upload_id,
                 }),
+                encryption: None,
             };
             let event = storage
                 .send_storage_effect(StorageEffect::Write {
@@ -881,6 +912,66 @@ mod tests {
         assert_eq!(outcome.processed, 0);
         assert_eq!(outcome.failed, 1);
         assert_eq!(remaining_rows(&storage).await, 1);
+    }
+
+    #[tokio::test]
+    async fn pending_write_owned() {
+        // The pending location row is the commit of an archive without a hash.
+        use aruna_core::keyspaces::COPY_OWNER_KEYSPACE;
+        use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
+        use aruna_core::structs::storage::blob::ArchiveKey;
+        use aruna_core::structs::storage::blob::{CopyOwner, VersionKey};
+        use ulid::Ulid;
+        for (owned, promoted) in [(true, false), (false, false), (true, true)] {
+            let (_dir, storage, context) = setup_context();
+            let BlobCleanupWork::DeleteBlob { location } =
+                BlobCleanupWork::from_bytes(&delete_work()).unwrap()
+            else {
+                panic!("expected a delete row")
+            };
+            // A promoted archive lost its pending row, but a version still owns it.
+            if promoted {
+                let version = VersionKey::new("bucket", "key", Ulid::from_bytes([6; 16]));
+                let owner = CopyOwner::new(ArchiveKey::of(&location), version);
+                let event = storage
+                    .send_storage_effect(StorageEffect::Write {
+                        key_space: COPY_OWNER_KEYSPACE.to_string(),
+                        key: owner.key().unwrap().into(),
+                        value: Vec::new().into(),
+                        txn_id: None,
+                    })
+                    .await;
+                assert!(matches!(
+                    event,
+                    Event::Storage(StorageEvent::WriteResult { .. })
+                ));
+            } else if owned {
+                let event = storage
+                    .send_storage_effect(StorageEffect::Write {
+                        key_space: PENDING_LOCATION_KEYSPACE.to_string(),
+                        key: ArchiveKey::of(&location).to_bytes().into(),
+                        value: location.to_bytes().unwrap().into(),
+                        txn_id: None,
+                    })
+                    .await;
+                assert!(matches!(
+                    event,
+                    Event::Storage(StorageEvent::WriteResult { .. })
+                ));
+            }
+            let row = BlobCleanupWork::ReconcileWrite {
+                location,
+                owner: WriteOwner::Pending,
+            };
+            write_rows(&storage, vec![row.to_bytes().unwrap()]).await;
+
+            let outcome = process_cleanup_batch(&context).await.unwrap();
+
+            // An unowned archive must be deleted, which needs the blob handle this context lacks.
+            assert_eq!(outcome.processed, usize::from(owned));
+            assert_eq!(outcome.failed, usize::from(!owned));
+            assert_eq!(remaining_rows(&storage).await, usize::from(!owned));
+        }
     }
 
     #[tokio::test]

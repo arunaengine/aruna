@@ -431,6 +431,10 @@ async fn build_hits(
                     .last_modified
                     .or(Some(candidate.version.created_at)),
             ),
+            // No content identity is claimed before the hash is verified.
+            BlobVersionState::PendingContent { .. } => {
+                (None, None, None, Some(candidate.version.created_at))
+            }
             BlobVersionState::Deleted => continue,
         };
         candidates.push(SearchNodeHit {

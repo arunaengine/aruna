@@ -29,8 +29,8 @@ use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, Storage
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, OBJECT_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE,
-    SYNC_REFERENCE_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_REFERENCE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
@@ -44,6 +44,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
     CurrentVersionPointer, ManagedCopyKey, VersionKey, object_permission_path,
 };
+use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::multipart::{
     MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
@@ -624,6 +625,8 @@ pub enum ReplicateObjectError {
     InvalidReferenceAdvance,
     #[error("Missing blob hash")]
     MissingBlobHash,
+    #[error("encrypted versions are not replicated")]
+    EncryptedVersion,
     #[error("Multipart metadata incomplete: expected {expected} parts, found {actual}")]
     PartCountMismatch { expected: usize, actual: usize },
     #[error("operation did not finish")]
@@ -1059,6 +1062,8 @@ enum ReplicateObjectState {
     ReadBlobLocation,
     CheckManagedCopy,
     ResolveReferenceAccess,
+    /// Reads the source bucket's encryption before reference content is read or materialized.
+    CheckReferenceEncryption,
     HeadReferenceSource,
     ReadReferenceState,
     LoadRouting,
@@ -1073,6 +1078,8 @@ enum ReplicateObjectState {
     OpenConnection,
     SendManifest,
     AwaitNegotiation,
+    /// Rereads the source bucket's encryption before any content leaves this node.
+    CheckSourceEncryption,
     TransferBlob,
     AwaitApplyComplete,
     WriteReferenceState,
@@ -1093,6 +1100,8 @@ pub struct ReplicateObjectOperation {
     stream_id: Option<Ulid>,
     manifest: Option<VersionReplicationManifest>,
     blob_replication_id: Option<Ulid>,
+    /// Resolved reference access, held until the source bucket's encryption is checked.
+    pending_access: Option<ResolvedSourceAccess>,
     cleanup_reference_blob: Option<BackendLocation>,
     preserve_reference: bool,
     reference_access: Option<ResolvedSourceAccess>,
@@ -1139,6 +1148,7 @@ impl ReplicateObjectOperation {
             stream_id: None,
             manifest: None,
             blob_replication_id: None,
+            pending_access: None,
             cleanup_reference_blob: None,
             preserve_reference: false,
             reference_access: None,
@@ -1191,6 +1201,7 @@ impl ReplicateObjectOperation {
             ReplicateObjectState::ReadBlobLocation => "ReadBlobLocation",
             ReplicateObjectState::CheckManagedCopy => "CheckManagedCopy",
             ReplicateObjectState::ResolveReferenceAccess => "ResolveReferenceAccess",
+            ReplicateObjectState::CheckReferenceEncryption => "CheckReferenceEncryption",
             ReplicateObjectState::HeadReferenceSource => "HeadReferenceSource",
             ReplicateObjectState::ReadReferenceState => "ReadReferenceState",
             ReplicateObjectState::LoadRouting => "LoadRouting",
@@ -1205,6 +1216,7 @@ impl ReplicateObjectOperation {
             ReplicateObjectState::OpenConnection => "OpenConnection",
             ReplicateObjectState::SendManifest => "SendManifest",
             ReplicateObjectState::AwaitNegotiation => "AwaitNegotiation",
+            ReplicateObjectState::CheckSourceEncryption => "CheckSourceEncryption",
             ReplicateObjectState::TransferBlob => "TransferBlob",
             ReplicateObjectState::AwaitApplyComplete => "AwaitApplyComplete",
             ReplicateObjectState::WriteReferenceState => "WriteReferenceState",
@@ -1379,6 +1391,32 @@ impl ReplicateObjectOperation {
         smallvec![resolve_binding_effect(ResolveBindingInput { source },)]
     }
 
+    fn accept_reference_encryption(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.fail(ReplicateObjectError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let settings = match BucketEncryption::from_row(value.as_deref()) {
+            Ok(settings) => settings,
+            Err(err) => return self.fail(err.into()),
+        };
+        if settings.is_encrypted() {
+            return self.fail(ReplicateObjectError::EncryptedVersion);
+        }
+        let Some(access) = self.pending_access.take() else {
+            return self.fail(ReplicateObjectError::VersionNotFound);
+        };
+        if self.sync.is_none() {
+            return self.load_routing(access);
+        }
+        self.reference_access = Some(access.clone());
+        self.state = ReplicateObjectState::HeadReferenceSource;
+        smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })]
+    }
+
     fn accept_reference_access(&mut self, event: Event) -> Effects {
         match event {
             Event::SubOperation(SubOperationEvent::VersionAccessResolved {
@@ -1402,12 +1440,14 @@ impl ReplicateObjectOperation {
                     source_version = ?source_version,
                     "Resolved on-demand reference access"
                 );
-                if self.sync.is_none() {
-                    return self.load_routing(access);
-                }
-                self.reference_access = Some(access.clone());
-                self.state = ReplicateObjectState::HeadReferenceSource;
-                smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })]
+                // Reference content of an encrypting bucket is never read or materialized here.
+                self.pending_access = Some(access);
+                self.state = ReplicateObjectState::CheckReferenceEncryption;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                    key: self.request.bucket.as_bytes().into(),
+                    txn_id: None,
+                })]
             }
             Event::SubOperation(SubOperationEvent::VersionAccessResolved { result: Err(_) }) => {
                 debug!(
@@ -1687,6 +1727,7 @@ impl ReplicateObjectOperation {
                     resolved,
                     created_by,
                     blob: stream,
+                    size: None,
                 })]
             }
             Event::StagingSource(StagingSourceEvent::Error { error }) => {
@@ -2094,6 +2135,9 @@ impl Operation for ReplicateObjectOperation {
             ReplicateObjectState::ReadBlobLocation => self.accept_blob_location(event),
             ReplicateObjectState::CheckManagedCopy => self.accept_managed_copy(event),
             ReplicateObjectState::ResolveReferenceAccess => self.accept_reference_access(event),
+            ReplicateObjectState::CheckReferenceEncryption => {
+                self.accept_reference_encryption(event)
+            }
             ReplicateObjectState::HeadReferenceSource => self.accept_reference_head(event),
             ReplicateObjectState::ReadReferenceState => self.accept_reference_state(event),
             ReplicateObjectState::LoadRouting => self.accept_routing_loaded(event),
@@ -2110,6 +2154,7 @@ impl Operation for ReplicateObjectOperation {
             ReplicateObjectState::SendManifest => self.accept_manifest_sent(event),
             ReplicateObjectState::AwaitNegotiation => self.accept_negotiation_response(event),
             // Transfer: push the blob the target requested.
+            ReplicateObjectState::CheckSourceEncryption => self.accept_source_encryption(event),
             ReplicateObjectState::TransferBlob => self.accept_blob_transfer(event),
             // Apply acknowledgement: the target reports the replica applied.
             ReplicateObjectState::AwaitApplyComplete => self.accept_apply_response(event),
@@ -2235,6 +2280,9 @@ impl ReplicateObjectOperation {
                     metadata,
                     advance_count,
                 })
+            }
+            BlobVersionState::PendingContent { .. } => {
+                self.fail(ReplicateObjectError::EncryptedVersion)
             }
         }
     }
@@ -2517,7 +2565,11 @@ impl ReplicateObjectOperation {
                 else {
                     return self.fail(ReplicateObjectError::MissingBlobHash);
                 };
-                self.state = ReplicateObjectState::TransferBlob;
+                // A copy of an encrypting bucket, sealed or not converted yet, never leaves.
+                if blob.location.format.bucket_key().is_some() {
+                    return self.fail(ReplicateObjectError::EncryptedVersion);
+                }
+                self.state = ReplicateObjectState::CheckSourceEncryption;
                 let replication_id = Ulid::generate();
                 self.blob_replication_id = Some(replication_id);
                 debug!(
@@ -2530,11 +2582,10 @@ impl ReplicateObjectOperation {
                     blob_size = blob.size,
                     "Target requested blob transfer"
                 );
-                smallvec![Effect::Blob(BlobEffect::Replicate {
-                    replication_id,
-                    stream_id: self.stream_id.expect("stream id available"),
-                    location: blob.location.clone(),
-                    keep_alive: true,
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                    key: self.request.bucket.as_bytes().into(),
+                    txn_id: None,
                 })]
             }
             ReplicationNegotiationResult::Rejected(reason) => {
@@ -2555,6 +2606,40 @@ impl ReplicateObjectOperation {
 // Phase: transfer
 // Pushing the blob the target accepted the version for.
 impl ReplicateObjectOperation {
+    fn accept_source_encryption(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.fail(ReplicateObjectError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let settings = match BucketEncryption::from_row(value.as_deref()) {
+            Ok(settings) => settings,
+            Err(err) => return self.fail(err.into()),
+        };
+        if settings.is_encrypted() {
+            return self.fail(ReplicateObjectError::EncryptedVersion);
+        }
+        let (Some(replication_id), Some(stream_id), Some(location)) = (
+            self.blob_replication_id,
+            self.stream_id,
+            self.manifest
+                .as_ref()
+                .and_then(|manifest| manifest.blob.as_ref())
+                .map(|blob| blob.location.clone()),
+        ) else {
+            return self.fail(ReplicateObjectError::MissingBlobHash);
+        };
+        self.state = ReplicateObjectState::TransferBlob;
+        smallvec![Effect::Blob(BlobEffect::Replicate {
+            replication_id,
+            stream_id,
+            location,
+            keep_alive: true,
+        })]
+    }
+
     fn accept_blob_transfer(&mut self, event: Event) -> Effects {
         let Event::Blob(BlobEvent::ReplicationFinished { .. }) = event else {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
@@ -2669,6 +2754,13 @@ impl ReplicateObjectOperation {
 
 #[cfg(test)]
 mod tests {
+    /// Answers an encryption settings read for a bucket without settings.
+    fn plain_settings() -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: vec![3u8].into(),
+            value: None,
+        })
+    }
     use super::{
         MAX_SCOPE_VERSIONS, ReplicateObjectError, ReplicateObjectOperation, ReplicateObjectState,
         ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeState,
@@ -3978,6 +4070,7 @@ mod tests {
         op.step(Event::SubOperation(
             SubOperationEvent::VersionAccessResolved { result: Ok(access) },
         ));
+        op.step(plain_settings());
         let mut stale = reference_cached_metadata();
         stale.etag = Some("etag-2".to_string());
         let effects = op.step(Event::StagingSource(StagingSourceEvent::HeadResult {
@@ -4012,6 +4105,7 @@ mod tests {
         op.step(Event::SubOperation(
             SubOperationEvent::VersionAccessResolved { result: Ok(access) },
         ));
+        op.step(plain_settings());
         let metadata = reference_cached_metadata();
         op.step(Event::StagingSource(StagingSourceEvent::HeadResult {
             metadata: metadata.clone(),
@@ -4073,6 +4167,7 @@ mod tests {
                 }),
             },
         ));
+        op.step(plain_settings());
         op.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
             result: Ok(GroupRoutingInputs::default()),
         }));
@@ -4107,11 +4202,12 @@ mod tests {
             path: "ref/file.txt".to_string(),
             version: None,
         };
-        let effects = op.step(Event::SubOperation(
+        op.step(Event::SubOperation(
             SubOperationEvent::VersionAccessResolved {
                 result: Ok(access.clone()),
             },
         ));
+        let effects = op.step(plain_settings());
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
         let effects = load_routing(&mut op);
         assert!(matches!(
@@ -4180,6 +4276,7 @@ mod tests {
                 }),
             },
         ));
+        op.step(plain_settings());
         load_routing(&mut op);
         op.step(Event::StagingSource(StagingSourceEvent::ReadResult {
             metadata: reference_cached_metadata(),
@@ -4205,6 +4302,51 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_source_refused() {
+        let version_id = Ulid::generate();
+        let mut op =
+            ReplicateObjectOperation::new(request_with_mode(version_id, ReplicationMode::OnDemand));
+
+        op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(reference_blob_version().to_bytes().unwrap().into()),
+        }));
+
+        let access = ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::Http,
+            config: HashMap::from([("endpoint".to_string(), "https://example.org".to_string())]),
+            path: "ref/file.txt".to_string(),
+            version: None,
+        };
+        op.step(Event::SubOperation(
+            SubOperationEvent::VersionAccessResolved { result: Ok(access) },
+        ));
+        // The source bucket encrypts: nothing of the reference is read or written here.
+        let settings = aruna_core::structs::storage::encryption::BucketEncryption {
+            mode: aruna_core::structs::storage::encryption::EncryptionMode::VaultLocked,
+            bucket_id: Some(Ulid::from_parts(77, 77)),
+            key_generation: 1,
+            ..Default::default()
+        };
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![3u8].into(),
+            value: Some(settings.to_bytes().unwrap().into()),
+        }));
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Blob(BlobEffect::Write { .. })
+                    | Effect::StagingSource(_)
+                    | Effect::SubOperation(_)
+            )),
+            "{effects:?}"
+        );
+        assert!(op.is_complete());
+        assert_eq!(op.finalize(), Err(ReplicateObjectError::EncryptedVersion));
+    }
+
+    #[test]
     fn reference_cleans_blob() {
         let version_id = Ulid::generate();
         let mut op =
@@ -4225,6 +4367,7 @@ mod tests {
         op.step(Event::SubOperation(
             SubOperationEvent::VersionAccessResolved { result: Ok(access) },
         ));
+        op.step(plain_settings());
         load_routing(&mut op);
         op.step(Event::StagingSource(StagingSourceEvent::ReadResult {
             metadata: reference_cached_metadata(),
@@ -4255,8 +4398,17 @@ mod tests {
         .unwrap();
         op.step(Event::Blob(BlobEvent::MessageReceived {
             stream_id: op.stream_id.expect("stream id available"),
-            payload: negotiation,
+            payload: negotiation.clone(),
         }));
+        // The source bucket has no encryption settings, so the transfer goes ahead.
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![3u8].into(),
+            value: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Replicate { .. })]
+        ));
         op.step(Event::Blob(BlobEvent::ReplicationFinished {
             location: temp_location.clone(),
         }));

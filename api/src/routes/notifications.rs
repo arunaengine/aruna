@@ -372,6 +372,20 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
             response.error = Some(error.clone());
             response.actor_user_id = Some(actor_user_id.to_string());
         }
+        NotificationKind::BucketRestartLocked {
+            bucket,
+            node_id,
+            group_id,
+        }
+        | NotificationKind::BucketRecoveryDegraded {
+            bucket,
+            node_id,
+            group_id,
+        } => {
+            response.bucket = Some(bucket.clone());
+            response.node_id = Some(node_id.to_string());
+            response.group_id = Some(group_id.to_string());
+        }
     }
     response
 }

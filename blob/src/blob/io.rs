@@ -7,6 +7,7 @@ use super::backend::{
     build_backend_path, build_hidden_path, build_part_path, intent_key, intent_value,
 };
 use super::group::GROUP_WRITE_CHUNK;
+use super::pithos::{ArchiveEncoder, Share, working_set};
 use crate::codec::FrameEncoder;
 use crate::hash::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
@@ -16,13 +17,17 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle as _;
-use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
+use aruna_core::keyspaces::{
+    BLOB_LOCATIONS_KEYSPACE, COPY_OWNER_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+};
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
+use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::storage::blob::{
-    Backend, BackendLocation, BackendRef, BlobLocationKey, HIDDEN_BLOB_PREFIX, HiddenBlobEntry,
-    HiddenBlobKey, ResolvedBackend,
+    ArchiveKey, Backend, BackendLocation, BackendRef, BlobLocationKey, CopyOwner,
+    HIDDEN_BLOB_PREFIX, HiddenBlobEntry, HiddenBlobKey, ResolvedBackend,
 };
+use aruna_core::structs::storage::encryption::{BucketKeyRef, SealPlan};
 use aruna_core::structs::storage::format::{Compression, FrameLayout, StoredFormat, StoredLayout};
 use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use aruna_core::structs::storage::multipart::MultipartPartKey;
@@ -46,7 +51,50 @@ use ulid::Ulid;
 struct WriteLimits {
     max_bytes: Option<u64>,
     deadline: Option<StdInstant>,
+    /// Writer chunk that keeps a large object within its provider's part limit.
+    chunk: Option<usize>,
 }
+
+/// Turns original bytes into stored bytes: zstd frames, or one Pithos archive of a bucket key.
+enum Encoder {
+    Frames(FrameEncoder),
+    Pithos(Box<ArchiveEncoder>, BucketKeyRef),
+}
+
+impl Encoder {
+    async fn push(&mut self, bytes: &[u8]) -> Result<Vec<Bytes>, BlobError> {
+        match self {
+            Self::Frames(encoder) => encoder.push(bytes).await,
+            Self::Pithos(encoder, _) => encoder.push(bytes).await,
+        }
+    }
+
+    /// The closing bytes and the stored format; a Pithos content hash must equal `blake3`.
+    /// The share, if any, covers the closing bytes until the writer is closed.
+    async fn finish(self, blake3: &[u8]) -> Result<Closing, BlobError> {
+        match self {
+            Self::Frames(encoder) => {
+                let (pieces, layout) = encoder.finish().await?;
+                let format = StoredFormat {
+                    layout: StoredLayout::Frames(Box::new(layout)),
+                    ..StoredFormat::default()
+                };
+                Ok((pieces, format, None))
+            }
+            Self::Pithos(encoder, key) => {
+                let (pieces, layout, content_hash, share) = encoder.finish().await?;
+                if content_hash != blake3 {
+                    let message = "the Pithos content hash differs from the original bytes";
+                    return Err(BlobError::IntegrityCheckFailed(message.to_string()));
+                }
+                Ok((pieces, StoredFormat::pithos(layout, key), share))
+            }
+        }
+    }
+}
+
+/// Closing bytes of an encoder, the stored format and the reservation covering those bytes.
+type Closing = (Vec<Bytes>, StoredFormat, Option<Share>);
 
 const HIDDEN_LIST_PAGE: usize = 128;
 const HIDDEN_BACKEND_LIMIT: usize = 256;
@@ -93,10 +141,12 @@ async fn open_writer(
     operator: &Operator,
     path: &str,
     backend: &BackendRef,
+    chunk: Option<usize>,
 ) -> Result<opendal::Writer, opendal::Error> {
-    match backend {
-        BackendRef::Group(_) => operator.writer_with(path).chunk(GROUP_WRITE_CHUNK).await,
-        BackendRef::Node(_) => operator.writer(path).await,
+    match (backend, chunk) {
+        (_, Some(chunk)) => operator.writer_with(path).chunk(chunk).await,
+        (BackendRef::Group(_), None) => operator.writer_with(path).chunk(GROUP_WRITE_CHUNK).await,
+        (BackendRef::Node(_), None) => operator.writer(path).await,
     }
 }
 
@@ -370,24 +420,59 @@ impl BlobHandler {
         Box::pin(self.write_stream_limit(location, operator, blob, limits, None, None)).await
     }
 
-    /// Writes the original bytes as frames compressed with `compression`.
-    async fn write_encoded(
+    /// Writes the original bytes as frames compressed with `compression`, or as one Pithos
+    /// archive when `seal` names a bucket key.
+    pub(super) async fn write_encoded(
         &self,
         location: BackendLocation,
         operator: Operator,
         blob: BackendStream<Result<Bytes, StreamError>>,
         compression: Compression,
+        (seal, reserved): (Option<SealPlan>, Option<Share>),
+        size: Option<u64>,
     ) -> BlobEvent {
-        let encoder = match compression {
-            Compression::Off => None,
-            Compression::Zstd { level } => Some(FrameEncoder::new(level)),
+        let mut limits = WriteLimits::default();
+        // A sealed archive of a known size picks a chunk that its provider's part limit admits.
+        if let (Some(_), Some(size)) = (seal, size) {
+            let backend = match self.registry.config_for(&location.backend) {
+                Ok(config) => config.backend_type,
+                Err(error) => return BlobEvent::Error(error),
+            };
+            limits.chunk = compose_chunk(&backend, size, true);
+        }
+        let encoder = match (seal, compression) {
+            (Some(plan), _) => {
+                // One supported size for every sealed copy, so any of them can be re-encoded later.
+                if size.is_some_and(|size| size > super::pithos::MAX_SIZE) {
+                    let limit = super::pithos::MAX_SIZE;
+                    return BlobEvent::Error(BlobError::SizeLimitExceeded { limit });
+                }
+                let covered = size.unwrap_or(super::pithos::GROWTH);
+                // A caller that already holds the share of this write passes it in.
+                let permit = match reserved {
+                    Some(permit) => permit,
+                    None => match self.reserve_pithos(working_set(covered)).await {
+                        Ok(permit) => permit,
+                        Err(error) => return BlobEvent::Error(error),
+                    },
+                };
+                let budget = Arc::clone(&self.pithos_budget);
+                match ArchiveEncoder::new(&plan, compression) {
+                    Ok(encoder) => {
+                        let encoder = encoder.with_budget(budget, permit, covered);
+                        Some(Encoder::Pithos(Box::new(encoder), plan.key))
+                    }
+                    Err(error) => return BlobEvent::Error(error),
+                }
+            }
+            (None, Compression::Off) => None,
+            (None, Compression::Zstd { level }) => Some(Encoder::Frames(FrameEncoder::new(level))),
         };
-        let limits = WriteLimits::default();
         Box::pin(self.write_stream_limit(location, operator, blob, limits, encoder, None)).await
     }
 
     /// Appends one piece to the open writer, failing the reservation on error.
-    async fn write_piece(
+    async fn write_stored(
         &self,
         reservation: &mut HiddenReservation,
         deadline: Option<StdInstant>,
@@ -429,12 +514,13 @@ impl BlobHandler {
         operator: Operator,
         mut blob: BackendStream<Result<Bytes, StreamError>>,
         limits: WriteLimits,
-        mut encoder: Option<FrameEncoder>,
+        mut encoder: Option<Encoder>,
         reservation: Option<&mut HiddenReservation>,
     ) -> BlobEvent {
         let WriteLimits {
             max_bytes,
             deadline,
+            chunk,
         } = limits;
         let mut plain = HiddenReservation::new(self.clone());
         let reservation = reservation.unwrap_or(&mut plain);
@@ -448,13 +534,13 @@ impl BlobHandler {
             Some(deadline) => {
                 with_deadline(
                     Some(deadline),
-                    open_writer(&operator, &storage_path, &location.backend),
+                    open_writer(&operator, &storage_path, &location.backend, chunk),
                 )
                 .await
             }
             None => timeout(
                 self.io_timeout(),
-                open_writer(&operator, &storage_path, &location.backend),
+                open_writer(&operator, &storage_path, &location.backend, chunk),
             )
             .await
             .map_err(|_| ()),
@@ -477,6 +563,13 @@ impl BlobHandler {
             }
         }
 
+        if let Some(Encoder::Pithos(archive, _)) = &encoder
+            && let Err(event) = self
+                .write_stored(reservation, deadline, archive.header())
+                .await
+        {
+            return event;
+        }
         let mut hasher = Hasher::new();
         let mut bytes_written = 0u64;
         loop {
@@ -528,23 +621,30 @@ impl BlobHandler {
                 None => vec![bytes],
             };
             for piece in pieces {
-                if let Err(event) = self.write_piece(reservation, deadline, piece).await {
+                if let Err(event) = self.write_stored(reservation, deadline, piece).await {
                     return event;
                 }
             }
             bytes_written = next_size;
         }
+        let hashes = hasher.to_map();
+        // Held until this write returns, after the closing bytes are written and closed.
+        let _covering: Option<Share>;
         if let Some(encoder) = encoder {
-            let (pieces, layout) = match encoder.finish().await {
+            let blake3 = hashes.get(HASH_BLAKE3).map_or(&[][..], Vec::as_slice);
+            let (pieces, format, share) = match encoder.finish(blake3).await {
                 Ok(finished) => finished,
                 Err(error) => return reservation.fail(error).await,
             };
+            _covering = share;
             for piece in pieces {
-                if let Err(event) = self.write_piece(reservation, deadline, piece).await {
+                if let Err(event) = self.write_stored(reservation, deadline, piece).await {
                     return event;
                 }
             }
-            location.format.layout = StoredLayout::Frames(Box::new(layout));
+            location.format = format;
+            // An uncertain close reports the stored format, so cleanup knows a Pithos archive.
+            reservation.set_location(location.clone());
         }
 
         reservation.mark_abandoned();
@@ -584,7 +684,7 @@ impl BlobHandler {
         }
         reservation.finish();
         location.blob_size = bytes_written;
-        location.hashes = hasher.to_map();
+        location.hashes = hashes;
         BlobEvent::WriteFinished { location }
     }
 
@@ -664,6 +764,7 @@ impl BlobHandler {
                 WriteLimits {
                     max_bytes,
                     deadline,
+                    chunk: None,
                 },
                 None,
                 Some(&mut reservation),
@@ -820,6 +921,13 @@ impl BlobHandler {
             return Ok(true);
         }
         let active = self.reservation_active(location.ulid);
+        // A pending archive has no hash, so its own records prove the commit.
+        if let StoredLayout::Pithos(_) = location.format.layout
+            && self.archive_owned(&location).await?
+        {
+            self.clear_marker(&location).await?;
+            return Ok(true);
+        }
         let hash = match location.get_blake3() {
             Some(hash) => hash
                 .try_into()
@@ -829,6 +937,7 @@ impl BlobHandler {
                 // Metadata is admitted only after the finalized marker is durable.
                 let operator = self.operator_from_location(&location)?;
                 let storage_path = location.get_storage_path()?;
+                let _claim = self.claim_archive(&location)?;
                 self.delete_path(&operator, &storage_path).await?;
                 self.release_reservation(&location).await?;
                 return Ok(true);
@@ -882,9 +991,63 @@ impl BlobHandler {
         if active {
             return Ok(false);
         }
+        let _claim = self.claim_archive(&location)?;
         self.delete_path(&operator, &storage_path).await?;
         self.release_reservation(&location).await?;
         Ok(true)
+    }
+
+    /// Claims a copy of any layout for deletion, so no lease starts while its backend copy goes.
+    /// A pinned copy fails the claim and stays for a later pass.
+    fn claim_archive(
+        &self,
+        location: &BackendLocation,
+    ) -> Result<super::unlock::DeleteClaim, BlobError> {
+        self.claim_delete(&ArchiveKey::of(location))
+    }
+
+    /// Whether committed records keep a Pithos archive: its pending location names this exact
+    /// object, or a version still owns it.
+    async fn archive_owned(&self, location: &BackendLocation) -> Result<bool, BlobError> {
+        let archive = ArchiveKey::of(location);
+        let reads = [
+            StorageEffect::Read {
+                key_space: PENDING_LOCATION_KEYSPACE.to_string(),
+                key: archive.to_bytes().into(),
+                txn_id: None,
+            },
+            StorageEffect::Iter {
+                key_space: COPY_OWNER_KEYSPACE.to_string(),
+                prefix: Some(CopyOwner::prefix(&archive).into()),
+                start: None,
+                limit: 1,
+                txn_id: None,
+            },
+        ];
+        for read in reads {
+            match self.storage.send_effect(Effect::Storage(read)).await {
+                Event::Storage(StorageEvent::ReadResult {
+                    value: Some(value), ..
+                }) => {
+                    let pending = BackendLocation::from_bytes(&value)?;
+                    if pending.same_object(location) {
+                        return Ok(true);
+                    }
+                }
+                Event::Storage(StorageEvent::IterResult { values, .. }) if !values.is_empty() => {
+                    return Ok(true);
+                }
+                Event::Storage(
+                    StorageEvent::ReadResult { .. } | StorageEvent::IterResult { .. },
+                ) => {}
+                other => {
+                    return Err(BlobError::ReadError(format!(
+                        "failed to read archive owners: {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(false)
     }
 
     pub async fn write_blob(
@@ -894,6 +1057,48 @@ impl BlobHandler {
         resolved: ResolvedBackend,
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
+    ) -> BlobEvent {
+        let written = self.write_sized_blob(
+            request_bucket,
+            request_key,
+            resolved,
+            created_by,
+            blob,
+            None,
+        );
+        Box::pin(written).await
+    }
+
+    /// Like `write_blob`; a declared `size` sizes the provider chunks of a sealed archive.
+    pub async fn write_sized_blob(
+        &self,
+        request_bucket: &str,
+        request_key: &str,
+        resolved: ResolvedBackend,
+        created_by: UserId,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+        size: Option<u64>,
+    ) -> BlobEvent {
+        let written = self.write_reserved_blob(
+            (request_bucket, request_key),
+            resolved,
+            created_by,
+            blob,
+            size,
+            None,
+        );
+        Box::pin(written).await
+    }
+
+    /// Like `write_sized_blob`, with the working-set share of a sealed write already reserved.
+    pub(super) async fn write_reserved_blob(
+        &self,
+        (request_bucket, request_key): (&str, &str),
+        resolved: ResolvedBackend,
+        created_by: UserId,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+        size: Option<u64>,
+        reserved: Option<Share>,
     ) -> BlobEvent {
         let root = match self.registry.config_for(&resolved.backend) {
             Ok(config) => config.root.clone(),
@@ -939,8 +1144,15 @@ impl BlobHandler {
                 return BlobEvent::Error(err);
             }
         };
-        match Box::pin(self.write_encoded(location.clone(), operator, blob, resolved.compression))
-            .await
+        match Box::pin(self.write_encoded(
+            location.clone(),
+            operator,
+            blob,
+            resolved.compression,
+            (resolved.encryption, reserved),
+            size,
+        ))
+        .await
         {
             BlobEvent::WriteFinished { location } => {
                 reservation.retain();
@@ -1305,6 +1517,9 @@ impl BlobHandler {
     }
 
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
+        if let StoredLayout::Pithos(_) = &location.format.layout {
+            return BlobEvent::Error(super::pithos::needs_bucket_key());
+        }
         if let StoredLayout::Frames(layout) = &location.format.layout {
             let range = 0..location.blob_size;
             return Box::pin(self.read_frames(&location, layout, range)).await;
@@ -1399,6 +1614,9 @@ impl BlobHandler {
         location: BackendLocation,
         range: impl RangeBounds<u64>,
     ) -> BlobEvent {
+        if let StoredLayout::Pithos(_) = &location.format.layout {
+            return BlobEvent::Error(super::pithos::needs_bucket_key());
+        }
         if let StoredLayout::Frames(layout) = &location.format.layout {
             let range = clamped_range(&range, location.blob_size);
             return Box::pin(self.read_frames(&location, layout, range)).await;
@@ -1798,6 +2016,12 @@ impl BlobHandler {
     }
 
     pub async fn delete_blob(&self, location: BackendLocation) -> BlobEvent {
+        // An admitted read or keyless work still uses the copy, in any layout; cleanup retries.
+        // The claim keeps new reads out until the backend delete ends.
+        let _claim = match self.claim_delete(&ArchiveKey::of(&location)) {
+            Ok(claim) => claim,
+            Err(error) => return BlobEvent::Error(error),
+        };
         self.clear_active(location.ulid);
         // An in-place part is no object: its provider upload holds the bytes until it settles.
         // Deleting it ends its claim: it was rolled back, or a staged record replaced it.

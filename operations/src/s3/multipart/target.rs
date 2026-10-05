@@ -81,6 +81,7 @@ mod pure_tests {
             subject_generation: 0,
             completing_since_ms: since,
             backend_upload: None,
+            encryption: None,
         }
     }
 

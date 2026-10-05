@@ -993,6 +993,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
             workspace_mode: WorkspaceMode::None,
             locally_exhausted: false,
             session_runtime: None,
+            awaiting_keys: Vec::new(),
         },
         spec,
         submission_id,

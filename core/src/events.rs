@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::audit::AuditPageBatch;
-use crate::compute::SecretBytes;
+use crate::compute::{SecretBytes, SharedSecret};
 use crate::effects::{
     FetchCursor, FrameBoundsError, JOB_PAGE_BYTES, JobRecordFrame, MAX_RECORD_PAGE, ReceiptFrame,
     encoded_len,
@@ -20,7 +20,10 @@ use crate::structs::identity::user::vault::VaultRecords;
 use crate::structs::placement::policy::document::{PlacementPolicyDocument, PolicyPublication};
 use crate::structs::placement::policy::{MAX_REF_INPUT, PlacementDecision};
 use crate::structs::storage::blob::{BackendLocation, HiddenBlobEntry};
-use crate::structs::storage::multipart::BackendUpload;
+use crate::structs::storage::encryption::{
+    BucketKeyRef, KeyTicket, ReadLease, SealedCopy, UnlockStatus,
+};
+use crate::structs::storage::multipart::{BackendUpload, PartPiece, WorkingShare};
 use crate::structs::storage::replication::{ReplicationItemError, ReplicationSuboperationResult};
 use crate::structs::storage::routing::GroupRoutingInputs;
 use crate::{
@@ -36,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     Blob(BlobEvent),
     StagingSource(StagingSourceEvent),
@@ -155,7 +159,60 @@ pub enum BlobEvent {
         backend_etag: String,
     },
     UploadAborted,
+    BucketKeyGenerated {
+        public_key: [u8; 32],
+        private_key: SharedSecret,
+    },
+    CopiesSealed {
+        copies: Vec<SealedCopy>,
+    },
+    KeyPrepared {
+        ticket: KeyTicket,
+    },
+    KeyActivated {
+        status: UnlockStatus,
+    },
+    KeyDiscarded {
+        ticket: KeyTicket,
+    },
+    KeyStatus {
+        generations: Vec<UnlockStatus>,
+    },
+    KeyExtended {
+        status: UnlockStatus,
+    },
+    /// The generations whose keys were removed; already locked buckets report none.
+    KeyLocked {
+        locked: Vec<KeyTicket>,
+        sequence: Ulid,
+        live: Option<Box<UnlockStatus>>,
+    },
+    ReadAdmitted {
+        lease: ReadLease,
+    },
     Error(BlobError),
+    /// The new copy of a rewrite; its reservation is held until released.
+    CopyRewritten {
+        location: BackendLocation,
+    },
+    /// A part sealed as a Pithos piece; the location holds the original size and checksums.
+    PieceWritten {
+        location: BackendLocation,
+        piece: PartPiece,
+    },
+    UnlockedKeyRead {
+        key: BucketKeyRef,
+        private_key: SharedSecret,
+    },
+    /// The raw hashes and size of the verified plaintext of a sealed copy.
+    ArchiveHashed {
+        hashes: std::collections::HashMap<String, Vec<u8>>,
+        size: u64,
+    },
+    /// The working set of one composition; the completion keeps it until composition ends.
+    ComposeReserved {
+        share: WorkingShare,
+    },
 }
 
 #[derive(Debug, PartialEq)]

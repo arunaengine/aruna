@@ -6,6 +6,7 @@ use aruna_core::structs::storage::format::StoredFormat;
 use std::time::Duration;
 
 use super::*;
+use aruna_core::structs::checksum::{HASH_CRC32, HASH_CRC32C, HASH_CRC64NVME, HASH_SHA256};
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::multipart::{
     BackendUpload, COMPLETION_LEASE_MS, MultipartChecksumHint,
@@ -81,6 +82,7 @@ fn open_upload_record(input: &CompleteUploadInput) -> MultipartUpload {
         subject_generation: 0,
         completing_since_ms: None,
         backend_upload: None,
+        encryption: None,
     }
 }
 
@@ -104,6 +106,7 @@ fn part_record(part_number: u16, blob_size: u64) -> MultipartPart {
         },
         created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000180),
         backend_etag: None,
+        piece: None,
     }
 }
 
@@ -171,11 +174,16 @@ fn refuses_disabled_backend() {
         [Effect::Storage(StorageEffect::BatchRead { .. })]
     ));
 
-    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+    op.step(Event::Storage(StorageEvent::BatchReadResult {
         values: vec![
             (b"bucket".to_vec().into(), None),
             (b"subject".to_vec().into(), None),
         ],
+    }));
+    assert_eq!(op.state, CompleteUploadState::CheckSealSettings);
+    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: None,
     }));
     assert_eq!(op.state, CompleteUploadState::FenceBackend);
     assert!(matches!(
@@ -1131,7 +1139,7 @@ fn undersized_middle_rejected() {
         input.upload_id,
         vec![part_record(1, 5 * 1024 * 1024 - 1), part_record(2, 1)],
     );
-    let op = CompleteUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
 
     assert_eq!(
         op.extract_requested_parts(values),
@@ -1159,7 +1167,7 @@ fn undersized_final_allowed() {
         input.upload_id,
         vec![part_record(1, 5 * 1024 * 1024), part_record(2, 1)],
     );
-    let op = CompleteUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
 
     assert!(op.extract_requested_parts(values).is_ok());
 }
@@ -1495,4 +1503,421 @@ fn committed_mark_continues() {
     ));
     assert_eq!(operation.state, CompleteUploadState::ReadUploadParts);
     assert_eq!(operation.txn_id, None);
+}
+
+fn sealed_plan() -> aruna_core::structs::storage::encryption::SealPlan {
+    use aruna_core::structs::storage::encryption::{BucketKeyRef, SealPlan};
+    SealPlan {
+        key: BucketKeyRef::new(Ulid::from_parts(8, 8), 1),
+        public_key: [3; 32],
+        cipher: Default::default(),
+        block_keys: Default::default(),
+        storage_generation: 2,
+    }
+}
+
+/// An operation of an encrypted upload whose parts were sealed, with its composed archive.
+fn sealed_operation(parts: &[&[u8]]) -> (CompleteUploadOperation, BackendLocation) {
+    use aruna_core::structs::storage::format::PithosLayout;
+    use aruna_core::structs::storage::multipart::{PartPiece, UploadEncryption};
+    let input = finalize_input();
+    let mut record = open_upload_record(&input);
+    record.encryption = Some(UploadEncryption {
+        plan: sealed_plan(),
+        compression: Compression::Off,
+    });
+    let mut operation = CompleteUploadOperation::new(input);
+    operation.upload_record = Some(record);
+    operation.compose_share = Some(test_share());
+    operation.resolved_parts = parts
+        .iter()
+        .zip(1u16..)
+        .map(|(bytes, number)| {
+            let mut part = part_record(number, bytes.len() as u64);
+            part.location.hashes = Hasher::new_with_bytes(bytes).to_map();
+            part.piece = Some(PartPiece {
+                record: vec![number as u8],
+                stored_len: bytes.len() as u64 + 40,
+                content_offset: None,
+            });
+            part
+        })
+        .collect();
+    let mut location = composed_location(Ulid::from_parts(9, 9));
+    location.backend = BackendRef::node_default();
+    let layout = PithosLayout {
+        stored_size: 400,
+        metadata_digest: [6; 32],
+        storage_generation: 0,
+    };
+    location.format = StoredFormat::pithos(layout, sealed_plan().key);
+    location.blob_size = parts.iter().map(|bytes| bytes.len() as u64).sum();
+    (operation, location)
+}
+
+/// A reservation the tests hand to the completion in place of the blob adapter's.
+fn test_share() -> aruna_core::structs::storage::multipart::WorkingShare {
+    aruna_core::structs::storage::multipart::WorkingShare::new(1 << 30, std::sync::Arc::new(()))
+}
+
+#[test]
+fn sealed_reserves_first() {
+    // The composition's share is reserved before any piece record loads, and composition
+    // receives that same share; a saturated budget therefore stops the completion early.
+    use aruna_core::structs::storage::multipart::MAX_PART_SIZE;
+    let (mut operation, _) = sealed_operation(&[b"first"]);
+    operation.compose_share = None;
+    operation.input.completed_parts = vec![CompleteMultipartPart {
+        part_number: 1,
+        etag: None,
+        expected_checksums: Vec::new(),
+    }];
+    operation.state = CompleteUploadState::CommitMarkTransaction;
+    let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+        txn_id: TxnId::generate(),
+    }));
+    assert_eq!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::ReserveCompose {
+            content: MAX_PART_SIZE
+        })]
+    );
+    let share = test_share();
+    let effects = operation.step(Event::Blob(BlobEvent::ComposeReserved {
+        share: share.clone(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Iter { key_space, .. })] if key_space == UPLOAD_PART_KEYSPACE
+    ));
+    let effects = operation.compose_blob();
+    let [Effect::Blob(BlobEffect::ComposePieces { share: kept, .. })] = effects.as_slice() else {
+        panic!("expected a piece composition, got {effects:?}")
+    };
+    assert_eq!(*kept, share);
+}
+
+impl CompleteUploadOperation {
+    fn step_composed(&mut self, location: BackendLocation) -> Effects {
+        self.state = CompleteUploadState::ComposeBlob;
+        self.step(Event::Blob(BlobEvent::WriteFinished { location }))
+    }
+}
+
+#[test]
+fn sealed_parts_compose() {
+    // Completion composes the saved pieces with the captured plan, never the bucket's.
+    let (mut operation, _) = sealed_operation(&[b"first", b"second"]);
+    let effects = operation.compose_blob();
+    let [
+        Effect::Blob(BlobEffect::ComposePieces {
+            resolved, parts, ..
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("expected a piece composition, got {effects:?}")
+    };
+    assert_eq!(resolved.encryption, Some(sealed_plan()));
+    assert_eq!(parts.len(), 2);
+
+    let (mut operation, _) = sealed_operation(&[b"first"]);
+    operation.resolved_parts[0].piece = None;
+    operation.compose_blob();
+    assert_eq!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::InvalidPart)
+    );
+}
+
+#[test]
+fn sealed_crcs_combine() {
+    // Full-object CRCs come from the parts; a full-object SHA256 is never acknowledged.
+    let parts: [&[u8]; 2] = [b"the first part", b"and the last"];
+    let (mut operation, location) = sealed_operation(&parts);
+    let effects = operation.step_composed(location.clone());
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction { .. })]
+    ));
+    let composed = operation.composed_location.clone().unwrap();
+    let whole = Hasher::new_with_bytes(&parts.concat()).to_map();
+    for name in [HASH_CRC32, HASH_CRC32C, HASH_CRC64NVME] {
+        assert_eq!(composed.hashes.get(name), whole.get(name), "{name}");
+    }
+    assert_eq!(composed.get_blake3(), None);
+
+    let (mut operation, location) = sealed_operation(&parts);
+    operation.input.expected_checksums = vec![ExpectedChecksum {
+        algorithm: ChecksumAlgorithm::Sha256,
+        digest: whole[HASH_SHA256].clone(),
+    }];
+    operation.step_composed(location);
+    assert_eq!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::MissingExpectedChecksum("SHA256"))
+    );
+}
+
+#[test]
+fn pending_publishes_owner() {
+    // Without a content hash the archive waits in pending_locations; its owner row and
+    // version commit in the same transaction.
+    let (mut operation, location) = sealed_operation(&[b"first"]);
+    let txn_id = Ulid::from_parts(4, 4);
+    operation.txn_id = Some(txn_id);
+    operation.composed_location = Some(location.clone());
+    let effects = operation.check_hash_lookup();
+    let archive = ArchiveKey::of(&location);
+    let [
+        Effect::Storage(StorageEffect::Write {
+            key_space,
+            key,
+            txn_id: write_txn,
+            ..
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("expected the pending location, got {effects:?}")
+    };
+    assert_eq!(key_space, PENDING_LOCATION_KEYSPACE);
+    assert_eq!(key.as_ref(), archive.to_bytes());
+    assert_eq!(*write_txn, Some(txn_id));
+    assert!(operation.new_blob);
+
+    operation.version_id = Some(Ulid::from_parts(5, 1));
+    let effects = operation.write_version();
+    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        panic!("expected the version, got {effects:?}")
+    };
+    let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
+    assert_eq!(version.state.pending_archive(), Some(&archive));
+
+    let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: b"version".to_vec().into(),
+    }));
+    let version_key = VersionKey::new("bucket", "object", Ulid::from_parts(5, 1));
+    let owner = CopyOwner::new(archive, version_key);
+    let [Effect::Storage(StorageEffect::Write { key_space, key, .. })] = effects.as_slice() else {
+        panic!("expected the owner row, got {effects:?}")
+    };
+    assert_eq!(key_space, aruna_core::keyspaces::COPY_OWNER_KEYSPACE);
+    assert_eq!(key.as_ref(), owner.key().unwrap());
+    // The stored credit is the new archive's, booked by its archive id.
+    let credit = StoredDelta::for_location(&location, true).unwrap();
+    assert_eq!(credit.bytes, 400);
+}
+
+#[test]
+fn sealed_rotation_refused() {
+    // A plan that is no longer current is never published.
+    use aruna_core::structs::storage::encryption::EncryptionMode;
+    let (mut operation, location) = sealed_operation(&[b"first"]);
+    operation.txn_id = Some(Ulid::from_parts(4, 4));
+    operation.composed_location = Some(location);
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(Ulid::from_parts(8, 8)),
+        key_generation: 2,
+        storage_generation: 2,
+        ..Default::default()
+    };
+    operation.state = CompleteUploadState::CheckSealSettings;
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: Some(settings.to_bytes().unwrap().into()),
+    }));
+    assert!(matches!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::BucketKey(_))
+    ));
+}
+
+#[test]
+fn plain_completion_refused() {
+    // A plain upload never publishes once its bucket encrypts, even if its record predates it.
+    use aruna_core::structs::storage::encryption::EncryptionMode;
+    let input = finalize_input();
+    let record = open_upload_record(&input);
+    let mut operation = CompleteUploadOperation::new(input);
+    operation.upload_record = Some(record);
+    operation.txn_id = Some(Ulid::from_parts(4, 4));
+    operation.composed_location = Some(composed_location(Ulid::from_parts(9, 9)));
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(Ulid::from_parts(8, 8)),
+        key_generation: 1,
+        ..Default::default()
+    };
+    operation.state = CompleteUploadState::CheckSealSettings;
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: Some(settings.to_bytes().unwrap().into()),
+    }));
+    assert!(matches!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::BucketKey(_))
+    ));
+}
+
+#[test]
+fn pending_schedules_promotion() {
+    // A pending completion during an unlock session asks for promotion at once; the timer is
+    // persisted, so it also runs after a restart. A known hash needs none.
+    let (mut operation, location) = sealed_operation(&[b"first"]);
+    let key = location.format.bucket_key().unwrap();
+    operation.final_location = Some(location.clone());
+    let effects = operation.finish_commit();
+    let promote = Effect::Task(TaskEffect::ShortenTimer {
+        key: TaskKey::PromotePending {
+            bucket_id: key.bucket_id,
+            generation: key.generation,
+        },
+        after: Duration::ZERO,
+    });
+    assert!(effects.contains(&promote));
+
+    let (mut operation, mut known) = sealed_operation(&[b"first"]);
+    known.hashes.insert(
+        aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+        vec![7; 32],
+    );
+    operation.final_location = Some(known);
+    let effects = operation.finish_commit();
+    assert!(!effects.contains(&promote));
+}
+
+#[test]
+fn omitted_parts_paged() {
+    // Many large omitted parts are read page by page and kept only as cleanup metadata; only
+    // the selected part keeps its piece record.
+    use aruna_core::structs::storage::multipart::PartPiece;
+    let (mut operation, _) = sealed_operation(&[b"first"]);
+    let upload_id = operation.input.upload_id;
+    operation.input.completed_parts = vec![CompleteMultipartPart {
+        part_number: 300,
+        etag: None,
+        expected_checksums: Vec::new(),
+    }];
+    operation.input.object_size = None;
+    let parts: Vec<MultipartPart> = (1..=400u16)
+        .map(|number| {
+            let mut part = part_record(number, 6 << 20);
+            part.location.hashes = Hasher::new_with_bytes(b"part").to_map();
+            part.piece = Some(PartPiece {
+                record: vec![7; 4096],
+                stored_len: (6 << 20) + 40,
+                content_offset: None,
+            });
+            part
+        })
+        .collect();
+    let values = part_values(upload_id, parts);
+    let (first, second) = values.split_at(PART_PAGE);
+    let next = first.last().unwrap().0.clone();
+    operation.state = CompleteUploadState::ReadUploadParts;
+    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+        values: first.to_vec(),
+        next_start_after: Some(next.clone()),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Iter { start: Some(IterStart::After(after)), limit, .. })]
+            if *after == next && *limit == PART_PAGE
+    ));
+    // Omitted parts already read hold no piece record while the next page loads.
+    assert!(
+        operation
+            .upload_parts
+            .iter()
+            .all(|part| part.piece.is_none())
+    );
+    assert_eq!(operation.selected_parts.len(), 0);
+
+    operation.step(Event::Storage(StorageEvent::IterResult {
+        values: second.to_vec(),
+        next_start_after: None,
+    }));
+    assert_eq!(operation.upload_parts.len(), 400);
+    assert!(
+        operation
+            .upload_parts
+            .iter()
+            .all(|part| part.piece.is_none())
+    );
+    assert_eq!(operation.resolved_parts.len(), 1);
+    assert_eq!(operation.resolved_parts[0].part_number, 300);
+    assert!(operation.resolved_parts[0].piece.is_some());
+}
+
+#[test]
+fn oversized_selection_refused() {
+    use aruna_core::structs::storage::multipart::PartPiece;
+    let (mut operation, _) = sealed_operation(&[]);
+    operation.input.object_size = None;
+    operation.input.completed_parts = (1..=10_000)
+        .map(|part_number| CompleteMultipartPart {
+            part_number,
+            etag: None,
+            expected_checksums: Vec::new(),
+        })
+        .collect();
+    operation.read_parts(None);
+    let limit = aruna_blob::blob::pithos::MAX_SIZE;
+    let mut effects = smallvec![];
+    for start in (1..=10_000u16).step_by(PART_PAGE) {
+        let end = (start as usize + PART_PAGE).min(10_001) as u16;
+        let parts = (start..end)
+            .map(|number| {
+                let mut part = part_record(number, MAX_PART_SIZE);
+                part.piece = Some(PartPiece {
+                    record: number.to_le_bytes().to_vec(),
+                    stored_len: MAX_PART_SIZE,
+                    content_offset: None,
+                });
+                part
+            })
+            .collect();
+        let values = part_values(operation.input.upload_id, parts);
+        let next_start_after = values.last().map(|(key, _)| key.clone());
+        effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Blob(BlobEffect::ComposePieces { .. })))
+        );
+        if operation.state != CompleteUploadState::ReadUploadParts {
+            break;
+        }
+    }
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction { .. })]
+    ));
+    assert!(operation.selected_bytes <= limit);
+    assert!(operation.resolved_parts.is_empty());
+    assert_eq!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::BlobError(
+            BlobError::SizeLimitExceeded { limit }
+        ))
+    );
+}
+
+#[test]
+fn share_outlives_compose() {
+    // The completion keeps its reservation after composition starts, while publication still
+    // holds the selected piece records.
+    let (mut operation, location) = sealed_operation(&[b"first"]);
+    let share = operation.compose_share.clone().unwrap();
+    let effects = operation.compose_blob();
+    let [Effect::Blob(BlobEffect::ComposePieces { share: sent, .. })] = effects.as_slice() else {
+        panic!("expected a piece composition, got {effects:?}")
+    };
+    assert_eq!(*sent, share);
+    operation.step_composed(location);
+    assert!(operation.resolved_parts[0].piece.is_some());
+    assert_eq!(operation.compose_share, Some(share));
 }

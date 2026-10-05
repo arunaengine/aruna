@@ -14,7 +14,9 @@ use aruna_operations::s3::bucket::compression::{
     MigrationStatusOperation, PutCompressionError, PutCompressionOperation,
 };
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::key_status::bucket_settings;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -55,6 +57,9 @@ pub struct BucketCompressionResponse {
     pub mode: CompressionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
+    /// The zstd level Pithos applies in an encrypted bucket; absent for plain buckets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_level: Option<u8>,
     /// This node's re-encoding of stored objects after the last change; absent before any change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration: Option<MigrationProgress>,
@@ -108,6 +113,7 @@ impl BucketCompressionResponse {
             bucket,
             mode,
             level,
+            effective_level: None,
             migration: migration.map(Into::into),
         }
     }
@@ -145,7 +151,9 @@ impl TryFrom<BucketCompressionRequest> for Compression {
 - `mode` is `off` or `zstd`; `level` is present only for `zstd`.
 - `migration` reports this node's re-encoding of stored objects after the last change. Buckets on
   other nodes are separate and keep their own setting.
-- S3 clients see no difference: sizes, ranges and checksums always refer to the original bytes."#,
+- S3 clients see no difference: sizes, ranges and checksums always refer to the original bytes.
+- `effective_level` is the zstd level Pithos applies in an encrypted bucket: the nearest of 1, 4,
+  8, 11, 15, 18 and 22, the lower on a tie."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     responses(
         (
@@ -156,6 +164,7 @@ impl TryFrom<BucketCompressionRequest> for Compression {
                 "bucket": "research-raw",
                 "mode": "zstd",
                 "level": 3,
+                "effective_level": 4,
                 "migration": {
                     "migrated": 120,
                     "skipped": 4,
@@ -203,11 +212,13 @@ pub async fn get_bucket_compression(
     .await
     .map_err(|error| ServerError::InternalError(error.to_string()))?;
     let migration = migration.filter(|migration| migration.target == info.compression);
-    Ok(Json(BucketCompressionResponse::new(
-        bucket,
-        info.compression,
-        migration,
-    )))
+    let encrypted = bucket_settings(&state.get_ctx(), &bucket)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .is_encrypted();
+    let mut response = BucketCompressionResponse::new(bucket, info.compression, migration);
+    response.effective_level = info.compression.pithos_level().filter(|_| encrypted);
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -229,6 +240,10 @@ pub async fn get_bucket_compression(
   or waits with failed versions. The response reports this node's current progress.
 - S3 behavior does not change: sizes, ranges and checksums always refer to the original bytes.
 - Quotas count original bytes; backend capacity counts stored bytes.
+- In an encrypted bucket the copies are re-encoded inside Pithos. The response then has no
+  `migration`; the `transition` field of `GET .../storage/encryption` reports the progress.
+- A change while an encryption transition of the bucket is unfinished answers 409
+  `transition_running`.
 
 **Limits**
 - `level` is 1 to 22 and only allowed with `zstd`; `zstd` without a level uses 3."#,
@@ -248,7 +263,8 @@ pub async fn get_bucket_compression(
         (status = 400, description = "Unknown mode, a level outside 1 to 22, or a level with `off`", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
-        (status = 404, description = "Bucket not found on this node, or no longer owned by the authorized group", body = ErrorResponse)
+        (status = 404, description = "Bucket not found on this node, or no longer owned by the authorized group", body = ErrorResponse),
+        (status = 409, description = "`transition_running`: an encryption transition of the bucket is unfinished", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -273,20 +289,31 @@ pub async fn put_bucket_compression(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| match error {
+    .map_err(put_refusal)?;
+    Ok(Json(BucketCompressionResponse::new(
+        bucket,
+        compression,
+        migration,
+    )))
+}
+
+fn put_refusal(error: PutCompressionError) -> ServerError {
+    match error {
         PutCompressionError::NoSuchBucket | PutCompressionError::GroupMismatch => {
             ServerError::NotFound
         }
         PutCompressionError::ConversionError(error) => {
             ServerError::BadRequestReason(error.to_string())
         }
+        PutCompressionError::TransitionRunning => ServerError::Refused(
+            StatusCode::CONFLICT,
+            "transition_running",
+            "the stored copies are still moving to a new encryption; retry when it finishes"
+                .to_string(),
+        ),
+        PutCompressionError::Key(error) => super::encryption::key_refusal(&error),
         other => ServerError::InternalError(other.to_string()),
-    })?;
-    Ok(Json(BucketCompressionResponse::new(
-        bucket,
-        compression,
-        migration,
-    )))
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +322,24 @@ mod tests {
 
     fn request(mode: CompressionMode, level: Option<u8>) -> BucketCompressionRequest {
         BucketCompressionRequest { mode, level }
+    }
+
+    #[test]
+    fn running_transition_conflicts() {
+        let refusal = put_refusal(PutCompressionError::TransitionRunning);
+        assert_eq!(refusal.status_code(), StatusCode::CONFLICT);
+        let code = refusal.response_body().code;
+        assert_eq!(code.as_deref(), Some("transition_running"));
+    }
+
+    #[test]
+    fn locked_key_conflicts() {
+        use aruna_core::structs::storage::encryption::BucketKeyError;
+        let locked = BucketKeyError::Locked(ulid::Ulid::from_bytes([1; 16]));
+        let refusal = put_refusal(PutCompressionError::Key(locked));
+        assert_eq!(refusal.status_code(), StatusCode::CONFLICT);
+        let code = refusal.response_body().code;
+        assert_eq!(code.as_deref(), Some("bucket_locked"));
     }
 
     #[test]

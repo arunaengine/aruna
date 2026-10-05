@@ -91,6 +91,8 @@ pub enum BlobError {
     ReplicationFailed(String),
     #[error("Blob storage is closed for shutdown")]
     Closed,
+    #[error(transparent)]
+    BucketKey(#[from] crate::structs::storage::encryption::BucketKeyError),
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -261,6 +263,8 @@ pub enum ConversionError {
     /// compare equal to an older one and silently win the convergent order.
     #[error("object head generation is exhausted")]
     HeadGenerationExhausted,
+    #[error(transparent)]
+    BucketKey(#[from] crate::structs::storage::encryption::BucketKeyError),
 }
 
 impl PartialEq for ConversionError {
@@ -301,6 +305,7 @@ impl PartialEq for ConversionError {
             (Self::AdvertisementError(left), Self::AdvertisementError(right)) => left == right,
             (Self::NonCanonicalRefs, Self::NonCanonicalRefs) => true,
             (Self::HeadGenerationExhausted, Self::HeadGenerationExhausted) => true,
+            (Self::BucketKey(left), Self::BucketKey(right)) => left == right,
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
     }

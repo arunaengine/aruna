@@ -479,6 +479,18 @@ async fn fill(
     checkpoint(StartupStage::UsageCounters)?;
     stopped(stop)?;
 
+    // Node-managed bucket keys open before content work; vault-locked keys stay locked.
+    open_managed_keys(driver_ctx.as_ref(), config).await?;
+    record_restart_locks(driver_ctx.as_ref(), config).await?;
+    // Recovery that weakened while the node was down, or later through role changes, is told.
+    let origin = (config.realm_id, config.node_id);
+    aruna_operations::s3::bucket::key_recovery::spawn_recovery_sweep(
+        driver_ctx.clone(),
+        origin,
+        &acquired.shutdown,
+    );
+    stopped(stop)?;
+
     // Bind compute reconciliation before startup recovery.
     initialize_net_holder(
         driver_ctx.clone(),
@@ -496,6 +508,86 @@ async fn fill(
     acquired.task_queues = Some(task_queues);
     checkpoint(StartupStage::TaskQueues)?;
 
+    Ok(())
+}
+
+/// Opens the node-managed bucket keys, then resumes the work that waited for them. A key that
+/// fails stays locked and is reported.
+async fn open_managed_keys(
+    driver_ctx: &DriverContext,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::time::unix_timestamp_millis;
+    use aruna_operations::driver::drive;
+    use aruna_operations::jobs::key_wake::wake_unlocked;
+    use aruna_operations::s3::bucket::key_startup::OpenManagedOperation;
+
+    let keys = drive(OpenManagedOperation::new(), driver_ctx).await?;
+    for (key, reason) in &keys.failed {
+        warn!(
+            bucket_id = %key.bucket_id,
+            generation = key.generation,
+            reason = %reason,
+            "A node-managed bucket key stays locked"
+        );
+    }
+    if keys.unreadable > 0 {
+        warn!(rows = keys.unreadable, "Skipped unreadable bucket key rows");
+    }
+    info!(
+        opened = keys.opened.len(),
+        "Opened node-managed bucket keys"
+    );
+    let origin = (config.realm_id, config.node_id);
+    for key in keys.opened {
+        let now_ms = unix_timestamp_millis();
+        let limits = &config.rocrate_limits;
+        if let Err(error) = wake_unlocked(driver_ctx, key, now_ms, origin, limits).await {
+            warn!(
+                bucket_id = %key.bucket_id,
+                generation = key.generation,
+                error = %error,
+                "Failed to resume work waiting for a node-managed key"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Records the restart lock of vault-locked buckets that were unlocked before this start and
+/// tells their holders.
+async fn record_restart_locks(
+    driver_ctx: &DriverContext,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_operations::driver::drive;
+    use aruna_operations::s3::bucket::audit_retry::resume_records;
+    use aruna_operations::s3::bucket::key_restart::RestartScanOperation;
+    use aruna_operations::s3::restart_notice::RestartNoticeOperation;
+
+    // Records kept by retry timers before the stop join the trail before it is read.
+    match resume_records(driver_ctx).await {
+        Ok(0) => {}
+        Ok(stored) => info!(records = stored, "Stored kept bucket key audit records"),
+        Err(error) => warn!(error = %error, "Kept bucket key audit records not read"),
+    }
+    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let scan = RestartScanOperation::new(now_ms, config.realm_id);
+    let buckets = drive(scan, driver_ctx).await?;
+    if buckets.is_empty() {
+        return Ok(());
+    }
+    let count = buckets.len();
+    let boot_id = ulid::Ulid::generate();
+    drive(
+        RestartNoticeOperation::new(config.node_id, boot_id, buckets),
+        driver_ctx,
+    )
+    .await?;
+    info!(
+        buckets = count,
+        "Recorded the restart lock of unlocked buckets"
+    );
     Ok(())
 }
 

@@ -12,8 +12,9 @@ use ulid::Ulid;
 
 use crate::blob::holders::GetHoldersOperation;
 use crate::driver::{DriverContext, drive};
+use crate::jobs::workflow::workspace::LOCKED_INPUT;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
+use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
 /// The staged bytes of one input plus the size the caller writes with.
 pub struct StagedInput {
@@ -126,6 +127,10 @@ pub(crate) fn stage_error(bucket: &str, key: &str, error: Option<BaoReadError>) 
     match error {
         Some(BaoReadError::PolicyRequired { .. }) | Some(BaoReadError::NoDestination) => {
             JobError::permanent(message)
+        }
+        // The holder's key is locked: the job parks on it instead of spending an attempt.
+        Some(BaoReadError::Refused(BaoReadRefusal::BucketLocked(_))) => {
+            JobError::retryable(format!("{LOCKED_INPUT}: {message}"))
         }
         _ => JobError::retryable(message),
     }

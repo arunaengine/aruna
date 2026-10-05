@@ -193,7 +193,7 @@ async fn sse_headers_rejected() -> TestResult<()> {
             .send()
             .await?;
 
-        // SSE-S3 on PutObject.
+        // SSE-S3 on PutObject into a plain bucket.
         let put_sse = sse_client
             .put_object()
             .bucket(bucket)
@@ -204,7 +204,7 @@ async fn sse_headers_rejected() -> TestResult<()> {
             .await;
         assert_eq!(
             service_error_code(&put_sse).as_deref(),
-            Some("NotImplemented")
+            Some("InvalidArgument")
         );
 
         // SSE-C on PutObject.
@@ -236,7 +236,7 @@ async fn sse_headers_rejected() -> TestResult<()> {
             Some("NotImplemented")
         );
 
-        // SSE-S3 on CopyObject.
+        // SSE-S3 on CopyObject into a plain bucket.
         let copy_sse = sse_client
             .copy_object()
             .bucket(bucket)
@@ -247,7 +247,7 @@ async fn sse_headers_rejected() -> TestResult<()> {
             .await;
         assert_eq!(
             service_error_code(&copy_sse).as_deref(),
-            Some("NotImplemented")
+            Some("InvalidArgument")
         );
 
         // SSE-C on a read path (GetObject) is rejected, not silently ignored.

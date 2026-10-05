@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::UserId;
 use crate::alpn::Alpn;
 use crate::audit::AuditPageRequest;
-use crate::compute::{ExecutionTargetId, SecretBytes};
+use crate::compute::{ExecutionTargetId, SharedSecret};
 use crate::document::DocumentEffect;
 use crate::id::{DhtKeyId, NodeId};
 use crate::jobs::JobRequest;
@@ -22,9 +22,10 @@ use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::structs::placement::policy::document::PolicyPublicationClaim;
 use crate::structs::placement::record::PlacementRef;
-use crate::structs::storage::blob::{BackendLocation, HiddenBlobKey, ResolvedBackend};
+use crate::structs::storage::blob::{ArchiveKey, BackendLocation, HiddenBlobKey, ResolvedBackend};
+use crate::structs::storage::encryption::{BucketKeyRef, CopyTarget, KeyTicket, ReadLease};
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
-use crate::structs::storage::multipart::{BackendUpload, MultipartPart};
+use crate::structs::storage::multipart::{BackendUpload, MultipartPart, WorkingShare};
 use crate::structs::storage::usage::UsageDelta;
 use crate::task::TaskEffect;
 use crate::types::{Key, KeySpace, TxnId, Value};
@@ -59,6 +60,8 @@ pub enum BlobEffect {
         resolved: ResolvedBackend,
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
+        /// Declared size of the original bytes, when known; it sizes provider chunks.
+        size: Option<u64>,
     },
     WritePart {
         upload_id: Ulid,
@@ -180,6 +183,120 @@ pub enum BlobEffect {
     CheckGroupBackend {
         record: GroupStorage,
         secret: GroupStorageSecret,
+    },
+    /// A fresh X25519 keypair for a bucket key generation.
+    GenerateBucketKey,
+    /// Seals the private key of `key` to each user key; the plain key is not returned.
+    SealHolderCopies {
+        key: BucketKeyRef,
+        public_key: [u8; 32],
+        private_key: SharedSecret,
+        realm_id: RealmId,
+        node_id: NodeId,
+        holders: Vec<CopyTarget>,
+    },
+    /// Seals copies with the unlocked key of `key`, which never leaves the adapter. A locked
+    /// generation answers `Locked`, so the caller records the holders as pending.
+    SealUnlocked {
+        key: BucketKeyRef,
+        realm_id: RealmId,
+        node_id: NodeId,
+        holders: Vec<CopyTarget>,
+    },
+    /// Holds a key checked against `public_key`; no read may use it before activation.
+    /// `max` bounds the session from its start, including every extension.
+    PrepareKey {
+        key: BucketKeyRef,
+        public_key: [u8; 32],
+        private_key: SharedSecret,
+        duration: Option<Duration>,
+        max: Option<Duration>,
+    },
+    ActivateKey {
+        ticket: KeyTicket,
+    },
+    DiscardKey {
+        ticket: KeyTicket,
+    },
+    ReadKeyStatus {
+        bucket_id: Ulid,
+    },
+    /// Moves the timed lock of one session to `duration` from now.
+    ExtendKey {
+        key: BucketKeyRef,
+        session_id: Ulid,
+        duration: Option<Duration>,
+    },
+    /// Locks every generation of a bucket, or only the named session for a timed lock.
+    LockKey {
+        bucket_id: Ulid,
+        session: Option<KeyTicket>,
+    },
+    /// Admits a plaintext read of `archive` while its key generation is unlocked.
+    AdmitRead {
+        key: BucketKeyRef,
+        archive: ArchiveKey,
+    },
+    /// Rewrites `source` into the format of `target` inside the adapter, so its plaintext never
+    /// reaches an operation. A sealed source needs `lease`; `grants_only` keeps its blocks.
+    RewriteCopy {
+        bucket: String,
+        key: String,
+        source: BackendLocation,
+        lease: Option<Box<ReadLease>>,
+        target: Box<ResolvedBackend>,
+        grants_only: bool,
+    },
+    /// Seals one part of an encrypted upload as a Pithos piece with the plan in `resolved`.
+    /// The piece records a content tree at `content_offset` when one is given.
+    WritePiece {
+        upload_id: Ulid,
+        part_number: u16,
+        resolved: ResolvedBackend,
+        created_by: UserId,
+        content_offset: Option<u64>,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
+    /// Composes the stored pieces of `parts`, in order, into one archive without a key, within
+    /// the working set `share` reserved before the parts were loaded.
+    ComposePieces {
+        bucket: String,
+        key: String,
+        resolved: ResolvedBackend,
+        created_by: UserId,
+        parts: Vec<MultipartPart>,
+        share: WorkingShare,
+    },
+    /// Hands out the unlocked key of `key`, for its node vault copy when a bucket leaves
+    /// `vault_locked`. A locked generation answers `Locked`.
+    ReadUnlockedKey {
+        key: BucketKeyRef,
+    },
+    /// Reads the sealed copy at `location` through `lease` and answers the raw hashes of its
+    /// verified plaintext; the plaintext never leaves the adapter.
+    HashArchive {
+        location: BackendLocation,
+        lease: Box<ReadLease>,
+    },
+    /// Streams `range`, or the whole object, of the sealed copy at `location` under `lease`.
+    /// The stream keeps the lease until it ends.
+    ReadSealed {
+        location: BackendLocation,
+        range: Option<Range<u64>>,
+        lease: Box<ReadLease>,
+    },
+    /// Serves the plaintext of `location`, a copy of an encrypting bucket, to an authorized
+    /// remote reader under `lease`. Replication of sealed copies stays refused.
+    ServeSealedRead {
+        stream_id: Ulid,
+        location: BackendLocation,
+        expected_blake3: [u8; 32],
+        lease: Box<ReadLease>,
+    },
+    /// Reserves the working set of composing at most `content` bytes, before the piece records
+    /// are loaded. Answers `ComposeReserved`.
+    ReserveCompose {
+        content: u64,
     },
 }
 
@@ -359,7 +476,7 @@ pub enum StorageEffect {
     /// Seals `secret` into the node vault under `entry`. Answers `WriteResult`.
     VaultWrite {
         entry: VaultEntry,
-        secret: SecretBytes,
+        secret: SharedSecret,
         txn_id: Option<TxnId>,
     },
     /// Opens the node vault record of `entry`. Answers `VaultResult`.

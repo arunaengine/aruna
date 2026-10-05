@@ -290,7 +290,7 @@ fn schedule_uses_retention() {
     record.finished_at_ms = Some(2_000);
     record.retention_ms = 42;
 
-    let (expiry, job_id) = parse_schedule_key(job_schedule_key(&record).as_ref()).unwrap();
+    let (expiry, job_id) = parse_schedule_key(job_schedule_key(&record).unwrap().as_ref()).unwrap();
 
     assert_eq!(expiry, 2_042);
     assert_eq!(job_id, record.job_id);

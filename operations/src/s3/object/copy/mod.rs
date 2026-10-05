@@ -2,11 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod sealed;
+
 use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     routing_snapshot,
 };
-use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use crate::s3::object::copy::sealed::{SealedCopyError, SealedCopyInput, SealedCopyOperation};
+use crate::s3::object::get::{
+    GetObjectError, GetObjectInput, GetObjectOperation, reference_archive,
+};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
@@ -16,7 +21,11 @@ use crate::staging::reference::{
     MaterializeReferenceError, ReferenceWrite, write_reference_version,
 };
 use aruna_core::UserId;
+use aruna_core::effects::{BlobEffect, StorageEffect};
+use aruna_core::errors::{BlobError, ConversionError};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
+use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::source_access::SourceMetadata;
@@ -24,6 +33,7 @@ use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBind
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BackendLocation;
+use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::resolve_backend;
 use aruna_core::types::GroupId;
@@ -101,6 +111,23 @@ pub enum CopyObjectError {
     Reference(#[from] MaterializeReferenceError),
     #[error("At least one of the preconditions you specified did not hold.")]
     PreconditionFailed,
+}
+
+/// A sealed copy fails like the write it stands in for, or like a missing source.
+fn sealed_error(error: SealedCopyError) -> CopyObjectError {
+    let put = |error| CopyObjectError::Put(error);
+    match error {
+        SealedCopyError::Storage(error) => put(PutObjectError::StorageError(error)),
+        SealedCopyError::Conversion(error) => put(PutObjectError::ConversionError(error)),
+        SealedCopyError::PurgeFence(error) => put(PutObjectError::PurgeFence(error)),
+        SealedCopyError::Quota(error) => put(PutObjectError::QuotaGateError(error)),
+        SealedCopyError::QuotaExceeded { limit, usage } => {
+            put(PutObjectError::QuotaExceeded { limit, usage })
+        }
+        SealedCopyError::PolicyGate(error) => put(PutObjectError::PolicyGate(error)),
+        SealedCopyError::NoSuchVersion => CopyObjectError::Get(GetObjectError::NoSuchVersion),
+        error => put(PutObjectError::WriteFailed(error.to_string())),
+    }
 }
 
 /// A description failure reads like the read it stands in for.
@@ -233,7 +260,17 @@ pub async fn copy_object_tracked(
         true,
     )?;
     if head.location.is_none() && input.references == CopyReferences::Preserve {
+        // Another bucket reads the reference without the source's lock, so admit it here.
+        if input.source_bucket != input.dest_bucket {
+            admit_source(context, &input.source_bucket).await?;
+        }
         return preserve_reference(context, input, head, source_last_modified).await;
+    }
+    // A sealed source in the same bucket is aliased, never read, so it copies while locked.
+    if let Some(location) = head.location.clone().filter(|location| {
+        location.format.bucket_key().is_some() && input.source_bucket == input.dest_bucket
+    }) {
+        return sealed_copy(context, input, head, location, source_last_modified).await;
     }
 
     let source = drive(
@@ -328,6 +365,84 @@ pub async fn copy_object_tracked(
         source_version_id,
         source_last_modified,
     })
+}
+
+/// Publishes the destination as a new version of the source's archive and grants.
+async fn sealed_copy(
+    context: &DriverContext,
+    input: CopyObjectInput,
+    head: HeadObjectResult,
+    location: BackendLocation,
+    source_last_modified: Option<SystemTime>,
+) -> Result<CopyResultData, CopyObjectError> {
+    let source_version_id = head
+        .version_id
+        .ok_or(CopyObjectError::Get(GetObjectError::NoSuchVersion))?;
+    let operation = SealedCopyOperation::new(SealedCopyInput {
+        bucket: input.dest_bucket,
+        source_key: input.source_key,
+        source_version_id,
+        location: location.clone(),
+        source_policies: head.source_policies,
+        size: location.blob_size,
+        dest_key: input.dest_key,
+        metadata: input.metadata,
+        user_id: input.user_id,
+        group_id: input.group_id,
+        realm_id: input.realm_id,
+        node_id: input.node_id,
+        quota_ceiling: input.quota_ceiling,
+    });
+    let operation = match gate_context(context, input.realm_id, now_ms()).await? {
+        Some(gate) => operation.with_gate(gate),
+        None => operation,
+    };
+    let version_id = drive(operation, context)
+        .await
+        .map_err(sealed_error)?
+        .version_id;
+    Ok(CopyResultData {
+        size: location.blob_size,
+        location: Some(location),
+        source_metadata: None,
+        version_id,
+        created_at: UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms()),
+        source_version_id: Some(source_version_id),
+        source_last_modified,
+    })
+}
+
+/// Admits a plaintext read of `bucket` the way GET does: an encrypting bucket must be unlocked.
+/// No bytes move, so the lease ends at once.
+async fn admit_source(context: &DriverContext, bucket: &str) -> Result<(), CopyObjectError> {
+    let failed = || CopyObjectError::Get(GetObjectError::GetObjectFailed);
+    let read = StorageEffect::Read {
+        key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+        key: bucket.as_bytes().to_vec().into(),
+        txn_id: None,
+    };
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) =
+        context.storage_handle.send_storage_effect(read).await
+    else {
+        return Err(failed());
+    };
+    let settings = BucketEncryption::from_row(value.as_deref())
+        .map_err(|error| CopyObjectError::Get(GetObjectError::ConversionError(error)))?;
+    let Some(key) = settings.active_key() else {
+        return Ok(());
+    };
+    let blob_handle = context.blob_handle.as_ref().ok_or_else(failed)?;
+    let archive = reference_archive(key);
+    match blob_handle
+        .send_blob_effect(BlobEffect::AdmitRead { key, archive })
+        .await
+    {
+        Event::Blob(BlobEvent::ReadAdmitted { .. }) => Ok(()),
+        Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => Err(CopyObjectError::Get(
+            GetObjectError::ConversionError(ConversionError::BucketKey(error)),
+        )),
+        _ => Err(failed()),
+    }
 }
 
 /// Records a reference of the source's binding at the destination, carrying
@@ -564,7 +679,10 @@ pub(crate) mod test {
     }
 
     /// A rule that admits exactly this node, so a governed write is allowed.
-    fn admits(node_id: NodeId, seed: u8) -> aruna_core::structs::placement::policy::VerifiedPolicy {
+    pub(crate) fn admits(
+        node_id: NodeId,
+        seed: u8,
+    ) -> aruna_core::structs::placement::policy::VerifiedPolicy {
         let policy = aruna_core::structs::placement::policy::PlacementPolicy::new(
             Ulid::from_bytes([seed; 16]),
             "residency".to_string(),
@@ -926,6 +1044,107 @@ pub(crate) mod test {
         let binding = dest_version.source_binding().expect("a reference binding");
         assert_eq!(binding.strategy, StagingStrategy::Reference);
         assert_eq!(binding.descriptor, source.descriptor);
+    }
+
+    #[tokio::test]
+    async fn locked_reference_refused() {
+        // A reference of a locked encrypting bucket is not preserved into another bucket, where
+        // its external bytes would be readable without the source's key.
+        use aruna_core::structs::storage::encryption::EncryptionMode;
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        seed_bucket(&context, "locked", group_id, user_id, Vec::new()).await;
+        seed_bucket(&context, "plain", group_id, user_id, Vec::new()).await;
+        let settings = BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(Ulid::generate()),
+            key_generation: 1,
+            ..Default::default()
+        };
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                key: b"locked".to_vec().into(),
+                value: settings.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([(
+                    "endpoint".to_string(),
+                    "http://127.0.0.1:9".to_string(),
+                )]),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: None,
+        };
+        let metadata = SourceMetadata {
+            content_length: 15,
+            content_type: None,
+            etag: Some("etag-1".to_string()),
+            last_modified: Some(SystemTime::UNIX_EPOCH),
+            source_version: None,
+        };
+        let version = BlobVersion::reference(
+            source,
+            metadata,
+            SystemTime::UNIX_EPOCH,
+            user_id,
+            SystemTime::UNIX_EPOCH,
+        );
+        write_version(&context, "locked", "ref.txt", version).await;
+        let request = |dest_bucket: &str| CopyObjectInput {
+            source_bucket: "locked".to_string(),
+            source_key: "ref.txt".to_string(),
+            source_version_id: None,
+            source_group_id: group_id,
+            source_auth_context: auth_context(user_id),
+            dest_bucket: dest_bucket.to_string(),
+            dest_key: "dest.txt".to_string(),
+            user_id,
+            group_id,
+            realm_id,
+            node_id,
+            quota_ceiling: None,
+            conditions: CopySourceConditions::default(),
+            metadata: None,
+            restrictions: None,
+            references: CopyReferences::Preserve,
+        };
+
+        let refused = copy_object(&context, request("plain")).await;
+
+        assert!(matches!(
+            refused,
+            Err(CopyObjectError::Get(GetObjectError::ConversionError(
+                ConversionError::BucketKey(_)
+            )))
+        ));
+        let head = BlobHeadKey::new("plain", "dest.txt").to_bytes().unwrap();
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                key: head.into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage event");
+        };
+        assert!(value.is_none(), "nothing is published in the plain bucket");
+        // Within its own bucket the reference stays behind the same lock, so it is kept.
+        copy_object(&context, request("locked")).await.unwrap();
     }
 
     #[tokio::test]

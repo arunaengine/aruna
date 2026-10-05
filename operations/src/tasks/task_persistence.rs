@@ -20,7 +20,7 @@ pub(crate) async fn persist_task_effect(
     storage: &StorageHandle,
     effect: &TaskEffect,
 ) -> Result<(), String> {
-    if timer_is_restored(effect) {
+    if timer_is_restored(effect) || timer_is_ephemeral(effect) {
         return Ok(());
     }
 
@@ -54,6 +54,15 @@ fn timer_is_restored(effect: &TaskEffect) -> bool {
             | TaskKey::DrainDeviceIntake
             | TaskKey::DrainLinkQueue
     )
+}
+
+/// Timed locks live in memory only; a restart locks their buckets without them.
+fn timer_is_ephemeral(effect: &TaskEffect) -> bool {
+    let (TaskEffect::ResetTimer { key, .. }
+    | TaskEffect::ShortenTimer { key, .. }
+    | TaskEffect::CancelTimer { key }
+    | TaskEffect::AbortRunningHandlers { key }) = effect;
+    matches!(key, TaskKey::LockBucket { .. })
 }
 
 pub(crate) async fn delete_persisted_timer(storage: &StorageHandle, key: &TaskKey) {
@@ -211,7 +220,7 @@ async fn delete_timer_key(storage: &StorageHandle, key: ByteView) {
     }
 }
 
-fn task_storage_key(key: &TaskKey) -> Result<ByteView, String> {
+pub(crate) fn task_storage_key(key: &TaskKey) -> Result<ByteView, String> {
     postcard::to_allocvec(key)
         .map(ByteView::from)
         .map_err(|error| error.to_string())
@@ -422,6 +431,35 @@ mod tests {
             .expect("timer reads")
             .expect("projection timer exists");
         assert_eq!(timer.key, TaskKey::DrainProjectionQueue);
+    }
+
+    #[tokio::test]
+    async fn timed_locks_ephemeral() {
+        // A restart locks the bucket anyway, so its timed lock never reaches storage.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let key = TaskKey::LockBucket {
+            bucket_id: ulid::Ulid::from_bytes([1; 16]),
+            generation: 2,
+            session_id: ulid::Ulid::from_bytes([3; 16]),
+        };
+        let after = Duration::from_secs(60);
+        for effect in [
+            TaskEffect::ResetTimer {
+                key: key.clone(),
+                after,
+            },
+            TaskEffect::ShortenTimer {
+                key: key.clone(),
+                after,
+            },
+        ] {
+            persist_task_effect(&storage, &effect)
+                .await
+                .expect("nothing to persist");
+        }
+        assert_eq!(read_timer(&storage, &key).await.expect("timer read"), None);
     }
 
     #[tokio::test]

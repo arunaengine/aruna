@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::checksum::checksum_mismatch_error;
-use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
+use aruna_core::errors::{BlobError, ConversionError, SourceResolutionError, StagingSourceError};
+use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::routing::RoutingError;
 use aruna_operations::blob::managed_copy::ManagedCopyError;
 use aruna_operations::driver::{GateContextError, RoutingInputsError};
@@ -46,6 +47,19 @@ fn quota_exceeded_error(limit: u64, usage: u64) -> S3Error {
         format!("Group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes"),
     );
     error.set_status_code(http::StatusCode::FORBIDDEN);
+    error
+}
+
+/// Response header that tells a locked bucket apart from other `AccessDenied` refusals.
+pub(crate) const LOCKED_HEADER: &str = "x-aruna-bucket-locked";
+
+/// Plaintext of a locked encrypted bucket: 403 `AccessDenied` with the locked header.
+pub(crate) fn bucket_locked_error() -> S3Error {
+    let mut error = S3Error::with_message(S3ErrorCode::AccessDenied, "Bucket is locked");
+    error.set_status_code(http::StatusCode::FORBIDDEN);
+    let mut headers = http::HeaderMap::new();
+    headers.insert(LOCKED_HEADER, http::HeaderValue::from_static("true"));
+    error.set_headers(headers);
     error
 }
 
@@ -462,6 +476,9 @@ impl IntoS3Error for GetObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
             GetObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
+            GetObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::Locked(_),
+            )) => bucket_locked_error(),
             GetObjectError::NoSuchVersion => missing_version_error(),
             GetObjectError::HistoricalReferenceUnavailable => {
                 s3_error!(
@@ -654,6 +671,32 @@ impl IntoS3Error for DeleteCorsError {
 mod tests {
     use super::*;
     use aruna_core::errors::BlobError;
+
+    #[test]
+    fn locked_read_denied() {
+        let bucket_id = ulid::Ulid::from_bytes([4; 16]);
+        let locked = || {
+            GetObjectError::ConversionError(ConversionError::BucketKey(BucketKeyError::Locked(
+                bucket_id,
+            )))
+        };
+        let error = locked().into_s3_error();
+        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(error.message(), Some("Bucket is locked"));
+        assert_eq!(error.status_code(), Some(http::StatusCode::FORBIDDEN));
+        let header = error
+            .headers()
+            .and_then(|headers| headers.get(LOCKED_HEADER));
+        assert_eq!(header.and_then(|value| value.to_str().ok()), Some("true"));
+        let copy = CopyObjectError::Get(locked());
+        assert!(copy.into_s3_error().headers().is_some());
+        let denied = GetObjectError::HolderAccessDenied.into_s3_error();
+        assert!(
+            denied
+                .headers()
+                .is_none_or(|headers| !headers.contains_key(LOCKED_HEADER))
+        );
+    }
 
     #[test]
     fn maps_incomplete_body() {

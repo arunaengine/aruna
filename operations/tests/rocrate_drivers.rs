@@ -2015,6 +2015,7 @@ fn run_name(result: Result<JobRunOutcome, tokio::task::JoinError>) -> &'static s
         Ok(JobRunOutcome::Deferred(_)) => "deferred",
         Ok(JobRunOutcome::Cancelled) => "cancelled",
         Ok(JobRunOutcome::Interrupted) => "interrupted",
+        Ok(JobRunOutcome::AwaitingKey(_)) => "awaiting key",
         Err(_) => "panicked",
     }
 }

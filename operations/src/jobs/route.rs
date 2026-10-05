@@ -249,6 +249,7 @@ mod pure_tests {
             workspace_mode: WorkspaceMode::None,
             locally_exhausted: false,
             session_runtime: None,
+            awaiting_keys: Vec::new(),
         }
     }
 

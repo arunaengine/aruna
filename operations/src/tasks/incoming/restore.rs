@@ -263,6 +263,10 @@ impl TaskQueues {
             handler
                 .reschedule_timer(TaskKey::DrainCleanupQueue, Duration::ZERO)
                 .await;
+            // Wakes owed before a restart are delivered again; a run with none is cheap.
+            handler
+                .reschedule_timer(TaskKey::DeliverKeyWakes, Duration::ZERO)
+                .await;
             // A run deletes its timer before the page it works on, so a crash in between
             // leaves an unfinished migration without one. A run with nothing left is cheap.
             handler
