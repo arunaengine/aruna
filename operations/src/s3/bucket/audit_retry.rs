@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::DriverContext;
-use crate::tasks::task_persistence::delete_persisted_timer;
+use crate::tasks::task_persistence::task_storage_key;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, TASK_TIMER_KEYSPACE};
@@ -33,22 +33,52 @@ pub fn retry_effect(record: &BucketAuditRecord) -> Effect {
     })
 }
 
-/// Stores the record a `RecordAudit` timer keeps; its event id makes a repeated write idempotent.
+/// Stores the record a `RecordAudit` timer keeps and deletes the timer's persisted row in the
+/// same transaction, so a crash at any point keeps either the row or the record. The event id
+/// makes a repeated write idempotent.
 pub async fn store_record(context: &DriverContext, key: &TaskKey) -> Result<(), String> {
     let TaskKey::RecordAudit { record } = key else {
         return Err("not an audit record timer".to_string());
     };
     let value = record.to_bytes().map_err(|error| error.to_string())?;
+    let timer = task_storage_key(key)?;
+    let storage = &context.storage_handle;
+    let start = StorageEffect::StartTransaction { read: false };
+    let txn_id = match storage.send_storage_effect(start).await {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        other => return Err(format!("audit record transaction not started: {other:?}")),
+    };
     let write = StorageEffect::Write {
         key_space: BUCKET_AUDIT_KEYSPACE.to_string(),
         key: record.key().into(),
         value: value.into(),
-        txn_id: None,
+        txn_id: Some(txn_id),
     };
-    match context.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected audit record answer: {other:?}")),
+    let delete = StorageEffect::Delete {
+        key_space: TASK_TIMER_KEYSPACE.to_string(),
+        key: timer,
+        txn_id: Some(txn_id),
+    };
+    let written = match storage.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {
+            match storage.send_storage_effect(delete).await {
+                Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+                other => Err(format!("retry timer row not deleted: {other:?}")),
+            }
+        }
+        other => Err(format!("audit record not written: {other:?}")),
+    };
+    if let Err(error) = written {
+        let abort = StorageEffect::AbortTransaction { txn_id };
+        storage.send_storage_effect(abort).await;
+        return Err(error);
+    }
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        other => Err(format!("audit record not committed: {other:?}")),
     }
 }
 
@@ -81,10 +111,7 @@ pub async fn resume_records(context: &DriverContext) -> Result<usize, String> {
                 continue;
             }
             match store_record(context, &timer.key).await {
-                Ok(()) => {
-                    delete_persisted_timer(&context.storage_handle, &timer.key).await;
-                    stored += 1;
-                }
+                Ok(()) => stored += 1,
                 // The timer stays persisted and retries once the task runtime restores it.
                 Err(error) => warn!(error = %error, "Kept audit record still not stored"),
             }
@@ -152,5 +179,81 @@ mod tests {
         assert_eq!(stored, record);
         // The timer is gone, so a second start stores nothing again.
         assert_eq!(resume_records(&context).await, Ok(0));
+    }
+
+    /// Whether `key` holds a row in `key_space`.
+    async fn stored(storage: &aruna_storage::StorageHandle, key_space: &str, key: Vec<u8>) -> bool {
+        let read = StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            txn_id: None,
+        };
+        match storage.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
+            other => panic!("unexpected read answer: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fired_retry_survives_crash() {
+        use crate::jobs::runtime::JobsRuntime;
+        use crate::tasks::incoming::OperationsTaskHandler;
+        use aruna_tasks::InboundTaskHandler;
+        use std::sync::Arc;
+
+        let dir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let handler = Arc::new(OperationsTaskHandler::new(context, JobsRuntime::new()));
+        // The handler is stopped after a growing number of steps, as a crash would stop it,
+        // and the last run completes.
+        for steps in 0..=16 {
+            let record = BucketAuditRecord {
+                event_id: next_event_id(5),
+                bucket_id: Ulid::from_bytes([4; 16]),
+                at_ms: 5,
+                action: AuditAction::TimedLock,
+                actor: None,
+                node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+                generation: Some(1),
+                session_id: Some(Ulid::from_bytes([7; 16])),
+                intent_id: None,
+                deadline_ms: None,
+                reason: None,
+                outcome: AuditOutcome::Applied,
+            };
+            let key = retry_timer(&record);
+            let arm = TaskEffect::ResetTimer {
+                key: key.clone(),
+                after: AUDIT_RETRY,
+            };
+            let persist =
+                crate::tasks::task_persistence::persist_task_effect(&storage_handle, &arm);
+            persist.await.unwrap();
+            let (fired, timer_key) = (Arc::clone(&handler), key.clone());
+            let run = tokio::spawn(async move { fired.handle_timer(timer_key).await });
+            if steps < 16 {
+                for _ in 0..steps {
+                    tokio::task::yield_now().await;
+                }
+                run.abort();
+            }
+            let finished = run.await.is_ok();
+            let row = task_storage_key(&key).unwrap().to_vec();
+            let kept = stored(&storage_handle, TASK_TIMER_KEYSPACE, row).await;
+            let written = stored(&storage_handle, BUCKET_AUDIT_KEYSPACE, record.key()).await;
+            // Never both and never neither: the row goes only with the stored record.
+            assert_ne!(kept, written, "after {steps} steps");
+            if finished {
+                assert!(written, "a finished run stores the record");
+            }
+        }
     }
 }

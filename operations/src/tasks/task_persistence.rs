@@ -220,7 +220,7 @@ async fn delete_timer_key(storage: &StorageHandle, key: ByteView) {
     }
 }
 
-fn task_storage_key(key: &TaskKey) -> Result<ByteView, String> {
+pub(crate) fn task_storage_key(key: &TaskKey) -> Result<ByteView, String> {
     postcard::to_allocvec(key)
         .map(ByteView::from)
         .map_err(|error| error.to_string())

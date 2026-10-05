@@ -967,7 +967,10 @@ pub struct OutboxDrainer {
 #[async_trait]
 impl InboundTaskHandler for OperationsTaskHandler {
     async fn handle_timer(&self, key: TaskKey) {
-        delete_persisted_timer(&self.context.storage_handle, &key).await;
+        // An audit record retry keeps its row until the record is stored, in one transaction.
+        if !matches!(key, TaskKey::RecordAudit { .. }) {
+            delete_persisted_timer(&self.context.storage_handle, &key).await;
+        }
         self.timer_work(key).await;
     }
 }
