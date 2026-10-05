@@ -278,6 +278,66 @@ fn lost_outcome_counts() {
 }
 
 #[test]
+fn unresolved_restart_notified() {
+    use crate::s3::restart_notice::RestartNoticeOperation;
+    use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
+    use aruna_core::structs::execution::notification::NotificationOutboxRecord;
+
+    for action in [AuditAction::Unlock, AuditAction::Extend] {
+        let mut log = Log::default();
+        if action == AuditAction::Extend {
+            log.applied(AuditAction::Unlock, (1, session(1)), Some(NOW - 1));
+        }
+        log.intent(action, (1, session(1)), Some(NOW - 1));
+        let (mut scan, _) = scanned(vec![(
+            b"locked".to_vec(),
+            settings(EncryptionMode::VaultLocked, LOCKED),
+        )]);
+        scan.step(rows(vec![key_row(LOCKED, 1, false)]));
+        let records = log
+            .stored()
+            .iter()
+            .map(|record| (record.key(), record.to_bytes().unwrap()))
+            .collect();
+        scan.step(rows(records));
+        let info = bucket_info();
+        scan.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(b"locked".to_vec()),
+            value: Some(info.to_bytes().unwrap().into()),
+        }));
+        let values = authority_rows(&info, None, &[]);
+        scan.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        scan.step(rows(Vec::new()));
+        scan.step(rows(vec![copy(user(1), 1)]));
+        let found = scan.finalize().unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].generations, [1]);
+        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let mut notice = RestartNoticeOperation::new(node, Ulid::from_parts(NOW, 1), found);
+        notice.start();
+        let effects = notice.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([7; 16]),
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice()
+        else {
+            panic!("restart writes missing")
+        };
+        assert!(txn_id.is_some());
+        assert_eq!(writes.len(), 2);
+        let (space, _, value) = &writes[0];
+        assert_eq!(space, BUCKET_AUDIT_KEYSPACE);
+        let record = BucketAuditRecord::from_bytes(value).unwrap();
+        assert_eq!(record.action, AuditAction::RestartLock);
+        assert_eq!(record.generation, Some(1));
+        let (space, _, value) = &writes[1];
+        assert_eq!(space, NOTIFICATION_OUTBOX_KEYSPACE);
+        let record = NotificationOutboxRecord::from_bytes(value).unwrap();
+        assert_eq!(record.record.recipient, user(1));
+        assert_eq!(record.record.kind.name(), "bucket_locked_by_restart");
+    }
+}
+
+#[test]
 fn expired_sessions_skipped() {
     // A timed session that ended before this start was not unlocked at the restart.
     let mut log = Log::default();
@@ -480,9 +540,8 @@ fn extension_interleavings_kept() {
                             }
                             log.records.last_mut().unwrap().event_id = id(slot + 1);
                         }
-                        assert_eq!(
+                        assert!(
                             !log.open().is_empty(),
-                            live(applied) || live(unresolved),
                             "{intent} {sequence} {outcome}: {applied:?} {unresolved:?}"
                         );
                         for result in [AuditOutcome::Applied, AuditOutcome::Failed] {

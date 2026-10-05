@@ -501,10 +501,11 @@ mod tests {
         let (mut operation, effects) = read(user(1));
         operation.input.duration = Some(Duration::from_secs(60));
         let effects = checked(&mut operation, &effects);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Write { .. })]
-        ));
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("intent missing")
+        };
+        let intent = BucketAuditRecord::from_bytes(value).unwrap();
+        assert_eq!(intent.deadline_ms, Some(61_000));
         operation.step(Event::Storage(StorageEvent::WriteResult {
             key: Vec::new().into(),
         }));
@@ -530,8 +531,17 @@ mod tests {
             (record.deadline_ms, record.sequence),
             (Some(91_000), Some(current.sequence))
         );
+        let mut unlocked = intent.clone();
+        unlocked.event_id = Ulid::from_parts(0, 1);
+        unlocked.action = AuditAction::Unlock;
+        unlocked.outcome = AuditOutcome::Applied;
+        unlocked.sequence = Some(Ulid::from_parts(0, 1));
         assert_eq!(
-            crate::s3::bucket::key_restart::replay(&[record], 76_000),
+            crate::s3::bucket::key_restart::replay(&[unlocked.clone(), intent.clone()], 76_000),
+            [2]
+        );
+        assert_eq!(
+            crate::s3::bucket::key_restart::replay(&[unlocked, intent, record], 76_000),
             [2]
         );
     }

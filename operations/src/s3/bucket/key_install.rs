@@ -477,7 +477,12 @@ mod tests {
             key: operation.key,
             session_id: Ulid::from_bytes([2; 16]),
         };
-        operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket }));
+        let effects = operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket }));
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("intent missing")
+        };
+        let intent = BucketAuditRecord::from_bytes(value).unwrap();
+        assert_eq!(intent.deadline_ms, Some(61_000));
         operation.step(Event::Storage(StorageEvent::WriteResult {
             key: Vec::new().into(),
         }));
@@ -501,7 +506,11 @@ mod tests {
             (Some(91_000), Some(active.sequence))
         );
         assert_eq!(
-            crate::s3::bucket::key_restart::replay(&[record], 76_000),
+            crate::s3::bucket::key_restart::replay(std::slice::from_ref(&intent), 76_000),
+            [1]
+        );
+        assert_eq!(
+            crate::s3::bucket::key_restart::replay(&[intent, record], 76_000),
             [1]
         );
     }

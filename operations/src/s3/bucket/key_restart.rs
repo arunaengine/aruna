@@ -174,6 +174,9 @@ impl Replay {
         match record.outcome {
             AuditOutcome::Intent => {
                 if matches!(record.action, AuditAction::Unlock | AuditAction::Extend) {
+                    let mut pending = pending;
+                    // Activation can follow the request deadline, so only outcomes establish expiry.
+                    pending.session.deadline_ms = None;
                     trail.intents.insert(record.event_id, pending);
                 }
             }

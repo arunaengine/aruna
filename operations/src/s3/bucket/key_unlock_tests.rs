@@ -147,7 +147,7 @@ fn intent_before_activation() {
     }));
     // The timed lock of this session is armed for the remaining time.
     let key = lock_timer(&ticket());
-    let arm = TaskEffect::ResetTimer {
+    let arm = TaskEffect::ShortenTimer {
         key: key.clone(),
         after: Duration::from_secs(60),
     };
@@ -165,6 +165,135 @@ fn intent_before_activation() {
         key: Key::from(Vec::new()),
     }));
     assert_eq!(operation.finalize(), Ok(status));
+}
+
+struct TimerSender(tokio::sync::mpsc::Sender<aruna_core::task::TaskKey>);
+
+#[async_trait::async_trait]
+impl aruna_tasks::InboundTaskHandler for TimerSender {
+    async fn handle_timer(&self, key: aruna_core::task::TaskKey) {
+        self.0.send(key).await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn reversed_unlock_shorten() {
+    use crate::s3::bucket::key_extend::{ExtendBucketOperation, ExtendInput};
+    use aruna_core::handle::Handle;
+
+    let (mut unlock, _) = prepared(user(1), &[]);
+    unlock.step = UnlockStep::ActivateKey;
+    unlock.ticket = Some(ticket());
+    let status = UnlockStatus {
+        key: ticket().key,
+        session_id: ticket().session_id,
+        sequence: Ulid::from_parts(1, 1),
+        deadline_ms: Some(91_000),
+        active: true,
+        unlocked_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        remaining: Some(Duration::from_secs(90)),
+        max_remaining: Some(Duration::from_secs(3_600)),
+    };
+    let mut older = unlock.step(Event::Blob(BlobEvent::KeyActivated {
+        status: status.clone(),
+    }));
+    let mut extension = ExtendBucketOperation::new(ExtendInput {
+        bucket: "bucket".to_string(),
+        group_id: Ulid::from_bytes([3; 16]),
+        realm_id: RealmId::from_bytes([1; 32]),
+        node_id: unlock.input.node_id,
+        caller: user(1),
+        generation: ticket().key.generation,
+        session_id: ticket().session_id,
+        duration: Some(Duration::from_secs(30)),
+        now_ms: 1_000,
+    });
+    extension.start();
+    let info = BucketInfo {
+        group_id: unlock.input.group_id,
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: user(1),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+    };
+    let settings = BucketEncryption {
+        mode: EncryptionMode::VaultLocked,
+        bucket_id: Some(BUCKET_ID),
+        key_generation: ticket().key.generation,
+        ..Default::default()
+    };
+    let values = authority_rows(&info, Some(&settings), &[]);
+    extension.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    extension.step(Event::Blob(BlobEvent::KeyStatus {
+        generations: vec![status.clone()],
+    }));
+    extension.step(Event::Storage(StorageEvent::WriteResult {
+        key: Key::from(Vec::new()),
+    }));
+    extension.step(Event::Storage(StorageEvent::SyncAllFinished));
+    let mut newer = extension.step(Event::Blob(BlobEvent::KeyExtended {
+        status: UnlockStatus {
+            sequence: Ulid::from_parts(1, 2),
+            deadline_ms: Some(31_000),
+            remaining: Some(Duration::from_secs(30)),
+            ..status
+        },
+    }));
+    let scheduler = aruna_tasks::TaskHandle::new();
+    let (sender, mut fired) = tokio::sync::mpsc::channel(2);
+    scheduler
+        .set_inbound_handler(std::sync::Arc::new(TimerSender(sender)))
+        .await;
+    let start = tokio::time::Instant::now();
+    extension.step(scheduler.send_effect(newer.pop().unwrap()).await);
+    unlock.step(scheduler.send_effect(older.pop().unwrap()).await);
+    assert_eq!(fired.recv().await.unwrap(), lock_timer(&ticket()));
+    assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(30));
+    scheduler.shutdown(Duration::ZERO).await;
+}
+
+#[test]
+fn delayed_unlock_unresolved() {
+    let (mut operation, _) = prepared(user(1), &[]);
+    let effects = operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket: ticket() }));
+    let intent = audited(&effects);
+    assert_eq!(intent.deadline_ms, Some(61_000));
+    operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: Key::from(Vec::new()),
+    }));
+    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+        txn_id: Ulid::from_bytes([9; 16]),
+    }));
+    operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+    operation.step(Event::Blob(BlobEvent::KeyActivated {
+        status: UnlockStatus {
+            key: ticket().key,
+            session_id: ticket().session_id,
+            sequence: Ulid::from_parts(31_000, 1),
+            deadline_ms: Some(91_000),
+            active: true,
+            unlocked_at: SystemTime::UNIX_EPOCH + Duration::from_secs(31),
+            remaining: Some(Duration::from_secs(60)),
+            max_remaining: Some(Duration::from_secs(3_600)),
+        },
+    }));
+    let effects = operation.step(Event::Task(aruna_core::task::TaskEvent::TimerScheduled {
+        key: lock_timer(&ticket()),
+        after: Duration::from_secs(60),
+    }));
+    let outcome = audited(&effects);
+    assert_eq!(outcome.deadline_ms, Some(91_000));
+    assert_eq!(
+        crate::s3::bucket::key_restart::replay(std::slice::from_ref(&intent), 76_000),
+        [2]
+    );
+    assert_eq!(
+        crate::s3::bucket::key_restart::replay(&[intent, outcome], 76_000),
+        [2]
+    );
 }
 
 #[test]

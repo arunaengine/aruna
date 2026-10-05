@@ -395,7 +395,7 @@ impl Operation for UnlockBucketOperation {
                 // The registry closes admission at the deadline; the timer records the lock.
                 self.activated = Some(status);
                 self.step = UnlockStep::ArmTimer;
-                smallvec![Effect::Task(TaskEffect::ResetTimer {
+                smallvec![Effect::Task(TaskEffect::ShortenTimer {
                     key: lock_timer(&ticket),
                     after,
                 })]
