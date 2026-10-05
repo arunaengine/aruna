@@ -10,12 +10,12 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_KEY_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_KEY_KEYSPACE,
     PENDING_LOCATION_KEYSPACE, TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE,
     TRANSITION_QUEUE_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::structs::storage::blob::{BackendLocation, VersionKey};
+use aruna_core::structs::storage::blob::{BackendLocation, BlobCleanupWork, VersionKey};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState, SealPlan,
 };
@@ -25,6 +25,7 @@ use aruna_core::structs::storage::transition::{
 };
 use aruna_core::types::{Key, TxnId, Value};
 use aruna_storage::StorageHandle;
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
 /// Versions, or old copies, one run checks per bucket.
@@ -203,6 +204,7 @@ async fn settle(
 ) -> Result<Option<Duration>, String> {
     let storage = &context.storage_handle;
     let prefix: Key = cleanup_prefix(bucket).into();
+    let queued = queued_deletes(storage).await?;
     let mut after = None;
     let mut left = 0u64;
     loop {
@@ -217,7 +219,10 @@ async fn settle(
         .await?;
         for (key, _) in rows {
             let location = key[prefix.len()..].to_vec();
-            if exists(storage, BLOB_LOCATIONS_KEYSPACE, location).await? {
+            // Reclaim drops the row before the backend delete; only finished cleanup work counts.
+            if queued.contains(&location)
+                || exists(storage, BLOB_LOCATIONS_KEYSPACE, location).await?
+            {
                 left += 1;
                 continue;
             }
@@ -302,6 +307,33 @@ fn uses_key(locations: &[BackendLocation], source: BucketKeyRef) -> u64 {
         .iter()
         .filter(|location| location.format.bucket_key() == Some(source));
     sealed.count() as u64
+}
+
+/// Location keys of copies whose physical deletion is still queued or failed and waits for
+/// a retry.
+async fn queued_deletes(storage: &StorageHandle) -> Result<HashSet<Vec<u8>>, String> {
+    let (mut after, mut queued) = (None, HashSet::new());
+    loop {
+        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+            storage,
+            BLOB_CLEANUP_KEYSPACE,
+            None,
+            after,
+            PAGE,
+            None,
+        )
+        .await?;
+        for (_, value) in rows {
+            let work = BlobCleanupWork::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
+            if let Some(Ok(key)) = work.location().map(BackendLocation::location_key) {
+                queued.insert(key.to_bytes());
+            }
+        }
+        match cursor {
+            Some(cursor) => after = Some(cursor),
+            None => return Ok(queued),
+        }
+    }
 }
 
 async fn exists(storage: &StorageHandle, key_space: &str, key: Vec<u8>) -> Result<bool, String> {
@@ -483,5 +515,85 @@ mod tests {
         ];
         assert_eq!(uses_key(&locations, source), 2);
         assert_eq!(uses_key(&locations[1..4], source), 0);
+    }
+
+    fn context(root: &std::path::Path) -> DriverContext {
+        DriverContext {
+            storage_handle: aruna_storage::FjallStorage::open(root.to_str().unwrap()).unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        }
+    }
+
+    async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
+        let write = StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        };
+        let event = context.storage_handle.send_storage_effect(write).await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_delete_keeps_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = context(directory.path());
+        let target = TransitionTarget {
+            compression: Compression::Off,
+            plan: None,
+        };
+        let mut record = EncryptionTransition::new(TransitionKind::Decrypt, None, target, 2, 1);
+        record.state = TransitionState::Cleanup;
+        put(
+            &context,
+            TRANSITION_KEYSPACE,
+            b"b".to_vec(),
+            record.to_bytes().unwrap(),
+        )
+        .await;
+        let mut old = pending(None);
+        let hash = aruna_core::structs::checksum::HASH_BLAKE3.to_string();
+        old.hashes.insert(hash, vec![7; 32]);
+        let old_key = old.location_key().unwrap().to_bytes();
+        let cleanup = aruna_core::structs::storage::transition::cleanup_key("b", &old_key);
+        put(&context, TRANSITION_CLEANUP_KEYSPACE, cleanup, Vec::new()).await;
+        // Reclaim removed the location row, but the backend delete is still queued or failed.
+        let work = BlobCleanupWork::DeleteBlob { location: old }
+            .to_bytes()
+            .unwrap();
+        let work_key = Ulid::generate().to_bytes().to_vec();
+        put(&context, BLOB_CLEANUP_KEYSPACE, work_key.clone(), work).await;
+
+        let wait = settle(&context, "b", record.clone()).await.unwrap();
+
+        assert_eq!(wait, Some(RECHECK));
+        let stored = read_record(&context.storage_handle, "b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.cleanup_remaining, 1);
+        assert_eq!(stored.finished_at_ms, None);
+
+        // Only a finished delete removes the work row; then the transition may finish.
+        let delete = StorageEffect::Delete {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: work_key.into(),
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(delete).await;
+        assert_eq!(settle(&context, "b", stored).await.unwrap(), None);
+        let stored = read_record(&context.storage_handle, "b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.reported_state(), TransitionState::Finished);
     }
 }
