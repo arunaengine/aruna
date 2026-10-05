@@ -4,14 +4,14 @@
 
 pub mod access;
 pub mod bucket;
+pub mod holder_seal;
+pub mod key_status;
 pub mod listing;
 pub mod multipart;
 pub mod object;
 pub mod policy;
 pub mod purge_fence;
-pub mod session;
-mod write_cleanup;
-pub mod key_status;
 pub mod restart_notice;
-pub mod holder_seal;
+pub mod session;
 pub mod unlock_limit;
+mod write_cleanup;
