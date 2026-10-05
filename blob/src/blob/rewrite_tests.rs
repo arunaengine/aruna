@@ -199,3 +199,56 @@ async fn replaces_archive_grants() {
     // The old archive is untouched until its copy is reclaimed.
     assert_eq!(opened(&handler, &sealed, old_private).await.unwrap(), data);
 }
+
+#[tokio::test]
+async fn retired_generations_free() {
+    // Two settled rotations without restart: generation 3 needs the slot of retired generation 1.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let bucket_id = Ulid::generate();
+    let (first, first_private, first_public) = bucket_key(bucket_id, 1, 7);
+    let (second, second_private, second_public) = bucket_key(bucket_id, 2, 8);
+    let (third, third_private, third_public) = bucket_key(bucket_id, 3, 9);
+    let source = plain(&handler, b"retired generation").await;
+    let event = rewritten(&handler, source, None, sealing(first, first_public), false).await;
+    let BlobEvent::CopyRewritten { location: sealed } = event else {
+        panic!("sealing failed: {event:?}")
+    };
+    let lease = admitted(&handler, first, first_private, first_public, &sealed).await;
+    admitted(&handler, second, second_private, second_public, &sealed).await;
+    let prepare = |key, private: [u8; 32], public_key| BlobEffect::PrepareKey {
+        key,
+        public_key,
+        private_key: SharedSecret::new(SecretBytes::new(private.to_vec())),
+        duration: None,
+        max: None,
+    };
+    let full = handler.unlock_effect(prepare(third, third_private, third_public));
+    assert!(matches!(
+        full,
+        BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Capacity))
+    ));
+
+    let BlobEvent::KeyStatus { generations } =
+        handler.unlock_effect(BlobEffect::ReadKeyStatus { bucket_id })
+    else {
+        panic!("no key status")
+    };
+    for status in generations.iter().filter(|status| status.key == first) {
+        let ticket = aruna_core::structs::storage::encryption::KeyTicket {
+            key: first,
+            session_id: status.session_id,
+        };
+        handler.unlock_effect(BlobEffect::DiscardKey { ticket });
+    }
+
+    let prepared = handler.unlock_effect(prepare(third, third_private, third_public));
+    assert!(matches!(prepared, BlobEvent::KeyPrepared { .. }));
+    // The admitted read of generation 1 still finishes with its own key.
+    let target = ResolvedBackend::node_default();
+    let event = rewritten(&handler, sealed, Some(lease), target, false).await;
+    assert!(
+        matches!(event, BlobEvent::CopyRewritten { .. }),
+        "{event:?}"
+    );
+}

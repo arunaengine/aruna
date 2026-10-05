@@ -6,9 +6,9 @@
 use crate::blob::migration::MIGRATION_CONTINUE;
 use crate::blob::migration_rewrite::{RewriteOutcome, RewriteVersionOperation};
 use crate::driver::DriverContext;
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_KEY_KEYSPACE,
     PENDING_LOCATION_KEYSPACE, TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE,
@@ -17,7 +17,7 @@ use aruna_core::keyspaces::{
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::structs::storage::blob::{BackendLocation, BlobCleanupWork, VersionKey};
 use aruna_core::structs::storage::encryption::{
-    BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState, SealPlan,
+    BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState, KeyTicket, SealPlan, UnlockStatus,
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::transition::{
@@ -262,8 +262,47 @@ async fn settle(
     record.blocked_reason = None;
     record.state = TransitionState::Finished;
     record.finished_at_ms = Some(now);
-    store(storage, bucket, &record).await?;
+    if store(storage, bucket, &record).await? {
+        forget_retired(context, &record).await;
+    }
     Ok(None)
+}
+
+/// The sessions of a retired source generation; admitted leases keep their own key handle.
+fn retired_sessions(generations: &[UnlockStatus], record: &EncryptionTransition) -> Vec<KeyTicket> {
+    let Some(source) = record.source else {
+        return Vec::new();
+    };
+    if record.target.plan.map(|plan| plan.key) == Some(source) {
+        return Vec::new();
+    }
+    let sessions = generations.iter().filter(|status| status.key == source);
+    sessions
+        .map(|status| KeyTicket {
+            key: status.key,
+            session_id: status.session_id,
+        })
+        .collect()
+}
+
+/// Drops a retired generation from the unlock registry, so it no longer takes a generation
+/// slot. A failure only leaves the key until the next lock or restart.
+async fn forget_retired(context: &DriverContext, record: &EncryptionTransition) {
+    let (Some(blob), Some(source)) = (context.blob_handle.as_ref(), record.source) else {
+        return;
+    };
+    let status = BlobEffect::ReadKeyStatus {
+        bucket_id: source.bucket_id,
+    };
+    let Event::Blob(BlobEvent::KeyStatus { generations }) = blob.send_blob_effect(status).await
+    else {
+        tracing::warn!("Could not read the unlock state of a retired key generation");
+        return;
+    };
+    for ticket in retired_sessions(&generations, record) {
+        blob.send_blob_effect(BlobEffect::DiscardKey { ticket })
+            .await;
+    }
 }
 
 /// Why a transition waits after every other copy moved.
@@ -354,7 +393,7 @@ async fn store(
     storage: &StorageHandle,
     bucket: &str,
     record: &EncryptionTransition,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let txn_id = match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
@@ -367,13 +406,13 @@ async fn store(
         storage
             .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
             .await;
-        return staged.map(|_| ());
+        return staged;
     }
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
         other => Err(format!("transition progress was not stored: {other:?}")),
     }
 }
@@ -595,5 +634,45 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.reported_state(), TransitionState::Finished);
+    }
+
+    #[test]
+    fn retired_sessions_only() {
+        let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
+        let newer = BucketKeyRef::new(source.bucket_id, 2);
+        let status = |key, seed| UnlockStatus {
+            key,
+            session_id: Ulid::from_bytes([seed; 16]),
+            active: true,
+            unlocked_at: SystemTime::UNIX_EPOCH,
+            remaining: None,
+            max_remaining: None,
+        };
+        let generations = [status(source, 5), status(newer, 6)];
+        let plan = |key| SealPlan {
+            key,
+            public_key: [2; 32],
+            cipher: Default::default(),
+            block_keys: Default::default(),
+            storage_generation: 3,
+        };
+        let rotate = TransitionTarget {
+            compression: Compression::Off,
+            plan: Some(plan(newer)),
+        };
+        let kind = TransitionKind::Rotate;
+        let rotation = EncryptionTransition::new(kind, Some(source), rotate, 3, 1);
+        let retired = retired_sessions(&generations, &rotation);
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].key, source);
+
+        // A re-encode keeps its key, so nothing retires.
+        let same = TransitionTarget {
+            compression: Compression::Off,
+            plan: Some(plan(source)),
+        };
+        let kind = TransitionKind::Reencode;
+        let reencode = EncryptionTransition::new(kind, Some(source), same, 3, 1);
+        assert!(retired_sessions(&generations, &reencode).is_empty());
     }
 }
