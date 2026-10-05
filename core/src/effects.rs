@@ -23,7 +23,9 @@ use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::structs::placement::policy::document::PolicyPublicationClaim;
 use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::blob::{ArchiveKey, BackendLocation, HiddenBlobKey, ResolvedBackend};
-use crate::structs::storage::encryption::{BucketKeyRef, CopyTarget, KeyTicket, ReadLease};
+use crate::structs::storage::encryption::{
+    BucketKeyRef, CopyTarget, KeyTicket, ReadLease, TokenCopy,
+};
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use crate::structs::storage::multipart::{BackendUpload, MultipartPart, WorkingShare};
 use crate::structs::storage::usage::UsageDelta;
@@ -297,6 +299,26 @@ pub enum BlobEffect {
     /// are loaded. Answers `ComposeReserved`.
     ReserveCompose {
         content: u64,
+    },
+    /// Draws a fresh token key and seals the unlocked key of each of `keys` with it for
+    /// `access_key`. Answers `TokenSealed`; a locked generation answers `Locked`.
+    SealToken {
+        keys: Vec<BucketKeyRef>,
+        realm_id: RealmId,
+        node_id: NodeId,
+        access_key: String,
+        created_by: UserId,
+    },
+    /// Admits a plaintext read of `archive` with the key `token` opens from `copy`, outside the
+    /// unlock registry. Answers `ReadAdmitted`; a wrong token answers `InvalidToken`.
+    AdmitToken {
+        key: BucketKeyRef,
+        archive: ArchiveKey,
+        copy: Box<TokenCopy>,
+        public_key: [u8; 32],
+        token: SharedSecret,
+        realm_id: RealmId,
+        node_id: NodeId,
     },
     /// Sends the copy at `location` of an encrypting bucket under `lease`, which covers the
     /// transfer. A sealed copy with `regrant` is granted to that key and sent as stored bytes;

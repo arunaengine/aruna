@@ -11,6 +11,8 @@ use crate::key_seal::seal_to;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::ArchiveKey;
 use crate::vault_format::key_fingerprint;
+use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::{Aead, KeyInit, Nonce, Payload};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fmt;
@@ -24,12 +26,15 @@ use zeroize::Zeroizing;
 
 /// HPKE purpose label of a bucket private key sealed to a user key.
 pub const COPY_PURPOSE: &[u8] = b"aruna bucket key copy v1";
+/// AES-GCM purpose label of a bucket private key sealed with a token key.
+pub const TOKEN_PURPOSE: &[u8] = b"aruna bucket key token v1";
 /// Holder tag of a user copy in a copy key.
 const USER_TAG: u8 = 1;
-/// Reserved for token credential copies (stage 5): tag, then the access key. Never stored yet.
+/// Holder tag of a token credential copy: tag, then the access key.
 const TOKEN_TAG: u8 = 2;
 const REF_LEN: usize = 24;
 const USER_KEY_LEN: usize = 48;
+const TOKEN_LEN: usize = 32;
 
 /// Names one key generation of one bucket. Keys bind to a stable id, because a deleted
 /// bucket's name may be used again.
@@ -348,7 +353,14 @@ impl SealedCopy {
         [&key.key()[..], &[USER_TAG], &user_id.to_storage_key()].concat()
     }
 
-    /// Reads the reference and user of a copy key. Token copies are refused until stage 5.
+    /// The user copy rows of a `bucket_key_copies` scan; token copies are left out undecoded.
+    pub fn user_rows<K: AsRef<[u8]>, V>(rows: Vec<(K, V)>) -> Vec<(K, V)> {
+        rows.into_iter()
+            .filter(|(key, _)| Self::parse_key(key.as_ref()).is_ok())
+            .collect()
+    }
+
+    /// Reads the reference and user of a copy key. A token copy key is refused.
     pub fn parse_key(bytes: &[u8]) -> Result<(BucketKeyRef, UserId, Ulid), ConversionError> {
         let (reference, rest) = bytes
             .split_at_checked(REF_LEN)
@@ -375,6 +387,104 @@ impl SealedCopy {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// A bucket private key sealed with AES-256-GCM under the random key of a token credential,
+/// stored in `bucket_key_copies`. Only the client holds the token key.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TokenCopy {
+    pub key: BucketKeyRef,
+    pub access_key: String,
+    /// The holder who created the credential; the copy opens only while they hold the key.
+    pub created_by: UserId,
+    pub nonce: [u8; 12],
+    pub ciphertext: Vec<u8>,
+    pub created_at_ms: u64,
+}
+
+impl TokenCopy {
+    pub fn key(&self) -> Vec<u8> {
+        Self::copy_key(self.key, &self.access_key)
+    }
+
+    /// Reference, token tag and access key.
+    pub fn copy_key(key: BucketKeyRef, access_key: &str) -> Vec<u8> {
+        [&key.key()[..], &[TOKEN_TAG], access_key.as_bytes()].concat()
+    }
+
+    /// Reads the reference and access key of a token copy key; a user copy key is refused.
+    pub fn parse_key(bytes: &[u8]) -> Result<(BucketKeyRef, String), ConversionError> {
+        let (reference, rest) = bytes
+            .split_at_checked(REF_LEN)
+            .ok_or_else(|| ConversionError::InvalidLength("token copy key".to_string()))?;
+        match rest.split_first() {
+            Some((&TOKEN_TAG, access_key)) if !access_key.is_empty() => Ok((
+                BucketKeyRef::from_key(reference)?,
+                String::from_utf8(access_key.to_vec())?,
+            )),
+            _ => Err(ConversionError::InvalidLength(
+                "token copy holder".to_string(),
+            )),
+        }
+    }
+
+    /// The `bucket_key_tokens` key of this copy: access key, a zero byte, then the reference.
+    pub fn index_key(&self) -> Vec<u8> {
+        [&Self::index_prefix(&self.access_key)[..], &self.key.key()].concat()
+    }
+
+    /// Scan prefix of the copies of one credential; access keys are alphanumeric.
+    pub fn index_prefix(access_key: &str) -> Vec<u8> {
+        [access_key.as_bytes(), &[0]].concat()
+    }
+
+    /// The reference an index key of `access_key` names.
+    pub fn parse_index(bytes: &[u8], access_key: &str) -> Result<BucketKeyRef, ConversionError> {
+        let reference = bytes
+            .strip_prefix(Self::index_prefix(access_key).as_slice())
+            .ok_or_else(|| ConversionError::InvalidLength("token index key".to_string()))?;
+        BucketKeyRef::from_key(reference)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// The access key and token of a token credential, held for one request only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TokenCredential {
+    pub access_key: String,
+    pub token: SharedSecret,
+}
+
+impl TokenCredential {
+    /// The token as clients send it in `x-amz-security-token`: lowercase hex.
+    pub fn encode(token: &SecretBytes) -> Zeroizing<String> {
+        Zeroizing::new(hex::encode(token.expose()))
+    }
+
+    /// Reads a token a client sent; anything but 32 hex-encoded bytes is refused.
+    pub fn parse(access_key: &str, text: &[u8]) -> Option<Self> {
+        let mut bytes = Zeroizing::new([0u8; TOKEN_LEN]);
+        hex::decode_to_slice(text, bytes.as_mut_slice()).ok()?;
+        Some(Self {
+            access_key: access_key.to_string(),
+            token: SharedSecret::new(SecretBytes::new(bytes.to_vec())),
+        })
+    }
+}
+
+impl fmt::Debug for TokenCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenCredential")
+            .field("access_key", &self.access_key)
+            .finish_non_exhaustive()
     }
 }
 
@@ -542,6 +652,99 @@ pub fn copy_info(
     .concat()
 }
 
+/// A fresh random token key from the system random number generator.
+pub fn generate_token() -> Result<SharedSecret, BucketKeyError> {
+    let mut bytes = Zeroizing::new(vec![0u8; TOKEN_LEN]);
+    getrandom::fill(&mut bytes).map_err(|_| BucketKeyError::Seal)?;
+    Ok(SharedSecret::new(SecretBytes::new(std::mem::take(
+        &mut *bytes,
+    ))))
+}
+
+/// Seals the private key of `key` with `token`, bound to this realm, node and access key.
+/// The key must match `public_key`, so a wrong key is never handed out.
+pub fn seal_token(
+    key: BucketKeyRef,
+    public_key: &[u8; 32],
+    private: &SecretBytes,
+    origin: (RealmId, NodeId),
+    holder: (&str, UserId),
+    token: &SecretBytes,
+    now_ms: u64,
+) -> Result<TokenCopy, BucketKeyError> {
+    if !key_matches(private, public_key) {
+        return Err(BucketKeyError::WrongKey);
+    }
+    let (access_key, created_by) = holder;
+    let cipher = token_cipher(token).ok_or(BucketKeyError::Seal)?;
+    let mut nonce = [0u8; 12];
+    getrandom::fill(&mut nonce).map_err(|_| BucketKeyError::Seal)?;
+    let aad = token_info(origin.0, origin.1, key, access_key);
+    let payload = Payload {
+        msg: private.expose(),
+        aad: &aad,
+    };
+    let ciphertext = cipher
+        .encrypt(&Nonce::<Aes256Gcm>::from(nonce), payload)
+        .map_err(|_| BucketKeyError::Seal)?;
+    Ok(TokenCopy {
+        key,
+        access_key: access_key.to_string(),
+        created_by,
+        nonce,
+        ciphertext,
+        created_at_ms: now_ms,
+    })
+}
+
+/// Opens `copy` with `token`. Another token or binding fails as `InvalidToken`; a key that does
+/// not match `public_key` fails as `WrongKey`.
+pub fn open_token(
+    copy: &TokenCopy,
+    public_key: &[u8; 32],
+    origin: (RealmId, NodeId),
+    token: &SecretBytes,
+) -> Result<SecretBytes, BucketKeyError> {
+    let cipher = token_cipher(token).ok_or(BucketKeyError::InvalidToken)?;
+    let aad = token_info(origin.0, origin.1, copy.key, &copy.access_key);
+    let payload = Payload {
+        msg: &copy.ciphertext,
+        aad: &aad,
+    };
+    let private = cipher
+        .decrypt(&Nonce::<Aes256Gcm>::from(copy.nonce), payload)
+        .map(SecretBytes::new)
+        .map_err(|_| BucketKeyError::InvalidToken)?;
+    if !key_matches(&private, public_key) {
+        return Err(BucketKeyError::WrongKey);
+    }
+    Ok(private)
+}
+
+fn token_cipher(token: &SecretBytes) -> Option<Aes256Gcm> {
+    let key = <&[u8; TOKEN_LEN]>::try_from(token.expose()).ok()?;
+    Some(Aes256Gcm::new(key.into()))
+}
+
+/// AAD of a token copy: the purpose label, then the realm, node, bucket and generation, and the
+/// access key last, so the encoding is canonical.
+pub fn token_info(
+    realm_id: RealmId,
+    node_id: NodeId,
+    key: BucketKeyRef,
+    access_key: &str,
+) -> Vec<u8> {
+    [
+        TOKEN_PURPOSE,
+        &[0],
+        realm_id.as_bytes(),
+        node_id.as_bytes(),
+        &key.key(),
+        access_key.as_bytes(),
+    ]
+    .concat()
+}
+
 /// Typed failures of bucket keys, unlock state and encrypted content access.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum BucketKeyError {
@@ -565,6 +768,9 @@ pub enum BucketKeyError {
     Seal,
     #[error("this encrypted bucket operation is not supported yet")]
     Unsupported,
+    /// The token of a token credential does not open its copy of the bucket key.
+    #[error("the token does not open the bucket key")]
+    InvalidToken,
 }
 
 #[cfg(test)]

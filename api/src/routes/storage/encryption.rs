@@ -231,6 +231,7 @@ pub(crate) fn key_refusal(error: &BucketKeyError) -> ServerError {
         BucketKeyError::InvalidDuration => (StatusCode::BAD_REQUEST, "invalid_duration"),
         BucketKeyError::Seal => return ServerError::InternalError(message),
         BucketKeyError::Unsupported => (StatusCode::NOT_IMPLEMENTED, "not_supported"),
+        BucketKeyError::InvalidToken => (StatusCode::FORBIDDEN, "invalid_token"),
     };
     ServerError::Refused(status, code, message)
 }

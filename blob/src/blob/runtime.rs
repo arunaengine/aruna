@@ -112,6 +112,8 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::ServeSealedRead { .. } => (EffectClass::Transfer, "serve_sealed_read"),
         BlobEffect::ReserveCompose { .. } => (EffectClass::Local, "reserve_compose"),
         BlobEffect::ReplicateLeased { .. } => (EffectClass::Transfer, "replicate_leased"),
+        BlobEffect::SealToken { .. } => (EffectClass::Local, "seal_token"),
+        BlobEffect::AdmitToken { .. } => (EffectClass::Local, "admit_token"),
     }
 }
 
@@ -914,6 +916,25 @@ impl BlobHandler {
                 let ids = (replication_id, stream_id);
                 let regrant = regrant.map(|plan| *plan);
                 Box::pin(self.replicate_leased(ids, location, *lease, regrant)).await
+            }
+            BlobEffect::SealToken {
+                keys,
+                realm_id,
+                node_id,
+                access_key,
+                created_by,
+            } => self.seal_token(&keys, (realm_id, node_id), (&access_key, created_by)),
+            BlobEffect::AdmitToken {
+                key,
+                archive,
+                copy,
+                public_key,
+                token,
+                realm_id,
+                node_id,
+            } => {
+                let copy = (*copy, public_key);
+                Box::pin(self.admit_token(key, archive, copy, (realm_id, node_id), token)).await
             }
         }
     }
