@@ -9,6 +9,7 @@ use crate::driver::DriverContext;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_KEY_KEYSPACE,
     PENDING_LOCATION_KEYSPACE, TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE,
@@ -25,6 +26,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::transition::{
     EncryptionTransition, TransitionKind, TransitionState, TransitionTarget, cleanup_prefix,
 };
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, TxnId, Value};
 use aruna_storage::StorageHandle;
 use std::collections::HashSet;
@@ -38,6 +40,79 @@ const BUCKET_PAGE: usize = 16;
 pub const RECHECK: Duration = Duration::from_secs(60);
 /// Passes with failures started again before the transition reports itself blocked.
 const RETRIES: u32 = 10;
+
+/// Clears matching retry deadlines and wakes the worker when a source key becomes usable.
+pub(crate) async fn resume_transitions(
+    context: &DriverContext,
+    key: BucketKeyRef,
+) -> Result<(), String> {
+    let storage = &context.storage_handle;
+    let (mut after, mut resumed) = (None, false);
+    loop {
+        let mut transaction = storage
+            .start_transaction(false)
+            .await
+            .map_err(|e| e.to_string())?;
+        let txn_id = transaction.id().ok_or("missing wake transaction")?;
+        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+            storage,
+            TRANSITION_KEYSPACE,
+            None,
+            after,
+            BUCKET_PAGE,
+            Some(txn_id),
+        )
+        .await?;
+        for (row, value) in rows {
+            let mut record = EncryptionTransition::from_bytes(&value).map_err(|e| e.to_string())?;
+            if record.source != Some(key) || record.finished_at_ms.is_some() {
+                continue;
+            }
+            record.retry_at_ms = None;
+            let value = record.to_bytes().map_err(|e| e.to_string())?.into();
+            let write = StorageEffect::Write {
+                key_space: TRANSITION_KEYSPACE.to_string(),
+                key: row,
+                value,
+                txn_id: Some(txn_id),
+            };
+            match storage.send_storage_effect(write).await {
+                Event::Storage(StorageEvent::WriteResult { .. }) => resumed = true,
+                other => return Err(format!("could not resume transition: {other:?}")),
+            }
+        }
+        let event = storage
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await;
+        if !matches!(
+            event,
+            Event::Storage(StorageEvent::TransactionCommitted { .. })
+        ) {
+            transaction.unknown();
+            return Err(format!("transition wake was not stored: {event:?}"));
+        }
+        transaction.finish();
+        match cursor {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
+    if resumed {
+        let effect = TaskEffect::ShortenTimer {
+            key: TaskKey::MigrateCompression,
+            after: Duration::ZERO,
+        };
+        crate::tasks::task_persistence::persist_task_effect(storage, &effect).await?;
+        if let Some(tasks) = context.task_handle.as_ref()
+            && let Event::Task(TaskEvent::Error { message, .. }) = tasks
+                .send_effect(aruna_core::effects::Effect::Task(effect))
+                .await
+        {
+            return Err(message);
+        }
+    }
+    Ok(())
+}
 
 /// Advances every queued transition by one page. Returns when the task must run again.
 pub async fn process_transitions(context: &DriverContext) -> Result<Option<Duration>, String> {
@@ -194,6 +269,13 @@ async fn advance(
     };
     record.retry_at_ms = wait.map(|wait| now.saturating_add(wait.as_millis() as u64));
     store(&context.storage_handle, bucket, &mut record).await?;
+    if record.state == TransitionState::AwaitingKey
+        && let Some(key) = record.source
+        && crate::jobs::runtime::key_unlocked(context, key).await
+    {
+        resume_transitions(context, key).await?;
+        return Ok(Some(Duration::ZERO));
+    }
     Ok(wait)
 }
 

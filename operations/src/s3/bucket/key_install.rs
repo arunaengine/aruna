@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::{DriverContext, drive};
+use crate::jobs::key_wake::wake_unlocked;
 use crate::s3::bucket::audit_retry::{AUDIT_ATTEMPTS, retry_effect, retry_timer};
 use crate::s3::bucket::key_lock::{answers_timer, lock_timer};
 use aruna_core::compute::SharedSecret;
@@ -11,6 +13,8 @@ use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketKeyRef, KeyTicket, UnlockStatus, deadline_after,
 };
@@ -382,6 +386,26 @@ impl Operation for InstallKeyOperation {
     }
 }
 
+/// Installs a key, then resumes its waiting work; a failed resume is reported.
+pub async fn install_and_wake(
+    context: &DriverContext,
+    operation: InstallKeyOperation,
+    origin: (RealmId, NodeId),
+    limits: &RoCrateLimits,
+) -> Result<UnlockStatus, InstallError> {
+    let status = drive(operation, context).await?;
+    let now_ms = aruna_core::time::unix_timestamp_millis();
+    if let Err(error) = wake_unlocked(context, status.key, now_ms, origin, limits).await {
+        tracing::warn!(
+            bucket_id = %status.key.bucket_id,
+            generation = status.key.generation,
+            error = %error,
+            "Failed to resume work waiting for an installed key"
+        );
+    }
+    Ok(status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,17 +643,18 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn enable_then_install() {
+    async fn enabled_context() -> (
+        tempfile::TempDir,
+        DriverContext,
+        crate::s3::bucket::encryption::EnableResult,
+    ) {
         use crate::driver::{DriverContext, drive};
         use crate::s3::bucket::create::CreateBucketOperation;
         use crate::s3::bucket::encryption::{EnableEncryptionOperation, EnableInput};
         use aruna_blob::blob::BlobHandler;
         use aruna_core::UserId;
         use aruna_core::effects::StorageEffect;
-        use aruna_core::events::StorageEvent;
-        use aruna_core::keyspaces::KEY_COPY_KEYSPACE;
-        use aruna_core::node_vault::{NodeVaultKey, VaultEntry, VaultPurpose};
+        use aruna_core::node_vault::NodeVaultKey;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
         use aruna_core::structs::storage::encryption::{BlockCipher, BlockKeys, EncryptionMode};
@@ -641,7 +666,13 @@ mod tests {
         let root = dir.path().to_str().unwrap();
         let storage = aruna_storage::FjallStorage::open(root).unwrap();
         storage.open_vault(NodeVaultKey::random());
-        let net = aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage.clone())
+        let net_config = aruna_net::NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            discovery_method: aruna_net::DiscoveryMethod::None,
+            relay_method: aruna_net::RelayMethod::None,
+            ..Default::default()
+        };
+        let net = aruna_net::NetHandle::new(net_config, storage.clone())
             .await
             .unwrap();
         let config = BackendConfig {
@@ -730,7 +761,62 @@ mod tests {
         )
         .await
         .unwrap();
+        (dir, context, enabled)
+    }
+
+    #[tokio::test]
+    async fn install_wakes_parked() {
+        use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, park_job, read_job_record};
+        use aruna_core::keyspaces::KEY_COPY_KEYSPACE;
+        use aruna_core::node_vault::{VaultEntry, VaultPurpose};
+        use aruna_core::structs::execution::job::{
+            JobId, JobPayload, JobRecord, JobState, KeyWait, due_index_key,
+        };
+
+        let (_dir, context, enabled) = enabled_context().await;
+        let storage = &context.storage_handle;
+        let node = context.net_handle.as_ref().unwrap().node_id();
+        let realm = RealmId::from_bytes([1; 32]);
+        let creator = UserId::new(Ulid::from_bytes([5; 16]), realm);
         let key = enabled.key.clone();
+        let job_id = JobId::from_bytes([8; 16]);
+        let payload = JobPayload::Probe {
+            steps: 1,
+            step_sleep_ms: 0,
+            fail_at: None,
+            panic_at: None,
+            cleanup_marker: None,
+        };
+        let job = JobRecord::new(job_id, payload, creator, node, 1_000, 1_000, None);
+        insert_job(storage, &job).await.unwrap();
+        let ClaimOutcome::Claimed(claimed) = claim_job(storage, job_id, node, 2_000).await.unwrap()
+        else {
+            panic!("job must be claimed")
+        };
+        let wait = KeyWait {
+            node_id: node,
+            bucket: "sealed".to_string(),
+            group_id: None,
+            key: key.key,
+        };
+        park_job(
+            storage,
+            job_id,
+            claimed.claim.unwrap().claim_token,
+            3_000,
+            vec![wait],
+        )
+        .await
+        .unwrap();
+        assert!(!crate::jobs::runtime::key_unlocked(&context, key.key).await);
+        assert_eq!(
+            read_job_record(storage, job_id, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::AwaitingKey
+        );
         let install = InstallKeyOperation::new(InstallInput {
             key: key.key,
             public_key: key.public_key,
@@ -738,8 +824,24 @@ mod tests {
             duration: None,
             max: None,
         });
-        let status = drive(install, &context).await.unwrap();
+        let status = install_and_wake(&context, install, (realm, node), &RoCrateLimits::default())
+            .await
+            .unwrap();
         assert!(status.active && status.remaining.is_none());
+        let job = read_job_record(storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.state, JobState::Queued);
+        let scheduled = StorageEffect::Read {
+            key_space: aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE.to_string(),
+            key: due_index_key(job.due_at_ms, job_id),
+            txn_id: None,
+        };
+        assert!(matches!(
+            storage.send_storage_effect(scheduled).await,
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
+        ));
 
         // The node copy opens to the installed key; the creator's copy is stored.
         let entry = VaultEntry::new(VaultPurpose::BucketKey, key.vault_entry.unwrap());
@@ -773,5 +875,181 @@ mod tests {
             panic!("no copies");
         };
         assert_eq!(values.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unlock_resumes_rewrite() {
+        use crate::blob::migration_queue::{RECHECK, process_transitions};
+        use crate::jobs::key_wake::read_row;
+        use crate::s3::bucket::key_unlock::{UnlockBucketOperation, UnlockInput, unlock_and_wake};
+        use crate::tests::incoming::{RecordingTaskHandler, freeze_clock};
+        use aruna_core::handle::Handle;
+        use aruna_core::keyspaces::{
+            BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, TRANSITION_KEYSPACE,
+        };
+        use aruna_core::stream::BackendStream;
+        use aruna_core::structs::storage::blob::{BlobVersion, ResolvedBackend, VersionKey};
+        use aruna_core::structs::storage::encryption::SealPlan;
+        use aruna_core::structs::storage::format::Compression;
+        use aruna_core::structs::storage::transition::{
+            EncryptionTransition, TransitionKind, TransitionState, TransitionTarget,
+        };
+        use aruna_core::task::{TaskEffect, TaskKey};
+
+        let (_dir, mut context, enabled) = enabled_context().await;
+        let key = enabled.key.key;
+        let plan = SealPlan::capture(&enabled.settings, &enabled.key)
+            .unwrap()
+            .unwrap();
+        let blob = context.blob_handle.as_ref().unwrap();
+        let stream = BackendStream(Box::pin(futures_util::stream::once(async {
+            Ok(bytes::Bytes::from_static(b"waiting encrypted bytes"))
+        })));
+        let write = BlobEffect::Write {
+            bucket: "sealed".to_string(),
+            key: "data".to_string(),
+            resolved: ResolvedBackend::node_default().with_encryption(Some(SealPlan {
+                storage_generation: 0,
+                ..plan
+            })),
+            created_by: UserId::default(),
+            blob: stream,
+            size: Some(23),
+        };
+        let Event::Blob(BlobEvent::WriteFinished { location }) = blob.send_blob_effect(write).await
+        else {
+            panic!("archive must be written")
+        };
+        let version_key = VersionKey::new("sealed", "data", Ulid::from_bytes([8; 16]));
+        let version = BlobVersion::materialized(
+            location.get_blake3().unwrap().try_into().unwrap(),
+            location.backend.clone(),
+            location.format.encoding(),
+            SystemTime::UNIX_EPOCH,
+            UserId::default(),
+            None,
+        );
+        let transition = EncryptionTransition::new(
+            TransitionKind::Reencode,
+            Some(key),
+            TransitionTarget {
+                compression: Compression::Off,
+                plan: Some(plan),
+            },
+            enabled.settings.storage_generation,
+            1,
+        );
+        let writes = vec![
+            (
+                BLOB_LOCATIONS_KEYSPACE.to_string(),
+                location.location_key().unwrap().to_bytes().into(),
+                location.to_bytes().unwrap().into(),
+            ),
+            (
+                BLOB_VERSIONS_KEYSPACE.to_string(),
+                version_key.to_bytes().unwrap().into(),
+                version.to_bytes().unwrap().into(),
+            ),
+            (
+                TRANSITION_KEYSPACE.to_string(),
+                b"sealed".to_vec().into(),
+                transition.to_bytes().unwrap().into(),
+            ),
+        ];
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await;
+        assert_eq!(process_transitions(&context).await.unwrap(), Some(RECHECK));
+        let stored = read_row(
+            &context.storage_handle,
+            TRANSITION_KEYSPACE,
+            b"sealed".to_vec(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let parked = EncryptionTransition::from_bytes(&stored).unwrap();
+        assert_eq!(
+            (parked.state, parked.remaining),
+            (TransitionState::AwaitingKey, 1)
+        );
+        assert!(parked.retry_at_ms.is_some());
+
+        tokio::time::pause();
+        let _clock = freeze_clock();
+        let tasks = aruna_tasks::TaskHandle::new();
+        let (sender, mut fired) = tokio::sync::mpsc::channel(8);
+        tasks
+            .set_inbound_handler(std::sync::Arc::new(RecordingTaskHandler { seen: sender }))
+            .await;
+        tasks
+            .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                key: TaskKey::MigrateCompression,
+                after: RECHECK,
+            }))
+            .await;
+        context.task_handle = Some(tasks.clone());
+        let start = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let duration = Duration::from_secs(30);
+        let node = context.net_handle.as_ref().unwrap().node_id();
+        let realm = RealmId::from_bytes([1; 32]);
+        let input = UnlockInput {
+            bucket: "sealed".to_string(),
+            group_id: Ulid::from_bytes([3; 16]),
+            realm_id: realm,
+            node_id: node,
+            caller: UserId::new(Ulid::from_bytes([5; 16]), realm),
+            key,
+            duration: Some(duration),
+            now_ms: crate::driver::now_ms(),
+        };
+        let unlock = UnlockBucketOperation::new(input, enabled.private_key);
+        let status = unlock_and_wake(&context, unlock, (realm, node), &RoCrateLimits::default())
+            .await
+            .unwrap();
+        assert!(
+            status
+                .remaining
+                .is_some_and(|remaining| remaining <= duration)
+        );
+        while fired.recv().await.unwrap() != TaskKey::MigrateCompression {}
+        let resumed = read_row(
+            &context.storage_handle,
+            TRANSITION_KEYSPACE,
+            b"sealed".to_vec(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            EncryptionTransition::from_bytes(&resumed)
+                .unwrap()
+                .retry_at_ms,
+            None
+        );
+        assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(1));
+        assert!(duration < RECHECK);
+        process_transitions(&context).await.unwrap();
+        let stored = read_row(
+            &context.storage_handle,
+            TRANSITION_KEYSPACE,
+            b"sealed".to_vec(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let progressed = EncryptionTransition::from_bytes(&stored).unwrap();
+        assert_eq!(
+            (progressed.done, progressed.remaining, progressed.failed),
+            (1, 0, 0)
+        );
+        assert_eq!(progressed.state, TransitionState::Cleanup);
+        tasks.shutdown(Duration::ZERO).await;
+        tokio::time::resume();
     }
 }

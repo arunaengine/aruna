@@ -8,6 +8,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use thiserror::Error;
 
+use crate::blob::migration_queue::resume_transitions;
 use crate::blob::promote::{PromoteError, promote_unlocked};
 use crate::driver::DriverContext;
 use crate::jobs::runtime::key_unlocked;
@@ -39,10 +40,11 @@ pub enum KeyWakeError {
     Jobs(#[from] JobMutationError),
     #[error(transparent)]
     Promote(#[from] PromoteError),
+    #[error("could not resume encryption transitions: {0}")]
+    Transition(String),
 }
 
-/// Wakes parked jobs of `key`, queues remote wakes, then promotes its pending archives. Call after unlock and after
-/// node-managed keys open at startup. Answers the woken jobs and the promoted archives.
+/// Resumes jobs, remote wakes, transitions and pending promotion whenever a key becomes usable.
 pub async fn wake_unlocked(
     context: &DriverContext,
     key: BucketKeyRef,
@@ -54,8 +56,13 @@ pub async fn wake_unlocked(
     // Remote waiters get owed wakes before promotion, so a corrupt archive never holds them back.
     let queued = super::remote_key::queue_wakes(context, key).await;
     super::remote_key::arm_delivery(context).await;
+    let mut resumed = resume_transitions(context, key).await;
     let promoted = promote_unlocked(context, key, origin, limits).await;
+    if !matches!(promoted, Ok(0)) {
+        resumed = resumed.and(resume_transitions(context, key).await);
+    }
     queued.map_err(|error| KeyWakeError::Jobs(JobMutationError::Storage(error)))?;
+    resumed.map_err(KeyWakeError::Transition)?;
     Ok((woken?, promoted?))
 }
 

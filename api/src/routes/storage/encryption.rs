@@ -8,6 +8,7 @@ use crate::auth::require_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::BlobError;
+use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::bucket_permission_path;
@@ -27,7 +28,9 @@ use aruna_operations::s3::bucket::encryption::{
 };
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::holders::lookup_keys;
-use aruna_operations::s3::bucket::key_install::{InstallInput, InstallKeyOperation};
+use aruna_operations::s3::bucket::key_install::{
+    InstallInput, InstallKeyOperation, install_and_wake,
+};
 use aruna_operations::s3::bucket::key_rows::SettingsError;
 use aruna_operations::s3::bucket::rotate::{
     ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
@@ -658,9 +661,17 @@ pub async fn put_bucket_encryption(
     }
     let context = state.get_ctx();
     let target = (state.get_realm_id(), state.get_node_id(), group_id);
-    enable_bucket(&context, target, auth.user_id, &bucket, &snapshot, &request)
-        .await
-        .map_err(enable_refusal)?;
+    enable_bucket(
+        &context,
+        target,
+        auth.user_id,
+        &bucket,
+        &snapshot,
+        &request,
+        state.rocrate_limits(),
+    )
+    .await
+    .map_err(enable_refusal)?;
     let status = current_status(&state, bucket, group_id, auth.user_id).await?;
     Ok(Json(status))
 }
@@ -775,7 +786,10 @@ pub(crate) async fn change_bucket(
         // The change is committed either way; a failed install only leaves the key locked.
         let node_id = state.get_node_id();
         let install = InstallKeyOperation::new(install).audited(node_id, Some(caller), now_ms());
-        if let Err(error) = drive(install, &context).await {
+        let origin = (state.get_realm_id(), node_id);
+        if let Err(error) =
+            install_and_wake(&context, install, origin, state.rocrate_limits()).await
+        {
             tracing::warn!(%bucket, ?error, "new bucket key stays locked");
         }
     }
@@ -818,6 +832,7 @@ pub(crate) async fn enable_bucket(
     bucket: &str,
     snapshot: &KeySnapshot,
     request: &EncryptionRequest,
+    limits: &RoCrateLimits,
 ) -> Result<(), EnableError> {
     let creator = snapshot.info.as_ref().map(|info| info.created_by);
     let users = creator
@@ -849,7 +864,7 @@ pub(crate) async fn enable_bucket(
     };
     // The bucket is encrypted either way; a failed install only leaves it locked.
     let install = InstallKeyOperation::new(install).audited(node_id, Some(caller), now_ms());
-    if let Err(error) = drive(install, context).await {
+    if let Err(error) = install_and_wake(context, install, (realm_id, node_id), limits).await {
         tracing::warn!(%bucket, ?error, "new bucket key stays locked");
     }
     Ok(())

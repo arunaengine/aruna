@@ -96,6 +96,7 @@ impl ArunaS3Service {
             bucket,
             &snapshot,
             &request,
+            &self.rocrate_limits,
         )
         .await
         .map_err(enable_error)
