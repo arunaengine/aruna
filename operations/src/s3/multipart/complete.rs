@@ -47,8 +47,9 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError};
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use aruna_core::structs::storage::multipart::{
-    MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
-    MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
+    MAX_PART_SIZE, MultipartChecksumType, MultipartObjectKey, MultipartObjectPart,
+    MultipartObjectSummary, MultipartPart, MultipartPartKey, MultipartUpload,
+    MultipartUploadStatus, WorkingShare,
 };
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -68,6 +69,7 @@ pub enum CompleteUploadState {
     ReadUploadMark,
     WriteUploadCompleting,
     CommitMarkTransaction,
+    ReserveCompose,
     ReadUploadParts,
     ReadGateBucket,
     PolicyGate,
@@ -263,6 +265,8 @@ pub struct CompleteUploadOperation {
     /// The reset that returns the record to `Open` has already been taken, so
     /// no later cleanup step may take it a second time.
     reset_done: bool,
+    /// Working set of a sealed composition, reserved before the piece records load.
+    compose_share: Option<WorkingShare>,
 }
 
 impl CompleteUploadOperation {
@@ -299,6 +303,7 @@ impl CompleteUploadOperation {
             gated_bucket: None,
             compression: Compression::Off,
             reset_done: false,
+            compose_share: None,
         }
     }
 
@@ -707,17 +712,15 @@ impl CompleteUploadOperation {
         match event {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                 self.txn_id = None;
-                self.state = CompleteUploadState::ReadUploadParts;
-                let prefix = match MultipartPartKey::prefix(self.input.upload_id) {
-                    Ok(prefix) => prefix,
-                    Err(err) => return self.schedule_error(err.into()),
-                };
-                smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: UPLOAD_PART_KEYSPACE.to_string(),
-                    prefix: Some(prefix.into()),
-                    start: None,
-                    limit: 10_000,
-                    txn_id: None,
+                let sealed = (self.upload_record.as_ref()).is_some_and(|u| u.encryption.is_some());
+                if !sealed {
+                    return self.read_parts();
+                }
+                // Piece records are large, so the composition's share comes before they load.
+                let parts = self.input.completed_parts.len() as u64;
+                self.state = CompleteUploadState::ReserveCompose;
+                smallvec![Effect::Blob(BlobEffect::ReserveCompose {
+                    content: parts.saturating_mul(MAX_PART_SIZE),
                 })]
             }
             Event::Storage(StorageEvent::Error { error }) if error.proves_no_commit() => {
@@ -729,6 +732,32 @@ impl CompleteUploadOperation {
             }
             _ => self.emit_error(CompleteUploadError::InvalidOperationState),
         }
+    }
+
+    fn compose_reserved(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Blob(BlobEvent::ComposeReserved { share }) => {
+                self.compose_share = Some(share);
+                self.read_parts()
+            }
+            Event::Blob(BlobEvent::Error(error)) => self.schedule_error(error.into()),
+            _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
+        }
+    }
+
+    fn read_parts(&mut self) -> Effects {
+        self.state = CompleteUploadState::ReadUploadParts;
+        let prefix = match MultipartPartKey::prefix(self.input.upload_id) {
+            Ok(prefix) => prefix,
+            Err(err) => return self.schedule_error(err.into()),
+        };
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: UPLOAD_PART_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: None,
+            limit: 10_000,
+            txn_id: None,
+        })]
     }
 
     fn extract_requested_parts(
@@ -908,6 +937,9 @@ impl CompleteUploadOperation {
                 ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone())
                     .with_compression(encryption.compression)
                     .with_encryption(Some(encryption.plan));
+            let Some(share) = self.compose_share.take() else {
+                return self.schedule_error(CompleteUploadError::InvalidOperationState);
+            };
             self.state = CompleteUploadState::ComposeBlob;
             return smallvec![Effect::Blob(BlobEffect::ComposePieces {
                 bucket: self.input.bucket.clone(),
@@ -915,6 +947,7 @@ impl CompleteUploadOperation {
                 resolved,
                 created_by: self.input.created_by,
                 parts: self.resolved_parts.clone(),
+                share,
             })];
         }
         if let Some(backend_upload) = upload.backend_upload.clone() {
@@ -1939,6 +1972,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::ReadUploadMark => self.mark_upload_read(event),
             CompleteUploadState::WriteUploadCompleting => self.handle_upload_marked(event),
             CompleteUploadState::CommitMarkTransaction => self.handle_mark_committed(event),
+            CompleteUploadState::ReserveCompose => self.compose_reserved(event),
             CompleteUploadState::ReadUploadParts => self.upload_parts_read(event),
             CompleteUploadState::ReadGateBucket => self.handle_gate_bucket(event),
             CompleteUploadState::PolicyGate => self.handle_policy_gate(event),

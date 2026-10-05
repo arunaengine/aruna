@@ -12,7 +12,10 @@ use crate::structs::storage::encryption::SealPlan;
 use crate::structs::storage::format::Compression;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
 use std::time::SystemTime;
 use ulid::Ulid;
 
@@ -188,6 +191,37 @@ pub struct MultipartPart {
     pub backend_etag: Option<String>,
     /// The sealed piece of a part of an encrypted upload.
     pub piece: Option<PartPiece>,
+}
+
+/// Largest S3 part; sealing a part stops at this many received bytes.
+pub const MAX_PART_SIZE: u64 = 5 << 30;
+
+/// A reservation of `bytes` of the node's Pithos working set, held until the last clone drops.
+/// Only the blob adapter interprets its guard.
+#[derive(Clone)]
+pub struct WorkingShare {
+    pub bytes: u64,
+    guard: Arc<dyn Any + Send + Sync>,
+}
+
+impl WorkingShare {
+    pub fn new(bytes: u64, guard: Arc<dyn Any + Send + Sync>) -> Self {
+        Self { bytes, guard }
+    }
+}
+
+impl fmt::Debug for WorkingShare {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkingShare")
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for WorkingShare {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes && Arc::ptr_eq(&self.guard, &other.guard)
+    }
 }
 
 /// Record of one part sealed as a Pithos piece. It holds no key material.

@@ -6,7 +6,10 @@
 use super::BlobHandler;
 use super::backend::build_part_path;
 use super::io::compose_chunk;
-use super::pithos::{OBJECT_PATH, cipher, key_mode, pithos_level, write_error};
+use super::pithos::{
+    OBJECT_PATH, Share, TokioBlocking, WORKING_SET, cipher, key_mode, pithos_level, working_set,
+    write_error,
+};
 use crate::hash::Hasher;
 use aruna_core::UserId;
 use aruna_core::errors::BlobError;
@@ -16,25 +19,26 @@ use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::storage::blob::{BackendLocation, ResolvedBackend};
 use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
 use aruna_core::structs::storage::multipart::{
-    MultipartPart, MultipartPartKey, PartPiece, UploadEncryption,
+    MAX_PART_SIZE, MultipartPart, MultipartPartKey, PartPiece, UploadEncryption, WorkingShare,
 };
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use opendal::{Operator, Writer};
 use pithos_lib::archive::{
-    ArchivePath, Chunking, Composition, EntryMetadata, Piece, PieceEncoder, ProcessingOptions,
-    compose,
+    ArchivePath, BlockingHook, Chunking, Composition, EntryMetadata, Piece, PieceEncoder,
+    ProcessingOptions, compose,
 };
 use pithos_lib::crypto::PublicKey;
 use pithos_lib::error::PithosError;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
 use ulid::Ulid;
 
 const MIB: usize = 1 << 20;
 /// Multipart parts use fixed blocks, so equal parts line up with the whole file.
-const PART_BLOCK: usize = 4 * MIB;
+pub(super) const PART_BLOCK: usize = 4 * MIB;
 
 impl BlobHandler {
     /// Writes one part of an encrypted upload as a Pithos piece keyed by its part number.
@@ -56,12 +60,9 @@ impl BlobHandler {
             plan,
             compression: resolved.compression,
         };
-        // An S3 part holds at most 5 GiB; the share stays reserved until the piece is written.
-        let _budget = match self
-            .reserve_pithos(super::pithos::working_set(5 << 30))
-            .await
-        {
-            Ok(permit) => permit,
+        // Sealing stops at the part cap, so its share covers every part; blocking work keeps it.
+        let share = match self.reserve_pithos(working_set(MAX_PART_SIZE)).await {
+            Ok(share) => share,
             Err(error) => return BlobEvent::Error(error),
         };
         let encoder = match piece_encoder(&upload, part.part_number, content_offset) {
@@ -104,7 +105,7 @@ impl BlobHandler {
                 .bucket_operator(&resolved.backend, &multipart_bucket, &self.egress);
         let written = match operator {
             Ok(operator) => {
-                self.seal_part(location.clone(), operator, encoder, blob)
+                self.seal_part(location.clone(), operator, encoder, blob, &share)
                     .await
             }
             Err(error) => Err(error),
@@ -143,6 +144,7 @@ impl BlobHandler {
         operator: Operator,
         encoder: PieceEncoder,
         blob: BackendStream<Result<Bytes, StreamError>>,
+        share: &Share,
     ) -> Result<(BackendLocation, Piece), BlobError> {
         let path = location.get_storage_path()?;
         let (mut writer, mut abandoned) = (None, false);
@@ -156,6 +158,7 @@ impl BlobHandler {
                 encoder,
                 blob,
                 &mut hasher,
+                share,
             )
             .await;
         match sealed {
@@ -195,6 +198,7 @@ impl BlobHandler {
         mut encoder: PieceEncoder,
         mut blob: BackendStream<Result<Bytes, StreamError>>,
         hasher: &mut Hasher,
+        share: &Share,
     ) -> Result<(u64, Piece), BlobError> {
         let writer = match timeout(self.io_timeout(), operator.writer(path)).await {
             Ok(Ok(opened)) => writer.insert(opened),
@@ -202,8 +206,8 @@ impl BlobHandler {
             Err(_) => return Err(deadline_expired()),
         };
         let idle = self.transfer_idle_timeout();
-        let (mut size, mut stored) = (0u64, 0u64);
-        let mut batch = BytesMut::new();
+        let mut stored = 0u64;
+        let mut batch = PartBatch::new(MAX_PART_SIZE);
         loop {
             let chunk = match timeout(idle, blob.next()).await {
                 Ok(Some(chunk)) => {
@@ -212,28 +216,24 @@ impl BlobHandler {
                 Ok(None) => break,
                 Err(_) => return Err(deadline_expired()),
             };
-            hasher.update(&chunk);
-            size = size
-                .checked_add(chunk.len() as u64)
-                .ok_or(BlobError::SizeLimitExceeded { limit: u64::MAX })?;
-            batch.extend_from_slice(&chunk);
-            if batch.len() < PART_BLOCK {
-                continue;
-            }
-            let plain = batch.split().freeze();
-            let blocks;
-            (encoder, blocks) = blocking(move || {
-                let mut encoder = encoder;
-                encoder.write(&plain).map(|blocks| (encoder, blocks))
-            })
-            .await?;
-            stored += blocks.len() as u64;
-            if !blocks.is_empty() {
-                settle(abandoned, idle, writer.write(blocks)).await?;
+            for plain in batch.push(chunk)? {
+                hasher.update(&plain);
+                let blocks;
+                (encoder, blocks) = blocking(share, move || {
+                    let mut encoder = encoder;
+                    encoder.write(&plain).map(|blocks| (encoder, blocks))
+                })
+                .await?;
+                stored += blocks.len() as u64;
+                if !blocks.is_empty() {
+                    settle(abandoned, idle, writer.write(blocks)).await?;
+                }
             }
         }
-        let plain = batch.freeze();
-        let (blocks, piece) = blocking(move || {
+        let size = batch.size;
+        let plain = batch.rest();
+        hasher.update(&plain);
+        let (blocks, piece) = blocking(share, move || {
             let mut blocks = encoder.write(&plain)?;
             blocks.extend(encoder.flush()?);
             Ok((blocks, encoder.finish()?))
@@ -263,18 +263,21 @@ impl BlobHandler {
         resolved: ResolvedBackend,
         created_by: UserId,
         parts: Vec<MultipartPart>,
+        share: WorkingShare,
     ) -> BlobEvent {
         let Some(plan) = resolved.encryption else {
             return BlobEvent::Error(BlobError::WriteError("pieces need a seal plan".into()));
         };
+        // The completion reserved before it loaded the piece records and keeps it until here.
         let content = parts.iter().map(|part| part.location.blob_size).sum();
-        let _budget = match self
-            .reserve_pithos(super::pithos::working_set(content))
-            .await
-        {
-            Ok(permit) => permit,
-            Err(error) => return BlobEvent::Error(error),
-        };
+        // One supported size for every sealed copy, so any of them can be re-encoded later.
+        if content > super::pithos::MAX_SIZE {
+            let limit = super::pithos::MAX_SIZE;
+            return BlobEvent::Error(BlobError::SizeLimitExceeded { limit });
+        }
+        if working_set(content) > share.bytes {
+            return BlobEvent::Error(BlobError::SizeLimitExceeded { limit: share.bytes });
+        }
         let composition = match compose_parts(&parts) {
             Ok(composition) => composition,
             Err(error) => return BlobEvent::Error(error),
@@ -340,6 +343,18 @@ impl BlobHandler {
                 _ = self.release_reservation(&location).await;
                 BlobEvent::Error(error)
             }
+        }
+    }
+
+    /// Reserves the working set of a composition over at most `content` bytes, clipped to the
+    /// node budget, before the completion loads any piece record.
+    pub async fn reserve_compose(&self, content: u64) -> BlobEvent {
+        let bytes = working_set(content).min(WORKING_SET);
+        match self.reserve_pithos(bytes).await {
+            Ok(share) => BlobEvent::ComposeReserved {
+                share: WorkingShare::new(bytes, Arc::new(share)),
+            },
+            Err(error) => BlobEvent::Error(error),
         }
     }
 
@@ -499,14 +514,57 @@ fn compose_parts(parts: &[MultipartPart]) -> Result<Composition, BlobError> {
     compose(path, EntryMetadata::new(0, 0, 0o644), &pieces).map_err(write_error)
 }
 
-/// Runs sealing on the blocking pool.
-async fn blocking<T: Send + 'static>(
+/// Runs sealing on the blocking pool. The task keeps `share`, so a cancelled part does not free
+/// the budget while detached work still holds the encoder and its buffers.
+pub(super) async fn blocking<T: Send + 'static>(
+    share: &Share,
     task: impl FnOnce() -> Result<T, PithosError> + Send + 'static,
 ) -> Result<T, BlobError> {
-    match tokio::task::spawn_blocking(task).await {
-        Ok(result) => result.map_err(write_error),
-        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-        Err(error) => Err(BlobError::WriteError(error.to_string())),
+    let hook = TokioBlocking(Some(Arc::clone(share)));
+    hook.spawn_blocking(task).await.map_err(write_error)
+}
+
+/// Plaintext of one part in whole blocks. The part cap is enforced on received bytes before
+/// anything is encoded, and a large chunk is taken in block slices.
+pub(super) struct PartBatch {
+    pending: BytesMut,
+    size: u64,
+    cap: u64,
+}
+
+impl PartBatch {
+    pub(super) fn new(cap: u64) -> Self {
+        Self {
+            pending: BytesMut::new(),
+            size: 0,
+            cap,
+        }
+    }
+
+    /// Adds `chunk` and returns the blocks it completes.
+    pub(super) fn push(&mut self, mut chunk: Bytes) -> Result<Vec<Bytes>, BlobError> {
+        let size = self.size.checked_add(chunk.len() as u64);
+        self.size = size
+            .filter(|size| *size <= self.cap)
+            .ok_or(BlobError::SizeLimitExceeded { limit: self.cap })?;
+        let mut blocks = Vec::new();
+        while !chunk.is_empty() {
+            if self.pending.is_empty() && chunk.len() >= PART_BLOCK {
+                blocks.push(chunk.split_to(PART_BLOCK));
+                continue;
+            }
+            let take = (PART_BLOCK - self.pending.len()).min(chunk.len());
+            self.pending.extend_from_slice(&chunk.split_to(take));
+            if self.pending.len() == PART_BLOCK {
+                blocks.push(self.pending.split().freeze());
+            }
+        }
+        Ok(blocks)
+    }
+
+    /// The bytes after the last whole block.
+    pub(super) fn rest(self) -> Bytes {
+        self.pending.freeze()
     }
 }
 

@@ -110,6 +110,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::HashArchive { .. } => (EffectClass::Transfer, "hash_archive"),
         BlobEffect::ReadSealed { .. } => (EffectClass::Read, "read_sealed"),
         BlobEffect::ServeSealedRead { .. } => (EffectClass::Transfer, "serve_sealed_read"),
+        BlobEffect::ReserveCompose { .. } => (EffectClass::Local, "reserve_compose"),
     }
 }
 
@@ -820,7 +821,13 @@ impl BlobHandler {
                 resolved,
                 created_by,
                 parts,
-            } => Box::pin(self.compose_pieces(&bucket, &key, resolved, created_by, parts)).await,
+                share,
+            } => {
+                let composed =
+                    self.compose_pieces(&bucket, &key, resolved, created_by, parts, share);
+                Box::pin(composed).await
+            }
+            BlobEffect::ReserveCompose { content } => self.reserve_compose(content).await,
             BlobEffect::HashArchive { location, lease } => {
                 Box::pin(self.hash_archive(location, *lease)).await
             }

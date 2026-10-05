@@ -23,7 +23,7 @@ use crate::structs::storage::blob::{BackendLocation, HiddenBlobEntry};
 use crate::structs::storage::encryption::{
     BucketKeyRef, KeyTicket, ReadLease, SealedCopy, UnlockStatus,
 };
-use crate::structs::storage::multipart::{BackendUpload, PartPiece};
+use crate::structs::storage::multipart::{BackendUpload, PartPiece, WorkingShare};
 use crate::structs::storage::replication::{ReplicationItemError, ReplicationSuboperationResult};
 use crate::structs::storage::routing::GroupRoutingInputs;
 use crate::{
@@ -206,6 +206,10 @@ pub enum BlobEvent {
     ArchiveHashed {
         hashes: std::collections::HashMap<String, Vec<u8>>,
         size: u64,
+    },
+    /// The working set of one composition; the completion keeps it until composition ends.
+    ComposeReserved {
+        share: WorkingShare,
     },
 }
 

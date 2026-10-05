@@ -25,7 +25,7 @@ use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::blob::{ArchiveKey, BackendLocation, HiddenBlobKey, ResolvedBackend};
 use crate::structs::storage::encryption::{BucketKeyRef, CopyTarget, KeyTicket, ReadLease};
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
-use crate::structs::storage::multipart::{BackendUpload, MultipartPart};
+use crate::structs::storage::multipart::{BackendUpload, MultipartPart, WorkingShare};
 use crate::structs::storage::usage::UsageDelta;
 use crate::task::TaskEffect;
 use crate::types::{Key, KeySpace, TxnId, Value};
@@ -257,13 +257,15 @@ pub enum BlobEffect {
         content_offset: Option<u64>,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
-    /// Composes the stored pieces of `parts`, in order, into one archive without a key.
+    /// Composes the stored pieces of `parts`, in order, into one archive without a key, within
+    /// the working set `share` reserved before the parts were loaded.
     ComposePieces {
         bucket: String,
         key: String,
         resolved: ResolvedBackend,
         created_by: UserId,
         parts: Vec<MultipartPart>,
+        share: WorkingShare,
     },
     /// Hands out the unlocked key of `key`, for its node vault copy when a bucket leaves
     /// `vault_locked`. A locked generation answers `Locked`.
@@ -290,6 +292,11 @@ pub enum BlobEffect {
         location: BackendLocation,
         expected_blake3: [u8; 32],
         lease: Box<ReadLease>,
+    },
+    /// Reserves the working set of composing at most `content` bytes, before the piece records
+    /// are loaded. Answers `ComposeReserved`.
+    ReserveCompose {
+        content: u64,
     },
 }
 

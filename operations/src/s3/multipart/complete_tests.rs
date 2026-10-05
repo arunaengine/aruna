@@ -1528,6 +1528,7 @@ fn sealed_operation(parts: &[&[u8]]) -> (CompleteUploadOperation, BackendLocatio
     });
     let mut operation = CompleteUploadOperation::new(input);
     operation.upload_record = Some(record);
+    operation.compose_share = Some(test_share());
     operation.resolved_parts = parts
         .iter()
         .zip(1u16..)
@@ -1551,6 +1552,48 @@ fn sealed_operation(parts: &[&[u8]]) -> (CompleteUploadOperation, BackendLocatio
     location.format = StoredFormat::pithos(layout, sealed_plan().key);
     location.blob_size = parts.iter().map(|bytes| bytes.len() as u64).sum();
     (operation, location)
+}
+
+/// A reservation the tests hand to the completion in place of the blob adapter's.
+fn test_share() -> aruna_core::structs::storage::multipart::WorkingShare {
+    aruna_core::structs::storage::multipart::WorkingShare::new(1 << 30, std::sync::Arc::new(()))
+}
+
+#[test]
+fn sealed_reserves_first() {
+    // The composition's share is reserved before any piece record loads, and composition
+    // receives that same share; a saturated budget therefore stops the completion early.
+    use aruna_core::structs::storage::multipart::MAX_PART_SIZE;
+    let (mut operation, _) = sealed_operation(&[b"first"]);
+    operation.compose_share = None;
+    operation.input.completed_parts = vec![CompleteMultipartPart {
+        part_number: 1,
+        etag: None,
+        expected_checksums: Vec::new(),
+    }];
+    operation.state = CompleteUploadState::CommitMarkTransaction;
+    let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+        txn_id: TxnId::generate(),
+    }));
+    assert_eq!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::ReserveCompose {
+            content: MAX_PART_SIZE
+        })]
+    );
+    let share = test_share();
+    let effects = operation.step(Event::Blob(BlobEvent::ComposeReserved {
+        share: share.clone(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Iter { key_space, .. })] if key_space == UPLOAD_PART_KEYSPACE
+    ));
+    let effects = operation.compose_blob();
+    let [Effect::Blob(BlobEffect::ComposePieces { share: kept, .. })] = effects.as_slice() else {
+        panic!("expected a piece composition, got {effects:?}")
+    };
+    assert_eq!(*kept, share);
 }
 
 impl CompleteUploadOperation {

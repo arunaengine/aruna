@@ -147,6 +147,7 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         BlobEffect::HashArchive { location, .. } => push(&mut ids, &location.backend),
         BlobEffect::ReadSealed { location, .. } => push(&mut ids, &location.backend),
         BlobEffect::ServeSealedRead { location, .. } => push(&mut ids, &location.backend),
+        BlobEffect::ReserveCompose { .. } => {}
     }
     ids
 }
