@@ -11,6 +11,7 @@ use std::time::SystemTime;
 
 const LOCKED: Ulid = Ulid::from_bytes([1; 16]);
 const GROUP: Ulid = Ulid::from_bytes([3; 16]);
+const NOW: u64 = 10_000;
 
 fn user(seed: u8) -> UserId {
     UserId::new(Ulid::from_bytes([seed; 16]), RealmId::from_bytes([1; 32]))
@@ -37,6 +38,15 @@ fn settings(mode: EncryptionMode, bucket_id: Ulid) -> Vec<u8> {
 }
 
 fn audit(action: AuditAction, generation: u64) -> (Vec<u8>, Vec<u8>) {
+    record(action, generation, AuditOutcome::Applied, None)
+}
+
+fn record(
+    action: AuditAction,
+    generation: u64,
+    outcome: AuditOutcome,
+    deadline_ms: Option<u64>,
+) -> (Vec<u8>, Vec<u8>) {
     let record = BucketAuditRecord {
         event_id: Ulid::generate(),
         bucket_id: LOCKED,
@@ -45,9 +55,9 @@ fn audit(action: AuditAction, generation: u64) -> (Vec<u8>, Vec<u8>) {
         actor: None,
         node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
         generation: Some(generation),
-        deadline_ms: None,
+        deadline_ms,
         reason: None,
-        outcome: AuditOutcome::Applied,
+        outcome,
     };
     (record.key(), record.to_bytes().unwrap())
 }
@@ -67,7 +77,7 @@ fn copy(user_id: UserId, generation: u64) -> (Vec<u8>, Vec<u8>) {
 
 #[test]
 fn finds_unlocked_generations() {
-    let mut operation = RestartScanOperation::new();
+    let mut operation = RestartScanOperation::new(NOW);
     operation.start();
     let effects = operation.step(rows(vec![
         (
@@ -125,4 +135,48 @@ fn finds_unlocked_generations() {
             holders: vec![user(1), user(2), user(3)],
         }]
     );
+}
+
+/// The generations a scan of one vault-locked bucket with `trail` reports as unlocked.
+fn reported(trail: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<u64> {
+    let mut operation = RestartScanOperation::new(NOW);
+    operation.start();
+    let locked = (
+        b"locked".to_vec(),
+        settings(EncryptionMode::VaultLocked, LOCKED),
+    );
+    operation.step(rows(vec![locked]));
+    let effects = operation.step(rows(trail));
+    if effects.is_empty() {
+        assert_eq!(operation.finalize().unwrap(), []);
+        return Vec::new();
+    }
+    let RestartScanOperation { current, .. } = operation;
+    current.unwrap().generations
+}
+
+#[test]
+fn lost_outcome_counts() {
+    // A crash after activation left only the synced intent: the key may have been in use.
+    let intent = record(AuditAction::Unlock, 1, AuditOutcome::Intent, None);
+    assert_eq!(reported(vec![intent]), [1]);
+    // A failed activation restores the state before its intent.
+    let intent = record(AuditAction::Unlock, 1, AuditOutcome::Intent, None);
+    let failed = record(AuditAction::Unlock, 1, AuditOutcome::Failed, None);
+    assert!(reported(vec![intent, failed]).is_empty());
+    // An outage lost the lock's audit: the last record is the unlock, so holders are told.
+    assert_eq!(reported(vec![audit(AuditAction::Unlock, 2)]), [2]);
+}
+
+#[test]
+fn expired_sessions_skipped() {
+    // A timed session that ended before this start was not unlocked at the restart.
+    let ended = record(AuditAction::Unlock, 1, AuditOutcome::Applied, Some(NOW - 1));
+    assert!(reported(vec![ended]).is_empty());
+    let running = record(AuditAction::Unlock, 1, AuditOutcome::Applied, Some(NOW + 1));
+    assert_eq!(reported(vec![running]), [1]);
+    // An extension moves the deadline that counts.
+    let ended = record(AuditAction::Unlock, 1, AuditOutcome::Applied, Some(NOW - 1));
+    let extended = record(AuditAction::Extend, 1, AuditOutcome::Applied, Some(NOW + 1));
+    assert_eq!(reported(vec![ended, extended]), [1]);
 }

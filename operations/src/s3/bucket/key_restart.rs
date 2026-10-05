@@ -53,32 +53,38 @@ pub enum RestartScanError {
     NotFinished,
 }
 
+/// What the audit trail says about one generation before this start.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Trail {
+    unlocked: bool,
+    /// The state before an intent whose outcome is not recorded, restored if it failed.
+    before_intent: Option<bool>,
+    deadline_ms: Option<u64>,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct RestartScanOperation {
+    /// The time of this start; a session whose deadline passed before it was not unlocked.
+    now_ms: u64,
     step: ScanStep,
     /// Vault-locked buckets still to scan, by name and stable id.
     pending: Vec<(String, Ulid)>,
     current: Option<RestartedBucket>,
-    /// Applied unlock state per generation of the current bucket, in audit order.
-    unlocked: BTreeMap<u64, bool>,
+    /// Unlock state per generation of the current bucket, in audit order.
+    trails: BTreeMap<u64, Trail>,
     holders: BTreeSet<aruna_core::UserId>,
     found: Vec<RestartedBucket>,
     output: Option<Result<Vec<RestartedBucket>, RestartScanError>>,
 }
 
-impl Default for RestartScanOperation {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl RestartScanOperation {
-    pub fn new() -> Self {
+    pub fn new(now_ms: u64) -> Self {
         Self {
+            now_ms,
             step: ScanStep::Init,
             pending: Vec::new(),
             current: None,
-            unlocked: BTreeMap::new(),
+            trails: BTreeMap::new(),
             holders: BTreeSet::new(),
             found: Vec::new(),
             output: None,
@@ -113,7 +119,7 @@ impl RestartScanOperation {
             self.output = Some(Ok(std::mem::take(&mut self.found)));
             return smallvec![];
         };
-        self.unlocked.clear();
+        self.trails.clear();
         self.holders.clear();
         self.current = Some(RestartedBucket {
             bucket,
@@ -144,22 +150,40 @@ impl RestartScanOperation {
         }
     }
 
-    /// An applied unlock or extension leaves a generation unlocked until a later applied lock.
+    /// An unlock or extension leaves a generation unlocked until a later applied lock or its
+    /// deadline. An intent without a recorded outcome counts as applied: a crash or an outage
+    /// may have lost the outcome after the key was in use.
     fn audit_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
         for (_, value) in values {
             let Ok(record) = BucketAuditRecord::from_bytes(value.as_ref()) else {
                 continue;
             };
-            let (Some(generation), AuditOutcome::Applied) = (record.generation, record.outcome)
-            else {
+            let Some(generation) = record.generation else {
                 continue;
             };
-            match record.action {
-                AuditAction::Unlock | AuditAction::Extend => {
-                    self.unlocked.insert(generation, true);
+            let trail = self.trails.entry(generation).or_default();
+            match (record.action, record.outcome) {
+                (AuditAction::Unlock | AuditAction::Extend, AuditOutcome::Intent) => {
+                    trail.before_intent.get_or_insert(trail.unlocked);
+                    trail.unlocked = true;
+                    trail.deadline_ms = record.deadline_ms;
                 }
-                AuditAction::Lock | AuditAction::TimedLock | AuditAction::RestartLock => {
-                    self.unlocked.insert(generation, false);
+                (AuditAction::Unlock | AuditAction::Extend, AuditOutcome::Applied) => {
+                    trail.before_intent = None;
+                    trail.unlocked = true;
+                    trail.deadline_ms = record.deadline_ms;
+                }
+                (AuditAction::Unlock | AuditAction::Extend, AuditOutcome::Failed) => {
+                    if let Some(before) = trail.before_intent.take() {
+                        trail.unlocked = before;
+                    }
+                }
+                (
+                    AuditAction::Lock | AuditAction::TimedLock | AuditAction::RestartLock,
+                    AuditOutcome::Applied,
+                ) => {
+                    trail.before_intent = None;
+                    trail.unlocked = false;
                 }
                 _ => {}
             }
@@ -171,10 +195,14 @@ impl RestartScanOperation {
             let prefix = current.bucket_id.to_bytes().to_vec();
             return iter(BUCKET_AUDIT_KEYSPACE, Some(prefix), Some(start), SCAN_LIMIT);
         }
+        let now_ms = self.now_ms;
+        let open = |trail: &Trail| {
+            trail.unlocked && trail.deadline_ms.is_none_or(|deadline| deadline > now_ms)
+        };
         current.generations = self
-            .unlocked
+            .trails
             .iter()
-            .filter(|(_, unlocked)| **unlocked)
+            .filter(|(_, trail)| open(trail))
             .map(|(generation, _)| *generation)
             .collect();
         if current.generations.is_empty() {

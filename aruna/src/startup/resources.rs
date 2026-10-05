@@ -557,7 +557,8 @@ async fn record_restart_locks(
     use aruna_operations::s3::bucket::key_restart::RestartScanOperation;
     use aruna_operations::s3::restart_notice::RestartNoticeOperation;
 
-    let buckets = drive(RestartScanOperation::new(), driver_ctx).await?;
+    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let buckets = drive(RestartScanOperation::new(now_ms), driver_ctx).await?;
     if buckets.is_empty() {
         return Ok(());
     }
