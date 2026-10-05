@@ -771,7 +771,8 @@ pub async fn rotate_key(
     let snapshot = read_snapshot(&state, &bucket, group_id).await?;
     let change = KeyChange::Rotate;
     let expected = request.expected_generation;
-    change_bucket(&state, &bucket, group_id, &snapshot, change, expected).await?;
+    let target = (group_id, auth.user_id);
+    change_bucket(&state, &bucket, target, &snapshot, change, expected).await?;
     let status = current_status(&state, bucket, group_id, auth.user_id).await?;
     Ok(Json(status))
 }

@@ -85,6 +85,8 @@ pub enum ChangeError {
     Settings(#[from] SettingsError),
     #[error("the bucket does not encrypt; enable encryption instead")]
     NotEncrypted,
+    #[error("the caller is no longer a group admin")]
+    NotAdmin,
     #[error("the bucket already uses these settings")]
     Unchanged,
     #[error("the bucket has open multipart uploads")]
@@ -109,6 +111,8 @@ pub struct ChangeInput {
     pub group_id: GroupId,
     pub realm_id: RealmId,
     pub node_id: NodeId,
+    /// The requesting user; they must hold the group admin role inside the transaction.
+    pub caller: UserId,
     pub change: KeyChange,
     /// The storage generation the caller read; another one means a concurrent change.
     pub expected_generation: u64,
@@ -201,6 +205,9 @@ impl ChangeEncryptionOperation {
             Ok(state) => state,
             Err(error) => return self.fail(error),
         };
+        if !state.admins.contains(&self.input.caller) {
+            return self.fail(ChangeError::NotAdmin);
+        }
         if !state.settings.is_encrypted() {
             return self.fail(ChangeError::NotEncrypted);
         }

@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::s3::bucket::key_rows::audit_row;
+use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 
 impl ChangeEncryptionOperation {
     pub(super) fn rows(
@@ -115,6 +117,26 @@ impl ChangeEncryptionOperation {
             }
             _ => None,
         };
+        // The change and its audit record commit together.
+        let action = match self.input.change {
+            KeyChange::Rotate => AuditAction::Rotation,
+            KeyChange::Settings { .. } => AuditAction::ModeChange,
+        };
+        let generation = key
+            .as_ref()
+            .map_or(old.key.generation, |(record, _)| record.key.generation);
+        rows.push(audit_row(&BucketAuditRecord {
+            event_id: Ulid::generate(),
+            bucket_id: old.key.bucket_id,
+            at_ms: self.input.now_ms,
+            action,
+            actor: Some(self.input.caller),
+            node_id: self.input.node_id,
+            generation: Some(generation),
+            deadline_ms: None,
+            reason: None,
+            outcome: AuditOutcome::Applied,
+        })?);
         self.result = Some(ChangeResult {
             settings,
             transition,

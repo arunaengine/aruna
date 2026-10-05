@@ -41,12 +41,18 @@ fn active(vault: bool) -> BucketKeyRecord {
     record
 }
 
+/// The group admin who asks for every change.
+fn admin() -> UserId {
+    UserId::new(Ulid::from_bytes([9; 16]), info().created_by.realm_id)
+}
+
 fn operation(change: KeyChange) -> ChangeEncryptionOperation {
     ChangeEncryptionOperation::new(ChangeInput {
         bucket: "b".to_string(),
         group_id: info().group_id,
         realm_id: info().created_by.realm_id,
         node_id: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+        caller: admin(),
         change,
         expected_generation: 4,
         lookups: BTreeMap::new(),
@@ -85,7 +91,7 @@ fn loaded_with(
         txn_id: TxnId::default(),
     }));
     let current = settings(mode);
-    let values = authority_rows(&info(), Some(&current), &[]);
+    let values = authority_rows(&info(), Some(&current), &[admin()]);
     operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
     let effects = operation.step(Event::Storage(StorageEvent::IterResult {
         values: uploads,
@@ -385,4 +391,47 @@ fn locked_source_refuses() {
             Err(ChangeError::Key(BucketKeyError::Locked(BUCKET_ID)))
         );
     }
+}
+
+#[test]
+fn former_admin_refused() {
+    let mut operation = operation(KeyChange::Rotate);
+    operation.start();
+    operation.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: TxnId::default(),
+    }));
+    let current = settings(EncryptionMode::NodeManaged);
+    let values = authority_rows(&info(), Some(&current), &[]);
+
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    assert_eq!(operation.finalize(), Err(ChangeError::NotAdmin));
+}
+
+#[test]
+fn change_writes_audit() {
+    use aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE;
+    use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
+    let mut change = operation(KeyChange::Rotate);
+    loaded(&mut change, EncryptionMode::NodeManaged, Vec::new());
+    let rotation = rows(&generated(&mut change));
+    let record = BucketAuditRecord::from_bytes(&row(&rotation, BUCKET_AUDIT_KEYSPACE)).unwrap();
+    assert_eq!(record.action, AuditAction::Rotation);
+    assert_eq!(record.actor, Some(admin()));
+    assert_eq!(record.generation, Some(2));
+    assert_eq!(record.outcome, AuditOutcome::Applied);
+
+    let mut change = operation(settings_change(EncryptionMode::Off));
+    let decrypt = rows(&loaded(
+        &mut change,
+        EncryptionMode::VaultLocked,
+        Vec::new(),
+    ));
+    let record = BucketAuditRecord::from_bytes(&row(&decrypt, BUCKET_AUDIT_KEYSPACE)).unwrap();
+    assert_eq!(record.action, AuditAction::ModeChange);
+    assert_eq!(record.generation, Some(1));
 }

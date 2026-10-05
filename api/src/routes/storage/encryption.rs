@@ -616,7 +616,8 @@ pub async fn put_bucket_encryption(
                 cipher,
                 block_keys,
             };
-            change_bucket(&state, &bucket, group_id, &snapshot, change, expected).await?;
+            let target = (group_id, auth.user_id);
+            change_bucket(&state, &bucket, target, &snapshot, change, expected).await?;
             expected = bucket_settings(&state.get_ctx(), &bucket)
                 .await
                 .map_err(|error| ServerError::InternalError(error.to_string()))?
@@ -677,7 +678,7 @@ async fn set_unlock_limit(
 pub(crate) async fn change_bucket(
     state: &ServerState,
     bucket: &str,
-    group_id: GroupId,
+    (group_id, caller): (GroupId, UserId),
     snapshot: &KeySnapshot,
     change: KeyChange,
     expected_generation: u64,
@@ -695,6 +696,7 @@ pub(crate) async fn change_bucket(
         group_id,
         realm_id: state.get_realm_id(),
         node_id: state.get_node_id(),
+        caller,
         change,
         expected_generation,
         lookups,
@@ -725,6 +727,7 @@ fn change_refusal(error: ChangeError) -> ServerError {
         ChangeError::Key(error) => key_refusal(&error),
         ChangeError::Blob(error) => blob_refusal(error),
         ChangeError::NotEncrypted => not_encrypted(),
+        ChangeError::NotAdmin => ServerError::Forbidden,
         ChangeError::Unchanged => refused(
             StatusCode::CONFLICT,
             "unchanged",
