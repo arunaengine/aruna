@@ -7,7 +7,9 @@ use crate::s3::bucket::key::rows::authority_rows;
 use aruna_core::structs::identity::user::vault::UserKeyRecord;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode, HolderOrigin};
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, EncryptionMode, HolderOrigin, TokenCopy,
+};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::vault_format::key_fingerprint;
 use std::time::SystemTime;
@@ -97,7 +99,16 @@ fn pending_holders_sealed() {
         granted_at_ms: 1,
     };
     operation.step(rows(vec![grant.to_bytes().unwrap()]));
-    let effects = operation.step(rows(vec![copy(user(1)).to_bytes().unwrap()]));
+    // A token copy of user(2)'s credential is no holder copy: user(2) still gets one.
+    let created = copy(user(1));
+    let token = TokenCopy::copy_key(created.key, "TOKENKEY");
+    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+        values: vec![
+            (created.key().into(), created.to_bytes().unwrap().into()),
+            (token.into(), b"not a user copy".to_vec().into()),
+        ],
+        next_start_after: None,
+    }));
     let [Effect::Blob(BlobEffect::SealUnlocked { holders, .. })] = effects.as_slice() else {
         panic!("expected the seal step, got {effects:?}");
     };
