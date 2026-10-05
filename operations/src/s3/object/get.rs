@@ -91,6 +91,9 @@ pub enum GetObjectState {
     ReadReferenceSource,
     /// A sealed copy waits for a read lease of its bucket key.
     AdmitRead,
+    /// A plain copy of an encrypting bucket reads its settings, then waits for a bucket lease.
+    ReadContentSettings,
+    AdmitPlain,
     /// A reference version of an encrypting bucket needs its bucket unlocked.
     ReadReferenceSettings,
     CheckReferenceKey,
@@ -316,7 +319,7 @@ pub struct GetObjectOperation {
     /// Refs of the version being read, carried to copy and advance writes.
     source_policies: Vec<PlacementPolicyRef>,
     output: Option<Result<GetObjectResult, GetObjectError>>,
-    /// Active key of an encrypting bucket whose reference version is read.
+    /// Active key of an encrypting bucket whose reference or unsealed copy is read.
     reference_key: Option<BucketKeyRef>,
     /// Admitted plaintext read of that bucket; the served stream keeps it until it ends.
     reference_lease: Option<ReadLease>,
@@ -724,28 +727,92 @@ impl GetObjectOperation {
         };
         self.resolved_range = resolved_range.clone();
 
-        let sealed = location.format.bucket_key();
-        let archive = ArchiveKey::of(&location);
-        let read_effect = match resolved_range {
-            Some(range) => BlobEffect::ReadRange {
-                location,
-                range: range.range,
-            },
-            None => BlobEffect::Read { location },
-        };
-
-        self.state = GetObjectState::CommitTransaction;
         // A sealed copy is read only under a lease of its key, admitted after the commit.
-        if let Some(key) = sealed {
+        if let Some(key) = location.format.bucket_key() {
+            let archive = ArchiveKey::of(&location);
+            self.state = GetObjectState::CommitTransaction;
             return smallvec![
                 Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
                 Effect::Blob(BlobEffect::AdmitRead { key, archive })
             ];
         }
+        // A plain copy of an encrypting bucket, not converted yet, needs the bucket unlocked too.
+        self.state = GetObjectState::ReadContentSettings;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            key: self.input.bucket.as_bytes().into(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    /// The read of a plain copy over the resolved range.
+    fn plain_read(&self) -> Option<BlobEffect> {
+        let location = self.location.clone()?;
+        Some(match self.resolved_range.as_ref() {
+            Some(range) => BlobEffect::ReadRange {
+                location,
+                range: range.range.clone(),
+            },
+            None => BlobEffect::Read { location },
+        })
+    }
+
+    fn content_settings_read(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(GetObjectError::NoTransactionFound);
+        };
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let settings = match BucketEncryption::from_row(value.as_deref()) {
+            Ok(settings) => settings,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        let Some(read_effect) = self.plain_read() else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        self.reference_key = settings.active_key();
+        self.state = GetObjectState::CommitTransaction;
+        let next = match self.reference_key {
+            Some(key) => BlobEffect::AdmitRead {
+                key,
+                archive: reference_archive(key),
+            },
+            None => read_effect,
+        };
         smallvec![
             Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
-            Effect::Blob(read_effect)
+            Effect::Blob(next)
         ]
+    }
+
+    /// Reads a plain copy of an encrypting bucket once its bucket lease is admitted.
+    fn plain_admitted(&mut self, event: Event) -> Effects {
+        let (Some(key), Some(read_effect)) = (self.reference_key, self.plain_read()) else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        match event {
+            Event::Blob(BlobEvent::ReadAdmitted { lease })
+                if lease.key == key && lease.archive == reference_archive(key) =>
+            {
+                self.reference_lease = Some(lease);
+                self.state = GetObjectState::GetBlob;
+                smallvec![Effect::Blob(read_effect)]
+            }
+            Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
+                self.emit_error(locked(error))
+            }
+            Event::Blob(BlobEvent::Error(_)) => self.emit_error(GetObjectError::GetObjectFailed),
+            other => self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Blob(BlobEvent::ReadAdmitted)",
+                received: other,
+            }),
+        }
     }
 
     /// Reads the sealed copy with the admitted lease; a locked key ends the read typed.
@@ -783,7 +850,7 @@ impl GetObjectOperation {
         smallvec![Effect::Blob(BlobEffect::ReadSealed {
             location,
             range,
-            lease
+            lease: Box::new(lease),
         })]
     }
 
@@ -871,9 +938,10 @@ impl GetObjectOperation {
                 .location
                 .as_ref()
                 .is_some_and(|location| location.format.bucket_key().is_some());
-            self.state = match sealed {
-                true => GetObjectState::AdmitRead,
-                false => GetObjectState::GetBlob,
+            self.state = match (sealed, self.reference_key.is_some()) {
+                (true, _) => GetObjectState::AdmitRead,
+                (false, true) => GetObjectState::AdmitPlain,
+                (false, false) => GetObjectState::GetBlob,
             };
             smallvec![]
         } else {
@@ -1329,7 +1397,10 @@ impl GetObjectOperation {
     }
 
     pub fn handle_received_blob(&mut self, event: Event) -> Effects {
-        if let Event::Blob(BlobEvent::ReadFinished { blob, .. }) = event {
+        if let Event::Blob(BlobEvent::ReadFinished { mut blob, .. }) = event {
+            if let Some(lease) = self.reference_lease.take() {
+                blob = leased(blob, lease);
+            }
             let Some(location) = self.location.clone() else {
                 return self.emit_error(GetObjectError::GetObjectFailed);
             };
@@ -1394,10 +1465,7 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
         if let Some(lease) = self.reference_lease.take() {
-            blob = BackendStream(Box::pin(blob.0.map(move |chunk| {
-                let _lease = &lease;
-                chunk
-            })));
+            blob = leased(blob, lease);
         }
         let Some(source_metadata) = self.source_metadata.clone() else {
             return self.emit_error(GetObjectError::GetObjectFailed);
@@ -1424,8 +1492,19 @@ impl GetObjectOperation {
     }
 }
 
+/// Keeps `lease` with the stream until the stream ends.
+pub(crate) fn leased(
+    blob: BackendStream<Result<Bytes, StreamError>>,
+    lease: ReadLease,
+) -> BackendStream<Result<Bytes, StreamError>> {
+    BackendStream(Box::pin(blob.0.map(move |chunk| {
+        let _lease = &lease;
+        chunk
+    })))
+}
+
 /// A reference version has no archive, so its lease names the bucket id, which no archive uses.
-fn reference_archive(key: BucketKeyRef) -> ArchiveKey {
+pub(crate) fn reference_archive(key: BucketKeyRef) -> ArchiveKey {
     ArchiveKey::new(key.bucket_id, BackendRef::node_default())
 }
 
@@ -1464,6 +1543,8 @@ impl Operation for GetObjectOperation {
             GetObjectState::GetBlob => self.handle_received_blob(event),
             GetObjectState::ReadReferenceSource => self.reference_source_received(event),
             GetObjectState::AdmitRead => self.read_admitted(event),
+            GetObjectState::ReadContentSettings => self.content_settings_read(event),
+            GetObjectState::AdmitPlain => self.plain_admitted(event),
             GetObjectState::ReadReferenceSettings => self.reference_settings_read(event),
             GetObjectState::CheckReferenceKey => self.reference_key_checked(event),
             GetObjectState::Finish => smallvec![],

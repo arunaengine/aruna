@@ -205,7 +205,10 @@ impl PromotePendingOperation {
         match event {
             Event::Blob(BlobEvent::ReadAdmitted { lease }) => {
                 self.state = State::Hash;
-                smallvec![Effect::Blob(BlobEffect::HashArchive { location, lease })]
+                smallvec![Effect::Blob(BlobEffect::HashArchive {
+                    location,
+                    lease: Box::new(lease),
+                })]
             }
             Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
                 let key = location.format.bucket_key();

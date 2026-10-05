@@ -243,8 +243,8 @@ pub enum BlobEffect {
         bucket: String,
         key: String,
         source: BackendLocation,
-        lease: Option<ReadLease>,
-        target: ResolvedBackend,
+        lease: Option<Box<ReadLease>>,
+        target: Box<ResolvedBackend>,
         grants_only: bool,
     },
     /// Seals one part of an encrypted upload as a Pithos piece with the plan in `resolved`.
@@ -274,22 +274,22 @@ pub enum BlobEffect {
     /// verified plaintext; the plaintext never leaves the adapter.
     HashArchive {
         location: BackendLocation,
-        lease: ReadLease,
+        lease: Box<ReadLease>,
     },
     /// Streams `range`, or the whole object, of the sealed copy at `location` under `lease`.
     /// The stream keeps the lease until it ends.
     ReadSealed {
         location: BackendLocation,
         range: Option<Range<u64>>,
-        lease: ReadLease,
+        lease: Box<ReadLease>,
     },
-    /// Serves the plaintext of the sealed copy at `location` to an authorized remote reader
-    /// under `lease`. Replication of sealed copies stays refused.
+    /// Serves the plaintext of `location`, a copy of an encrypting bucket, to an authorized
+    /// remote reader under `lease`. Replication of sealed copies stays refused.
     ServeSealedRead {
         stream_id: Ulid,
         location: BackendLocation,
         expected_blake3: [u8; 32],
-        lease: ReadLease,
+        lease: Box<ReadLease>,
     },
 }
 

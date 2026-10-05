@@ -390,7 +390,12 @@ fn materialized_range_reads() {
     operation.txn_id = Some(txn_id);
     operation.location = Some(location.clone());
 
-    let effects = operation.read_blob();
+    operation.read_blob();
+    // The bucket has no encryption settings, so the plain copy is read without a lease.
+    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"s3test".to_vec().into(),
+        value: None,
+    }));
 
     assert!(matches!(
         effects.as_slice(),
@@ -2115,5 +2120,90 @@ mod sealed {
                 key().bucket_id
             )))
         );
+    }
+
+    fn encrypting() -> BucketEncryption {
+        BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(key().bucket_id),
+            key_generation: 1,
+            ..Default::default()
+        }
+    }
+
+    /// A raw copy still waiting for conversion, read with the bucket's current `settings`.
+    fn plain_read(settings: &BucketEncryption) -> (GetObjectOperation, Vec<Effect>) {
+        let mut operation = operation();
+        let mut location = sealed_location();
+        location.format = StoredFormat::default();
+        operation.location = Some(location);
+        operation.read_blob();
+        let row = Some(settings.to_bytes().unwrap().into());
+        let effects = operation
+            .step(Event::Storage(StorageEvent::ReadResult {
+                key: b"bucket".to_vec().into(),
+                value: row,
+            }))
+            .into_vec();
+        (operation, effects)
+    }
+
+    #[test]
+    fn unconverted_copy_gated() {
+        let archive = ArchiveKey::new(key().bucket_id, BackendRef::node_default());
+        let (mut operation, effects) = plain_read(&encrypting());
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::Storage(StorageEffect::CommitTransaction { .. }),
+                Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: named }),
+            ] if *admitted == key() && *named == archive
+        ));
+        assert!(operation.step(committed()).is_empty());
+        let locked = BlobError::BucketKey(BucketKeyError::Locked(key().bucket_id));
+        operation.step(Event::Blob(BlobEvent::Error(locked)));
+        assert_eq!(
+            operation.finalize().err(),
+            Some(GetObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::Locked(key().bucket_id)
+            )))
+        );
+
+        // Unlocked, the raw bytes are read and the stream keeps the bucket lease.
+        let (mut operation, _) = plain_read(&encrypting());
+        operation.step(committed());
+        let guard = Arc::new(());
+        let lease = ReadLease::new(key(), archive, Ulid::generate(), guard.clone());
+        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Read { .. })]
+        ));
+        let blob = aruna_core::stream::BackendStream::new(futures_util::stream::iter([Ok::<
+            _,
+            std::io::Error,
+        >(
+            bytes::Bytes::from_static(b"plain"),
+        )]));
+        operation.step(Event::Blob(BlobEvent::ReadFinished {
+            blob,
+            stream_size: 5,
+        }));
+        let output = operation.finalize().unwrap();
+        assert_eq!(Arc::strong_count(&guard), 2);
+        drop(output);
+        assert_eq!(Arc::strong_count(&guard), 1);
+    }
+
+    #[test]
+    fn plain_bucket_ungated() {
+        let (_, effects) = plain_read(&BucketEncryption::default());
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::Storage(StorageEffect::CommitTransaction { .. }),
+                Effect::Blob(BlobEffect::Read { .. }),
+            ]
+        ));
     }
 }

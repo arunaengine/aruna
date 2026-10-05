@@ -92,8 +92,8 @@ impl BlobHandler {
             .await
     }
 
-    /// Serves the plaintext of a sealed copy to an authorized reader. The lease keeps the key
-    /// and the archive in use until the transfer ends; replication never takes this path.
+    /// Serves the plaintext of a copy of an encrypting bucket to an authorized reader. The lease
+    /// keeps the key and the archive in use until the transfer ends; replication never does this.
     pub async fn serve_sealed_read(
         &self,
         stream_id: Ulid,
@@ -106,9 +106,16 @@ impl BlobHandler {
                 "bao read location hash mismatch".to_string(),
             ));
         }
-        let reader = match self.sealed_reader(&location, lease).await {
-            Ok(reader) => SliceReader::Sealed(reader),
-            Err(error) => return BlobEvent::Error(error),
+        // A plain copy of an encrypting bucket keeps its bucket lease until the transfer ends.
+        let (reader, _lease) = match location.format.layout {
+            StoredLayout::Pithos(_) => match self.sealed_reader(&location, lease).await {
+                Ok(reader) => (SliceReader::Sealed(reader), None),
+                Err(error) => return BlobEvent::Error(error),
+            },
+            _ => match self.slice_reader(&location).await {
+                Ok(reader) => (reader, Some(lease)),
+                Err(error) => return BlobEvent::Error(error),
+            },
         };
         self.serve_from(stream_id, location, expected_blake3, reader)
             .await

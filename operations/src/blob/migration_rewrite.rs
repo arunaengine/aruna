@@ -253,8 +253,8 @@ impl RewriteVersionOperation {
             bucket: self.version_key.bucket.clone(),
             key: self.version_key.key.clone(),
             source: old,
-            lease: self.lease.take(),
-            target: resolved,
+            lease: self.lease.take().map(Box::new),
+            target: Box::new(resolved),
             grants_only: sealed && self.transition.kind == TransitionKind::Rotate,
         })]
     }

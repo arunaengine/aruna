@@ -798,6 +798,7 @@ impl BlobHandler {
                 target,
                 grants_only,
             } => {
+                let (lease, target) = (lease.map(|lease| *lease), *target);
                 let rewrite = self.rewrite_copy(&bucket, &key, source, lease, target, grants_only);
                 Box::pin(rewrite).await
             }
@@ -821,20 +822,20 @@ impl BlobHandler {
                 parts,
             } => Box::pin(self.compose_pieces(&bucket, &key, resolved, created_by, parts)).await,
             BlobEffect::HashArchive { location, lease } => {
-                Box::pin(self.hash_archive(location, lease)).await
+                Box::pin(self.hash_archive(location, *lease)).await
             }
             BlobEffect::ReadSealed {
                 location,
                 range,
                 lease,
-            } => Box::pin(self.read_sealed(location, range, lease)).await,
+            } => Box::pin(self.read_sealed(location, range, *lease)).await,
             BlobEffect::ServeSealedRead {
                 stream_id,
                 location,
                 expected_blake3,
                 lease,
             } => {
-                let serve = self.serve_sealed_read(stream_id, location, expected_blake3, lease);
+                let serve = self.serve_sealed_read(stream_id, location, expected_blake3, *lease);
                 Box::pin(serve).await
             }
             BlobEffect::OpenConnection { node_id } => Box::pin(self.open_connection(node_id)).await,
