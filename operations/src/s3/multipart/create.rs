@@ -422,9 +422,6 @@ impl CreateMultipartOperation {
     /// Rereads the settings in the transaction, so a mode change or rotation that started
     /// meanwhile conflicts instead of leaving an upload with a stale plan.
     fn check_settings(&mut self) -> Effects {
-        if self.encryption.is_none() {
-            return self.write_upload();
-        }
         self.state = CreateMultipartState::CheckSettings;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
@@ -437,12 +434,10 @@ impl CreateMultipartOperation {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
-        let Some(encryption) = self.encryption else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
+        let plan = self.encryption.map(|encryption| encryption.plan);
         let current = BucketEncryption::from_row(value.as_deref())
             .map_err(CreateMultipartError::from)
-            .and_then(|settings| Ok(encryption.plan.still_current(&settings)?));
+            .and_then(|settings| Ok(storage_current(plan.as_ref(), &settings)?));
         match current {
             Ok(()) => self.write_upload(),
             Err(error) => self.emit_error(error),
@@ -520,6 +515,21 @@ impl CreateMultipartOperation {
         self.state = CreateMultipartState::Finish;
         self.output = Some(Ok(CreateMultipartResult { record }));
         smallvec![]
+    }
+}
+
+/// A plain upload needs a bucket that still stores plain bytes; a sealed one its exact plan.
+pub(crate) fn storage_current(
+    plan: Option<&SealPlan>,
+    settings: &BucketEncryption,
+) -> Result<(), BucketKeyError> {
+    match plan {
+        Some(plan) => plan.still_current(settings),
+        None if settings.is_encrypted() => Err(BucketKeyError::StaleGeneration {
+            requested: 0,
+            current: settings.key_generation,
+        }),
+        None => Ok(()),
     }
 }
 
@@ -692,7 +702,8 @@ mod pure_tests {
             txn_id: TxnId::default(),
         }));
 
-        let effects = operation.step(fence_clear());
+        operation.step(fence_clear());
+        let effects = operation.step(plain_settings());
 
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected one record write, got {effects:?}")
@@ -863,7 +874,8 @@ mod pure_tests {
             txn_id: TxnId::default(),
         }));
 
-        let effects = operation.step(fence_clear());
+        operation.step(fence_clear());
+        let effects = operation.step(plain_settings());
 
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected one record write, got {effects:?}")
@@ -908,6 +920,67 @@ mod pure_tests {
             Err(CreateMultipartError::BackendFenceError(
                 BackendFenceError::Unavailable
             ))
+        ));
+    }
+
+    /// The settings reread inside the record transaction, for a bucket without encryption.
+    fn plain_settings() -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: None,
+        })
+    }
+
+    #[test]
+    fn plain_create_refused() {
+        // Encryption enabled while the provider upload opened, before any upload row existed:
+        // the plain upload never records and its provider upload is aborted.
+        let mut operation = CreateMultipartOperation::new(input(snapshot()));
+        operation.start();
+        operation.step(ungoverned_bucket());
+        operation.step(fence_clear());
+        let upload = BackendUpload {
+            location: aruna_core::structs::storage::blob::BackendLocation {
+                backend: BackendRef::node_default(),
+                storage_class: None,
+                root: "/".to_string(),
+                storage_bucket: "bucket".to_string(),
+                backend_path: "bucket/key".to_string(),
+                ulid: Ulid::from_bytes([6u8; 16]),
+                format: aruna_core::structs::storage::format::StoredFormat::default(),
+                created_by: aruna_core::UserId::default(),
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+                staging: false,
+                partial: false,
+                blob_size: 0,
+                hashes: std::collections::HashMap::new(),
+            },
+            upload_id: "provider".to_string(),
+            record_id: Ulid::from_bytes([9u8; 16]),
+        };
+        operation.step(opened(Some(upload.clone())));
+        let txn_id = TxnId::from_bytes([3u8; 16]);
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(fence_clear());
+        let (settings, _) = sealed_settings();
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(settings.to_bytes().unwrap().into()),
+        }));
+
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::Storage(StorageEffect::AbortTransaction { .. }),
+                    Effect::Blob(BlobEffect::AbortUpload { backend_upload }),
+                ] if **backend_upload == upload
+            ),
+            "expected the record and provider upload to be dropped, got {effects:?}"
+        );
+        assert!(matches!(
+            operation.pending_error,
+            Some(CreateMultipartError::BucketKey(_))
         ));
     }
 

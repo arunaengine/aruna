@@ -174,11 +174,16 @@ fn refuses_disabled_backend() {
         [Effect::Storage(StorageEffect::BatchRead { .. })]
     ));
 
-    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+    op.step(Event::Storage(StorageEvent::BatchReadResult {
         values: vec![
             (b"bucket".to_vec().into(), None),
             (b"subject".to_vec().into(), None),
         ],
+    }));
+    assert_eq!(op.state, CompleteUploadState::CheckSealSettings);
+    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: None,
     }));
     assert_eq!(op.state, CompleteUploadState::FenceBackend);
     assert!(matches!(
@@ -1670,6 +1675,33 @@ fn sealed_rotation_refused() {
         bucket_id: Some(Ulid::from_parts(8, 8)),
         key_generation: 2,
         storage_generation: 2,
+        ..Default::default()
+    };
+    operation.state = CompleteUploadState::CheckSealSettings;
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: Some(settings.to_bytes().unwrap().into()),
+    }));
+    assert!(matches!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::BucketKey(_))
+    ));
+}
+
+#[test]
+fn plain_completion_refused() {
+    // A plain upload never publishes once its bucket encrypts, even if its record predates it.
+    use aruna_core::structs::storage::encryption::EncryptionMode;
+    let input = finalize_input();
+    let record = open_upload_record(&input);
+    let mut operation = CompleteUploadOperation::new(input);
+    operation.upload_record = Some(record);
+    operation.txn_id = Some(Ulid::from_parts(4, 4));
+    operation.composed_location = Some(composed_location(Ulid::from_parts(9, 9)));
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(Ulid::from_parts(8, 8)),
+        key_generation: 1,
         ..Default::default()
     };
     operation.state = CompleteUploadState::CheckSealSettings;

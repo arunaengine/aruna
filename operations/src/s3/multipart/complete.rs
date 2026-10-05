@@ -18,6 +18,7 @@ use crate::placement::policy::{
     split_drift_reads, union_refs, write_gate,
 };
 use crate::replication::queue::build_live_obligation;
+use crate::s3::multipart::create::storage_current;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup, delete_records_effect};
@@ -1026,26 +1027,25 @@ impl CompleteUploadOperation {
         let Some(location) = self.composed_location.clone() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
-        // A sealed copy must still match the bucket's seal plan instead.
-        if location.format.bucket_key().is_some() {
-            self.state = CompleteUploadState::CheckSealSettings;
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-                key: self.input.bucket.as_bytes().into(),
-                txn_id: self.txn_id,
-            })];
-        }
         // A copy encoded under an older setting is never published: the bucket's
-        // migration may already have passed this key.
-        if bucket.as_ref().is_some_and(|bucket| {
-            EncodingClass::from(bucket.compression) != location.format.encoding()
-        }) {
+        // migration may already have passed this key. A sealed copy checks its plan instead.
+        if location.format.bucket_key().is_none()
+            && bucket.as_ref().is_some_and(|bucket| {
+                EncodingClass::from(bucket.compression) != location.format.encoding()
+            })
+        {
             return self.schedule_error(StorageError::TransactionConflict.into());
         }
-        self.fence_composed(&location)
+        self.state = CompleteUploadState::CheckSealSettings;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            key: self.input.bucket.as_bytes().into(),
+            txn_id: self.txn_id,
+        })]
     }
 
-    /// A rotation or mode change since the upload started never publishes its old plan.
+    /// A rotation or mode change since the upload started never publishes its old plan, and a
+    /// plain upload never publishes into a bucket that encrypts now.
     fn seal_settings_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
@@ -1053,13 +1053,14 @@ impl CompleteUploadOperation {
         let plan = self
             .upload_record
             .as_ref()
-            .and_then(|upload| upload.encryption);
-        let (Some(encryption), Some(location)) = (plan, self.composed_location.clone()) else {
+            .and_then(|upload| upload.encryption)
+            .map(|encryption| encryption.plan);
+        let Some(location) = self.composed_location.clone() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
         let current = BucketEncryption::from_row(value.as_deref())
             .map_err(CompleteUploadError::from)
-            .and_then(|settings| Ok(encryption.plan.still_current(&settings)?));
+            .and_then(|settings| Ok(storage_current(plan.as_ref(), &settings)?));
         match current {
             Ok(()) => self.fence_composed(&location),
             Err(error) => self.schedule_error(error),
