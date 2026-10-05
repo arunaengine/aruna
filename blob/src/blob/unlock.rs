@@ -407,6 +407,53 @@ impl UnlockRegistry {
         Ok((session.secret.clone(), session.public_key))
     }
 
+    /// Seals the unlocked key of each of `keys` with one fresh token key; any locked generation
+    /// fails them all. Only the caller of the credential receives the token.
+    pub(super) fn seal_tokens(
+        &mut self,
+        keys: &[BucketKeyRef],
+        origin: (RealmId, NodeId),
+        holder: (&str, UserId),
+        now: Instant,
+    ) -> Result<(Vec<TokenCopy>, SharedSecret), BucketKeyError> {
+        let token = generate_token()?;
+        let now_ms = aruna_core::time::unix_timestamp_millis();
+        let copies = keys
+            .iter()
+            .map(|key| {
+                let (secret, public_key) = self.unlocked_key(*key, now)?;
+                let private = secret.bytes();
+                seal_token(
+                    *key,
+                    &public_key,
+                    private,
+                    origin,
+                    holder,
+                    token.bytes(),
+                    now_ms,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((copies, token))
+    }
+
+    /// A lease of `archive` with a key a token opened. It pins the archive and holds `slot` like
+    /// a registry lease, but belongs to no unlock session.
+    pub(super) fn token_lease(
+        &self,
+        key: BucketKeyRef,
+        archive: ArchiveKey,
+        secret: SharedSecret,
+        slot: OwnedSemaphorePermit,
+    ) -> Result<ReadLease, BlobError> {
+        let guard = LeaseGuard {
+            secret,
+            _pin: self.pin(archive.clone())?,
+            _slot: slot,
+        };
+        Ok(ReadLease::new(key, archive, Ulid::nil(), Arc::new(guard)))
+    }
+
     /// Pins an archive without a key, so cleanup keeps it while keyless work uses it.
     /// An archive claimed for deletion is refused.
     pub(super) fn pin(&self, archive: ArchiveKey) -> Result<ArchivePin, BlobError> {
@@ -624,29 +671,10 @@ impl super::BlobHandler {
         origin: (RealmId, NodeId),
         holder: (&str, UserId),
     ) -> BlobEvent {
-        let sealed = generate_token().and_then(|token| {
-            let now_ms = aruna_core::time::unix_timestamp_millis();
-            let copies = keys
-                .iter()
-                .map(|key| {
-                    let (secret, public_key) = self
-                        .unlocks
-                        .lock()
-                        .map_err(|_| BucketKeyError::Locked(key.bucket_id))?
-                        .unlocked_key(*key, Instant::now())?;
-                    seal_token(
-                        *key,
-                        &public_key,
-                        secret.bytes(),
-                        origin,
-                        holder,
-                        token.bytes(),
-                        now_ms,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((copies, token))
-        });
+        let sealed = match self.unlocks.lock() {
+            Ok(mut registry) => registry.seal_tokens(keys, origin, holder, Instant::now()),
+            Err(_) => Err(BucketKeyError::Seal),
+        };
         match sealed {
             Ok((copies, token)) => BlobEvent::TokenSealed { copies, token },
             Err(error) => BlobEvent::Error(error.into()),
@@ -680,20 +708,12 @@ impl super::BlobHandler {
             Ok(secret) => SharedSecret::new(secret),
             Err(error) => return BlobEvent::Error(error.into()),
         };
-        let pin = match self.unlocks.lock() {
-            Ok(registry) => registry.pin(archive.clone()),
+        let lease = match self.unlocks.lock() {
+            Ok(registry) => registry.token_lease(key, archive, secret, slot),
             Err(_) => Err(poisoned()),
         };
-        match pin {
-            Ok(pin) => {
-                let guard = LeaseGuard {
-                    secret,
-                    _pin: pin,
-                    _slot: slot,
-                };
-                let lease = ReadLease::new(key, archive, Ulid::nil(), Arc::new(guard));
-                BlobEvent::ReadAdmitted { lease }
-            }
+        match lease {
+            Ok(lease) => BlobEvent::ReadAdmitted { lease },
             Err(error) => BlobEvent::Error(error),
         }
     }
