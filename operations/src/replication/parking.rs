@@ -275,3 +275,174 @@ async fn abort(storage: &StorageHandle, txn_id: TxnId) {
         warn!(%error, "Failed to abort a copy job wait transaction");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replication::protocol::ReplicationMode;
+    use crate::replication::queue::{blob_job_key, next_blob_timer};
+    use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
+    use aruna_core::UserId;
+    use aruna_core::compute::{SecretBytes, SharedSecret};
+    use aruna_core::effects::BlobEffect;
+    use aruna_core::events::BlobEvent;
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::encryption::public_key_of;
+    use tempfile::TempDir;
+
+    fn context(storage: StorageHandle) -> DriverContext {
+        DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        }
+    }
+
+    /// A node with a blob adapter, so key states are real.
+    async fn keyed_context() -> (TempDir, DriverContext) {
+        use aruna_core::structs::storage::blob::{Backend, BackendConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let blob_root = format!("{root}/blobstore");
+        std::fs::create_dir_all(&blob_root).unwrap();
+        let storage = aruna_storage::FjallStorage::open(root).unwrap();
+        let net = aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage.clone())
+            .await
+            .unwrap();
+        let config = BackendConfig {
+            backend_type: Backend::FileSystem,
+            bucket_prefix: Some("aruna_".to_string()),
+            max_bucket_size: Some(100_000),
+            multipart_bucket: Some("multipart".to_string()),
+            root: blob_root,
+            service_config: std::collections::HashMap::new(),
+            timeouts: Default::default(),
+        };
+        let blob = aruna_blob::blob::BlobHandler::new(config, storage.clone(), net.clone())
+            .await
+            .unwrap();
+        let mut context = context(storage);
+        context.net_handle = Some(net);
+        context.blob_handle = Some(blob);
+        (dir, context)
+    }
+
+    async fn unlock(context: &DriverContext, key: BucketKeyRef) {
+        let private = [9u8; 32];
+        let public_key = public_key_of(&SecretBytes::new(private.to_vec())).unwrap();
+        let blob = context.blob_handle.as_ref().unwrap();
+        let prepare = BlobEffect::PrepareKey {
+            key,
+            public_key,
+            private_key: SharedSecret::new(SecretBytes::new(private.to_vec())),
+            duration: None,
+            max: None,
+        };
+        let Event::Blob(BlobEvent::KeyPrepared { ticket }) = blob.send_blob_effect(prepare).await
+        else {
+            panic!("the key is prepared")
+        };
+        let activated = blob
+            .send_blob_effect(BlobEffect::ActivateKey { ticket })
+            .await;
+        assert!(matches!(
+            activated,
+            Event::Blob(BlobEvent::KeyActivated { .. })
+        ));
+    }
+
+    fn job(relationship_id: Ulid) -> BlobJobRecord {
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let input = ReplicateScopeInput {
+            bucket: "source".to_string(),
+            target: ReplicateScopeTarget::Bucket,
+            target_node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            auth_context: AuthContext {
+                user_id: UserId::nil(realm_id),
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            replicate_delete_markers: false,
+            mode: ReplicationMode::OnDemand,
+        };
+        BlobJobRecord::new_relationship(input, None, relationship_id, 1_000)
+    }
+
+    async fn store(storage: &StorageHandle, job: &BlobJobRecord) -> Vec<u8> {
+        let key = blob_job_key(job).unwrap().to_vec();
+        let write = StorageEffect::Write {
+            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
+            key: key.clone().into(),
+            value: job.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        run(storage, write).await.unwrap();
+        key
+    }
+
+    #[tokio::test]
+    async fn parked_job_wakes() {
+        // A locked source parks the job without an attempt; the unlock makes it due again.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = context(storage.clone());
+        let relationship = Ulid::from_parts(5, 5);
+        let mut record = job(relationship);
+        record.attempts = 2;
+        let key = store(&storage, &record).await;
+        let locked = BucketKeyRef::new(Ulid::from_parts(6, 6), 1);
+
+        let due = park_job(&context, key.clone(), &record, &[locked])
+            .await
+            .unwrap();
+        assert_eq!(due, None);
+        let parked = read_job(&storage, &key, None).await.unwrap().unwrap();
+        assert_eq!(parked.due_at_ms, PARKED_DUE);
+        assert_eq!(parked.attempts, 2);
+        assert_eq!(parked.last_error, None);
+        assert_eq!(awaiting_jobs(&context, relationship).await.unwrap(), 1);
+        // The drain neither runs a parked job nor times a wake for it.
+        assert_eq!(next_blob_timer(&storage).await.unwrap(), None);
+
+        // Another key's unlock leaves it parked.
+        let other = BucketKeyRef::new(locked.bucket_id, 2);
+        assert_eq!(wake_parked(&context, other, 5_000).await.unwrap(), 0);
+        assert_eq!(wake_parked(&context, locked, 5_000).await.unwrap(), 1);
+        let woken = read_job(&storage, &key, None).await.unwrap().unwrap();
+        assert_eq!(woken.due_at_ms, 5_000);
+        assert_eq!(woken.attempts, 2);
+        assert_eq!(awaiting_jobs(&context, relationship).await.unwrap(), 0);
+        assert_eq!(wake_parked(&context, locked, 6_000).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn unlock_before_park() {
+        // The unlock ran before the wait row existed: the recheck after parking wakes the job.
+        let (_dir, context) = keyed_context().await;
+        let storage = context.storage_handle.clone();
+        let record = job(Ulid::from_parts(7, 7));
+        let key = store(&storage, &record).await;
+        let unlocked = BucketKeyRef::new(Ulid::from_parts(8, 8), 1);
+        unlock(&context, unlocked).await;
+        assert_eq!(wake_parked(&context, unlocked, 1).await.unwrap(), 0);
+
+        let due = park_job(&context, key.clone(), &record, &[unlocked])
+            .await
+            .unwrap();
+
+        let woken = read_job(&storage, &key, None).await.unwrap().unwrap();
+        assert_eq!(due, Some(woken.due_at_ms));
+        assert_ne!(woken.due_at_ms, PARKED_DUE);
+        assert_eq!(
+            awaiting_jobs(&context, Ulid::from_parts(7, 7))
+                .await
+                .unwrap(),
+            0
+        );
+    }
+}

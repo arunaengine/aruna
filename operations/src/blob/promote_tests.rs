@@ -52,14 +52,42 @@ fn location_read() -> Event {
     read(Some(sealed().to_bytes().unwrap()))
 }
 
-fn reread(operation: &mut PromotePendingOperation) -> Effects {
+/// The key record and the claimed hash of the archive, as the reread transaction reads them.
+fn key_rows(record: &BucketKeyRecord, claim: Option<[u8; 32]>) -> Event {
+    Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (
+                Key::from(Vec::new()),
+                Some(Value::from(record.to_bytes().unwrap())),
+            ),
+            (
+                Key::from(Vec::new()),
+                claim.map(|claim| Value::from(claim.to_vec())),
+            ),
+        ],
+    })
+}
+
+fn reread_with(operation: &mut PromotePendingOperation, claim: Option<[u8; 32]>) -> Effects {
     let effects = operation.step(location_read());
-    assert!(
-        matches!(effects.as_slice(), [Effect::Storage(StorageEffect::Read { key_space, txn_id: Some(_), .. })] if key_space == BUCKET_KEY_KEYSPACE)
-    );
+    let [
+        Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(_),
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("the key and the claim are read in the transaction")
+    };
+    assert_eq!(reads[0].0, BUCKET_KEY_KEYSPACE);
+    assert_eq!(reads[1].0, PENDING_CLAIM_KEYSPACE);
     let key = sealed().format.bucket_key().unwrap();
     let record = BucketKeyRecord::new(key, Ulid::nil(), [1; 32], 0);
-    operation.step(read(Some(record.to_bytes().unwrap())))
+    operation.step(key_rows(&record, claim))
+}
+
+fn reread(operation: &mut PromotePendingOperation) -> Effects {
+    reread_with(operation, None)
 }
 
 fn lease() -> ReadLease {
@@ -190,7 +218,7 @@ fn retired_key_refused() {
     let key = sealed().format.bucket_key().unwrap();
     let mut record = BucketKeyRecord::new(key, Ulid::nil(), [1; 32], 0);
     record.state = KeyState::Retired;
-    let effects = operation.step(read(Some(record.to_bytes().unwrap())));
+    let effects = operation.step(key_rows(&record, None));
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::AbortTransaction { .. })]
@@ -276,13 +304,13 @@ fn promotes_pending_alias() {
     let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
         values: versions,
     }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Delete { key_space, .. })]
-            if key_space == PENDING_LOCATION_KEYSPACE
-    ));
-    operation.step(Event::Storage(StorageEvent::DeleteResult {
-        key: Key::from(Vec::new()),
+    let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice() else {
+        panic!("the pending row and its claim go together")
+    };
+    assert_eq!(deletes[0].0, PENDING_LOCATION_KEYSPACE);
+    assert_eq!(deletes[1].0, PENDING_CLAIM_KEYSPACE);
+    operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+        entries: Vec::new(),
     }));
     let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
         txn_id: Ulid::nil(),
@@ -423,7 +451,7 @@ fn alias_behind_cursor() {
     assert!(
         !matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::Delete { .. })]
+            [Effect::Storage(StorageEffect::BatchDelete { .. })]
         ),
         "the pending row must stay while an alias still pends"
     );
@@ -440,8 +468,8 @@ fn alias_behind_cursor() {
     }));
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::Delete { key_space, .. })]
-            if key_space == PENDING_LOCATION_KEYSPACE
+        [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })]
+            if deletes[0].0 == PENDING_LOCATION_KEYSPACE
     ));
 }
 
@@ -463,8 +491,8 @@ fn conflict_restarts_scan() {
     operation.step(Event::Storage(StorageEvent::BatchReadResult {
         values: Vec::new(),
     }));
-    operation.step(Event::Storage(StorageEvent::DeleteResult {
-        key: Key::from(Vec::new()),
+    operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+        entries: Vec::new(),
     }));
     // An owner inserted into the scanned range makes the final commit conflict.
     let effects = operation.step(Event::Storage(StorageEvent::Error {
@@ -550,4 +578,31 @@ fn governed_alias_registration() {
         subject_generation: None,
     };
     assert!(validate_registration(Some(value.as_ref()), &request).is_ok());
+}
+
+/// A received archive whose verified hash differs from its sender's claim registers nothing.
+#[test]
+fn claim_mismatch_unregistered() {
+    let mut operation = hashed_operation();
+    let effects = reread_with(&mut operation, Some([8; 32]));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    operation.step(Event::Storage(StorageEvent::TransactionAborted {
+        txn_id: Ulid::nil(),
+    }));
+    assert_eq!(
+        operation.finalize(),
+        Ok(Promotion::Mismatch { claimed: [8; 32] })
+    );
+
+    // A matching claim promotes as usual.
+    let mut operation = hashed_operation();
+    let effects = reread_with(&mut operation, Some(BLAKE3));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Write { key_space, .. })]
+            if key_space == BLOB_LOCATIONS_KEYSPACE
+    ));
 }

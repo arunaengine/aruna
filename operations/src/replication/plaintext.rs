@@ -126,3 +126,146 @@ pub async fn plaintext_allowed(
     }
     is_holder(context, bucket, requester).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+    use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+    use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::encryption::{EncryptionMode, GrantState};
+    use std::time::SystemTime;
+
+    fn user(seed: u8) -> UserId {
+        UserId::new(Ulid::from_bytes([seed; 16]), RealmId::from_bytes([3; 32]))
+    }
+
+    /// An encrypting bucket created by user 1, whose group user 2 administers, with an explicit
+    /// grant to user 3.
+    async fn bucket(context: &DriverContext) {
+        let realm_id = RealmId::from_bytes([3; 32]);
+        let group_id = Ulid::from_bytes([4; 16]);
+        let bucket_id = Ulid::from_bytes([5; 16]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            user_id: user(2),
+            realm_id,
+        };
+        let realm = RealmAuthorizationDocument {
+            realm_id,
+            roles: Default::default(),
+            operation_restrictions: Default::default(),
+        };
+        let group = GroupAuthorizationDocument::default_group_doc(user(2), realm_id, group_id);
+        let info = BucketInfo {
+            group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: user(1),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+        };
+        let settings = BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(bucket_id),
+            key_generation: 1,
+            ..Default::default()
+        };
+        let grant = BucketHolder {
+            bucket_id,
+            user_id: user(3),
+            origin: HolderOrigin::Explicit,
+            state: GrantState::Ready,
+            granted_by: user(1),
+            granted_at_ms: 0,
+        };
+        let rows = [
+            (
+                AUTH_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                realm.to_bytes(&actor).unwrap(),
+            ),
+            (
+                AUTH_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
+            ),
+            (
+                S3_BUCKET_KEYSPACE,
+                b"sealed".to_vec(),
+                info.to_bytes().unwrap(),
+            ),
+            (
+                BUCKET_ENCRYPTION_KEYSPACE,
+                b"sealed".to_vec(),
+                settings.to_bytes().unwrap(),
+            ),
+            (
+                BUCKET_HOLDER_KEYSPACE,
+                grant.key(),
+                grant.to_bytes().unwrap(),
+            ),
+        ];
+        for (key_space, key, value) in rows {
+            let write = StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            };
+            context.storage_handle.send_storage_effect(write).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_needs_holder() {
+        let (_dir, storage) = crate::tests::s3::test_storage();
+        let context = crate::tests::s3::test_context(storage);
+        bucket(&context).await;
+        assert!(source_encrypted(&context, "sealed").await.unwrap());
+        for (seed, holder) in [(1, true), (2, true), (3, true), (4, false)] {
+            assert_eq!(is_holder(&context, "sealed", user(seed)).await, Ok(holder));
+        }
+
+        let row = relationship_consent(Ulid::from_bytes([6; 16]));
+        // No request, or a request of another user, never permits plaintext.
+        assert!(
+            !plaintext_allowed(&context, "sealed", user(1), row.clone())
+                .await
+                .unwrap()
+        );
+        store_consent(&context, consent_write(row.clone(), user(4)).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            !plaintext_allowed(&context, "sealed", user(4), row.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !plaintext_allowed(&context, "sealed", user(1), row.clone())
+                .await
+                .unwrap()
+        );
+        store_consent(&context, consent_write(row.clone(), user(1)).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            plaintext_allowed(&context, "sealed", user(1), row.clone())
+                .await
+                .unwrap()
+        );
+        store_consent(&context, consent_delete(row.clone()))
+            .await
+            .unwrap();
+        assert!(
+            !plaintext_allowed(&context, "sealed", user(1), row)
+                .await
+                .unwrap()
+        );
+    }
+}
