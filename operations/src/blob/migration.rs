@@ -7,13 +7,14 @@ use crate::blob::cleanup::schedule_cleanup_effect;
 use crate::blob::managed_copy::{ManagedCopyError, check_serveable, read_effect};
 use crate::blob::records::{blob_location_read, read_version_effect};
 use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
+use crate::s3::bucket::key_rows::settings_read;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE, MANAGED_COPY_KEYSPACE,
-    S3_BUCKET_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE,
+    MANAGED_COPY_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{
@@ -21,6 +22,7 @@ use aruna_core::structs::storage::blob::{
     ManagedCopyRecord, ResolvedBackend, VersionKey,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
+use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::{Compression, CompressionMigration, EncodingClass};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -302,24 +304,28 @@ impl MigrateVersionOperation {
         };
         self.txn_id = Some(txn_id);
         self.state = MigrateState::ReadBucket;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.version_key.bucket.as_bytes().to_vec().into(),
-            txn_id: Some(txn_id),
-        })]
+        smallvec![settings_read(&self.version_key.bucket, Some(txn_id))]
     }
 
-    /// Publishes only while the bucket still asks for this target.
+    /// Publishes only while the bucket still asks for this target and stores plain bytes; an
+    /// encrypting bucket converts its versions through its own transition.
     fn handle_bucket(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected(event);
+        };
+        let Ok([(_, value), (_, settings)]) = <[_; 2]>::try_from(values) else {
+            return self.fail(MigrateVersionError::NotFinished);
         };
         let current = match value.map(|value| BucketInfo::from_bytes(value.as_ref())) {
             Some(Ok(info)) => Some(info.compression),
             Some(Err(error)) => return self.fail(error.into()),
             None => None,
         };
-        if current != Some(self.target) {
+        let encrypting = match BucketEncryption::from_row(settings.as_deref()) {
+            Ok(settings) => settings.is_encrypted(),
+            Err(error) => return self.fail(error.into()),
+        };
+        if current != Some(self.target) || encrypting {
             return self.skip();
         }
         let effect = match read_version_effect(&self.version_key, self.txn_id) {
@@ -635,6 +641,14 @@ pub async fn process_migrations(
             continue;
         }
         let bucket = String::from_utf8(key.to_vec()).map_err(|error| error.to_string())?;
+        // Encryption replaced this work: its transition converts every version.
+        if encrypting(context, &key).await? {
+            let mut retired = record;
+            retired.retry_at_ms = None;
+            retired.finished_at_ms = Some(now);
+            store_progress(context, &bucket, &retired).await?;
+            continue;
+        }
         if let Some(after) = migrate_page(context, &bucket, record).await? {
             soon(after);
         }
@@ -650,6 +664,22 @@ pub async fn process_migrations(
         soon(MIGRATION_CONTINUE);
     }
     Ok(MigrationRun { next, cursor })
+}
+
+async fn encrypting(context: &crate::driver::DriverContext, bucket: &Key) -> Result<bool, String> {
+    let read = StorageEffect::Read {
+        key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+        key: bucket.clone(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            BucketEncryption::from_row(value.as_deref())
+                .map(|settings| settings.is_encrypted())
+                .map_err(|error| error.to_string())
+        }
+        other => Err(format!("could not read encryption settings: {other:?}")),
+    }
 }
 
 async fn read_progress(
@@ -868,6 +898,17 @@ mod tests {
         })
     }
 
+    /// The publication's read of the bucket and its encryption settings.
+    fn bucket_read(compression: Compression, settings: Option<BucketEncryption>) -> Event {
+        let settings = settings.map(|settings| settings.to_bytes().unwrap().into());
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Vec::new().into(), Some(bucket(compression).into())),
+                (Vec::new().into(), settings),
+            ],
+        })
+    }
+
     fn bucket(compression: Compression) -> Vec<u8> {
         BucketInfo {
             group_id: Ulid::from_bytes([1; 16]),
@@ -944,7 +985,7 @@ mod tests {
         let mut operation = operation();
         let version = raw_version();
         written(&mut operation, &version);
-        operation.step(read_result(Some(bucket(ZSTD))));
+        operation.step(bucket_read(ZSTD, None));
         operation.step(read_result(Some(version.to_bytes().unwrap())));
 
         let effects = operation.step(read_result(None));
@@ -986,7 +1027,7 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
-        operation.step(read_result(Some(bucket(ZSTD))));
+        operation.step(bucket_read(ZSTD, None));
         operation.step(read_result(Some(version.to_bytes().unwrap())));
         let effects = operation.step(read_result(Some(location(true).to_bytes().unwrap())));
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
@@ -1007,7 +1048,7 @@ mod tests {
             }])
             .unwrap();
         written(&mut operation, &version);
-        operation.step(read_result(Some(bucket(ZSTD))));
+        operation.step(bucket_read(ZSTD, None));
         let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
         let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
             panic!("expected the registration read, got {effects:?}")
@@ -1048,7 +1089,7 @@ mod tests {
             }])
             .unwrap();
         written(&mut operation, &version);
-        operation.step(read_result(Some(bucket(ZSTD))));
+        operation.step(bucket_read(ZSTD, None));
         operation.step(read_result(Some(version.to_bytes().unwrap())));
 
         operation.step(read_result(None));
@@ -1082,7 +1123,7 @@ mod tests {
         let mut operation = operation();
         written(&mut operation, &raw_version());
 
-        let effects = operation.step(read_result(Some(bucket(Compression::Off))));
+        let effects = operation.step(bucket_read(Compression::Off, None));
 
         assert!(matches!(
             effects.as_slice(),
@@ -1100,6 +1141,119 @@ mod tests {
         }));
         assert!(matches!(effects.as_slice(), [Effect::Task(_)]));
         assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+    }
+
+    #[test]
+    fn encrypting_bucket_skips() {
+        // Encryption was enabled while this compression pass waited: a plain copy is never
+        // published for the version, and the written copy goes back to the cleanup queue.
+        use aruna_core::structs::storage::encryption::EncryptionMode;
+        let mut operation = operation();
+        written(&mut operation, &raw_version());
+        let settings = BucketEncryption {
+            mode: EncryptionMode::NodeManaged,
+            bucket_id: Some(Ulid::from_bytes([3; 16])),
+            key_generation: 1,
+            ..Default::default()
+        };
+
+        let effects = operation.step(bucket_read(ZSTD, Some(settings)));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: TxnId::default(),
+        }));
+        operation.step(Event::Blob(BlobEvent::ReservationReleased {
+            id: Ulid::nil(),
+        }));
+        assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+    }
+
+    #[test]
+    fn encrypting_adoption_skips() {
+        // A matching plain copy appeared after encryption was enabled: the retry never adopts
+        // it for this version.
+        use aruna_core::structs::storage::encryption::EncryptionMode;
+        let mut operation = operation();
+        let version = raw_version();
+        operation.start();
+        operation.step(read_result(Some(version.to_bytes().unwrap())));
+        operation.step(read_result(Some(location(false).to_bytes().unwrap())));
+        operation.step(read_result(Some(location(true).to_bytes().unwrap())));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        let settings = BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(Ulid::from_bytes([3; 16])),
+            key_generation: 1,
+            ..Default::default()
+        };
+
+        let effects = operation.step(bucket_read(ZSTD, Some(settings)));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: TxnId::default(),
+        }));
+        assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+    }
+
+    #[tokio::test]
+    async fn encryption_retires_compression() {
+        // A compression pass waiting for its retry is finished once its bucket encrypts.
+        use aruna_core::structs::storage::encryption::EncryptionMode;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let context = crate::driver::DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let mut record = CompressionMigration::new(ZSTD, 1);
+        record.failed = 2;
+        record.retry_at_ms = Some(2);
+        let settings = BucketEncryption {
+            mode: EncryptionMode::NodeManaged,
+            bucket_id: Some(Ulid::from_bytes([3; 16])),
+            key_generation: 1,
+            ..Default::default()
+        };
+        for (key_space, value) in [
+            (COMPRESSION_QUEUE_KEYSPACE, Vec::new()),
+            (COMPRESSION_MIGRATION_KEYSPACE, record.to_bytes().unwrap()),
+            (BUCKET_ENCRYPTION_KEYSPACE, settings.to_bytes().unwrap()),
+        ] {
+            storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key: b"b".to_vec().into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await;
+        }
+
+        // Resuming after "a" skips the transition queue, which this test does not seed.
+        process_migrations(&context, Some(b"a".to_vec().into()))
+            .await
+            .unwrap();
+
+        let stored = read_progress(&context, &b"b".to_vec().into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.finished_at_ms.is_some());
+        assert_eq!(stored.retry_at_ms, None);
     }
 
     #[test]
