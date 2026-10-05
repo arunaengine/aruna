@@ -289,6 +289,11 @@ impl SealedCopyOperation {
             return Err(SealedCopyError::SourceChanged);
         }
         let archive = self.archive();
+        if let Some(key) = source.location_key()
+            && key != self.input.location.location_key()?
+        {
+            return Err(SealedCopyError::SourceChanged);
+        }
         let state = match source.state {
             BlobVersionState::Materialized {
                 blob_hash,

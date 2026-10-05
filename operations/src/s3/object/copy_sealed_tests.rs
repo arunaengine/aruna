@@ -157,7 +157,8 @@ async fn pending_alias_shared() {
 async fn known_archive_shared() {
     // A known-hash source keeps its hash and archive; replacement metadata is applied.
     let (_temp, context) = context();
-    let location = sealed_location();
+    let mut location = sealed_location();
+    location.hashes.insert("blake3".to_string(), vec![9; 32]);
     let archive = ArchiveKey::of(&location);
     let source_id = Ulid::generate();
     let source = BlobVersion::materialized(
@@ -205,6 +206,47 @@ async fn changed_source_refused() {
             .await
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn materialized_archive_changed() {
+    for changed_hash in [false, true] {
+        let (_temp, context) = context();
+        let mut captured = sealed_location();
+        captured.hashes.insert("blake3".to_string(), vec![9; 32]);
+        let mut current = captured.clone();
+        current.ulid = Ulid::generate();
+        if !changed_hash {
+            let layout = PithosLayout {
+                stored_size: 80,
+                metadata_digest: [6; 32],
+            };
+            current.format = StoredFormat::pithos(layout, current.format.bucket_key().unwrap());
+        }
+        let source_id = Ulid::generate();
+        let source = BlobVersion::materialized(
+            [if changed_hash { 8 } else { 9 }; 32],
+            current.backend,
+            current.format.encoding(),
+            SystemTime::UNIX_EPOCH,
+            UserId::default(),
+            None,
+        );
+        seed(&context.storage_handle, source_id, &source).await;
+        let operation = SealedCopyOperation::new(input(&captured, source_id));
+        let version = operation.version_id;
+        assert_eq!(
+            drive(operation, &context).await,
+            Err(SealedCopyError::SourceChanged)
+        );
+        assert!(!owns(&context.storage_handle, &ArchiveKey::of(&captured), version).await);
+        let head = BlobHeadKey::new("bucket", "copy").to_bytes().unwrap();
+        assert!(
+            get(&context.storage_handle, BLOB_HEAD_KEYSPACE, head)
+                .await
+                .is_none()
+        );
+    }
 }
 
 #[test]
