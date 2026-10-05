@@ -1094,3 +1094,120 @@ fn subpath_operations_limited() {
     assert!(!is_listing_operation("PutObject"));
     assert!(!is_listing_operation("GetObject"));
 }
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    /// The hex of `canary-token-key-7a2c-0000-00000`, a token no log or error may show.
+    const CANARY: &str = "63616e6172792d746f6b656e2d6b65792d376132632d303030302d3030303030";
+    const SIGNED: &str = "AWS4-HMAC-SHA256 Credential=TOKENKEY/20261005/us-east-1/s3/aws4_request, \
+        SignedHeaders=host;x-amz-date;x-amz-security-token, Signature=00";
+    const UNSIGNED: &str = "AWS4-HMAC-SHA256 Credential=TOKENKEY/20261005/us-east-1/s3/aws4_request, \
+        SignedHeaders=host;x-amz-date, Signature=00";
+
+    fn headers(authorization: &str, tokens: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let value = http::HeaderValue::from_str(authorization).unwrap();
+        headers.insert(http::header::AUTHORIZATION, value);
+        for token in tokens {
+            headers.append(TOKEN_HEADER, http::HeaderValue::from_str(token).unwrap());
+        }
+        headers
+    }
+
+    fn checked(headers: &HeaderMap, uri: &'static str) -> S3Result<Option<TokenCredential>> {
+        credential_token(headers, &Uri::from_static(uri), "TOKENKEY")
+    }
+
+    fn refused(result: S3Result<Option<TokenCredential>>) -> bool {
+        result.is_err_and(|error| error.code() == &s3s::S3ErrorCode::InvalidToken)
+    }
+
+    #[test]
+    fn signed_token_accepted() {
+        let token = checked(&headers(SIGNED, &[CANARY]), "/bucket/key")
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.access_key, "TOKENKEY");
+        assert_eq!(*TokenCredential::encode(token.token.bytes()), CANARY);
+        // A long-lived key without a token stays an ordinary credential.
+        assert!(
+            checked(&headers(SIGNED, &[]), "/bucket/key")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unsigned_token_refused() {
+        assert!(refused(checked(
+            &headers(UNSIGNED, &[CANARY]),
+            "/bucket/key"
+        )));
+        assert!(refused(checked(
+            &headers(SIGNED, &[CANARY, CANARY]),
+            "/bucket/key"
+        )));
+        assert!(refused(checked(
+            &headers(SIGNED, &["not-a-token"]),
+            "/bucket/key"
+        )));
+        let short = &CANARY[..62];
+        assert!(refused(checked(&headers(SIGNED, &[short]), "/bucket/key")));
+    }
+
+    #[test]
+    fn presigned_token_refused() {
+        // A token in the query of a long-lived key is refused before s3s logs the URI.
+        let query = Uri::from_static(
+            "/bucket/key?X-Amz-Credential=TOKENKEY%2F20261005%2Fus-east-1%2Fs3%2Faws4_request\
+             &X-Amz-Security-Token=secret&X-Amz-Signature=00",
+        );
+        assert!(query_token_refused(&HeaderMap::new(), &query));
+        let header_auth = Uri::from_static("/bucket/key?X-Amz-Security-Token=secret");
+        assert!(query_token_refused(&headers(SIGNED, &[]), &header_auth));
+        assert!(query_token_refused(&HeaderMap::new(), &header_auth));
+        // Session keys keep their presigned tokens; requests without a query token pass.
+        let session = Uri::from_static(
+            "/bucket/key?X-Amz-Credential=ASIAKEY%2F20261005%2Fus-east-1%2Fs3%2Faws4_request\
+             &X-Amz-Security-Token=secret",
+        );
+        assert!(!query_token_refused(&HeaderMap::new(), &session));
+        let plain = Uri::from_static("/bucket/key?X-Amz-Signature=00");
+        assert!(!query_token_refused(&HeaderMap::new(), &plain));
+        // The access check refuses a presigned request with a header token, and a query token.
+        let presigned = "/bucket/key?X-Amz-Signature=00";
+        assert!(refused(checked(&headers(SIGNED, &[CANARY]), presigned)));
+        let token_query = "/bucket/key?X-Amz-Security-Token=00";
+        assert!(refused(checked(&headers(SIGNED, &[]), token_query)));
+    }
+
+    #[test]
+    fn tokens_never_logged() {
+        let mut request = http::Request::builder()
+            .uri("/bucket/key")
+            .header(http::header::AUTHORIZATION, SIGNED)
+            .header(TOKEN_HEADER, CANARY)
+            .body(())
+            .unwrap();
+        assert!(format!("{request:?}").contains(CANARY));
+        hide_tokens(request.headers_mut());
+        let formatted = format!("{request:?}");
+        assert!(!formatted.contains(CANARY), "{formatted}");
+        // Signing still sees the value; only formatting hides it.
+        assert!(signs_header(request.headers(), TOKEN_HEADER));
+        let kept = request.headers().get(TOKEN_HEADER).unwrap();
+        assert_eq!(kept.as_bytes(), CANARY.as_bytes());
+        // Refusals and the admitted credential show no token either.
+        let error = checked(&headers(UNSIGNED, &[CANARY]), "/bucket/key").unwrap_err();
+        let token = checked(&headers(SIGNED, &[CANARY]), "/bucket/key").unwrap();
+        for formatted in [
+            format!("{error:?}"),
+            error.to_string(),
+            format!("{token:?}"),
+        ] {
+            assert!(!formatted.contains(CANARY), "{formatted}");
+        }
+    }
+}
