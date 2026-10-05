@@ -1,9 +1,11 @@
 //! Finds the vault-locked buckets whose last recorded session was unlocked before this start,
-//! with the generations that were unlocked and the users who hold a grant or copy of them.
+//! with the generations that were unlocked and the bucket's current key holders (D30).
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
 use crate::s3::restart_notice::RestartedBucket;
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -12,10 +14,12 @@ use aruna_core::keyspaces::{
     S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketHolder, EncryptionMode, SealedCopy,
 };
+use aruna_core::structs::storage::holders::resolve_holders;
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
@@ -31,6 +35,7 @@ enum ScanStep {
     ScanSettings,
     ScanAudit,
     ReadBucket,
+    ReadAuthority,
     ScanGrants,
     ScanCopies,
     Finish,
@@ -43,6 +48,8 @@ pub enum RestartScanError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    Settings(#[from] SettingsError),
     #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: String,
@@ -66,26 +73,36 @@ struct Trail {
 pub struct RestartScanOperation {
     /// The time of this start; a session whose deadline passed before it was not unlocked.
     now_ms: u64,
+    realm_id: RealmId,
     step: ScanStep,
     /// Vault-locked buckets still to scan, by name and stable id.
     pending: Vec<(String, Ulid)>,
     current: Option<RestartedBucket>,
     /// Unlock state per generation of the current bucket, in audit order.
     trails: BTreeMap<u64, Trail>,
-    holders: BTreeSet<aruna_core::UserId>,
+    creator: Option<UserId>,
+    /// Current group admins, read from the authorization documents.
+    admins: BTreeSet<UserId>,
+    grants: Vec<BucketHolder>,
+    /// Copies of the unlocked generations.
+    copies: Vec<SealedCopy>,
     found: Vec<RestartedBucket>,
     output: Option<Result<Vec<RestartedBucket>, RestartScanError>>,
 }
 
 impl RestartScanOperation {
-    pub fn new(now_ms: u64) -> Self {
+    pub fn new(now_ms: u64, realm_id: RealmId) -> Self {
         Self {
             now_ms,
+            realm_id,
             step: ScanStep::Init,
             pending: Vec::new(),
             current: None,
             trails: BTreeMap::new(),
-            holders: BTreeSet::new(),
+            creator: None,
+            admins: BTreeSet::new(),
+            grants: Vec::new(),
+            copies: Vec::new(),
             found: Vec::new(),
             output: None,
         }
@@ -120,7 +137,8 @@ impl RestartScanOperation {
             return smallvec![];
         };
         self.trails.clear();
-        self.holders.clear();
+        self.grants.clear();
+        self.copies.clear();
         self.current = Some(RestartedBucket {
             bucket,
             bucket_id,
@@ -225,11 +243,32 @@ impl RestartScanOperation {
             Ok(info) => info,
             Err(error) => return self.fail(error),
         };
-        self.holders.insert(info.created_by);
         let Some(current) = self.current.as_mut() else {
             return self.fail(RestartScanError::NotFinished);
         };
         current.group_id = info.group_id;
+        self.step = ScanStep::ReadAuthority;
+        let realm_id = self.realm_id;
+        smallvec![authority_read(
+            &current.bucket,
+            realm_id,
+            info.group_id,
+            None
+        )]
+    }
+
+    /// Admin rights come from the current authorization documents, not from stored copies.
+    fn authority_scanned(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+        let Some(current) = self.current.as_ref() else {
+            return self.fail(RestartScanError::NotFinished);
+        };
+        match parse_authority(values, self.realm_id, current.group_id) {
+            Ok(state) => {
+                self.creator = Some(state.info.created_by);
+                self.admins = state.admins;
+            }
+            Err(error) => return self.fail(error),
+        }
         let bucket_id = current.bucket_id;
         self.scan_rows(ScanStep::ScanGrants, BUCKET_HOLDER_KEYSPACE, bucket_id)
     }
@@ -239,24 +278,32 @@ impl RestartScanOperation {
             return self.fail(RestartScanError::NotFinished);
         };
         for (_, value) in values {
-            let user = match self.step {
-                ScanStep::ScanGrants => BucketHolder::from_bytes(value.as_ref())
-                    .ok()
-                    .map(|grant| grant.user_id),
-                _ => SealedCopy::from_bytes(value.as_ref())
-                    .ok()
-                    .filter(|copy| current.generations.contains(&copy.key.generation))
-                    .map(|copy| copy.user_id),
-            };
-            self.holders.extend(user);
+            match self.step {
+                ScanStep::ScanGrants => {
+                    let grant = BucketHolder::from_bytes(value.as_ref()).ok();
+                    self.grants.extend(grant);
+                }
+                _ => {
+                    let copy = SealedCopy::from_bytes(value.as_ref())
+                        .ok()
+                        .filter(|copy| current.generations.contains(&copy.key.generation));
+                    self.copies.extend(copy);
+                }
+            }
         }
         if self.step == ScanStep::ScanGrants {
             let bucket_id = current.bucket_id;
             return self.scan_rows(ScanStep::ScanCopies, KEY_COPY_KEYSPACE, bucket_id);
         }
+        // The holders now: creator, current admins and explicit grants; former admins are not.
+        let Some(creator) = self.creator.take() else {
+            return self.fail(RestartScanError::NotFinished);
+        };
+        let lookups = BTreeMap::new();
+        let report = resolve_holders(creator, &self.admins, &self.grants, &lookups, &self.copies);
         let mut bucket = self.current.take();
         if let Some(bucket) = bucket.as_mut() {
-            bucket.holders = std::mem::take(&mut self.holders).into_iter().collect();
+            bucket.holders = report.holders.iter().map(|holder| holder.user_id).collect();
         }
         self.found.extend(bucket);
         self.next_bucket()
@@ -300,6 +347,9 @@ impl Operation for RestartScanOperation {
             ) => self.audit_scanned(values, next_start_after),
             (ScanStep::ReadBucket, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
                 self.bucket_read(value)
+            }
+            (ScanStep::ReadAuthority, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                self.authority_scanned(values)
             }
             (
                 ScanStep::ScanGrants | ScanStep::ScanCopies,

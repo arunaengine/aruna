@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::s3::bucket::key_rows::authority_rows;
 use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, GrantState, HolderOrigin};
@@ -77,7 +78,7 @@ fn copy(user_id: UserId, generation: u64) -> (Vec<u8>, Vec<u8>) {
 
 #[test]
 fn finds_unlocked_generations() {
-    let mut operation = RestartScanOperation::new(NOW);
+    let mut operation = RestartScanOperation::new(NOW, RealmId::from_bytes([1; 32]));
     operation.start();
     let effects = operation.step(rows(vec![
         (
@@ -109,10 +110,18 @@ fn finds_unlocked_generations() {
         placement_policy_generation: 0,
         compression: Compression::Off,
     };
-    operation.step(Event::Storage(StorageEvent::ReadResult {
+    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
         key: Key::from(b"locked".to_vec()),
         value: Some(info.to_bytes().unwrap().into()),
     }));
+    // Admin rights come from the current authorization documents: user(4) lost its role.
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { .. })]
+    ));
+    let settings = BucketEncryption::from_bytes(&settings(EncryptionMode::VaultLocked, LOCKED));
+    let values = authority_rows(&info, Some(&settings.unwrap()), &[user(5)]);
+    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
     let grant = BucketHolder {
         bucket_id: LOCKED,
         user_id: user(3),
@@ -122,8 +131,8 @@ fn finds_unlocked_generations() {
         granted_at_ms: 1,
     };
     operation.step(rows(vec![(grant.key(), grant.to_bytes().unwrap())]));
-    // Only holders of an unlocked generation are told.
-    operation.step(rows(vec![copy(user(2), 1), copy(user(4), 2)]));
+    // A former admin keeps an old copy but is no holder any more and is not told.
+    operation.step(rows(vec![copy(user(2), 1), copy(user(4), 1)]));
     let found = operation.finalize().unwrap();
     assert_eq!(
         found,
@@ -132,14 +141,14 @@ fn finds_unlocked_generations() {
             bucket_id: LOCKED,
             group_id: GROUP,
             generations: vec![1],
-            holders: vec![user(1), user(2), user(3)],
+            holders: vec![user(1), user(3), user(5)],
         }]
     );
 }
 
 /// The generations a scan of one vault-locked bucket with `trail` reports as unlocked.
 fn reported(trail: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<u64> {
-    let mut operation = RestartScanOperation::new(NOW);
+    let mut operation = RestartScanOperation::new(NOW, RealmId::from_bytes([1; 32]));
     operation.start();
     let locked = (
         b"locked".to_vec(),
