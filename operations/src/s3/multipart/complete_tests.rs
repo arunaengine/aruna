@@ -1849,6 +1849,63 @@ fn omitted_parts_paged() {
 }
 
 #[test]
+fn oversized_selection_refused() {
+    use aruna_core::structs::storage::multipart::PartPiece;
+    let (mut operation, _) = sealed_operation(&[]);
+    operation.input.object_size = None;
+    operation.input.completed_parts = (1..=10_000)
+        .map(|part_number| CompleteMultipartPart {
+            part_number,
+            etag: None,
+            expected_checksums: Vec::new(),
+        })
+        .collect();
+    operation.read_parts(None);
+    let limit = aruna_blob::blob::pithos::MAX_SIZE;
+    let mut effects = smallvec![];
+    for start in (1..=10_000u16).step_by(PART_PAGE) {
+        let end = (start as usize + PART_PAGE).min(10_001) as u16;
+        let parts = (start..end)
+            .map(|number| {
+                let mut part = part_record(number, MAX_PART_SIZE);
+                part.piece = Some(PartPiece {
+                    record: number.to_le_bytes().to_vec(),
+                    stored_len: MAX_PART_SIZE,
+                    content_offset: None,
+                });
+                part
+            })
+            .collect();
+        let values = part_values(operation.input.upload_id, parts);
+        let next_start_after = values.last().map(|(key, _)| key.clone());
+        effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Blob(BlobEffect::ComposePieces { .. })))
+        );
+        if operation.state != CompleteUploadState::ReadUploadParts {
+            break;
+        }
+    }
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction { .. })]
+    ));
+    assert!(operation.selected_bytes <= limit);
+    assert!(operation.resolved_parts.is_empty());
+    assert_eq!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::BlobError(
+            BlobError::SizeLimitExceeded { limit }
+        ))
+    );
+}
+
+#[test]
 fn share_outlives_compose() {
     // The completion keeps its reservation after composition starts, while publication still
     // holds the selected piece records.

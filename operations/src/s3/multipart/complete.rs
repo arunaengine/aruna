@@ -273,6 +273,7 @@ pub struct CompleteUploadOperation {
     compose_share: Option<WorkingShare>,
     /// Selected parts with their piece records, gathered while the part rows are paged.
     selected_parts: HashMap<u16, MultipartPart>,
+    selected_bytes: u64,
 }
 
 impl CompleteUploadOperation {
@@ -311,6 +312,7 @@ impl CompleteUploadOperation {
             reset_done: false,
             compose_share: None,
             selected_parts: HashMap::new(),
+            selected_bytes: 0,
         }
     }
 
@@ -781,6 +783,14 @@ impl CompleteUploadOperation {
             let part_key = MultipartPartKey::from_bytes(key.as_ref())?;
             let mut part_record = MultipartPart::from_bytes(value.as_ref())?;
             if requested.contains(&part_key.part_number) {
+                if self.compose_share.is_some() {
+                    let limit = aruna_blob::blob::pithos::MAX_SIZE;
+                    self.selected_bytes = self
+                        .selected_bytes
+                        .checked_add(part_record.location.blob_size)
+                        .filter(|size| *size <= limit)
+                        .ok_or(BlobError::SizeLimitExceeded { limit })?;
+                }
                 self.selected_parts
                     .insert(part_key.part_number, part_record.clone());
             }
