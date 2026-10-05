@@ -478,7 +478,14 @@ impl IntoS3Error for GetObjectError {
             GetObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
             GetObjectError::ConversionError(ConversionError::BucketKey(
                 BucketKeyError::Locked(_),
-            )) => bucket_locked_error(),
+            ))
+            | GetObjectError::PendingContent(_) => bucket_locked_error(),
+            GetObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::InvalidToken,
+            )) => s3_error!(
+                InvalidToken,
+                "The security token does not open the bucket key"
+            ),
             GetObjectError::NoSuchVersion => missing_version_error(),
             GetObjectError::HistoricalReferenceUnavailable => {
                 s3_error!(

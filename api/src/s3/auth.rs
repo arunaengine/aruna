@@ -14,6 +14,7 @@ use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX
 use aruna_core::structs::storage::blob::{
     BucketInfo, UserAccess, bucket_permission_path, group_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::encryption::TokenCredential;
 use aruna_core::{NodeId, UserId};
 use aruna_operations::auth::bearer_token::realm_user_cutoff;
 use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
@@ -154,8 +155,12 @@ impl S3Access for AuthProvider {
             let permit = self.admit_session(&session, &token_hash, now)?;
             (session.as_user_access(), permit, Some(token_hash))
         } else {
+            let token = credential_token(cx.headers(), cx.uri(), &access_key_id)?;
             let user_access = self.query_user_access(&access_key_id).await?;
             let permit = self.admit_credential(&user_access)?;
+            if let Some(token) = token {
+                cx.extensions_mut().insert(token);
+            }
             (user_access, permit, None)
         };
         let lease = cx
@@ -328,6 +333,85 @@ fn request_token_hash(headers: &HeaderMap, uri: &Uri) -> S3Result<String> {
     token
         .map(|token| S3Session::hash_token(&token))
         .ok_or_else(|| s3_error!(MissingAuthenticationToken, "Session token is required"))
+}
+
+const TOKEN_HEADER: &str = "x-amz-security-token";
+const TOKEN_QUERY: &str = "X-Amz-Security-Token";
+
+/// Hides every token header value from formatting, so a logged request shows no token.
+pub(crate) fn hide_tokens(headers: &mut HeaderMap) {
+    if let http::header::Entry::Occupied(mut entry) = headers.entry(TOKEN_HEADER) {
+        for value in entry.iter_mut() {
+            value.set_sensitive(true);
+        }
+    }
+}
+
+/// Whether the request carries a query token for anything but a session key. Such a token
+/// would sit in the logged URI, so it is refused before the request is parsed.
+pub(crate) fn query_token_refused(headers: &HeaderMap, uri: &Uri) -> bool {
+    let query = uri.query().unwrap_or_default();
+    let mut token = false;
+    let mut access_key = None;
+    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match name.as_ref() {
+            TOKEN_QUERY => token = true,
+            "X-Amz-Credential" => access_key = value.split('/').next().map(str::to_string),
+            _ => {}
+        }
+    }
+    let header_key = || {
+        let value = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
+        let (_, credential) = value.split_once("Credential=")?;
+        credential.split('/').next().map(str::to_string)
+    };
+    token
+        && !access_key
+            .or_else(header_key)
+            .is_some_and(|key| S3Session::is_session_key(&key))
+}
+
+/// Whether the SigV4 `Authorization` header lists `name` among its signed headers.
+pub(crate) fn signs_header(headers: &HeaderMap, name: &str) -> bool {
+    headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once("SignedHeaders="))
+        .and_then(|(_, rest)| rest.split(',').next())
+        .is_some_and(|names| {
+            names
+                .split(';')
+                .any(|signed| signed.trim().eq_ignore_ascii_case(name))
+        })
+}
+
+/// The token credential a long-lived key sends in a signed `x-amz-security-token` header.
+/// A query token, a presigned request or an unsigned or malformed token is refused.
+fn credential_token(
+    headers: &HeaderMap,
+    uri: &Uri,
+    access_key: &str,
+) -> S3Result<Option<TokenCredential>> {
+    let invalid = || s3_error!(InvalidToken, "Invalid security token");
+    let (mut query_token, mut presigned) = (false, false);
+    let query = uri.query().unwrap_or_default();
+    for (name, _) in url::form_urlencoded::parse(query.as_bytes()) {
+        query_token |= name == TOKEN_QUERY;
+        presigned |= name == "X-Amz-Signature";
+    }
+    if query_token {
+        return Err(invalid());
+    }
+    let mut values = headers.get_all(TOKEN_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() || presigned || !signs_header(headers, TOKEN_HEADER) {
+        return Err(invalid());
+    }
+    TokenCredential::parse(access_key, value.as_bytes())
+        .map(Some)
+        .ok_or_else(invalid)
 }
 
 fn map_session_error(error: S3SessionError) -> s3s::S3Error {

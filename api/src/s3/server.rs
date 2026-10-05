@@ -18,8 +18,8 @@ use self::activity::{
 use self::classification::RequestClassification;
 use self::keepalive::{HandlerOutcome, await_handler, keepalive_response};
 use self::response::{
-    apply_response_cors, connection_error, invalid_bucket_response, oversized_delete_response,
-    preflight_response, slow_down_response, stream_timeout_response,
+    apply_response_cors, connection_error, invalid_bucket_response, invalid_token_response,
+    oversized_delete_response, preflight_response, slow_down_response, stream_timeout_response,
 };
 use super::auth::AuthProvider;
 use super::service::ArunaS3Service;
@@ -386,6 +386,14 @@ impl PreparedRequest {
             .request
             .take()
             .expect("request is present before the handler runs");
+        // Stage: a query token of a long-lived key is refused before s3s logs the URI.
+        if super::auth::query_token_refused(request.headers(), request.uri()) {
+            drop(request);
+            self.finish_request();
+            return self
+                .trace
+                .respond("invalid_token", invalid_token_response()?);
+        }
         let token = super::auth::request_token(request.headers(), request.uri());
         let mut handler: BoxFuture<'static, Result<HttpResponse, HttpError>> = Box::pin(
             super::auth::with_request_token(token, async move { shared.call(request).await })
@@ -892,17 +900,7 @@ fn restore_signed_expect(headers: &mut http::HeaderMap) {
     if headers.contains_key(header::EXPECT) {
         return;
     }
-    let signs_expect = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split_once("SignedHeaders="))
-        .and_then(|(_, rest)| rest.split(',').next())
-        .is_some_and(|names| {
-            names
-                .split(';')
-                .any(|name| name.trim().eq_ignore_ascii_case("expect"))
-        });
-    if signs_expect {
+    if super::auth::signs_header(headers, "expect") {
         headers.insert(
             header::EXPECT,
             http::HeaderValue::from_static("100-continue"),
@@ -919,6 +917,7 @@ impl Service<Request<Incoming>> for WrappingService {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let (mut parts, body) = req.into_parts();
+        super::auth::hide_tokens(&mut parts.headers);
         restore_signed_expect(&mut parts.headers);
         // Stage: classification. Route, bucket, CORS preconditions and body
         // shape are derived before anything is parsed or stored.

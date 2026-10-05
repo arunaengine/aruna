@@ -44,6 +44,16 @@ pub(super) fn invalid_bucket_response(reason: &'static str) -> Result<HttpRespon
         .map_err(|error| HttpError::new(Box::new(error)))
 }
 
+/// A security token in the query of a long-lived key; token credentials cannot be presigned.
+pub(super) fn invalid_token_response() -> Result<HttpResponse, HttpError> {
+    s3_error!(
+        InvalidToken,
+        "Token credentials accept the security token only as a header"
+    )
+    .to_http_response()
+    .map_err(|error| HttpError::new(Box::new(error)))
+}
+
 pub(super) fn slow_down_response(retry_after: u64) -> HttpResponse {
     const SLOW_DOWN_BODY: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>SlowDown</Code><Message>Reduce your request rate.</Message></Error>";
     let mut response = http::Response::builder()
