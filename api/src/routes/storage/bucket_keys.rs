@@ -755,7 +755,7 @@ group's admin path.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
-        (status = 409, description = "`stale_generation`, `bucket_locked`, `open_uploads` or `recovery_unmet`", body = ErrorResponse)
+        (status = 409, description = "`stale_generation`, `bucket_locked`, `open_uploads`, `recovery_unmet` or `transition_running`", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
