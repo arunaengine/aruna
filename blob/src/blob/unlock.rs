@@ -127,6 +127,8 @@ impl LeaseGuard {
 pub(super) struct UnlockRegistry {
     capacity: usize,
     sessions: HashMap<BucketKeyRef, Vec<Session>>,
+    /// Sessions that reached their deadline before their timer ran, so it still records the lock.
+    expired: HashMap<BucketKeyRef, Ulid>,
     pins: Pins,
     leases: Arc<Semaphore>,
 }
@@ -150,6 +152,7 @@ impl UnlockRegistry {
         Self {
             capacity,
             sessions: HashMap::new(),
+            expired: HashMap::new(),
             pins: Arc::default(),
             leases: Arc::new(Semaphore::new(leases)),
         }
@@ -298,9 +301,17 @@ impl UnlockRegistry {
         Ok(session.status(key, now))
     }
 
-    /// Locks every generation of a bucket, or only `only` when a timer names its session.
+    /// Locks every generation of a bucket, or only `only` when a timer names its session. A timer
+    /// whose session already expired still reports it, so its timed lock is recorded.
     pub(super) fn lock(&mut self, bucket_id: Ulid, only: Option<KeyTicket>) -> Vec<KeyTicket> {
         let mut locked = Vec::new();
+        if let Some(ticket) = only
+            && ticket.key.bucket_id == bucket_id
+            && self.expired.get(&ticket.key) == Some(&ticket.session_id)
+        {
+            self.expired.remove(&ticket.key);
+            locked.push(ticket);
+        }
         self.sessions.retain(|key, sessions| {
             if key.bucket_id != bucket_id {
                 return true;
@@ -409,6 +420,7 @@ impl UnlockRegistry {
     /// Forgets every session, for shutdown; admitted leases keep their own key until they end.
     pub(super) fn clear(&mut self) {
         self.sessions.clear();
+        self.expired.clear();
     }
 
     /// Drops the session of `ticket` if it was prepared but never activated.
@@ -421,10 +433,18 @@ impl UnlockRegistry {
         }
     }
 
-    /// Removes sessions past their deadline; admitted leases keep their own key.
+    /// Removes sessions past their deadline; admitted leases keep their own key. An active
+    /// session keeps only its id as evidence until its timer records the lock.
     fn purge(&mut self, now: Instant) {
-        self.sessions.retain(|_, sessions| {
-            sessions.retain(|session| !session.expired(now));
+        let expired = &mut self.expired;
+        self.sessions.retain(|key, sessions| {
+            sessions.retain(|session| {
+                let ended = session.expired(now);
+                if ended && session.active {
+                    expired.insert(*key, session.session_id);
+                }
+                !ended
+            });
             !sessions.is_empty()
         });
     }

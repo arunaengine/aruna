@@ -317,3 +317,24 @@ async fn idle_prepared_dropped() {
     assert!(!guard.sessions.contains_key(&idle));
     assert!(guard.status(used.bucket_id, now)[0].active);
 }
+
+#[test]
+fn polled_expiry_still_locks() {
+    let mut registry = UnlockRegistry::new(UNLOCKED_BUCKETS);
+    let start = Instant::now();
+    let key = reference(1, 1);
+    let ticket = unlock(&mut registry, key, 1, (Some(MINUTE), None), start).unwrap();
+    // Status polling after the deadline removes the key before the timer runs.
+    let later = start + 2 * MINUTE;
+    assert!(registry.status(key.bucket_id, later).is_empty());
+    assert!(admit(&mut registry, key, archive(1), later).is_err());
+    // The timer still learns that its session ended, so the timed lock is recorded once.
+    assert_eq!(registry.lock(key.bucket_id, Some(ticket)), vec![ticket]);
+    assert!(registry.lock(key.bucket_id, Some(ticket)).is_empty());
+    // A stale timer of another session records nothing.
+    let other = KeyTicket {
+        key,
+        session_id: Ulid::generate(),
+    };
+    assert!(registry.lock(key.bucket_id, Some(other)).is_empty());
+}
