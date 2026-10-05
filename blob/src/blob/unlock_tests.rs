@@ -5,10 +5,12 @@
 use super::{LeaseGuard, UNLOCKED_BUCKETS, UnlockRegistry, expire_prepared};
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::errors::BlobError;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{ArchiveKey, BackendRef};
 use aruna_core::structs::storage::encryption::{
-    BucketKeyError, BucketKeyRef, KeyTicket, ReadLease, public_key_of,
+    BucketKeyError, BucketKeyRef, KeyTicket, ReadLease, open_token, public_key_of,
 };
+use aruna_core::{NodeId, UserId};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime};
 use ulid::Ulid;
@@ -481,4 +483,65 @@ fn timer_spares_extension() {
         vec![ticket]
     );
     assert!(admit(&mut registry, key, archive(1), new).is_err());
+}
+
+#[test]
+fn seals_unlocked_tokens() {
+    let mut registry = UnlockRegistry::new(UNLOCKED_BUCKETS);
+    let now = Instant::now();
+    let (first, second) = (reference(1, 1), reference(2, 1));
+    unlock(&mut registry, first, 1, (None, None), now).unwrap();
+    unlock(&mut registry, second, 2, (None, None), now).unwrap();
+    // The Ed25519 base point is a valid node id.
+    let mut base = [0x66; 32];
+    base[0] = 0x58;
+    let origin = (
+        RealmId::from_bytes([1; 32]),
+        NodeId::from_bytes(&base).unwrap(),
+    );
+    let creator = UserId::new(Ulid::from_bytes([5; 16]), origin.0);
+    let holder = ("TOKENKEY", creator);
+    let (copies, token) = registry
+        .seal_tokens(&[first, second], origin, holder, now)
+        .unwrap();
+    // One token opens the copy of each bucket, and only that bucket's key.
+    for (copy, seed) in copies.iter().zip([1, 2]) {
+        let public = public_key_of(private(seed).bytes()).unwrap();
+        let opened = open_token(copy, &public, origin, token.bytes()).unwrap();
+        assert_eq!(opened.expose(), private(seed).bytes().expose());
+        assert_eq!((copy.access_key.as_str(), copy.created_by), holder);
+    }
+    // A locked bucket fails the whole credential.
+    registry.lock(second.bucket_id, None, now);
+    let locked = registry.seal_tokens(&[first, second], origin, holder, now);
+    assert_eq!(
+        locked.unwrap_err(),
+        BucketKeyError::Locked(second.bucket_id)
+    );
+}
+
+#[test]
+fn token_leases_pin() {
+    let registry = UnlockRegistry::with_leases(UNLOCKED_BUCKETS, 1);
+    let key = reference(1, 1);
+    let slot = registry.lease_slots().try_acquire_owned().unwrap();
+    // A token lease needs no unlock session, yet holds the key, the archive and the slot.
+    let lease = registry
+        .token_lease(key, archive(1), private(1), slot)
+        .unwrap();
+    assert_eq!(LeaseGuard::secret(&lease), Some(&private(1)));
+    assert_eq!((lease.key, lease.session_id), (key, Ulid::nil()));
+    assert!(registry.claim_delete(&archive(1)).is_err());
+    assert!(registry.lease_slots().try_acquire_owned().is_err());
+    drop(lease);
+    assert!(registry.lease_slots().try_acquire_owned().is_ok());
+    // An archive claimed for deletion is not leased.
+    let claim = registry.claim_delete(&archive(1)).unwrap();
+    let slot = registry.lease_slots().try_acquire_owned().unwrap();
+    assert!(
+        registry
+            .token_lease(key, archive(1), private(1), slot)
+            .is_err()
+    );
+    drop(claim);
 }
