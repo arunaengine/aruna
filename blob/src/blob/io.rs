@@ -986,16 +986,13 @@ impl BlobHandler {
         Ok(true)
     }
 
-    /// Claims a Pithos archive for deletion, so no lease starts while its backend copy goes.
-    /// A pinned archive fails the claim and stays for a later pass.
+    /// Claims a copy of any layout for deletion, so no lease starts while its backend copy goes.
+    /// A pinned copy fails the claim and stays for a later pass.
     fn claim_archive(
         &self,
         location: &BackendLocation,
-    ) -> Result<Option<super::unlock::DeleteClaim>, BlobError> {
-        match location.format.layout {
-            StoredLayout::Pithos(_) => self.claim_delete(&ArchiveKey::of(location)).map(Some),
-            _ => Ok(None),
-        }
+    ) -> Result<super::unlock::DeleteClaim, BlobError> {
+        self.claim_delete(&ArchiveKey::of(location))
     }
 
     /// Whether committed records keep a Pithos archive: its pending location names this exact
@@ -2008,14 +2005,11 @@ impl BlobHandler {
     }
 
     pub async fn delete_blob(&self, location: BackendLocation) -> BlobEvent {
-        // An admitted read or keyless work still uses the archive; the cleanup row retries.
+        // An admitted read or keyless work still uses the copy, in any layout; cleanup retries.
         // The claim keeps new reads out until the backend delete ends.
-        let _claim = match location.format.layout {
-            StoredLayout::Pithos(_) => match self.claim_delete(&ArchiveKey::of(&location)) {
-                Ok(claim) => Some(claim),
-                Err(error) => return BlobEvent::Error(error),
-            },
-            _ => None,
+        let _claim = match self.claim_delete(&ArchiveKey::of(&location)) {
+            Ok(claim) => claim,
+            Err(error) => return BlobEvent::Error(error),
         };
         self.clear_active(location.ulid);
         // An in-place part is no object: its provider upload holds the bytes until it settles.

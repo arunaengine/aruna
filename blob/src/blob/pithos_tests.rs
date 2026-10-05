@@ -1086,3 +1086,70 @@ async fn rewrites_never_deadlock() {
     drop(held);
     assert_eq!(handler.pithos_budget.available_permits(), budget_permits());
 }
+
+#[tokio::test]
+async fn framed_reads_pin_copies() {
+    use aruna_core::compute::{SecretBytes, SharedSecret};
+    use aruna_core::effects::BlobEffect;
+    use aruna_core::structs::storage::blob::ArchiveKey;
+    use aruna_core::structs::storage::encryption::public_key_of;
+    use futures::StreamExt;
+
+    // A framed copy of an encrypting bucket, not converted yet.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let data = content(3 * MIB);
+    let backend = ResolvedBackend::node_default().with_compression(Compression::Zstd { level: 3 });
+    let written = handler
+        .write_blob(
+            "bucket",
+            "framed.bin",
+            backend,
+            test_user_id(),
+            stream_from_bytes(&data),
+        )
+        .await;
+    let BlobEvent::WriteFinished { location } = written else {
+        panic!("write failed: {written:?}")
+    };
+    assert!(matches!(location.format.layout, StoredLayout::Frames(_)));
+    let key = BucketKeyRef::new(ulid::Ulid::generate(), 1);
+    let prepare = BlobEffect::PrepareKey {
+        key,
+        public_key: public_key_of(&SecretBytes::new(vec![5; 32])).unwrap(),
+        private_key: SharedSecret::new(SecretBytes::new(vec![5; 32])),
+        duration: None,
+        max: None,
+    };
+    let BlobEvent::KeyPrepared { ticket } = handler.unlock_effect(prepare) else {
+        panic!("prepare failed")
+    };
+    handler.unlock_effect(BlobEffect::ActivateKey { ticket });
+    let BlobEvent::ReadAdmitted { lease } =
+        handler.admit_read(key, ArchiveKey::of(&location)).await
+    else {
+        panic!("admission failed")
+    };
+    let BlobEvent::ReadFinished { mut blob, .. } = handler.read_blob(location.clone()).await else {
+        panic!("the framed read must start")
+    };
+    let first = blob.next().await.unwrap().unwrap();
+
+    // Conversion and reclaim delete through the same path; the admitted read keeps the copy.
+    let refused = handler.delete_blob(location.clone()).await;
+    assert!(matches!(
+        refused,
+        BlobEvent::Error(BlobError::DeleteError(_))
+    ));
+    let mut received = first.to_vec();
+    while let Some(chunk) = blob.next().await {
+        received.extend_from_slice(&chunk.unwrap());
+    }
+    assert!(received == data);
+    drop(blob);
+    drop(lease);
+    assert_eq!(
+        handler.delete_blob(location).await,
+        BlobEvent::DeleteFinished
+    );
+}

@@ -2150,7 +2150,8 @@ mod sealed {
 
     #[test]
     fn unconverted_copy_gated() {
-        let archive = ArchiveKey::new(key().bucket_id, BackendRef::node_default());
+        // The lease pins the physical copy, not a bucket-wide placeholder.
+        let archive = ArchiveKey::of(&sealed_location());
         let (mut operation, effects) = plain_read(&encrypting());
         assert!(matches!(
             effects.as_slice(),

@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path};
 
-use crate::s3::object::get::{leased, reference_archive};
+use crate::s3::object::get::leased;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, BlobError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -1997,7 +1997,7 @@ async fn read_admission(
             let settings = BucketEncryption::from_row(row.as_deref())
                 .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
             match settings.active_key() {
-                Some(key) => (key, reference_archive(key)),
+                Some(key) => (key, ArchiveKey::of(location)),
                 None => return Ok(Ok(None)),
             }
         }

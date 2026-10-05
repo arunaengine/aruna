@@ -772,16 +772,16 @@ impl GetObjectOperation {
             Ok(settings) => settings,
             Err(error) => return self.emit_error(error.into()),
         };
-        let Some(read_effect) = self.plain_read() else {
+        let (Some(read_effect), Some(location)) = (self.plain_read(), self.location.as_ref())
+        else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
+        // The lease pins the physical copy, so conversion and cleanup wait for this read.
+        let archive = ArchiveKey::of(location);
         self.reference_key = settings.active_key();
         self.state = GetObjectState::CommitTransaction;
         let next = match self.reference_key {
-            Some(key) => BlobEffect::AdmitRead {
-                key,
-                archive: reference_archive(key),
-            },
+            Some(key) => BlobEffect::AdmitRead { key, archive },
             None => read_effect,
         };
         smallvec![
@@ -792,12 +792,17 @@ impl GetObjectOperation {
 
     /// Reads a plain copy of an encrypting bucket once its bucket lease is admitted.
     fn plain_admitted(&mut self, event: Event) -> Effects {
-        let (Some(key), Some(read_effect)) = (self.reference_key, self.plain_read()) else {
+        let (Some(key), Some(read_effect), Some(location)) = (
+            self.reference_key,
+            self.plain_read(),
+            self.location.as_ref(),
+        ) else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
+        let archive = ArchiveKey::of(location);
         match event {
             Event::Blob(BlobEvent::ReadAdmitted { lease })
-                if lease.key == key && lease.archive == reference_archive(key) =>
+                if lease.key == key && lease.archive == archive =>
             {
                 self.reference_lease = Some(lease);
                 self.state = GetObjectState::GetBlob;
