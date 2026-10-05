@@ -200,7 +200,7 @@ fn deadlines_close_admission() {
         key: source,
         session_id: source_session,
     };
-    assert_eq!(registry.lock(source.bucket_id, Some(only)), vec![only]);
+    registry.discard(only);
 
     // A delayed timer cannot keep the key admitted past its deadline.
     let expired = later + Duration::from_secs(10);
@@ -222,11 +222,11 @@ fn lock_keeps_leases() {
     // A stale timer names an older session and locks nothing.
     let fresh = unlock(&mut registry, active, 1, (None, None), now).unwrap();
     assert_ne!(fresh.session_id, first.session_id);
-    assert!(registry.lock(active.bucket_id, Some(first)).is_empty());
+    assert!(registry.lock(active.bucket_id, Some(first), now).is_empty());
     assert!(admit(&mut registry, active, archive(7), now).is_ok());
 
     // A lock closes every generation of the bucket at once.
-    let locked = registry.lock(active.bucket_id, None);
+    let locked = registry.lock(active.bucket_id, None, now);
     assert_eq!(locked.len(), 2);
     assert!(admit(&mut registry, active, archive(7), now).is_err());
     assert!(admit(&mut registry, source, archive(7), now).is_err());
@@ -250,7 +250,7 @@ fn leases_hold_slots() {
     unlock(&mut registry, key, 1, (None, None), now).unwrap();
     let lease = admit(&mut registry, key, archive(1), now).unwrap();
     // The only slot stays with the lease while its stream lives, even after a lock.
-    registry.lock(key.bucket_id, None);
+    registry.lock(key.bucket_id, None, now);
     assert!(registry.lease_slots().try_acquire_owned().is_err());
     drop(lease);
     assert!(registry.lease_slots().try_acquire_owned().is_ok());
@@ -329,14 +329,17 @@ fn polled_expiry_still_locks() {
     assert!(registry.status(key.bucket_id, later).is_empty());
     assert!(admit(&mut registry, key, archive(1), later).is_err());
     // The timer still learns that its session ended, so the timed lock is recorded once.
-    assert_eq!(registry.lock(key.bucket_id, Some(ticket)), vec![ticket]);
-    assert!(registry.lock(key.bucket_id, Some(ticket)).is_empty());
+    assert_eq!(
+        registry.lock(key.bucket_id, Some(ticket), later),
+        vec![ticket]
+    );
+    assert!(registry.lock(key.bucket_id, Some(ticket), later).is_empty());
     // A stale timer of another session records nothing.
     let other = KeyTicket {
         key,
         session_id: Ulid::generate(),
     };
-    assert!(registry.lock(key.bucket_id, Some(other)).is_empty());
+    assert!(registry.lock(key.bucket_id, Some(other), later).is_empty());
 }
 
 #[test]
@@ -352,13 +355,42 @@ fn expiries_kept_per_session() {
     let last = later + 2 * MINUTE;
     assert!(registry.status(key.bucket_id, last).is_empty());
     // Both delayed timers still record their own timed lock, in any order.
-    assert_eq!(registry.lock(key.bucket_id, Some(second)), vec![second]);
-    assert_eq!(registry.lock(key.bucket_id, Some(first)), vec![first]);
+    assert_eq!(
+        registry.lock(key.bucket_id, Some(second), last),
+        vec![second]
+    );
+    assert_eq!(registry.lock(key.bucket_id, Some(first), last), vec![first]);
     // A third session unlocked after both expiries stays open whatever the old timers do.
     let third = unlock(&mut registry, key, 1, (None, None), last).unwrap();
-    assert!(registry.lock(key.bucket_id, Some(first)).is_empty());
+    assert!(registry.lock(key.bucket_id, Some(first), last).is_empty());
     assert_eq!(
         registry.status(key.bucket_id, last)[0].session_id,
         third.session_id
     );
+}
+
+#[test]
+fn running_timer_spares_extension() {
+    let mut registry = UnlockRegistry::new(UNLOCKED_BUCKETS);
+    let start = Instant::now();
+    let key = reference(1, 1);
+    let bounds = (Some(MINUTE), Some(3 * MINUTE));
+    let ticket = unlock(&mut registry, key, 1, bounds, start).unwrap();
+    // The session is extended to 90 seconds while its old timer callback already runs.
+    let extended = start + Duration::from_secs(30);
+    let session = ticket.session_id;
+    registry
+        .extend(key, session, Some(MINUTE), extended)
+        .unwrap();
+    // The old callback reaches the registry at the old deadline and locks nothing.
+    let old = start + MINUTE;
+    assert!(registry.lock(key.bucket_id, Some(ticket), old).is_empty());
+    assert!(admit(&mut registry, key, archive(1), old).is_ok());
+    // The rescheduled timer locks it at the new deadline.
+    let new = extended + MINUTE;
+    assert_eq!(
+        registry.lock(key.bucket_id, Some(ticket), new),
+        vec![ticket]
+    );
+    assert!(admit(&mut registry, key, archive(1), new).is_err());
 }

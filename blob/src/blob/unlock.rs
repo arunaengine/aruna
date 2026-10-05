@@ -301,33 +301,32 @@ impl UnlockRegistry {
         Ok(session.status(key, now))
     }
 
-    /// Locks every generation of a bucket, or only `only` when a timer names its session. A timer
-    /// whose session already expired still reports it, so its timed lock is recorded.
-    pub(super) fn lock(&mut self, bucket_id: Ulid, only: Option<KeyTicket>) -> Vec<KeyTicket> {
-        let mut locked = Vec::new();
-        if let Some(ticket) = only
-            && ticket.key.bucket_id == bucket_id
-            && self.expired.remove(&(ticket.key, ticket.session_id))
-        {
-            locked.push(ticket);
+    /// Locks every generation of a bucket, or only `only` when a timer names its session. A
+    /// timer locks only a session past its deadline, checked here under the registry lock, so
+    /// an old callback of an extended session locks nothing; an expired session is reported
+    /// once, so its timed lock is recorded.
+    pub(super) fn lock(
+        &mut self,
+        bucket_id: Ulid,
+        only: Option<KeyTicket>,
+        now: Instant,
+    ) -> Vec<KeyTicket> {
+        self.purge(now);
+        if let Some(ticket) = only {
+            let expired = ticket.key.bucket_id == bucket_id
+                && self.expired.remove(&(ticket.key, ticket.session_id));
+            return if expired { vec![ticket] } else { Vec::new() };
         }
+        let mut locked = Vec::new();
         self.sessions.retain(|key, sessions| {
             if key.bucket_id != bucket_id {
                 return true;
             }
-            sessions.retain(|session| {
-                let named = only.is_none_or(|ticket| {
-                    ticket.key == *key && ticket.session_id == session.session_id
-                });
-                if named {
-                    locked.push(KeyTicket {
-                        key: *key,
-                        session_id: session.session_id,
-                    });
-                }
-                !named
-            });
-            !sessions.is_empty()
+            locked.extend(sessions.iter().map(|session| KeyTicket {
+                key: *key,
+                session_id: session.session_id,
+            }));
+            false
         });
         locked.sort_by_key(|ticket| ticket.key.generation);
         locked
@@ -532,7 +531,7 @@ impl super::BlobHandler {
                 .extend(key, session_id, duration, now)
                 .map(|status| BlobEvent::KeyExtended { status }),
             BlobEffect::LockKey { bucket_id, session } => Ok(BlobEvent::KeyLocked {
-                locked: registry.lock(bucket_id, session),
+                locked: registry.lock(bucket_id, session, now),
             }),
             _ => Err(BucketKeyError::Unsupported),
         };
