@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
     COMPRESSION_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, TRANSITION_KEYSPACE, TRANSITION_QUEUE_KEYSPACE,
@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
-    BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
+    BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan, UnlockStatus,
 };
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
 use aruna_core::structs::storage::transition::{
@@ -31,6 +31,7 @@ enum PutCompressionState {
     StartTransaction,
     ReadBucket,
     ReadMigration,
+    CheckUnlocked,
     ReadKey,
     WriteBucket,
     CommitTransaction,
@@ -112,6 +113,7 @@ impl PutCompressionOperation {
             PutCompressionState::StartTransaction => "StartTransaction",
             PutCompressionState::ReadBucket => "ReadBucket",
             PutCompressionState::ReadMigration => "ReadMigration",
+            PutCompressionState::CheckUnlocked => "CheckUnlocked",
             PutCompressionState::ReadKey => "ReadKey",
             PutCompressionState::WriteBucket => "WriteBucket",
             PutCompressionState::CommitTransaction => "CommitTransaction",
@@ -173,6 +175,27 @@ impl PutCompressionOperation {
             return self.write_bucket(migration.map(|value| value.to_vec()));
         };
         self.settings = Some(settings);
+        // Re-encoding opens every archive, so the active key must be unlocked before anything commits.
+        self.state = PutCompressionState::CheckUnlocked;
+        smallvec![Effect::Blob(BlobEffect::ReadKeyStatus {
+            bucket_id: active.bucket_id
+        })]
+    }
+
+    fn check_unlocked(&mut self, generations: &[UnlockStatus]) -> Effects {
+        let Some(active) = self
+            .settings
+            .as_ref()
+            .and_then(BucketEncryption::active_key)
+        else {
+            return self.fail(PutCompressionError::NotFinished);
+        };
+        if !generations
+            .iter()
+            .any(|status| status.key == active && status.active)
+        {
+            return self.fail(BucketKeyError::Locked(active.bucket_id).into());
+        }
         self.state = PutCompressionState::ReadKey;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: BUCKET_KEY_KEYSPACE.to_string(),
@@ -336,6 +359,12 @@ impl Operation for PutCompressionOperation {
                     return self.unexpected("BatchReadResult", event);
                 };
                 self.read_rows(values)
+            }
+            PutCompressionState::CheckUnlocked => {
+                let Event::Blob(BlobEvent::KeyStatus { generations }) = event else {
+                    return self.unexpected("KeyStatus", event);
+                };
+                self.check_unlocked(&generations)
             }
             PutCompressionState::ReadKey => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
@@ -529,6 +558,46 @@ mod tests {
         )
     }
 
+    /// The registry's answer: the active generation unlocked, or nothing unlocked.
+    fn status(record: &BucketKeyRecord, unlocked: bool) -> Event {
+        let session = UnlockStatus {
+            key: record.key,
+            session_id: Ulid::from_bytes([5; 16]),
+            active: true,
+            unlocked_at: SystemTime::UNIX_EPOCH,
+            remaining: None,
+            max_remaining: None,
+        };
+        let generations = if unlocked { vec![session] } else { Vec::new() };
+        Event::Blob(BlobEvent::KeyStatus { generations })
+    }
+
+    #[test]
+    fn locked_key_refuses() {
+        // Nothing is written while the archives' key is locked on this node.
+        let zstd = Compression::Zstd { level: 7 };
+        let mut operation = PutCompressionOperation::new("b".to_string(), group(), zstd, 5);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"b".to_vec().into(),
+            value: Some(bucket(group()).to_bytes().unwrap().into()),
+        }));
+        let (settings, record) = encrypted();
+        operation.step(rows(None, Some(settings.to_bytes().unwrap().into()), None));
+
+        let effects = operation.step(status(&record, false));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        let locked = BucketKeyError::Locked(record.key.bucket_id);
+        assert_eq!(operation.finalize(), Err(PutCompressionError::Key(locked)));
+    }
+
     #[test]
     fn encrypted_change_reencodes() {
         // Archives re-encode through a transition; no plain migration would read them.
@@ -544,6 +613,11 @@ mod tests {
         }));
         let (settings, record) = encrypted();
         let effects = operation.step(rows(None, Some(settings.to_bytes().unwrap().into()), None));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReadKeyStatus { .. })]
+        ));
+        let effects = operation.step(status(&record, true));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == BUCKET_KEY_KEYSPACE

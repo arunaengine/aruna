@@ -311,6 +311,7 @@ fn put_refusal(error: PutCompressionError) -> ServerError {
             "the stored copies are still moving to a new encryption; retry when it finishes"
                 .to_string(),
         ),
+        PutCompressionError::Key(error) => super::encryption::key_refusal(&error),
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -329,6 +330,16 @@ mod tests {
         assert_eq!(refusal.status_code(), StatusCode::CONFLICT);
         let code = refusal.response_body().code;
         assert_eq!(code.as_deref(), Some("transition_running"));
+    }
+
+    #[test]
+    fn locked_key_conflicts() {
+        use aruna_core::structs::storage::encryption::BucketKeyError;
+        let locked = BucketKeyError::Locked(ulid::Ulid::from_bytes([1; 16]));
+        let refusal = put_refusal(PutCompressionError::Key(locked));
+        assert_eq!(refusal.status_code(), StatusCode::CONFLICT);
+        let code = refusal.response_body().code;
+        assert_eq!(code.as_deref(), Some("bucket_locked"));
     }
 
     #[test]
