@@ -147,6 +147,13 @@ encrypted.
   to an encrypted bucket are encrypted.
 - **Content fingerprints.** For deduplication, the node keeps content hashes of encrypted
   objects. These hashes are extra plaintext fingerprints: they can show that two files are equal.
+- **Copies and sync to other nodes.** A target bucket that encrypts stores every copy sealed to
+  its own key. When both buckets encrypt, the source node grants each encrypted file to the key of
+  the target bucket, so the target never needs the source key. While the source bucket is locked,
+  its copies wait and run after the next unlock; the sync status shows how many wait. The target
+  checks the content of such a copy when its own bucket is next unlocked. A target bucket without
+  encryption gets copies of an encrypted bucket only when the request sets `plaintext: true` and
+  the requester holds the key of the source bucket.
 
 ## Avoiding Common Pitfalls
 
