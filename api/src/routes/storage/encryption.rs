@@ -35,6 +35,7 @@ use aruna_operations::s3::bucket::key_rows::SettingsError;
 use aruna_operations::s3::bucket::rotate::{
     ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
 };
+use aruna_operations::s3::bucket::token_list::ListTokensOperation;
 use aruna_operations::s3::key_status::{KeySnapshot, KeyStatusError, KeyStatusOperation};
 use aruna_operations::s3::unlock_limit::{
     UnlockLimitError, UnlockLimitInput, UnlockLimitOperation,
@@ -58,6 +59,7 @@ pub struct StorageEncryptionDoc;
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(StorageEncryptionDoc::openapi())
         .routes(routes!(get_bucket_encryption, put_bucket_encryption))
+        .routes(routes!(list_bucket_tokens))
 }
 
 /// Unlock state of one key generation on this node.
@@ -234,6 +236,101 @@ pub(crate) fn key_refusal(error: &BucketKeyError) -> ServerError {
         BucketKeyError::InvalidToken => (StatusCode::FORBIDDEN, "invalid_token"),
     };
     ServerError::Refused(status, code, message)
+}
+
+/// One token copy of a bucket key.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct TokenView {
+    pub access_key_id: String,
+    /// The key holder who created the token credential.
+    pub user_id: String,
+    /// RFC 3339 time the copy was sealed.
+    pub created_at: String,
+    pub generation: u64,
+    /// True when the copy is of another generation than the active one, or its credential no
+    /// longer authenticates; such a token reads nothing any more.
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct TokenListView {
+    pub tokens: Vec<TokenView>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/buckets/{bucket}/storage/encryption/tokens",
+    tag = "data/storage",
+    summary = "List a bucket's token credentials",
+    description = r#"Lists the token credentials that hold a sealed copy of a bucket key on this node.
+
+**Authentication**: realm bearer token of a current key holder of the bucket, or WRITE on the
+owning group's admin path.
+
+**Behavior**
+- One entry per sealed copy: a credential gets one copy per key generation it was created for.
+- `stale` marks a copy of a generation that is no longer active, or of a credential that was
+  revoked, expired or deleted. A key rotation leaves every older token stale; create a new
+  credential to read again while the bucket is locked.
+- Tokens themselves are never stored or shown."#,
+    params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
+    responses(
+        (
+            status = 200,
+            description = "The bucket's token copies",
+            body = TokenListView,
+            example = json!({
+                "tokens": [{
+                    "access_key_id": "01JAKEY0123456789ABCDEFGHJ",
+                    "user_id": "01JUSER0123456789ABCDEFGHJ",
+                    "created_at": "2026-10-05T12:00:00Z",
+                    "generation": 1,
+                    "stale": false
+                }]
+            })
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or neither key holder nor group admin", body = ErrorResponse),
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
+        (status = 503, description = "An authorization document of the bucket is missing", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_bucket_tokens(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+) -> ServerResult<Json<TokenListView>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = bucket_group(&state, &bucket).await?;
+    let snapshot = read_snapshot(&state, &bucket, group_id).await?;
+    if !is_holder(&snapshot, auth.user_id) {
+        ensure_group_admin(&state, &auth, group_id).await?;
+    }
+    let Some(bucket_id) = snapshot.settings.bucket_id else {
+        return Ok(Json(TokenListView { tokens: Vec::new() }));
+    };
+    let operation = ListTokensOperation::new(bucket_id, std::time::SystemTime::now());
+    let entries = drive(operation, &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let active = snapshot.settings.active_key();
+    let tokens = entries
+        .into_iter()
+        .map(|entry| TokenView {
+            access_key_id: entry.copy.access_key,
+            user_id: entry.copy.created_by.to_string(),
+            created_at: rfc3339(entry.copy.created_at_ms),
+            generation: entry.copy.key.generation,
+            stale: Some(entry.copy.key) != active || !entry.credential_active,
+        })
+        .collect();
+    Ok(Json(TokenListView { tokens }))
+}
+
+fn rfc3339(at_ms: u64) -> String {
+    let at = UNIX_EPOCH + Duration::from_millis(at_ms);
+    chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 pub(crate) fn blob_refusal(error: BlobError) -> ServerError {

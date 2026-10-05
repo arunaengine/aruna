@@ -236,6 +236,7 @@ pub(crate) mod tests {
         ("GET", "/data/buckets/{bucket}/storage/encryption/audit"),
         ("GET", "/data/buckets/{bucket}/storage/encryption/copies/me"),
         ("GET", "/data/buckets/{bucket}/storage/encryption/holders"),
+        ("GET", "/data/buckets/{bucket}/storage/encryption/tokens"),
         ("GET", "/data/buckets/{bucket}/storage/routing"),
         ("GET", "/data/buckets/{bucket}/usage"),
         ("GET", "/data/sync/relationships"),
