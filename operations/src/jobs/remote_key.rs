@@ -11,11 +11,12 @@ use aruna_core::NodeId;
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
-use aruna_core::jobs::{JobRequest, JobResponse};
+use aruna_core::jobs::{JobRequest, JobResponse, WaitTarget};
+use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::execution::job::{JobId, JobRecord, JobState, KeyWait};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{HashIndex, object_permission_path};
+use aruna_core::structs::storage::blob::{BucketInfo, VersionKey, object_permission_path};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
@@ -25,7 +26,7 @@ use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
-use crate::jobs::key_wake::{content_aliases, version_wait};
+use crate::jobs::key_wake::{alias_page, alias_wait, find_alias, read_row, version_wait};
 use crate::jobs::route::{JobRouteOperation, JobRouteOutcome};
 use crate::jobs::runtime::key_unlocked;
 use crate::jobs::store::{
@@ -34,33 +35,24 @@ use crate::jobs::store::{
 };
 use crate::tasks::task_persistence::persist_task_effect;
 
-/// Contents one registration may name; more is refused rather than scanned.
+/// Targets one registration may name; more is refused rather than scanned.
 pub const MAX_AWAITED: usize = 1024;
 
-/// Key node: registers `job_id` of `peer` on the locked keys of `contents`, then answers only
+/// Key node: registers `job_id` of `peer` on the locked keys of `targets`, then answers only
 /// the keys still locked. A key unlocked in between is either seen here or wakes the job later.
 pub(crate) async fn register_waits(
     context: &DriverContext,
     (node_id, peer): (NodeId, NodeId),
     auth: &AuthContext,
     job_id: JobId,
-    contents: &[[u8; 32]],
+    targets: &[WaitTarget],
 ) -> Result<Vec<KeyWait>, String> {
-    if contents.len() > MAX_AWAITED {
-        return Err(format!("at most {MAX_AWAITED} contents per key wait"));
+    if targets.len() > MAX_AWAITED {
+        return Err(format!("at most {MAX_AWAITED} targets per key wait"));
     }
-    // Only versions the caller may READ here count; a content waits only when none is readable.
     let mut waits: Vec<KeyWait> = Vec::new();
-    for content in contents {
-        let mut locked = Vec::new();
-        let mut readable = false;
-        for alias in readable_aliases(context, node_id, auth, content).await? {
-            match version_wait(context, &alias).await? {
-                Some(wait) => locked.push(wait),
-                None => readable = true,
-            }
-        }
-        for wait in locked.into_iter().filter(|_| !readable) {
+    for target in targets {
+        for wait in target_locks(context, node_id, auth, target).await? {
             if !waits.contains(&wait) {
                 waits.push(wait);
             }
@@ -78,35 +70,90 @@ pub(crate) async fn register_waits(
     Ok(locked)
 }
 
-/// Aliases of `content` on this node that `auth` may READ, within its path restrictions.
-async fn readable_aliases(
+/// Locked keys of one target the caller may READ here. An exact version is judged alone, so
+/// another readable alias cannot hide it; a bare content waits only while none is readable.
+async fn target_locks(
     context: &DriverContext,
     node_id: NodeId,
     auth: &AuthContext,
-    content: &[u8; 32],
-) -> Result<Vec<HashIndex>, String> {
-    let mut readable = Vec::new();
-    for alias in content_aliases(context, content, node_id).await? {
-        if alias.realm_id != auth.realm_id {
-            continue;
+    target: &WaitTarget,
+) -> Result<Vec<KeyWait>, String> {
+    match target {
+        WaitTarget::Object {
+            bucket,
+            key,
+            version_id,
+        } => {
+            let row = read_row(
+                &context.storage_handle,
+                S3_BUCKET_KEYSPACE,
+                bucket.clone().into(),
+            );
+            let Some(info) = row.await? else {
+                return Ok(Vec::new());
+            };
+            let group_id = BucketInfo::from_bytes(&info)
+                .map_err(|error| error.to_string())?
+                .group_id;
+            if !may_read(context, auth, (node_id, group_id), bucket, key).await {
+                return Ok(Vec::new());
+            }
+            let version = VersionKey::new(bucket, key, *version_id);
+            let wait = version_wait(context, (node_id, group_id), &version).await?;
+            Ok(wait.into_iter().collect())
         }
-        let path = object_permission_path(
-            auth.realm_id,
-            alias.group_id,
-            node_id,
-            &alias.bucket,
-            &alias.key,
-        );
-        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path,
-            required_permission: Permission::READ,
-        });
-        if drive(check, context).await.unwrap_or(false) {
-            readable.push(alias);
+        WaitTarget::Captured { blake3, version_id } => {
+            let alias = find_alias(context, blake3, *version_id, node_id).await?;
+            let Some(alias) = alias.filter(|alias| alias.realm_id == auth.realm_id) else {
+                return Ok(Vec::new());
+            };
+            let place = (node_id, alias.group_id);
+            if !may_read(context, auth, place, &alias.bucket, &alias.key).await {
+                return Ok(Vec::new());
+            }
+            Ok(alias_wait(context, &alias).await?.into_iter().collect())
+        }
+        WaitTarget::Content { blake3 } => {
+            let mut locked = Vec::new();
+            let mut start_after = None;
+            loop {
+                let (aliases, next) = alias_page(context, blake3, node_id, start_after).await?;
+                for alias in aliases {
+                    let place = (node_id, alias.group_id);
+                    if alias.realm_id != auth.realm_id
+                        || !may_read(context, auth, place, &alias.bucket, &alias.key).await
+                    {
+                        continue;
+                    }
+                    match alias_wait(context, &alias).await? {
+                        Some(wait) => locked.push(wait),
+                        None => return Ok(Vec::new()),
+                    }
+                }
+                match next {
+                    Some(next) => start_after = Some(next),
+                    None => return Ok(locked),
+                }
+            }
         }
     }
-    Ok(readable)
+}
+
+/// Whether `auth` may READ one object here, within its path restrictions.
+async fn may_read(
+    context: &DriverContext,
+    auth: &AuthContext,
+    (node_id, group_id): (NodeId, ulid::Ulid),
+    bucket: &str,
+    key: &str,
+) -> bool {
+    let path = object_permission_path(auth.realm_id, group_id, node_id, bucket, key);
+    let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+        auth_context: auth.clone(),
+        path,
+        required_permission: Permission::READ,
+    });
+    drive(check, context).await.unwrap_or(false)
 }
 
 /// Waiting node: applies a wake from `peer`. False while the job may still be parking, so the
@@ -170,38 +217,41 @@ pub(crate) async fn remote_waits(
     record: &JobRecord,
     node_id: NodeId,
 ) -> Vec<KeyWait> {
-    let mut by_node: BTreeMap<NodeId, Vec<[u8; 32]>> = BTreeMap::new();
+    let mut by_node: BTreeMap<NodeId, Vec<WaitTarget>> = BTreeMap::new();
     for input in &record.captured_inputs {
         if input.source_node_id != node_id {
             by_node
                 .entry(input.source_node_id)
                 .or_default()
-                .push(input.blake3);
+                .push(WaitTarget::Captured {
+                    blake3: input.blake3,
+                    version_id: input.version_id,
+                });
         }
     }
     let auth = owner_auth(record);
     let mut waits = Vec::new();
-    for (node, contents) in by_node {
-        waits.extend(contents_waits(context, &auth, record.job_id, node, &contents).await);
+    for (node, targets) in by_node {
+        waits.extend(ask_waits(context, &auth, record.job_id, node, &targets).await);
     }
     waits
 }
 
-/// Waiting node: registers the job on `node` for `contents` and returns the keys still locked
+/// Waiting node: registers the job on `node` for `targets` and returns the keys still locked
 /// there. An unreachable or refusing node yields none.
-pub(crate) async fn contents_waits(
+pub(crate) async fn ask_waits(
     context: &DriverContext,
     auth: &AuthContext,
     job_id: JobId,
     node: NodeId,
-    contents: &[[u8; 32]],
+    targets: &[WaitTarget],
 ) -> Vec<KeyWait> {
     let mut waits = Vec::new();
-    for contents in contents.chunks(MAX_AWAITED) {
+    for targets in targets.chunks(MAX_AWAITED) {
         let request = JobRequest::AwaitKeys {
             auth_token: AuthToken::Internal(auth.clone()),
             job_id,
-            contents: contents.to_vec(),
+            targets: targets.to_vec(),
         };
         match ask(context, node, job_id, request).await {
             Some(JobResponse::KeysLocked(locked)) => {
@@ -342,6 +392,7 @@ mod tests {
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::execution::job::JobPayload;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::HashIndex;
     use ulid::Ulid;
 
     #[tokio::test]
@@ -512,6 +563,16 @@ mod tests {
             owner,
             None,
         );
+        let bucket = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: owner,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+        };
         let realm_doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         let rows = [
@@ -539,6 +600,11 @@ mod tests {
                 BUCKET_ENCRYPTION_KEYSPACE,
                 b"sealed".to_vec(),
                 settings.to_bytes().unwrap(),
+            ),
+            (
+                S3_BUCKET_KEYSPACE,
+                b"sealed".to_vec(),
+                bucket.to_bytes().unwrap(),
             ),
             (
                 BLOB_LOCATIONS_KEYSPACE,
@@ -591,7 +657,7 @@ mod tests {
             path_restrictions,
             session: None,
         };
-        let content = [[9; 32]];
+        let content = [sealed_object()];
 
         // A caller without READ learns nothing and subscribes to nothing.
         let stranger = UserId::local(Ulid::from_bytes([3; 16]), RealmId([1; 32]));
@@ -772,11 +838,162 @@ mod tests {
         };
 
         // The copy is not converted yet, but the bucket's locked key still gates it.
-        let waits = register_waits(&context, (node, peer), &auth, job_id, &[[9; 32]]);
+        let targets = [sealed_object()];
+        let waits = register_waits(&context, (node, peer), &auth, job_id, &targets);
         let waits = waits.await.unwrap();
 
         assert_eq!(waits.len(), 1);
         assert_eq!(waits[0].bucket, "sealed");
+        assert_eq!(
+            waits[0].key,
+            BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1)
+        );
+        assert_eq!(registrations(&context).await, 1);
+    }
+
+    /// The exact object `guarded_node` stores in its encrypting bucket.
+    fn sealed_object() -> WaitTarget {
+        WaitTarget::Object {
+            bucket: "sealed".to_string(),
+            key: "data.bin".to_string(),
+            version_id: Ulid::from_bytes([6; 16]),
+        }
+    }
+
+    async fn put_rows(context: &DriverContext, rows: Vec<(&str, Vec<u8>, Vec<u8>)>) {
+        for (key_space, key, value) in rows {
+            let effect = aruna_core::effects::StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            };
+            context.storage_handle.send_storage_effect(effect).await;
+        }
+    }
+
+    fn owner_context(owner: UserId) -> AuthContext {
+        AuthContext {
+            user_id: owner,
+            realm_id: RealmId([1; 32]),
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_target_not_hidden() {
+        use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
+        use aruna_core::structs::storage::blob::{BackendRef, BlobVersion};
+        use aruna_core::structs::storage::format::EncodingClass;
+
+        let (_dir, context, node, owner) = guarded_node(false).await;
+        // The same content is also readable in a bucket that does not encrypt.
+        let open = HashIndex::new(
+            [9; 32],
+            Ulid::from_bytes([7; 16]),
+            RealmId([1; 32]),
+            Ulid::from_bytes([4; 16]),
+            node,
+            "open",
+            "copy.bin",
+        );
+        let version = BlobVersion::materialized(
+            [9; 32],
+            BackendRef::node_default(),
+            EncodingClass::Raw,
+            std::time::SystemTime::UNIX_EPOCH,
+            owner,
+            None,
+        );
+        let version_key = VersionKey::new("open", "copy.bin", Ulid::from_bytes([7; 16]));
+        put_rows(
+            &context,
+            vec![
+                (PATHS_INDEX_KEYSPACE, open.to_bytes().unwrap(), Vec::new()),
+                (
+                    BLOB_VERSIONS_KEYSPACE,
+                    version_key.to_bytes().unwrap(),
+                    version.to_bytes().unwrap(),
+                ),
+            ],
+        )
+        .await;
+        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let job_id = JobId::from_bytes([5; 16]);
+        let auth = owner_context(owner);
+        let captured = WaitTarget::Captured {
+            blake3: [9; 32],
+            version_id: Ulid::from_bytes([6; 16]),
+        };
+
+        // The exact version and the captured version keep their dependency.
+        for target in [sealed_object(), captured] {
+            let targets = [target];
+            let waits = register_waits(&context, (node, peer), &auth, job_id, &targets);
+            assert_eq!(waits.await.unwrap().len(), 1);
+        }
+        // Only a bare content is satisfied by another readable version.
+        let content = [WaitTarget::Content { blake3: [9; 32] }];
+        let waits = register_waits(&context, (node, peer), &auth, job_id, &content);
+        assert!(waits.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reference_target_waits() {
+        use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
+        use aruna_core::structs::execution::source_access::SourceMetadata;
+        use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_core::structs::execution::staging::{
+            PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+        };
+        use aruna_core::structs::storage::blob::BlobVersion;
+
+        let (_dir, context, node, owner) = guarded_node(true).await;
+        // A reference in the encrypting bucket has no content hash this node knows.
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::ArunaNative,
+                public_config: Default::default(),
+                source_path: "source/object.bin".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: None,
+        };
+        let metadata = SourceMetadata {
+            content_length: 10,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+        };
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let reference = BlobVersion::reference(source, metadata, epoch, owner, epoch);
+        let version_id = Ulid::from_bytes([11; 16]);
+        let version_key = VersionKey::new("sealed", "ref.bin", version_id);
+        let row = (
+            BLOB_VERSIONS_KEYSPACE,
+            version_key.to_bytes().unwrap(),
+            reference.to_bytes().unwrap(),
+        );
+        put_rows(&context, vec![row]).await;
+        let target = WaitTarget::Object {
+            bucket: "sealed".to_string(),
+            key: "ref.bin".to_string(),
+            version_id,
+        };
+        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let auth = owner_context(owner);
+
+        let targets = [target];
+        let job_id = JobId::from_bytes([5; 16]);
+        let waits = register_waits(&context, (node, peer), &auth, job_id, &targets);
+        let waits = waits.await.unwrap();
+
+        assert_eq!(waits.len(), 1);
         assert_eq!(
             waits[0].key,
             BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1)

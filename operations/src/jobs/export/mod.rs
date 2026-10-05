@@ -76,6 +76,7 @@ use crate::metadata::api::{
 use crate::metadata::forward::export_rocrate_routed;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use aruna_core::jobs::WaitTarget;
 use aruna_core::structs::identity::auth::AuthContext;
 
 mod archive;
@@ -299,7 +300,8 @@ enum ExportFailure {
     /// A remote holder refused because its bucket key is locked; the job registers there.
     RemoteLocked {
         node_id: NodeId,
-        content: Option<[u8; 32]>,
+        /// The exact source the refused read named, so the holder admits only that.
+        target: WaitTarget,
         auth: Box<AuthContext>,
     },
     Validation(Vec<MetadataValidationViolation>),
@@ -2071,6 +2073,14 @@ async fn open_remote(
     expected_blake3: Option<[u8; 32]>,
     metadata_only: bool,
 ) -> Result<CandidateOpen, ExportFailure> {
+    let wait_target = match &target {
+        BaoReadTarget::ExactVersion(arn) => WaitTarget::Object {
+            bucket: arn.bucket.clone(),
+            key: arn.key.clone(),
+            version_id: arn.version,
+        },
+        BaoReadTarget::Blake3(blake3) => WaitTarget::Content { blake3: *blake3 },
+    };
     // The challenge loop fills in this node's advertised subject and the refs
     // it learns, so a governed copy can be staged instead of dead-ending.
     match managed_read(
@@ -2101,7 +2111,7 @@ async fn open_remote(
         Err(BaoReadError::Refused(BaoReadRefusal::BucketLocked(_))) => {
             Err(ExportFailure::RemoteLocked {
                 node_id,
-                content: expected_blake3,
+                target: wait_target,
                 auth: Box::new(spec.auth_context.clone()),
             })
         }

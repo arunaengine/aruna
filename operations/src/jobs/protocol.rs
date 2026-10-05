@@ -286,12 +286,12 @@ async fn prepare_response(
         }
         // Key waits address the node that holds the content or the job, not the job owner.
         JobRequest::AwaitKeys {
-            job_id, contents, ..
+            job_id, targets, ..
         } => PreparedResponse::new(match local_node {
             Some(node) => {
                 let nodes = (node, peer);
                 let waits =
-                    super::remote_key::register_waits(context, nodes, &auth, job_id, &contents);
+                    super::remote_key::register_waits(context, nodes, &auth, job_id, &targets);
                 match waits.await {
                     Ok(locked) => JobResponse::KeysLocked(locked),
                     Err(error) => JobResponse::Unavailable(error),

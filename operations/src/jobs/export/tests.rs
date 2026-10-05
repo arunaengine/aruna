@@ -2275,12 +2275,18 @@ async fn locked_remote_export() {
     )
     .await;
     let Err(ExportFailure::RemoteLocked {
-        node_id, content, ..
+        node_id, target, ..
     }) = opened
     else {
         panic!("a locked remote input must be typed, got another outcome")
     };
-    assert_eq!((node_id, content), (source.net.node_id(), Some(hash)));
+    // The refusal keeps the exact version the read named, not only its content.
+    let exact = aruna_core::jobs::WaitTarget::Object {
+        bucket: "remote".to_string(),
+        key: "payload".to_string(),
+        version_id,
+    };
+    assert_eq!((node_id, target), (source.net.node_id(), exact));
     client.net.shutdown().await;
     source.net.shutdown().await;
 }

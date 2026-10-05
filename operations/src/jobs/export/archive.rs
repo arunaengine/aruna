@@ -1252,16 +1252,16 @@ pub(super) async fn finish_export(
     // A remote holder with a locked key wakes this job once it registers there.
     if let ExportFailure::RemoteLocked {
         node_id,
-        content: Some(content),
+        target,
         auth,
     } = &error
     {
-        let waits = super::super::remote_key::contents_waits(
+        let waits = super::super::remote_key::ask_waits(
             &ctx.driver,
             auth,
             ctx.job_id,
             *node_id,
-            &[*content],
+            std::slice::from_ref(target),
         )
         .await;
         if !waits.is_empty() {

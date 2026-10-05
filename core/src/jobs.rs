@@ -6,6 +6,7 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use ulid::Ulid;
 
 use crate::UserId;
 use crate::metadata::AuthToken;
@@ -216,12 +217,12 @@ pub enum JobRequest {
         auth_token: AuthToken,
         job_id: JobId,
     },
-    /// Registers `job_id` of the sending node as waiting for the keys of these local contents.
+    /// Registers `job_id` of the sending node as waiting for the keys of these exact sources.
     /// The answer lists only keys still locked after the registration, closing the unlock race.
     AwaitKeys {
         auth_token: AuthToken,
         job_id: JobId,
-        contents: Vec<[u8; 32]>,
+        targets: Vec<WaitTarget>,
     },
     /// Tells the waiting node that `key` of the sending node is unlocked. Grants no read.
     KeyWake {
@@ -229,6 +230,21 @@ pub enum JobRequest {
         job_id: JobId,
         key: BucketKeyRef,
     },
+}
+
+/// The exact source a remote key wait names; the key node authorizes and admits only that.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WaitTarget {
+    /// One object version, also a reference whose content hash is not known.
+    Object {
+        bucket: String,
+        key: String,
+        version_id: Ulid,
+    },
+    /// The version a captured input names among the aliases of its content.
+    Captured { blake3: [u8; 32], version_id: Ulid },
+    /// Any readable version of a content; it waits only while none is readable.
+    Content { blake3: [u8; 32] },
 }
 
 impl JobRequest {

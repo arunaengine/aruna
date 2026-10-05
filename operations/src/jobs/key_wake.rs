@@ -22,7 +22,9 @@ use aruna_core::keyspaces::{
     PATHS_INDEX_KEYSPACE, PENDING_LOCATION_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{CapturedInput, JobError, JobRecord, KeyWait};
-use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, HashIndex, VersionKey};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BlobVersion, BlobVersionState, HashIndex, VersionKey,
+};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::time::unix_timestamp_millis;
 use tracing::warn;
@@ -69,12 +71,9 @@ pub(crate) async fn locked_inputs(
         .iter()
         .filter(|input| input.source_node_id == node_id)
     {
-        let aliases = content_aliases(context, &input.blake3, node_id).await?;
-        let alias = aliases
-            .into_iter()
-            .find(|alias| alias.version_id == input.version_id);
+        let alias = find_alias(context, &input.blake3, input.version_id, node_id).await?;
         if let Some(alias) = alias
-            && let Some(wait) = version_wait(context, &alias).await?
+            && let Some(wait) = alias_wait(context, &alias).await?
             && !waits.contains(&wait)
         {
             waits.push(wait);
@@ -83,60 +82,102 @@ pub(crate) async fn locked_inputs(
     Ok(waits)
 }
 
-/// Aliases a content has on this node, at most one page of them.
-pub(crate) async fn content_aliases(
+/// The alias of exactly `version_id` among a content's aliases on this node, paging through
+/// every alias page until it is found or the aliases end.
+pub(crate) async fn find_alias(
+    context: &DriverContext,
+    content: &[u8; 32],
+    version_id: Ulid,
+    node_id: NodeId,
+) -> Result<Option<HashIndex>, String> {
+    let mut start_after = None;
+    loop {
+        let (aliases, next) = alias_page(context, content, node_id, start_after).await?;
+        if let Some(alias) = aliases
+            .into_iter()
+            .find(|alias| alias.version_id == version_id)
+        {
+            return Ok(Some(alias));
+        }
+        match next {
+            Some(next) => start_after = Some(next),
+            None => return Ok(None),
+        }
+    }
+}
+
+/// One page of a content's aliases on this node, and the cursor of the next page.
+pub(crate) async fn alias_page(
     context: &DriverContext,
     content: &[u8; 32],
     node_id: NodeId,
-) -> Result<Vec<HashIndex>, String> {
+    start_after: Option<aruna_core::types::Key>,
+) -> Result<(Vec<HashIndex>, Option<aruna_core::types::Key>), String> {
     let prefix = HashIndex::hash_prefix(content).map_err(|error| error.to_string())?;
     let (rows, _) = iter_prefix_page(
         &context.storage_handle,
         PATHS_INDEX_KEYSPACE,
         Some(prefix.into()),
-        None,
+        start_after,
         ALIAS_PAGE,
         None,
     )
     .await?;
-    Ok(rows
+    let next = (rows.len() == ALIAS_PAGE)
+        .then(|| rows.last().map(|(row, _)| row.clone()))
+        .flatten();
+    let aliases = rows
         .iter()
         .filter_map(|(row, _)| HashIndex::from_bytes(row).ok())
         .filter(|alias| alias.node_id == node_id)
-        .collect())
+        .collect();
+    Ok((aliases, next))
 }
 
-/// The locked key a read of exactly this version would need, following read admission: a
-/// sealed copy needs its own key, a plain copy of an encrypting bucket the bucket's active key.
-pub(crate) async fn version_wait(
+/// The locked key a read of the version an alias names would need.
+pub(crate) async fn alias_wait(
     context: &DriverContext,
     alias: &HashIndex,
 ) -> Result<Option<KeyWait>, String> {
-    let storage = &context.storage_handle;
     let version = VersionKey::new(&alias.bucket, &alias.key, alias.version_id);
-    let version = version.to_bytes().map_err(|error| error.to_string())?;
-    let Some(row) = read_row(storage, BLOB_VERSIONS_KEYSPACE, version).await? else {
+    version_wait(context, (alias.node_id, alias.group_id), &version).await
+}
+
+/// The locked key a read of exactly this version would need, following read admission: a
+/// sealed copy needs its own key; a plain copy or a reference of an encrypting bucket needs
+/// the bucket's active key.
+pub(crate) async fn version_wait(
+    context: &DriverContext,
+    (node_id, group_id): (NodeId, Ulid),
+    version: &VersionKey,
+) -> Result<Option<KeyWait>, String> {
+    let storage = &context.storage_handle;
+    let row_key = version.to_bytes().map_err(|error| error.to_string())?;
+    let Some(row) = read_row(storage, BLOB_VERSIONS_KEYSPACE, row_key).await? else {
         return Ok(None);
     };
-    let version = BlobVersion::from_bytes(&row).map_err(|error| error.to_string())?;
-    let location = match (
-        &version.state.location_key(),
-        version.state.pending_archive(),
-    ) {
-        (Some(key), _) => read_row(storage, BLOB_LOCATIONS_KEYSPACE, key.to_bytes()).await?,
-        (None, Some(archive)) => {
+    let state = BlobVersion::from_bytes(&row)
+        .map_err(|error| error.to_string())?
+        .state;
+    let location = match (&state.location_key(), state.pending_archive(), &state) {
+        (Some(key), _, _) => read_row(storage, BLOB_LOCATIONS_KEYSPACE, key.to_bytes()).await?,
+        (None, Some(archive), _) => {
             read_row(storage, PENDING_LOCATION_KEYSPACE, archive.to_bytes()).await?
         }
-        (None, None) => return Ok(None),
+        (None, None, BlobVersionState::Reference { .. }) => None,
+        (None, None, _) => return Ok(None),
     };
-    let Some(location) = location else {
-        return Ok(None);
+    let sealed = match location {
+        Some(location) => BackendLocation::from_bytes(&location)
+            .map_err(|error| error.to_string())?
+            .format
+            .bucket_key(),
+        None => None,
     };
-    let location = BackendLocation::from_bytes(&location).map_err(|error| error.to_string())?;
-    let key = match location.format.bucket_key() {
+    let key = match sealed {
         Some(key) => Some(key),
         None => {
-            let bucket = alias.bucket.as_bytes().to_vec();
+            let bucket = version.bucket.as_bytes().to_vec();
             let settings = read_row(storage, BUCKET_ENCRYPTION_KEYSPACE, bucket).await?;
             BucketEncryption::from_row(settings.as_deref())
                 .map_err(|error| error.to_string())?
@@ -150,14 +191,14 @@ pub(crate) async fn version_wait(
         return Ok(None);
     }
     Ok(Some(KeyWait {
-        node_id: alias.node_id,
-        bucket: alias.bucket.clone(),
-        group_id: Some(alias.group_id),
+        node_id,
+        bucket: version.bucket.clone(),
+        group_id: Some(group_id),
         key,
     }))
 }
 
-async fn read_row(
+pub(crate) async fn read_row(
     storage: &aruna_storage::StorageHandle,
     key_space: &str,
     key: Vec<u8>,
@@ -441,6 +482,47 @@ mod tests {
         };
         context.storage_handle.send_storage_effect(effect).await;
         (dir, context, node, key)
+    }
+
+    #[tokio::test]
+    async fn alias_beyond_page() {
+        use aruna_core::effects::StorageEffect;
+
+        let (_dir, context, node, key) = sealed_node(true).await;
+        // Seventy older versions of the same content sort before the captured one.
+        for version in 1..=70u128 {
+            let decoy = HashIndex::new(
+                [9; 32],
+                Ulid::from(version),
+                RealmId([1; 32]),
+                Ulid::from_bytes([4; 16]),
+                node,
+                "sealed",
+                format!("old-{version}"),
+            );
+            let effect = StorageEffect::Write {
+                key_space: PATHS_INDEX_KEYSPACE.to_string(),
+                key: decoy.to_bytes().unwrap().into(),
+                value: Vec::new().into(),
+                txn_id: None,
+            };
+            context.storage_handle.send_storage_effect(effect).await;
+        }
+        let input = CapturedInput {
+            destination_key: "in".to_string(),
+            source_node_id: node,
+            version_id: Ulid::from_bytes([6; 16]),
+            blake3: [9; 32],
+            bytes: 100,
+            policies: Vec::new(),
+        };
+
+        let waits = locked_inputs(&context, &[input], node).await.unwrap();
+
+        assert_eq!(
+            waits.iter().map(|wait| wait.key).collect::<Vec<_>>(),
+            vec![key]
+        );
     }
 
     #[tokio::test]
