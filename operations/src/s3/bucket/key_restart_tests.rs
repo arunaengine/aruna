@@ -1,4 +1,5 @@
-//! The restart scan finds generations left unlocked by the last applied audit records.
+//! The restart scan rebuilds each session from audit records replayed in storage order, with
+//! outcomes paired to their intents; records share one millisecond to rule out time order.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -6,26 +7,38 @@ use super::*;
 use crate::s3::bucket::key_rows::authority_rows;
 use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::encryption::{BucketKeyRef, GrantState, HolderOrigin};
+use aruna_core::structs::storage::encryption::{
+    BucketKeyRef, EncryptionMode, GrantState, HolderOrigin,
+};
 use aruna_core::structs::storage::format::Compression;
 use std::time::SystemTime;
 
 const LOCKED: Ulid = Ulid::from_bytes([1; 16]);
 const GROUP: Ulid = Ulid::from_bytes([3; 16]);
 const NOW: u64 = 10_000;
+/// Every record of a trail is written within this one millisecond.
+const AT: u64 = 5_000;
 
 fn user(seed: u8) -> UserId {
     UserId::new(Ulid::from_bytes([seed; 16]), RealmId::from_bytes([1; 32]))
 }
 
-fn rows(values: Vec<(Vec<u8>, Vec<u8>)>) -> Event {
+fn session(seed: u8) -> Option<Ulid> {
+    Some(Ulid::from_bytes([seed; 16]))
+}
+
+fn page(values: Vec<(Vec<u8>, Vec<u8>)>, next: Option<Vec<u8>>) -> Event {
     Event::Storage(StorageEvent::IterResult {
         values: values
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect(),
-        next_start_after: None,
+        next_start_after: next.map(Into::into),
     })
+}
+
+fn rows(values: Vec<(Vec<u8>, Vec<u8>)>) -> Event {
+    page(values, None)
 }
 
 fn settings(mode: EncryptionMode, bucket_id: Ulid) -> Vec<u8> {
@@ -38,40 +51,114 @@ fn settings(mode: EncryptionMode, bucket_id: Ulid) -> Vec<u8> {
     settings.to_bytes().unwrap()
 }
 
-fn audit(action: AuditAction, generation: u64) -> (Vec<u8>, Vec<u8>) {
-    record(action, generation, AuditOutcome::Applied, None)
+/// The key record of `generation`; a node-managed key has a node vault copy.
+fn key_row(bucket_id: Ulid, generation: u64, managed: bool) -> (Vec<u8>, Vec<u8>) {
+    let key = BucketKeyRef::new(bucket_id, generation);
+    let mut record = BucketKeyRecord::new(key, Ulid::from_bytes([6; 16]), [5; 32], 1);
+    record.vault_entry = managed.then_some(Ulid::from_bytes([8; 16]));
+    (record.key.key(), record.to_bytes().unwrap())
 }
 
-fn record(
-    action: AuditAction,
-    generation: u64,
-    outcome: AuditOutcome,
-    deadline_ms: Option<u64>,
-) -> (Vec<u8>, Vec<u8>) {
-    in_session(action, (generation, None), outcome, deadline_ms)
+/// An audit trail written within one millisecond, with ids that grow in issue order as
+/// `next_event_id` issues them.
+#[derive(Default)]
+struct Log {
+    records: Vec<BucketAuditRecord>,
 }
 
-/// A record of `generation` that names `session`.
-fn in_session(
-    action: AuditAction,
-    (generation, session_id): (u64, Option<Ulid>),
-    outcome: AuditOutcome,
-    deadline_ms: Option<u64>,
-) -> (Vec<u8>, Vec<u8>) {
-    let record = BucketAuditRecord {
-        event_id: Ulid::generate(),
-        bucket_id: LOCKED,
-        at_ms: 1,
-        action,
-        actor: None,
-        node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
-        generation: Some(generation),
-        session_id,
-        deadline_ms,
-        reason: None,
-        outcome,
-    };
-    (record.key(), record.to_bytes().unwrap())
+impl Log {
+    fn add(
+        &mut self,
+        action: AuditAction,
+        (generation, session_id): (u64, Option<Ulid>),
+        (outcome, intent_id): (AuditOutcome, Option<Ulid>),
+        deadline_ms: Option<u64>,
+    ) -> Ulid {
+        let record = BucketAuditRecord {
+            event_id: Ulid::from_parts(AT, (1 << 64) + self.records.len() as u128),
+            bucket_id: LOCKED,
+            at_ms: AT,
+            action,
+            actor: None,
+            node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+            generation: Some(generation),
+            session_id,
+            intent_id,
+            deadline_ms,
+            reason: None,
+            outcome,
+        };
+        let event_id = record.event_id;
+        self.records.push(record);
+        event_id
+    }
+
+    fn intent(
+        &mut self,
+        action: AuditAction,
+        at: (u64, Option<Ulid>),
+        deadline: Option<u64>,
+    ) -> Ulid {
+        self.add(action, at, (AuditOutcome::Intent, None), deadline)
+    }
+
+    fn outcome(
+        &mut self,
+        action: AuditAction,
+        at: (u64, Option<Ulid>),
+        (outcome, intent): (AuditOutcome, Ulid),
+        deadline: Option<u64>,
+    ) {
+        self.add(action, at, (outcome, Some(intent)), deadline);
+    }
+
+    fn applied(&mut self, action: AuditAction, at: (u64, Option<Ulid>), deadline: Option<u64>) {
+        self.add(action, at, (AuditOutcome::Applied, None), deadline);
+    }
+
+    /// The trail as storage returns it: sorted by key, all in one millisecond.
+    fn stored(&self) -> Vec<BucketAuditRecord> {
+        let mut records = self.records.clone();
+        records.sort_by_key(BucketAuditRecord::key);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.event_id.timestamp_ms() == AT)
+        );
+        records
+    }
+
+    fn open(&self) -> Vec<u64> {
+        replay(&self.stored(), NOW)
+    }
+}
+
+/// Starts a scan of the bucket settings `buckets` and answers the settings page.
+fn scanned(buckets: Vec<(Vec<u8>, Vec<u8>)>) -> (RestartScanOperation, Effects) {
+    let mut operation = RestartScanOperation::new(NOW, RealmId::from_bytes([1; 32]));
+    operation.start();
+    let effects = operation.step(rows(buckets));
+    (operation, effects)
+}
+
+fn scans(effects: &Effects, key_space: &str) -> bool {
+    matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Iter { key_space: scanned, .. })] if scanned == key_space
+    )
+}
+
+fn bucket_info() -> BucketInfo {
+    BucketInfo {
+        group_id: GROUP,
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: user(1),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+    }
 }
 
 fn copy(user_id: UserId, generation: u64) -> (Vec<u8>, Vec<u8>) {
@@ -89,47 +176,35 @@ fn copy(user_id: UserId, generation: u64) -> (Vec<u8>, Vec<u8>) {
 
 #[test]
 fn finds_unlocked_generations() {
-    let mut operation = RestartScanOperation::new(NOW, RealmId::from_bytes([1; 32]));
-    operation.start();
-    let effects = operation.step(rows(vec![
-        (
-            b"locked".to_vec(),
-            settings(EncryptionMode::VaultLocked, LOCKED),
-        ),
-        (
-            b"managed".to_vec(),
-            settings(EncryptionMode::NodeManaged, GROUP),
-        ),
-    ]));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Iter { key_space, .. })] if key_space == BUCKET_AUDIT_KEYSPACE
-    ));
-    // Generation 2 was locked after its unlock; generation 1 was still unlocked.
-    operation.step(rows(vec![
-        audit(AuditAction::Unlock, 1),
-        audit(AuditAction::Unlock, 2),
-        audit(AuditAction::Lock, 2),
-    ]));
-    let info = BucketInfo {
-        group_id: GROUP,
-        created_at: SystemTime::UNIX_EPOCH,
-        created_by: user(1),
-        cors_configuration: None,
-        storage_routing: Vec::new(),
-        placement_policies: Vec::new(),
-        placement_policy_generation: 0,
-        compression: Compression::Off,
-    };
-    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+    let locked = (
+        b"locked".to_vec(),
+        settings(EncryptionMode::VaultLocked, LOCKED),
+    );
+    let (mut operation, effects) = scanned(vec![locked]);
+    assert!(scans(&effects, BUCKET_KEY_KEYSPACE));
+    let keys = vec![key_row(LOCKED, 1, false), key_row(LOCKED, 2, false)];
+    let effects = operation.step(rows(keys));
+    assert!(scans(&effects, BUCKET_AUDIT_KEYSPACE));
+    // Generation 2 was locked after its unlock; generation 1 is still unlocked.
+    let mut log = Log::default();
+    log.applied(AuditAction::Unlock, (1, session(1)), None);
+    log.applied(AuditAction::Unlock, (2, session(2)), None);
+    log.applied(AuditAction::Lock, (2, session(2)), None);
+    let stored: Vec<_> = (log.stored().iter())
+        .map(|record| (record.key(), record.to_bytes().unwrap()))
+        .collect();
+    // The trail arrives in two storage pages.
+    let (first, second) = stored.split_at(2);
+    let next = first.last().map(|(key, _)| key.clone());
+    let effects = operation.step(page(first.to_vec(), next));
+    assert!(scans(&effects, BUCKET_AUDIT_KEYSPACE));
+    let info = bucket_info();
+    operation.step(rows(second.to_vec()));
+    operation.step(Event::Storage(StorageEvent::ReadResult {
         key: Key::from(b"locked".to_vec()),
         value: Some(info.to_bytes().unwrap().into()),
     }));
     // Admin rights come from the current authorization documents: user(4) lost its role.
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { .. })]
-    ));
     let settings = BucketEncryption::from_bytes(&settings(EncryptionMode::VaultLocked, LOCKED));
     let values = authority_rows(&info, Some(&settings.unwrap()), &[user(5)]);
     operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
@@ -157,111 +232,121 @@ fn finds_unlocked_generations() {
     );
 }
 
-/// The generations a scan of one vault-locked bucket with `trail` reports as unlocked.
-fn reported(trail: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<u64> {
-    let mut operation = RestartScanOperation::new(NOW, RealmId::from_bytes([1; 32]));
-    operation.start();
-    let locked = (
-        b"locked".to_vec(),
-        settings(EncryptionMode::VaultLocked, LOCKED),
-    );
-    operation.step(rows(vec![locked]));
-    let effects = operation.step(rows(trail));
-    if effects.is_empty() {
-        assert_eq!(operation.finalize().unwrap(), []);
-        return Vec::new();
-    }
-    let RestartScanOperation { current, .. } = operation;
-    current.unwrap().generations
+#[test]
+fn decrypting_bucket_included() {
+    // A bucket in mode off still holds its source key while a decryption runs; a node-managed
+    // bucket has only node vault keys, which startup opens itself.
+    let managed_id = Ulid::from_bytes([2; 16]);
+    let (mut operation, effects) = scanned(vec![
+        (b"locked".to_vec(), settings(EncryptionMode::Off, LOCKED)),
+        (
+            b"managed".to_vec(),
+            settings(EncryptionMode::NodeManaged, managed_id),
+        ),
+    ]);
+    // The last listed bucket is scanned first: its only key has a node copy.
+    assert!(scans(&effects, BUCKET_KEY_KEYSPACE));
+    let effects = operation.step(rows(vec![key_row(managed_id, 1, true)]));
+    assert!(scans(&effects, BUCKET_KEY_KEYSPACE));
+    let effects = operation.step(rows(vec![key_row(LOCKED, 1, false)]));
+    assert!(scans(&effects, BUCKET_AUDIT_KEYSPACE));
+    let mut log = Log::default();
+    log.applied(AuditAction::Unlock, (1, session(1)), None);
+    let stored = (log.stored().iter())
+        .map(|record| (record.key(), record.to_bytes().unwrap()))
+        .collect();
+    let effects = operation.step(rows(stored));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == S3_BUCKET_KEYSPACE
+    ));
 }
 
 #[test]
 fn lost_outcome_counts() {
     // A crash after activation left only the synced intent: the key may have been in use.
-    let intent = record(AuditAction::Unlock, 1, AuditOutcome::Intent, None);
-    assert_eq!(reported(vec![intent]), [1]);
+    let mut log = Log::default();
+    log.intent(AuditAction::Unlock, (1, session(1)), None);
+    assert_eq!(log.open(), [1]);
     // A failed activation restores the state before its intent.
-    let intent = record(AuditAction::Unlock, 1, AuditOutcome::Intent, None);
-    let failed = record(AuditAction::Unlock, 1, AuditOutcome::Failed, None);
-    assert!(reported(vec![intent, failed]).is_empty());
-    // An outage lost the lock's audit: the last record is the unlock, so holders are told.
-    assert_eq!(reported(vec![audit(AuditAction::Unlock, 2)]), [2]);
+    let mut log = Log::default();
+    let intent = log.intent(AuditAction::Unlock, (1, session(1)), None);
+    let failed = (AuditOutcome::Failed, intent);
+    log.outcome(AuditAction::Unlock, (1, session(1)), failed, None);
+    assert!(log.open().is_empty());
 }
 
 #[test]
 fn expired_sessions_skipped() {
     // A timed session that ended before this start was not unlocked at the restart.
-    let ended = record(AuditAction::Unlock, 1, AuditOutcome::Applied, Some(NOW - 1));
-    assert!(reported(vec![ended]).is_empty());
-    let running = record(AuditAction::Unlock, 1, AuditOutcome::Applied, Some(NOW + 1));
-    assert_eq!(reported(vec![running]), [1]);
-    // An extension moves the deadline that counts.
-    let ended = record(AuditAction::Unlock, 1, AuditOutcome::Applied, Some(NOW - 1));
-    let extended = record(AuditAction::Extend, 1, AuditOutcome::Applied, Some(NOW + 1));
-    assert_eq!(reported(vec![ended, extended]), [1]);
+    let mut log = Log::default();
+    log.applied(AuditAction::Unlock, (1, session(1)), Some(NOW - 1));
+    assert!(log.open().is_empty());
+    // An extension of that session moves the deadline that counts.
+    let intent = log.intent(AuditAction::Extend, (1, session(1)), Some(NOW + 1));
+    let applied = (AuditOutcome::Applied, intent);
+    log.outcome(AuditAction::Extend, (1, session(1)), applied, Some(NOW + 1));
+    assert_eq!(log.open(), [1]);
 }
 
 #[test]
 fn rejected_extension_restored() {
-    let first = Some(Ulid::from_bytes([7; 16]));
-    let unlock = |deadline| {
-        in_session(
-            AuditAction::Unlock,
-            (1, first),
-            AuditOutcome::Applied,
-            deadline,
-        )
-    };
-    // A rejected extension without a duration restores the ended deadline, so no false notice.
-    let intent = in_session(AuditAction::Extend, (1, first), AuditOutcome::Intent, None);
-    let failed = in_session(AuditAction::Extend, (1, first), AuditOutcome::Failed, None);
-    assert!(reported(vec![unlock(Some(NOW - 1)), intent, failed]).is_empty());
+    // A refused extension without a duration restores the ended deadline: no false notice.
+    let mut log = Log::default();
+    log.applied(AuditAction::Unlock, (1, session(1)), Some(NOW - 1));
+    let intent = log.intent(AuditAction::Extend, (1, session(1)), None);
+    let failed = (AuditOutcome::Failed, intent);
+    log.outcome(AuditAction::Extend, (1, session(1)), failed, None);
+    assert!(log.open().is_empty());
     // An extension of another session never moves this session's deadline.
-    let stranger = Some(Ulid::from_bytes([8; 16]));
-    let foreign = in_session(
-        AuditAction::Extend,
-        (1, stranger),
-        AuditOutcome::Intent,
-        None,
-    );
-    assert!(reported(vec![unlock(Some(NOW - 1)), foreign]).is_empty());
+    let mut log = Log::default();
+    log.applied(AuditAction::Unlock, (1, session(1)), Some(NOW - 1));
+    log.intent(AuditAction::Extend, (1, session(2)), None);
+    assert!(log.open().is_empty());
     // An extension whose outcome was lost still counts, as it may have applied.
-    let intent = in_session(AuditAction::Extend, (1, first), AuditOutcome::Intent, None);
-    assert_eq!(reported(vec![unlock(Some(NOW - 1)), intent]), [1]);
+    let mut log = Log::default();
+    log.applied(AuditAction::Unlock, (1, session(1)), Some(NOW - 1));
+    log.intent(AuditAction::Extend, (1, session(1)), None);
+    assert_eq!(log.open(), [1]);
+}
+
+#[test]
+fn failure_restores_own_intent() {
+    // A delayed failed extension of session A never rolls back B's later unlock intent, even
+    // when B's outcome was lost.
+    let mut log = Log::default();
+    log.applied(AuditAction::Unlock, (1, session(1)), Some(NOW - 1));
+    let extend = log.intent(AuditAction::Extend, (1, session(1)), None);
+    log.intent(AuditAction::Unlock, (1, session(2)), None);
+    let failed = (AuditOutcome::Failed, extend);
+    log.outcome(AuditAction::Extend, (1, session(1)), failed, None);
+    assert_eq!(log.open(), [1]);
+    // A failed unlock of A after B's intent leaves B; B failing too restores the state before A.
+    let mut log = Log::default();
+    let first = log.intent(AuditAction::Unlock, (1, session(1)), None);
+    let second = log.intent(AuditAction::Unlock, (1, session(2)), None);
+    let failed = (AuditOutcome::Failed, first);
+    log.outcome(AuditAction::Unlock, (1, session(1)), failed, None);
+    assert_eq!(log.open(), [1]);
+    let failed = (AuditOutcome::Failed, second);
+    log.outcome(AuditAction::Unlock, (1, session(2)), failed, None);
+    assert!(log.open().is_empty());
 }
 
 #[test]
 fn delayed_timer_keeps_newer() {
-    let (a, b) = (
-        Some(Ulid::from_bytes([7; 16])),
-        Some(Ulid::from_bytes([8; 16])),
-    );
-    let unlock = |session| {
-        in_session(
-            AuditAction::Unlock,
-            (1, session),
-            AuditOutcome::Applied,
-            None,
-        )
-    };
-    let timed = |session| {
-        in_session(
-            AuditAction::TimedLock,
-            (1, session),
-            AuditOutcome::Applied,
-            None,
-        )
-    };
     // Session A's delayed timer records its lock after session B unlocked: B stays unlocked.
-    assert_eq!(reported(vec![unlock(a), unlock(b), timed(a)]), [1]);
+    let mut log = Log::default();
+    log.applied(AuditAction::Unlock, (1, session(1)), None);
+    log.applied(AuditAction::Unlock, (1, session(2)), None);
+    log.applied(AuditAction::TimedLock, (1, session(1)), None);
+    assert_eq!(log.open(), [1]);
     // B's own timed lock ends it.
-    assert!(reported(vec![unlock(a), unlock(b), timed(a), timed(b)]).is_empty());
-    // A manual lock of the generation without a session ends every session.
-    let lock = in_session(
-        AuditAction::RestartLock,
-        (1, None),
-        AuditOutcome::Applied,
-        None,
-    );
-    assert!(reported(vec![unlock(a), unlock(b), lock]).is_empty());
+    log.applied(AuditAction::TimedLock, (1, session(2)), None);
+    assert!(log.open().is_empty());
+    // A restart lock of the generation ends every session.
+    let mut log = Log::default();
+    log.applied(AuditAction::Unlock, (1, session(1)), None);
+    log.applied(AuditAction::RestartLock, (1, None), None);
+    assert!(log.open().is_empty());
 }
