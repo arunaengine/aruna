@@ -30,7 +30,8 @@ use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, Sub
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_REFERENCE_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE, PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE,
+    SYNC_REFERENCE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
@@ -41,10 +42,10 @@ use aruna_core::structs::execution::staging::{
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
-    CurrentVersionPointer, ManagedCopyKey, VersionKey, object_permission_path,
+    ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    BucketInfo, CurrentVersionPointer, ManagedCopyKey, VersionKey, object_permission_path,
 };
-use aruna_core::structs::storage::encryption::BucketEncryption;
+use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, BucketKeyRef};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::multipart::{
     MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
@@ -56,6 +57,7 @@ use aruna_core::structs::storage::replication::{
 use aruna_core::structs::storage::routing::{GroupRoutingInputs, RoutingError};
 use aruna_core::structs::storage::routing::{NodeRouting, StorageRoutingRule, resolve_backend};
 use aruna_core::structs::{ReferenceHandling, SyncMode, SyncRelationship, sync_state_key};
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
@@ -276,6 +278,8 @@ pub struct ReplicateScopeResult {
     pub last_error: Option<String>,
     /// Stable category of the last failed item, for retry/terminal policy.
     pub failure: Option<ReplicationFailure>,
+    /// Source keys locked here that items wait for; they run again after an unlock.
+    pub awaiting: Vec<BucketKeyRef>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -349,6 +353,8 @@ pub struct ReplicateScopeOperation {
     gate_context: Option<GateContext>,
     result: ReplicateScopeResult,
     output: Option<Result<ReplicateScopeResult, ReplicateScopeError>>,
+    /// A holder's permitted plaintext request, checked by the caller before each run.
+    plaintext: bool,
 }
 
 impl Operation for ReplicateScopeOperation {
@@ -542,6 +548,11 @@ impl Operation for ReplicateScopeOperation {
                 match &result {
                     Ok(ReplicationSuboperationResult::Replicated) => self.result.replicated += 1,
                     Ok(ReplicationSuboperationResult::Skipped) => self.result.skipped += 1,
+                    Ok(ReplicationSuboperationResult::AwaitingKey(key)) => {
+                        if !self.result.awaiting.contains(key) {
+                            self.result.awaiting.push(*key);
+                        }
+                    }
                     Ok(ReplicationSuboperationResult::ReplicatedBytes(bytes)) => {
                         self.result.replicated = self.result.replicated.saturating_add(1);
                         self.result.replicated_bytes =
@@ -637,6 +648,12 @@ pub enum ReplicateObjectError {
         expected: &'static str,
         received: Event,
     },
+    #[error("plaintext_required")]
+    PlaintextRefused,
+    #[error("the source version waits for its content hash")]
+    PendingSource,
+    #[error(transparent)]
+    Blob(#[from] BlobError),
 }
 
 impl ReplicateScopeOperation {
@@ -664,8 +681,10 @@ impl ReplicateScopeOperation {
                 failed: 0,
                 last_error: None,
                 failure: None,
+                awaiting: Vec::new(),
             },
             output: None,
+            plaintext: false,
         }
     }
 
@@ -694,6 +713,13 @@ impl ReplicateScopeOperation {
 
     pub fn with_reference_advance(mut self, advance: ReferenceAdvance) -> Self {
         self.reference_advance = Some(advance);
+        self
+    }
+
+    /// Lets encrypted source items reach a plain target as plaintext. Only for a requester
+    /// who is a current key holder of the source bucket.
+    pub fn with_plaintext(mut self, plaintext: bool) -> Self {
+        self.plaintext = plaintext;
         self
     }
 
@@ -1000,6 +1026,7 @@ impl ReplicateScopeOperation {
             Some(advance) => operation.with_reference_advance(advance),
             None => operation,
         };
+        let operation = operation.with_plaintext(self.plaintext);
         smallvec![Effect::SubOperation(boxed_suboperation(
             operation,
             |result| Event::SubOperation(SubOperationEvent::ReplicationItemResult {
@@ -1047,6 +1074,7 @@ impl ReplicateObjectError {
             Self::ReplicationError(ReplicationError::ReplicationRejected(reason)) => {
                 ReplicationItemError::from_peer_reason(reason).failure
             }
+            Self::PlaintextRefused => ReplicationFailure::PlaintextRefused,
             _ => ReplicationFailure::Other,
         }
     }
@@ -1075,11 +1103,18 @@ enum ReplicateObjectState {
     ReadMultipartSummary,
     ReadMultipartParts,
     ReadCurrentLookup,
+    /// Reads the location of a pending source version, then admits its key.
+    ReadPendingSource,
+    AdmitPendingSource,
+    /// An unlocked pending source is promoted first; this item fails and retries.
+    SchedulePromotion,
     OpenConnection,
     SendManifest,
     AwaitNegotiation,
     /// Rereads the source bucket's encryption before any content leaves this node.
     CheckSourceEncryption,
+    /// Admits the source key; the lease covers the transfer.
+    AdmitSourceKey,
     TransferBlob,
     AwaitApplyComplete,
     WriteReferenceState,
@@ -1123,6 +1158,13 @@ pub struct ReplicateObjectOperation {
     gate: Option<PolicyGateOperation>,
     routing: NodeRouting,
     result: Result<ReplicationSuboperationResult, ReplicateObjectError>,
+    /// A permitted plaintext request: encrypted items may reach a plain target.
+    plaintext: bool,
+    /// What the target asked for; it decides how an encrypted source sends.
+    negotiated: Option<ReplicationNegotiationResult>,
+    /// The archive of a pending source version, or the key a sending source admits.
+    pending_archive: Option<ArchiveKey>,
+    admit_key: Option<BucketKeyRef>,
 }
 
 struct ManifestVersionParts {
@@ -1166,6 +1208,10 @@ impl ReplicateObjectOperation {
             gate: None,
             routing: NodeRouting::default(),
             result: Ok(ReplicationSuboperationResult::Replicated),
+            plaintext: false,
+            negotiated: None,
+            pending_archive: None,
+            admit_key: None,
         }
     }
 
@@ -1176,6 +1222,11 @@ impl ReplicateObjectOperation {
 
     pub fn with_gate(mut self, context: GateContext) -> Self {
         self.gate_context = Some(context);
+        self
+    }
+
+    fn with_plaintext(mut self, plaintext: bool) -> Self {
+        self.plaintext = plaintext;
         self
     }
 
@@ -1213,6 +1264,10 @@ impl ReplicateObjectOperation {
             ReplicateObjectState::ReadMultipartSummary => "ReadMultipartSummary",
             ReplicateObjectState::ReadMultipartParts => "ReadMultipartParts",
             ReplicateObjectState::ReadCurrentLookup => "ReadCurrentLookup",
+            ReplicateObjectState::ReadPendingSource => "ReadPendingSource",
+            ReplicateObjectState::AdmitPendingSource => "AdmitPendingSource",
+            ReplicateObjectState::SchedulePromotion => "SchedulePromotion",
+            ReplicateObjectState::AdmitSourceKey => "AdmitSourceKey",
             ReplicateObjectState::OpenConnection => "OpenConnection",
             ReplicateObjectState::SendManifest => "SendManifest",
             ReplicateObjectState::AwaitNegotiation => "AwaitNegotiation",
@@ -2148,6 +2203,10 @@ impl Operation for ReplicateObjectOperation {
             ReplicateObjectState::ReadMultipartSummary => self.accept_multipart_summary(event),
             ReplicateObjectState::ReadMultipartParts => self.accept_multipart_parts(event),
             ReplicateObjectState::ReadCurrentLookup => self.accept_current_lookup(event),
+            ReplicateObjectState::ReadPendingSource => self.accept_pending_source(event),
+            ReplicateObjectState::AdmitPendingSource => self.accept_pending_admission(event),
+            ReplicateObjectState::SchedulePromotion => self.accept_promotion_scheduled(event),
+            ReplicateObjectState::AdmitSourceKey => self.accept_source_admission(event),
             // Connection: open the stream to the target node.
             ReplicateObjectState::OpenConnection => self.accept_connection_established(event),
             // Negotiation: send the manifest and accept the target's decision.
@@ -2281,8 +2340,15 @@ impl ReplicateObjectOperation {
                     advance_count,
                 })
             }
-            BlobVersionState::PendingContent { .. } => {
-                self.fail(ReplicateObjectError::EncryptedVersion)
+            // Its content hash is known only after promotion with its key.
+            BlobVersionState::PendingContent { archive, .. } => {
+                self.state = ReplicateObjectState::ReadPendingSource;
+                self.pending_archive = Some(archive.clone());
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: PENDING_LOCATION_KEYSPACE.to_string(),
+                    key: archive.to_bytes().into(),
+                    txn_id: None,
+                })]
             }
         }
     }
@@ -2555,21 +2621,20 @@ impl ReplicateObjectOperation {
                     decision = ?result,
                     "Target requested version metadata only"
                 );
-                self.await_apply_complete()
+                // A plain target linking its own copy still needs the plaintext rule.
+                if self.manifest_blob().is_none() {
+                    return self.await_apply_complete();
+                }
+                self.negotiated = Some(result);
+                self.read_source_encryption()
             }
-            ReplicationNegotiationResult::NeedBlobVersion => {
-                let Some(blob) = self
-                    .manifest
-                    .as_ref()
-                    .and_then(|manifest| manifest.blob.as_ref())
-                else {
+            ReplicationNegotiationResult::NeedBlobVersion
+            | ReplicationNegotiationResult::NeedSealedBlob(_) => {
+                let Some(blob) = self.manifest_blob() else {
                     return self.fail(ReplicateObjectError::MissingBlobHash);
                 };
-                // A copy of an encrypting bucket, sealed or not converted yet, never leaves.
-                if blob.location.format.bucket_key().is_some() {
-                    return self.fail(ReplicateObjectError::EncryptedVersion);
-                }
-                self.state = ReplicateObjectState::CheckSourceEncryption;
+                let blob_size = blob.size;
+                self.negotiated = Some(result.clone());
                 let replication_id = Ulid::generate();
                 self.blob_replication_id = Some(replication_id);
                 debug!(
@@ -2579,14 +2644,10 @@ impl ReplicateObjectOperation {
                     target_node = %self.request.target_node_id,
                     decision = ?result,
                     replication_id = %replication_id,
-                    blob_size = blob.size,
+                    blob_size,
                     "Target requested blob transfer"
                 );
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-                    key: self.request.bucket.as_bytes().into(),
-                    txn_id: None,
-                })]
+                self.read_source_encryption()
             }
             ReplicationNegotiationResult::Rejected(reason) => {
                 debug!(
@@ -2606,6 +2667,25 @@ impl ReplicateObjectOperation {
 // Phase: transfer
 // Pushing the blob the target accepted the version for.
 impl ReplicateObjectOperation {
+    fn manifest_blob(&self) -> Option<&MaterializedBlobInfo> {
+        self.manifest
+            .as_ref()
+            .and_then(|manifest| manifest.blob.as_ref())
+    }
+
+    /// Rereads the source bucket's encryption before any content leaves this node.
+    fn read_source_encryption(&mut self) -> Effects {
+        self.state = ReplicateObjectState::CheckSourceEncryption;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            key: self.request.bucket.as_bytes().into(),
+            txn_id: None,
+        })]
+    }
+
+    /// Any copy of an encrypting bucket, and every sealed copy, needs a key admission. A plain
+    /// target takes it only as a permitted plaintext copy; an encrypting target gets a sealed
+    /// copy granted to its key, or plaintext it seals itself.
     fn accept_source_encryption(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
@@ -2618,17 +2698,36 @@ impl ReplicateObjectOperation {
             Ok(settings) => settings,
             Err(err) => return self.fail(err.into()),
         };
-        if settings.is_encrypted() {
-            return self.fail(ReplicateObjectError::EncryptedVersion);
-        }
-        let (Some(replication_id), Some(stream_id), Some(location)) = (
-            self.blob_replication_id,
-            self.stream_id,
-            self.manifest
-                .as_ref()
-                .and_then(|manifest| manifest.blob.as_ref())
-                .map(|blob| blob.location.clone()),
+        let (Some(location), Some(negotiated)) = (
+            self.manifest_blob().map(|blob| blob.location.clone()),
+            self.negotiated.clone(),
         ) else {
+            return self.fail(ReplicateObjectError::MissingBlobHash);
+        };
+        let Some(key) = location.format.bucket_key().or(settings.active_key()) else {
+            return match negotiated {
+                ReplicationNegotiationResult::NeedVersionOnly => self.await_apply_complete(),
+                _ => self.replicate_plain(location),
+            };
+        };
+        let sealed_target = matches!(negotiated, ReplicationNegotiationResult::NeedSealedBlob(_));
+        if !sealed_target && !self.plaintext {
+            return self.fail(ReplicateObjectError::PlaintextRefused);
+        }
+        if negotiated == ReplicationNegotiationResult::NeedVersionOnly {
+            return self.await_apply_complete();
+        }
+        self.admit_key = Some(key);
+        self.state = ReplicateObjectState::AdmitSourceKey;
+        smallvec![Effect::Blob(BlobEffect::AdmitRead {
+            key,
+            archive: ArchiveKey::of(&location),
+        })]
+    }
+
+    fn replicate_plain(&mut self, location: BackendLocation) -> Effects {
+        let (Some(replication_id), Some(stream_id)) = (self.blob_replication_id, self.stream_id)
+        else {
             return self.fail(ReplicateObjectError::MissingBlobHash);
         };
         self.state = ReplicateObjectState::TransferBlob;
@@ -2638,6 +2737,137 @@ impl ReplicateObjectOperation {
             location,
             keep_alive: true,
         })]
+    }
+
+    /// A sealed copy goes to an encrypting target granted to its key; anything else is sent as
+    /// plaintext. A locked key ends this item until the next unlock.
+    fn accept_source_admission(&mut self, event: Event) -> Effects {
+        let key = self.admit_key.take();
+        let lease = match event {
+            Event::Blob(BlobEvent::ReadAdmitted { lease }) if Some(lease.key) == key => lease,
+            Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
+                return match key {
+                    Some(key) => self.await_key(key),
+                    None => self.fail(ReplicateObjectError::MissingBlobHash),
+                };
+            }
+            Event::Blob(BlobEvent::Error(error)) => {
+                return self.fail(ReplicateObjectError::Blob(error));
+            }
+            other => {
+                return self.fail(ReplicateObjectError::InvalidStateEvent {
+                    state: self.state_name(),
+                    expected: "Event::Blob(BlobEvent::ReadAdmitted)",
+                    received: other,
+                });
+            }
+        };
+        let (Some(replication_id), Some(stream_id), Some(location)) = (
+            self.blob_replication_id,
+            self.stream_id,
+            self.manifest_blob().map(|blob| blob.location.clone()),
+        ) else {
+            return self.fail(ReplicateObjectError::MissingBlobHash);
+        };
+        let regrant = match (&self.negotiated, location.format.bucket_key()) {
+            (Some(ReplicationNegotiationResult::NeedSealedBlob(plan)), Some(_)) => {
+                Some(Box::new(*plan))
+            }
+            _ => None,
+        };
+        self.state = ReplicateObjectState::TransferBlob;
+        smallvec![Effect::Blob(BlobEffect::ReplicateLeased {
+            replication_id,
+            stream_id,
+            location,
+            lease: Box::new(lease),
+            regrant,
+        })]
+    }
+
+    /// Ends the item without an error; its job waits for the next unlock of `key`.
+    fn await_key(&mut self, key: BucketKeyRef) -> Effects {
+        debug!(
+            bucket = %self.request.bucket,
+            key = %self.request.key,
+            version_id = %self.request.version_id,
+            bucket_id = %key.bucket_id,
+            generation = key.generation,
+            "Replication waits for a locked source key"
+        );
+        self.result = Ok(ReplicationSuboperationResult::AwaitingKey(key));
+        match self.stream_id {
+            Some(_) => self.close_connection(),
+            None => {
+                self.state = ReplicateObjectState::Finish;
+                smallvec![]
+            }
+        }
+    }
+
+    fn accept_pending_source(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.fail(ReplicateObjectError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let location = match value.map(|value| BackendLocation::from_bytes(&value)) {
+            Some(Ok(location)) => location,
+            Some(Err(error)) => return self.fail(error.into()),
+            None => return self.fail(ReplicateObjectError::PendingSource),
+        };
+        let (Some(key), Some(archive)) =
+            (location.format.bucket_key(), self.pending_archive.clone())
+        else {
+            return self.fail(ReplicateObjectError::EncryptedVersion);
+        };
+        self.admit_key = Some(key);
+        self.state = ReplicateObjectState::AdmitPendingSource;
+        smallvec![Effect::Blob(BlobEffect::AdmitRead { key, archive })]
+    }
+
+    /// A locked pending source waits for the unlock, which promotes it first. An unlocked one is
+    /// promoted now and this item retries afterwards.
+    fn accept_pending_admission(&mut self, event: Event) -> Effects {
+        let Some(key) = self.admit_key.take() else {
+            return self.fail(ReplicateObjectError::PendingSource);
+        };
+        match event {
+            Event::Blob(BlobEvent::ReadAdmitted { .. }) => {
+                self.state = ReplicateObjectState::SchedulePromotion;
+                smallvec![Effect::Task(TaskEffect::ResetTimer {
+                    key: TaskKey::PromotePending {
+                        bucket_id: key.bucket_id,
+                        generation: key.generation,
+                    },
+                    after: std::time::Duration::ZERO,
+                })]
+            }
+            Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
+                self.await_key(key)
+            }
+            Event::Blob(BlobEvent::Error(error)) => self.fail(ReplicateObjectError::Blob(error)),
+            other => self.fail(ReplicateObjectError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Blob(BlobEvent::ReadAdmitted)",
+                received: other,
+            }),
+        }
+    }
+
+    fn accept_promotion_scheduled(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }) => {
+                self.fail(ReplicateObjectError::PendingSource)
+            }
+            other => self.fail(ReplicateObjectError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Task(TaskEvent::TimerScheduled)",
+                received: other,
+            }),
+        }
     }
 
     fn accept_blob_transfer(&mut self, event: Event) -> Effects {
