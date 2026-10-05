@@ -219,7 +219,7 @@ pub async fn wake_key_page(
     key: BucketKeyRef,
     now_ms: u64,
 ) -> Result<(usize, bool), JobMutationError> {
-    let prefix = ByteView::from([&[b'k'][..], &key.key()].concat());
+    let prefix = ByteView::from([&b"k"[..], &key.key()].concat());
     let (rows, _) = iter_prefix_page(
         storage,
         JOB_KEY_WAIT_KEYSPACE,

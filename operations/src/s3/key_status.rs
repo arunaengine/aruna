@@ -315,7 +315,7 @@ pub struct AuditPageOperation {
     cursor: Option<Ulid>,
     limit: usize,
     done: bool,
-    output: Option<Result<(Vec<BucketAuditRecord>, Option<Ulid>), KeyStatusError>>,
+    output: Option<Result<AuditPage, KeyStatusError>>,
 }
 
 impl AuditPageOperation {
