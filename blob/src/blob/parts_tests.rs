@@ -104,3 +104,66 @@ async fn composition_waits_budget() {
     drop(share);
     assert_eq!(handler.pithos_budget.available_permits(), budget_permits());
 }
+
+#[tokio::test]
+async fn composition_keeps_slot() {
+    // Through the dispatcher: a reservation waits for a transfer slot before it takes memory,
+    // and the composition then runs on that slot even while every other slot is busy.
+    use aruna_core::effects::BlobEffect;
+    use aruna_core::events::Event;
+    use aruna_core::structs::storage::blob::ResolvedBackend;
+    use aruna_core::structs::storage::encryption::{BucketKeyRef, SealPlan};
+    use ulid::Ulid;
+
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let slots = handler.transfer_slots.available_permits() as u32;
+    let busy = Arc::clone(&handler.transfer_slots)
+        .acquire_many_owned(slots - 1)
+        .await
+        .unwrap();
+    let last = Arc::clone(&handler.transfer_slots)
+        .acquire_owned()
+        .await
+        .unwrap();
+    let reserve = BlobEffect::ReserveCompose {
+        content: MAX_PART_SIZE,
+    };
+    let mut reserving = Box::pin(context.blob_handle.send_blob_effect(reserve));
+    assert!((&mut reserving).now_or_never().is_none());
+    // No memory is held while the reservation waits for its slot.
+    assert_eq!(handler.pithos_budget.available_permits(), budget_permits());
+
+    // One part write finishes; every other slot stays busy.
+    drop(last);
+    let Event::Blob(BlobEvent::ComposeReserved { share }) = reserving.await else {
+        panic!("the reservation must take the freed slot")
+    };
+    assert_eq!(handler.transfer_slots.available_permits(), 0);
+    assert!(handler.pithos_budget.available_permits() < budget_permits());
+
+    let plan = SealPlan {
+        key: BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1),
+        public_key: [1; 32],
+        cipher: Default::default(),
+        block_keys: Default::default(),
+        storage_generation: 1,
+    };
+    let compose = BlobEffect::ComposePieces {
+        bucket: "bucket".to_string(),
+        key: "object".to_string(),
+        resolved: ResolvedBackend::node_default().with_encryption(Some(plan)),
+        created_by: super::test_user_id(),
+        parts: Vec::new(),
+        share,
+    };
+    // A generous cap that only a wait for a transfer slot reaches.
+    let composed = tokio::time::timeout(
+        Duration::from_secs(60),
+        context.blob_handle.send_blob_effect(compose),
+    )
+    .await;
+    assert!(composed.is_ok(), "the composition must not wait for a slot");
+    drop(busy);
+    assert_eq!(handler.pithos_budget.available_permits(), budget_permits());
+}

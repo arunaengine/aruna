@@ -346,13 +346,18 @@ impl BlobHandler {
         }
     }
 
-    /// Reserves the working set of a composition over at most `content` bytes, clipped to the
-    /// node budget, before the completion loads any piece record.
+    /// Reserves a transfer slot, then the working set of a composition over at most `content`
+    /// bytes, clipped to the node budget, before the completion loads any piece record. The
+    /// composition reuses that slot, so it never waits for one while it holds memory.
     pub async fn reserve_compose(&self, content: u64) -> BlobEvent {
+        let slot = match Arc::clone(&self.transfer_slots).acquire_owned().await {
+            Ok(slot) => slot,
+            Err(_) => return BlobEvent::Error(BlobError::Closed),
+        };
         let bytes = working_set(content).min(WORKING_SET);
         match self.reserve_pithos(bytes).await {
             Ok(share) => BlobEvent::ComposeReserved {
-                share: WorkingShare::new(bytes, Arc::new(share)),
+                share: WorkingShare::new(bytes, Arc::new((slot, share))),
             },
             Err(error) => BlobEvent::Error(error),
         }

@@ -269,7 +269,10 @@ impl BlobHandle {
             BlobEffect::SpoolHidden { deadline, .. } => *deadline,
             _ => None,
         };
+        // A composition runs on the transfer slot its reservation already holds.
+        let reserved = matches!(effect, BlobEffect::ComposePieces { .. });
         let slots = match class {
+            EffectClass::Transfer if reserved => None,
             EffectClass::Transfer => Some(self.handler.transfer_slots.clone()),
             EffectClass::Read => Some(self.handler.read_slots.clone()),
             EffectClass::Spool => Some(self.handler.spool_slots.clone()),
