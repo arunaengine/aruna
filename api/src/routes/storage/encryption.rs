@@ -835,7 +835,8 @@ pub(crate) async fn enable_bucket(
         max: enabled.settings.max_unlock_ms.map(Duration::from_millis),
     };
     // The bucket is encrypted either way; a failed install only leaves it locked.
-    if let Err(error) = drive(InstallKeyOperation::new(install), context).await {
+    let install = InstallKeyOperation::new(install).audited(node_id, Some(caller), now_ms());
+    if let Err(error) = drive(install, context).await {
         tracing::warn!(%bucket, ?error, "new bucket key stays locked");
     }
     Ok(())
