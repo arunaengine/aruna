@@ -287,12 +287,18 @@ async fn prepare_response(
         // Key waits address the node that holds the content or the job, not the job owner.
         JobRequest::AwaitKeys {
             job_id, contents, ..
-        } => PreparedResponse::new(
-            match super::remote_key::register_waits(context, peer, &auth, job_id, &contents).await {
-                Ok(locked) => JobResponse::KeysLocked(locked),
-                Err(error) => JobResponse::Unavailable(error),
-            },
-        ),
+        } => PreparedResponse::new(match local_node {
+            Some(node) => {
+                let nodes = (node, peer);
+                let waits =
+                    super::remote_key::register_waits(context, nodes, &auth, job_id, &contents);
+                match waits.await {
+                    Ok(locked) => JobResponse::KeysLocked(locked),
+                    Err(error) => JobResponse::Unavailable(error),
+                }
+            }
+            None => JobResponse::Unavailable("job-control network handle unavailable".into()),
+        }),
         JobRequest::KeyWake { job_id, key, .. } => PreparedResponse::new(
             match super::remote_key::accept_wake(context, peer, &auth, job_id, key).await {
                 Ok(true) => JobResponse::KeyWakeAcked,
