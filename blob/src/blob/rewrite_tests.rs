@@ -163,6 +163,77 @@ async fn opens_with_lease() {
 }
 
 #[tokio::test]
+async fn reencodes_archive_format() {
+    use pithos_lib::archive::{Archive, OpenOptions};
+    use pithos_lib::source::MemorySource;
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let data = b"reencoded archive format".repeat(2000);
+    for (cipher, block_keys) in [
+        (BlockCipher::Aes256Gcm, BlockKeys::ContentDerived),
+        (BlockCipher::ChaCha20Poly1305, BlockKeys::Unique),
+        (BlockCipher::Aes256Gcm, BlockKeys::Unique),
+    ] {
+        let bucket_id = Ulid::generate();
+        let (old, old_private, old_public) = bucket_key(bucket_id, 1, 5);
+        let (new, new_private, new_public) = bucket_key(bucket_id, 2, 6);
+        let source = plain(&handler, &data).await;
+        let event = rewritten(&handler, source, None, sealing(old, old_public), false).await;
+        let BlobEvent::CopyRewritten { location: sealed } = event else {
+            panic!("sealing failed")
+        };
+        let lease = admitted(&handler, old, old_private, old_public, &sealed).await;
+        let mut target = sealing(new, new_public);
+        let plan = target.encryption.as_mut().unwrap();
+        plan.cipher = cipher;
+        plan.block_keys = block_keys;
+        plan.storage_generation = 2;
+        let event = rewritten(&handler, sealed, Some(lease), target, false).await;
+        let BlobEvent::CopyRewritten { location } = event else {
+            panic!("reencoding failed")
+        };
+        let operator = handler.operator_from_location(&location).unwrap();
+        let bytes = operator
+            .read(&location.get_storage_path().unwrap())
+            .await
+            .unwrap()
+            .to_vec();
+        let keys = AccessKeys::new().with_key(PrivateKey::from_raw(Zeroizing::new(new_private)));
+        let archive = Archive::open(
+            MemorySource::new(bytes),
+            OpenOptions::default().with_access_keys(keys),
+        )
+        .unwrap();
+        let blocks = archive
+            .view()
+            .plan_range(crate::blob::pithos::OBJECT_PATH, 0..location.blob_size)
+            .unwrap();
+        let mut count = 0;
+        for block in blocks {
+            // Pithos exposes decoded processing flags through the planned block's Debug output.
+            let block = format!("{:?}", block.unwrap());
+            assert!(block.contains(&format!(
+                "aes_256_gcm: {}",
+                cipher == BlockCipher::Aes256Gcm
+            )));
+            assert!(block.contains(&format!("unique_key: {}", block_keys == BlockKeys::Unique)));
+            count += 1;
+        }
+        assert!(count > 0);
+        assert_eq!(location.format.bucket_key(), Some(new));
+        let StoredLayout::Pithos(layout) = &location.format.layout else {
+            panic!("expected Pithos")
+        };
+        assert_eq!(layout.storage_generation, 2);
+        assert_eq!(
+            opened(&handler, &location, new_private).await.unwrap(),
+            data
+        );
+        assert!(opened(&handler, &location, old_private).await.is_err());
+    }
+}
+
+#[tokio::test]
 async fn replaces_archive_grants() {
     let context = setup_two_backends().await;
     let handler = context.blob_handle.handler.clone();

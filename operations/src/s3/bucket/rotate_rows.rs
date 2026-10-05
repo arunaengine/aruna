@@ -66,10 +66,10 @@ impl ChangeEncryptionOperation {
         let moves = target_key.as_ref().map(|key| key.key) != Some(old.key) || format_changed;
         let transition = match moves {
             true => {
-                let kind = match (&target_key, self.new_key.is_some()) {
+                let kind = match (&target_key, format_changed) {
                     (None, _) => TransitionKind::Decrypt,
-                    (Some(_), true) => TransitionKind::Rotate,
-                    (Some(_), false) => TransitionKind::Reencode,
+                    (Some(_), true) => TransitionKind::Reencode,
+                    (Some(_), false) => TransitionKind::Rotate,
                 };
                 let plan = target_key.as_ref().map(|key| SealPlan {
                     key: key.key,

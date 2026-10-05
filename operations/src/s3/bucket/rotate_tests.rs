@@ -269,6 +269,64 @@ fn cipher_change_reencodes() {
 }
 
 #[test]
+fn combined_change_reencodes() {
+    use aruna_core::structs::identity::user::vault::UserKeyRecord;
+    use aruna_core::structs::placement::record::PlacementRef;
+    for (cipher, block_keys) in [
+        (BlockCipher::Aes256Gcm, BlockKeys::ContentDerived),
+        (BlockCipher::ChaCha20Poly1305, BlockKeys::Unique),
+        (BlockCipher::Aes256Gcm, BlockKeys::Unique),
+    ] {
+        let mut operation = operation(KeyChange::Settings {
+            mode: EncryptionMode::VaultLocked,
+            cipher,
+            block_keys,
+        });
+        let holder = UserKeyRecord {
+            user_id: admin(),
+            record_id: Ulid::from_bytes([8; 16]),
+            key_id: "slot".to_string(),
+            public_key: [7; 32],
+            fingerprint: aruna_core::vault_format::key_fingerprint(&[7; 32]),
+            has_recovery: true,
+            node_id: operation.input.node_id,
+            placement: PlacementRef::NIL,
+            created_at_ms: 1,
+        };
+        operation
+            .input
+            .lookups
+            .insert(admin(), KeyLookup::Keys(vec![holder.clone()]));
+        loaded(&mut operation, EncryptionMode::NodeManaged, Vec::new());
+        let effects = generated(&mut operation);
+        let [Effect::Blob(BlobEffect::SealHolderCopies { key, .. })] = effects.as_slice() else {
+            panic!("expected holder copies")
+        };
+        let copy = SealedCopy {
+            key: *key,
+            user_id: holder.user_id,
+            key_record: holder.record_id,
+            key_id: holder.key_id,
+            enc: [0; 32],
+            ciphertext: vec![0; 48],
+            created_at_ms: 50,
+        };
+        let writes =
+            rows(&operation.step(Event::Blob(BlobEvent::CopiesSealed { copies: vec![copy] })));
+        let transition =
+            EncryptionTransition::from_bytes(&row(&writes, TRANSITION_KEYSPACE)).unwrap();
+        assert_eq!(transition.kind, TransitionKind::Reencode);
+        let plan = transition.target.plan.unwrap();
+        assert_eq!(
+            (plan.key.generation, plan.cipher, plan.block_keys),
+            (2, cipher, block_keys)
+        );
+        assert_eq!(plan.storage_generation, 5);
+        assert_eq!(transition.source, Some(active(true).key));
+    }
+}
+
+#[test]
 fn concurrent_put_converted() {
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
