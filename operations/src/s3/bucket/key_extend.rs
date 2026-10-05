@@ -84,6 +84,8 @@ pub struct ExtendBucketOperation {
     status: Option<UnlockStatus>,
     /// The outcome record until it is written, and the writes tried so far.
     outcome: Option<BucketAuditRecord>,
+    /// Why the registry refused the extension, reported once its failed outcome is recorded.
+    failure: Option<ExtendError>,
     attempts: u32,
     output: Option<Result<UnlockStatus, ExtendError>>,
 }
@@ -96,6 +98,7 @@ impl ExtendBucketOperation {
             key: None,
             status: None,
             outcome: None,
+            failure: None,
             attempts: 0,
             output: None,
         }
@@ -195,7 +198,7 @@ impl ExtendBucketOperation {
     fn move_timer(&mut self, status: UnlockStatus) -> Effects {
         let foreign = Some(status.key) != self.key || status.session_id != self.input.session_id;
         if foreign {
-            return self.fail(BlobError::BucketKey(BucketKeyError::SessionMismatch));
+            return self.reject(BlobError::BucketKey(BucketKeyError::SessionMismatch).into());
         }
         let ticket = KeyTicket {
             key: status.key,
@@ -224,6 +227,17 @@ impl ExtendBucketOperation {
         self.retry_audit()
     }
 
+    /// A refused extension records its failed outcome, so the synced intent never reads as
+    /// applied at restart.
+    fn reject(&mut self, error: ExtendError) -> Effects {
+        let Some(key) = self.key else {
+            return self.fail(error);
+        };
+        self.failure = Some(error);
+        self.outcome = Some(self.record(key, AuditOutcome::Failed, None));
+        self.retry_audit()
+    }
+
     fn retry_audit(&mut self) -> Effects {
         let Some(record) = self.outcome.clone() else {
             return self.fail(ExtendError::NotFinished);
@@ -235,7 +249,10 @@ impl ExtendBucketOperation {
 
     /// The new deadline already applies; a lost audit write does not undo it.
     fn finish(&mut self) -> Effects {
-        self.output = self.status.take().map(Ok);
+        self.output = match self.failure.take() {
+            Some(error) => Some(Err(error)),
+            None => self.status.take().map(Ok),
+        };
         self.step = ExtendStep::Finish;
         smallvec![]
     }
@@ -258,7 +275,11 @@ impl Operation for ExtendBucketOperation {
             {
                 self.retry_audit()
             }
-            (ExtendStep::WriteAudit, _) => self.finish(),
+            // A lasting outage leaves the synced intent; only the write's own answers count.
+            (
+                ExtendStep::WriteAudit,
+                Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::Error { .. }),
+            ) => self.finish(),
             (ExtendStep::WriteIntent, Event::Storage(StorageEvent::WriteResult { .. })) => {
                 self.step = ExtendStep::SyncIntent;
                 smallvec![Effect::Storage(StorageEffect::SyncAll)]
@@ -297,6 +318,9 @@ impl Operation for ExtendBucketOperation {
             }
             (ExtendStep::ExtendKey, Event::Blob(BlobEvent::KeyExtended { status })) => {
                 self.move_timer(status)
+            }
+            (ExtendStep::ExtendKey, Event::Blob(BlobEvent::Error(error))) => {
+                self.reject(error.into())
             }
             (ExtendStep::Finish | ExtendStep::Error, _) => smallvec![],
             (_, Event::Blob(BlobEvent::Error(error))) => self.fail(error),
@@ -458,7 +482,35 @@ mod tests {
         let (mut operation, effects) = read(user(1));
         synced(&mut operation, &effects);
         let mismatch = || BlobError::BucketKey(BucketKeyError::SessionMismatch);
-        operation.step(Event::Blob(BlobEvent::Error(mismatch())));
+        let effects = operation.step(Event::Blob(BlobEvent::Error(mismatch())));
+        // The refused extension records a failed outcome before the error is reported.
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected the failed outcome, got {effects:?}");
+        };
+        let record = BucketAuditRecord::from_bytes(value).unwrap();
+        assert_eq!(
+            (record.action, record.outcome, record.session_id),
+            (AuditAction::Extend, AuditOutcome::Failed, Some(SESSION))
+        );
+        // Only the write's own answer completes it.
+        let stray = Event::Blob(BlobEvent::KeyDiscarded {
+            ticket: KeyTicket {
+                key: BucketKeyRef::new(BUCKET_ID, 2),
+                session_id: SESSION,
+            },
+        });
+        let (mut wrong, effects) = read(user(1));
+        let effects_wrong = synced(&mut wrong, &effects);
+        assert!(!effects_wrong.is_empty());
+        wrong.step(Event::Blob(BlobEvent::Error(mismatch())));
+        wrong.step(stray);
+        assert!(matches!(
+            wrong.finalize(),
+            Err(ExtendError::InvalidStateEvent { .. })
+        ));
+        operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: Key::from(Vec::new()),
+        }));
         assert_eq!(operation.finalize(), Err(ExtendError::Blob(mismatch())));
 
         let (mut operation, effects) = read(user(9));
