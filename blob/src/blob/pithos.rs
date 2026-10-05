@@ -749,7 +749,8 @@ mod tests {
     use aruna_core::structs::storage::encryption::{BucketKeyRef, SealPlan};
     use aruna_core::structs::storage::format::Compression;
     use pithos_lib::archive::{
-        AccessKeys, Archive, BlockingHook, OpenOptions, PieceEncoder, ProcessingOptions,
+        AccessKeys, Archive, BlockKeyMode, BlockingHook, OpenOptions, PieceEncoder,
+        ProcessingOptions,
     };
     use pithos_lib::crypto::PrivateKey;
     use pithos_lib::source::MemorySource;
@@ -886,17 +887,35 @@ mod tests {
         }
     }
 
-    /// An archive of `blocks` sealed 1 KiB blocks, so its metadata dominates its working set.
-    fn small_blocks(blocks: usize, key: &PrivateKey) -> Vec<u8> {
-        let processing = ProcessingOptions::new(true, 0).unwrap();
-        let mut encoder = PieceEncoder::new(1, vec![key.public_key()], processing)
+    /// Distinct seeded bytes, so no two 1 KiB blocks share content and deduplication saves nothing.
+    fn distinct(len: usize) -> Vec<u8> {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    /// An encoder of 1 KiB blocks granted to `key`, with content-derived or unique block keys.
+    fn small_encoder(key: &PrivateKey, unique: bool) -> PieceEncoder {
+        let mut processing = ProcessingOptions::new(true, 0).unwrap();
+        if unique {
+            processing = processing.with_key_mode(BlockKeyMode::Unique).unwrap();
+        }
+        PieceEncoder::new(1, vec![key.public_key()], processing)
             .unwrap()
             .with_block_size(1024)
-            .unwrap();
-        let data: Vec<u8> = (0..blocks * 1024)
-            .map(|index| (index * 7 % 251) as u8)
-            .collect();
-        let mut stored = encoder.write(&data).unwrap();
+            .unwrap()
+    }
+
+    /// An archive of `blocks` distinct sealed 1 KiB blocks, so its metadata dominates its size.
+    fn small_blocks(blocks: usize, key: &PrivateKey, unique: bool) -> Vec<u8> {
+        let mut encoder = small_encoder(key, unique);
+        let mut stored = encoder.write(&distinct(blocks * 1024)).unwrap();
         stored.extend(encoder.flush().unwrap());
         let piece = encoder.finish().unwrap();
         let composition = compose_object(&[piece]).unwrap();
@@ -911,50 +930,64 @@ mod tests {
     #[test]
     fn measured_metadata_fits() {
         const BLOCKS: usize = 8192;
-        let key = PrivateKey::generate();
-        let archive = small_blocks(BLOCKS, &key);
         let original = (BLOCKS * 1024) as u64;
-        let source = MemorySource::new(archive);
-        let options = OpenOptions::default()
-            .with_limits(open_limits(original))
-            .with_access_keys(AccessKeys::new().with_key(key.duplicate()));
-        // Opening and reading every block holds the directory, descriptors and indexes at once.
-        let (read, peak) = counting::peak(|| {
-            let archive = Archive::open(source, options)?;
-            archive.copy_to(OBJECT_PATH, &mut std::io::sink())
-        });
-        read.unwrap();
-        assert!(
-            peak as u64 <= BLOCKS as u64 * BLOCK_MEMORY,
-            "read peak {peak}"
-        );
+        let bound = BLOCKS as u64 * BLOCK_MEMORY;
+        for unique in [false, true] {
+            let key = PrivateKey::generate();
+            let archive = small_blocks(BLOCKS, &key, unique);
+            let options = || {
+                OpenOptions::default()
+                    .with_limits(open_limits(original))
+                    .with_access_keys(AccessKeys::new().with_key(key.duplicate()))
+            };
+            // Opening and reading every block holds the directory, descriptors and indexes at once.
+            let source = MemorySource::new(archive.clone());
+            let (read, peak) = counting::peak(|| {
+                let opened = Archive::open(source, options())?;
+                let descriptors = opened
+                    .view()
+                    .plan_range(OBJECT_PATH, 0..original)?
+                    .try_fold(0, |count, block| block.map(|_| count + 1))?;
+                opened.copy_to(OBJECT_PATH, &mut std::io::sink())?;
+                Ok::<_, pithos_lib::error::PithosError>(descriptors)
+            });
+            assert_eq!(read.unwrap(), BLOCKS, "unique {unique}");
+            assert!(peak as u64 <= bound, "read peak {peak}, unique {unique}");
 
-        // Encoding keeps the same metadata per block, plus the composition of the piece.
-        let data = vec![9u8; 64 << 10];
-        let (_, peak) = counting::peak(|| {
-            let processing = ProcessingOptions::new(true, 0).unwrap();
-            let mut encoder = PieceEncoder::new(1, vec![key.public_key()], processing)
-                .unwrap()
-                .with_block_size(1024)
-                .unwrap();
-            for _ in 0..BLOCKS / 64 {
-                drop(encoder.write(&data).unwrap());
-            }
-            drop(encoder.flush().unwrap());
-            let piece = encoder.finish().unwrap();
-            compose_object(&[piece]).unwrap()
-        });
-        assert!(
-            peak as u64 <= BLOCKS as u64 * BLOCK_MEMORY,
-            "write peak {peak}"
-        );
+            // Grant replacement holds the view, the stored directory and the new directory.
+            let source = MemorySource::new(archive.clone());
+            let recipient = PrivateKey::generate().public_key();
+            let (replaced, peak) = counting::peak(|| {
+                let opened = Archive::open(source, options())?;
+                let range = opened.view().directory_range();
+                let directory = archive[range.start as usize..range.end as usize].to_vec();
+                opened.view().replace_grants(&directory, vec![recipient])
+            });
+            replaced.unwrap();
+            assert!(peak as u64 <= bound, "grant peak {peak}, unique {unique}");
+
+            // Encoding keeps the same metadata per block, plus the composition of the piece.
+            let data = distinct(BLOCKS * 1024);
+            let (blocks, peak) = counting::peak(|| {
+                let mut encoder = small_encoder(&key, unique);
+                for batch in data.chunks(64 << 10) {
+                    drop(encoder.write(batch).unwrap());
+                }
+                drop(encoder.flush().unwrap());
+                let piece = encoder.finish().unwrap();
+                let composition = compose_object(&[piece]).unwrap();
+                composition.directory().len()
+            });
+            assert!(blocks > 0);
+            assert!(peak as u64 <= bound, "write peak {peak}, unique {unique}");
+        }
     }
 
     #[test]
     fn oversized_directories_refused() {
         // 20,000 blocks claimed as 1 MiB of content exceed the blocks that size allows.
         let key = PrivateKey::generate();
-        let archive = small_blocks(20_000, &key);
+        let archive = small_blocks(20_000, &key, false);
         let options = OpenOptions::default()
             .with_limits(open_limits(1 << 20))
             .with_access_keys(AccessKeys::new().with_key(key.duplicate()));
