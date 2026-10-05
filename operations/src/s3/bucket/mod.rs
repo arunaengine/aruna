@@ -14,6 +14,7 @@ pub mod key_extend;
 pub mod key_grant;
 pub mod key_install;
 pub mod key_lock;
+pub mod key_recovery;
 pub mod key_removal;
 pub mod key_restart;
 pub mod key_rows;
