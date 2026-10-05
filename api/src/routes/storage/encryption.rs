@@ -648,7 +648,7 @@ pub async fn put_bucket_encryption(
     }
     let context = state.get_ctx();
     let target = (state.get_realm_id(), state.get_node_id(), group_id);
-    enable_bucket(&context, target, &bucket, &snapshot, &request)
+    enable_bucket(&context, target, auth.user_id, &bucket, &snapshot, &request)
         .await
         .map_err(enable_refusal)?;
     let status = current_status(&state, bucket, group_id, auth.user_id).await?;
@@ -703,6 +703,7 @@ async fn set_unlock_limit(
     let input = UnlockLimitInput {
         bucket: bucket.to_string(),
         group_id,
+        realm_id: state.get_realm_id(),
         node_id: state.get_node_id(),
         caller,
         max_unlock_ms,
@@ -716,6 +717,7 @@ async fn set_unlock_limit(
             UnlockLimitError::Settings(error) => settings_refusal(error),
             UnlockLimitError::Key(error) => key_refusal(&error),
             UnlockLimitError::NotEncrypted => not_encrypted(),
+            UnlockLimitError::NotAdmin => ServerError::Forbidden,
             other => ServerError::InternalError(other.to_string()),
         })
 }
@@ -795,9 +797,11 @@ fn change_refusal(error: ChangeError) -> ServerError {
 }
 
 /// Creates key generation 1 sealed to the creator and admins, then installs the new key.
+/// `caller` must still be a group admin inside the enabling transaction.
 pub(crate) async fn enable_bucket(
     context: &DriverContext,
     (realm_id, node_id, group_id): (RealmId, NodeId, GroupId),
+    caller: UserId,
     bucket: &str,
     snapshot: &KeySnapshot,
     request: &EncryptionRequest,
@@ -813,6 +817,7 @@ pub(crate) async fn enable_bucket(
         group_id,
         realm_id,
         node_id,
+        caller,
         mode: request.mode,
         cipher: request.cipher.unwrap_or_default(),
         block_keys: request.block_keys.unwrap_or_default(),
@@ -841,6 +846,7 @@ pub(crate) fn enable_refusal(error: EnableError) -> ServerError {
         EnableError::Settings(error) => settings_refusal(error),
         EnableError::Key(error) => key_refusal(&error),
         EnableError::Blob(error) => blob_refusal(error),
+        EnableError::NotAdmin => ServerError::Forbidden,
         EnableError::AlreadyEncrypted => refused(
             StatusCode::CONFLICT,
             "stale_generation",

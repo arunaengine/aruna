@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::s3::bucket::key_rows::authority_rows;
 use aruna_core::structs::identity::user::vault::UserKeyRecord;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -45,8 +46,18 @@ fn keys() -> KeyLookup {
     }])
 }
 
-/// Runs a grant up to its seal or write step against an encrypted bucket, or a plain one.
+/// Runs a grant by admin user(1) up to its seal or write step against an encrypted bucket, or a
+/// plain one.
 fn started(lookup: KeyLookup, encrypted: bool) -> (GrantHolderOperation, Effects) {
+    granted(lookup, encrypted, &[user(1)])
+}
+
+/// Runs a grant by user(1) while `admins` hold the group admin role in the transaction.
+fn granted(
+    lookup: KeyLookup,
+    encrypted: bool,
+    admins: &[UserId],
+) -> (GrantHolderOperation, Effects) {
     let mut operation = GrantHolderOperation::new(input(lookup));
     operation.start();
     operation.step(Event::Storage(StorageEvent::TransactionStarted {
@@ -68,16 +79,10 @@ fn started(lookup: KeyLookup, encrypted: bool) -> (GrantHolderOperation, Effects
         key_generation: 2,
         ..Default::default()
     };
-    let settings = encrypted.then(|| settings.to_bytes().unwrap().into());
-    let values = vec![
-        (
-            Key::from(b"bucket".to_vec()),
-            Some(info.to_bytes().unwrap().into()),
-        ),
-        (Key::from(b"bucket".to_vec()), settings),
-    ];
+    let settings = encrypted.then_some(&settings);
+    let values = authority_rows(&info, settings, admins);
     let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-    if !encrypted {
+    if !encrypted || !admins.contains(&user(1)) {
         return (operation, effects);
     }
     let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -157,4 +162,15 @@ fn plain_bucket_refused() {
         [Effect::Storage(StorageEffect::AbortTransaction { .. })]
     ));
     assert_eq!(operation.finalize(), Err(GrantError::NotEncrypted));
+}
+
+#[test]
+fn revoked_admin_refused() {
+    // The route saw user(1) as admin, but the role was revoked before the grant's transaction.
+    let (operation, effects) = granted(keys(), true, &[]);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    assert_eq!(operation.finalize(), Err(GrantError::NotAdmin));
 }

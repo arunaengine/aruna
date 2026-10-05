@@ -61,6 +61,9 @@ pub enum EnableError {
     Settings(#[from] SettingsError),
     #[error("the bucket already encrypts its writes")]
     AlreadyEncrypted,
+    /// The enabling user lost the group admin role before the change committed.
+    #[error("the caller is no group admin")]
+    NotAdmin,
     #[error("encryption needs the mode node_managed or vault_locked")]
     InvalidMode,
     #[error("the bucket has open multipart uploads")]
@@ -86,6 +89,8 @@ pub struct EnableInput {
     pub group_id: GroupId,
     pub realm_id: RealmId,
     pub node_id: NodeId,
+    /// The group admin who enables encryption; checked again inside the transaction.
+    pub caller: UserId,
     pub mode: EncryptionMode,
     pub cipher: BlockCipher,
     pub block_keys: BlockKeys,
@@ -149,6 +154,9 @@ impl EnableEncryptionOperation {
     fn read_bucket(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
         let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
         let (info, settings) = match parse_authority(values, realm_id, group_id) {
+            Ok(state) if !state.admins.contains(&self.input.caller) => {
+                return self.fail(EnableError::NotAdmin);
+            }
             Ok(state) => {
                 self.admins = state.admins;
                 (state.info, state.settings)

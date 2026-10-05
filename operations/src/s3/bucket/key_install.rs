@@ -327,7 +327,7 @@ mod tests {
             compression: Compression::Off,
         };
         // The authorization documents the enable reads its admins from.
-        let rows = crate::s3::bucket::key_rows::authority_rows(&info, None, &[]);
+        let rows = crate::s3::bucket::key_rows::authority_rows(&info, None, &[creator]);
         let documents = [realm_id.as_bytes().to_vec(), group_id.to_bytes().to_vec()];
         for (key, (_, value)) in documents.into_iter().zip(rows.into_iter().skip(2)) {
             let key_space = aruna_core::keyspaces::AUTH_KEYSPACE.to_string();
@@ -366,6 +366,7 @@ mod tests {
                 group_id,
                 realm_id,
                 node_id: net.node_id(),
+                caller: creator,
                 mode: EncryptionMode::NodeManaged,
                 cipher: BlockCipher::ChaCha20Poly1305,
                 block_keys: BlockKeys::ContentDerived,

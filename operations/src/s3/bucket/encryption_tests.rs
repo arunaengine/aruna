@@ -39,6 +39,7 @@ fn input(mode: EncryptionMode, lookups: BTreeMap<UserId, KeyLookup>) -> EnableIn
         group_id: Ulid::from_bytes([3; 16]),
         realm_id: RealmId::from_bytes([1; 32]),
         node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+        caller: user(2),
         mode,
         cipher: BlockCipher::Aes256Gcm,
         block_keys: BlockKeys::ContentDerived,
@@ -283,4 +284,22 @@ fn open_uploads_conflict() {
         [Effect::Storage(StorageEffect::AbortTransaction { .. })]
     ));
     assert_eq!(operation.finalize(), Err(EnableError::OpenUploads));
+}
+
+#[test]
+fn revoked_enabler_refused() {
+    // The route saw user(2) as admin, but the role was revoked before the enable's transaction.
+    let lookups = BTreeMap::from([(user(1), keys(user(1), true))]);
+    let mut operation = EnableEncryptionOperation::new(input(EncryptionMode::NodeManaged, lookups));
+    operation.start();
+    operation.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: Ulid::from_bytes([9; 16]),
+    }));
+    let values = authority_rows(&bucket(), None, &[]);
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    assert!(matches!(operation.finalize(), Err(EnableError::NotAdmin)));
 }

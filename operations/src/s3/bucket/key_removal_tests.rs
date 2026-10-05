@@ -70,8 +70,17 @@ struct Case {
 /// The active generation 2 of a vault-locked bucket.
 const LOCKED: (EncryptionMode, u64, KeyState) = (EncryptionMode::VaultLocked, 2, KeyState::Active);
 
-/// Runs a removal on a bucket of creator user(1) up to its delete batch.
+/// Runs a removal by admin user(1) on a bucket of creator user(1) up to its delete batch.
 fn run(case: Case) -> (RemoveHolderOperation, Effects) {
+    run_by(case, true)
+}
+
+/// Runs a removal by user(1), who holds the group admin role in the transaction if `admin`.
+fn run_by(case: Case, admin: bool) -> (RemoveHolderOperation, Effects) {
+    let mut admins = case.admins.clone();
+    if admin {
+        admins.insert(user(1));
+    }
     let lookups = [user(1), user(2), user(3)].map(|user| (user, keys(user)));
     let revision = case.revision.unwrap_or_else(|| {
         // The list the caller saw: rows and facts of the active generation 2, if any.
@@ -83,11 +92,11 @@ fn run(case: Case) -> (RemoveHolderOperation, Effects) {
             .cloned()
             .collect();
         let lookups = BTreeMap::from(lookups.clone());
-        let report = resolve_holders(user(1), &case.admins, &case.grants, &lookups, &in_active);
+        let report = resolve_holders(user(1), &admins, &case.grants, &lookups, &in_active);
         let rows = holder_revision(&case.grants, &case.copies);
-        revision_with_facts(rows, user(1), &case.admins, &report)
+        revision_with_facts(rows, user(1), &admins, &report)
     });
-    let admins: Vec<_> = case.admins.iter().copied().collect();
+    let admins: Vec<_> = admins.into_iter().collect();
     let mut operation = RemoveHolderOperation::new(RemovalInput {
         bucket: "bucket".to_string(),
         group_id: Ulid::from_bytes([3; 16]),
@@ -310,4 +319,21 @@ fn weak_recovery_protected() {
             [BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE]
         );
     }
+}
+
+#[test]
+fn revoked_remover_refused() {
+    // The route saw user(1) as admin, but the role was revoked before the removal's transaction.
+    let case = Case {
+        target: user(3),
+        admins: BTreeSet::new(),
+        grants: vec![grant(user(3))],
+        copies: vec![copy(user(1), 2), copy(user(2), 2), copy(user(3), 2)],
+        revision: None,
+        confirm: true,
+        mode: LOCKED.0,
+        keys: vec![(LOCKED.1, LOCKED.2)],
+    };
+    let (operation, _) = run_by(case, false);
+    assert_eq!(operation.finalize(), Err(RemovalError::NotAdmin));
 }

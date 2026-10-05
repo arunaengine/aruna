@@ -55,6 +55,9 @@ pub enum RemovalError {
     NoSuchGrant,
     #[error("the holders changed since they were read")]
     StaleHolders,
+    /// The removing user lost the group admin role before the removal committed.
+    #[error("the caller is no group admin")]
+    NotAdmin,
     #[error("removing this holder breaks the recovery rule")]
     RecoveryConfirmationRequired,
     #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
@@ -281,6 +284,9 @@ impl Operation for RemoveHolderOperation {
             (RemovalStep::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
                 match parse_authority(values, realm_id, group_id) {
+                    Ok(state) if !state.admins.contains(&self.input.removed_by) => {
+                        self.fail(RemovalError::NotAdmin)
+                    }
                     Ok(state) => {
                         self.creator = Some(state.info.created_by);
                         self.admins = state.admins;

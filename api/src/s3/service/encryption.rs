@@ -88,9 +88,16 @@ impl ArunaS3Service {
             expected_generation: snapshot.settings.storage_generation,
         };
         let target = (self.realm_id, self.node_id, info.group_id);
-        enable_bucket(&self.state, target, bucket, &snapshot, &request)
-            .await
-            .map_err(enable_error)
+        enable_bucket(
+            &self.state,
+            target,
+            auth.user_id,
+            bucket,
+            &snapshot,
+            &request,
+        )
+        .await
+        .map_err(enable_error)
     }
 }
 
@@ -155,6 +162,7 @@ fn enable_error(error: EnableError) -> S3Error {
                 "The bucket encryption changed during the request"
             )
         }
+        EnableError::NotAdmin => s3_error!(AccessDenied, "The caller is no group admin"),
         other => s3_error!(InternalError, "{}", other),
     }
 }

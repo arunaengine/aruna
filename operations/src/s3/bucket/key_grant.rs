@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::key_rows::{SettingsError, parse_settings, settings_read};
+use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -44,6 +44,9 @@ pub enum GrantError {
     Blob(#[from] BlobError),
     #[error("the bucket does not encrypt")]
     NotEncrypted,
+    /// The granting user lost the group admin role before the grant committed.
+    #[error("the caller is no group admin")]
+    NotAdmin,
     #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: String,
@@ -102,9 +105,12 @@ impl GrantHolderOperation {
         effects
     }
 
+    /// The granting admin is checked again against the authorization read in this transaction.
     fn read_grant(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let settings = match parse_settings(values, self.input.group_id) {
-            Ok((_, settings)) => settings,
+        let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+        let settings = match parse_authority(values, realm_id, group_id) {
+            Ok(state) if state.admins.contains(&self.input.granted_by) => state.settings,
+            Ok(_) => return self.fail(GrantError::NotAdmin),
             Err(error) => return self.fail(error),
         };
         let Some(key) = settings.active_key() else {
@@ -233,7 +239,13 @@ impl Operation for GrantHolderOperation {
             ) => {
                 self.txn_id = Some(txn_id);
                 self.step = GrantStep::ReadBucket;
-                smallvec![settings_read(&self.input.bucket, Some(txn_id))]
+                let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+                smallvec![authority_read(
+                    &self.input.bucket,
+                    realm_id,
+                    group_id,
+                    Some(txn_id)
+                )]
             }
             (GrantStep::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.read_grant(values)

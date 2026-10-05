@@ -3,12 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::key_rows::{SettingsError, parse_settings, settings_read};
+use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError};
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -29,6 +30,9 @@ pub enum UnlockLimitError {
     Key(#[from] BucketKeyError),
     #[error("the bucket has no keys")]
     NotEncrypted,
+    /// The calling user lost the group admin role before the change committed.
+    #[error("the caller is no group admin")]
+    NotAdmin,
     #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: String,
@@ -44,7 +48,9 @@ pub enum UnlockLimitError {
 pub struct UnlockLimitInput {
     pub bucket: String,
     pub group_id: GroupId,
+    pub realm_id: RealmId,
     pub node_id: NodeId,
+    /// The group admin who changes the limit; checked again inside the transaction.
     pub caller: UserId,
     pub max_unlock_ms: Option<u64>,
     /// The storage generation the caller read; another one means a concurrent change.
@@ -91,8 +97,10 @@ impl UnlockLimitOperation {
     }
 
     fn write(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let mut settings = match parse_settings(values, self.input.group_id) {
-            Ok((_, settings)) => settings,
+        let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+        let mut settings = match parse_authority(values, realm_id, group_id) {
+            Ok(state) if state.admins.contains(&self.input.caller) => state.settings,
+            Ok(_) => return self.fail(UnlockLimitError::NotAdmin),
             Err(error) => return self.fail(error),
         };
         let (Some(bucket_id), true) = (settings.bucket_id, settings.is_encrypted()) else {
@@ -162,7 +170,13 @@ impl Operation for UnlockLimitOperation {
             ) => {
                 self.txn_id = Some(txn_id);
                 self.step = LimitStep::ReadBucket;
-                smallvec![settings_read(&self.input.bucket, Some(txn_id))]
+                let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+                smallvec![authority_read(
+                    &self.input.bucket,
+                    realm_id,
+                    group_id,
+                    Some(txn_id)
+                )]
             }
             (LimitStep::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.write(values)
@@ -222,7 +236,8 @@ mod tests {
         UserId::new(Ulid::from_bytes([5; 16]), RealmId::from_bytes([1; 32]))
     }
 
-    fn rows(settings: &BucketEncryption) -> Vec<(Key, Option<Value>)> {
+    /// The authority read of a bucket whose group admins are `admins`.
+    fn rows(settings: &BucketEncryption, admins: &[UserId]) -> Vec<(Key, Option<Value>)> {
         let info = BucketInfo {
             group_id: Ulid::from_bytes([3; 16]),
             created_at: SystemTime::UNIX_EPOCH,
@@ -233,19 +248,23 @@ mod tests {
             placement_policy_generation: 0,
             compression: Compression::Off,
         };
-        vec![
-            (Key::from(Vec::new()), Some(info.to_bytes().unwrap().into())),
-            (
-                Key::from(Vec::new()),
-                Some(settings.to_bytes().unwrap().into()),
-            ),
-        ]
+        crate::s3::bucket::key_rows::authority_rows(&info, Some(settings), admins)
     }
 
     fn run(max_unlock_ms: Option<u64>, expected: u64) -> (UnlockLimitOperation, Effects) {
+        run_by(max_unlock_ms, expected, &[caller()])
+    }
+
+    /// Runs a change by `caller()` while `admins` hold the group admin role in the transaction.
+    fn run_by(
+        max_unlock_ms: Option<u64>,
+        expected: u64,
+        admins: &[UserId],
+    ) -> (UnlockLimitOperation, Effects) {
         let mut operation = UnlockLimitOperation::new(UnlockLimitInput {
             bucket: "raw".to_string(),
             group_id: Ulid::from_bytes([3; 16]),
+            realm_id: RealmId::from_bytes([1; 32]),
             node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
             caller: caller(),
             max_unlock_ms,
@@ -265,7 +284,7 @@ mod tests {
             ..Default::default()
         };
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: rows(&settings),
+            values: rows(&settings, admins),
         }));
         (operation, effects)
     }
@@ -312,5 +331,16 @@ mod tests {
             ));
             assert_eq!(operation.finalize(), Err(error));
         }
+    }
+
+    #[test]
+    fn revoked_admin_refused() {
+        // The route saw the caller as admin, but the role was revoked before the transaction.
+        let (operation, effects) = run_by(Some(60_000), 2, &[]);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert_eq!(operation.finalize(), Err(UnlockLimitError::NotAdmin));
     }
 }

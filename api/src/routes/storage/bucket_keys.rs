@@ -586,6 +586,7 @@ pub async fn grant_holder(
             GrantError::Settings(error) => settings_refusal(error),
             GrantError::Blob(error) => blob_refusal(error),
             GrantError::NotEncrypted => not_encrypted(),
+            GrantError::NotAdmin => ServerError::Forbidden,
             other => ServerError::InternalError(other.to_string()),
         })?;
     let grant = result.grant;
@@ -670,6 +671,7 @@ pub async fn remove_holder(
             RemovalError::Settings(error) => settings_refusal(error),
             RemovalError::NotEncrypted => not_encrypted(),
             RemovalError::NoSuchGrant => ServerError::NotFound,
+            RemovalError::NotAdmin => ServerError::Forbidden,
             RemovalError::StaleHolders => refused(
                 StatusCode::CONFLICT,
                 "stale_holders",

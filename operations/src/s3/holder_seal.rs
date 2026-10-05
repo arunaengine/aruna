@@ -224,6 +224,7 @@ mod tests {
                 group_id,
                 realm_id,
                 node_id,
+                caller: admin,
                 mode: EncryptionMode::NodeManaged,
                 cipher: BlockCipher::ChaCha20Poly1305,
                 block_keys: BlockKeys::ContentDerived,
