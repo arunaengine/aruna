@@ -6,7 +6,7 @@ use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
 };
-use crate::s3::bucket::key_rows::settings_read;
+use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};

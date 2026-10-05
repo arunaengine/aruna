@@ -8,7 +8,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use thiserror::Error;
 
-use crate::blob::migration_queue::resume_transitions;
+use crate::blob::migration::queue::resume_transitions;
 use crate::blob::promote::{PromoteError, promote_unlocked};
 use crate::driver::DriverContext;
 use crate::jobs::runtime::key_unlocked;
@@ -291,7 +291,7 @@ mod tests {
     use byteview::ByteView;
 
     #[tokio::test]
-    async fn corrupt_archive_still_wakes() {
+    async fn corrupt_archive_wakes() {
         use crate::jobs::store::{owed_wakes, register_remote_wait};
         use aruna_core::effects::StorageEffect;
         use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;

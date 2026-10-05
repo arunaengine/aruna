@@ -4,8 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::DriverContext;
-use crate::s3::bucket::key_restart::Replay;
-use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
+use crate::s3::bucket::key::restart::Replay;
+use crate::s3::bucket::key::rows::{SettingsError, authority_read, parse_authority};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -385,7 +385,7 @@ impl Operation for AuditPageOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s3::bucket::key_rows::authority_rows;
+    use crate::s3::bucket::key::rows::authority_rows;
     use aruna_core::structs::storage::encryption::{BucketKeyRef, EncryptionMode};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::key_audit::AuditOutcome;
@@ -555,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_outcomes_keep_reason() {
+    fn failures_keep_reason() {
         let mut operation = operation();
         operation.start();
         let settings = BucketEncryption {

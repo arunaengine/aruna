@@ -91,7 +91,8 @@ pub enum NotificationKind {
         actor_user_id: UserId,
     },
     /// A node restart locked an unlocked encrypted bucket; a holder must unlock it again.
-    BucketLockedByRestart {
+    #[serde(rename = "BucketLockedByRestart")]
+    BucketRestartLocked {
         bucket: String,
         node_id: NodeId,
         group_id: GroupId,
@@ -119,7 +120,7 @@ impl NotificationKind {
             | NotificationKind::DataUploaded { .. }
             | NotificationKind::SyncCompleted { .. }
             | NotificationKind::SyncFailed { .. } => "resource.watch",
-            NotificationKind::BucketLockedByRestart { .. }
+            NotificationKind::BucketRestartLocked { .. }
             | NotificationKind::BucketRecoveryDegraded { .. } => "bucket.encryption",
         }
     }
@@ -136,7 +137,7 @@ impl NotificationKind {
             NotificationKind::DataUploaded { .. } => "data_uploaded",
             NotificationKind::SyncCompleted { .. } => "sync_completed",
             NotificationKind::SyncFailed { .. } => "sync_failed",
-            NotificationKind::BucketLockedByRestart { .. } => "bucket_locked_by_restart",
+            NotificationKind::BucketRestartLocked { .. } => "bucket_locked_by_restart",
             NotificationKind::BucketRecoveryDegraded { .. } => "bucket_recovery_degraded",
         }
     }
@@ -380,7 +381,7 @@ mod tests {
         let data_group_id = Ulid::generate();
         let data_node_id = make_node_id(8);
         for kind in [
-            NotificationKind::BucketLockedByRestart {
+            NotificationKind::BucketRestartLocked {
                 bucket: "raw".to_string(),
                 node_id: make_node_id(9),
                 group_id: Ulid::generate(),

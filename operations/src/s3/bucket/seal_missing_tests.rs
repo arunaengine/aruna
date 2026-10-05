@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::s3::bucket::key_rows::authority_rows;
+use crate::s3::bucket::key::rows::authority_rows;
 use aruna_core::structs::identity::user::vault::UserKeyRecord;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::blob::BucketInfo;

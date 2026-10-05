@@ -124,7 +124,7 @@ mod tests {
     use super::*;
     use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::encryption::{EnableEncryptionOperation, EnableInput};
-    use crate::s3::bucket::key_install::{InstallInput, InstallKeyOperation};
+    use crate::s3::bucket::key::install::{InstallInput, InstallKeyOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::UserId;
     use aruna_core::compute::SecretBytes;
@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seals_new_admin_key() {
+    async fn seals_admin_key() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         let storage = aruna_storage::FjallStorage::open(root).unwrap();
@@ -198,7 +198,7 @@ mod tests {
             placement_policy_generation: 0,
             compression: Compression::Off,
         };
-        let rows = crate::s3::bucket::key_rows::authority_rows(&info, None, &[admin]);
+        let rows = crate::s3::bucket::key::rows::authority_rows(&info, None, &[admin]);
         let documents = [realm_id.as_bytes().to_vec(), group_id.to_bytes().to_vec()];
         for (key, (_, value)) in documents.into_iter().zip(rows.into_iter().skip(2)) {
             let write = StorageEffect::Write {

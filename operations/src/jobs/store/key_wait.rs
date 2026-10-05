@@ -57,13 +57,13 @@ pub async fn park_job(
         let result = match result {
             Ok(record) if parked => {
                 let mut writes = vec![(
-                    JOB_KEY_WAIT_KEYSPACE.to_string(),
+                    KEY_WAIT_KEYSPACE.to_string(),
                     job_wait_key(job_id),
                     list.clone(),
                 )];
                 writes.extend(waits.iter().map(|wait| {
                     (
-                        JOB_KEY_WAIT_KEYSPACE.to_string(),
+                        KEY_WAIT_KEYSPACE.to_string(),
                         key_wait_key(wait.key, job_id),
                         empty_value(),
                     )
@@ -99,14 +99,9 @@ pub async fn read_key_waits(
     storage: &StorageHandle,
     job_id: JobId,
 ) -> Result<Vec<KeyWait>, String> {
-    read_state(
-        storage,
-        JOB_KEY_WAIT_KEYSPACE,
-        job_wait_key(job_id),
-        "key wait",
-    )
-    .await
-    .map(Option::unwrap_or_default)
+    read_state(storage, KEY_WAIT_KEYSPACE, job_wait_key(job_id), "key wait")
+        .await
+        .map(Option::unwrap_or_default)
 }
 
 /// Marks `key` available for one job. The job returns to `Queued`, due now, only when no
@@ -149,14 +144,14 @@ async fn satisfy_in_txn(
     let storage_error = |error: String| JobMutationError::Storage(error);
     batch_delete(
         storage,
-        vec![(JOB_KEY_WAIT_KEYSPACE.to_string(), key_wait_key(key, job_id))],
+        vec![(KEY_WAIT_KEYSPACE.to_string(), key_wait_key(key, job_id))],
         Some(txn_id),
     )
     .await
     .map_err(storage_error)?;
     let list = read_raw(
         storage,
-        JOB_KEY_WAIT_KEYSPACE,
+        KEY_WAIT_KEYSPACE,
         job_wait_key(job_id),
         Some(txn_id),
     )
@@ -191,7 +186,7 @@ async fn satisfy_in_txn(
         batch_write(
             storage,
             vec![(
-                JOB_KEY_WAIT_KEYSPACE.to_string(),
+                KEY_WAIT_KEYSPACE.to_string(),
                 job_wait_key(job_id),
                 ByteView::from(value),
             )],
@@ -203,7 +198,7 @@ async fn satisfy_in_txn(
         // A list without a parked job is stale: the job was cancelled or pruned.
         batch_delete(
             storage,
-            vec![(JOB_KEY_WAIT_KEYSPACE.to_string(), job_wait_key(job_id))],
+            vec![(KEY_WAIT_KEYSPACE.to_string(), job_wait_key(job_id))],
             Some(txn_id),
         )
         .await
@@ -222,7 +217,7 @@ pub async fn wake_key_page(
     let prefix = ByteView::from([&b"k"[..], &key.key()].concat());
     let (rows, _) = iter_prefix_page(
         storage,
-        JOB_KEY_WAIT_KEYSPACE,
+        KEY_WAIT_KEYSPACE,
         Some(prefix),
         None,
         WAKE_PAGE,
@@ -234,7 +229,7 @@ pub async fn wake_key_page(
     for (row, _) in &rows {
         let Some((_, job_id)) = parse_wait_key(row.as_ref()) else {
             warn!("Deleting malformed key wait row");
-            delete_raw(storage, JOB_KEY_WAIT_KEYSPACE, row.clone(), None)
+            delete_raw(storage, KEY_WAIT_KEYSPACE, row.clone(), None)
                 .await
                 .map_err(JobMutationError::Storage)?;
             continue;

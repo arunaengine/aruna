@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::setup_two_backends;
+use crate::blob::pithos::parts::{PART_BLOCK, PartBatch, blocking};
 use crate::blob::pithos::{Share, WORKING_SET, budget_permits, working_set};
-use crate::blob::pithos_parts::{PART_BLOCK, PartBatch, blocking};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::structs::storage::multipart::MAX_PART_SIZE;

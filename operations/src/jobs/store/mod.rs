@@ -10,9 +10,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, ARTIFACT_TOMBSTONE_KEYSPACE, ATTEMPT_CONTROL_KEYSPACE,
-    DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEY_WAIT_KEYSPACE,
-    JOB_KEYSPACE, JOB_STATE_KEYSPACE, OUTPUT_RECORD_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE,
-    RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
+    DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE,
+    KEY_WAIT_KEYSPACE, OUTPUT_RECORD_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE, RUN_CRATE_KEYSPACE,
+    SCHEDULE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{
     ActiveJobKind, AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError,
@@ -267,7 +267,7 @@ pub(super) fn index_deltas(
     }
     // Leaving the parked state drops its wait list; stale wake rows are skipped on wake.
     if old.state == JobState::AwaitingKey && new.state != JobState::AwaitingKey {
-        deletes.push((JOB_KEY_WAIT_KEYSPACE.to_string(), job_wait_key(new.job_id)));
+        deletes.push((KEY_WAIT_KEYSPACE.to_string(), job_wait_key(new.job_id)));
     }
     if let Some(kind) = ActiveJobKind::of(&old.payload)
         && !old.is_settled()

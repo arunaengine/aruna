@@ -7,8 +7,6 @@ pub mod hidden;
 pub mod holders;
 pub mod managed_copy;
 pub mod migration;
-pub mod migration_queue;
-pub mod migration_rewrite;
 pub mod pending_reclaim;
 pub mod permission_paths;
 pub mod promote;

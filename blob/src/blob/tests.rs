@@ -3803,7 +3803,7 @@ async fn hold_excludes_claim() {
 #[path = "frames_tests.rs"]
 mod frames;
 
-#[path = "pithos_tests.rs"]
+#[path = "pithos/tests.rs"]
 mod pithos;
 
 #[path = "parts_tests.rs"]

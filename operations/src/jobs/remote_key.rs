@@ -396,7 +396,7 @@ mod tests {
     use ulid::Ulid;
 
     #[tokio::test]
-    async fn wake_needs_parked_job() {
+    async fn wake_requires_parked() {
         let dir = tempfile::tempdir().unwrap();
         let context = DriverContext {
             storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
@@ -632,11 +632,11 @@ mod tests {
     }
 
     async fn registrations(context: &DriverContext) -> usize {
-        use aruna_core::keyspaces::JOB_KEY_WAIT_KEYSPACE;
+        use aruna_core::keyspaces::KEY_WAIT_KEYSPACE;
         let prefix = Some(b"r".to_vec().into());
         let rows = iter_prefix_page(
             &context.storage_handle,
-            JOB_KEY_WAIT_KEYSPACE,
+            KEY_WAIT_KEYSPACE,
             prefix,
             None,
             8,
@@ -883,7 +883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_target_not_hidden() {
+    async fn exact_target_visible() {
         use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
         use aruna_core::structs::storage::blob::{BackendRef, BlobVersion};
         use aruna_core::structs::storage::format::EncodingClass;

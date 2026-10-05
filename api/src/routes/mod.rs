@@ -39,7 +39,8 @@ pub mod sync;
 // and storage families own these modules now. Remove once consumers migrate.
 pub use access::{credentials, group_join, groups, sessions, tokens, users};
 pub use execution::{compute, device_compute, jobs, tes};
-pub use storage::{blobs, bucket_usage, connectors, group_backends};
+pub use storage::bucket::usage as bucket_usage;
+pub use storage::{blobs, connectors, group_backends};
 
 /// The single REST source: every route is registered from a `#[utoipa::path]`
 /// handler, so the runtime router and the generated document cannot diverge.
@@ -50,10 +51,10 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(info::router())
         .merge(onboarding::router())
         .merge(storage::blobs::router())
-        .merge(storage::bucket_usage::router())
+        .merge(storage::bucket::usage::router())
         .merge(storage::compression::router())
         .merge(storage::encryption::router())
-        .merge(storage::bucket_keys::router())
+        .merge(storage::bucket::keys::router())
         .merge(drs::router())
         .merge(staging::router())
         .merge(storage::deletion::router())

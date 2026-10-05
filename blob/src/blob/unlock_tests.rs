@@ -394,7 +394,7 @@ async fn idle_prepared_dropped() {
 }
 
 #[test]
-fn polled_expiry_still_locks() {
+fn polled_expiry_locks() {
     let mut registry = UnlockRegistry::new(UNLOCKED_BUCKETS);
     let start = Instant::now();
     let key = reference(1, 1);
@@ -428,7 +428,7 @@ fn polled_expiry_still_locks() {
 }
 
 #[test]
-fn expiries_kept_per_session() {
+fn expiry_per_session() {
     let mut registry = UnlockRegistry::new(UNLOCKED_BUCKETS);
     let start = Instant::now();
     let key = reference(1, 1);
@@ -458,7 +458,7 @@ fn expiries_kept_per_session() {
 }
 
 #[test]
-fn running_timer_spares_extension() {
+fn timer_spares_extension() {
     let mut registry = UnlockRegistry::new(UNLOCKED_BUCKETS);
     let start = Instant::now();
     let key = reference(1, 1);

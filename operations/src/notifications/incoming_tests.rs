@@ -1963,7 +1963,7 @@ fn restart_notice_origin() {
     let origin = iroh::SecretKey::from_bytes(&[3; 32]).public();
     let other = iroh::SecretKey::from_bytes(&[4; 32]).public();
     let recipient = UserId::new(Ulid::from_bytes([5; 16]), RealmId::from_bytes([1; 32]));
-    let kind = NotificationKind::BucketLockedByRestart {
+    let kind = NotificationKind::BucketRestartLocked {
         bucket: "raw".to_string(),
         node_id: origin,
         group_id: Ulid::from_bytes([6; 16]),

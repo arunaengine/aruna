@@ -196,7 +196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fired_retry_survives_crash() {
+    async fn retry_survives_crash() {
         use crate::jobs::runtime::JobsRuntime;
         use crate::tasks::incoming::OperationsTaskHandler;
         use aruna_tasks::InboundTaskHandler;

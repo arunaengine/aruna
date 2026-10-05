@@ -4,7 +4,6 @@
 
 pub mod attributes;
 pub mod copy;
-pub mod copy_sealed;
 pub mod delete;
 pub mod get;
 pub mod head;

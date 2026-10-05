@@ -372,7 +372,7 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
             response.error = Some(error.clone());
             response.actor_user_id = Some(actor_user_id.to_string());
         }
-        NotificationKind::BucketLockedByRestart {
+        NotificationKind::BucketRestartLocked {
             bucket,
             node_id,
             group_id,

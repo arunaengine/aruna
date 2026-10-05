@@ -297,7 +297,7 @@ async fn build_response(
 /// may deliver it.
 fn verify_node_origin(records: &[NotificationRecord], peer: NodeId) -> Result<(), String> {
     let foreign = records.iter().any(|record| match &record.kind {
-        NotificationKind::BucketLockedByRestart { node_id, .. }
+        NotificationKind::BucketRestartLocked { node_id, .. }
         | NotificationKind::BucketRecoveryDegraded { node_id, .. } => *node_id != peer,
         _ => false,
     });
@@ -582,7 +582,7 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             }
             validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
         }
-        NotificationKind::BucketLockedByRestart {
+        NotificationKind::BucketRestartLocked {
             bucket, group_id, ..
         }
         | NotificationKind::BucketRecoveryDegraded {

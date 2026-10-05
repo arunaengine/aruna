@@ -26,7 +26,7 @@ use crate::replication::queue::{
     LiveObligationRecord, live_obligation_effect, schedule_blob_drain,
 };
 use crate::s3::bucket::create::CreateBucketOperation;
-use crate::s3::bucket::key_rows::settings_read;
+use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};

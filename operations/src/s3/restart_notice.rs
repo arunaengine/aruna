@@ -128,7 +128,7 @@ impl RestartNoticeOperation {
 
     fn notice(&self, bucket: &RestartedBucket, holder: UserId) -> NotificationOutboxRecord {
         let subject = [&bucket.bucket_id.to_bytes()[..], &holder.to_storage_key()].concat();
-        let kind = NotificationKind::BucketLockedByRestart {
+        let kind = NotificationKind::BucketRestartLocked {
             bucket: bucket.bucket.clone(),
             node_id: self.node_id,
             group_id: bucket.group_id,
@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_audit_and_notices() {
+    fn writes_audit_notices() {
         let mut operation = operation(1_000);
         let rows = rows(&mut operation);
         let audits: Vec<_> = rows

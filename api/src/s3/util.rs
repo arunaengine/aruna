@@ -761,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn sse_by_bucket_mode() {
+    fn bucket_sse_modes() {
         use super::{ServerSideEncryption, check_sse};
         let aes = ServerSideEncryption::from_static(ServerSideEncryption::AES256);
         let kms = ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS);

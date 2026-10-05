@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ownerless_freed_after_grace() {
+    async fn ownerless_after_grace() {
         let dir = tempfile::tempdir().unwrap();
         let context = DriverContext {
             storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())

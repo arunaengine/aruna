@@ -83,7 +83,7 @@ async fn park_keeps_attempts() {
 }
 
 #[tokio::test]
-async fn wakes_after_all_keys() {
+async fn waits_for_keys() {
     let (_dir, storage) = temp_storage();
     let (job_id, token) = claimed_job(&storage, 5).await;
     let (first, second) = (wait("a", 8), wait("b", 9));
@@ -111,7 +111,7 @@ async fn wakes_after_all_keys() {
     assert_eq!(record.state, JobState::Queued);
     assert_eq!(record.due_at_ms, 5_000);
     assert_eq!(record.attempts, 0);
-    assert!(rows(&storage, JOB_KEY_WAIT_KEYSPACE).await.is_empty());
+    assert!(rows(&storage, KEY_WAIT_KEYSPACE).await.is_empty());
     assert_eq!(rows(&storage, SCHEDULE_INDEX_KEYSPACE).await.len(), 1);
 }
 
@@ -130,7 +130,7 @@ async fn wake_pages_bounded() {
         wake_key_waits(&storage, shared.key, 4_000).await.unwrap(),
         3
     );
-    assert!(rows(&storage, JOB_KEY_WAIT_KEYSPACE).await.is_empty());
+    assert!(rows(&storage, KEY_WAIT_KEYSPACE).await.is_empty());
 }
 
 #[tokio::test]
@@ -148,7 +148,7 @@ async fn cancel_parked_job() {
     assert!(read_key_waits(&storage, job_id).await.unwrap().is_empty());
     // The leftover wake row is dropped without reviving the job.
     assert_eq!(wake_key_waits(&storage, key.key, 5_000).await.unwrap(), 0);
-    assert!(rows(&storage, JOB_KEY_WAIT_KEYSPACE).await.is_empty());
+    assert!(rows(&storage, KEY_WAIT_KEYSPACE).await.is_empty());
     let record = read_job_record(&storage, job_id, None)
         .await
         .unwrap()
@@ -180,11 +180,11 @@ async fn cancel_requeues_ran() {
 }
 
 #[tokio::test]
-async fn cancel_wins_over_park() {
+async fn cancellation_beats_parking() {
     let (_dir, storage) = temp_storage();
     let (job_id, token) = claimed_job(&storage, 5).await;
     set_cancel_requested(&storage, job_id, 2_500).await.unwrap();
     let outcome = park_job(&storage, job_id, token, 3_000, vec![wait("a", 8)]).await;
     assert!(matches!(outcome, Ok(AwaitOutcome::Skipped)));
-    assert!(rows(&storage, JOB_KEY_WAIT_KEYSPACE).await.is_empty());
+    assert!(rows(&storage, KEY_WAIT_KEYSPACE).await.is_empty());
 }

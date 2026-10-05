@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
+use crate::s3::bucket::key::rows::{SettingsError, authority_read, parse_authority};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -251,7 +251,7 @@ mod tests {
             placement_policy_generation: 0,
             compression: Compression::Off,
         };
-        crate::s3::bucket::key_rows::authority_rows(&info, Some(settings), admins)
+        crate::s3::bucket::key::rows::authority_rows(&info, Some(settings), admins)
     }
 
     fn run(max_unlock_ms: Option<u64>, expected: u64) -> (UnlockLimitOperation, Effects) {

@@ -2292,7 +2292,7 @@ async fn locked_remote_export() {
 }
 
 #[tokio::test]
-async fn plain_remote_export_parks() {
+async fn plaintext_export_parks() {
     // The remote copy is not converted yet; its encrypting bucket's locked key parks the export.
     let realm_id = RealmId::from_bytes([131; 32]);
     let owner = UserId::local(Ulid::from_bytes([132; 16]), realm_id);

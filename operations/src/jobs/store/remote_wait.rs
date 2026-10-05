@@ -69,11 +69,7 @@ pub async fn register_remote_wait(
     let value = postcard::to_allocvec(auth).map_err(|error| error.to_string())?;
     batch_write(
         storage,
-        vec![(
-            JOB_KEY_WAIT_KEYSPACE.to_string(),
-            row,
-            ByteView::from(value),
-        )],
+        vec![(KEY_WAIT_KEYSPACE.to_string(), row, ByteView::from(value))],
         None,
     )
     .await
@@ -92,7 +88,7 @@ pub async fn queue_remote_wakes(
             .map_err(JobMutationError::Storage)?;
         let page = iter_prefix_page(
             storage,
-            JOB_KEY_WAIT_KEYSPACE,
+            KEY_WAIT_KEYSPACE,
             Some(prefix.clone()),
             None,
             WAKE_PAGE,
@@ -116,9 +112,9 @@ pub async fn queue_remote_wakes(
             });
             if let Some((waiter, job_id)) = parsed {
                 let owed = delivery_key(waiter, job_id, key);
-                writes.push((JOB_KEY_WAIT_KEYSPACE.to_string(), owed, value.clone()));
+                writes.push((KEY_WAIT_KEYSPACE.to_string(), owed, value.clone()));
             }
-            deletes.push((JOB_KEY_WAIT_KEYSPACE.to_string(), row.clone()));
+            deletes.push((KEY_WAIT_KEYSPACE.to_string(), row.clone()));
         }
         let written = match batch_write(storage, writes, Some(txn_id)).await {
             Ok(()) => batch_delete(storage, deletes, Some(txn_id)).await,
@@ -147,7 +143,7 @@ pub async fn owed_wakes(
     let prefix = ByteView::from(vec![DELIVERY_PREFIX]);
     let (rows, _) = iter_prefix_page(
         storage,
-        JOB_KEY_WAIT_KEYSPACE,
+        KEY_WAIT_KEYSPACE,
         Some(prefix),
         start_after,
         WAKE_PAGE,
@@ -181,12 +177,7 @@ pub async fn ack_wake(
     key: BucketKeyRef,
 ) -> Result<(), String> {
     let row = delivery_key(waiter, job_id, key);
-    batch_delete(
-        storage,
-        vec![(JOB_KEY_WAIT_KEYSPACE.to_string(), row)],
-        None,
-    )
-    .await
+    batch_delete(storage, vec![(KEY_WAIT_KEYSPACE.to_string(), row)], None).await
 }
 
 #[cfg(test)]
@@ -196,7 +187,7 @@ mod tests {
     use aruna_storage::FjallStorage;
 
     #[tokio::test]
-    async fn wake_owed_until_ack() {
+    async fn wake_until_acknowledged() {
         let dir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let waiter = iroh::SecretKey::from_bytes(&[2; 32]).public();

@@ -120,7 +120,7 @@ pub const TRANSITION_QUEUE_KEYSPACE: &str = "encryption_transition_queue";
 /// Old copies a transition still waits to see removed, keyed by bucket and location key.
 pub const TRANSITION_CLEANUP_KEYSPACE: &str = "encryption_transition_cleanups";
 /// Bucket keys parked jobs wait for: per-job lists and a wake index by key reference.
-pub const JOB_KEY_WAIT_KEYSPACE: &str = "job_key_waits";
+pub const KEY_WAIT_KEYSPACE: &str = "job_key_waits";
 /// When each pending archive was first seen without owners, keyed by archive.
 pub const PENDING_RECLAIM_KEYSPACE: &str = "pending_reclaims";
 /// The weakened recovery each encrypted bucket's holders were last told about, by bucket id.
@@ -487,7 +487,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     TRANSITION_KEYSPACE,
     TRANSITION_QUEUE_KEYSPACE,
     TRANSITION_CLEANUP_KEYSPACE,
-    JOB_KEY_WAIT_KEYSPACE,
+    KEY_WAIT_KEYSPACE,
     PENDING_RECLAIM_KEYSPACE,
     BUCKET_RECOVERY_KEYSPACE,
 ];
