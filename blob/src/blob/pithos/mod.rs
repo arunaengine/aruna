@@ -5,6 +5,7 @@
 
 mod hash;
 pub(in crate::blob) mod parts;
+mod regrant;
 mod rewrite;
 
 use super::BlobHandler;

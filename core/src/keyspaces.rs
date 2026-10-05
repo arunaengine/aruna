@@ -125,6 +125,12 @@ pub const KEY_WAIT_KEYSPACE: &str = "job_key_waits";
 pub const PENDING_RECLAIM_KEYSPACE: &str = "pending_reclaims";
 /// The weakened recovery each encrypted bucket's holders were last told about, by bucket id.
 pub const BUCKET_RECOVERY_KEYSPACE: &str = "bucket_recovery";
+/// The content hash a sender claimed for a received pending archive, keyed by archive.
+pub const PENDING_CLAIM_KEYSPACE: &str = "pending_claims";
+/// Replication jobs waiting for a locked source key, keyed by key reference and job key.
+pub const COPY_WAIT_KEYSPACE: &str = "replication_key_waits";
+/// Plaintext copy requests of encrypted sources, keyed by job key or relationship id.
+pub const PLAINTEXT_COPY_KEYSPACE: &str = "replication_plaintext";
 /// Durable evidence of a copy that failed hash/bao verification (§8.2), keyed
 /// per (hash, backend) so re-hitting the same corrupt copy overwrites its row.
 pub const BLOB_QUARANTINE_KEYSPACE: &str = "blob_quarantine";
@@ -490,6 +496,9 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     KEY_WAIT_KEYSPACE,
     PENDING_RECLAIM_KEYSPACE,
     BUCKET_RECOVERY_KEYSPACE,
+    PENDING_CLAIM_KEYSPACE,
+    COPY_WAIT_KEYSPACE,
+    PLAINTEXT_COPY_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

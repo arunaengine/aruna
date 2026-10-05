@@ -111,6 +111,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::ReadSealed { .. } => (EffectClass::Read, "read_sealed"),
         BlobEffect::ServeSealedRead { .. } => (EffectClass::Transfer, "serve_sealed_read"),
         BlobEffect::ReserveCompose { .. } => (EffectClass::Local, "reserve_compose"),
+        BlobEffect::ReplicateLeased { .. } => (EffectClass::Transfer, "replicate_leased"),
     }
 }
 
@@ -134,6 +135,7 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::RewriteCopy { .. }
             | BlobEffect::WritePiece { .. }
             | BlobEffect::ComposePieces { .. }
+            | BlobEffect::ReplicateLeased { .. }
     )
 }
 
@@ -902,6 +904,17 @@ impl BlobHandler {
                 size,
                 expected_blake3,
             } => Box::pin(self.receive_read(stream_id, size, expected_blake3)).await,
+            BlobEffect::ReplicateLeased {
+                replication_id,
+                stream_id,
+                location,
+                lease,
+                regrant,
+            } => {
+                let ids = (replication_id, stream_id);
+                let regrant = regrant.map(|plan| *plan);
+                Box::pin(self.replicate_leased(ids, location, *lease, regrant)).await
+            }
         }
     }
 

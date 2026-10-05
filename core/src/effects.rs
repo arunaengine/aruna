@@ -286,7 +286,7 @@ pub enum BlobEffect {
         lease: Box<ReadLease>,
     },
     /// Serves the plaintext of `location`, a copy of an encrypting bucket, to an authorized
-    /// remote reader under `lease`. Replication of sealed copies stays refused.
+    /// remote reader under `lease`. Replication sends through `ReplicateLeased`.
     ServeSealedRead {
         stream_id: Ulid,
         location: BackendLocation,
@@ -297,6 +297,16 @@ pub enum BlobEffect {
     /// are loaded. Answers `ComposeReserved`.
     ReserveCompose {
         content: u64,
+    },
+    /// Sends the copy at `location` of an encrypting bucket under `lease`, which covers the
+    /// transfer. A sealed copy with `regrant` is granted to that key and sent as stored bytes;
+    /// otherwise the plaintext is sent. Answers `ReplicationFinished`.
+    ReplicateLeased {
+        replication_id: Ulid,
+        stream_id: Ulid,
+        location: BackendLocation,
+        lease: Box<ReadLease>,
+        regrant: Option<Box<crate::structs::storage::encryption::SealPlan>>,
     },
 }
 

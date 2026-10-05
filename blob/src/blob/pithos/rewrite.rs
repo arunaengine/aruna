@@ -47,10 +47,10 @@ impl<S: Stream> Stream for Exclusive<S> {
 }
 
 /// The stored bytes of one archive, served to the Pithos reader by range.
-struct StoredBytes {
-    operator: Operator,
-    path: String,
-    idle: Duration,
+pub(super) struct StoredBytes {
+    pub(super) operator: Operator,
+    pub(super) path: String,
+    pub(super) idle: Duration,
 }
 
 impl AsyncArchiveSource for StoredBytes {
