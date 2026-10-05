@@ -327,13 +327,12 @@ fn advance_version_lookup(op: &mut IncomingVersionOperation, group_id: Ulid) -> 
     assert_eq!(op.state, IncomingVersionState::ReadDestinationBucket);
     assert!(matches!(
         effects[0],
-        Effect::Storage(StorageEffect::Read { .. })
+        Effect::Storage(StorageEffect::BatchRead { .. })
     ));
 
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
-    }));
+    op.step(bucket_read(Some(
+        make_bucket_info(group_id).to_bytes().unwrap().into(),
+    )));
     let mut effects = load_routing(op, GroupRoutingInputs::default());
     assert_eq!(op.state, IncomingVersionState::ReadExistingVersion);
     assert_eq!(effects.len(), 1);
@@ -373,7 +372,21 @@ fn advance_blob_lookup(op: &mut IncomingVersionOperation) -> aruna_core::types::
 /// and an absent subject, which an ungoverned replica passes.
 fn no_drift() -> Event {
     Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![(vec![0u8; 4].into(), None), (vec![1u8; 4].into(), None)],
+        values: vec![
+            (vec![0u8; 4].into(), None),
+            (vec![1u8; 4].into(), None),
+            (vec![2u8; 4].into(), None),
+        ],
+    })
+}
+
+/// The destination bucket read with no encryption settings row.
+fn bucket_read(bucket: Option<aruna_core::types::Value>) -> Event {
+    Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (b"bucket".to_vec().into(), bucket),
+            (b"bucket".to_vec().into(), None),
+        ],
     })
 }
 
@@ -387,6 +400,7 @@ fn bucket_drift(bucket_info: &BucketInfo) -> Event {
                 Some(bucket_info.to_bytes().unwrap().into()),
             ),
             (vec![1u8; 4].into(), None),
+            (vec![2u8; 4].into(), None),
         ],
     })
 }
@@ -421,7 +435,11 @@ fn start_apply_with(
     // The apply transaction re-reads the destination default and the local
     // subject before it exposes anything.
     let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![(vec![0u8; 4].into(), bucket), (vec![1u8; 4].into(), None)],
+        values: vec![
+            (vec![0u8; 4].into(), bucket),
+            (vec![1u8; 4].into(), None),
+            (vec![2u8; 4].into(), None),
+        ],
     }));
     assert_eq!(op.state, IncomingVersionState::VerifyReplaced);
     assert!(matches!(
@@ -754,10 +772,7 @@ fn advance_needs_bucket() {
     op.manifest_policy = Some(op.target_authorization_path(test_group_id()));
 
     op.start();
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: None,
-    }));
+    let effects = op.step(bucket_read(None));
 
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert!(!op.create_attempted);
@@ -1986,10 +2001,7 @@ fn probe_backend(
     op.writer_policy = Some(op.target_authorization_path(bucket_info.group_id));
 
     op.start();
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: Some(bucket_info.to_bytes().unwrap().into()),
-    }));
+    op.step(bucket_read(Some(bucket_info.to_bytes().unwrap().into())));
     load_routing(&mut op, inputs);
     let effects = advance_blob_lookup(&mut op);
     (op, effects)
@@ -2193,19 +2205,13 @@ fn unbuildable_bucket_rejects() {
     op.writer_policy = Some(op.target_authorization_path(test_group_id()));
 
     op.start();
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: None,
-    }));
+    op.step(bucket_read(None));
     assert_eq!(op.state, IncomingVersionState::CreateDestinationBucket);
     op.step(Event::SubOperation(SubOperationEvent::BucketCreated {
         result: Err("boom".to_string()),
     }));
 
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: None,
-    }));
+    let effects = op.step(bucket_read(None));
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
         &effects[0],
@@ -2240,10 +2246,9 @@ fn rejects_denied_writer() {
     op.manifest_policy = Some(op.target_authorization_path(group_id));
 
     op.start();
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
-    }));
+    op.step(bucket_read(Some(
+        make_bucket_info(group_id).to_bytes().unwrap().into(),
+    )));
     let effects = load_routing(&mut op, GroupRoutingInputs::default());
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
@@ -2275,10 +2280,9 @@ fn rejects_missing_policy() {
     op.manifest_policy = Some(op.target_authorization_path(group_id));
 
     op.start();
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
-    }));
+    op.step(bucket_read(Some(
+        make_bucket_info(group_id).to_bytes().unwrap().into(),
+    )));
     let effects = load_routing(&mut op, GroupRoutingInputs::default());
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
@@ -2300,10 +2304,9 @@ fn rejects_manifest_policy() {
     .with_manifest_policy(None);
     let group_id = Ulid::from_parts(68, 68);
     op.start();
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
-    }));
+    op.step(bucket_read(Some(
+        make_bucket_info(group_id).to_bytes().unwrap().into(),
+    )));
     let effects = load_routing(&mut op, GroupRoutingInputs::default());
     expect_rejected_negotiation(
         &effects[0],
@@ -2777,10 +2780,7 @@ fn missing_bucket_op() -> IncomingVersionOperation {
     op.manifest_policy = Some(op.target_authorization_path(test_group_id()));
     op.writer_policy = Some(op.target_authorization_path(test_group_id()));
     op.start();
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: None,
-    }));
+    op.step(bucket_read(None));
     op
 }
 
@@ -2804,8 +2804,8 @@ fn autocreate_rereads_bucket() {
     assert_eq!(op.state, IncomingVersionState::ReadDestinationBucket);
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })]
-            if key_space == S3_BUCKET_KEYSPACE
+        [Effect::Storage(StorageEffect::BatchRead { reads, .. })]
+            if reads[0].0 == S3_BUCKET_KEYSPACE
     ));
 }
 
@@ -2843,13 +2843,12 @@ fn materialized_trace() {
     assert_eq!(op.state, IncomingVersionState::ReadDestinationBucket);
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { .. })]
+        [Effect::Storage(StorageEffect::BatchRead { .. })]
     ));
 
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
-    }));
+    let effects = op.step(bucket_read(Some(
+        make_bucket_info(group_id).to_bytes().unwrap().into(),
+    )));
     assert_eq!(op.state, IncomingVersionState::LoadDestinationRouting);
     assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
 
@@ -3032,10 +3031,9 @@ fn delete_marker_trace() {
     op.writer_policy = Some(op.target_authorization_path(group_id));
 
     op.start();
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
-    }));
+    op.step(bucket_read(Some(
+        make_bucket_info(group_id).to_bytes().unwrap().into(),
+    )));
     op.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
         result: Ok(GroupRoutingInputs::default()),
     }));
@@ -3129,10 +3127,9 @@ fn rejected_trace() {
     op.writer_policy = Some("/other/path".to_string());
 
     op.start();
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
-    }));
+    op.step(bucket_read(Some(
+        make_bucket_info(group_id).to_bytes().unwrap().into(),
+    )));
     let effects = op.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
         result: Ok(GroupRoutingInputs::default()),
     }));
@@ -3275,4 +3272,82 @@ fn stale_encoding_rejects() {
             aruna_core::errors::StorageError::TransactionConflict
         )))
     ));
+}
+
+#[test]
+fn encrypted_destination_refused() {
+    // An encrypting bucket refuses a replica before any byte arrives.
+    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+    let group_id = test_group_id();
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(94, 94),
+        iroh::SecretKey::from_bytes(&[94; 32]).public(),
+        test_realm_id(),
+        make_manifest(ReplicationItemKind::Materialized),
+    );
+    op.manifest_policy = Some(op.target_authorization_path(group_id));
+    op.writer_policy = Some(op.target_authorization_path(group_id));
+    op.start();
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(Ulid::from_parts(95, 95)),
+        key_generation: 1,
+        ..Default::default()
+    };
+    let bucket = make_bucket_info(group_id).to_bytes().unwrap();
+    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (b"bucket".to_vec().into(), Some(bucket.into())),
+            (
+                b"bucket".to_vec().into(),
+                Some(settings.to_bytes().unwrap().into()),
+            ),
+        ],
+    }));
+
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
+    expect_rejected_negotiation(
+        &effects[0],
+        &IncomingVersionError::EncryptedDestination.to_string(),
+    );
+}
+
+#[test]
+fn encrypted_publication_refused() {
+    // Encryption enabled after the negotiation still refuses the replica at publication.
+    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(96, 96),
+        iroh::SecretKey::from_bytes(&[96; 32]).public(),
+        test_realm_id(),
+        make_manifest(ReplicationItemKind::Materialized),
+    );
+    op.state = IncomingVersionState::CheckDrift;
+    op.txn_id = Some(Ulid::from_parts(97, 97));
+    op.existing_blob_location = Some(make_location());
+    let settings = BucketEncryption {
+        mode: EncryptionMode::VaultLocked,
+        bucket_id: Some(Ulid::from_parts(98, 98)),
+        key_generation: 1,
+        ..Default::default()
+    };
+    let bucket = make_bucket_info(Ulid::from_parts(93, 93))
+        .to_bytes()
+        .unwrap();
+    op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (vec![0u8; 4].into(), Some(bucket.into())),
+            (vec![1u8; 4].into(), None),
+            (
+                vec![2u8; 4].into(),
+                Some(settings.to_bytes().unwrap().into()),
+            ),
+        ],
+    }));
+
+    assert_eq!(op.state, IncomingVersionState::Error);
+    assert_eq!(
+        op.output,
+        Some(Err(IncomingVersionError::EncryptedDestination))
+    );
 }
