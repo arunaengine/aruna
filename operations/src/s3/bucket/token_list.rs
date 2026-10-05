@@ -181,3 +181,97 @@ impl Operation for ListTokensOperation {
         smallvec![]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::drive;
+    use crate::tests::s3::{test_context, test_storage};
+    use aruna_core::UserId;
+    use aruna_core::credential_encryption::EncryptedS3Secret;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::encryption::{BucketKeyRef, SealedCopy};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn lists_bucket_tokens() {
+        let (_dir, storage) = test_storage();
+        let context = test_context(storage.clone());
+        let user = UserId::new(Ulid::from_bytes([5; 16]), RealmId::from_bytes([1; 32]));
+        let bucket_id = Ulid::from_bytes([4; 16]);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let copy = |access_key: &str, bucket_id: Ulid, generation: u64| TokenCopy {
+            key: BucketKeyRef::new(bucket_id, generation),
+            access_key: access_key.to_string(),
+            created_by: user,
+            nonce: [0; 12],
+            ciphertext: vec![0; 48],
+            created_at_ms: 1,
+        };
+        let listed = [
+            copy("ACTIVE", bucket_id, 1),
+            copy("ACTIVE", bucket_id, 2),
+            copy("REVOKED", bucket_id, 2),
+        ];
+        let elsewhere = copy("ACTIVE", Ulid::from_bytes([6; 16]), 1);
+        let holder = SealedCopy {
+            key: BucketKeyRef::new(bucket_id, 2),
+            user_id: user,
+            key_record: Ulid::from_bytes([7; 16]),
+            key_id: "slot".to_string(),
+            enc: [0; 32],
+            ciphertext: vec![0; 48],
+            created_at_ms: 1,
+        };
+        let mut writes: Vec<_> = listed
+            .iter()
+            .chain([&elsewhere])
+            .map(|copy| (copy.key(), copy.to_bytes().unwrap()))
+            .collect();
+        writes.push((holder.key(), holder.to_bytes().unwrap()));
+        let access = |access_key: &str, revoked_at| UserAccess {
+            access_key: access_key.to_string(),
+            user_identity: user,
+            group_id: Ulid::from_bytes([3; 16]),
+            secret: EncryptedS3Secret::empty(),
+            expiry: now + Duration::from_secs(60),
+            path_restrictions: None,
+            issued_by: [0; 32],
+            revoked_at,
+        };
+        let credentials = [access("ACTIVE", None), access("REVOKED", Some(now))];
+        for (key_space, key, value) in writes
+            .into_iter()
+            .map(|(key, value)| (KEY_COPY_KEYSPACE, key, value))
+            .chain(credentials.iter().map(|access| {
+                let key = access.access_key.as_bytes().to_vec();
+                (USER_ACCESS_KEYSPACE, key, access.to_bytes().unwrap())
+            }))
+        {
+            let write = StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            };
+            storage.send_storage_effect(write).await;
+        }
+
+        let entries = drive(ListTokensOperation::new(bucket_id, now), &context)
+            .await
+            .unwrap();
+        // Every generation's copy of this bucket, never a holder copy or another bucket's.
+        let found: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.copy.clone(), entry.credential_active))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (listed[0].clone(), true),
+                (listed[1].clone(), true),
+                (listed[2].clone(), false),
+            ]
+        );
+    }
+}

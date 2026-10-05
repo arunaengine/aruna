@@ -13,7 +13,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::encryption::{
-    BlockCipher, BlockKeys, BucketKeyError, EncryptionMode, KeyState, UnlockStatus,
+    BlockCipher, BlockKeys, BucketKeyError, BucketKeyRef, EncryptionMode, KeyState, UnlockStatus,
 };
 use aruna_core::structs::storage::holders::{
     HolderReport, HolderState, Recovery, RecoveryState, resolve_holders,
@@ -35,7 +35,7 @@ use aruna_operations::s3::bucket::key_rows::SettingsError;
 use aruna_operations::s3::bucket::rotate::{
     ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
 };
-use aruna_operations::s3::bucket::token_list::ListTokensOperation;
+use aruna_operations::s3::bucket::token_list::{ListTokensOperation, TokenEntry};
 use aruna_operations::s3::key_status::{KeySnapshot, KeyStatusError, KeyStatusOperation};
 use aruna_operations::s3::unlock_limit::{
     UnlockLimitError, UnlockLimitInput, UnlockLimitOperation,
@@ -317,15 +317,20 @@ pub async fn list_bucket_tokens(
     let active = snapshot.settings.active_key();
     let tokens = entries
         .into_iter()
-        .map(|entry| TokenView {
-            access_key_id: entry.copy.access_key,
-            user_id: entry.copy.created_by.to_string(),
-            created_at: rfc3339(entry.copy.created_at_ms),
-            generation: entry.copy.key.generation,
-            stale: Some(entry.copy.key) != active || !entry.credential_active,
-        })
+        .map(|entry| token_view(entry, active))
         .collect();
     Ok(Json(TokenListView { tokens }))
+}
+
+/// A token copy is stale unless it is of the `active` generation and its credential still works.
+fn token_view(entry: TokenEntry, active: Option<BucketKeyRef>) -> TokenView {
+    TokenView {
+        stale: Some(entry.copy.key) != active || !entry.credential_active,
+        access_key_id: entry.copy.access_key,
+        user_id: entry.copy.created_by.to_string(),
+        created_at: rfc3339(entry.copy.created_at_ms),
+        generation: entry.copy.key.generation,
+    }
 }
 
 fn rfc3339(at_ms: u64) -> String {
@@ -1000,6 +1005,40 @@ pub(crate) fn enable_refusal(error: EnableError) -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_tokens_marked() {
+        use aruna_core::structs::storage::encryption::TokenCopy;
+        let bucket_id = Ulid::from_bytes([4; 16]);
+        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), RealmId::from_bytes([1; 32]));
+        let entry = |generation, credential_active| TokenEntry {
+            copy: TokenCopy {
+                key: BucketKeyRef::new(bucket_id, generation),
+                access_key: "TOKENKEY".to_string(),
+                created_by: user,
+                nonce: [0; 12],
+                ciphertext: vec![0; 48],
+                created_at_ms: 1_791_000_000_000,
+            },
+            credential_active,
+        };
+        let active = Some(BucketKeyRef::new(bucket_id, 2));
+        let view = token_view(entry(2, true), active);
+        assert_eq!(
+            view,
+            TokenView {
+                access_key_id: "TOKENKEY".to_string(),
+                user_id: user.to_string(),
+                created_at: "2026-10-03T04:00:00Z".to_string(),
+                generation: 2,
+                stale: false,
+            }
+        );
+        // A rotation, a revoked credential or a bucket that stopped encrypting leaves it stale.
+        assert!(token_view(entry(1, true), active).stale);
+        assert!(token_view(entry(2, false), active).stale);
+        assert!(token_view(entry(2, true), None).stale);
+    }
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::encryption::{
         BucketEncryption, BucketKeyRecord, BucketKeyRef,
