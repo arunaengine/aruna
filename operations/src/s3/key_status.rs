@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::DriverContext;
+use crate::s3::bucket::key_restart::Replay;
 use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
@@ -19,7 +20,7 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketHolder, BucketKeyRecord, SealedCopy, UnlockStatus,
 };
-use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
+use aruna_core::structs::storage::key_audit::{AuditAction, BucketAuditRecord};
 use aruna_core::structs::storage::transition::EncryptionTransition;
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use smallvec::smallvec;
@@ -87,6 +88,8 @@ pub struct KeyStatusOperation {
     group_id: GroupId,
     step: StatusStep,
     snapshot: KeySnapshot,
+    /// The audit trail read the same way as at restart, for the lock reasons.
+    replay: Replay,
     output: Option<Result<KeySnapshot, KeyStatusError>>,
 }
 
@@ -98,6 +101,7 @@ impl KeyStatusOperation {
             group_id,
             step: StatusStep::Init,
             snapshot: KeySnapshot::default(),
+            replay: Replay::default(),
             output: None,
         }
     }
@@ -164,19 +168,18 @@ impl KeyStatusOperation {
 
     fn take_page(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
         for (key, value) in values {
-            let parsed = match self.step {
-                StatusStep::Records => BucketKeyRecord::from_bytes(&value)
-                    .map(|record| self.snapshot.records.push(record)),
-                StatusStep::Grants => {
-                    BucketHolder::from_bytes(&value).map(|grant| self.snapshot.grants.push(grant))
-                }
-                StatusStep::Audit => {
-                    BucketAuditRecord::from_bytes(&value).map(|record| self.track_lock(&record))
-                }
-                // Only user copies; other copy kinds are not part of this stage.
-                _ if SealedCopy::parse_key(&key).is_err() => Ok(()),
-                _ => SealedCopy::from_bytes(&value).map(|copy| self.snapshot.copies.push(copy)),
-            };
+            let parsed =
+                match self.step {
+                    StatusStep::Records => BucketKeyRecord::from_bytes(&value)
+                        .map(|record| self.snapshot.records.push(record)),
+                    StatusStep::Grants => BucketHolder::from_bytes(&value)
+                        .map(|grant| self.snapshot.grants.push(grant)),
+                    StatusStep::Audit => BucketAuditRecord::from_bytes(&value)
+                        .map(|record| self.replay.apply(&record)),
+                    // Only user copies; other copy kinds are not part of this stage.
+                    _ if SealedCopy::parse_key(&key).is_err() => Ok(()),
+                    _ => SealedCopy::from_bytes(&value).map(|copy| self.snapshot.copies.push(copy)),
+                };
             if let Err(error) = parsed {
                 return self.fail(error);
             }
@@ -192,25 +195,9 @@ impl KeyStatusOperation {
         }
     }
 
-    /// The trail scans in time order, so a later applied unlock clears an earlier lock.
-    fn track_lock(&mut self, record: &BucketAuditRecord) {
-        let (Some(generation), AuditOutcome::Applied) = (record.generation, record.outcome) else {
-            return;
-        };
-        match record.action {
-            AuditAction::Lock | AuditAction::TimedLock | AuditAction::RestartLock => {
-                self.snapshot
-                    .locks
-                    .insert(generation, (record.action, record.at_ms));
-            }
-            AuditAction::Unlock => {
-                self.snapshot.locks.remove(&generation);
-            }
-            _ => {}
-        }
-    }
-
+    /// Outcomes pair with their intents, so a failed unlock keeps the lock reason it replaced.
     fn read_unlocks(&mut self) -> Effects {
+        self.snapshot.locks = self.replay.locks();
         let Some(bucket_id) = self.bucket_id() else {
             return self.fail(KeyStatusError::NotFinished);
         };
@@ -401,6 +388,7 @@ mod tests {
     use crate::s3::bucket::key_rows::authority_rows;
     use aruna_core::structs::storage::encryption::{BucketKeyRef, EncryptionMode};
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::key_audit::AuditOutcome;
     use aruna_core::structs::storage::transition::{TransitionKind, TransitionTarget};
     use std::time::SystemTime;
 
@@ -562,6 +550,68 @@ mod tests {
             (1, (AuditAction::RestartLock, 1)),
             (3, (AuditAction::TimedLock, 4)),
         ]);
+        assert_eq!(snapshot.locks, locks);
+    }
+
+    #[test]
+    fn failed_outcomes_keep_reason() {
+        let mut operation = operation();
+        operation.start();
+        let settings = BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(BUCKET_ID),
+            key_generation: 1,
+            ..Default::default()
+        };
+        let rows = authority_rows(&info(), Some(&settings), &[]);
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: rows,
+        }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(Vec::new()),
+            value: None,
+        }));
+        for _ in 0..3 {
+            operation.step(iter(Vec::new(), None));
+        }
+        // Every record shares one millisecond; storage returns them sorted by key.
+        let mut trail = Vec::new();
+        let mut add = |action, session: u8, outcome, intent_id| {
+            let record = BucketAuditRecord {
+                event_id: Ulid::from_parts(4, (1 << 64) + trail.len() as u128),
+                bucket_id: BUCKET_ID,
+                at_ms: 4,
+                action,
+                actor: None,
+                node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+                generation: Some(1),
+                session_id: Some(Ulid::from_bytes([session; 16])),
+                intent_id,
+                deadline_ms: None,
+                reason: None,
+                outcome,
+            };
+            trail.push(record.clone());
+            record.event_id
+        };
+        add(AuditAction::Unlock, 1, AuditOutcome::Applied, None);
+        add(AuditAction::TimedLock, 1, AuditOutcome::Applied, None);
+        // A later unlock and an extension both fail: the timed lock stays the reason.
+        let unlock = add(AuditAction::Unlock, 2, AuditOutcome::Intent, None);
+        add(AuditAction::Unlock, 2, AuditOutcome::Failed, Some(unlock));
+        let extend = add(AuditAction::Extend, 1, AuditOutcome::Intent, None);
+        add(AuditAction::Extend, 1, AuditOutcome::Failed, Some(extend));
+        trail.sort_by_key(BucketAuditRecord::key);
+        let rows = trail
+            .iter()
+            .map(|record| record.to_bytes().unwrap())
+            .collect();
+        operation.step(iter(rows, None));
+        operation.step(Event::Blob(BlobEvent::KeyStatus {
+            generations: Vec::new(),
+        }));
+        let snapshot = operation.finalize().unwrap();
+        let locks = BTreeMap::from([(1, (AuditAction::TimedLock, 4))]);
         assert_eq!(snapshot.locks, locks);
     }
 

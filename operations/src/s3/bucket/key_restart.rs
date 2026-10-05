@@ -74,13 +74,19 @@ struct Session {
 struct Pending {
     session: Option<Ulid>,
     before: Option<Session>,
+    /// The lock reason the intent cleared, restored with the session.
+    lock: Option<Lock>,
 }
+
+/// The action and time of the lock that ended a generation's last session.
+pub(crate) type Lock = (AuditAction, u64);
 
 /// The unlock state of one generation.
 #[derive(Debug, Default, PartialEq)]
 struct Trail {
     open: Option<Session>,
     intents: BTreeMap<Ulid, Pending>,
+    lock: Option<Lock>,
 }
 
 /// A record without a session applies to every session of its generation.
@@ -126,32 +132,37 @@ impl Replay {
         let pending = record.intent_id.and_then(|id| trail.intents.remove(&id));
         match (record.action, record.outcome) {
             (AuditAction::Unlock, AuditOutcome::Intent) => {
-                let before = trail.open;
-                trail
-                    .intents
-                    .insert(record.event_id, Pending { session, before });
+                let (before, lock) = (trail.open, trail.lock.take());
+                let pending = Pending {
+                    session,
+                    before,
+                    lock,
+                };
+                trail.intents.insert(record.event_id, pending);
                 trail.open = Some(current);
             }
             // A confirmed unlock never replaces a newer session's intent.
             (AuditAction::Unlock, AuditOutcome::Applied) => {
                 if pending.is_none() || trail.opens(session) {
-                    trail.open = Some(current);
+                    (trail.open, trail.lock) = (Some(current), None);
                 }
             }
             (AuditAction::Unlock, AuditOutcome::Failed) => {
                 if let Some(pending) = pending {
                     if trail.opens(pending.session) {
-                        trail.open = pending.before;
+                        (trail.open, trail.lock) = (pending.before, pending.lock);
                     }
                     trail.forget(pending.session, pending.before);
                 }
             }
             // An extension only moves the deadline of the session it names.
             (AuditAction::Extend, AuditOutcome::Intent) if trail.opens(session) => {
-                let before = trail.open;
-                trail
-                    .intents
-                    .insert(record.event_id, Pending { session, before });
+                let pending = Pending {
+                    session,
+                    before: trail.open,
+                    lock: trail.lock,
+                };
+                trail.intents.insert(record.event_id, pending);
                 trail.open = Some(current);
             }
             (AuditAction::Extend, AuditOutcome::Applied) if trail.opens(session) => {
@@ -165,17 +176,24 @@ impl Replay {
             }
             // A delayed lock of an older session leaves a newer session unlocked.
             (AuditAction::Lock | AuditAction::TimedLock, AuditOutcome::Applied)
-                if trail.opens(session) =>
+                if trail.open.is_none() || trail.opens(session) =>
             {
-                trail.open = None;
+                (trail.open, trail.lock) = (None, Some((record.action, record.at_ms)));
                 trail.forget(session, None);
             }
             (AuditAction::RestartLock, AuditOutcome::Applied) => {
-                trail.open = None;
+                (trail.open, trail.lock) = (None, Some((record.action, record.at_ms)));
                 trail.intents.clear();
             }
             _ => {}
         }
+    }
+
+    /// The lock that ended each generation's last session, for the generations it applies to.
+    pub(crate) fn locks(&self) -> BTreeMap<u64, Lock> {
+        (self.trails.iter())
+            .filter_map(|(generation, trail)| trail.lock.map(|lock| (*generation, lock)))
+            .collect()
     }
 
     /// The generations still unlocked at `now_ms`.
