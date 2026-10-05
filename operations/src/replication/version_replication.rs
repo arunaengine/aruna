@@ -2837,7 +2837,7 @@ impl ReplicateObjectOperation {
         match event {
             Event::Blob(BlobEvent::ReadAdmitted { .. }) => {
                 self.state = ReplicateObjectState::SchedulePromotion;
-                smallvec![Effect::Task(TaskEffect::ResetTimer {
+                smallvec![Effect::Task(TaskEffect::ShortenTimer {
                     key: TaskKey::PromotePending {
                         bucket_id: key.bucket_id,
                         generation: key.generation,

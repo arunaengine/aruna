@@ -61,7 +61,7 @@ use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, NodeRouting, RoutingError, StorageRoutingRule, resolve_backend,
 };
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::task::TaskEvent;
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use std::collections::VecDeque;
@@ -116,6 +116,8 @@ enum IncomingVersionState {
     ReleaseReservation,
     ScheduleUsage,
     ScheduleLiveDrain,
+    /// Hashes a pending replica at once when its key is already unlocked here.
+    SchedulePromotion,
     SendApplyRejected,
     AbortTransaction,
     CleanupReceivedBlob,
@@ -559,6 +561,7 @@ impl Operation for IncomingVersionOperation {
             IncomingVersionState::ReleaseReservation => self.accept_reservation_release(event),
             IncomingVersionState::ScheduleUsage => self.accept_usage_schedule(event),
             IncomingVersionState::ScheduleLiveDrain => self.accept_live_drain(event),
+            IncomingVersionState::SchedulePromotion => self.accept_promotion_scheduled(event),
             IncomingVersionState::RegisterBlobDht => self.accept_blob_registration(event),
             IncomingVersionState::SendApplyComplete => self.accept_completion_sent(event),
             // Cleanup: reject, abort, delete and close.
@@ -672,6 +675,7 @@ impl IncomingVersionOperation {
             IncomingVersionState::ReleaseReservation => "ReleaseReservation",
             IncomingVersionState::ScheduleUsage => "ScheduleUsage",
             IncomingVersionState::ScheduleLiveDrain => "ScheduleLiveDrain",
+            IncomingVersionState::SchedulePromotion => "SchedulePromotion",
             IncomingVersionState::SendApplyRejected => "SendApplyRejected",
             IncomingVersionState::AbortTransaction => "AbortTransaction",
             IncomingVersionState::CleanupReceivedBlob => "CleanupReceivedBlob",
@@ -2174,9 +2178,34 @@ impl IncomingVersionOperation {
 
     fn finish_live_drain(&mut self) -> Effects {
         match self.manifest.kind {
+            ReplicationItemKind::Materialized if self.pending_replica() => {
+                self.schedule_promotion()
+            }
             ReplicationItemKind::Materialized => self.register_blob_dht(),
             ReplicationItemKind::DeleteMarker => self.send_apply_complete(),
         }
+    }
+
+    /// A pending replica registers nothing here; its promotion does once the key is usable.
+    fn schedule_promotion(&mut self) -> Effects {
+        let Some(key) = self.seal_plan.map(|plan| plan.key) else {
+            return self.send_apply_complete();
+        };
+        self.state = IncomingVersionState::SchedulePromotion;
+        smallvec![Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::PromotePending {
+                bucket_id: key.bucket_id,
+                generation: key.generation,
+            },
+            after: std::time::Duration::ZERO,
+        })]
+    }
+
+    fn accept_promotion_scheduled(&mut self, event: Event) -> Effects {
+        if !matches!(event, Event::Task(_)) {
+            warn!(event = ?event, "Incoming replication committed but promotion scheduling returned an unexpected event");
+        }
+        self.send_apply_complete()
     }
 
     fn send_apply_complete(&mut self) -> Effects {
