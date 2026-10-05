@@ -248,14 +248,13 @@ impl ExtendBucketOperation {
             session_id: status.session_id,
         };
         let key = lock_timer(&ticket);
-        let effect = match status.remaining {
-            Some(after) => TaskEffect::ResetTimer { key, after },
-            // An unlock without a maximum lasts until lock or restart, so no timer runs.
-            None => TaskEffect::CancelTimer { key },
-        };
+        let remaining = status.remaining;
         self.status = Some(status);
+        let Some(after) = remaining else {
+            return self.audit();
+        };
         self.step = ExtendStep::MoveTimer;
-        smallvec![Effect::Task(effect)]
+        smallvec![Effect::Task(TaskEffect::ShortenTimer { key, after })]
     }
 
     fn audit(&mut self) -> Effects {
@@ -547,6 +546,79 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn reversed_extensions_shorten() {
+        use aruna_core::handle::Handle;
+        for remaining in [None, Some(Duration::from_secs(90))] {
+            let (mut first, _) = read(user(1));
+            let (mut second, _) = read(user(1));
+            first.step = ExtendStep::ExtendKey;
+            second.step = ExtendStep::ExtendKey;
+            let mut older = first.step(Event::Blob(BlobEvent::KeyExtended {
+                status: status(remaining),
+            }));
+            let mut newer = second.step(Event::Blob(BlobEvent::KeyExtended {
+                status: status(Some(Duration::from_secs(30))),
+            }));
+            let scheduler = aruna_tasks::TaskHandle::new();
+            let (sender, mut fired) = tokio::sync::mpsc::channel(2);
+            scheduler
+                .set_inbound_handler(std::sync::Arc::new(TimerSender(sender)))
+                .await;
+            let start = tokio::time::Instant::now();
+            second.step(scheduler.send_effect(newer.pop().unwrap()).await);
+            if remaining.is_some() {
+                first.step(scheduler.send_effect(older.pop().unwrap()).await);
+            } else {
+                assert!(matches!(
+                    older.as_slice(),
+                    [Effect::Storage(StorageEffect::Write { .. })]
+                ));
+            }
+            let ticket = KeyTicket {
+                key: status(None).key,
+                session_id: SESSION,
+            };
+            assert_eq!(fired.recv().await.unwrap(), lock_timer(&ticket));
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(30));
+            scheduler.shutdown(Duration::ZERO).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reversed_rearms_shorten() {
+        use crate::s3::bucket::key_lock::LockBucketOperation;
+        use aruna_core::handle::Handle;
+        let ticket = KeyTicket {
+            key: status(None).key,
+            session_id: SESSION,
+        };
+        let mut callback =
+            LockBucketOperation::timed(ticket, iroh::SecretKey::from_bytes(&[2; 32]).public());
+        callback.start();
+        let mut stale = callback.step(Event::Blob(BlobEvent::KeyLocked {
+            locked: Vec::new(),
+            sequence: Ulid::nil(),
+            live: Some(Box::new(status(Some(Duration::from_secs(90))))),
+        }));
+        let (mut extension, _) = read(user(1));
+        extension.step = ExtendStep::ExtendKey;
+        let mut newer = extension.step(Event::Blob(BlobEvent::KeyExtended {
+            status: status(Some(Duration::from_secs(30))),
+        }));
+        let scheduler = aruna_tasks::TaskHandle::new();
+        let (sender, mut fired) = tokio::sync::mpsc::channel(2);
+        scheduler
+            .set_inbound_handler(std::sync::Arc::new(TimerSender(sender)))
+            .await;
+        let start = tokio::time::Instant::now();
+        extension.step(scheduler.send_effect(newer.pop().unwrap()).await);
+        callback.step(scheduler.send_effect(stale.pop().unwrap()).await);
+        assert_eq!(fired.recv().await.unwrap(), lock_timer(&ticket));
+        assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(30));
+        scheduler.shutdown(Duration::ZERO).await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn reversed_timers_rearm() {
         use crate::s3::bucket::key_lock::LockBucketOperation;
         use aruna_core::handle::Handle;
@@ -635,7 +707,7 @@ mod tests {
             key: BucketKeyRef::new(BUCKET_ID, 2),
             session_id: SESSION,
         };
-        let reset = TaskEffect::ResetTimer {
+        let reset = TaskEffect::ShortenTimer {
             key: lock_timer(&ticket),
             after: Duration::from_secs(30),
         };

@@ -199,7 +199,7 @@ impl InstallKeyOperation {
         };
         self.activated = Some(status);
         self.state = InstallState::ArmTimer;
-        smallvec![Effect::Task(TaskEffect::ResetTimer {
+        smallvec![Effect::Task(TaskEffect::ShortenTimer {
             key: lock_timer(&ticket),
             after,
         })]
@@ -438,7 +438,7 @@ mod tests {
         }));
         // A timed session arms its lock timer, so the timed lock is recorded.
         let key = lock_timer(&ticket);
-        let arm = TaskEffect::ResetTimer {
+        let arm = TaskEffect::ShortenTimer {
             key: key.clone(),
             after: Duration::from_secs(60),
         };

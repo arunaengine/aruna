@@ -246,7 +246,7 @@ impl LockBucketOperation {
             return self.finish(true);
         };
         self.step = LockStep::RearmTimer;
-        smallvec![Effect::Task(TaskEffect::ResetTimer {
+        smallvec![Effect::Task(TaskEffect::ShortenTimer {
             key: lock_timer(&ticket),
             after
         })]
