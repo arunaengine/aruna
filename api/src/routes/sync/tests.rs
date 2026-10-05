@@ -126,6 +126,7 @@ fn create_request(target_node: NodeId) -> CreateSyncRequest {
         mode: ApiSyncMode::Once,
         reference_handling: ApiReferenceHandling::default(),
         replicate_deletes: false,
+        plaintext: false,
     }
 }
 
