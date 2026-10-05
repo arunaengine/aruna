@@ -95,13 +95,26 @@ fn same(left: Option<Ulid>, right: Option<Ulid>) -> bool {
 
 impl Trail {
     fn current(&self) -> (Option<Session>, Option<Lock>) {
-        let (mut open, mut lock) = (self.open, self.lock);
-        for (id, pending) in &self.intents {
-            if self.sequence.is_none_or(|sequence| *id > sequence) {
-                pending.apply(&mut open, &mut lock);
-            }
-        }
-        (open, lock)
+        let candidates = self.open.into_iter().chain(
+            self.intents
+                .values()
+                .filter(|pending| pending.action == AuditAction::Unlock)
+                .map(|pending| pending.session),
+        );
+        let open = candidates
+            .map(|mut session| {
+                for pending in self.intents.values().filter(|pending| {
+                    pending.action == AuditAction::Extend && same(session.id, pending.session.id)
+                }) {
+                    session.deadline_ms = match (session.deadline_ms, pending.session.deadline_ms) {
+                        (Some(left), Some(right)) => Some(left.max(right)),
+                        _ => None,
+                    };
+                }
+                session
+            })
+            .max_by_key(|session| (session.deadline_ms.is_none(), session.deadline_ms));
+        (open, open.is_none().then_some(self.lock).flatten())
     }
 }
 

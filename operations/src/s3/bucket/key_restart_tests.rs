@@ -424,7 +424,7 @@ fn unresolved_intents_kept() {
 }
 
 #[test]
-fn mutation_covers_intents() {
+fn mutation_keeps_intents() {
     let mut log = Log::default();
     let first = log.intent(AuditAction::Unlock, (1, session(1)), Some(NOW - 1));
     let second = log.intent(AuditAction::Unlock, (1, session(2)), None);
@@ -435,7 +435,7 @@ fn mutation_covers_intents() {
         Some(NOW - 1),
     );
     log.records.last_mut().unwrap().sequence = Some(Ulid::from(u128::from(second) + 1));
-    assert!(log.open().is_empty());
+    assert_eq!(log.open(), [1]);
     log.outcome(
         AuditAction::Unlock,
         (1, session(2)),
@@ -443,6 +443,76 @@ fn mutation_covers_intents() {
         None,
     );
     assert!(log.open().is_empty());
+}
+
+#[test]
+fn extension_interleavings_kept() {
+    let deadlines = [Some(NOW - 1), Some(NOW + 100), None];
+    let live = |deadline: Option<u64>| deadline.is_none_or(|deadline| deadline > NOW);
+    let id = |slot: usize| Ulid::from_parts(AT, (1 << 64) + 10 * slot as u128);
+    let mut interleavings = 0;
+    for intent in 0..5 {
+        for sequence in intent + 1..5 {
+            for outcome in sequence + 1..5 {
+                let other: Vec<_> = (0..5)
+                    .filter(|slot| ![intent, sequence, outcome].contains(slot))
+                    .collect();
+                interleavings += 1;
+                for applied in deadlines {
+                    for unresolved in deadlines {
+                        let mut log = Log::default();
+                        log.applied(AuditAction::Unlock, (1, session(1)), Some(NOW - 1));
+                        log.records.last_mut().unwrap().sequence = Some(id(0));
+                        for slot in 0..5 {
+                            if slot == intent || slot == other[0] {
+                                let deadline = if slot == intent { applied } else { unresolved };
+                                log.intent(AuditAction::Extend, (1, session(1)), deadline);
+                            } else if slot == outcome {
+                                log.outcome(
+                                    AuditAction::Extend,
+                                    (1, session(1)),
+                                    (AuditOutcome::Applied, id(intent + 1)),
+                                    applied,
+                                );
+                                log.records.last_mut().unwrap().sequence = Some(id(sequence + 1));
+                            } else {
+                                continue;
+                            }
+                            log.records.last_mut().unwrap().event_id = id(slot + 1);
+                        }
+                        assert_eq!(
+                            !log.open().is_empty(),
+                            live(applied) || live(unresolved),
+                            "{intent} {sequence} {outcome}: {applied:?} {unresolved:?}"
+                        );
+                        for result in [AuditOutcome::Applied, AuditOutcome::Failed] {
+                            let mut resolved = Log {
+                                records: log.records.clone(),
+                            };
+                            resolved.outcome(
+                                AuditAction::Extend,
+                                (1, session(1)),
+                                (result, id(other[0] + 1)),
+                                unresolved,
+                            );
+                            let last = resolved.records.last_mut().unwrap();
+                            last.event_id = id(6);
+                            last.sequence =
+                                (result == AuditOutcome::Applied).then_some(id(other[1] + 1));
+                            let deadline = if result == AuditOutcome::Applied && other[1] > sequence
+                            {
+                                unresolved
+                            } else {
+                                applied
+                            };
+                            assert_eq!(!resolved.open().is_empty(), live(deadline));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(interleavings, 10);
 }
 
 #[test]
