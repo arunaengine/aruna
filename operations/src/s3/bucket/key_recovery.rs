@@ -3,27 +3,37 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::{DriverContext, drive};
 use crate::notifications::outbox::{new_outbox_record, schedule_drain_effect};
+use crate::s3::bucket::holders::lookup_keys;
 use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
-use aruna_core::effects::{Effect, StorageEffect};
+use crate::s3::key_status::KeyStatusOperation;
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{BUCKET_HOLDER_KEYSPACE, BUCKET_RECOVERY_KEYSPACE, KEY_COPY_KEYSPACE};
+use aruna_core::keyspaces::{
+    BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_RECOVERY_KEYSPACE,
+    KEY_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::operation::Operation;
+use aruna_core::shutdown::Shutdown;
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
-    BucketHolder, BucketKeyRef, EncryptionMode, SealedCopy,
+    BucketEncryption, BucketHolder, BucketKeyRef, EncryptionMode, SealedCopy,
 };
 use aruna_core::structs::storage::holders::{KeyLookup, RecoveryState, resolve_holders};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use aruna_core::{NodeId, UserId};
 use smallvec::smallvec;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use thiserror::Error;
+use tracing::warn;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecoveryStep {
@@ -333,6 +343,120 @@ impl Operation for RecoveryNoticeOperation {
             None => smallvec![],
         }
     }
+}
+
+/// Checks one bucket: reads its holders, asks the key directory and tells the holders if the
+/// recovery path weakened. Call it after a group or realm role change and at startup.
+pub async fn check_recovery(
+    context: &DriverContext,
+    (realm_id, node_id): (RealmId, NodeId),
+    bucket: &str,
+    group_id: GroupId,
+) -> Result<Vec<UserId>, RecoveryNoticeError> {
+    let status = KeyStatusOperation::new(bucket.to_string(), realm_id, group_id);
+    let snapshot = drive(status, context)
+        .await
+        .map_err(|error| StorageError::ReadError(error.to_string()))?;
+    let Some(info) = snapshot.info else {
+        return Ok(Vec::new());
+    };
+    let users: BTreeSet<_> = std::iter::once(info.created_by)
+        .chain(snapshot.admins.iter().copied())
+        .chain(snapshot.grants.iter().map(|grant| grant.user_id))
+        .collect();
+    let lookups = lookup_keys(context, node_id, users).await;
+    let input = RecoveryInput {
+        bucket: bucket.to_string(),
+        group_id,
+        realm_id,
+        node_id,
+        lookups,
+        now_ms: aruna_core::time::unix_timestamp_millis(),
+    };
+    drive(RecoveryNoticeOperation::new(input), context).await
+}
+
+/// How often the node checks its vault-locked buckets for weakened recovery; role changes reach
+/// it through document sync, so no local event marks them.
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Checks every vault-locked bucket of this node once.
+pub async fn check_buckets(context: &DriverContext, origin: (RealmId, NodeId)) {
+    let mut start = None;
+    loop {
+        let scan = StorageEffect::Iter {
+            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            prefix: None,
+            start: start.take().map(IterStart::After),
+            limit: 1_000,
+            txn_id: None,
+        };
+        let event = context.storage_handle.send_storage_effect(scan).await;
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            warn!("Bucket recovery sweep could not list buckets");
+            return;
+        };
+        for (key, value) in values {
+            let locked = BucketEncryption::from_bytes(value.as_ref())
+                .is_ok_and(|settings| settings.mode == EncryptionMode::VaultLocked);
+            let bucket = String::from_utf8_lossy(key.as_ref()).into_owned();
+            let group_id = match locked {
+                true => bucket_group(context, &bucket).await,
+                false => None,
+            };
+            let Some(group_id) = group_id else {
+                continue;
+            };
+            if let Err(error) = check_recovery(context, origin, &bucket, group_id).await {
+                warn!(%bucket, error = %error, "Bucket recovery check failed");
+            }
+        }
+        match next_start_after {
+            Some(next) => start = Some(next),
+            None => return,
+        }
+    }
+}
+
+async fn bucket_group(context: &DriverContext, bucket: &str) -> Option<GroupId> {
+    let read = StorageEffect::Read {
+        key_space: S3_BUCKET_KEYSPACE.to_string(),
+        key: bucket.as_bytes().to_vec().into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => BucketInfo::from_bytes(value.as_ref())
+            .ok()
+            .map(|info| info.group_id),
+        _ => None,
+    }
+}
+
+/// Checks the vault-locked buckets right after startup and then at a fixed interval.
+pub fn spawn_recovery_sweep(
+    context: Arc<DriverContext>,
+    origin: (RealmId, NodeId),
+    shutdown: &Shutdown,
+) {
+    let token = shutdown.token();
+    shutdown.spawn(async move {
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = check_buckets(context.as_ref(), origin) => {}
+            }
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(SWEEP_INTERVAL) => {}
+            }
+        }
+    });
 }
 
 #[cfg(test)]

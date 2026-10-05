@@ -482,6 +482,13 @@ async fn fill(
     // Node-managed bucket keys open before content work; vault-locked keys stay locked.
     open_managed_keys(driver_ctx.as_ref(), config).await?;
     record_restart_locks(driver_ctx.as_ref(), config).await?;
+    // Recovery that weakened while the node was down, or later through role changes, is told.
+    let origin = (config.realm_id, config.node_id);
+    aruna_operations::s3::bucket::key_recovery::spawn_recovery_sweep(
+        driver_ctx.clone(),
+        origin,
+        &acquired.shutdown,
+    );
     stopped(stop)?;
 
     // Bind compute reconciliation before startup recovery.
