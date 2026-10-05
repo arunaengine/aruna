@@ -22,6 +22,9 @@ impl ChangeEncryptionOperation {
             block_keys,
             ..previous.clone()
         };
+        if let Some(max) = self.input.max_unlock_ms {
+            settings.max_unlock_ms = max;
+        }
         let format_changed = previous.cipher != cipher
             || previous.block_keys != block_keys
             || mode == EncryptionMode::Off;
@@ -135,6 +138,7 @@ impl ChangeEncryptionOperation {
             generation: Some(generation),
             session_id: None,
             intent_id: None,
+            sequence: None,
             deadline_ms: None,
             reason: None,
             outcome: AuditOutcome::Applied,

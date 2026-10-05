@@ -114,6 +114,7 @@ pub struct ChangeInput {
     /// The requesting user; they must hold the group admin role inside the transaction.
     pub caller: UserId,
     pub change: KeyChange,
+    pub max_unlock_ms: Option<Option<u64>>,
     /// The storage generation the caller read; another one means a concurrent change.
     pub expected_generation: u64,
     /// Key directory answers for the holders of a new generation.
@@ -216,6 +217,9 @@ impl ChangeEncryptionOperation {
                 requested: self.input.expected_generation,
                 current: state.settings.storage_generation,
             });
+        }
+        if self.input.max_unlock_ms == Some(Some(0)) {
+            return self.fail(BucketKeyError::InvalidDuration);
         }
         self.admins = state.admins;
         self.info = Some(state.info);

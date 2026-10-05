@@ -54,6 +54,7 @@ fn operation(change: KeyChange) -> ChangeEncryptionOperation {
         node_id: iroh::SecretKey::from_bytes(&[1; 32]).public(),
         caller: admin(),
         change,
+        max_unlock_ms: None,
         expected_generation: 4,
         lookups: BTreeMap::new(),
         now_ms: 50,
@@ -123,6 +124,8 @@ fn loaded_with(
     let status = UnlockStatus {
         key: record.key,
         session_id: Ulid::from_bytes([4; 16]),
+        sequence: ulid::Ulid::from_parts(1, 1),
+        deadline_ms: None,
         active: true,
         unlocked_at: SystemTime::UNIX_EPOCH,
         remaining: None,
@@ -263,6 +266,60 @@ fn cipher_change_reencodes() {
     );
     let old = BucketKeyRecord::from_bytes(&row(&rows, BUCKET_KEY_KEYSPACE)).unwrap();
     assert_eq!(old.state, KeyState::Active);
+}
+
+#[test]
+fn combined_settings_atomic() {
+    let change = KeyChange::Settings {
+        mode: EncryptionMode::NodeManaged,
+        cipher: BlockCipher::Aes256Gcm,
+        block_keys: BlockKeys::default(),
+    };
+    let mut operation = operation(change);
+    operation.input.max_unlock_ms = Some(Some(60_000));
+    let writes = rows(&loaded(
+        &mut operation,
+        EncryptionMode::NodeManaged,
+        Vec::new(),
+    ));
+    let stored = BucketEncryption::from_bytes(&row(&writes, BUCKET_ENCRYPTION_KEYSPACE)).unwrap();
+    assert_eq!(stored.cipher, BlockCipher::Aes256Gcm);
+    assert_eq!(stored.max_unlock_ms, Some(60_000));
+    assert_eq!(stored.storage_generation, 5);
+}
+
+#[test]
+fn combined_settings_refused() {
+    for (max, generation, error) in [
+        (Some(0), 4, BucketKeyError::InvalidDuration),
+        (
+            Some(60_000),
+            3,
+            BucketKeyError::StaleGeneration {
+                requested: 3,
+                current: 4,
+            },
+        ),
+    ] {
+        let mut operation = operation(settings_change(EncryptionMode::Off));
+        operation.input.max_unlock_ms = Some(max);
+        operation.input.expected_generation = generation;
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        let values = authority_rows(
+            &info(),
+            Some(&settings(EncryptionMode::NodeManaged)),
+            &[admin()],
+        );
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert_eq!(operation.finalize(), Err(ChangeError::Key(error)));
+    }
 }
 
 #[test]

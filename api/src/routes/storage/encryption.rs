@@ -32,9 +32,7 @@ use aruna_operations::s3::bucket::key_rows::SettingsError;
 use aruna_operations::s3::bucket::rotate::{
     ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
 };
-use aruna_operations::s3::key_status::{
-    KeySnapshot, KeyStatusError, KeyStatusOperation, bucket_settings,
-};
+use aruna_operations::s3::key_status::{KeySnapshot, KeyStatusError, KeyStatusOperation};
 use aruna_operations::s3::unlock_limit::{
     UnlockLimitError, UnlockLimitInput, UnlockLimitOperation,
 };
@@ -628,7 +626,7 @@ pub async fn put_bucket_encryption(
         );
         let same = (request.mode, cipher, block_keys)
             == (current.mode, current.cipher, current.block_keys);
-        let mut expected = request.expected_generation;
+        let expected = request.expected_generation;
         if !same {
             let change = KeyChange::Settings {
                 mode: request.mode,
@@ -636,13 +634,16 @@ pub async fn put_bucket_encryption(
                 block_keys,
             };
             let target = (group_id, auth.user_id);
-            change_bucket(&state, &bucket, target, &snapshot, change, expected).await?;
-            expected = bucket_settings(&state.get_ctx(), &bucket)
-                .await
-                .map_err(|error| ServerError::InternalError(error.to_string()))?
-                .storage_generation;
-        }
-        if let Some(max) = request
+            change_bucket(
+                &state,
+                &bucket,
+                target,
+                &snapshot,
+                change,
+                (expected, request.max_unlock_ms),
+            )
+            .await?;
+        } else if let Some(max) = request
             .max_unlock_ms
             .filter(|max| *max != current.max_unlock_ms)
         {
@@ -738,7 +739,7 @@ pub(crate) async fn change_bucket(
     (group_id, caller): (GroupId, UserId),
     snapshot: &KeySnapshot,
     change: KeyChange,
-    expected_generation: u64,
+    (expected_generation, max_unlock_ms): (u64, Option<Option<u64>>),
 ) -> ServerResult<()> {
     let creator = snapshot.info.as_ref().map(|info| info.created_by);
     let users = creator
@@ -755,6 +756,7 @@ pub(crate) async fn change_bucket(
         node_id: state.get_node_id(),
         caller,
         change,
+        max_unlock_ms,
         expected_generation,
         lookups,
         now_ms: now_ms(),
@@ -929,6 +931,8 @@ mod tests {
             unlocks: vec![UnlockStatus {
                 key: BucketKeyRef::new(BUCKET_ID, 1),
                 session_id: Ulid::from_bytes([9; 16]),
+                sequence: ulid::Ulid::from_parts(1, 1),
+                deadline_ms: Some(60),
                 active: true,
                 unlocked_at: SystemTime::UNIX_EPOCH + Duration::from_millis(50),
                 remaining: Some(Duration::from_millis(10)),
