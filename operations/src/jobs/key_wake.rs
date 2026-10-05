@@ -33,7 +33,7 @@ pub enum KeyWakeError {
     Promote(#[from] PromoteError),
 }
 
-/// Wakes parked jobs of `key`, then promotes its pending archives. Call after unlock and after
+/// Wakes parked jobs of `key`, queues remote wakes, then promotes its pending archives. Call after unlock and after
 /// node-managed keys open at startup. Answers the woken jobs and the promoted archives.
 pub async fn wake_unlocked(
     context: &DriverContext,
@@ -42,14 +42,13 @@ pub async fn wake_unlocked(
     origin: (RealmId, NodeId),
     limits: &RoCrateLimits,
 ) -> Result<(usize, usize), KeyWakeError> {
-    let woken = wake_key_waits(&context.storage_handle, key, now_ms).await?;
-    let promoted = promote_unlocked(context, key, origin, limits).await?;
-    // Remote waiters get owed wakes; the delivery timer retries them until acknowledged.
-    super::remote_key::queue_wakes(context, key)
-        .await
-        .map_err(|error| KeyWakeError::Jobs(JobMutationError::Storage(error)))?;
+    let woken = wake_key_waits(&context.storage_handle, key, now_ms).await;
+    // Remote waiters get owed wakes before promotion, so a corrupt archive never holds them back.
+    let queued = super::remote_key::queue_wakes(context, key).await;
     super::remote_key::arm_delivery(context).await;
-    Ok((woken, promoted))
+    let promoted = promote_unlocked(context, key, origin, limits).await;
+    queued.map_err(|error| KeyWakeError::Jobs(JobMutationError::Storage(error)))?;
+    Ok((woken?, promoted?))
 }
 
 /// Local inputs whose every local copy is sealed with a key generation that is locked here.
@@ -210,6 +209,56 @@ mod tests {
     use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, park_job, read_job_record};
     use aruna_core::UserId;
     use aruna_core::structs::execution::job::{JobId, JobPayload, JobState};
+
+    #[tokio::test]
+    async fn corrupt_archive_still_wakes() {
+        use crate::jobs::store::{owed_wakes, register_remote_wait};
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
+        use aruna_core::structs::identity::auth::AuthContext;
+
+        let dir = tempfile::tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let storage = &context.storage_handle;
+        let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let waiter = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let key = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1);
+        let auth = AuthContext {
+            user_id: UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),
+            realm_id: RealmId([1; 32]),
+            path_restrictions: None,
+            session: None,
+        };
+        let job_id = JobId::from_bytes([5; 16]);
+        register_remote_wait(storage, key, waiter, job_id, &auth)
+            .await
+            .unwrap();
+        // A pending row that cannot be decoded makes promotion fail.
+        let corrupt = StorageEffect::Write {
+            key_space: PENDING_LOCATION_KEYSPACE.to_string(),
+            key: ByteView::from(b"archive".to_vec()),
+            value: ByteView::from(b"corrupt".to_vec()),
+            txn_id: None,
+        };
+        storage.send_storage_effect(corrupt).await;
+
+        let origin = (RealmId([1; 32]), node);
+        let limits = RoCrateLimits::default();
+        let result = wake_unlocked(&context, key, 4_000, origin, &limits).await;
+
+        assert!(matches!(result, Err(KeyWakeError::Promote(_))));
+        let (owed, _) = owed_wakes(storage, None).await.unwrap();
+        assert_eq!(owed.len(), 1);
+        assert_eq!((owed[0].waiter, owed[0].job_id), (waiter, job_id));
+    }
 
     #[tokio::test]
     async fn wake_queues_parked() {
