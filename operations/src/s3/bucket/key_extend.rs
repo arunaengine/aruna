@@ -206,6 +206,7 @@ impl ExtendBucketOperation {
                 AuditOutcome::Intent => None,
                 AuditOutcome::Applied | AuditOutcome::Failed => self.intent_id,
             },
+            sequence: None,
             deadline_ms,
             reason: None,
             outcome,
@@ -261,11 +262,9 @@ impl ExtendBucketOperation {
         let Some(status) = self.status.as_ref() else {
             return self.fail(ExtendError::NotFinished);
         };
-        let now_ms = self.input.now_ms;
-        let deadline = status
-            .remaining
-            .and_then(|left| deadline_after(now_ms, left));
-        self.outcome = Some(self.record(status.key, AuditOutcome::Applied, deadline));
+        let mut record = self.record(status.key, AuditOutcome::Applied, status.deadline_ms);
+        record.sequence = Some(status.sequence);
+        self.outcome = Some(record);
         self.retry_audit()
     }
 
@@ -489,11 +488,131 @@ mod tests {
         UnlockStatus {
             key: BucketKeyRef::new(BUCKET_ID, 2),
             session_id: SESSION,
+            sequence: ulid::Ulid::from_parts(1, 1),
+            deadline_ms: remaining.and_then(|left| deadline_after(1_000, left)),
             active: true,
             unlocked_at: SystemTime::UNIX_EPOCH,
             remaining,
             max_remaining: Some(Duration::from_secs(90)),
         }
+    }
+
+    #[test]
+    fn delayed_extension_recorded() {
+        let (mut operation, effects) = read(user(1));
+        operation.input.duration = Some(Duration::from_secs(60));
+        let effects = checked(&mut operation, &effects);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { .. })]
+        ));
+        operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: Vec::new().into(),
+        }));
+        operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+        let mut current = status(Some(Duration::from_secs(60)));
+        current.deadline_ms = Some(91_000);
+        operation.step(Event::Blob(BlobEvent::KeyExtended {
+            status: current.clone(),
+        }));
+        let ticket = KeyTicket {
+            key: current.key,
+            session_id: current.session_id,
+        };
+        let effects = operation.step(Event::Task(aruna_core::task::TaskEvent::TimerScheduled {
+            key: lock_timer(&ticket),
+            after: Duration::from_secs(60),
+        }));
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("outcome missing")
+        };
+        let record = BucketAuditRecord::from_bytes(value).unwrap();
+        assert_eq!(
+            (record.deadline_ms, record.sequence),
+            (Some(91_000), Some(current.sequence))
+        );
+        assert_eq!(
+            crate::s3::bucket::key_restart::replay(&[record], 76_000),
+            [2]
+        );
+    }
+
+    struct TimerSender(tokio::sync::mpsc::Sender<aruna_core::task::TaskKey>);
+
+    #[async_trait::async_trait]
+    impl aruna_tasks::InboundTaskHandler for TimerSender {
+        async fn handle_timer(&self, key: aruna_core::task::TaskKey) {
+            self.0.send(key).await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reversed_timers_rearm() {
+        use crate::s3::bucket::key_lock::LockBucketOperation;
+        use aruna_core::handle::Handle;
+        let ready = |seconds| {
+            let (mut operation, effects) = read(user(1));
+            operation.input.duration = Some(Duration::from_secs(seconds));
+            checked(&mut operation, &effects);
+            operation.step(Event::Storage(StorageEvent::WriteResult {
+                key: Vec::new().into(),
+            }));
+            operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+            operation
+        };
+        let (mut first, mut second) = (ready(30), ready(90));
+        let mut short = status(Some(Duration::from_secs(30)));
+        short.sequence = Ulid::from_parts(1, 1);
+        let mut long = status(Some(Duration::from_secs(90)));
+        long.sequence = Ulid::from_parts(1, 2);
+        let first_reset = first.step(Event::Blob(BlobEvent::KeyExtended { status: short }));
+        let second_reset = second.step(Event::Blob(BlobEvent::KeyExtended {
+            status: long.clone(),
+        }));
+        let scheduler = aruna_tasks::TaskHandle::new();
+        let (sender, mut fired) = tokio::sync::mpsc::channel(2);
+        scheduler
+            .set_inbound_handler(std::sync::Arc::new(TimerSender(sender)))
+            .await;
+        let start = tokio::time::Instant::now();
+        for (operation, mut effects) in [(&mut second, second_reset), (&mut first, first_reset)] {
+            let event = scheduler.send_effect(effects.pop().unwrap()).await;
+            operation.step(event);
+        }
+        let ticket = KeyTicket {
+            key: long.key,
+            session_id: long.session_id,
+        };
+        assert_eq!(fired.recv().await.unwrap(), lock_timer(&ticket));
+        assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(30));
+        let mut callback =
+            LockBucketOperation::timed(ticket, iroh::SecretKey::from_bytes(&[2; 32]).public());
+        callback.start();
+        long.remaining = Some(Duration::from_secs(60));
+        let mut effects = callback.step(Event::Blob(BlobEvent::KeyLocked {
+            locked: Vec::new(),
+            sequence: Ulid::nil(),
+            live: Some(Box::new(long)),
+        }));
+        let event = scheduler.send_effect(effects.pop().unwrap()).await;
+        callback.step(event);
+        assert!(callback.finalize().unwrap().locked.is_empty());
+        assert_eq!(fired.recv().await.unwrap(), lock_timer(&ticket));
+        assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(90));
+        let mut callback =
+            LockBucketOperation::timed(ticket, iroh::SecretKey::from_bytes(&[2; 32]).public());
+        callback.start();
+        let effects = callback.step(Event::Blob(BlobEvent::KeyLocked {
+            locked: vec![ticket],
+            sequence: Ulid::from_parts(1, 3),
+            live: None,
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("timed audit missing")
+        };
+        let record = BucketAuditRecord::from_bytes(&writes[0].2).unwrap();
+        assert_eq!(record.action, AuditAction::TimedLock);
+        scheduler.shutdown(Duration::ZERO).await;
     }
 
     #[test]
@@ -675,6 +794,7 @@ mod tests {
             event_id: Ulid::from_parts(1, 0),
             action: AuditAction::Unlock,
             outcome: AuditOutcome::Applied,
+            sequence: None,
             deadline_ms: Some(1_000),
             intent_id: None,
             ..intent.clone()

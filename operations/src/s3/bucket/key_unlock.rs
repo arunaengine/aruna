@@ -258,6 +258,7 @@ impl UnlockBucketOperation {
             generation: Some(self.input.key.generation),
             session_id: self.session,
             intent_id: None,
+            sequence: None,
             deadline_ms: deadline.and_then(|deadline| deadline_after(at_ms, deadline)),
             reason: None,
             outcome,
@@ -285,16 +286,11 @@ impl UnlockBucketOperation {
         let mut record = self.record(outcome, self.input.now_ms);
         // An applied unlock records the deadline of the session as it was activated.
         record.deadline_ms = match &result {
-            Ok(status) => status.remaining.and_then(|left| {
-                let since = status
-                    .unlocked_at
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()?;
-                deadline_after(u64::try_from(since.as_millis()).ok()?, left)
-            }),
+            Ok(status) => status.deadline_ms,
             Err(_) => self.intent.as_ref().and_then(|intent| intent.deadline_ms),
         };
         record.intent_id = self.intent.as_ref().map(|intent| intent.event_id);
+        record.sequence = result.as_ref().ok().map(|status| status.sequence);
         self.output = Some(result);
         self.outcome = Some(record);
         self.retry_outcome()

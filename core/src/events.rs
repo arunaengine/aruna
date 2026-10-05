@@ -184,6 +184,8 @@ pub enum BlobEvent {
     /// The generations whose keys were removed; already locked buckets report none.
     KeyLocked {
         locked: Vec<KeyTicket>,
+        sequence: Ulid,
+        live: Option<Box<UnlockStatus>>,
     },
     ReadAdmitted {
         lease: ReadLease,

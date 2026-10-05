@@ -89,6 +89,7 @@ struct Trail {
     open: Option<Session>,
     intents: BTreeMap<Ulid, Pending>,
     lock: Option<Lock>,
+    sequence: Option<Ulid>,
 }
 
 /// A record without a session applies to every session of its generation.
@@ -139,6 +140,18 @@ impl Replay {
             return;
         };
         let trail = self.trails.entry(generation).or_default();
+        if let Some(sequence) = record
+            .sequence
+            .filter(|_| record.outcome == AuditOutcome::Applied)
+        {
+            if trail.sequence.is_some_and(|previous| previous >= sequence) {
+                if let Some(intent) = record.intent_id {
+                    trail.intents.remove(&intent);
+                }
+                return;
+            }
+            trail.sequence = Some(sequence);
+        }
         let session = record.session_id;
         let current = Session {
             id: session,
@@ -160,9 +173,9 @@ impl Replay {
                 trail.intents.insert(record.event_id, pending);
                 trail.open = Some(current);
             }
-            // A confirmed unlock never replaces a newer session's intent.
+            // Registry order decides which confirmed mutation applies.
             (AuditAction::Unlock, AuditOutcome::Applied) => {
-                if pending.is_none() || trail.opens(session) {
+                if record.sequence.is_some() || pending.is_none() || trail.opens(session) {
                     (trail.open, trail.lock) = (Some(current), None);
                 }
             }
@@ -184,10 +197,12 @@ impl Replay {
                 trail.intents.insert(record.event_id, pending);
                 trail.open = Some(current);
             }
-            // A confirmed extension never replaces the deadline of a later intent.
-            (AuditAction::Extend, AuditOutcome::Applied) if trail.opens(session) => {
+            // A later registry mutation replaces an earlier deadline, regardless of intent order.
+            (AuditAction::Extend, AuditOutcome::Applied)
+                if record.sequence.is_some() || trail.opens(session) =>
+            {
                 let from = |open: Session| open.source == record.intent_id;
-                if pending.is_none() || trail.open.is_some_and(from) {
+                if record.sequence.is_some() || pending.is_none() || trail.open.is_some_and(from) {
                     trail.open = Some(current);
                 }
             }

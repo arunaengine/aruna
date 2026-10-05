@@ -135,6 +135,8 @@ fn intent_before_activation() {
     let status = UnlockStatus {
         key: ticket().key,
         session_id: ticket().session_id,
+        sequence: ulid::Ulid::from_parts(1, 1),
+        deadline_ms: Some(65_000),
         active: true,
         unlocked_at: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
         remaining: Some(Duration::from_secs(60)),
@@ -242,6 +244,8 @@ fn foreign_events_refused() {
     let status = UnlockStatus {
         key: BucketKeyRef::new(BUCKET_ID, 1),
         session_id: ticket().session_id,
+        sequence: ulid::Ulid::from_parts(1, 1),
+        deadline_ms: None,
         active: true,
         unlocked_at: SystemTime::UNIX_EPOCH,
         remaining: None,

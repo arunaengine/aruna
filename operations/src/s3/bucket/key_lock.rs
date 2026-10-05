@@ -11,7 +11,9 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::encryption::{BucketHolder, HolderOrigin, KeyTicket};
+use aruna_core::structs::storage::encryption::{
+    BucketHolder, HolderOrigin, KeyTicket, UnlockStatus,
+};
 use aruna_core::structs::storage::key_audit::{
     AuditAction, AuditOutcome, BucketAuditRecord, next_event_id,
 };
@@ -42,6 +44,7 @@ pub fn lock_record(
         generation: Some(ticket.key.generation),
         session_id: Some(ticket.session_id),
         intent_id: None,
+        sequence: None,
         deadline_ms: None,
         reason: None,
         outcome: AuditOutcome::Applied,
@@ -54,6 +57,7 @@ enum LockStep {
     ReadBucket,
     ReadGrant,
     LockKeys,
+    RearmTimer,
     WriteAudit,
     ArmRetries,
     CancelTimers,
@@ -195,16 +199,25 @@ impl LockBucketOperation {
         })]
     }
 
-    fn audit(&mut self, locked: Vec<KeyTicket>) -> Effects {
+    fn audit(
+        &mut self,
+        locked: Vec<KeyTicket>,
+        sequence: Ulid,
+        live: Option<UnlockStatus>,
+    ) -> Effects {
         let foreign = |ticket: &KeyTicket| Some(ticket.key.bucket_id) != self.bucket_id;
         if locked.iter().any(foreign) {
             return self.fail(LockError::NotFinished);
         }
         self.locked = locked;
+        if self.locked.is_empty() && self.input.session.is_some() {
+            return self.rearm(live);
+        }
         let mut writes = Vec::new();
         for ticket in &self.locked {
             let (actor, node_id) = (self.input.caller, self.input.node_id);
-            let record = lock_record(*ticket, actor, node_id, self.input.now_ms);
+            let mut record = lock_record(*ticket, actor, node_id, self.input.now_ms);
+            record.sequence = Some(sequence);
             match record.to_bytes() {
                 Ok(value) => writes.push((
                     BUCKET_AUDIT_KEYSPACE.to_string(),
@@ -220,6 +233,23 @@ impl LockBucketOperation {
         }
         self.audit_writes = writes;
         self.write_audit()
+    }
+
+    fn rearm(&mut self, live: Option<UnlockStatus>) -> Effects {
+        let Some(ticket) = self.input.session else {
+            return self.fail(LockError::NotFinished);
+        };
+        let live = live.filter(|status| {
+            status.active && status.key == ticket.key && status.session_id == ticket.session_id
+        });
+        let Some(after) = live.and_then(|status| status.remaining) else {
+            return self.finish(true);
+        };
+        self.step = LockStep::RearmTimer;
+        smallvec![Effect::Task(TaskEffect::ResetTimer {
+            key: lock_timer(&ticket),
+            after
+        })]
     }
 
     /// The audit records stay with the operation until written, so a failed write is retried.
@@ -330,8 +360,21 @@ impl Operation for LockBucketOperation {
                     Err(error) => self.fail(error),
                 }
             }
-            (LockStep::LockKeys, Event::Blob(BlobEvent::KeyLocked { locked })) => {
-                self.audit(locked)
+            (
+                LockStep::LockKeys,
+                Event::Blob(BlobEvent::KeyLocked {
+                    locked,
+                    sequence,
+                    live,
+                }),
+            ) => self.audit(locked, sequence, live.map(|status| *status)),
+            (LockStep::RearmTimer, Event::Task(event))
+                if self
+                    .input
+                    .session
+                    .is_some_and(|ticket| answers_timer(&event, &lock_timer(&ticket))) =>
+            {
+                self.finish(true)
             }
             // A timer that cannot be cancelled fires later and finds its session gone.
             (LockStep::CancelTimers, Event::Task(event))
@@ -459,6 +502,8 @@ mod tests {
         let locked = vec![ticket(1), ticket(2)];
         let effects = operation.step(Event::Blob(BlobEvent::KeyLocked {
             locked: locked.clone(),
+            sequence: Ulid::from_parts(1, 1),
+            live: None,
         }));
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected the audit records, got {effects:?}");
@@ -557,7 +602,11 @@ mod tests {
         };
         assert_eq!(effects.as_slice(), [Effect::Blob(lock)]);
         // A stale timer locks nothing and records nothing.
-        operation.step(Event::Blob(BlobEvent::KeyLocked { locked: Vec::new() }));
+        operation.step(Event::Blob(BlobEvent::KeyLocked {
+            locked: Vec::new(),
+            sequence: Ulid::nil(),
+            live: None,
+        }));
         assert_eq!(
             operation.finalize(),
             Ok(LockResult {

@@ -119,6 +119,7 @@ impl RestartNoticeOperation {
             generation: Some(generation),
             session_id: None,
             intent_id: None,
+            sequence: None,
             deadline_ms: None,
             reason: Some("node restart".to_string()),
             outcome: AuditOutcome::Applied,

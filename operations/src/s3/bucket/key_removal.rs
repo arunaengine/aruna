@@ -240,6 +240,7 @@ impl RemoveHolderOperation {
             generation: active.map(|key| key.generation),
             session_id: None,
             intent_id: None,
+            sequence: None,
             deadline_ms: None,
             reason,
             outcome: AuditOutcome::Applied,

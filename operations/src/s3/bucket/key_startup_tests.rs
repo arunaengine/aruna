@@ -103,6 +103,8 @@ fn opens_managed_keys() {
     let status = UnlockStatus {
         key: ticket.key,
         session_id: ticket.session_id,
+        sequence: ulid::Ulid::from_parts(1, 1),
+        deadline_ms: None,
         active: true,
         unlocked_at: SystemTime::UNIX_EPOCH,
         remaining: None,

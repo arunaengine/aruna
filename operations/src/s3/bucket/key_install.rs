@@ -159,6 +159,7 @@ impl InstallKeyOperation {
             generation: Some(self.key.generation),
             session_id: self.session,
             intent_id: None,
+            sequence: None,
             deadline_ms: duration
                 .or(max)
                 .and_then(|left| deadline_after(audit.now_ms, left)),
@@ -215,8 +216,12 @@ impl InstallKeyOperation {
             Ok(_) => AuditOutcome::Applied,
             Err(_) => AuditOutcome::Failed,
         };
-        self.output = Some(result);
         let mut record = self.record(audit, outcome);
+        if let Ok(status) = &result {
+            record.deadline_ms = status.deadline_ms;
+            record.sequence = Some(status.sequence);
+        }
+        self.output = Some(result);
         record.intent_id = self.intent_id;
         self.outcome = Some(record);
         self.retry_outcome()
@@ -416,6 +421,8 @@ mod tests {
         UnlockStatus {
             key: ticket.key,
             session_id: ticket.session_id,
+            sequence: ulid::Ulid::from_parts(1, 1),
+            deadline_ms: Some(60_000),
             active: true,
             unlocked_at: SystemTime::UNIX_EPOCH,
             remaining: Some(Duration::from_secs(60)),
@@ -451,6 +458,52 @@ mod tests {
             operation.finalize(),
             Err(InstallError::InvalidStateEvent { .. })
         ));
+    }
+
+    #[test]
+    fn delayed_install_recorded() {
+        let private = SecretBytes::new(vec![4; 32]);
+        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let mut operation = InstallKeyOperation::new(InstallInput {
+            key: BucketKeyRef::new(Ulid::from_bytes([1; 16]), 1),
+            public_key: public_key_of(&private).unwrap(),
+            private_key: SharedSecret::new(private),
+            duration: Some(Duration::from_secs(60)),
+            max: None,
+        })
+        .audited(node, None, 1_000);
+        operation.start();
+        let ticket = KeyTicket {
+            key: operation.key,
+            session_id: Ulid::from_bytes([2; 16]),
+        };
+        operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket }));
+        operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: Vec::new().into(),
+        }));
+        operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+        let mut active = status(ticket);
+        active.unlocked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(31);
+        active.deadline_ms = Some(91_000);
+        operation.step(Event::Blob(BlobEvent::KeyActivated {
+            status: active.clone(),
+        }));
+        let effects = operation.step(Event::Task(aruna_core::task::TaskEvent::TimerScheduled {
+            key: lock_timer(&ticket),
+            after: Duration::from_secs(60),
+        }));
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("outcome missing")
+        };
+        let record = BucketAuditRecord::from_bytes(value).unwrap();
+        assert_eq!(
+            (record.deadline_ms, record.sequence),
+            (Some(91_000), Some(active.sequence))
+        );
+        assert_eq!(
+            crate::s3::bucket::key_restart::replay(&[record], 76_000),
+            [1]
+        );
     }
 
     #[test]

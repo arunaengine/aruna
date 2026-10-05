@@ -84,6 +84,7 @@ impl Log {
             generation: Some(generation),
             session_id,
             intent_id,
+            sequence: None,
             deadline_ms,
             reason: None,
             outcome,
@@ -349,6 +350,37 @@ fn delayed_timer_keeps_newer() {
     log.applied(AuditAction::Unlock, (1, session(1)), None);
     log.applied(AuditAction::RestartLock, (1, None), None);
     assert!(log.open().is_empty());
+}
+
+#[test]
+fn registry_order_replayed() {
+    for (reversed, failed) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut log = Log::default();
+        log.applied(AuditAction::Unlock, (1, session(1)), None);
+        let first = log.intent(AuditAction::Extend, (1, session(1)), Some(90_000));
+        let second = log.intent(AuditAction::Extend, (1, session(1)), Some(30_000));
+        let mut outcomes = [(second, 30_000, 1), (first, 90_000, 2)];
+        if reversed {
+            outcomes.reverse();
+        }
+        for (intent, deadline, sequence) in outcomes {
+            let outcome = if failed && intent == second {
+                AuditOutcome::Failed
+            } else {
+                AuditOutcome::Applied
+            };
+            log.outcome(
+                AuditAction::Extend,
+                (1, session(1)),
+                (outcome, intent),
+                (outcome == AuditOutcome::Applied).then_some(deadline),
+            );
+            log.records.last_mut().unwrap().sequence =
+                (outcome == AuditOutcome::Applied).then_some(Ulid::from_parts(AT, sequence));
+        }
+        assert_eq!(replay(&log.stored(), 45_000), [1]);
+        assert!(replay(&log.stored(), 90_000).is_empty());
+    }
 }
 
 #[test]

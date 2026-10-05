@@ -407,6 +407,7 @@ impl EnableEncryptionOperation {
             generation: Some(key.generation),
             session_id: None,
             intent_id: None,
+            sequence: None,
             deadline_ms: None,
             reason: Some(format!("enabled {:?}", self.input.mode)),
             outcome: AuditOutcome::Applied,

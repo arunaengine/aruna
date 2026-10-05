@@ -49,6 +49,7 @@ pub struct BucketAuditRecord {
     pub session_id: Option<Ulid>,
     /// The event id of the intent an applied or failed outcome completes.
     pub intent_id: Option<Ulid>,
+    pub sequence: Option<Ulid>,
     pub deadline_ms: Option<u64>,
     pub reason: Option<String>,
     pub outcome: AuditOutcome,
@@ -105,6 +106,7 @@ mod tests {
             generation: Some(1),
             session_id: None,
             intent_id: None,
+            sequence: None,
             deadline_ms: None,
             reason: None,
             outcome: AuditOutcome::Intent,

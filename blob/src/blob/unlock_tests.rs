@@ -138,12 +138,72 @@ fn unreachable_bounds_refused() {
     let refused = unlock(&mut registry, key, 1, (Some(endless), None), now);
     assert_eq!(refused, Err(BucketKeyError::InvalidDuration));
     let ticket = unlock(&mut registry, key, 1, (None, None), now).unwrap();
-    let extended = registry.extend(key, ticket.session_id, Some(endless), now);
+    let extended = registry.extend(
+        key,
+        ticket.session_id,
+        Some(endless),
+        (now, SystemTime::now()),
+    );
     assert_eq!(extended, Err(BucketKeyError::InvalidDuration));
     assert!(
         admit(&mut registry, key, archive(1), now).is_ok(),
         "the session stays as it was"
     );
+}
+
+#[test]
+fn mutation_deadlines_match() {
+    let mut registry = UnlockRegistry::new(UNLOCKED_BUCKETS);
+    let key = reference(1, 1);
+    let start = Instant::now();
+    let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    let public = public_key_of(private(1).bytes()).unwrap();
+    let ticket = registry
+        .prepare(
+            key,
+            &public,
+            private(1),
+            (Some(MINUTE), Some(3 * MINUTE)),
+            (start, wall),
+        )
+        .unwrap();
+    let active = registry
+        .activate(
+            ticket,
+            (
+                start + Duration::from_secs(30),
+                wall + Duration::from_secs(30),
+            ),
+        )
+        .unwrap();
+    assert_eq!(active.deadline_ms, Some(91_000));
+    assert_eq!(active.remaining, Some(MINUTE));
+    let extended = registry
+        .extend(
+            key,
+            ticket.session_id,
+            Some(MINUTE),
+            (
+                start + Duration::from_secs(60),
+                wall + Duration::from_secs(60),
+            ),
+        )
+        .unwrap();
+    assert_eq!(extended.deadline_ms, Some(121_000));
+    assert!(extended.sequence > active.sequence);
+    let unlimited = registry
+        .extend(
+            key,
+            ticket.session_id,
+            None,
+            (
+                start + Duration::from_secs(70),
+                wall + Duration::from_secs(70),
+            ),
+        )
+        .unwrap();
+    assert_eq!(unlimited.deadline_ms, Some(211_000));
+    assert!(unlimited.sequence > extended.sequence);
 }
 
 #[test]
@@ -182,18 +242,28 @@ fn deadlines_close_admission() {
 
     let later = start + Duration::from_secs(30);
     let short = registry
-        .extend(key, ticket.session_id, Some(Duration::from_secs(10)), later)
+        .extend(
+            key,
+            ticket.session_id,
+            Some(Duration::from_secs(10)),
+            (later, SystemTime::now()),
+        )
         .unwrap();
     assert_eq!(short.remaining, Some(Duration::from_secs(10)));
     assert_eq!(short.max_remaining, Some(Duration::from_secs(30)));
-    let beyond = registry.extend(key, ticket.session_id, Some(MINUTE), later);
+    let beyond = registry.extend(
+        key,
+        ticket.session_id,
+        Some(MINUTE),
+        (later, SystemTime::now()),
+    );
     assert_eq!(beyond, Err(BucketKeyError::InvalidDuration));
-    let stranger = registry.extend(key, Ulid::generate(), None, later);
+    let stranger = registry.extend(key, Ulid::generate(), None, (later, SystemTime::now()));
     assert_eq!(stranger, Err(BucketKeyError::SessionMismatch));
     // A session id is only valid with the generation it unlocked.
     let source = reference(1, 7);
     unlock(&mut registry, source, 7, (None, None), later).unwrap();
-    let elsewhere = registry.extend(source, ticket.session_id, None, later);
+    let elsewhere = registry.extend(source, ticket.session_id, None, (later, SystemTime::now()));
     assert_eq!(elsewhere, Err(BucketKeyError::SessionMismatch));
     let source_session = registry.status(source.bucket_id, later)[1].session_id;
     let only = KeyTicket {
@@ -206,7 +276,7 @@ fn deadlines_close_admission() {
     let expired = later + Duration::from_secs(10);
     assert!(admit(&mut registry, key, archive(1), expired).is_err());
     assert!(registry.status(key.bucket_id, expired).is_empty());
-    let locked = registry.extend(key, ticket.session_id, None, expired);
+    let locked = registry.extend(key, ticket.session_id, None, (expired, SystemTime::now()));
     assert_eq!(locked, Err(BucketKeyError::Locked(key.bucket_id)));
 }
 
@@ -222,11 +292,16 @@ fn lock_keeps_leases() {
     // A stale timer names an older session and locks nothing.
     let fresh = unlock(&mut registry, active, 1, (None, None), now).unwrap();
     assert_ne!(fresh.session_id, first.session_id);
-    assert!(registry.lock(active.bucket_id, Some(first), now).is_empty());
+    assert!(
+        registry
+            .lock(active.bucket_id, Some(first), now)
+            .0
+            .is_empty()
+    );
     assert!(admit(&mut registry, active, archive(7), now).is_ok());
 
     // A lock closes every generation of the bucket at once.
-    let locked = registry.lock(active.bucket_id, None, now);
+    let locked = registry.lock(active.bucket_id, None, now).0;
     assert_eq!(locked.len(), 2);
     assert!(admit(&mut registry, active, archive(7), now).is_err());
     assert!(admit(&mut registry, source, archive(7), now).is_err());
@@ -250,7 +325,7 @@ fn leases_hold_slots() {
     unlock(&mut registry, key, 1, (None, None), now).unwrap();
     let lease = admit(&mut registry, key, archive(1), now).unwrap();
     // The only slot stays with the lease while its stream lives, even after a lock.
-    registry.lock(key.bucket_id, None, now);
+    registry.lock(key.bucket_id, None, now).0;
     assert!(registry.lease_slots().try_acquire_owned().is_err());
     drop(lease);
     assert!(registry.lease_slots().try_acquire_owned().is_ok());
@@ -330,16 +405,26 @@ fn polled_expiry_still_locks() {
     assert!(admit(&mut registry, key, archive(1), later).is_err());
     // The timer still learns that its session ended, so the timed lock is recorded once.
     assert_eq!(
-        registry.lock(key.bucket_id, Some(ticket), later),
+        registry.lock(key.bucket_id, Some(ticket), later).0,
         vec![ticket]
     );
-    assert!(registry.lock(key.bucket_id, Some(ticket), later).is_empty());
+    assert!(
+        registry
+            .lock(key.bucket_id, Some(ticket), later)
+            .0
+            .is_empty()
+    );
     // A stale timer of another session records nothing.
     let other = KeyTicket {
         key,
         session_id: Ulid::generate(),
     };
-    assert!(registry.lock(key.bucket_id, Some(other), later).is_empty());
+    assert!(
+        registry
+            .lock(key.bucket_id, Some(other), later)
+            .0
+            .is_empty()
+    );
 }
 
 #[test]
@@ -356,13 +441,16 @@ fn expiries_kept_per_session() {
     assert!(registry.status(key.bucket_id, last).is_empty());
     // Both delayed timers still record their own timed lock, in any order.
     assert_eq!(
-        registry.lock(key.bucket_id, Some(second), last),
+        registry.lock(key.bucket_id, Some(second), last).0,
         vec![second]
     );
-    assert_eq!(registry.lock(key.bucket_id, Some(first), last), vec![first]);
+    assert_eq!(
+        registry.lock(key.bucket_id, Some(first), last).0,
+        vec![first]
+    );
     // A third session unlocked after both expiries stays open whatever the old timers do.
     let third = unlock(&mut registry, key, 1, (None, None), last).unwrap();
-    assert!(registry.lock(key.bucket_id, Some(first), last).is_empty());
+    assert!(registry.lock(key.bucket_id, Some(first), last).0.is_empty());
     assert_eq!(
         registry.status(key.bucket_id, last)[0].session_id,
         third.session_id
@@ -380,16 +468,16 @@ fn running_timer_spares_extension() {
     let extended = start + Duration::from_secs(30);
     let session = ticket.session_id;
     registry
-        .extend(key, session, Some(MINUTE), extended)
+        .extend(key, session, Some(MINUTE), (extended, SystemTime::now()))
         .unwrap();
     // The old callback reaches the registry at the old deadline and locks nothing.
     let old = start + MINUTE;
-    assert!(registry.lock(key.bucket_id, Some(ticket), old).is_empty());
+    assert!(registry.lock(key.bucket_id, Some(ticket), old).0.is_empty());
     assert!(admit(&mut registry, key, archive(1), old).is_ok());
     // The rescheduled timer locks it at the new deadline.
     let new = extended + MINUTE;
     assert_eq!(
-        registry.lock(key.bucket_id, Some(ticket), new),
+        registry.lock(key.bucket_id, Some(ticket), new).0,
         vec![ticket]
     );
     assert!(admit(&mut registry, key, archive(1), new).is_err());

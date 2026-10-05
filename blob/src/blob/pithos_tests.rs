@@ -499,7 +499,7 @@ async fn leases_pin_archives() {
         session: None,
     };
     assert!(
-        matches!(handler.unlock_effect(lock), BlobEvent::KeyLocked { locked } if locked.len() == 1)
+        matches!(handler.unlock_effect(lock), BlobEvent::KeyLocked { locked, .. } if locked.len() == 1)
     );
     let refused = handler.delete_blob(location.clone()).await;
     assert!(matches!(

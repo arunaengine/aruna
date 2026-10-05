@@ -12,9 +12,10 @@ use aruna_core::events::BlobEvent;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::ArchiveKey;
 use aruna_core::structs::storage::encryption::{
-    BucketKeyError, BucketKeyRef, CopyTarget, KeyTicket, ReadLease, UnlockStatus, key_matches,
-    seal_copies,
+    BucketKeyError, BucketKeyRef, CopyTarget, KeyTicket, ReadLease, UnlockStatus, deadline_after,
+    key_matches, seal_copies,
 };
+use aruna_core::structs::storage::key_audit::next_event_id;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -42,6 +43,8 @@ type Pins = Arc<StdMutex<ArchiveUse>>;
 /// One unlock session of a key generation.
 struct Session {
     session_id: Ulid,
+    sequence: Ulid,
+    deadline_ms: Option<u64>,
     secret: SharedSecret,
     public_key: [u8; 32],
     active: bool,
@@ -64,6 +67,8 @@ impl Session {
         UnlockStatus {
             key,
             session_id: self.session_id,
+            sequence: self.sequence,
+            deadline_ms: self.deadline_ms,
             active: self.active,
             unlocked_at: self.unlocked_at,
             remaining: left(self.deadline),
@@ -128,7 +133,7 @@ pub(super) struct UnlockRegistry {
     capacity: usize,
     sessions: HashMap<BucketKeyRef, Vec<Session>>,
     /// Sessions that reached their deadline before their timer ran, so it still records the lock.
-    expired: HashSet<(BucketKeyRef, Ulid)>,
+    expired: HashMap<(BucketKeyRef, Ulid), Ulid>,
     pins: Pins,
     leases: Arc<Semaphore>,
 }
@@ -152,7 +157,7 @@ impl UnlockRegistry {
         Self {
             capacity,
             sessions: HashMap::new(),
-            expired: HashSet::new(),
+            expired: HashMap::new(),
             pins: Arc::default(),
             leases: Arc::new(Semaphore::new(leases)),
         }
@@ -198,6 +203,8 @@ impl UnlockRegistry {
         let session_id = Ulid::generate();
         sessions.push(Session {
             session_id,
+            sequence: Ulid::nil(),
+            deadline_ms: None,
             secret: private_key,
             public_key: *public_key,
             active: false,
@@ -240,6 +247,12 @@ impl UnlockRegistry {
         session.active = true;
         session.unlocked_at = unlocked_at;
         session.deadline = deadline;
+        let at_ms = unlocked_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        session.sequence = next_event_id(at_ms);
+        session.deadline_ms = duration.and_then(|duration| deadline_after(at_ms, duration));
         session.max_deadline = max_deadline;
         let status = session.status(ticket.key, now);
         sessions.clear();
@@ -275,8 +288,9 @@ impl UnlockRegistry {
         key: BucketKeyRef,
         session_id: Ulid,
         duration: Option<Duration>,
-        now: Instant,
+        now: (Instant, SystemTime),
     ) -> Result<UnlockStatus, BucketKeyError> {
+        let (now, at) = now;
         self.purge(now);
         let session = self
             .sessions
@@ -298,6 +312,22 @@ impl UnlockRegistry {
             return Err(BucketKeyError::InvalidDuration);
         }
         session.deadline = deadline;
+        let at_ms = at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        session.sequence = next_event_id(at_ms);
+        session.deadline_ms = match duration {
+            Some(duration) => deadline_after(at_ms, duration),
+            None => session.bounds.1.and_then(|max| {
+                let start = session
+                    .unlocked_at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                deadline_after(start, max)
+            }),
+        };
         Ok(session.status(key, now))
     }
 
@@ -310,12 +340,15 @@ impl UnlockRegistry {
         bucket_id: Ulid,
         only: Option<KeyTicket>,
         now: Instant,
-    ) -> Vec<KeyTicket> {
+    ) -> (Vec<KeyTicket>, Ulid) {
         self.purge(now);
         if let Some(ticket) = only {
-            let expired = ticket.key.bucket_id == bucket_id
-                && self.expired.remove(&(ticket.key, ticket.session_id));
-            return if expired { vec![ticket] } else { Vec::new() };
+            let expired = (ticket.key.bucket_id == bucket_id)
+                .then(|| self.expired.remove(&(ticket.key, ticket.session_id)))
+                .flatten();
+            return expired.map_or((Vec::new(), Ulid::nil()), |sequence| {
+                (vec![ticket], sequence)
+            });
         }
         let mut locked = Vec::new();
         self.sessions.retain(|key, sessions| {
@@ -329,7 +362,10 @@ impl UnlockRegistry {
             false
         });
         locked.sort_by_key(|ticket| ticket.key.generation);
-        locked
+        (
+            locked,
+            next_event_id(aruna_core::time::unix_timestamp_millis()),
+        )
     }
 
     /// A lease for one plaintext read of `archive`, while its key generation is unlocked.
@@ -439,7 +475,10 @@ impl UnlockRegistry {
             sessions.retain(|session| {
                 let ended = session.expired(now);
                 if ended && session.active {
-                    expired.insert((*key, session.session_id));
+                    expired.insert(
+                        (*key, session.session_id),
+                        next_event_id(aruna_core::time::unix_timestamp_millis()),
+                    );
                 }
                 !ended
             });
@@ -528,11 +567,26 @@ impl super::BlobHandler {
                 session_id,
                 duration,
             } => registry
-                .extend(key, session_id, duration, now)
+                .extend(key, session_id, duration, (now, SystemTime::now()))
                 .map(|status| BlobEvent::KeyExtended { status }),
-            BlobEffect::LockKey { bucket_id, session } => Ok(BlobEvent::KeyLocked {
-                locked: registry.lock(bucket_id, session, now),
-            }),
+            BlobEffect::LockKey { bucket_id, session } => {
+                let (locked, sequence) = registry.lock(bucket_id, session, now);
+                let live = session
+                    .filter(|_| locked.is_empty())
+                    .and_then(|ticket| {
+                        registry.status(bucket_id, now).into_iter().find(|status| {
+                            status.active
+                                && status.key == ticket.key
+                                && status.session_id == ticket.session_id
+                        })
+                    })
+                    .map(Box::new);
+                Ok(BlobEvent::KeyLocked {
+                    locked,
+                    sequence,
+                    live,
+                })
+            }
             _ => Err(BucketKeyError::Unsupported),
         };
         result.unwrap_or_else(|error| BlobEvent::Error(error.into()))

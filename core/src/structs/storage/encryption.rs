@@ -400,6 +400,8 @@ pub struct KeyTicket {
 pub struct UnlockStatus {
     pub key: BucketKeyRef,
     pub session_id: Ulid,
+    pub sequence: Ulid,
+    pub deadline_ms: Option<u64>,
     /// False while the key is prepared but no read may use it yet.
     pub active: bool,
     pub unlocked_at: SystemTime,

@@ -563,6 +563,8 @@ mod tests {
         let session = UnlockStatus {
             key: record.key,
             session_id: Ulid::from_bytes([5; 16]),
+            sequence: ulid::Ulid::from_parts(1, 1),
+            deadline_ms: None,
             active: true,
             unlocked_at: SystemTime::UNIX_EPOCH,
             remaining: None,
