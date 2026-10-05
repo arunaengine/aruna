@@ -32,7 +32,12 @@ use aruna_operations::s3::bucket::key_rows::SettingsError;
 use aruna_operations::s3::bucket::rotate::{
     ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
 };
-use aruna_operations::s3::key_status::{KeySnapshot, KeyStatusError, KeyStatusOperation};
+use aruna_operations::s3::key_status::{
+    KeySnapshot, KeyStatusError, KeyStatusOperation, bucket_settings,
+};
+use aruna_operations::s3::unlock_limit::{
+    UnlockLimitError, UnlockLimitInput, UnlockLimitOperation,
+};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -192,10 +197,19 @@ pub struct EncryptionRequest {
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub block_keys: Option<BlockKeys>,
-    #[serde(default)]
-    pub max_unlock_ms: Option<u64>,
+    /// Absent keeps the current maximum; null lets an unlock last until lock or restart.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<u64>)]
+    pub max_unlock_ms: Option<Option<u64>>,
     /// The `storage_generation` the caller read; another value is refused as stale.
     pub expected_generation: u64,
+}
+
+/// A present field, which may be null, as opposed to an absent one.
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<u64>>, D::Error> {
+    Option::<u64>::deserialize(deserializer).map(Some)
 }
 
 pub(crate) fn refused(status: StatusCode, code: &'static str, message: &str) -> ServerError {
@@ -552,6 +566,8 @@ pub async fn get_bucket_encryption(
 - `expected_generation` must equal the current `storage_generation`.
 - On an encrypted bucket, another mode, `off`, cipher or block-key mode starts a transition of
   this node's stored copies; `transition` in the status reports its progress.
+- `max_unlock_ms` changes the longest unlock of an encrypted bucket from the next unlock on;
+  an absent field keeps it, `null` removes the limit.
 - A change that needs the old key answers 409 `bucket_locked` while that key is locked."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     request_body(
@@ -587,13 +603,31 @@ pub async fn put_bucket_encryption(
         }));
     }
     if current.is_encrypted() || current.bucket_id.is_some() {
-        let change = KeyChange::Settings {
-            mode: request.mode,
-            cipher: request.cipher.unwrap_or(current.cipher),
-            block_keys: request.block_keys.unwrap_or(current.block_keys),
-        };
-        let expected = request.expected_generation;
-        change_bucket(&state, &bucket, group_id, &snapshot, change, expected).await?;
+        let (cipher, block_keys) = (
+            request.cipher.unwrap_or(current.cipher),
+            request.block_keys.unwrap_or(current.block_keys),
+        );
+        let same = (request.mode, cipher, block_keys)
+            == (current.mode, current.cipher, current.block_keys);
+        let mut expected = request.expected_generation;
+        if !same {
+            let change = KeyChange::Settings {
+                mode: request.mode,
+                cipher,
+                block_keys,
+            };
+            change_bucket(&state, &bucket, group_id, &snapshot, change, expected).await?;
+            expected = bucket_settings(&state.get_ctx(), &bucket)
+                .await
+                .map_err(|error| ServerError::InternalError(error.to_string()))?
+                .storage_generation;
+        }
+        if let Some(max) = request
+            .max_unlock_ms
+            .filter(|max| *max != current.max_unlock_ms)
+        {
+            set_unlock_limit(&state, &bucket, group_id, auth.user_id, max, expected).await?;
+        }
         let status = current_status(&state, bucket, group_id, auth.user_id).await?;
         return Ok(Json(status));
     }
@@ -608,6 +642,35 @@ pub async fn put_bucket_encryption(
         .map_err(enable_refusal)?;
     let status = current_status(&state, bucket, group_id, auth.user_id).await?;
     Ok(Json(status))
+}
+
+/// Stores a new unlock maximum of an encrypted bucket; the next unlock uses it.
+async fn set_unlock_limit(
+    state: &ServerState,
+    bucket: &str,
+    group_id: GroupId,
+    caller: UserId,
+    max_unlock_ms: Option<u64>,
+    expected_generation: u64,
+) -> ServerResult<()> {
+    let input = UnlockLimitInput {
+        bucket: bucket.to_string(),
+        group_id,
+        node_id: state.get_node_id(),
+        caller,
+        max_unlock_ms,
+        expected_generation,
+        now_ms: now_ms(),
+    };
+    drive(UnlockLimitOperation::new(input), &state.get_ctx())
+        .await
+        .map(|_| ())
+        .map_err(|error| match error {
+            UnlockLimitError::Settings(error) => settings_refusal(error),
+            UnlockLimitError::Key(error) => key_refusal(&error),
+            UnlockLimitError::NotEncrypted => not_encrypted(),
+            other => ServerError::InternalError(other.to_string()),
+        })
 }
 
 /// Applies a mode change or rotation, then installs a new key generation if it made one.
@@ -703,7 +766,7 @@ pub(crate) async fn enable_bucket(
         mode: request.mode,
         cipher: request.cipher.unwrap_or_default(),
         block_keys: request.block_keys.unwrap_or_default(),
-        max_unlock_ms: request.max_unlock_ms,
+        max_unlock_ms: request.max_unlock_ms.flatten(),
         expected_generation: request.expected_generation,
         lookups,
         now_ms: now_ms(),
@@ -874,6 +937,23 @@ mod tests {
         assert_eq!(json["mode"], "off");
         assert!(json["unlock"].is_null() && json["public_key"].is_null());
         assert_eq!(json["generations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn unlock_maximum_presence() {
+        let parse = |body: &str| {
+            serde_json::from_str::<EncryptionRequest>(body)
+                .unwrap()
+                .max_unlock_ms
+        };
+        let base = r#""mode":"vault_locked","expected_generation":1"#;
+        assert_eq!(parse(&format!("{{{base}}}")), None);
+        assert_eq!(
+            parse(&format!(r#"{{{base},"max_unlock_ms":null}}"#)),
+            Some(None)
+        );
+        let limited = parse(&format!(r#"{{{base},"max_unlock_ms":60000}}"#));
+        assert_eq!(limited, Some(Some(60_000)));
     }
 
     #[test]
