@@ -13,6 +13,7 @@ use aruna_core::UserId;
 use aruna_core::effects::VaultQuery;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::user::vault::{KEY_ID_BYTES, UserKeyRecord, VaultRecords};
+use aruna_operations::s3::holder_seal::seal_published;
 use aruna_operations::users::vault_write::{VaultAppended, VaultChange};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -89,6 +90,8 @@ refused. A caller publishes only their own keys.
   newer record; readers use the newest one.
 - The node stores the SHA-256 fingerprint of the public key with it.
 - `has_recovery` is declared by the client; the node cannot see inside the vault.
+- Encrypted buckets on this node whose key is unlocked seal a copy of their key to the new
+  record when the caller holds them; locked buckets seal it at their next unlock.
 
 **Limits**
 - `key_id` holds 1 to 128 bytes. A user may publish at most 64 key records."#,
@@ -145,7 +148,14 @@ pub async fn publish_key(
     };
     let auth_token = forwarded_auth_token(bearer_token)?;
     match append(&state, &auth, auth_token, change).await? {
-        VaultAppended::Key(record) => Ok((StatusCode::CREATED, Json(key_response(*record)))),
+        VaultAppended::Key(record) => {
+            let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+            // Buckets on this node seal the holder's missing copies now; locked ones at unlock.
+            if let Err(error) = seal_published(&state.get_ctx(), realm_id, node_id, &record).await {
+                tracing::warn!(%error, "could not seal bucket key copies for a new user key");
+            }
+            Ok((StatusCode::CREATED, Json(key_response(*record))))
+        }
         VaultAppended::Heads(_) => Err(ServerError::InternalError(
             "key publish answered vault heads".to_string(),
         )),
