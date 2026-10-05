@@ -350,3 +350,48 @@ fn delayed_timer_keeps_newer() {
     log.applied(AuditAction::RestartLock, (1, None), None);
     assert!(log.open().is_empty());
 }
+
+#[test]
+fn overlapping_extensions_kept() {
+    // E1 and E2 both extend session 1; E2 applies, then E1 fails: E2's deadline stays.
+    let mut log = Log::default();
+    log.applied(AuditAction::Unlock, (1, session(1)), Some(NOW - 1));
+    let first = log.intent(AuditAction::Extend, (1, session(1)), Some(NOW - 1));
+    let second = log.intent(AuditAction::Extend, (1, session(1)), Some(NOW + 100));
+    let applied = (AuditOutcome::Applied, second);
+    log.outcome(
+        AuditAction::Extend,
+        (1, session(1)),
+        applied,
+        Some(NOW + 100),
+    );
+    let failed = (AuditOutcome::Failed, first);
+    log.outcome(AuditAction::Extend, (1, session(1)), failed, None);
+    assert_eq!(log.open(), [1]);
+    // E1 fails first, then E2 fails: the deadline from before both intents comes back.
+    let mut log = Log::default();
+    log.applied(AuditAction::Unlock, (1, session(1)), Some(NOW - 1));
+    let first = log.intent(AuditAction::Extend, (1, session(1)), Some(NOW + 50));
+    let second = log.intent(AuditAction::Extend, (1, session(1)), Some(NOW + 100));
+    let failed = (AuditOutcome::Failed, first);
+    log.outcome(AuditAction::Extend, (1, session(1)), failed, None);
+    assert_eq!(log.open(), [1], "E2 still holds its deadline");
+    let failed = (AuditOutcome::Failed, second);
+    log.outcome(AuditAction::Extend, (1, session(1)), failed, None);
+    assert!(log.open().is_empty());
+    // E2 fails, then E1 applies: E1's own deadline counts.
+    let mut log = Log::default();
+    log.applied(AuditAction::Unlock, (1, session(1)), Some(NOW - 1));
+    let first = log.intent(AuditAction::Extend, (1, session(1)), Some(NOW + 50));
+    let second = log.intent(AuditAction::Extend, (1, session(1)), Some(NOW - 1));
+    let failed = (AuditOutcome::Failed, second);
+    log.outcome(AuditAction::Extend, (1, session(1)), failed, None);
+    let applied = (AuditOutcome::Applied, first);
+    log.outcome(
+        AuditAction::Extend,
+        (1, session(1)),
+        applied,
+        Some(NOW + 50),
+    );
+    assert_eq!(log.open(), [1]);
+}

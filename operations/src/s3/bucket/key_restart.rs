@@ -66,6 +66,8 @@ pub enum RestartScanError {
 struct Session {
     id: Option<Ulid>,
     deadline_ms: Option<u64>,
+    /// The intent that set the deadline, so only its failure undoes it.
+    source: Option<Ulid>,
 }
 
 /// An intent whose outcome is not read yet: the session it opens or extends, and the state it
@@ -99,6 +101,19 @@ impl Trail {
         self.open.is_some_and(|open| same(open.id, session))
     }
 
+    /// Intents that would restore the deadline of failed intent `source` restore `instead`, as
+    /// that deadline never applied.
+    fn unset(&mut self, source: Ulid, instead: Option<Session>) {
+        for pending in self.intents.values_mut() {
+            if pending
+                .before
+                .is_some_and(|before| before.source == Some(source))
+            {
+                pending.before = instead;
+            }
+        }
+    }
+
     /// Intents that would restore `ended` restore `instead`, as `ended` no longer exists.
     fn forget(&mut self, ended: Option<Ulid>, instead: Option<Session>) {
         for pending in self.intents.values_mut() {
@@ -128,6 +143,10 @@ impl Replay {
         let current = Session {
             id: session,
             deadline_ms: record.deadline_ms,
+            source: match record.outcome {
+                AuditOutcome::Intent => Some(record.event_id),
+                AuditOutcome::Applied | AuditOutcome::Failed => record.intent_id,
+            },
         };
         let pending = record.intent_id.and_then(|id| trail.intents.remove(&id));
         match (record.action, record.outcome) {
@@ -165,13 +184,21 @@ impl Replay {
                 trail.intents.insert(record.event_id, pending);
                 trail.open = Some(current);
             }
+            // A confirmed extension never replaces the deadline of a later intent.
             (AuditAction::Extend, AuditOutcome::Applied) if trail.opens(session) => {
-                trail.open = Some(current);
+                let from = |open: Session| open.source == record.intent_id;
+                if pending.is_none() || trail.open.is_some_and(from) {
+                    trail.open = Some(current);
+                }
             }
+            // A failed extension undoes only the deadline it set itself.
             (AuditAction::Extend, AuditOutcome::Failed) => {
-                let restore = pending.filter(|pending| trail.opens(pending.session));
-                if let (Some(pending), Some(open)) = (restore, trail.open.as_mut()) {
-                    open.deadline_ms = pending.before.and_then(|before| before.deadline_ms);
+                if let (Some(pending), Some(intent)) = (pending, record.intent_id) {
+                    let own = |open: Session| open.source == Some(intent);
+                    if trail.opens(pending.session) && trail.open.is_some_and(own) {
+                        trail.open = pending.before;
+                    }
+                    trail.unset(intent, pending.before);
                 }
             }
             // A delayed lock of an older session leaves a newer session unlocked.
