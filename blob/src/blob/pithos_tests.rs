@@ -328,7 +328,7 @@ async fn aborts_failed_writes() {
             operator,
             stream,
             Compression::Off,
-            Some(seal),
+            (Some(seal), None),
             None,
         )
         .await;
@@ -353,7 +353,7 @@ async fn aborts_failed_writes() {
             operator.clone(),
             stream,
             Compression::Off,
-            Some(seal),
+            (Some(seal), None),
             None,
         )
         .await;
@@ -813,7 +813,7 @@ async fn declared_size_chunks() {
             operator,
             stream_from_bytes(&data),
             Compression::Off,
-            Some(seal),
+            (Some(seal), None),
             Some(declared),
         )
         .await;
@@ -976,5 +976,113 @@ async fn reads_reserve_budget() {
     );
     let chunks: Vec<Bytes> = blob.try_collect().await.unwrap();
     assert!(chunks.concat() == data);
+    assert_eq!(handler.pithos_budget.available_permits(), budget_permits());
+}
+
+#[tokio::test]
+async fn rewrites_never_deadlock() {
+    use crate::blob::pithos::{budget_permits, working_set};
+    use aruna_core::compute::{SecretBytes, SharedSecret};
+    use aruna_core::effects::BlobEffect;
+    use aruna_core::structs::storage::blob::ArchiveKey;
+
+    let source_key = PrivateKey::from_raw(zeroize::Zeroizing::new([5; 32]));
+    let source = plan(
+        &source_key,
+        BlockCipher::ChaCha20Poly1305,
+        BlockKeys::ContentDerived,
+    );
+    let mut target = plan(
+        &PrivateKey::generate(),
+        BlockCipher::Aes256Gcm,
+        BlockKeys::Unique,
+    );
+    target.key = BucketKeyRef::new(ulid::Ulid::from_bytes([6; 16]), 2);
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let prepare = BlobEffect::PrepareKey {
+        key: source.key,
+        public_key: source.public_key,
+        private_key: SharedSecret::new(SecretBytes::new(vec![5; 32])),
+        duration: None,
+        max: None,
+    };
+    let BlobEvent::KeyPrepared { ticket } = handler.unlock_effect(prepare) else {
+        panic!("prepare failed")
+    };
+    handler.unlock_effect(BlobEffect::ActivateKey { ticket });
+
+    let data = content(100_000);
+    let mut copies = Vec::new();
+    for index in 0..4 {
+        let backend = ResolvedBackend::node_default().with_encryption(Some(source));
+        let name = format!("sealed-{index}.bin");
+        let written = handler
+            .write_blob(
+                "bucket",
+                &name,
+                backend,
+                test_user_id(),
+                stream_from_bytes(&data),
+            )
+            .await;
+        let BlobEvent::WriteFinished { location } = written else {
+            panic!("write failed: {written:?}")
+        };
+        copies.push(location);
+    }
+
+    // Only one rewrite's combined share is free, so they must run one after another.
+    let StoredLayout::Pithos(layout) = &copies[0].format.layout else {
+        panic!("not a Pithos copy")
+    };
+    let share = (working_set(layout.stored_size) + working_set(data.len() as u64)).div_ceil(1 << 20)
+        as usize;
+    let held = handler
+        .pithos_budget
+        .clone()
+        .acquire_many_owned((budget_permits() - share - 1) as u32)
+        .await
+        .unwrap();
+    let mut rewrites = Vec::new();
+    for location in copies {
+        let BlobEvent::ReadAdmitted { lease } = handler
+            .admit_read(source.key, ArchiveKey::of(&location))
+            .await
+        else {
+            panic!("admission failed")
+        };
+        let handler = handler.clone();
+        let target = ResolvedBackend::node_default().with_encryption(Some(target));
+        rewrites.push(tokio::spawn(async move {
+            handler
+                .rewrite_copy(
+                    "bucket",
+                    "rewritten.bin",
+                    location,
+                    Some(lease),
+                    target,
+                    false,
+                )
+                .await
+        }));
+    }
+    // A generous cap that only a hang reaches.
+    let finished = tokio::time::timeout(Duration::from_secs(300), async {
+        let mut events = Vec::new();
+        for rewrite in rewrites {
+            events.push(rewrite.await.unwrap());
+        }
+        events
+    })
+    .await
+    .expect("saturated rewrites must not deadlock");
+    for event in finished {
+        let BlobEvent::CopyRewritten { location } = event else {
+            panic!("rewrite failed: {event:?}")
+        };
+        assert_eq!(location.format.bucket_key(), Some(target.key));
+    }
+    drop(held);
     assert_eq!(handler.pithos_budget.available_permits(), budget_permits());
 }

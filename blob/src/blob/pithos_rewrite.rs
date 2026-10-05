@@ -6,6 +6,7 @@
 use super::BlobHandler;
 use super::backend::build_backend_path;
 use super::frames::read_range;
+use super::pithos::{WORKING_SET, working_set};
 use super::unlock::LeaseGuard;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
@@ -107,15 +108,28 @@ impl BlobHandler {
         lease: Option<&ReadLease>,
         target: ResolvedBackend,
     ) -> Result<BlobEvent, BlobError> {
+        // One reservation covers the read and the write, so two rewrites never wait half-held.
+        let read_share = match &source.format.layout {
+            StoredLayout::Pithos(layout) => working_set(layout.stored_size),
+            _ => 0,
+        };
+        let write_share = match target.encryption {
+            Some(_) => working_set(source.blob_size),
+            None => 0,
+        };
+        let share = (read_share + write_share).min(WORKING_SET);
+        let mut permit = match share {
+            0 => None,
+            share => Some(self.reserve_pithos(share).await?),
+        };
         let plain = match &source.format.layout {
             StoredLayout::Pithos(layout) => {
                 let keys = self.lease_keys(&source, lease)?;
                 let operator = self.operator_from_location(&source)?;
                 let path = source.get_storage_path()?;
                 let range = 0..source.blob_size;
-                let stream = self
-                    .read_archive(operator, path, layout, keys, range)
-                    .await?;
+                let idle = self.transfer_idle_timeout();
+                let stream = super::pithos::read(operator, path, layout, keys, range, idle).await?;
                 BackendStream::new(Exclusive(Mutex::new(Box::pin(stream))))
             }
             _ => match Box::pin(self.read_blob(source.clone())).await {
@@ -124,8 +138,15 @@ impl BlobHandler {
                 _ => return Err(BlobError::ReadError("unexpected read event".to_string())),
             },
         };
-        let written = self.write_blob(bucket, key, target, source.created_by, plain);
-        Ok(match Box::pin(written).await {
+        // A sealed target takes the share into its encoder; otherwise it is held until the end.
+        let reserved = target.encryption.and_then(|_| permit.take());
+        let size = Some(source.blob_size);
+        let created_by = source.created_by;
+        let written =
+            self.write_reserved_blob((bucket, key), target, created_by, plain, size, reserved);
+        let event = Box::pin(written).await;
+        drop(permit);
+        Ok(match event {
             BlobEvent::WriteFinished { location } => BlobEvent::CopyRewritten { location },
             other => other,
         })

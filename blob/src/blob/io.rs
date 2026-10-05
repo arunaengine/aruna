@@ -43,6 +43,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::{Instant, timeout, timeout_at};
 use ulid::Ulid;
 
@@ -424,7 +425,7 @@ impl BlobHandler {
         operator: Operator,
         blob: BackendStream<Result<Bytes, StreamError>>,
         compression: Compression,
-        seal: Option<SealPlan>,
+        (seal, reserved): (Option<SealPlan>, Option<OwnedSemaphorePermit>),
         size: Option<u64>,
     ) -> BlobEvent {
         let mut limits = WriteLimits::default();
@@ -439,9 +440,13 @@ impl BlobHandler {
         let encoder = match (seal, compression) {
             (Some(plan), _) => {
                 let covered = size.unwrap_or(super::pithos::GROWTH);
-                let permit = match self.reserve_pithos(working_set(covered)).await {
-                    Ok(permit) => permit,
-                    Err(error) => return BlobEvent::Error(error),
+                // A caller that already holds the share of this write passes it in.
+                let permit = match reserved {
+                    Some(permit) => permit,
+                    None => match self.reserve_pithos(working_set(covered)).await {
+                        Ok(permit) => permit,
+                        Err(error) => return BlobEvent::Error(error),
+                    },
                 };
                 let budget = Arc::clone(&self.pithos_budget);
                 match ArchiveEncoder::new(&plan, compression) {
@@ -1066,6 +1071,27 @@ impl BlobHandler {
         blob: BackendStream<Result<Bytes, StreamError>>,
         size: Option<u64>,
     ) -> BlobEvent {
+        let written = self.write_reserved_blob(
+            (request_bucket, request_key),
+            resolved,
+            created_by,
+            blob,
+            size,
+            None,
+        );
+        Box::pin(written).await
+    }
+
+    /// Like `write_sized_blob`, with the working-set share of a sealed write already reserved.
+    pub(super) async fn write_reserved_blob(
+        &self,
+        (request_bucket, request_key): (&str, &str),
+        resolved: ResolvedBackend,
+        created_by: UserId,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+        size: Option<u64>,
+        reserved: Option<OwnedSemaphorePermit>,
+    ) -> BlobEvent {
         let root = match self.registry.config_for(&resolved.backend) {
             Ok(config) => config.root.clone(),
             Err(err) => return BlobEvent::Error(err),
@@ -1115,7 +1141,7 @@ impl BlobHandler {
             operator,
             blob,
             resolved.compression,
-            resolved.encryption,
+            (resolved.encryption, reserved),
             size,
         ))
         .await
