@@ -1139,7 +1139,7 @@ fn undersized_middle_rejected() {
         input.upload_id,
         vec![part_record(1, 5 * 1024 * 1024 - 1), part_record(2, 1)],
     );
-    let op = CompleteUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
 
     assert_eq!(
         op.extract_requested_parts(values),
@@ -1167,7 +1167,7 @@ fn undersized_final_allowed() {
         input.upload_id,
         vec![part_record(1, 5 * 1024 * 1024), part_record(2, 1)],
     );
-    let op = CompleteUploadOperation::new(input);
+    let mut op = CompleteUploadOperation::new(input);
 
     assert!(op.extract_requested_parts(values).is_ok());
 }
@@ -1783,4 +1783,83 @@ fn pending_schedules_promotion() {
     operation.final_location = Some(known);
     let effects = operation.finish_commit();
     assert!(!effects.contains(&promote));
+}
+
+#[test]
+fn omitted_parts_paged() {
+    // Many large omitted parts are read page by page and kept only as cleanup metadata; only
+    // the selected part keeps its piece record.
+    use aruna_core::structs::storage::multipart::PartPiece;
+    let (mut operation, _) = sealed_operation(&[b"first"]);
+    let upload_id = operation.input.upload_id;
+    operation.input.completed_parts = vec![CompleteMultipartPart {
+        part_number: 300,
+        etag: None,
+        expected_checksums: Vec::new(),
+    }];
+    operation.input.object_size = None;
+    let parts: Vec<MultipartPart> = (1..=400u16)
+        .map(|number| {
+            let mut part = part_record(number, 6 << 20);
+            part.location.hashes = Hasher::new_with_bytes(b"part").to_map();
+            part.piece = Some(PartPiece {
+                record: vec![7; 4096],
+                stored_len: (6 << 20) + 40,
+                content_offset: None,
+            });
+            part
+        })
+        .collect();
+    let values = part_values(upload_id, parts);
+    let (first, second) = values.split_at(PART_PAGE);
+    let next = first.last().unwrap().0.clone();
+    operation.state = CompleteUploadState::ReadUploadParts;
+    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+        values: first.to_vec(),
+        next_start_after: Some(next.clone()),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Iter { start: Some(IterStart::After(after)), limit, .. })]
+            if *after == next && *limit == PART_PAGE
+    ));
+    // Omitted parts already read hold no piece record while the next page loads.
+    assert!(
+        operation
+            .upload_parts
+            .iter()
+            .all(|part| part.piece.is_none())
+    );
+    assert_eq!(operation.selected_parts.len(), 0);
+
+    operation.step(Event::Storage(StorageEvent::IterResult {
+        values: second.to_vec(),
+        next_start_after: None,
+    }));
+    assert_eq!(operation.upload_parts.len(), 400);
+    assert!(
+        operation
+            .upload_parts
+            .iter()
+            .all(|part| part.piece.is_none())
+    );
+    assert_eq!(operation.resolved_parts.len(), 1);
+    assert_eq!(operation.resolved_parts[0].part_number, 300);
+    assert!(operation.resolved_parts[0].piece.is_some());
+}
+
+#[test]
+fn share_outlives_compose() {
+    // The completion keeps its reservation after composition starts, while publication still
+    // holds the selected piece records.
+    let (mut operation, location) = sealed_operation(&[b"first"]);
+    let share = operation.compose_share.clone().unwrap();
+    let effects = operation.compose_blob();
+    let [Effect::Blob(BlobEffect::ComposePieces { share: sent, .. })] = effects.as_slice() else {
+        panic!("expected a piece composition, got {effects:?}")
+    };
+    assert_eq!(*sent, share);
+    operation.step_composed(location);
+    assert!(operation.resolved_parts[0].piece.is_some());
+    assert_eq!(operation.compose_share, Some(share));
 }

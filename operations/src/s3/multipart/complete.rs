@@ -24,7 +24,7 @@ use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_rea
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup, delete_records_effect};
 use aruna_blob::hash::{Hasher, combine_crcs};
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -60,6 +60,9 @@ use std::time::SystemTime;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
+
+/// Part rows read per page.
+const PART_PAGE: usize = 256;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum CompleteUploadState {
@@ -265,8 +268,11 @@ pub struct CompleteUploadOperation {
     /// The reset that returns the record to `Open` has already been taken, so
     /// no later cleanup step may take it a second time.
     reset_done: bool,
-    /// Working set of a sealed composition, reserved before the piece records load.
+    /// Working set of a sealed composition, reserved before the piece records load. It stays
+    /// until the operation drops the selected piece records.
     compose_share: Option<WorkingShare>,
+    /// Selected parts with their piece records, gathered while the part rows are paged.
+    selected_parts: HashMap<u16, MultipartPart>,
 }
 
 impl CompleteUploadOperation {
@@ -304,6 +310,7 @@ impl CompleteUploadOperation {
             compression: Compression::Off,
             reset_done: false,
             compose_share: None,
+            selected_parts: HashMap::new(),
         }
     }
 
@@ -714,7 +721,7 @@ impl CompleteUploadOperation {
                 self.txn_id = None;
                 let sealed = (self.upload_record.as_ref()).is_some_and(|u| u.encryption.is_some());
                 if !sealed {
-                    return self.read_parts();
+                    return self.read_parts(None);
                 }
                 // Piece records are large, so the composition's share comes before they load.
                 let parts = self.input.completed_parts.len() as u64;
@@ -738,14 +745,15 @@ impl CompleteUploadOperation {
         match event {
             Event::Blob(BlobEvent::ComposeReserved { share }) => {
                 self.compose_share = Some(share);
-                self.read_parts()
+                self.read_parts(None)
             }
             Event::Blob(BlobEvent::Error(error)) => self.schedule_error(error.into()),
             _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
         }
     }
 
-    fn read_parts(&mut self) -> Effects {
+    /// Reads one page of part rows; only the selected parts keep their piece records.
+    fn read_parts(&mut self, after: Option<aruna_core::types::Key>) -> Effects {
         self.state = CompleteUploadState::ReadUploadParts;
         let prefix = match MultipartPartKey::prefix(self.input.upload_id) {
             Ok(prefix) => prefix,
@@ -754,28 +762,44 @@ impl CompleteUploadOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: UPLOAD_PART_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
-            start: None,
-            limit: 10_000,
+            start: after.map(IterStart::After),
+            limit: PART_PAGE,
             txn_id: None,
         })]
     }
 
+    /// Keeps every part as cleanup metadata without its piece record, and the selected parts
+    /// in full.
+    fn collect_parts(
+        &mut self,
+        values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>,
+    ) -> Result<(), CompleteUploadError> {
+        let requested: std::collections::HashSet<u16> = (self.input.completed_parts.iter())
+            .map(|part| part.part_number)
+            .collect();
+        for (key, value) in values {
+            let part_key = MultipartPartKey::from_bytes(key.as_ref())?;
+            let mut part_record = MultipartPart::from_bytes(value.as_ref())?;
+            if requested.contains(&part_key.part_number) {
+                self.selected_parts
+                    .insert(part_key.part_number, part_record.clone());
+            }
+            part_record.piece = None;
+            self.upload_parts.push(part_record);
+        }
+        Ok(())
+    }
+
     fn extract_requested_parts(
-        &self,
+        &mut self,
         values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>,
     ) -> Result<(Vec<MultipartPart>, Vec<MultipartPart>), CompleteUploadError> {
         if self.input.completed_parts.is_empty() {
             return Err(CompleteUploadError::MissingParts);
         }
-
-        let mut all_parts = HashMap::new();
-        let mut upload_parts = Vec::new();
-        for (key, value) in values {
-            let part_key = MultipartPartKey::from_bytes(key.as_ref())?;
-            let part_record = MultipartPart::from_bytes(value.as_ref())?;
-            upload_parts.push(part_record.clone());
-            all_parts.insert(part_key.part_number, part_record);
-        }
+        self.collect_parts(values)?;
+        let mut all_parts = std::mem::take(&mut self.selected_parts);
+        let upload_parts = std::mem::take(&mut self.upload_parts);
 
         let mut previous = None;
         let mut resolved = Vec::with_capacity(self.input.completed_parts.len());
@@ -791,7 +815,7 @@ impl CompleteUploadOperation {
             }
             previous = Some(requested.part_number);
 
-            let Some(record) = all_parts.get(&requested.part_number).cloned() else {
+            let Some(record) = all_parts.remove(&requested.part_number) else {
                 return Err(CompleteUploadError::InvalidPart);
             };
             // Compose stays same-backend: a part elsewhere means a routing bug.
@@ -825,9 +849,19 @@ impl CompleteUploadOperation {
     }
 
     fn upload_parts_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
+        if let Some(next) = next_start_after.filter(|_| values.len() == PART_PAGE) {
+            if let Err(err) = self.collect_parts(values) {
+                return self.schedule_error(err);
+            }
+            return self.read_parts(Some(next));
+        }
 
         let (resolved, upload_parts) = match self.extract_requested_parts(values) {
             Ok(parts) => parts,
@@ -937,7 +971,8 @@ impl CompleteUploadOperation {
                 ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone())
                     .with_compression(encryption.compression)
                     .with_encryption(Some(encryption.plan));
-            let Some(share) = self.compose_share.take() else {
+            // The operation keeps its clone while it holds the piece records.
+            let Some(share) = self.compose_share.clone() else {
                 return self.schedule_error(CompleteUploadError::InvalidOperationState);
             };
             self.state = CompleteUploadState::ComposeBlob;
