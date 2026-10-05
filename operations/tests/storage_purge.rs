@@ -754,6 +754,7 @@ fn purge_result(
         JobRunOutcome::Deferred(error) => panic!("purge was deferred: {}", error.message),
         JobRunOutcome::Cancelled => panic!("purge was cancelled"),
         JobRunOutcome::Interrupted => panic!("purge was interrupted"),
+        JobRunOutcome::AwaitingKey(_) => panic!("purge was awaiting a key"),
     }
 }
 
