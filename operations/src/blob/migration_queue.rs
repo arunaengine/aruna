@@ -311,7 +311,7 @@ async fn pending_on_source(
             .map(|(_, value)| BackendLocation::from_bytes(value.as_ref()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
-        count += uses_key(&locations, source);
+        count += uses_key(&locations, source, record);
         match cursor {
             Some(cursor) => after = Some(cursor),
             None => return Ok(count),
@@ -319,11 +319,15 @@ async fn pending_on_source(
     }
 }
 
-/// How many of `locations` are sealed to `source`.
-fn uses_key(locations: &[BackendLocation], source: BucketKeyRef) -> u64 {
+/// How many of `locations` are sealed to `source` and still need `record`.
+fn uses_key(
+    locations: &[BackendLocation],
+    source: BucketKeyRef,
+    record: &EncryptionTransition,
+) -> u64 {
     let sealed = locations
         .iter()
-        .filter(|location| location.format.bucket_key() == Some(source));
+        .filter(|location| location.format.bucket_key() == Some(source) && record.needs(location));
     sealed.count() as u64
 }
 
@@ -668,8 +672,13 @@ mod tests {
             pending(None),
             pending(Some(source)),
         ];
-        assert_eq!(uses_key(&locations, source), 2);
-        assert_eq!(uses_key(&locations[1..4], source), 0);
+        let target = TransitionTarget {
+            compression: Compression::Off,
+            plan: None,
+        };
+        let record = EncryptionTransition::new(TransitionKind::Decrypt, Some(source), target, 2, 1);
+        assert_eq!(uses_key(&locations, source, &record), 2);
+        assert_eq!(uses_key(&locations[1..4], source, &record), 0);
     }
 
     fn context(root: &std::path::Path) -> DriverContext {
@@ -695,6 +704,73 @@ mod tests {
             event,
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn pending_target_settles() {
+        use aruna_core::structs::storage::format::StoredLayout;
+        for generation in [1, 2] {
+            let directory = tempfile::tempdir().unwrap();
+            let context = context(directory.path());
+            let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
+            let plan = SealPlan {
+                key: source,
+                public_key: [4; 32],
+                cipher: Default::default(),
+                block_keys: Default::default(),
+                storage_generation: 2,
+            };
+            let target = TransitionTarget {
+                compression: Compression::Off,
+                plan: Some(plan),
+            };
+            let mut record =
+                EncryptionTransition::new(TransitionKind::Reencode, Some(source), target, 2, 1);
+            record.state = TransitionState::Cleanup;
+            put(
+                &context,
+                TRANSITION_KEYSPACE,
+                b"b".to_vec(),
+                record.to_bytes().unwrap(),
+            )
+            .await;
+            put(
+                &context,
+                TRANSITION_QUEUE_KEYSPACE,
+                b"b".to_vec(),
+                Vec::new(),
+            )
+            .await;
+            let mut location = pending(Some(source));
+            let StoredLayout::Pithos(layout) = &mut location.format.layout else {
+                panic!("expected Pithos")
+            };
+            layout.storage_generation = generation;
+            let archive = aruna_core::structs::storage::blob::ArchiveKey::of(&location);
+            put(
+                &context,
+                PENDING_LOCATION_KEYSPACE,
+                archive.to_bytes(),
+                location.to_bytes().unwrap(),
+            )
+            .await;
+            let wait = settle(&context, "b", record).await.unwrap();
+            let stored = read_record(&context.storage_handle, "b")
+                .await
+                .unwrap()
+                .unwrap();
+            if generation == 2 {
+                assert_eq!(wait, None);
+                assert_eq!(stored.reported_state(), TransitionState::Finished);
+                assert!(stored.finished_at_ms.is_some());
+            } else {
+                assert_eq!(wait, Some(RECHECK));
+                assert_eq!(
+                    (stored.state, stored.remaining, stored.finished_at_ms),
+                    (TransitionState::Blocked, 1, None)
+                );
+            }
+        }
     }
 
     #[tokio::test]
