@@ -237,8 +237,17 @@ pub(crate) fn key_refusal(error: &BucketKeyError) -> ServerError {
 pub(crate) fn blob_refusal(error: BlobError) -> ServerError {
     match error {
         BlobError::BucketKey(error) => key_refusal(&error),
+        BlobError::SizeLimitExceeded { limit } => {
+            refused(StatusCode::CONFLICT, "object_too_large", &too_large(limit))
+        }
         other => ServerError::InternalError(other.to_string()),
     }
+}
+
+/// The refusal text for an object above the encryption ceiling, in bytes and TiB.
+pub(crate) fn too_large(limit: u64) -> String {
+    let tib = limit as f64 / (1u64 << 40) as f64;
+    format!("an object is larger than the {limit} byte ({tib:.2} TiB) limit of encrypted objects")
 }
 
 pub(crate) fn settings_refusal(error: SettingsError) -> ServerError {
@@ -583,7 +592,7 @@ pub async fn get_bucket_encryption(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
-        (status = 409, description = "`stale_generation`, `open_uploads`, `recovery_unmet`, `bucket_locked`, `transition_running`, or `unchanged` when the settings already apply", body = ErrorResponse)
+        (status = 409, description = "`stale_generation`, `open_uploads`, `recovery_unmet`, `bucket_locked`, `transition_running`, `object_too_large` when a stored object exceeds the encryption size limit, or `unchanged` when the settings already apply", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1059,6 +1068,17 @@ mod tests {
             .response_body()
             .code;
         assert_eq!(code.as_deref(), Some("transition_running"));
+    }
+
+    #[test]
+    fn oversized_object_conflicts() {
+        let limit = 1u64 << 40;
+        let error = EnableError::Blob(BlobError::SizeLimitExceeded { limit });
+        let refusal = enable_refusal(error);
+        assert_eq!(refusal.status_code(), StatusCode::CONFLICT);
+        let body = refusal.response_body();
+        assert_eq!(body.code.as_deref(), Some("object_too_large"));
+        assert!(body.error.contains("1099511627776 byte (1.00 TiB)"));
     }
 
     #[test]

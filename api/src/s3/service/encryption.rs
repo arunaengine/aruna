@@ -4,9 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::ArunaS3Service;
-use crate::routes::storage::encryption::{EncryptionRequest, enable_bucket};
+use crate::routes::storage::encryption::{EncryptionRequest, enable_bucket, too_large};
 use crate::s3::auth::map_authorize_error;
 use crate::s3::error::IntoS3Error;
+use aruna_core::errors::BlobError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::blob::UserAccess;
@@ -167,6 +168,9 @@ fn enable_error(error: EnableError) -> S3Error {
             )
         }
         EnableError::NotAdmin => s3_error!(AccessDenied, "The caller is no group admin"),
+        EnableError::Blob(BlobError::SizeLimitExceeded { limit }) => {
+            s3_error!(InvalidRequest, "{}", too_large(limit))
+        }
         other => s3_error!(InternalError, "{}", other),
     }
 }
@@ -216,5 +220,13 @@ mod tests {
     fn running_transition_aborts() {
         let error = enable_error(EnableError::TransitionRunning);
         assert_eq!(error.code(), &S3ErrorCode::OperationAborted);
+    }
+
+    #[test]
+    fn oversized_object_invalid() {
+        let limit = 1u64 << 40;
+        let error = enable_error(EnableError::Blob(BlobError::SizeLimitExceeded { limit }));
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert!(error.message().unwrap().contains("1099511627776 byte"));
     }
 }
