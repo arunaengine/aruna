@@ -4663,4 +4663,241 @@ mod tests {
             Ok(ReplicationSuboperationResult::ReplicatedBytes(42))
         );
     }
+
+    /// Encrypted copies: the source decides after the target's answer and its own settings.
+    mod sealed {
+        use super::*;
+        use aruna_core::errors::BlobError;
+        use aruna_core::structs::storage::blob::ArchiveKey;
+        use aruna_core::structs::storage::encryption::{
+            BucketEncryption, BucketKeyError, BucketKeyRef, EncryptionMode, ReadLease, SealPlan,
+        };
+        use aruna_core::structs::storage::format::PithosLayout;
+        use std::sync::Arc;
+
+        fn source_key() -> BucketKeyRef {
+            BucketKeyRef::new(Ulid::from_parts(70, 70), 2)
+        }
+
+        fn target_plan() -> SealPlan {
+            SealPlan {
+                key: BucketKeyRef::new(Ulid::from_parts(71, 71), 1),
+                public_key: [5; 32],
+                cipher: Default::default(),
+                block_keys: Default::default(),
+                storage_generation: 4,
+            }
+        }
+
+        fn sealed_location() -> BackendLocation {
+            let mut location = materialized_location();
+            let layout = PithosLayout {
+                stored_size: 99,
+                metadata_digest: [3; 32],
+                storage_generation: 1,
+            };
+            location.format = StoredFormat::pithos(layout, source_key());
+            location
+        }
+
+        fn encrypting() -> Event {
+            let settings = BucketEncryption {
+                mode: EncryptionMode::VaultLocked,
+                bucket_id: Some(source_key().bucket_id),
+                key_generation: source_key().generation,
+                ..Default::default()
+            };
+            Event::Storage(StorageEvent::ReadResult {
+                key: vec![3u8].into(),
+                value: Some(settings.to_bytes().unwrap().into()),
+            })
+        }
+
+        /// An operation that sent the manifest of `location` and waits for the target's answer.
+        fn negotiating(location: BackendLocation, plaintext: bool) -> ReplicateObjectOperation {
+            let version_id = Ulid::generate();
+            let mut op = ReplicateObjectOperation::new(version_request(version_id))
+                .with_plaintext(plaintext);
+            op.replication_version = Some(ReplicationVersion::Materialized {
+                created_at: SystemTime::now(),
+                created_by: test_user_id(),
+                location,
+                source: None,
+                metadata: HashMap::new(),
+            });
+            op.build_manifest(None).unwrap();
+            op.stream_id = Some(Ulid::generate());
+            op.state = ReplicateObjectState::AwaitNegotiation;
+            op
+        }
+
+        fn answer(op: &mut ReplicateObjectOperation, result: ReplicationNegotiationResult) {
+            let payload = VersionReplicationMessage::VersionNegotiationResponse(result)
+                .to_bytes()
+                .unwrap();
+            let stream_id = op.stream_id.unwrap();
+            let effects = op.step(Event::Blob(BlobEvent::MessageReceived {
+                stream_id,
+                payload,
+            }));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                    if key_space == aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE
+            ));
+        }
+
+        fn admitted(key: BucketKeyRef, location: &BackendLocation) -> Event {
+            let lease = ReadLease::new(key, ArchiveKey::of(location), Ulid::nil(), Arc::new(()));
+            Event::Blob(BlobEvent::ReadAdmitted { lease })
+        }
+
+        #[test]
+        fn plain_target_refused() {
+            // Without a permitted plaintext request no byte of an encrypted source leaves.
+            for result in [
+                ReplicationNegotiationResult::NeedBlobVersion,
+                ReplicationNegotiationResult::NeedVersionOnly,
+            ] {
+                let mut op = negotiating(sealed_location(), false);
+                answer(&mut op, result);
+                let effects = op.step(encrypting());
+                assert!(matches!(
+                    effects.as_slice(),
+                    [Effect::Blob(BlobEffect::CloseConnection { .. })]
+                ));
+                let error = op.finalize().unwrap_err();
+                assert_eq!(error, ReplicateObjectError::PlaintextRefused);
+                assert_eq!(
+                    error.failure_category(),
+                    ReplicationFailure::PlaintextRefused
+                );
+            }
+        }
+
+        #[test]
+        fn plaintext_copy_leased() {
+            // A holder's plaintext request decrypts under a lease on today's path.
+            let location = sealed_location();
+            let mut op = negotiating(location.clone(), true);
+            answer(&mut op, ReplicationNegotiationResult::NeedBlobVersion);
+            let effects = op.step(encrypting());
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::AdmitRead { key, .. })] if *key == source_key()
+            ));
+            let effects = op.step(admitted(source_key(), &location));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::ReplicateLeased {
+                    regrant: None,
+                    ..
+                })]
+            ));
+        }
+
+        #[test]
+        fn sealed_target_regrants() {
+            // An encrypting target gets the archive granted to its own key.
+            let location = sealed_location();
+            let mut op = negotiating(location.clone(), false);
+            answer(
+                &mut op,
+                ReplicationNegotiationResult::NeedSealedBlob(target_plan()),
+            );
+            op.step(encrypting());
+            let effects = op.step(admitted(source_key(), &location));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::ReplicateLeased { regrant: Some(plan), .. })]
+                    if **plan == target_plan()
+            ));
+        }
+
+        #[test]
+        fn locked_source_waits() {
+            // A locked source key ends the item without an error; its job parks.
+            let location = sealed_location();
+            let mut op = negotiating(location, false);
+            answer(
+                &mut op,
+                ReplicationNegotiationResult::NeedSealedBlob(target_plan()),
+            );
+            op.step(encrypting());
+            let locked = BlobError::BucketKey(BucketKeyError::Locked(source_key().bucket_id));
+            let effects = op.step(Event::Blob(BlobEvent::Error(locked)));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::CloseConnection { .. })]
+            ));
+            let stream_id = op.stream_id.unwrap();
+            op.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
+            assert_eq!(
+                op.finalize(),
+                Ok(ReplicationSuboperationResult::AwaitingKey(source_key()))
+            );
+        }
+
+        #[test]
+        fn plain_source_sealed_remotely() {
+            // A plain bucket sends plaintext to an encrypting target, which seals it itself.
+            let mut op = negotiating(materialized_location(), false);
+            answer(
+                &mut op,
+                ReplicationNegotiationResult::NeedSealedBlob(target_plan()),
+            );
+            let effects = op.step(plain_settings());
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::Replicate { .. })]
+            ));
+        }
+
+        #[test]
+        fn pending_source_waits() {
+            // A pending source version waits for its key before any connection opens.
+            let location = sealed_location();
+            let archive = ArchiveKey::of(&location);
+            let pending = BlobVersion::pending(archive, SystemTime::now(), test_user_id(), None);
+            let mut op = ReplicateObjectOperation::new(version_request(Ulid::generate()));
+            op.start();
+            let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+                key: vec![1u8].into(),
+                value: Some(pending.to_bytes().unwrap().into()),
+            }));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                    if key_space == aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE
+            ));
+            let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+                key: vec![2u8].into(),
+                value: Some(location.to_bytes().unwrap().into()),
+            }));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::AdmitRead { .. })]
+            ));
+            let locked = BlobError::BucketKey(BucketKeyError::Locked(source_key().bucket_id));
+            op.step(Event::Blob(BlobEvent::Error(locked)));
+            assert!(op.is_complete());
+            assert_eq!(
+                op.finalize(),
+                Ok(ReplicationSuboperationResult::AwaitingKey(source_key()))
+            );
+        }
+
+        #[test]
+        fn scope_collects_waits() {
+            let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
+            op.state = ReplicateScopeState::RunVersionReplication;
+            let result = Ok(ReplicationSuboperationResult::AwaitingKey(source_key()));
+            op.step(Event::SubOperation(
+                SubOperationEvent::ReplicationItemResult { result },
+            ));
+            let result = op.finalize().unwrap();
+            assert_eq!(result.awaiting, vec![source_key()]);
+            assert_eq!(result.failed, 0);
+        }
+    }
 }
