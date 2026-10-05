@@ -535,4 +535,92 @@ mod tests {
         };
         assert!(decode_index(value.as_ref()).unwrap().is_empty());
     }
+
+    #[tokio::test]
+    async fn revoke_deletes_tokens() {
+        use aruna_core::structs::storage::encryption::BucketKeyRef;
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let user_access = UserAccess {
+            access_key: "tokenkey".to_string(),
+            user_identity: Default::default(),
+            group_id: Ulid::generate(),
+            secret: aruna_core::credential_encryption::EncryptedS3Secret::empty(),
+            expiry: SystemTime::now() + Duration::from_secs(3600),
+            path_restrictions: None,
+            issued_by: [0u8; 32],
+            revoked_at: None,
+        };
+        let write = |key_space: &str, key: Vec<u8>, value: Vec<u8>| StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        };
+        storage_handle
+            .send_storage_effect(write(
+                USER_ACCESS_KEYSPACE,
+                b"tokenkey".to_vec(),
+                user_access.to_bytes().unwrap(),
+            ))
+            .await;
+        // Copies of two buckets, and one of another credential whose key extends this one.
+        let copy = |access_key: &str, bucket: u8| TokenCopy {
+            key: BucketKeyRef::new(Ulid::from_bytes([bucket; 16]), 1),
+            access_key: access_key.to_string(),
+            created_by: user_access.user_identity,
+            nonce: [0; 12],
+            ciphertext: vec![0; 48],
+            created_at_ms: 1,
+        };
+        let copies = [
+            copy("tokenkey", 1),
+            copy("tokenkey", 2),
+            copy("tokenkeyx", 1),
+        ];
+        for copy in &copies {
+            let value = copy.to_bytes().unwrap();
+            storage_handle
+                .send_storage_effect(write(KEY_COPY_KEYSPACE, copy.key(), value))
+                .await;
+            storage_handle
+                .send_storage_effect(write(TOKEN_INDEX_KEYSPACE, copy.index_key(), Vec::new()))
+                .await;
+        }
+
+        drive(
+            RevokeUserOperation::new("tokenkey".to_string()),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+
+        for (copy, kept) in copies.iter().zip([false, false, true]) {
+            for (key_space, key) in [
+                (KEY_COPY_KEYSPACE, copy.key()),
+                (TOKEN_INDEX_KEYSPACE, copy.index_key()),
+            ] {
+                let read = StorageEffect::Read {
+                    key_space: key_space.to_string(),
+                    key: key.into(),
+                    txn_id: None,
+                };
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) =
+                    storage_handle.send_storage_effect(read).await
+                else {
+                    panic!("token row read failed");
+                };
+                assert_eq!(value.is_some(), kept, "{key_space} of {}", copy.access_key);
+            }
+        }
+    }
 }
