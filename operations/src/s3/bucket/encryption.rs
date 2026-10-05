@@ -12,7 +12,7 @@ use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{BUCKET_HOLDER_KEYSPACE, UPLOAD_KEYSPACE};
+use aruna_core::keyspaces::{BUCKET_HOLDER_KEYSPACE, TRANSITION_KEYSPACE, UPLOAD_KEYSPACE};
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
@@ -25,6 +25,7 @@ use aruna_core::structs::storage::holders::{
     HolderReport, KeyLookup, RecoveryState, resolve_holders,
 };
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
+use aruna_core::structs::storage::transition::EncryptionTransition;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use aruna_core::{NodeId, UserId};
@@ -39,6 +40,7 @@ enum EnableState {
     StartTransaction,
     ReadBucket,
     CheckUploads,
+    ReadTransition,
     ReadGrants,
     GenerateKey,
     SealCopies,
@@ -70,6 +72,9 @@ pub enum EnableError {
     InvalidMode,
     #[error("the bucket has open multipart uploads")]
     OpenUploads,
+    /// Replacing an unfinished decryption would strand the copies it still has to move.
+    #[error("the bucket's stored copies are still moving to a new encryption")]
+    TransitionRunning,
     /// `vault_locked` needs two ready holders, or one whose key declares a recovery code.
     #[error("the key holders do not meet the recovery rule")]
     RecoveryUnmet,
@@ -194,6 +199,27 @@ impl EnableEncryptionOperation {
     fn check_uploads(&mut self, uploads: &[(Key, Value)]) -> Effects {
         if uploads_open(uploads, &self.input.bucket) {
             return self.fail(EnableError::OpenUploads);
+        }
+        if self.settings.bucket_id.is_none() {
+            return self.generate();
+        }
+        // A bucket that was encrypted before may still run its decryption.
+        self.state = EnableState::ReadTransition;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: TRANSITION_KEYSPACE.to_string(),
+            key: self.input.bucket.as_bytes().to_vec().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn check_transition(&mut self, value: Option<Value>) -> Effects {
+        let transition = value.map(|value| EncryptionTransition::from_bytes(value.as_ref()));
+        match transition.transpose() {
+            Ok(Some(transition)) if transition.finished_at_ms.is_none() => {
+                return self.fail(EnableError::TransitionRunning);
+            }
+            Ok(_) => {}
+            Err(error) => return self.fail(error),
         }
         let Some(bucket_id) = self.settings.bucket_id else {
             return self.generate();
@@ -394,6 +420,10 @@ impl Operation for EnableEncryptionOperation {
                 EnableState::CheckUploads,
                 Event::Storage(StorageEvent::IterResult { values, .. }),
             ) => self.check_uploads(&values),
+            (
+                EnableState::ReadTransition,
+                Event::Storage(StorageEvent::ReadResult { value, .. }),
+            ) => self.check_transition(value),
             (EnableState::ReadGrants, Event::Storage(StorageEvent::IterResult { values, .. })) => {
                 let grants = values
                     .iter()

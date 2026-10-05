@@ -850,6 +850,7 @@ pub(crate) fn enable_refusal(error: EnableError) -> ServerError {
         EnableError::Key(error) => key_refusal(&error),
         EnableError::Blob(error) => blob_refusal(error),
         EnableError::NotAdmin => ServerError::Forbidden,
+        EnableError::TransitionRunning => transition_running(),
         EnableError::AlreadyEncrypted => refused(
             StatusCode::CONFLICT,
             "stale_generation",
@@ -1051,6 +1052,10 @@ mod tests {
         );
         assert_eq!(put_route(false, Some(&decrypt), off), PutRoute::Keep);
         let code = change_refusal(ChangeError::TransitionRunning)
+            .response_body()
+            .code;
+        assert_eq!(code.as_deref(), Some("transition_running"));
+        let code = enable_refusal(EnableError::TransitionRunning)
             .response_body()
             .code;
         assert_eq!(code.as_deref(), Some("transition_running"));

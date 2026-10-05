@@ -239,6 +239,61 @@ fn bucket_read(
 }
 
 #[test]
+fn decryption_blocks_enable() {
+    use aruna_core::keyspaces::{BUCKET_HOLDER_KEYSPACE, TRANSITION_KEYSPACE};
+    use aruna_core::structs::storage::transition::{
+        EncryptionTransition, TransitionKind, TransitionTarget,
+    };
+    // An `off` bucket that was encrypted keeps its id while the decryption still runs.
+    let decrypted = BucketEncryption {
+        bucket_id: Some(Ulid::from_bytes([6; 16])),
+        key_generation: 1,
+        ..Default::default()
+    };
+    let target = TransitionTarget {
+        compression: Compression::Off,
+        plan: None,
+    };
+    let source = BucketKeyRef::new(Ulid::from_bytes([6; 16]), 1);
+    let kind = TransitionKind::Decrypt;
+    let mut decrypt = EncryptionTransition::new(kind, Some(source), target, 1, 1);
+    let read = |operation: &mut EnableEncryptionOperation, transition: &EncryptionTransition| {
+        bucket_read(operation, Some(decrypted.clone()));
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == TRANSITION_KEYSPACE
+        ));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(transition.to_bytes().unwrap().into()),
+        }))
+    };
+
+    let mut operation =
+        EnableEncryptionOperation::new(input(EncryptionMode::NodeManaged, BTreeMap::new()));
+    let effects = read(&mut operation, &decrypt);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    assert_eq!(operation.finalize(), Err(EnableError::TransitionRunning));
+
+    // Once the decryption finished, the bucket enables again with its next generation.
+    decrypt.finished_at_ms = Some(9);
+    let mut operation =
+        EnableEncryptionOperation::new(input(EncryptionMode::NodeManaged, BTreeMap::new()));
+    let effects = read(&mut operation, &decrypt);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Iter { key_space, .. })] if key_space == BUCKET_HOLDER_KEYSPACE
+    ));
+}
+
+#[test]
 fn stale_generation_refused() {
     let mut operation =
         EnableEncryptionOperation::new(input(EncryptionMode::NodeManaged, BTreeMap::new()));

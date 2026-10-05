@@ -151,6 +151,10 @@ fn enable_error(error: EnableError) -> S3Error {
             OperationAborted,
             "Complete or abort the open multipart uploads before enabling encryption"
         ),
+        EnableError::TransitionRunning => s3_error!(
+            OperationAborted,
+            "The bucket's stored copies are still moving to a new encryption; retry later"
+        ),
         EnableError::RecoveryUnmet => s3_error!(
             InvalidRequest,
             "The bucket key holders do not meet the recovery rule"
@@ -206,5 +210,11 @@ mod tests {
             &S3ErrorCode::ServerSideEncryptionConfigurationNotFoundError
         );
         assert_eq!(error.status_code(), Some(http::StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn running_transition_aborts() {
+        let error = enable_error(EnableError::TransitionRunning);
+        assert_eq!(error.code(), &S3ErrorCode::OperationAborted);
     }
 }
