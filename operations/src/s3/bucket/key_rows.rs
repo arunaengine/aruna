@@ -7,8 +7,8 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
-    KEY_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
+    AUTH_KEYSPACE, BUCKET_AUDIT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE,
+    BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
@@ -24,6 +24,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 pub type Row = (String, Key, Value);
+
+/// The audit row of a key change, written in the same batch as the change it records.
+pub fn audit_row(
+    record: &aruna_core::structs::storage::key_audit::BucketAuditRecord,
+) -> Result<Row, ConversionError> {
+    let value = record.to_bytes()?;
+    Ok((
+        BUCKET_AUDIT_KEYSPACE.to_string(),
+        record.key().into(),
+        value.into(),
+    ))
+}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum SettingsError {
