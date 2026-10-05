@@ -4,6 +4,7 @@
 
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::managed_copy::ManagedCopyError;
+use crate::blob::promote::PromotePendingOperation;
 use crate::blob::records::blob_location_read;
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::driver::{DriverContext, drive};
@@ -15,6 +16,7 @@ use crate::replication::protocol::{
 use crate::replication::queue::{
     LiveObligationRecord, LiveVersionInput, LiveVersionOperation, live_obligation_entry,
 };
+use crate::s3::bucket::token_admit::{AdmitTokenOperation, TokenAdmitError, TokenAdmitInput};
 use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
     multipart_summary_read, summary_from_read,
@@ -26,11 +28,12 @@ use aruna_core::errors::{
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE, PENDING_LOCATION_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
+use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
@@ -40,7 +43,7 @@ use aruna_core::structs::storage::blob::{
     BlobVersionState, CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
 use aruna_core::structs::storage::encryption::{
-    BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
+    BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease, TokenCredential,
 };
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectKey, MultipartObjectSummary,
@@ -99,6 +102,8 @@ pub enum GetObjectState {
     CheckReferenceKey,
     Finish,
     Error,
+    /// A locked key is admitted with the request's token credential instead of the registry.
+    AdmitToken,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -176,6 +181,9 @@ pub enum GetObjectError {
     GetObjectFailed,
     #[error("operation did not finish")]
     NotFinished,
+    /// The version waits for its content hash; a token credential promotes it first.
+    #[error("The object content waits for its bucket key.")]
+    PendingContent(ArchiveKey),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -227,7 +235,7 @@ impl ObjectRangeRequest {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GetObjectInput {
     pub bucket: String,
     pub key: String,
@@ -323,6 +331,10 @@ pub struct GetObjectOperation {
     reference_key: Option<BucketKeyRef>,
     /// Admitted plaintext read of that bucket; the served stream keeps it until it ends.
     reference_lease: Option<ReadLease>,
+    /// The request's token credential, used once when the registry reports the key locked.
+    token: Option<TokenCredential>,
+    /// The token admission of a locked key and the admission state it answers.
+    token_admit: Option<(AdmitTokenOperation, GetObjectState)>,
 }
 
 impl GetObjectOperation {
@@ -362,12 +374,87 @@ impl GetObjectOperation {
             output: None,
             reference_key: None,
             reference_lease: None,
+            token: None,
+            token_admit: None,
         }
     }
 
     pub fn with_restrictions(mut self, restrictions: Option<Vec<PathRestriction>>) -> Self {
         self.restrictions = restrictions;
         self
+    }
+
+    /// Admits a read of a locked key with `token`, if the credential has a copy of the key.
+    pub fn with_token(mut self, token: Option<TokenCredential>) -> Self {
+        self.token = token;
+        self
+    }
+
+    /// The key and archive an admission state waits for.
+    fn admission(&self) -> Option<(BucketKeyRef, ArchiveKey)> {
+        let location = self.location.as_ref();
+        match self.state {
+            GetObjectState::AdmitRead => {
+                let location = location?;
+                Some((location.format.bucket_key()?, ArchiveKey::of(location)))
+            }
+            GetObjectState::AdmitPlain => Some((self.reference_key?, ArchiveKey::of(location?))),
+            GetObjectState::CheckReferenceKey => {
+                let key = self.reference_key?;
+                Some((key, reference_archive(key)))
+            }
+            _ => None,
+        }
+    }
+
+    /// A locked key with a token credential starts the token admission; the token is used once.
+    fn admit_token(&mut self, event: Event) -> Result<Effects, Event> {
+        let locked = matches!(
+            event,
+            Event::Blob(BlobEvent::Error(BlobError::BucketKey(
+                BucketKeyError::Locked(_)
+            )))
+        );
+        let Some((key, archive)) = self.admission().filter(|_| locked && self.token.is_some())
+        else {
+            return Err(event);
+        };
+        let Some(credential) = self.token.take() else {
+            return Err(event);
+        };
+        let mut operation = AdmitTokenOperation::new(TokenAdmitInput {
+            bucket: self.input.bucket.clone(),
+            group_id: self.input.group_id,
+            realm_id: self.input.user_identity.realm_id,
+            node_id: self.input.node_id,
+            key,
+            archive,
+            credential,
+        });
+        let effects = operation.start();
+        self.token_admit = Some((operation, self.state.clone()));
+        self.state = GetObjectState::AdmitToken;
+        Ok(effects)
+    }
+
+    /// Steps the token admission; its lease answers the admission state it stands in for.
+    fn token_step(&mut self, event: Event) -> Effects {
+        let Some((mut operation, resume)) = self.token_admit.take() else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        let effects = operation.step(event);
+        if !operation.is_complete() {
+            self.token_admit = Some((operation, resume));
+            return effects;
+        }
+        self.state = resume;
+        match operation.finalize() {
+            Ok(lease) => self.step(Event::Blob(BlobEvent::ReadAdmitted { lease })),
+            Err(TokenAdmitError::Key(error)) => self.emit_error(locked(error)),
+            Err(TokenAdmitError::Storage(error)) => self.emit_error(error.into()),
+            Err(TokenAdmitError::Conversion(error)) => self.emit_error(error.into()),
+            Err(_) => self.emit_error(GetObjectError::GetObjectFailed),
+        }
     }
 
     fn auth_context(&self) -> AuthContext {
@@ -575,6 +662,9 @@ impl GetObjectOperation {
                 self.version_created_at = None;
                 self.state = GetObjectState::ResolveReferenceAccess;
                 smallvec![resolve_binding_effect(ResolveBindingInput { source },)]
+            }
+            BlobVersionState::PendingContent { archive, .. } if self.token.is_some() => {
+                self.abort_with_error(GetObjectError::PendingContent(archive))
             }
             BlobVersionState::PendingContent { .. } => {
                 self.emit_error(ConversionError::BucketKey(BucketKeyError::Unsupported).into())
@@ -1526,6 +1616,10 @@ impl Operation for GetObjectOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        let event = match self.admit_token(event) {
+            Ok(effects) => return effects,
+            Err(event) => event,
+        };
         match &self.state {
             GetObjectState::Init => self.handle_init(),
             GetObjectState::StartTransaction => self.handle_transaction_started(event),
@@ -1554,6 +1648,7 @@ impl Operation for GetObjectOperation {
             GetObjectState::CheckReferenceKey => self.reference_key_checked(event),
             GetObjectState::Finish => smallvec![],
             GetObjectState::Error => self.abort(),
+            GetObjectState::AdmitToken => self.token_step(event),
         }
     }
 
@@ -1584,10 +1679,27 @@ pub async fn get_object_routed(
     input: GetObjectInput,
     restrictions: Option<Vec<PathRestriction>>,
 ) -> Result<GetObjectResult, GetObjectError> {
+    get_object_token(context, input, restrictions, None).await
+}
+
+/// The token credential of one S3 request and the limits of a promotion it starts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenRead {
+    pub credential: TokenCredential,
+    pub limits: RoCrateLimits,
+}
+
+/// `get_object_routed` where `token` admits a read of a locked bucket key. A pending version
+/// is promoted with the token first, then read like any other.
+pub async fn get_object_token(
+    context: &DriverContext,
+    input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+    token: Option<TokenRead>,
+) -> Result<GetObjectResult, GetObjectError> {
     let ranged = input.range.is_some();
     let user_id = input.user_identity;
-    let operation = GetObjectOperation::new(input).with_restrictions(restrictions.clone());
-    let result = drive(operation, context).await;
+    let result = read_local(context, input, restrictions.clone(), token.as_ref()).await;
     let Err(GetObjectError::BlobNotLocal {
         blake3,
         version_id,
@@ -1611,6 +1723,82 @@ pub async fn get_object_routed(
         restrictions,
     };
     routed_blob(context, read).await
+}
+
+/// Reads the local copy; with a token, a pending version is promoted once and read again.
+pub(crate) async fn read_local(
+    context: &DriverContext,
+    input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+    token: Option<&TokenRead>,
+) -> Result<GetObjectResult, GetObjectError> {
+    let operation = |input| {
+        GetObjectOperation::new(input)
+            .with_restrictions(restrictions.clone())
+            .with_token(token.map(|token| token.credential.clone()))
+    };
+    let Some(token) = token else {
+        return drive(operation(input), context).await;
+    };
+    match drive(operation(input.clone()), context).await {
+        Err(GetObjectError::PendingContent(archive)) => {
+            promote_token(context, &input, archive, token).await?;
+            drive(operation(input), context).await
+        }
+        result => result,
+    }
+}
+
+/// Promotes the pending `archive` with a lease the token admits, as an unlock would.
+async fn promote_token(
+    context: &DriverContext,
+    input: &GetObjectInput,
+    archive: ArchiveKey,
+    token: &TokenRead,
+) -> Result<(), GetObjectError> {
+    let read = StorageEffect::Read {
+        key_space: PENDING_LOCATION_KEYSPACE.to_string(),
+        key: archive.to_bytes().into(),
+        txn_id: None,
+    };
+    let value = match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        _ => return Err(GetObjectError::GetObjectFailed),
+    };
+    // Promoted in between: the second read finds the content hash.
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let location = BackendLocation::from_bytes(&value)?;
+    let key = location
+        .format
+        .bucket_key()
+        .ok_or(GetObjectError::GetObjectFailed)?;
+    let (realm_id, node_id) = (input.user_identity.realm_id, input.node_id);
+    let admit = AdmitTokenOperation::new(TokenAdmitInput {
+        bucket: input.bucket.clone(),
+        group_id: input.group_id,
+        realm_id,
+        node_id,
+        key,
+        archive: archive.clone(),
+        credential: token.credential.clone(),
+    });
+    let lease = drive(admit, context).await.map_err(|error| match error {
+        TokenAdmitError::Key(error) => locked(error),
+        TokenAdmitError::Storage(error) => error.into(),
+        TokenAdmitError::Conversion(error) => error.into(),
+        _ => GetObjectError::GetObjectFailed,
+    })?;
+    let promote = PromotePendingOperation::new(archive, realm_id, node_id, token.limits.clone());
+    drive(promote.with_lease(lease), context)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            warn!(error = %error, "Token promotion of a pending version failed");
+            GetObjectError::GetObjectFailed
+        })
 }
 
 /// Resolves complete object facts without transferring holder bytes.

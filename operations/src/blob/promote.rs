@@ -23,7 +23,7 @@ use aruna_core::structs::storage::blob::{
     BlobVersionState, BucketInfo, CopyOwner, ManagedCopyKey, ManagedCopyRecord, VersionKey,
 };
 use aruna_core::structs::storage::encryption::{
-    BucketKeyError, BucketKeyRecord, BucketKeyRef, KeyState,
+    BucketKeyError, BucketKeyRecord, BucketKeyRef, KeyState, ReadLease,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -115,6 +115,8 @@ pub struct PromotePendingOperation {
     groups: HashMap<String, Ulid>,
     promoted: usize,
     output: Option<Result<Promotion, PromoteError>>,
+    /// A read admitted outside the unlock registry, such as with a token credential.
+    lease: Option<ReadLease>,
 }
 
 impl PromotePendingOperation {
@@ -142,7 +144,14 @@ impl PromotePendingOperation {
             groups: HashMap::new(),
             promoted: 0,
             output: None,
+            lease: None,
         }
+    }
+
+    /// Hashes the archive under `lease` instead of a registry admission.
+    pub fn with_lease(mut self, lease: ReadLease) -> Self {
+        self.lease = Some(lease);
+        self
     }
 
     fn finish(&mut self, output: Result<Promotion, PromoteError>) -> Effects {
@@ -200,6 +209,11 @@ impl PromotePendingOperation {
         };
         self.location = Some(location);
         self.state = State::Admit;
+        let archive = &self.archive;
+        let lease = self.lease.take();
+        if let Some(lease) = lease.filter(|lease| lease.key == key && &lease.archive == archive) {
+            return self.handle_admit(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        }
         smallvec![Effect::Blob(BlobEffect::AdmitRead {
             key,
             archive: self.archive.clone(),

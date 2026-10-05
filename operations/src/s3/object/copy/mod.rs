@@ -8,9 +8,10 @@ use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     routing_snapshot,
 };
+use crate::s3::bucket::token_admit::{AdmitTokenOperation, TokenAdmitError, TokenAdmitInput};
 use crate::s3::object::copy::sealed::{SealedCopyError, SealedCopyInput, SealedCopyOperation};
 use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectOperation, reference_archive,
+    GetObjectError, GetObjectInput, TokenRead, read_local, reference_archive,
 };
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
@@ -33,7 +34,7 @@ use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBind
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BackendLocation;
-use aruna_core::structs::storage::encryption::BucketEncryption;
+use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError};
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::resolve_backend;
 use aruna_core::types::GroupId;
@@ -220,6 +221,24 @@ pub async fn copy_object_tracked(
     input: CopyObjectInput,
     progress: Option<Arc<AtomicU64>>,
 ) -> Result<CopyResultData, CopyObjectError> {
+    copy_inner(context, input, progress, None).await
+}
+
+/// `copy_object` where `token` admits the source read while its bucket key is locked.
+pub async fn copy_object_token(
+    context: &DriverContext,
+    input: CopyObjectInput,
+    token: Option<TokenRead>,
+) -> Result<CopyResultData, CopyObjectError> {
+    copy_inner(context, input, None, token.as_ref()).await
+}
+
+async fn copy_inner(
+    context: &DriverContext,
+    input: CopyObjectInput,
+    progress: Option<Arc<AtomicU64>>,
+    token: Option<&TokenRead>,
+) -> Result<CopyResultData, CopyObjectError> {
     ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
         .await
         .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
@@ -262,7 +281,7 @@ pub async fn copy_object_tracked(
     if head.location.is_none() && input.references == CopyReferences::Preserve {
         // Another bucket reads the reference without the source's lock, so admit it here.
         if input.source_bucket != input.dest_bucket {
-            admit_source(context, &input.source_bucket).await?;
+            admit_source(context, &input, token).await?;
         }
         return preserve_reference(context, input, head, source_last_modified).await;
     }
@@ -273,20 +292,17 @@ pub async fn copy_object_tracked(
         return sealed_copy(context, input, head, location, source_last_modified).await;
     }
 
-    let source = drive(
-        GetObjectOperation::new(GetObjectInput {
-            bucket: input.source_bucket,
-            key: input.source_key,
-            version_id: input.source_version_id,
-            range: None,
-            group_id: input.source_group_id,
-            user_identity: input.source_auth_context.user_id,
-            node_id: input.node_id,
-        })
-        .with_restrictions(input.source_auth_context.path_restrictions.clone()),
-        context,
-    )
-    .await?;
+    let source_input = GetObjectInput {
+        bucket: input.source_bucket,
+        key: input.source_key,
+        version_id: input.source_version_id,
+        range: None,
+        group_id: input.source_group_id,
+        user_identity: input.source_auth_context.user_id,
+        node_id: input.node_id,
+    };
+    let restrictions = input.source_auth_context.path_restrictions.clone();
+    let source = read_local(context, source_input, restrictions, token).await?;
 
     let source_version_id = source.version_id;
     let materialized = source.location.is_some();
@@ -412,13 +428,17 @@ async fn sealed_copy(
     })
 }
 
-/// Admits a plaintext read of `bucket` the way GET does: an encrypting bucket must be unlocked.
-/// No bytes move, so the lease ends at once.
-async fn admit_source(context: &DriverContext, bucket: &str) -> Result<(), CopyObjectError> {
+/// Admits a plaintext read of the source bucket the way GET does: an encrypting bucket must be
+/// unlocked, or `token` must open its key. No bytes move, so the lease ends at once.
+async fn admit_source(
+    context: &DriverContext,
+    input: &CopyObjectInput,
+    token: Option<&TokenRead>,
+) -> Result<(), CopyObjectError> {
     let failed = || CopyObjectError::Get(GetObjectError::GetObjectFailed);
     let read = StorageEffect::Read {
         key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-        key: bucket.as_bytes().to_vec().into(),
+        key: input.source_bucket.as_bytes().to_vec().into(),
         txn_id: None,
     };
     let Event::Storage(StorageEvent::ReadResult { value, .. }) =
@@ -433,14 +453,37 @@ async fn admit_source(context: &DriverContext, bucket: &str) -> Result<(), CopyO
     };
     let blob_handle = context.blob_handle.as_ref().ok_or_else(failed)?;
     let archive = reference_archive(key);
-    match blob_handle
-        .send_blob_effect(BlobEffect::AdmitRead { key, archive })
-        .await
-    {
-        Event::Blob(BlobEvent::ReadAdmitted { .. }) => Ok(()),
-        Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => Err(CopyObjectError::Get(
-            GetObjectError::ConversionError(ConversionError::BucketKey(error)),
-        )),
+    let locked = |error| {
+        CopyObjectError::Get(GetObjectError::ConversionError(ConversionError::BucketKey(
+            error,
+        )))
+    };
+    let admit = BlobEffect::AdmitRead {
+        key,
+        archive: archive.clone(),
+    };
+    match (blob_handle.send_blob_effect(admit).await, token) {
+        (Event::Blob(BlobEvent::ReadAdmitted { .. }), _) => Ok(()),
+        (
+            Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))),
+            Some(token),
+        ) => {
+            let operation = AdmitTokenOperation::new(TokenAdmitInput {
+                bucket: input.source_bucket.clone(),
+                group_id: input.source_group_id,
+                realm_id: input.realm_id,
+                node_id: input.node_id,
+                key,
+                archive,
+                credential: token.credential.clone(),
+            });
+            match drive(operation, context).await {
+                Ok(_) => Ok(()),
+                Err(TokenAdmitError::Key(error)) => Err(locked(error)),
+                Err(_) => Err(failed()),
+            }
+        }
+        (Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))), _) => Err(locked(error)),
         _ => Err(failed()),
     }
 }
