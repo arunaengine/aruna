@@ -128,7 +128,7 @@ pub(super) struct UnlockRegistry {
     capacity: usize,
     sessions: HashMap<BucketKeyRef, Vec<Session>>,
     /// Sessions that reached their deadline before their timer ran, so it still records the lock.
-    expired: HashMap<BucketKeyRef, Ulid>,
+    expired: HashSet<(BucketKeyRef, Ulid)>,
     pins: Pins,
     leases: Arc<Semaphore>,
 }
@@ -152,7 +152,7 @@ impl UnlockRegistry {
         Self {
             capacity,
             sessions: HashMap::new(),
-            expired: HashMap::new(),
+            expired: HashSet::new(),
             pins: Arc::default(),
             leases: Arc::new(Semaphore::new(leases)),
         }
@@ -307,9 +307,8 @@ impl UnlockRegistry {
         let mut locked = Vec::new();
         if let Some(ticket) = only
             && ticket.key.bucket_id == bucket_id
-            && self.expired.get(&ticket.key) == Some(&ticket.session_id)
+            && self.expired.remove(&(ticket.key, ticket.session_id))
         {
-            self.expired.remove(&ticket.key);
             locked.push(ticket);
         }
         self.sessions.retain(|key, sessions| {
@@ -441,7 +440,7 @@ impl UnlockRegistry {
             sessions.retain(|session| {
                 let ended = session.expired(now);
                 if ended && session.active {
-                    expired.insert(*key, session.session_id);
+                    expired.insert((*key, session.session_id));
                 }
                 !ended
             });

@@ -183,6 +183,7 @@ impl LockBucketOperation {
                 actor: self.input.caller,
                 node_id: self.input.node_id,
                 generation: Some(ticket.key.generation),
+                session_id: Some(ticket.session_id),
                 deadline_ms: None,
                 reason: None,
                 outcome: AuditOutcome::Applied,

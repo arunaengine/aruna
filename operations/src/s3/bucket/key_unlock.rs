@@ -100,6 +100,8 @@ pub struct UnlockBucketOperation {
     private_key: Option<SharedSecret>,
     record: Option<BucketKeyRecord>,
     ticket: Option<KeyTicket>,
+    /// The session the prepared key opens, named in the audit records of this unlock.
+    session: Option<Ulid>,
     intent: Option<BucketAuditRecord>,
     failure: Option<UnlockError>,
     activated: Option<UnlockStatus>,
@@ -121,6 +123,7 @@ impl UnlockBucketOperation {
             private_key: Some(private_key),
             record: None,
             ticket: None,
+            session: None,
             intent: None,
             failure: None,
             activated: None,
@@ -249,6 +252,7 @@ impl UnlockBucketOperation {
             actor: Some(self.input.caller),
             node_id: self.input.node_id,
             generation: Some(self.input.key.generation),
+            session_id: self.session,
             deadline_ms: deadline.and_then(|deadline| deadline_after(at_ms, deadline)),
             reason: None,
             outcome,
@@ -345,6 +349,7 @@ impl Operation for UnlockBucketOperation {
                 if ticket.key == self.input.key =>
             {
                 self.ticket = Some(ticket);
+                self.session = Some(ticket.session_id);
                 let intent = self.record(AuditOutcome::Intent, self.input.now_ms);
                 self.step = UnlockStep::WriteIntent;
                 let effects = self.write_record(&intent, self.txn_id);

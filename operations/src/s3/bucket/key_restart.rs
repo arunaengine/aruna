@@ -63,10 +63,30 @@ pub enum RestartScanError {
 /// What the audit trail says about one generation before this start.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Trail {
+    /// The session last unlocked; a lock or extension of another session does not change it.
+    session: Option<Ulid>,
     unlocked: bool,
-    /// The state before an intent whose outcome is not recorded, restored if it failed.
-    before_intent: Option<bool>,
     deadline_ms: Option<u64>,
+    /// The state before an intent whose outcome is not recorded, restored if it failed.
+    before: Option<(Option<Ulid>, bool, Option<u64>)>,
+}
+
+impl Trail {
+    /// A record without a session, or of a trail without one, applies to the generation.
+    fn names(&self, session: Option<Ulid>) -> bool {
+        session.is_none() || self.session.is_none() || session == self.session
+    }
+
+    fn save(&mut self) {
+        let state = (self.session, self.unlocked, self.deadline_ms);
+        self.before.get_or_insert(state);
+    }
+
+    fn restore(&mut self) {
+        if let Some((session, unlocked, deadline_ms)) = self.before.take() {
+            (self.session, self.unlocked, self.deadline_ms) = (session, unlocked, deadline_ms);
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -180,27 +200,39 @@ impl RestartScanOperation {
                 continue;
             };
             let trail = self.trails.entry(generation).or_default();
+            let session = record.session_id;
             match (record.action, record.outcome) {
-                (AuditAction::Unlock | AuditAction::Extend, AuditOutcome::Intent) => {
-                    trail.before_intent.get_or_insert(trail.unlocked);
-                    trail.unlocked = true;
+                (AuditAction::Unlock, AuditOutcome::Intent) => {
+                    trail.save();
+                    (trail.session, trail.unlocked) = (session, true);
                     trail.deadline_ms = record.deadline_ms;
                 }
-                (AuditAction::Unlock | AuditAction::Extend, AuditOutcome::Applied) => {
-                    trail.before_intent = None;
-                    trail.unlocked = true;
+                (AuditAction::Unlock, AuditOutcome::Applied) => {
+                    trail.before = None;
+                    (trail.session, trail.unlocked) = (session, true);
+                    trail.deadline_ms = record.deadline_ms;
+                }
+                // An extension only moves the deadline of the session it names.
+                (AuditAction::Extend, AuditOutcome::Intent) if trail.names(session) => {
+                    trail.save();
+                    trail.deadline_ms = record.deadline_ms;
+                }
+                (AuditAction::Extend, AuditOutcome::Applied) if trail.names(session) => {
+                    trail.before = None;
                     trail.deadline_ms = record.deadline_ms;
                 }
                 (AuditAction::Unlock | AuditAction::Extend, AuditOutcome::Failed) => {
-                    if let Some(before) = trail.before_intent.take() {
-                        trail.unlocked = before;
-                    }
+                    trail.restore();
                 }
-                (
-                    AuditAction::Lock | AuditAction::TimedLock | AuditAction::RestartLock,
-                    AuditOutcome::Applied,
-                ) => {
-                    trail.before_intent = None;
+                // A delayed lock of an older session leaves a newer session unlocked.
+                (AuditAction::Lock | AuditAction::TimedLock, AuditOutcome::Applied)
+                    if trail.names(session) =>
+                {
+                    trail.before = None;
+                    trail.unlocked = false;
+                }
+                (AuditAction::RestartLock, AuditOutcome::Applied) => {
+                    trail.before = None;
                     trail.unlocked = false;
                 }
                 _ => {}

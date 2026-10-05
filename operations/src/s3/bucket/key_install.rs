@@ -81,6 +81,8 @@ pub struct InstallKeyOperation {
     audit: Option<InstallAudit>,
     state: InstallState,
     ticket: Option<KeyTicket>,
+    /// The session the prepared key opens, named in the audit records of the activation.
+    session: Option<Ulid>,
     discarded: Option<KeyTicket>,
     failure: Option<InstallError>,
     activated: Option<UnlockStatus>,
@@ -100,6 +102,7 @@ impl InstallKeyOperation {
             audit: None,
             state: InstallState::Init,
             ticket: None,
+            session: None,
             discarded: None,
             failure: None,
             activated: None,
@@ -147,6 +150,7 @@ impl InstallKeyOperation {
             actor: audit.actor,
             node_id: audit.node_id,
             generation: Some(self.key.generation),
+            session_id: self.session,
             deadline_ms: duration
                 .or(max)
                 .and_then(|left| deadline_after(audit.now_ms, left)),
@@ -254,6 +258,7 @@ impl Operation for InstallKeyOperation {
                 if ticket.key == self.key =>
             {
                 self.ticket = Some(ticket);
+                self.session = Some(ticket.session_id);
                 let Some(audit) = self.audit else {
                     return self.activate();
                 };

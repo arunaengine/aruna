@@ -43,6 +43,8 @@ pub struct BucketAuditRecord {
     pub actor: Option<UserId>,
     pub node_id: NodeId,
     pub generation: Option<u64>,
+    /// The unlock session an unlock, extension or lock names; none for actions of a generation.
+    pub session_id: Option<Ulid>,
     pub deadline_ms: Option<u64>,
     pub reason: Option<String>,
     pub outcome: AuditOutcome,
@@ -81,6 +83,7 @@ mod tests {
             )),
             node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
             generation: Some(1),
+            session_id: None,
             deadline_ms: None,
             reason: None,
             outcome: AuditOutcome::Intent,

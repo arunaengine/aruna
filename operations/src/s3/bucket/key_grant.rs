@@ -205,6 +205,7 @@ impl GrantHolderOperation {
             actor: Some(self.input.granted_by),
             node_id: self.input.node_id,
             generation: Some(key.generation),
+            session_id: None,
             deadline_ms: None,
             reason: Some(format!("granted to {}", grant.user_id)),
             outcome: AuditOutcome::Applied,

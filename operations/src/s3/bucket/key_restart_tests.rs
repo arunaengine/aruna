@@ -48,6 +48,16 @@ fn record(
     outcome: AuditOutcome,
     deadline_ms: Option<u64>,
 ) -> (Vec<u8>, Vec<u8>) {
+    in_session(action, (generation, None), outcome, deadline_ms)
+}
+
+/// A record of `generation` that names `session`.
+fn in_session(
+    action: AuditAction,
+    (generation, session_id): (u64, Option<Ulid>),
+    outcome: AuditOutcome,
+    deadline_ms: Option<u64>,
+) -> (Vec<u8>, Vec<u8>) {
     let record = BucketAuditRecord {
         event_id: Ulid::generate(),
         bucket_id: LOCKED,
@@ -56,6 +66,7 @@ fn record(
         actor: None,
         node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
         generation: Some(generation),
+        session_id,
         deadline_ms,
         reason: None,
         outcome,
@@ -188,4 +199,69 @@ fn expired_sessions_skipped() {
     let ended = record(AuditAction::Unlock, 1, AuditOutcome::Applied, Some(NOW - 1));
     let extended = record(AuditAction::Extend, 1, AuditOutcome::Applied, Some(NOW + 1));
     assert_eq!(reported(vec![ended, extended]), [1]);
+}
+
+#[test]
+fn rejected_extension_restored() {
+    let first = Some(Ulid::from_bytes([7; 16]));
+    let unlock = |deadline| {
+        in_session(
+            AuditAction::Unlock,
+            (1, first),
+            AuditOutcome::Applied,
+            deadline,
+        )
+    };
+    // A rejected extension without a duration restores the ended deadline, so no false notice.
+    let intent = in_session(AuditAction::Extend, (1, first), AuditOutcome::Intent, None);
+    let failed = in_session(AuditAction::Extend, (1, first), AuditOutcome::Failed, None);
+    assert!(reported(vec![unlock(Some(NOW - 1)), intent, failed]).is_empty());
+    // An extension of another session never moves this session's deadline.
+    let stranger = Some(Ulid::from_bytes([8; 16]));
+    let foreign = in_session(
+        AuditAction::Extend,
+        (1, stranger),
+        AuditOutcome::Intent,
+        None,
+    );
+    assert!(reported(vec![unlock(Some(NOW - 1)), foreign]).is_empty());
+    // An extension whose outcome was lost still counts, as it may have applied.
+    let intent = in_session(AuditAction::Extend, (1, first), AuditOutcome::Intent, None);
+    assert_eq!(reported(vec![unlock(Some(NOW - 1)), intent]), [1]);
+}
+
+#[test]
+fn delayed_timer_keeps_newer() {
+    let (a, b) = (
+        Some(Ulid::from_bytes([7; 16])),
+        Some(Ulid::from_bytes([8; 16])),
+    );
+    let unlock = |session| {
+        in_session(
+            AuditAction::Unlock,
+            (1, session),
+            AuditOutcome::Applied,
+            None,
+        )
+    };
+    let timed = |session| {
+        in_session(
+            AuditAction::TimedLock,
+            (1, session),
+            AuditOutcome::Applied,
+            None,
+        )
+    };
+    // Session A's delayed timer records its lock after session B unlocked: B stays unlocked.
+    assert_eq!(reported(vec![unlock(a), unlock(b), timed(a)]), [1]);
+    // B's own timed lock ends it.
+    assert!(reported(vec![unlock(a), unlock(b), timed(a), timed(b)]).is_empty());
+    // A manual lock of the generation without a session ends every session.
+    let lock = in_session(
+        AuditAction::RestartLock,
+        (1, None),
+        AuditOutcome::Applied,
+        None,
+    );
+    assert!(reported(vec![unlock(a), unlock(b), lock]).is_empty());
 }

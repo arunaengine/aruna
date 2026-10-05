@@ -338,3 +338,27 @@ fn polled_expiry_still_locks() {
     };
     assert!(registry.lock(key.bucket_id, Some(other)).is_empty());
 }
+
+#[test]
+fn expiries_kept_per_session() {
+    let mut registry = UnlockRegistry::new(UNLOCKED_BUCKETS);
+    let start = Instant::now();
+    let key = reference(1, 1);
+    let first = unlock(&mut registry, key, 1, (Some(MINUTE), None), start).unwrap();
+    // The first session expires unseen, then a second session of the generation expires too.
+    let later = start + 2 * MINUTE;
+    assert!(registry.status(key.bucket_id, later).is_empty());
+    let second = unlock(&mut registry, key, 1, (Some(MINUTE), None), later).unwrap();
+    let last = later + 2 * MINUTE;
+    assert!(registry.status(key.bucket_id, last).is_empty());
+    // Both delayed timers still record their own timed lock, in any order.
+    assert_eq!(registry.lock(key.bucket_id, Some(second)), vec![second]);
+    assert_eq!(registry.lock(key.bucket_id, Some(first)), vec![first]);
+    // A third session unlocked after both expiries stays open whatever the old timers do.
+    let third = unlock(&mut registry, key, 1, (None, None), last).unwrap();
+    assert!(registry.lock(key.bucket_id, Some(first)).is_empty());
+    assert_eq!(
+        registry.status(key.bucket_id, last)[0].session_id,
+        third.session_id
+    );
+}

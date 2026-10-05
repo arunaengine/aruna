@@ -160,6 +160,7 @@ impl ExtendBucketOperation {
             actor: Some(self.input.caller),
             node_id: self.input.node_id,
             generation: Some(key.generation),
+            session_id: Some(self.input.session_id),
             deadline_ms,
             reason: None,
             outcome,

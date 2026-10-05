@@ -238,6 +238,7 @@ impl RemoveHolderOperation {
             actor: Some(self.input.removed_by),
             node_id: self.input.node_id,
             generation: active.map(|key| key.generation),
+            session_id: None,
             deadline_ms: None,
             reason,
             outcome: AuditOutcome::Applied,
