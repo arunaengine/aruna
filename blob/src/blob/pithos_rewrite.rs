@@ -112,9 +112,10 @@ impl BlobHandler {
                 let keys = self.lease_keys(&source, lease)?;
                 let operator = self.operator_from_location(&source)?;
                 let path = source.get_storage_path()?;
-                let idle = self.transfer_idle_timeout();
                 let range = 0..source.blob_size;
-                let stream = super::pithos::read(operator, path, layout, keys, range, idle).await?;
+                let stream = self
+                    .read_archive(operator, path, layout, keys, range)
+                    .await?;
                 BackendStream::new(Exclusive(Mutex::new(Box::pin(stream))))
             }
             _ => match Box::pin(self.read_blob(source.clone())).await {
@@ -179,6 +180,8 @@ impl BlobHandler {
             return Err(BlobError::WriteError(message.to_string()));
         };
         let keys = self.lease_keys(source, lease)?;
+        let working = super::pithos::working_set(layout.stored_size);
+        let _budget = self.reserve_pithos(working).await?;
         let operator = self.operator_from_location(source)?;
         let path = source.get_storage_path()?;
         let idle = self.transfer_idle_timeout();

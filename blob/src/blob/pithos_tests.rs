@@ -902,3 +902,79 @@ async fn serves_leased_plaintext() {
         .unwrap();
     assert_eq!(outboard.root, blake3::hash(&data));
 }
+
+#[tokio::test]
+async fn reads_reserve_budget() {
+    use crate::blob::pithos::{budget_permits, working_set};
+    use aruna_core::compute::{SecretBytes, SharedSecret};
+    use aruna_core::effects::BlobEffect;
+    use aruna_core::structs::storage::blob::ArchiveKey;
+    use futures::FutureExt;
+
+    let bucket = PrivateKey::from_raw(zeroize::Zeroizing::new([5; 32]));
+    let seal = plan(
+        &bucket,
+        BlockCipher::ChaCha20Poly1305,
+        BlockKeys::ContentDerived,
+    );
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let data = content(100_000);
+    let backend = ResolvedBackend::node_default().with_encryption(Some(seal));
+    let written = handler
+        .write_blob(
+            "bucket",
+            "sealed.bin",
+            backend,
+            test_user_id(),
+            stream_from_bytes(&data),
+        )
+        .await;
+    let BlobEvent::WriteFinished { location } = written else {
+        panic!("write failed: {written:?}")
+    };
+    // The finished write returned its whole share.
+    assert_eq!(handler.pithos_budget.available_permits(), budget_permits());
+    let prepare = BlobEffect::PrepareKey {
+        key: seal.key,
+        public_key: seal.public_key,
+        private_key: SharedSecret::new(SecretBytes::new(vec![5; 32])),
+        duration: None,
+        max: None,
+    };
+    let BlobEvent::KeyPrepared { ticket } = handler.unlock_effect(prepare) else {
+        panic!("prepare failed")
+    };
+    handler.unlock_effect(BlobEffect::ActivateKey { ticket });
+    let admit = || handler.admit_read(seal.key, ArchiveKey::of(&location));
+
+    // A saturated budget holds a new open back until room is free again.
+    let held = handler
+        .pithos_budget
+        .clone()
+        .acquire_many_owned(budget_permits() as u32)
+        .await
+        .unwrap();
+    let BlobEvent::ReadAdmitted { lease } = admit().await else {
+        panic!("admission failed")
+    };
+    let mut waiting = Box::pin(handler.read_sealed(location.clone(), None, lease));
+    assert!((&mut waiting).now_or_never().is_none());
+    drop(held);
+    let BlobEvent::ReadFinished { blob, .. } = waiting.await else {
+        panic!("the read must start once the budget has room")
+    };
+
+    // The open keeps its share until the stream ends.
+    let StoredLayout::Pithos(layout) = &location.format.layout else {
+        panic!("not a Pithos copy")
+    };
+    let share = working_set(layout.stored_size).div_ceil(1 << 20) as usize;
+    assert_eq!(
+        handler.pithos_budget.available_permits(),
+        budget_permits() - share
+    );
+    let chunks: Vec<Bytes> = blob.try_collect().await.unwrap();
+    assert!(chunks.concat() == data);
+    assert_eq!(handler.pithos_budget.available_permits(), budget_permits());
+}

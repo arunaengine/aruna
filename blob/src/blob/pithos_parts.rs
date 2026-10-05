@@ -56,6 +56,14 @@ impl BlobHandler {
             plan,
             compression: resolved.compression,
         };
+        // An S3 part holds at most 5 GiB; the share stays reserved until the piece is written.
+        let _budget = match self
+            .reserve_pithos(super::pithos::working_set(5 << 30))
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => return BlobEvent::Error(error),
+        };
         let encoder = match piece_encoder(&upload, part.part_number, content_offset) {
             Ok(encoder) => encoder,
             Err(error) => return BlobEvent::Error(error),
@@ -258,6 +266,14 @@ impl BlobHandler {
     ) -> BlobEvent {
         let Some(plan) = resolved.encryption else {
             return BlobEvent::Error(BlobError::WriteError("pieces need a seal plan".into()));
+        };
+        let content = parts.iter().map(|part| part.location.blob_size).sum();
+        let _budget = match self
+            .reserve_pithos(super::pithos::working_set(content))
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => return BlobEvent::Error(error),
         };
         let composition = match compose_parts(&parts) {
             Ok(composition) => composition,

@@ -7,7 +7,7 @@ use super::backend::{
     build_backend_path, build_hidden_path, build_part_path, intent_key, intent_value,
 };
 use super::group::GROUP_WRITE_CHUNK;
-use super::pithos::ArchiveEncoder;
+use super::pithos::{ArchiveEncoder, working_set};
 use crate::codec::FrameEncoder;
 use crate::hash::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
@@ -437,10 +437,21 @@ impl BlobHandler {
             limits.chunk = compose_chunk(&backend, size, true);
         }
         let encoder = match (seal, compression) {
-            (Some(plan), _) => match ArchiveEncoder::new(&plan, compression) {
-                Ok(encoder) => Some(Encoder::Pithos(Box::new(encoder), plan.key)),
-                Err(error) => return BlobEvent::Error(error),
-            },
+            (Some(plan), _) => {
+                let covered = size.unwrap_or(super::pithos::GROWTH);
+                let permit = match self.reserve_pithos(working_set(covered)).await {
+                    Ok(permit) => permit,
+                    Err(error) => return BlobEvent::Error(error),
+                };
+                let budget = Arc::clone(&self.pithos_budget);
+                match ArchiveEncoder::new(&plan, compression) {
+                    Ok(encoder) => {
+                        let encoder = encoder.with_budget(budget, permit, covered);
+                        Some(Encoder::Pithos(Box::new(encoder), plan.key))
+                    }
+                    Err(error) => return BlobEvent::Error(error),
+                }
+            }
             (None, Compression::Off) => None,
             (None, Compression::Zstd { level }) => Some(Encoder::Frames(FrameEncoder::new(level))),
         };

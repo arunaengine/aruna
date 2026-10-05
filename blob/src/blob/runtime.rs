@@ -569,6 +569,7 @@ impl BlobHandler {
             unlocks: Arc::new(StdMutex::new(super::unlock::UnlockRegistry::new(
                 super::unlock::UNLOCKED_BUCKETS,
             ))),
+            pithos_budget: Arc::new(Semaphore::new(super::pithos::budget_permits())),
         };
         blob_handler.ensure_multipart_bucket().await?;
         blob_handler.probe_all_backends().await;

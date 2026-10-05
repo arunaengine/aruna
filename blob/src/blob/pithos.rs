@@ -20,7 +20,7 @@ use opendal::Operator;
 use pithos_lib::archive::{
     AccessKeys, ArchivePath, AsyncArchive, BlockKeyMode, BlockingHook, CdcConfig, Chunking,
     Composition, EntryKind, EntryMetadata, NoExternalBlocks, OpenLimits, OpenOptions,
-    PayloadCipher, Piece, PieceEncoder, ProcessingOptions, compose,
+    PayloadCipher, Piece, PieceEncoder, ProcessingOptions, ReadLimits, compose,
 };
 use pithos_lib::crypto::{PrivateKey, PublicKey};
 use pithos_lib::error::PithosError;
@@ -30,6 +30,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
 /// Path of the one file in the archive of an object.
@@ -44,6 +45,38 @@ const PITHOS_ZSTD: [u8; 7] = [1, 4, 8, 11, 15, 18, 22];
 pub const MAX_SIZE: u64 = 5 << 40;
 /// Largest decoded block: the FastCDC maximum of single uploads.
 const MAX_BLOCK: u64 = 16 << 20;
+/// Pithos metadata, encoder state and read buffers that may be in use at once on one node.
+pub(super) const WORKING_SET: u64 = 2 << 30;
+/// Fixed share of one open, encoder or composition: batches, sealed blocks and read buffers.
+const BASE_SHARE: u64 = 64 << 20;
+/// Retained metadata per MiB of content: descriptors, keys, hashes and their directory bytes.
+const META_PER_MIB: u64 = 256;
+/// Read buffers of one open stay within the fixed share.
+const READ_LIMITS: ReadLimits = ReadLimits {
+    max_in_flight: 4,
+    max_buffered_bytes: 32 << 20,
+    max_request_bytes: 8 << 20,
+};
+
+/// Conservative working set of an open, encoder or composition over `size` content bytes. It
+/// never exceeds the node budget, so one operation can always run alone.
+pub(super) fn working_set(size: u64) -> u64 {
+    let metadata = size.div_ceil(1 << 20).saturating_mul(META_PER_MIB);
+    BASE_SHARE.saturating_add(metadata).min(WORKING_SET)
+}
+
+/// Content an unsized write reserves for at first, and each later growth step.
+pub(super) const GROWTH: u64 = 64 << 30;
+
+/// Permits of the node budget, one per MiB.
+pub(super) fn budget_permits() -> usize {
+    budget_units(WORKING_SET) as usize
+}
+
+/// Budget permits for `bytes`, one permit per MiB.
+fn budget_units(bytes: u64) -> u32 {
+    u32::try_from(bytes.div_ceil(1 << 20)).unwrap_or(u32::MAX)
+}
 
 /// One stored archive. Stored objects never change, so reads need no pinned revision.
 struct StoredArchive {
@@ -133,6 +166,20 @@ pub async fn read(
     Ok(stream.map(|chunk| chunk.map(Bytes::from).map_err(blob_error)))
 }
 
+/// A stream that keeps its working-set reservation until it ends.
+struct Budgeted<S> {
+    stream: Pin<Box<S>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl<S: Stream> Stream for Budgeted<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<S::Item>> {
+        self.get_mut().stream.as_mut().poll_next(context)
+    }
+}
+
 /// An opened Aruna archive whose single file reads with the granted keys.
 type OpenArchive = Arc<AsyncArchive<StoredArchive, NoExternalBlocks, TokioBlocking>>;
 
@@ -156,7 +203,8 @@ async fn open(
     let archive =
         AsyncArchive::open_with_hook(source, options, Some(layout.stored_size), TokioBlocking)
             .await
-            .map_err(blob_error)?;
+            .map_err(blob_error)?
+            .with_read_limits(READ_LIMITS);
     let single = {
         let mut entries = archive.entries();
         match (entries.next(), entries.next()) {
@@ -181,6 +229,7 @@ pub(super) struct SealedReader {
     archive: OpenArchive,
     size: u64,
     _lease: ReadLease,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl iroh_io::AsyncSliceReader for SealedReader {
@@ -218,6 +267,9 @@ pub(super) struct ArchiveEncoder {
     size: u64,
     stored: u64,
     header: [u8; 6],
+    /// Working-set reservation and the content bytes it covers; it grows only without waiting.
+    budget: Option<(Arc<Semaphore>, OwnedSemaphorePermit)>,
+    covered: u64,
 }
 
 impl ArchiveEncoder {
@@ -242,7 +294,21 @@ impl ArchiveEncoder {
             size: 0,
             stored: header.len() as u64,
             header,
+            budget: None,
+            covered: u64::MAX,
         })
+    }
+
+    /// Keeps `permit` from `budget` for the encoder's lifetime; it covers `covered` content bytes.
+    pub(super) fn with_budget(
+        mut self,
+        budget: Arc<Semaphore>,
+        permit: OwnedSemaphorePermit,
+        covered: u64,
+    ) -> Self {
+        self.budget = Some((budget, permit));
+        self.covered = covered;
+        self
     }
 
     /// The archive header, written before any block.
@@ -319,6 +385,25 @@ impl ArchiveEncoder {
             .checked_add(len as u64)
             .filter(|size| *size <= MAX_SIZE)
             .ok_or(BlobError::SizeLimitExceeded { limit: MAX_SIZE })?;
+        while self.size > self.covered {
+            self.grow()?;
+        }
+        Ok(())
+    }
+
+    /// Extends the reservation by one growth step if the budget has room now; it never waits.
+    fn grow(&mut self) -> Result<(), BlobError> {
+        let Some((budget, permit)) = self.budget.as_mut() else {
+            return Ok(());
+        };
+        let units = budget_units(working_set(GROWTH) - BASE_SHARE);
+        let extra = Arc::clone(budget)
+            .try_acquire_many_owned(units)
+            .map_err(|_| {
+                BlobError::WriteError("the Pithos working set is exhausted".to_string())
+            })?;
+        permit.merge(extra);
+        self.covered = self.covered.saturating_add(GROWTH);
         Ok(())
     }
 }
@@ -398,7 +483,12 @@ impl BlobHandler {
         let path = location.get_storage_path()?;
         let idle = self.transfer_idle_timeout();
         let size = range.end.saturating_sub(range.start);
-        let stream = Box::pin(read(operator, path, layout, keys, range, idle).await?);
+        let permit = self.reserve_pithos(working_set(layout.stored_size)).await?;
+        let stream = read(operator, path, layout, keys, range, idle).await?;
+        let stream = Box::pin(Budgeted {
+            stream: Box::pin(stream),
+            _permit: permit,
+        });
         let blob = LeasedRead {
             stream: Mutex::new(stream),
             hasher: blake3::Hasher::new(),
@@ -420,11 +510,44 @@ impl BlobHandler {
         let keys = self.sealed_keys(location, &lease)?;
         let operator = self.operator_from_location(location)?;
         let path = location.get_storage_path()?;
+        let permit = self.reserve_pithos(working_set(layout.stored_size)).await?;
         let archive = open(operator, path, layout, keys, self.transfer_idle_timeout()).await?;
         Ok(SealedReader {
             archive,
             size: location.blob_size,
             _lease: lease,
+            _permit: permit,
+        })
+    }
+
+    /// Reserves `bytes` of the node's Pithos working set before anything is allocated. A request
+    /// waits for the whole share at once, so no operation holds part of it while waiting.
+    pub(super) async fn reserve_pithos(
+        &self,
+        bytes: u64,
+    ) -> Result<OwnedSemaphorePermit, BlobError> {
+        let budget = Arc::clone(&self.pithos_budget);
+        budget
+            .acquire_many_owned(budget_units(bytes))
+            .await
+            .map_err(|_| BlobError::ReadError("the Pithos working set is closed".to_string()))
+    }
+
+    /// Streams `range` of a Pithos copy within the node's working set, for keyless or leased work.
+    pub(super) async fn read_archive(
+        &self,
+        operator: Operator,
+        path: String,
+        layout: &PithosLayout,
+        keys: AccessKeys,
+        range: Range<u64>,
+    ) -> Result<impl Stream<Item = Result<Bytes, BlobError>> + Send + 'static, BlobError> {
+        let permit = self.reserve_pithos(working_set(layout.stored_size)).await?;
+        let idle = self.transfer_idle_timeout();
+        let stream = read(operator, path, layout, keys, range, idle).await?;
+        Ok(Budgeted {
+            stream: Box::pin(stream),
+            _permit: permit,
         })
     }
 
@@ -518,11 +641,16 @@ fn blob_error(error: PithosError) -> BlobError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArchiveEncoder, BATCH, MAX_SIZE};
+    use super::{
+        ArchiveEncoder, BASE_SHARE, BATCH, GROWTH, MAX_SIZE, WORKING_SET, budget_permits,
+        working_set,
+    };
     use aruna_core::errors::BlobError;
     use aruna_core::structs::storage::encryption::{BucketKeyRef, SealPlan};
     use aruna_core::structs::storage::format::Compression;
     use pithos_lib::crypto::PrivateKey;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
     fn encoder() -> ArchiveEncoder {
         let plan = SealPlan {
@@ -552,5 +680,36 @@ mod tests {
             refused.unwrap_err(),
             BlobError::SizeLimitExceeded { limit: MAX_SIZE }
         );
+    }
+
+    #[test]
+    fn working_sets_fit() {
+        assert_eq!(working_set(0), BASE_SHARE);
+        // A 5 TiB archive, the largest one, still fits the node budget on its own.
+        let largest = working_set(MAX_SIZE);
+        assert!(largest > BASE_SHARE + (1 << 30) && largest <= WORKING_SET);
+        assert_eq!(budget_permits() as u64, WORKING_SET >> 20);
+    }
+
+    #[tokio::test]
+    async fn growth_never_waits() {
+        // The budget holds the first share only, so growth past it fails instead of waiting.
+        let budget = Arc::new(Semaphore::new(64));
+        let permit = Arc::clone(&budget).acquire_many_owned(64).await.unwrap();
+        let mut sealing = encoder().with_budget(Arc::clone(&budget), permit, BATCH as u64);
+        sealing.push(&vec![7; BATCH]).await.unwrap();
+        let exhausted = sealing.push(&vec![7; BATCH]).await;
+        assert!(matches!(exhausted, Err(BlobError::WriteError(_))));
+
+        // With room, the reservation grows by one step and keeps it.
+        let budget = Arc::new(Semaphore::new(budget_permits()));
+        let permit = Arc::clone(&budget).acquire_many_owned(64).await.unwrap();
+        let mut sealing = encoder().with_budget(Arc::clone(&budget), permit, BATCH as u64);
+        sealing.push(&vec![7; 2 * BATCH]).await.unwrap();
+        assert_eq!(sealing.covered, BATCH as u64 + GROWTH);
+        let held = budget_permits() - budget.available_permits();
+        assert_eq!(held as u64, 64 + ((working_set(GROWTH) - BASE_SHARE) >> 20));
+        drop(sealing);
+        assert_eq!(budget.available_permits(), budget_permits());
     }
 }

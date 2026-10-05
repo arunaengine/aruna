@@ -36,9 +36,10 @@ impl BlobHandler {
         let keys = self.lease_keys(location, Some(lease))?;
         let operator = self.operator_from_location(location)?;
         let path = location.get_storage_path()?;
-        let idle = self.transfer_idle_timeout();
         let range = 0..location.blob_size;
-        let stream = super::pithos::read(operator, path, layout, keys, range, idle).await?;
+        let stream = self
+            .read_archive(operator, path, layout, keys, range)
+            .await?;
         let mut stream = Box::pin(stream);
         let mut hasher = Hasher::new();
         let mut size = 0u64;

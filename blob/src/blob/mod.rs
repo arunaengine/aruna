@@ -93,6 +93,8 @@ pub struct BlobHandler {
     monitor_task: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Unlocked bucket keys of this node. Memory only, so a restart locks every bucket.
     unlocks: Arc<StdMutex<unlock::UnlockRegistry>>,
+    /// Pithos working set in MiB permits, shared by archive opens, encoders and compositions.
+    pithos_budget: Arc<Semaphore>,
 }
 
 #[derive(Clone, Debug)]
