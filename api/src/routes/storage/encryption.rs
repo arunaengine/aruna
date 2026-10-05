@@ -568,7 +568,9 @@ pub async fn get_bucket_encryption(
   this node's stored copies; `transition` in the status reports its progress.
 - `max_unlock_ms` changes the longest unlock of an encrypted bucket from the next unlock on;
   an absent field keeps it, `null` removes the limit.
-- A change that needs the old key answers 409 `bucket_locked` while that key is locked."#,
+- A change that needs the old key answers 409 `bucket_locked` while that key is locked.
+- While stored copies still move, a further change answers 409 `transition_running`; a bucket
+  set to `off` enables again once its decryption has finished."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     request_body(
         content = EncryptionRequest,
@@ -581,7 +583,7 @@ pub async fn get_bucket_encryption(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
-        (status = 409, description = "`stale_generation`, `open_uploads`, `recovery_unmet`, `bucket_locked`, or `unchanged` when the settings already apply", body = ErrorResponse)
+        (status = 409, description = "`stale_generation`, `open_uploads`, `recovery_unmet`, `bucket_locked`, `transition_running`, or `unchanged` when the settings already apply", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -602,7 +604,15 @@ pub async fn put_bucket_encryption(
             current: current.storage_generation,
         }));
     }
-    if current.is_encrypted() || current.bucket_id.is_some() {
+    let route = put_route(
+        current.is_encrypted(),
+        snapshot.transition.as_ref(),
+        request.mode,
+    );
+    if route == PutRoute::Busy {
+        return Err(transition_running());
+    }
+    if route == PutRoute::Change {
         let (cipher, block_keys) = (
             request.cipher.unwrap_or(current.cipher),
             request.block_keys.unwrap_or(current.block_keys),
@@ -632,7 +642,7 @@ pub async fn put_bucket_encryption(
         let status = current_status(&state, bucket, group_id, auth.user_id).await?;
         return Ok(Json(status));
     }
-    if request.mode == EncryptionMode::Off {
+    if route == PutRoute::Keep {
         let status = current_status(&state, bucket, group_id, auth.user_id).await?;
         return Ok(Json(status));
     }
@@ -643,6 +653,42 @@ pub async fn put_bucket_encryption(
         .map_err(enable_refusal)?;
     let status = current_status(&state, bucket, group_id, auth.user_id).await?;
     Ok(Json(status))
+}
+
+/// What a PUT does with a bucket in its current state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PutRoute {
+    Change,
+    Enable,
+    Keep,
+    Busy,
+}
+
+/// An encrypted bucket changes through a transition. A plain or settled `off` bucket enables
+/// again, but not while a decryption still needs its source key.
+fn put_route(
+    encrypted: bool,
+    transition: Option<&EncryptionTransition>,
+    mode: EncryptionMode,
+) -> PutRoute {
+    if encrypted {
+        return PutRoute::Change;
+    }
+    if mode == EncryptionMode::Off {
+        return PutRoute::Keep;
+    }
+    match transition.is_some_and(|transition| transition.finished_at_ms.is_none()) {
+        true => PutRoute::Busy,
+        false => PutRoute::Enable,
+    }
+}
+
+fn transition_running() -> ServerError {
+    refused(
+        StatusCode::CONFLICT,
+        "transition_running",
+        "the bucket's stored copies are still moving to a new encryption",
+    )
 }
 
 /// Stores a new unlock maximum of an encrypted bucket; the next unlock uses it.
@@ -743,6 +789,7 @@ fn change_refusal(error: ChangeError) -> ServerError {
             "recovery_unmet",
             "the key holders do not meet the recovery rule",
         ),
+        ChangeError::TransitionRunning => transition_running(),
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -972,6 +1019,32 @@ mod tests {
         assert_eq!(code(ChangeError::Key(stale)), "stale_generation");
         let locked = ChangeError::Key(BucketKeyError::Locked(BUCKET_ID));
         assert_eq!(code(locked), "bucket_locked");
+    }
+
+    #[test]
+    fn put_round_trips() {
+        use aruna_core::structs::storage::format::Compression;
+        use aruna_core::structs::storage::transition::{TransitionKind, TransitionTarget};
+        let (locked, off) = (EncryptionMode::VaultLocked, EncryptionMode::Off);
+        // Encrypted to off and back: a settled decryption enables again.
+        assert_eq!(put_route(true, None, off), PutRoute::Change);
+        let target = TransitionTarget {
+            compression: Compression::Off,
+            plan: None,
+        };
+        let mut decrypt = EncryptionTransition::new(TransitionKind::Decrypt, None, target, 2, 1);
+        assert_eq!(put_route(false, Some(&decrypt), locked), PutRoute::Busy);
+        decrypt.finished_at_ms = Some(5);
+        assert_eq!(put_route(false, Some(&decrypt), locked), PutRoute::Enable);
+        assert_eq!(
+            put_route(false, None, EncryptionMode::NodeManaged),
+            PutRoute::Enable
+        );
+        assert_eq!(put_route(false, Some(&decrypt), off), PutRoute::Keep);
+        let code = change_refusal(ChangeError::TransitionRunning)
+            .response_body()
+            .code;
+        assert_eq!(code.as_deref(), Some("transition_running"));
     }
 
     #[test]
