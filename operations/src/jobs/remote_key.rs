@@ -4,8 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
+use aruna_core::handle::Handle;
 use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
 use aruna_core::metadata::AuthToken;
@@ -13,7 +18,10 @@ use aruna_core::structs::execution::job::{JobId, JobRecord, JobState, KeyWait};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{HashIndex, object_permission_path};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::Key;
+use aruna_storage::StorageHandle;
 use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -22,9 +30,10 @@ use crate::jobs::key_wake::locked_contents;
 use crate::jobs::route::{JobRouteOperation, JobRouteOutcome};
 use crate::jobs::runtime::key_unlocked;
 use crate::jobs::store::{
-    ack_wake, iter_prefix_page, owed_wakes, queue_remote_wakes, read_job_record, read_key_waits,
-    register_remote_wait, satisfy_key_wait,
+    OwedWake, ack_wake, iter_prefix_page, owed_wakes, queue_remote_wakes, read_job_record,
+    read_key_waits, register_remote_wait, satisfy_key_wait,
 };
+use crate::tasks::task_persistence::persist_task_effect;
 
 /// Contents one registration may name; more is refused rather than scanned.
 pub const MAX_AWAITED: usize = 1024;
@@ -189,22 +198,36 @@ pub(crate) async fn remote_waits(
     let auth = owner_auth(record);
     let mut waits = Vec::new();
     for (node, contents) in by_node {
-        for contents in contents.chunks(MAX_AWAITED) {
-            let request = JobRequest::AwaitKeys {
-                auth_token: AuthToken::Internal(auth.clone()),
-                job_id: record.job_id,
-                contents: contents.to_vec(),
-            };
-            match ask(context, node, record.job_id, request).await {
-                Some(JobResponse::KeysLocked(locked)) => {
-                    // The answering node names its own keys only.
-                    waits.extend(locked.into_iter().filter(|wait| wait.node_id == node));
-                }
-                Some(response) => {
-                    warn!(job_id = %record.job_id, node = %node, ?response, "Key wait refused")
-                }
-                None => {}
+        waits.extend(contents_waits(context, &auth, record.job_id, node, &contents).await);
+    }
+    waits
+}
+
+/// Waiting node: registers the job on `node` for `contents` and returns the keys still locked
+/// there. An unreachable or refusing node yields none.
+pub(crate) async fn contents_waits(
+    context: &DriverContext,
+    auth: &AuthContext,
+    job_id: JobId,
+    node: NodeId,
+    contents: &[[u8; 32]],
+) -> Vec<KeyWait> {
+    let mut waits = Vec::new();
+    for contents in contents.chunks(MAX_AWAITED) {
+        let request = JobRequest::AwaitKeys {
+            auth_token: AuthToken::Internal(auth.clone()),
+            job_id,
+            contents: contents.to_vec(),
+        };
+        match ask(context, node, job_id, request).await {
+            Some(JobResponse::KeysLocked(locked)) => {
+                // The answering node names its own keys only.
+                waits.extend(locked.into_iter().filter(|wait| wait.node_id == node));
             }
+            Some(response) => {
+                warn!(job_id = %job_id, node = %node, ?response, "Key wait refused")
+            }
+            None => {}
         }
     }
     waits
@@ -229,36 +252,101 @@ pub(crate) async fn queue_wakes(context: &DriverContext, key: BucketKeyRef) -> R
     Ok(())
 }
 
-/// Key node: sends one page of owed wakes and drops each one its waiting node acknowledged.
-/// Unacknowledged wakes stay for the next delivery. Answers the acknowledged count.
-pub async fn deliver_owed_wakes(context: &DriverContext) -> usize {
-    let owed = match owed_wakes(&context.storage_handle).await {
-        Ok(owed) => owed,
+/// Wait before owed wakes are tried again once a full round left some unacknowledged.
+pub const WAKE_RETRY: Duration = Duration::from_secs(30);
+
+/// What one delivery pass left behind.
+#[derive(Debug, Default, PartialEq)]
+pub struct Delivery {
+    pub acked: usize,
+    /// Some wakes stay owed, so the delivery timer runs again.
+    pub owed: bool,
+    /// Where the next pass starts, so unreachable waiters never hide the rows after them.
+    pub next: Option<Key>,
+}
+
+/// Key node: sends one page of owed wakes after `start_after` and drops each acknowledged one.
+pub async fn deliver_owed_wakes(context: &DriverContext, start_after: Option<Key>) -> Delivery {
+    let send = |wake: OwedWake| send_wake(context, wake);
+    deliver_with(&context.storage_handle, start_after, send).await
+}
+
+async fn send_wake(context: &DriverContext, wake: OwedWake) -> bool {
+    let request = JobRequest::KeyWake {
+        auth_token: AuthToken::Internal(wake.auth),
+        job_id: wake.job_id,
+        key: wake.key,
+    };
+    matches!(
+        ask(context, wake.waiter, wake.job_id, request).await,
+        Some(JobResponse::KeyWakeAcked)
+    )
+}
+
+/// One delivery pass with `send` as the transport; true from `send` means acknowledged.
+pub(crate) async fn deliver_with<F, Fut>(
+    storage: &StorageHandle,
+    start_after: Option<Key>,
+    mut send: F,
+) -> Delivery
+where
+    F: FnMut(OwedWake) -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let resumed = start_after.is_some();
+    let (owed, next) = match owed_wakes(storage, start_after).await {
+        Ok(page) => page,
         Err(error) => {
             warn!(%error, "Owed key wakes could not be read");
-            return 0;
+            return Delivery {
+                acked: 0,
+                owed: true,
+                next: None,
+            };
         }
     };
     let mut acked = 0;
+    let mut left = false;
     for wake in owed {
-        let request = JobRequest::KeyWake {
-            auth_token: AuthToken::Internal(wake.auth.clone()),
-            job_id: wake.job_id,
-            key: wake.key,
-        };
-        if !matches!(
-            ask(context, wake.waiter, wake.job_id, request).await,
-            Some(JobResponse::KeyWakeAcked)
-        ) {
+        let (waiter, job_id, key) = (wake.waiter, wake.job_id, wake.key);
+        if !send(wake).await {
+            left = true;
             continue;
         }
-        let storage = &context.storage_handle;
-        match ack_wake(storage, wake.waiter, wake.job_id, wake.key).await {
+        match ack_wake(storage, waiter, job_id, key).await {
             Ok(()) => acked += 1,
-            Err(error) => warn!(job_id = %wake.job_id, %error, "Acknowledged wake not dropped"),
+            Err(error) => {
+                warn!(job_id = %job_id, %error, "Acknowledged wake not dropped");
+                left = true;
+            }
         }
     }
-    acked
+    // A pass that started mid-way must wrap around before it may report nothing owed.
+    Delivery {
+        acked,
+        owed: left || resumed || next.is_some(),
+        next,
+    }
+}
+
+/// Arms the persisted delivery timer, so owed wakes are tried even on an idle node.
+pub(crate) async fn arm_delivery(context: &DriverContext) {
+    let Some(task_handle) = context.task_handle.as_ref() else {
+        return;
+    };
+    let effect = TaskEffect::ShortenTimer {
+        key: TaskKey::DeliverKeyWakes,
+        after: Duration::ZERO,
+    };
+    if let Err(message) = persist_task_effect(&context.storage_handle, &effect).await {
+        warn!(%message, "Failed to persist the key wake timer");
+        return;
+    }
+    if let Event::Task(TaskEvent::Error { message, .. }) =
+        task_handle.send_effect(Effect::Task(effect)).await
+    {
+        warn!(%message, "Failed to schedule key wake delivery");
+    }
 }
 
 #[cfg(test)]
@@ -519,5 +607,148 @@ mod tests {
         assert_eq!(waits.len(), 1);
         assert_eq!(waits[0].bucket, "sealed");
         assert_eq!(registrations(&context).await, 1);
+    }
+
+    fn empty_context(dir: &tempfile::TempDir) -> DriverContext {
+        DriverContext {
+            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_waiter_recovers() {
+        use crate::jobs::store::queue_remote_wakes;
+
+        let (key_dir, waiter_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (key_node, waiter_node) = (empty_context(&key_dir), empty_context(&waiter_dir));
+        let node = |seed| iroh::SecretKey::from_bytes(&[seed; 32]).public();
+        let (source, waiter) = (node(1), node(2));
+        let storage = &waiter_node.storage_handle;
+        let job_id = JobId::from_bytes([5; 16]);
+        let payload = JobPayload::Probe {
+            steps: 1,
+            step_sleep_ms: 0,
+            fail_at: None,
+            panic_at: None,
+            cleanup_marker: None,
+        };
+        let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
+        let record = JobRecord::new(job_id, payload, owner, waiter, 1_000, 1_000, None);
+        insert_job(storage, &record).await.unwrap();
+        let ClaimOutcome::Claimed(claimed) =
+            claim_job(storage, job_id, waiter, 2_000).await.unwrap()
+        else {
+            panic!("job must be claimed")
+        };
+        let auth = owner_auth(&claimed);
+        let key = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1);
+        let wait = KeyWait {
+            node_id: source,
+            bucket: "b".to_string(),
+            group_id: None,
+            key,
+        };
+        let token = claimed.claim.unwrap().claim_token;
+        park_job(storage, job_id, token, 3_000, vec![wait])
+            .await
+            .unwrap();
+        let owed_storage = &key_node.storage_handle;
+        register_remote_wait(owed_storage, key, waiter, job_id, &auth)
+            .await
+            .unwrap();
+        queue_remote_wakes(owed_storage, key).await.unwrap();
+
+        // The waiting node is offline: the wake stays owed and the timer runs again.
+        let offline = deliver_with(owed_storage, None, |_| async { false }).await;
+        assert_eq!(
+            offline,
+            Delivery {
+                acked: 0,
+                owed: true,
+                next: None
+            }
+        );
+
+        // After recovery the retry reaches it, wakes the job and drops the owed wake.
+        let online = |wake: OwedWake| {
+            let context = &waiter_node;
+            async move {
+                let accepted = accept_wake(context, source, &wake.auth, wake.job_id, wake.key);
+                accepted.await == Ok(true)
+            }
+        };
+        let recovered = deliver_with(owed_storage, None, online).await;
+        assert_eq!(
+            recovered,
+            Delivery {
+                acked: 1,
+                owed: false,
+                next: None
+            }
+        );
+        let woken = read_job_record(storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(woken.state, JobState::Queued);
+        let left = owed_wakes(owed_storage, None).await.unwrap();
+        assert!(left.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn paging_reaches_later() {
+        use crate::jobs::store::{WAKE_PAGE, queue_remote_wakes};
+
+        let dir = tempfile::tempdir().unwrap();
+        let context = empty_context(&dir);
+        let storage = &context.storage_handle;
+        let key = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1);
+        let auth = AuthContext {
+            user_id: UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),
+            realm_id: RealmId([1; 32]),
+            path_restrictions: None,
+            session: None,
+        };
+        let waiter = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let job = |timestamp_ms: u64| {
+            use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+            use aruna_core::structured_id::{BucketId, PlacementHandle};
+            let handle = PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap();
+            JobId::from_parts(timestamp_ms, handle, BucketId::new(0).unwrap(), 0).unwrap()
+        };
+        let last = job(1_000_000);
+        for timestamp_ms in 1..=WAKE_PAGE as u64 {
+            let job_id = job(timestamp_ms);
+            register_remote_wait(storage, key, waiter, job_id, &auth)
+                .await
+                .unwrap();
+        }
+        register_remote_wait(storage, key, waiter, last, &auth)
+            .await
+            .unwrap();
+        while queue_remote_wakes(storage, key).await.unwrap() {}
+
+        // Only the row after a full page of unreachable jobs answers.
+        let send = |wake: OwedWake| async move { wake.job_id == last };
+        let first = deliver_with(storage, None, send).await;
+        assert_eq!(first.acked, 0);
+        assert!(first.owed && first.next.is_some());
+        let second = deliver_with(storage, first.next, send).await;
+        assert_eq!(second.acked, 1);
+        // The pass started mid-way, so it wraps around for the rows still owed.
+        assert_eq!(
+            second,
+            Delivery {
+                acked: 1,
+                owed: true,
+                next: None
+            }
+        );
     }
 }

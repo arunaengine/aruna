@@ -263,6 +263,10 @@ impl TaskQueues {
             handler
                 .reschedule_timer(TaskKey::DrainCleanupQueue, Duration::ZERO)
                 .await;
+            // Wakes owed before a restart are delivered again; a run with none is cheap.
+            handler
+                .reschedule_timer(TaskKey::DeliverKeyWakes, Duration::ZERO)
+                .await;
             // A run deletes its timer before the page it works on, so a crash in between
             // leaves an unfinished migration without one. A run with nothing left is cheap.
             handler
@@ -861,11 +865,6 @@ impl OperationsTaskHandler {
         if !self.jobs_runtime.is_started() {
             return;
         }
-        // Owed key wakes retry on every pass, detached so an offline waiter never stalls it.
-        let context = self.context.clone();
-        tokio::spawn(async move {
-            crate::jobs::remote_key::deliver_owed_wakes(&context).await;
-        });
         let Some(owner_node_id) = self.context.net_handle.as_ref().map(|net| net.node_id()) else {
             warn!(task_id = ?TaskKey::DrainJobQueue, "Cannot drain job queue without net handle");
             self.reschedule_timer(TaskKey::DrainJobQueue, DRAIN_RETRY_AFTER)

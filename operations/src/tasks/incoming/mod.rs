@@ -196,6 +196,7 @@ pub(crate) struct OperationsTaskHandler {
     // Queued bucket the next migration run resumes after. Loss on restart is fine: the
     // next run starts at the head of the queue.
     migration_cursor: std::sync::Mutex<Option<Key>>,
+    wake_cursor: std::sync::Mutex<Option<Key>>,
     // Rotation state of the bounded outbox drain. Loss on restart is fine: the
     // next rotation opens at the head.
     rotation: std::sync::Mutex<OutboxRotation>,
@@ -332,6 +333,7 @@ impl OperationsTaskHandler {
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
             reclaim_cursor: std::sync::Mutex::new(None),
             migration_cursor: std::sync::Mutex::new(None),
+            wake_cursor: std::sync::Mutex::new(None),
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
             drain_guard: tokio::sync::Mutex::new(()),
             outbox_limits: OutboxLimits::default(),
@@ -853,6 +855,23 @@ impl OperationsTaskHandler {
                 // A locked key leaves the archives pending; its next unlock promotes them.
                 if let Err(error) = promoted.await {
                     warn!(bucket_id = %bucket_id, error = %error, "Pending promotion failed");
+                }
+            }),
+            TaskKey::DeliverKeyWakes => Box::pin(async move {
+                let start = (self.wake_cursor.lock())
+                    .expect("wake cursor mutex poisoned")
+                    .clone();
+                let delivery =
+                    crate::jobs::remote_key::deliver_owed_wakes(&self.context, start).await;
+                *(self.wake_cursor.lock()).expect("wake cursor mutex poisoned") =
+                    delivery.next.clone();
+                if delivery.owed {
+                    // A further page follows at once; a finished round waits before retrying.
+                    let after = match delivery.next {
+                        Some(_) => Duration::ZERO,
+                        None => crate::jobs::remote_key::WAKE_RETRY,
+                    };
+                    self.reschedule_timer(TaskKey::DeliverKeyWakes, after).await;
                 }
             }),
             TaskKey::DrainFamilyOutbox => Box::pin(async move {

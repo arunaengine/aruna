@@ -138,19 +138,26 @@ pub async fn queue_remote_wakes(
     ))
 }
 
-/// One page of owed wakes, ordered by waiting node. Undecodable rows are skipped.
-pub async fn owed_wakes(storage: &StorageHandle) -> Result<Vec<OwedWake>, String> {
+/// One page of owed wakes after `start_after`, and the cursor of the next page when this one
+/// is full. Undecodable rows are skipped but still advance the cursor.
+pub async fn owed_wakes(
+    storage: &StorageHandle,
+    start_after: Option<Key>,
+) -> Result<(Vec<OwedWake>, Option<Key>), String> {
     let prefix = ByteView::from(vec![DELIVERY_PREFIX]);
     let (rows, _) = iter_prefix_page(
         storage,
         JOB_KEY_WAIT_KEYSPACE,
         Some(prefix),
-        None,
+        start_after,
         WAKE_PAGE,
         None,
     )
     .await?;
-    Ok(rows
+    let next = (rows.len() == WAKE_PAGE)
+        .then(|| rows.last().map(|(row, _)| row.clone()))
+        .flatten();
+    let owed = rows
         .iter()
         .filter_map(|(row, value)| {
             let (waiter, job_id, key) = parse_delivery(row)?;
@@ -162,7 +169,8 @@ pub async fn owed_wakes(storage: &StorageHandle) -> Result<Vec<OwedWake>, String
                 auth,
             })
         })
-        .collect())
+        .collect();
+    Ok((owed, next))
 }
 
 /// Drops an owed wake once the waiting node acknowledged it.
@@ -215,12 +223,15 @@ mod tests {
             key,
             auth,
         };
-        assert_eq!(owed_wakes(&storage).await.unwrap(), vec![owed]);
+        assert_eq!(
+            owed_wakes(&storage, None).await.unwrap(),
+            (vec![owed], None)
+        );
         // A repeated unlock finds nothing left to queue for this key.
         assert!(!queue_remote_wakes(&storage, key).await.unwrap());
-        assert_eq!(owed_wakes(&storage).await.unwrap().len(), 1);
+        assert_eq!(owed_wakes(&storage, None).await.unwrap().0.len(), 1);
 
         ack_wake(&storage, waiter, job_id, key).await.unwrap();
-        assert!(owed_wakes(&storage).await.unwrap().is_empty());
+        assert!(owed_wakes(&storage, None).await.unwrap().0.is_empty());
     }
 }

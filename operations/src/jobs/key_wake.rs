@@ -44,11 +44,11 @@ pub async fn wake_unlocked(
 ) -> Result<(usize, usize), KeyWakeError> {
     let woken = wake_key_waits(&context.storage_handle, key, now_ms).await?;
     let promoted = promote_unlocked(context, key, origin, limits).await?;
-    // Remote waiters get owed wakes; a failed delivery stays owed for the next one.
+    // Remote waiters get owed wakes; the delivery timer retries them until acknowledged.
     super::remote_key::queue_wakes(context, key)
         .await
         .map_err(|error| KeyWakeError::Jobs(JobMutationError::Storage(error)))?;
-    super::remote_key::deliver_owed_wakes(context).await;
+    super::remote_key::arm_delivery(context).await;
     Ok((woken, promoted))
 }
 

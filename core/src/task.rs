@@ -69,7 +69,12 @@ pub enum TaskKey {
     },
     /// Hashes the pending archives of one key generation if it is unlocked. Persisted, so a
     /// completion during an unlock session is promoted even across a restart.
-    PromotePending { bucket_id: Ulid, generation: u64 },
+    PromotePending {
+        bucket_id: Ulid,
+        generation: u64,
+    },
+    /// Delivers wakes owed to nodes waiting on this node's keys; re-armed while any remain.
+    DeliverKeyWakes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
