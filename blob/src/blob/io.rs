@@ -7,7 +7,7 @@ use super::backend::{
     build_backend_path, build_hidden_path, build_part_path, intent_key, intent_value,
 };
 use super::group::GROUP_WRITE_CHUNK;
-use super::pithos::{ArchiveEncoder, working_set};
+use super::pithos::{ArchiveEncoder, Share, working_set};
 use crate::codec::FrameEncoder;
 use crate::hash::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
@@ -43,7 +43,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
-use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::{Instant, timeout, timeout_at};
 use ulid::Ulid;
 
@@ -71,7 +70,8 @@ impl Encoder {
     }
 
     /// The closing bytes and the stored format; a Pithos content hash must equal `blake3`.
-    async fn finish(self, blake3: &[u8]) -> Result<(Vec<Bytes>, StoredFormat), BlobError> {
+    /// The share, if any, covers the closing bytes until the writer is closed.
+    async fn finish(self, blake3: &[u8]) -> Result<Closing, BlobError> {
         match self {
             Self::Frames(encoder) => {
                 let (pieces, layout) = encoder.finish().await?;
@@ -79,19 +79,22 @@ impl Encoder {
                     layout: StoredLayout::Frames(Box::new(layout)),
                     ..StoredFormat::default()
                 };
-                Ok((pieces, format))
+                Ok((pieces, format, None))
             }
             Self::Pithos(encoder, key) => {
-                let (pieces, layout, content_hash) = encoder.finish().await?;
+                let (pieces, layout, content_hash, share) = encoder.finish().await?;
                 if content_hash != blake3 {
                     let message = "the Pithos content hash differs from the original bytes";
                     return Err(BlobError::IntegrityCheckFailed(message.to_string()));
                 }
-                Ok((pieces, StoredFormat::pithos(layout, key)))
+                Ok((pieces, StoredFormat::pithos(layout, key), share))
             }
         }
     }
 }
+
+/// Closing bytes of an encoder, the stored format and the reservation covering those bytes.
+type Closing = (Vec<Bytes>, StoredFormat, Option<Share>);
 
 const HIDDEN_LIST_PAGE: usize = 128;
 const HIDDEN_BACKEND_LIMIT: usize = 256;
@@ -425,7 +428,7 @@ impl BlobHandler {
         operator: Operator,
         blob: BackendStream<Result<Bytes, StreamError>>,
         compression: Compression,
-        (seal, reserved): (Option<SealPlan>, Option<OwnedSemaphorePermit>),
+        (seal, reserved): (Option<SealPlan>, Option<Share>),
         size: Option<u64>,
     ) -> BlobEvent {
         let mut limits = WriteLimits::default();
@@ -620,12 +623,15 @@ impl BlobHandler {
             bytes_written = next_size;
         }
         let hashes = hasher.to_map();
+        // Held until this write returns, after the closing bytes are written and closed.
+        let _covering: Option<Share>;
         if let Some(encoder) = encoder {
             let blake3 = hashes.get(HASH_BLAKE3).map_or(&[][..], Vec::as_slice);
-            let (pieces, format) = match encoder.finish(blake3).await {
+            let (pieces, format, share) = match encoder.finish(blake3).await {
                 Ok(finished) => finished,
                 Err(error) => return reservation.fail(error).await,
             };
+            _covering = share;
             for piece in pieces {
                 if let Err(event) = self.write_stored(reservation, deadline, piece).await {
                     return event;
@@ -1087,7 +1093,7 @@ impl BlobHandler {
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
         size: Option<u64>,
-        reserved: Option<OwnedSemaphorePermit>,
+        reserved: Option<Share>,
     ) -> BlobEvent {
         let root = match self.registry.config_for(&resolved.backend) {
             Ok(config) => config.root.clone(),

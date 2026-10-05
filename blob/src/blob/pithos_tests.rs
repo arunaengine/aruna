@@ -966,10 +966,7 @@ async fn reads_reserve_budget() {
     };
 
     // The open keeps its share until the stream ends.
-    let StoredLayout::Pithos(layout) = &location.format.layout else {
-        panic!("not a Pithos copy")
-    };
-    let share = working_set(layout.stored_size).div_ceil(1 << 20) as usize;
+    let share = working_set(location.blob_size).div_ceil(1 << 20) as usize;
     assert_eq!(
         handler.pithos_budget.available_permits(),
         budget_permits() - share
@@ -1033,11 +1030,7 @@ async fn rewrites_never_deadlock() {
     }
 
     // Only one rewrite's combined share is free, so they must run one after another.
-    let StoredLayout::Pithos(layout) = &copies[0].format.layout else {
-        panic!("not a Pithos copy")
-    };
-    let share = (working_set(layout.stored_size) + working_set(data.len() as u64)).div_ceil(1 << 20)
-        as usize;
+    let share = (2 * working_set(data.len() as u64)).div_ceil(1 << 20) as usize;
     let held = handler
         .pithos_budget
         .clone()
@@ -1152,4 +1145,19 @@ async fn framed_reads_pin_copies() {
         handler.delete_blob(location).await,
         BlobEvent::DeleteFinished
     );
+}
+
+#[tokio::test]
+async fn over_budget_refused() {
+    use crate::blob::pithos::{MAX_SIZE, WORKING_SET, budget_permits, working_set};
+
+    // The largest object's working set exceeds the node budget: refused, never clipped.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let refused = handler.reserve_pithos(working_set(MAX_SIZE)).await;
+    assert_eq!(
+        refused.err(),
+        Some(BlobError::SizeLimitExceeded { limit: WORKING_SET })
+    );
+    assert_eq!(handler.pithos_budget.available_permits(), budget_permits());
 }

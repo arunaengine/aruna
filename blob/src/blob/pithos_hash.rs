@@ -30,16 +30,12 @@ impl BlobHandler {
         location: &BackendLocation,
         lease: &ReadLease,
     ) -> Result<BlobEvent, BlobError> {
-        let StoredLayout::Pithos(layout) = &location.format.layout else {
+        let StoredLayout::Pithos(_) = &location.format.layout else {
             return Err(BlobError::ReadError("only sealed copies hash here".into()));
         };
         let keys = self.lease_keys(location, Some(lease))?;
-        let operator = self.operator_from_location(location)?;
-        let path = location.get_storage_path()?;
         let range = 0..location.blob_size;
-        let stream = self
-            .read_archive(operator, path, layout, keys, range)
-            .await?;
+        let stream = self.read_archive(location, keys, range).await?;
         let mut stream = Box::pin(stream);
         let mut hasher = Hasher::new();
         let mut size = 0u64;

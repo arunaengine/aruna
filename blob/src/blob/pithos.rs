@@ -48,9 +48,17 @@ const MAX_BLOCK: u64 = 16 << 20;
 /// Pithos metadata, encoder state and read buffers that may be in use at once on one node.
 pub(super) const WORKING_SET: u64 = 2 << 30;
 /// Fixed share of one open, encoder or composition: batches, sealed blocks and read buffers.
-const BASE_SHARE: u64 = 64 << 20;
-/// Retained metadata per MiB of content: descriptors, keys, hashes and their directory bytes.
-const META_PER_MIB: u64 = 256;
+pub(super) const BASE_SHARE: u64 = 64 << 20;
+/// Smallest block of an Aruna archive except the last block of each piece.
+const MIN_BLOCK: u64 = 1 << 20;
+/// Pieces of one archive: the S3 part numbers 1 to 10,000.
+const MAX_PIECES: u64 = 10_000;
+/// Memory per block while its encoded directory entry, decoded descriptor and index entries are
+/// held at the same time; the measured allocation test checks this bound.
+pub(super) const BLOCK_MEMORY: u64 = 1024;
+/// Encoded directory bytes per block, and the fixed directory part of grants and entries.
+const DIRECTORY_PER_BLOCK: u64 = 256;
+const DIRECTORY_BASE: u64 = 1 << 20;
 /// Read buffers of one open stay within the fixed share.
 const READ_LIMITS: ReadLimits = ReadLimits {
     max_in_flight: 4,
@@ -58,12 +66,38 @@ const READ_LIMITS: ReadLimits = ReadLimits {
     max_request_bytes: 8 << 20,
 };
 
-/// Conservative working set of an open, encoder or composition over `size` content bytes. It
-/// never exceeds the node budget, so one operation can always run alone.
-pub(super) fn working_set(size: u64) -> u64 {
-    let metadata = size.div_ceil(1 << 20).saturating_mul(META_PER_MIB);
-    BASE_SHARE.saturating_add(metadata).min(WORKING_SET)
+/// Upper bound of the blocks of an archive over `original` content bytes.
+fn blocks_of(original: u64) -> u64 {
+    original.div_ceil(MIN_BLOCK).saturating_add(MAX_PIECES)
 }
+
+/// Conservative working set of an open, encoder or composition over `original` content bytes:
+/// the fixed buffers and the memory of every block's metadata. It is never clipped; work above
+/// the node budget is refused when it is reserved.
+pub(super) fn working_set(original: u64) -> u64 {
+    let metadata = blocks_of(original).saturating_mul(BLOCK_MEMORY);
+    BASE_SHARE.saturating_add(metadata)
+}
+
+/// Reader limits that keep an open of `original` content bytes within its working set.
+pub(super) fn open_limits(original: u64) -> OpenLimits {
+    let blocks = blocks_of(original);
+    let directory = blocks
+        .saturating_mul(DIRECTORY_PER_BLOCK)
+        .saturating_add(DIRECTORY_BASE);
+    let base = limits();
+    OpenLimits {
+        max_descriptors: blocks.min(base.max_descriptors),
+        max_accessible_block_references: blocks.min(base.max_accessible_block_references),
+        max_directory_bytes: directory.min(base.max_directory_bytes),
+        max_total_directory_bytes: directory.min(base.max_total_directory_bytes),
+        ..base
+    }
+}
+
+/// A working-set reservation shared by an operation and every blocking task it starts, so the
+/// reservation ends only when the last of them releases its allocations.
+pub(super) type Share = Arc<Mutex<OwnedSemaphorePermit>>;
 
 /// Content an unsized write reserves for at first, and each later growth step.
 pub(super) const GROWTH: u64 = 64 << 30;
@@ -111,8 +145,9 @@ impl AsyncArchiveSource for StoredArchive {
     }
 }
 
-/// Runs the CPU work of the Pithos reader on Tokio's blocking pool.
-struct TokioBlocking;
+/// Runs Pithos CPU work on Tokio's blocking pool. Each task keeps the reservation share, so a
+/// cancelled caller does not free the budget while detached work still owns its allocations.
+pub(super) struct TokioBlocking(pub(super) Option<Share>);
 
 impl BlockingHook for TokioBlocking {
     async fn spawn_blocking<F, T>(&self, task: F) -> T
@@ -120,6 +155,12 @@ impl BlockingHook for TokioBlocking {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        let share = self.0.clone();
+        let task = move || {
+            let value = task();
+            drop(share);
+            value
+        };
         match tokio::task::spawn_blocking(task).await {
             Ok(value) => value,
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
@@ -159,7 +200,30 @@ pub async fn read(
     range: Range<u64>,
     idle: Duration,
 ) -> Result<impl Stream<Item = Result<Bytes, BlobError>> + Send + 'static, BlobError> {
-    let archive = open(operator, path, layout, keys, idle).await?;
+    let opening = Opening {
+        original: u64::MAX,
+        share: None,
+    };
+    read_within(operator, path, layout, keys, range, idle, opening).await
+}
+
+/// How an open is bounded: its original content size and the reservation its tasks keep.
+pub(super) struct Opening {
+    pub(super) original: u64,
+    pub(super) share: Option<Share>,
+}
+
+/// Like `read`, within the reader limits and reservation of `opening`.
+pub(super) async fn read_within(
+    operator: Operator,
+    path: String,
+    layout: &PithosLayout,
+    keys: AccessKeys,
+    range: Range<u64>,
+    idle: Duration,
+    opening: Opening,
+) -> Result<impl Stream<Item = Result<Bytes, BlobError>> + Send + 'static, BlobError> {
+    let archive = open(operator, path, layout, keys, idle, opening).await?;
     let stream = archive
         .read_range_owned(OBJECT_PATH, range)
         .map_err(blob_error)?;
@@ -169,7 +233,7 @@ pub async fn read(
 /// A stream that keeps its working-set reservation until it ends.
 struct Budgeted<S> {
     stream: Pin<Box<S>>,
-    _permit: OwnedSemaphorePermit,
+    _share: Share,
 }
 
 impl<S: Stream> Stream for Budgeted<S> {
@@ -190,6 +254,7 @@ async fn open(
     layout: &PithosLayout,
     keys: AccessKeys,
     idle: Duration,
+    opening: Opening,
 ) -> Result<OpenArchive, BlobError> {
     let source = StoredArchive {
         operator,
@@ -197,14 +262,14 @@ async fn open(
         idle,
     };
     let options = OpenOptions::default()
-        .with_limits(limits())
+        .with_limits(open_limits(opening.original))
         .with_access_keys(keys)
         .with_expected_metadata_digest(layout.metadata_digest);
-    let archive =
-        AsyncArchive::open_with_hook(source, options, Some(layout.stored_size), TokioBlocking)
-            .await
-            .map_err(blob_error)?
-            .with_read_limits(READ_LIMITS);
+    let hook = TokioBlocking(opening.share);
+    let archive = AsyncArchive::open_with_hook(source, options, Some(layout.stored_size), hook)
+        .await
+        .map_err(blob_error)?
+        .with_read_limits(READ_LIMITS);
     let single = {
         let mut entries = archive.entries();
         match (entries.next(), entries.next()) {
@@ -229,7 +294,7 @@ pub(super) struct SealedReader {
     archive: OpenArchive,
     size: u64,
     _lease: ReadLease,
-    _permit: OwnedSemaphorePermit,
+    _share: Share,
 }
 
 impl iroh_io::AsyncSliceReader for SealedReader {
@@ -268,7 +333,7 @@ pub(super) struct ArchiveEncoder {
     stored: u64,
     header: [u8; 6],
     /// Working-set reservation and the content bytes it covers; it grows only without waiting.
-    budget: Option<(Arc<Semaphore>, OwnedSemaphorePermit)>,
+    budget: Option<(Arc<Semaphore>, Share)>,
     covered: u64,
 }
 
@@ -299,14 +364,14 @@ impl ArchiveEncoder {
         })
     }
 
-    /// Keeps `permit` from `budget` for the encoder's lifetime; it covers `covered` content bytes.
+    /// Keeps `share` from `budget` for the encoder's lifetime; it covers `covered` content bytes.
     pub(super) fn with_budget(
         mut self,
         budget: Arc<Semaphore>,
-        permit: OwnedSemaphorePermit,
+        share: Share,
         covered: u64,
     ) -> Self {
-        self.budget = Some((budget, permit));
+        self.budget = Some((budget, share));
         self.covered = covered;
         self
     }
@@ -335,7 +400,8 @@ impl ArchiveEncoder {
     async fn seal(&mut self, plain: Bytes) -> Result<Option<Bytes>, BlobError> {
         self.count(plain.len())?;
         let mut encoder = self.encoder.take().ok_or_else(sealing_failed)?;
-        let sealed = TokioBlocking.spawn_blocking(move || {
+        let hook = self.hook();
+        let sealed = hook.spawn_blocking(move || {
             let blocks = encoder.write(&plain);
             (encoder, blocks)
         });
@@ -347,13 +413,13 @@ impl ArchiveEncoder {
     }
 
     /// Seals the last bytes and returns the closing bytes, the layout and the content hash.
-    pub(super) async fn finish(
-        mut self,
-    ) -> Result<(Vec<Bytes>, PithosLayout, [u8; 32]), BlobError> {
+    /// The returned share covers the closing bytes until the caller has written them.
+    pub(super) async fn finish(mut self) -> Result<Finished, BlobError> {
         let plain = std::mem::take(&mut self.batch).freeze();
         self.count(plain.len())?;
         let encoder = self.encoder.take().ok_or_else(sealing_failed)?;
-        let sealed = TokioBlocking.spawn_blocking(move || finish_piece(encoder, &plain));
+        let hook = self.hook();
+        let sealed = hook.spawn_blocking(move || finish_piece(encoder, &plain));
         let (blocks, piece, composition) = sealed.await.map_err(write_error)?;
         let start = self.header.len() as u64;
         let stored = self.stored + blocks.len() as u64;
@@ -376,7 +442,8 @@ impl ArchiveEncoder {
             out.push(Bytes::from(blocks));
         }
         out.push(Bytes::from(directory));
-        Ok((out, layout, content_hash))
+        let share = self.budget.take().map(|(_, share)| share);
+        Ok((out, layout, content_hash, share))
     }
 
     fn count(&mut self, len: usize) -> Result<(), BlobError> {
@@ -393,18 +460,31 @@ impl ArchiveEncoder {
 
     /// Extends the reservation by one growth step if the budget has room now; it never waits.
     fn grow(&mut self) -> Result<(), BlobError> {
-        let Some((budget, permit)) = self.budget.as_mut() else {
+        let Some((budget, share)) = self.budget.as_mut() else {
             return Ok(());
         };
-        let units = budget_units(working_set(GROWTH) - BASE_SHARE);
+        let units = budget_units(working_set(GROWTH) - working_set(0));
         let extra = Arc::clone(budget)
             .try_acquire_many_owned(units)
             .map_err(|_| {
                 BlobError::WriteError("the Pithos working set is exhausted".to_string())
             })?;
-        permit.merge(extra);
+        share
+            .lock()
+            .map_err(|_| BlobError::WriteError("the Pithos working set is poisoned".to_string()))?
+            .merge(extra);
         self.covered = self.covered.saturating_add(GROWTH);
         Ok(())
+    }
+}
+
+/// Closing bytes, layout, content hash and the reservation that covers the closing bytes.
+pub(super) type Finished = (Vec<Bytes>, PithosLayout, [u8; 32], Option<Share>);
+
+impl ArchiveEncoder {
+    /// Blocking tasks of this encoder keep its reservation while they run.
+    fn hook(&self) -> TokioBlocking {
+        TokioBlocking(self.budget.as_ref().map(|(_, share)| Arc::clone(share)))
     }
 }
 
@@ -483,11 +563,15 @@ impl BlobHandler {
         let path = location.get_storage_path()?;
         let idle = self.transfer_idle_timeout();
         let size = range.end.saturating_sub(range.start);
-        let permit = self.reserve_pithos(working_set(layout.stored_size)).await?;
-        let stream = read(operator, path, layout, keys, range, idle).await?;
+        let share = self.reserve_pithos(working_set(location.blob_size)).await?;
+        let opening = Opening {
+            original: location.blob_size,
+            share: Some(Arc::clone(&share)),
+        };
+        let stream = read_within(operator, path, layout, keys, range, idle, opening).await?;
         let stream = Box::pin(Budgeted {
             stream: Box::pin(stream),
-            _permit: permit,
+            _share: share,
         });
         let blob = LeasedRead {
             stream: Mutex::new(stream),
@@ -510,44 +594,58 @@ impl BlobHandler {
         let keys = self.sealed_keys(location, &lease)?;
         let operator = self.operator_from_location(location)?;
         let path = location.get_storage_path()?;
-        let permit = self.reserve_pithos(working_set(layout.stored_size)).await?;
-        let archive = open(operator, path, layout, keys, self.transfer_idle_timeout()).await?;
+        let share = self.reserve_pithos(working_set(location.blob_size)).await?;
+        let opening = Opening {
+            original: location.blob_size,
+            share: Some(Arc::clone(&share)),
+        };
+        let idle = self.transfer_idle_timeout();
+        let archive = open(operator, path, layout, keys, idle, opening).await?;
         Ok(SealedReader {
             archive,
             size: location.blob_size,
             _lease: lease,
-            _permit: permit,
+            _share: share,
         })
     }
 
     /// Reserves `bytes` of the node's Pithos working set before anything is allocated. A request
     /// waits for the whole share at once, so no operation holds part of it while waiting.
-    pub(super) async fn reserve_pithos(
-        &self,
-        bytes: u64,
-    ) -> Result<OwnedSemaphorePermit, BlobError> {
+    /// Work above the whole node budget is refused rather than clipped to fit.
+    pub(super) async fn reserve_pithos(&self, bytes: u64) -> Result<Share, BlobError> {
+        if bytes > WORKING_SET {
+            return Err(BlobError::SizeLimitExceeded { limit: WORKING_SET });
+        }
         let budget = Arc::clone(&self.pithos_budget);
-        budget
+        let permit = budget
             .acquire_many_owned(budget_units(bytes))
             .await
-            .map_err(|_| BlobError::ReadError("the Pithos working set is closed".to_string()))
+            .map_err(|_| BlobError::ReadError("the Pithos working set is closed".to_string()))?;
+        Ok(Arc::new(Mutex::new(permit)))
     }
 
     /// Streams `range` of a Pithos copy within the node's working set, for keyless or leased work.
     pub(super) async fn read_archive(
         &self,
-        operator: Operator,
-        path: String,
-        layout: &PithosLayout,
+        location: &BackendLocation,
         keys: AccessKeys,
         range: Range<u64>,
     ) -> Result<impl Stream<Item = Result<Bytes, BlobError>> + Send + 'static, BlobError> {
-        let permit = self.reserve_pithos(working_set(layout.stored_size)).await?;
+        let StoredLayout::Pithos(layout) = &location.format.layout else {
+            return Err(needs_bucket_key());
+        };
+        let share = self.reserve_pithos(working_set(location.blob_size)).await?;
+        let opening = Opening {
+            original: location.blob_size,
+            share: Some(Arc::clone(&share)),
+        };
+        let operator = self.operator_from_location(location)?;
+        let path = location.get_storage_path()?;
         let idle = self.transfer_idle_timeout();
-        let stream = read(operator, path, layout, keys, range, idle).await?;
+        let stream = read_within(operator, path, layout, keys, range, idle, opening).await?;
         Ok(Budgeted {
             stream: Box::pin(stream),
-            _permit: permit,
+            _share: share,
         })
     }
 
@@ -642,14 +740,20 @@ fn blob_error(error: PithosError) -> BlobError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArchiveEncoder, BASE_SHARE, BATCH, GROWTH, MAX_SIZE, WORKING_SET, budget_permits,
+        ArchiveEncoder, BASE_SHARE, BATCH, BLOCK_MEMORY, GROWTH, MAX_PIECES, MAX_SIZE, OBJECT_PATH,
+        Share, TokioBlocking, WORKING_SET, budget_permits, compose_object, open_limits,
         working_set,
     };
     use aruna_core::errors::BlobError;
     use aruna_core::structs::storage::encryption::{BucketKeyRef, SealPlan};
     use aruna_core::structs::storage::format::Compression;
+    use pithos_lib::archive::{
+        AccessKeys, Archive, BlockingHook, OpenOptions, PieceEncoder, ProcessingOptions,
+    };
     use pithos_lib::crypto::PrivateKey;
+    use pithos_lib::source::MemorySource;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use tokio::sync::Semaphore;
 
     fn encoder() -> ArchiveEncoder {
@@ -683,11 +787,14 @@ mod tests {
     }
 
     #[test]
-    fn working_sets_fit() {
-        assert_eq!(working_set(0), BASE_SHARE);
-        // A 5 TiB archive, the largest one, still fits the node budget on its own.
-        let largest = working_set(MAX_SIZE);
-        assert!(largest > BASE_SHARE + (1 << 30) && largest <= WORKING_SET);
+    fn working_sets_bound() {
+        assert_eq!(working_set(0), BASE_SHARE + MAX_PIECES * BLOCK_MEMORY);
+        // Nothing is clipped: the largest object needs more than the node budget, so it is
+        // refused when reserved instead of running with too small a share.
+        assert!(working_set(MAX_SIZE) > WORKING_SET);
+        let limits = open_limits(1 << 30);
+        assert_eq!(limits.max_descriptors, 1024 + MAX_PIECES);
+        assert!(limits.max_total_directory_bytes < working_set(1 << 30));
         assert_eq!(budget_permits() as u64, WORKING_SET >> 20);
     }
 
@@ -696,7 +803,8 @@ mod tests {
         // The budget holds the first share only, so growth past it fails instead of waiting.
         let budget = Arc::new(Semaphore::new(64));
         let permit = Arc::clone(&budget).acquire_many_owned(64).await.unwrap();
-        let mut sealing = encoder().with_budget(Arc::clone(&budget), permit, BATCH as u64);
+        let share = Arc::new(Mutex::new(permit));
+        let mut sealing = encoder().with_budget(Arc::clone(&budget), share, BATCH as u64);
         sealing.push(&vec![7; BATCH]).await.unwrap();
         let exhausted = sealing.push(&vec![7; BATCH]).await;
         assert!(matches!(exhausted, Err(BlobError::WriteError(_))));
@@ -704,12 +812,197 @@ mod tests {
         // With room, the reservation grows by one step and keeps it.
         let budget = Arc::new(Semaphore::new(budget_permits()));
         let permit = Arc::clone(&budget).acquire_many_owned(64).await.unwrap();
-        let mut sealing = encoder().with_budget(Arc::clone(&budget), permit, BATCH as u64);
+        let share = Arc::new(Mutex::new(permit));
+        let mut sealing = encoder().with_budget(Arc::clone(&budget), share, BATCH as u64);
         sealing.push(&vec![7; 2 * BATCH]).await.unwrap();
         assert_eq!(sealing.covered, BATCH as u64 + GROWTH);
         let held = budget_permits() - budget.available_permits();
-        assert_eq!(held as u64, 64 + ((working_set(GROWTH) - BASE_SHARE) >> 20));
+        assert_eq!(
+            held as u64,
+            64 + ((working_set(GROWTH) - working_set(0)) >> 20)
+        );
         drop(sealing);
         assert_eq!(budget.available_permits(), budget_permits());
+    }
+
+    /// Counts the bytes allocated on the measuring thread only, so other tests do not disturb it.
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static ACTIVE: Cell<bool> = const { Cell::new(false) };
+            static CURRENT: Cell<isize> = const { Cell::new(0) };
+            static PEAK: Cell<isize> = const { Cell::new(0) };
+        }
+
+        struct Counting;
+
+        fn track(delta: isize) {
+            let _ = ACTIVE.try_with(|active| {
+                if active.get() {
+                    let now = CURRENT.get() + delta;
+                    CURRENT.set(now);
+                    PEAK.set(PEAK.get().max(now));
+                }
+            });
+        }
+
+        // SAFETY: every call forwards to the system allocator unchanged; only counters change.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                track(layout.size() as isize);
+                // SAFETY: the caller upholds the `GlobalAlloc::alloc` contract.
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                track(-(layout.size() as isize));
+                // SAFETY: `ptr` came from this allocator with `layout`.
+                unsafe { System.dealloc(ptr, layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                track(size as isize - layout.size() as isize);
+                // SAFETY: the caller upholds the `GlobalAlloc::realloc` contract.
+                unsafe { System.realloc(ptr, layout, size) }
+            }
+        }
+
+        #[global_allocator]
+        static ALLOCATOR: Counting = Counting;
+
+        /// Runs `work` and returns its result with the peak bytes it held at once.
+        pub(super) fn peak<T>(work: impl FnOnce() -> T) -> (T, usize) {
+            CURRENT.set(0);
+            PEAK.set(0);
+            ACTIVE.set(true);
+            let value = work();
+            ACTIVE.set(false);
+            (value, PEAK.get().max(0) as usize)
+        }
+    }
+
+    /// An archive of `blocks` sealed 1 KiB blocks, so its metadata dominates its working set.
+    fn small_blocks(blocks: usize, key: &PrivateKey) -> Vec<u8> {
+        let processing = ProcessingOptions::new(true, 0).unwrap();
+        let mut encoder = PieceEncoder::new(1, vec![key.public_key()], processing)
+            .unwrap()
+            .with_block_size(1024)
+            .unwrap();
+        let data: Vec<u8> = (0..blocks * 1024)
+            .map(|index| (index * 7 % 251) as u8)
+            .collect();
+        let mut stored = encoder.write(&data).unwrap();
+        stored.extend(encoder.flush().unwrap());
+        let piece = encoder.finish().unwrap();
+        let composition = compose_object(&[piece]).unwrap();
+        [
+            composition.header().as_slice(),
+            &stored,
+            composition.directory(),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn measured_metadata_fits() {
+        const BLOCKS: usize = 8192;
+        let key = PrivateKey::generate();
+        let archive = small_blocks(BLOCKS, &key);
+        let original = (BLOCKS * 1024) as u64;
+        let source = MemorySource::new(archive);
+        let options = OpenOptions::default()
+            .with_limits(open_limits(original))
+            .with_access_keys(AccessKeys::new().with_key(key.duplicate()));
+        // Opening and reading every block holds the directory, descriptors and indexes at once.
+        let (read, peak) = counting::peak(|| {
+            let archive = Archive::open(source, options)?;
+            archive.copy_to(OBJECT_PATH, &mut std::io::sink())
+        });
+        read.unwrap();
+        assert!(
+            peak as u64 <= BLOCKS as u64 * BLOCK_MEMORY,
+            "read peak {peak}"
+        );
+
+        // Encoding keeps the same metadata per block, plus the composition of the piece.
+        let data = vec![9u8; 64 << 10];
+        let (_, peak) = counting::peak(|| {
+            let processing = ProcessingOptions::new(true, 0).unwrap();
+            let mut encoder = PieceEncoder::new(1, vec![key.public_key()], processing)
+                .unwrap()
+                .with_block_size(1024)
+                .unwrap();
+            for _ in 0..BLOCKS / 64 {
+                drop(encoder.write(&data).unwrap());
+            }
+            drop(encoder.flush().unwrap());
+            let piece = encoder.finish().unwrap();
+            compose_object(&[piece]).unwrap()
+        });
+        assert!(
+            peak as u64 <= BLOCKS as u64 * BLOCK_MEMORY,
+            "write peak {peak}"
+        );
+    }
+
+    #[test]
+    fn oversized_directories_refused() {
+        // 20,000 blocks claimed as 1 MiB of content exceed the blocks that size allows.
+        let key = PrivateKey::generate();
+        let archive = small_blocks(20_000, &key);
+        let options = OpenOptions::default()
+            .with_limits(open_limits(1 << 20))
+            .with_access_keys(AccessKeys::new().with_key(key.duplicate()));
+        assert!(Archive::open(MemorySource::new(archive), options).is_err());
+    }
+
+    #[tokio::test]
+    async fn finish_keeps_share() {
+        let budget = Arc::new(Semaphore::new(budget_permits()));
+        let permit = Arc::clone(&budget).acquire_many_owned(64).await.unwrap();
+        let share: Share = Arc::new(Mutex::new(permit));
+        let mut sealing = encoder().with_budget(Arc::clone(&budget), share, BATCH as u64);
+        sealing.push(&vec![7; 1000]).await.unwrap();
+        let (closing, _, _, share) = sealing.finish().await.unwrap();
+        // The directory bytes are still to be written, so their share is still reserved.
+        assert_eq!(budget.available_permits(), budget_permits() - 64);
+        drop(closing);
+        drop(share);
+        assert_eq!(budget.available_permits(), budget_permits());
+    }
+
+    #[tokio::test]
+    async fn detached_work_keeps_share() {
+        use futures::FutureExt;
+
+        let budget = Arc::new(Semaphore::new(budget_permits()));
+        let permit = Arc::clone(&budget).acquire_many_owned(64).await.unwrap();
+        let share: Share = Arc::new(Mutex::new(permit));
+        let hook = TokioBlocking(Some(Arc::clone(&share)));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let mut task = Box::pin(hook.spawn_blocking(move || {
+            let _ = started.send(());
+            let _ = wait.recv();
+        }));
+        assert!((&mut task).now_or_never().is_none());
+        running.await.unwrap();
+        // The caller gives up while the blocking task still owns its allocations.
+        drop(task);
+        drop(hook);
+        drop(share);
+        assert_eq!(budget.available_permits(), budget_permits() - 64);
+        release.send(()).unwrap();
+        // A generous cap that only a hang reaches.
+        let freed = async {
+            while budget.available_permits() != budget_permits() {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), freed)
+            .await
+            .expect("the share must be freed once the blocking task ends");
     }
 }

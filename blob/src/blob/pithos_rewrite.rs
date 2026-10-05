@@ -6,7 +6,7 @@
 use super::BlobHandler;
 use super::backend::build_backend_path;
 use super::frames::read_range;
-use super::pithos::{WORKING_SET, working_set};
+use super::pithos::{Opening, read_within, working_set};
 use super::unlock::LeaseGuard;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
@@ -109,16 +109,16 @@ impl BlobHandler {
         target: ResolvedBackend,
     ) -> Result<BlobEvent, BlobError> {
         // One reservation covers the read and the write, so two rewrites never wait half-held.
+        // Work above the node budget is refused, never clipped to fit.
         let read_share = match &source.format.layout {
-            StoredLayout::Pithos(layout) => working_set(layout.stored_size),
+            StoredLayout::Pithos(_) => working_set(source.blob_size),
             _ => 0,
         };
         let write_share = match target.encryption {
             Some(_) => working_set(source.blob_size),
             None => 0,
         };
-        let share = (read_share + write_share).min(WORKING_SET);
-        let mut permit = match share {
+        let mut permit = match read_share + write_share {
             0 => None,
             share => Some(self.reserve_pithos(share).await?),
         };
@@ -129,7 +129,12 @@ impl BlobHandler {
                 let path = source.get_storage_path()?;
                 let range = 0..source.blob_size;
                 let idle = self.transfer_idle_timeout();
-                let stream = super::pithos::read(operator, path, layout, keys, range, idle).await?;
+                let opening = Opening {
+                    original: source.blob_size,
+                    share: permit.clone(),
+                };
+                let stream =
+                    read_within(operator, path, layout, keys, range, idle, opening).await?;
                 BackendStream::new(Exclusive(Mutex::new(Box::pin(stream))))
             }
             _ => match Box::pin(self.read_blob(source.clone())).await {
@@ -201,8 +206,8 @@ impl BlobHandler {
             return Err(BlobError::WriteError(message.to_string()));
         };
         let keys = self.lease_keys(source, lease)?;
-        let working = super::pithos::working_set(layout.stored_size);
-        let _budget = self.reserve_pithos(working).await?;
+        // Covers the decoded view, the raw directory and the replacement held at once.
+        let _budget = self.reserve_pithos(working_set(source.blob_size)).await?;
         let operator = self.operator_from_location(source)?;
         let path = source.get_storage_path()?;
         let idle = self.transfer_idle_timeout();
@@ -212,7 +217,7 @@ impl BlobHandler {
             idle,
         };
         let options = OpenOptions::default()
-            .with_limits(super::pithos::limits())
+            .with_limits(super::pithos::open_limits(source.blob_size))
             .with_access_keys(keys)
             .with_expected_metadata_digest(layout.metadata_digest);
         let archive = AsyncArchive::open(stored, options, Some(layout.stored_size)).await;
