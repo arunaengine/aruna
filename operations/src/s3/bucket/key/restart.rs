@@ -420,12 +420,14 @@ impl RestartScanOperation {
         let Some(current) = self.current.as_mut() else {
             return self.fail(RestartScanError::NotFinished);
         };
-        for (_, value) in values {
+        for (key, value) in values {
             match self.step {
                 ScanStep::ScanGrants => {
                     let grant = BucketHolder::from_bytes(value.as_ref()).ok();
                     self.grants.extend(grant);
                 }
+                // Token copies are not holder copies.
+                _ if SealedCopy::parse_key(&key).is_err() => {}
                 _ => {
                     let copy = SealedCopy::from_bytes(value.as_ref())
                         .ok()
