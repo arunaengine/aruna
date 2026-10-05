@@ -1913,8 +1913,10 @@ async fn historical_drift_fails() {
 
 mod sealed {
     use super::test_node_id;
+    use crate::s3::bucket::key::rows::authority_rows;
     use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
     use aruna_core::UserId;
+    use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
     use aruna_core::errors::{BlobError, ConversionError};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -1923,9 +1925,12 @@ mod sealed {
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation, BackendRef};
+    use aruna_core::structs::storage::blob::{BlobVersion, BucketInfo};
     use aruna_core::structs::storage::encryption::{
-        BucketEncryption, BucketKeyError, BucketKeyRef, EncryptionMode, ReadLease,
+        BucketEncryption, BucketKeyError, BucketKeyRecord, BucketKeyRef, EncryptionMode, ReadLease,
+        TokenCopy, TokenCredential,
     };
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2206,6 +2211,347 @@ mod sealed {
                 Effect::Storage(StorageEffect::CommitTransaction { .. }),
                 Effect::Blob(BlobEffect::Read { .. }),
             ]
+        ));
+    }
+
+    fn credential() -> TokenCredential {
+        TokenCredential {
+            access_key: "TOKENKEY".to_string(),
+            token: SharedSecret::new(SecretBytes::new(vec![9; 32])),
+        }
+    }
+
+    /// What a token admission reads: a bucket whose creator made the token, its copy and key.
+    fn token_rows(operation: &GetObjectOperation) -> Event {
+        let creator = UserId::new(Ulid::from_bytes([5; 16]), RealmId::from_bytes([3; 32]));
+        let info = BucketInfo {
+            group_id: operation.input.group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: creator,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+        };
+        let mut values = authority_rows(&info, Some(&encrypting()), &[]);
+        let copy = TokenCopy {
+            key: key(),
+            access_key: "TOKENKEY".to_string(),
+            created_by: creator,
+            nonce: [0; 12],
+            ciphertext: vec![0; 48],
+            created_at_ms: 1,
+        };
+        let record = BucketKeyRecord::new(key(), Ulid::from_bytes([8; 16]), [6; 32], 1);
+        values.push((Vec::new().into(), Some(copy.to_bytes().unwrap().into())));
+        values.push((Vec::new().into(), Some(record.to_bytes().unwrap().into())));
+        Event::Storage(StorageEvent::BatchReadResult { values })
+    }
+
+    /// Steps a sealed read with a token up to the adapter's token admission.
+    fn token_read() -> (GetObjectOperation, BackendLocation) {
+        let mut operation = operation().with_token(Some(credential()));
+        let location = sealed_location();
+        operation.location = Some(location.clone());
+        operation.read_blob();
+        operation.step(committed());
+        let locked = BlobError::BucketKey(BucketKeyError::Locked(key().bucket_id));
+        let effects = operation.step(Event::Blob(BlobEvent::Error(locked)));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead {
+                txn_id: None,
+                ..
+            })]
+        ));
+        let rows = token_rows(&operation);
+        let effects = operation.step(rows);
+        let archive = ArchiveKey::of(&location);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::AdmitToken { key: admitted, archive: named, token, .. })]
+                if *admitted == key() && *named == archive && *token == credential().token
+        ));
+        (operation, location)
+    }
+
+    #[test]
+    fn locked_read_token() {
+        let (mut operation, location) = token_read();
+        let lease = ReadLease::new(key(), ArchiveKey::of(&location), Ulid::nil(), Arc::new(()));
+        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReadSealed { range: None, .. })]
+        ));
+    }
+
+    #[test]
+    fn wrong_token_once() {
+        // A wrong token fails typed and is not tried again.
+        let (mut operation, _) = token_read();
+        let wrong = BlobError::BucketKey(BucketKeyError::InvalidToken);
+        let effects = operation.step(Event::Blob(BlobEvent::Error(wrong)));
+        assert!(effects.is_empty());
+        assert_eq!(
+            operation.finalize().err(),
+            Some(GetObjectError::ConversionError(ConversionError::BucketKey(
+                BucketKeyError::InvalidToken
+            )))
+        );
+    }
+
+    #[test]
+    fn reference_token_admits() {
+        let (mut operation, _) = reference(&encrypting());
+        operation.token = Some(credential());
+        let locked = BlobError::BucketKey(BucketKeyError::Locked(key().bucket_id));
+        operation.step(Event::Blob(BlobEvent::Error(locked)));
+        let rows = token_rows(&operation);
+        let effects = operation.step(rows);
+        let archive = ArchiveKey::new(key().bucket_id, BackendRef::node_default());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::AdmitToken { archive: named, .. })] if *named == archive
+        ));
+        let lease = ReadLease::new(key(), archive, Ulid::nil(), Arc::new(()));
+        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StagingSource(StagingSourceEffect::Head { .. })]
+        ));
+    }
+
+    #[test]
+    fn pending_token_promotes() {
+        // With a token, a pending version ends the read typed, so the caller promotes it.
+        let mut operation = operation().with_token(Some(credential()));
+        let archive = ArchiveKey::new(Ulid::generate(), BackendRef::node_default());
+        let version = BlobVersion::pending(
+            archive.clone(),
+            SystemTime::UNIX_EPOCH,
+            operation.input.user_identity,
+            None,
+        );
+        let effects = operation.read_version(Ulid::generate(), version, false);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert_eq!(
+            operation.finalize().err(),
+            Some(GetObjectError::PendingContent(archive))
+        );
+    }
+}
+
+mod token_read {
+    use crate::driver::DriverContext;
+    use crate::s3::object::copy::test::{full_context, seed_authority, seed_bucket};
+    use crate::s3::object::get::{GetObjectInput, TokenRead, get_object_token};
+    use aruna_core::UserId;
+    use aruna_core::compute::SecretBytes;
+    use aruna_core::effects::{BlobEffect, StorageEffect};
+    use aruna_core::events::{BlobEvent, Event};
+    use aruna_core::keyspaces::{
+        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+        BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE, KEY_COPY_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    };
+    use aruna_core::structs::execution::job::RoCrateLimits;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::{
+        ArchiveKey, BlobHeadKey, BlobVersion, BlobVersionState, CopyOwner, CurrentVersionPointer,
+        ResolvedBackend, VersionKey,
+    };
+    use aruna_core::structs::storage::encryption::{
+        BlockCipher, BlockKeys, BucketEncryption, BucketKeyRecord, BucketKeyRef, EncryptionMode,
+        SealPlan, TokenCredential, generate_token, public_key_of, seal_token,
+    };
+    use futures_util::StreamExt;
+    use std::time::SystemTime;
+    use ulid::Ulid;
+
+    async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
+        let write = StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(write).await;
+    }
+
+    #[tokio::test]
+    async fn pending_read_promoted() {
+        // A multipart upload whose content hash is still pending: a token promotes it while the
+        // bucket stays locked, then serves its plaintext.
+        let (_temp, context) = full_context().await;
+        let blob = context.blob_handle.clone().unwrap();
+        let realm_id = RealmId::from_bytes([6; 32]);
+        let (group_id, user_id) = (Ulid::generate(), UserId::local(Ulid::generate(), realm_id));
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        seed_bucket(&context, "locked", group_id, user_id, Vec::new()).await;
+        seed_authority(&context, realm_id, group_id, user_id).await;
+        let private = SecretBytes::new(vec![9; 32]);
+        let public = public_key_of(&private).unwrap();
+        let key = BucketKeyRef::new(Ulid::generate(), 1);
+        let settings = BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(key.bucket_id),
+            key_generation: 1,
+            ..Default::default()
+        };
+        let record = BucketKeyRecord::new(key, Ulid::generate(), public, 1);
+        let token = generate_token().unwrap();
+        let origin = (realm_id, node_id);
+        let copy = seal_token(
+            key,
+            &public,
+            &private,
+            origin,
+            ("HOLDER", user_id),
+            token.bytes(),
+            1,
+        );
+        let copy = copy.unwrap();
+        put(
+            &context,
+            BUCKET_ENCRYPTION_KEYSPACE,
+            b"locked".to_vec(),
+            settings.to_bytes().unwrap(),
+        )
+        .await;
+        put(
+            &context,
+            BUCKET_KEY_KEYSPACE,
+            key.key(),
+            record.to_bytes().unwrap(),
+        )
+        .await;
+        put(
+            &context,
+            KEY_COPY_KEYSPACE,
+            copy.key(),
+            copy.to_bytes().unwrap(),
+        )
+        .await;
+
+        // A sealed archive with no recorded content hash, as a short last part leaves it.
+        let data = b"pending multipart content".repeat(500);
+        let stream = aruna_core::stream::BackendStream::new(futures_util::stream::iter([Ok::<
+            _,
+            std::io::Error,
+        >(
+            bytes::Bytes::from(data.clone()),
+        )]));
+        let write = BlobEffect::Write {
+            bucket: "locked".to_string(),
+            key: "pending.bin".to_string(),
+            resolved: ResolvedBackend::node_default(),
+            created_by: user_id,
+            blob: stream,
+            size: Some(data.len() as u64),
+        };
+        let Event::Blob(BlobEvent::WriteFinished { location }) = blob.send_blob_effect(write).await
+        else {
+            panic!("plain write failed");
+        };
+        let plan = SealPlan {
+            key,
+            public_key: public,
+            cipher: BlockCipher::default(),
+            block_keys: BlockKeys::default(),
+            storage_generation: 0,
+        };
+        let rewrite = BlobEffect::RewriteCopy {
+            bucket: "locked".to_string(),
+            key: "pending.bin".to_string(),
+            source: location,
+            lease: None,
+            target: Box::new(ResolvedBackend::node_default().with_encryption(Some(plan))),
+            grants_only: false,
+        };
+        let Event::Blob(BlobEvent::CopyRewritten {
+            location: mut sealed,
+        }) = blob.send_blob_effect(rewrite).await
+        else {
+            panic!("sealing failed");
+        };
+        sealed.hashes.clear();
+        let archive = ArchiveKey::of(&sealed);
+        let version_id = Ulid::generate();
+        let version = BlobVersion::pending(archive.clone(), SystemTime::now(), user_id, None);
+        let version_key = VersionKey::new("locked", "pending.bin", version_id);
+        let owner = CopyOwner::new(archive.clone(), version_key.clone());
+        let head = BlobHeadKey::new("locked", "pending.bin")
+            .to_bytes()
+            .unwrap();
+        let pointer = CurrentVersionPointer::new(version_id).to_bytes().unwrap();
+        put(
+            &context,
+            PENDING_LOCATION_KEYSPACE,
+            archive.to_bytes(),
+            sealed.to_bytes().unwrap(),
+        )
+        .await;
+        put(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            version_key.to_bytes().unwrap(),
+            version.to_bytes().unwrap(),
+        )
+        .await;
+        put(
+            &context,
+            COPY_OWNER_KEYSPACE,
+            owner.key().unwrap(),
+            Vec::new(),
+        )
+        .await;
+        put(&context, BLOB_HEAD_KEYSPACE, head, pointer).await;
+
+        let input = GetObjectInput {
+            bucket: "locked".to_string(),
+            key: "pending.bin".to_string(),
+            version_id: None,
+            range: None,
+            group_id,
+            user_identity: user_id,
+            node_id,
+        };
+        let token = TokenRead {
+            credential: TokenCredential {
+                access_key: "HOLDER".to_string(),
+                token,
+            },
+            limits: RoCrateLimits::default(),
+        };
+        let result = get_object_token(&context, input, None, Some(token))
+            .await
+            .unwrap();
+        let chunks: Vec<_> = result.blob.0.collect().await;
+        let read: Vec<u8> = chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.unwrap())
+            .collect();
+        assert_eq!(read, data);
+        // The version now names its content hash; the pending row is gone.
+        let stored = StorageEffect::Read {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: version_key.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        let Event::Storage(aruna_core::events::StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = context.storage_handle.send_storage_effect(stored).await
+        else {
+            panic!("version read failed");
+        };
+        let version = BlobVersion::from_bytes(&value).unwrap();
+        assert!(matches!(
+            version.state,
+            BlobVersionState::Materialized { .. }
         ));
     }
 }

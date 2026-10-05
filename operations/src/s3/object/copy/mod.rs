@@ -1093,7 +1093,13 @@ pub(crate) mod test {
     async fn locked_reference_refused() {
         // A reference of a locked encrypting bucket is not preserved into another bucket, where
         // its external bytes would be readable without the source's key.
-        use aruna_core::structs::storage::encryption::EncryptionMode;
+        use aruna_core::compute::{SecretBytes, SharedSecret};
+        use aruna_core::keyspaces::{BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE};
+        use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::storage::encryption::{
+            BucketKeyRecord, BucketKeyRef, EncryptionMode, TokenCredential, generate_token,
+            public_key_of, seal_token,
+        };
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([6u8; 32]);
         let group_id = Ulid::generate();
@@ -1188,6 +1194,107 @@ pub(crate) mod test {
         assert!(value.is_none(), "nothing is published in the plain bucket");
         // Within its own bucket the reference stays behind the same lock, so it is kept.
         copy_object(&context, request("locked")).await.unwrap();
+
+        // A token credential of a key holder admits the copy while the bucket stays locked.
+        let key = BucketKeyRef::new(settings.bucket_id.unwrap(), 1);
+        let private = SecretBytes::new(vec![9; 32]);
+        let public = public_key_of(&private).unwrap();
+        seed_authority(&context, realm_id, group_id, user_id).await;
+        let record = BucketKeyRecord::new(key, Ulid::generate(), public, 1);
+        let token = generate_token().unwrap();
+        let other = UserId::local(Ulid::generate(), realm_id);
+        let sealed = |access_key: &str, creator| {
+            let holder = (access_key, creator);
+            let origin = (realm_id, node_id);
+            seal_token(key, &public, &private, origin, holder, token.bytes(), 1).unwrap()
+        };
+        for (space, row_key, value) in [
+            (BUCKET_KEY_KEYSPACE, key.key(), record.to_bytes().unwrap()),
+            (
+                KEY_COPY_KEYSPACE,
+                sealed("HOLDER", user_id).key(),
+                sealed("HOLDER", user_id).to_bytes().unwrap(),
+            ),
+            (
+                KEY_COPY_KEYSPACE,
+                sealed("FORMER", other).key(),
+                sealed("FORMER", other).to_bytes().unwrap(),
+            ),
+        ] {
+            let write = StorageEffect::Write {
+                key_space: space.to_string(),
+                key: row_key.into(),
+                value: value.into(),
+                txn_id: None,
+            };
+            context.storage_handle.send_storage_effect(write).await;
+        }
+        let read = |access_key: &str, token: &SharedSecret| {
+            Some(TokenRead {
+                credential: TokenCredential {
+                    access_key: access_key.to_string(),
+                    token: token.clone(),
+                },
+                limits: RoCrateLimits::default(),
+            })
+        };
+        let key_error = |result: Result<CopyResultData, CopyObjectError>| match result {
+            Err(CopyObjectError::Get(GetObjectError::ConversionError(
+                ConversionError::BucketKey(error),
+            ))) => error,
+            other => panic!("expected a key refusal, got {other:?}"),
+        };
+        // A wrong token fails typed, and a token whose creator holds no key opens nothing.
+        let wrong = generate_token().unwrap();
+        let refused = copy_object_token(&context, request("plain"), read("HOLDER", &wrong)).await;
+        assert_eq!(key_error(refused), BucketKeyError::InvalidToken);
+        let refused = copy_object_token(&context, request("plain"), read("FORMER", &token)).await;
+        assert_eq!(key_error(refused), BucketKeyError::Locked(key.bucket_id));
+        copy_object_token(&context, request("plain"), read("HOLDER", &token))
+            .await
+            .unwrap();
+    }
+
+    /// Stores the realm and group documents, so `owner` holds the group's roles.
+    pub(crate) async fn seed_authority(
+        context: &DriverContext,
+        realm_id: RealmId,
+        group_id: GroupId,
+        owner: UserId,
+    ) {
+        use aruna_core::keyspaces::AUTH_KEYSPACE;
+        use aruna_core::structs::identity::auth::Actor;
+        use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+        use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+        let realm = RealmAuthorizationDocument {
+            realm_id,
+            roles: Default::default(),
+            operation_restrictions: Default::default(),
+        };
+        let group = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            user_id: owner,
+            realm_id,
+        };
+        for (key, value) in [
+            (
+                realm_id.as_bytes().to_vec(),
+                realm.to_bytes(&actor).unwrap(),
+            ),
+            (
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
+            ),
+        ] {
+            let write = StorageEffect::Write {
+                key_space: AUTH_KEYSPACE.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            };
+            context.storage_handle.send_storage_effect(write).await;
+        }
     }
 
     #[tokio::test]
