@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
+use crate::s3::bucket::key_rows::{SettingsError, audit_row, authority_read, parse_authority};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -14,10 +14,12 @@ use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRef, CopyTarget, GrantState, HolderOrigin, SealedCopy,
 };
 use aruna_core::structs::storage::holders::{HolderState, KeyLookup};
+use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use aruna_core::{NodeId, UserId};
 use smallvec::smallvec;
 use thiserror::Error;
+use ulid::Ulid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GrantStep {
@@ -193,6 +195,23 @@ impl GrantHolderOperation {
                 )),
                 Err(error) => return self.fail(error),
             }
+        }
+        // The grant and its audit record commit together.
+        let record = BucketAuditRecord {
+            event_id: Ulid::generate(),
+            bucket_id: key.bucket_id,
+            at_ms: self.input.now_ms,
+            action: AuditAction::HolderGrant,
+            actor: Some(self.input.granted_by),
+            node_id: self.input.node_id,
+            generation: Some(key.generation),
+            deadline_ms: None,
+            reason: Some(format!("granted to {}", grant.user_id)),
+            outcome: AuditOutcome::Applied,
+        };
+        match audit_row(&record) {
+            Ok(row) => writes.push(row),
+            Err(error) => return self.fail(error),
         }
         match grant.to_bytes() {
             Ok(value) => writes.push((

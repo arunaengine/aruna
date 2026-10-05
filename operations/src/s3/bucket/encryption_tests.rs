@@ -134,8 +134,19 @@ fn managed_enable_writes() {
             BUCKET_KEY_KEYSPACE,
             KEY_COPY_KEYSPACE,
             aruna_core::keyspaces::TRANSITION_KEYSPACE,
-            aruna_core::keyspaces::TRANSITION_QUEUE_KEYSPACE
+            aruna_core::keyspaces::TRANSITION_QUEUE_KEYSPACE,
+            aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE
         ]
+    );
+    // The enable records its mode change in the same batch.
+    let audit = BucketAuditRecord::from_bytes(&writes[5].2).unwrap();
+    assert_eq!(
+        (audit.action, audit.actor, audit.outcome),
+        (
+            AuditAction::ModeChange,
+            Some(user(2)),
+            AuditOutcome::Applied
+        )
     );
     let settings = BucketEncryption::from_bytes(&writes[0].2).unwrap();
     assert_eq!(

@@ -5,7 +5,8 @@
 
 use crate::blob::migration_queue::encrypt_rows;
 use crate::s3::bucket::key_rows::{
-    SettingsError, authority_read, copy_targets, generation_rows, parse_authority, uploads_open,
+    SettingsError, audit_row, authority_read, copy_targets, generation_rows, parse_authority,
+    uploads_open,
 };
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -23,6 +24,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::holders::{
     HolderReport, KeyLookup, RecoveryState, resolve_holders,
 };
+use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use aruna_core::{NodeId, UserId};
@@ -287,6 +289,23 @@ impl EnableEncryptionOperation {
         let (bucket, now_ms) = (&self.input.bucket, self.input.now_ms);
         match encrypt_rows(bucket, &self.settings, &record, self.compression, now_ms) {
             Ok(rows) => writes.extend(rows),
+            Err(error) => return self.fail(error),
+        }
+        // The mode change and its audit record commit together.
+        let audit = BucketAuditRecord {
+            event_id: Ulid::generate(),
+            bucket_id: key.bucket_id,
+            at_ms: now_ms,
+            action: AuditAction::ModeChange,
+            actor: Some(self.input.caller),
+            node_id: self.input.node_id,
+            generation: Some(key.generation),
+            deadline_ms: None,
+            reason: Some(format!("enabled {:?}", self.input.mode)),
+            outcome: AuditOutcome::Applied,
+        };
+        match audit_row(&audit) {
+            Ok(row) => writes.push(row),
             Err(error) => return self.fail(error),
         }
         self.result = Some(EnableResult {

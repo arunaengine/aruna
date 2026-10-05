@@ -99,7 +99,19 @@ fn written_grant(effects: &Effects) -> (BucketHolder, usize) {
     };
     let (space, _, value) = writes.last().unwrap();
     assert_eq!(space, BUCKET_HOLDER_KEYSPACE);
-    (BucketHolder::from_bytes(value).unwrap(), writes.len() - 1)
+    // The audit record of the grant commits in the same batch.
+    let (audit_space, _, audit) = &writes[writes.len() - 2];
+    assert_eq!(audit_space, aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE);
+    let record = BucketAuditRecord::from_bytes(audit).unwrap();
+    assert_eq!(
+        (record.action, record.actor, record.outcome),
+        (
+            AuditAction::HolderGrant,
+            Some(user(1)),
+            AuditOutcome::Applied
+        )
+    );
+    (BucketHolder::from_bytes(value).unwrap(), writes.len() - 2)
 }
 
 fn committed(mut operation: GrantHolderOperation) -> GrantResult {
