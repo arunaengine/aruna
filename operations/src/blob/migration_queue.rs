@@ -204,7 +204,6 @@ async fn settle(
 ) -> Result<Option<Duration>, String> {
     let storage = &context.storage_handle;
     let prefix: Key = cleanup_prefix(bucket).into();
-    let queued = queued_deletes(storage).await?;
     let mut after = None;
     let mut left = 0u64;
     loop {
@@ -217,25 +216,8 @@ async fn settle(
             None,
         )
         .await?;
-        for (key, _) in rows {
-            let location = key[prefix.len()..].to_vec();
-            // Reclaim drops the row before the backend delete; only finished cleanup work counts.
-            if queued.contains(&location)
-                || exists(storage, BLOB_LOCATIONS_KEYSPACE, location).await?
-            {
-                left += 1;
-                continue;
-            }
-            let delete = StorageEffect::Delete {
-                key_space: TRANSITION_CLEANUP_KEYSPACE.to_string(),
-                key,
-                txn_id: None,
-            };
-            match storage.send_storage_effect(delete).await {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => {}
-                other => return Err(format!("could not forget a removed copy: {other:?}")),
-            }
-        }
+        let keys = rows.into_iter().map(|(key, _)| key).collect();
+        left += forget_removed(storage, prefix.len(), keys).await?;
         match cursor {
             Some(cursor) => after = Some(cursor),
             None => break,
@@ -350,7 +332,73 @@ fn uses_key(locations: &[BackendLocation], source: BucketKeyRef) -> u64 {
 
 /// Location keys of copies whose physical deletion is still queued or failed and waits for
 /// a retry.
-async fn queued_deletes(storage: &StorageHandle) -> Result<HashSet<Vec<u8>>, String> {
+/// Forgets the old copies of one page that are gone, in one transaction: a reclaim committing
+/// meanwhile is either in its snapshot or fails the commit. Returns the copies still present.
+async fn forget_removed(
+    storage: &StorageHandle,
+    prefix_len: usize,
+    keys: Vec<Key>,
+) -> Result<u64, String> {
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        other => return Err(format!("could not start a cleanup transaction: {other:?}")),
+    };
+    let staged = stage_forget(storage, txn_id, prefix_len, keys).await;
+    let Ok(left) = staged else {
+        storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+        return staged;
+    };
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(left),
+        other => Err(format!("removed copies were not forgotten: {other:?}")),
+    }
+}
+
+/// Checks the location row and the queued delete work of each old copy in `txn_id`. Reclaim
+/// drops the row before the backend delete, so only finished delete work proves removal.
+async fn stage_forget(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    prefix_len: usize,
+    keys: Vec<Key>,
+) -> Result<u64, String> {
+    let queued = queued_deletes(storage, txn_id).await?;
+    let mut left = 0;
+    for key in keys {
+        let location = key[prefix_len..].to_vec();
+        if queued.contains(&location)
+            || exists(storage, BLOB_LOCATIONS_KEYSPACE, location, Some(txn_id)).await?
+        {
+            left += 1;
+            continue;
+        }
+        let delete = StorageEffect::Delete {
+            key_space: TRANSITION_CLEANUP_KEYSPACE.to_string(),
+            key,
+            txn_id: Some(txn_id),
+        };
+        match storage.send_storage_effect(delete).await {
+            Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+            other => return Err(format!("could not forget a removed copy: {other:?}")),
+        }
+    }
+    Ok(left)
+}
+
+/// Location keys of copies whose physical deletion is still queued or failed and waits for
+/// a retry.
+async fn queued_deletes(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+) -> Result<HashSet<Vec<u8>>, String> {
     let (mut after, mut queued) = (None, HashSet::new());
     loop {
         let (rows, cursor) = crate::jobs::store::iter_prefix_page(
@@ -359,7 +407,7 @@ async fn queued_deletes(storage: &StorageHandle) -> Result<HashSet<Vec<u8>>, Str
             None,
             after,
             PAGE,
-            None,
+            Some(txn_id),
         )
         .await?;
         for (_, value) in rows {
@@ -375,11 +423,16 @@ async fn queued_deletes(storage: &StorageHandle) -> Result<HashSet<Vec<u8>>, Str
     }
 }
 
-async fn exists(storage: &StorageHandle, key_space: &str, key: Vec<u8>) -> Result<bool, String> {
+async fn exists(
+    storage: &StorageHandle,
+    key_space: &str,
+    key: Vec<u8>,
+    txn_id: Option<TxnId>,
+) -> Result<bool, String> {
     let read = StorageEffect::Read {
         key_space: key_space.to_string(),
         key: key.into(),
-        txn_id: None,
+        txn_id,
     };
     match storage.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
@@ -674,5 +727,65 @@ mod tests {
         let kind = TransitionKind::Reencode;
         let reencode = EncryptionTransition::new(kind, Some(source), same, 3, 1);
         assert!(retired_sessions(&generations, &reencode).is_empty());
+    }
+
+    #[tokio::test]
+    async fn reclaim_between_reads() {
+        // A reclaim commits after the cleanup check began: the check must still see the copy.
+        let directory = tempfile::tempdir().unwrap();
+        let context = context(directory.path());
+        let storage = &context.storage_handle;
+        let mut old = pending(None);
+        let hash = aruna_core::structs::checksum::HASH_BLAKE3.to_string();
+        old.hashes.insert(hash, vec![7; 32]);
+        let old_key = old.location_key().unwrap().to_bytes();
+        let cleanup = aruna_core::structs::storage::transition::cleanup_key("b", &old_key);
+        put(
+            &context,
+            TRANSITION_CLEANUP_KEYSPACE,
+            cleanup.clone(),
+            Vec::new(),
+        )
+        .await;
+        let row = old.to_bytes().unwrap();
+        put(&context, BLOB_LOCATIONS_KEYSPACE, old_key.clone(), row).await;
+        let started = storage
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await;
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = started else {
+            panic!("no transaction: {started:?}")
+        };
+
+        let delete = StorageEffect::Delete {
+            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+            key: old_key.into(),
+            txn_id: None,
+        };
+        storage.send_storage_effect(delete).await;
+        let work = BlobCleanupWork::DeleteBlob { location: old }
+            .to_bytes()
+            .unwrap();
+        put(
+            &context,
+            BLOB_CLEANUP_KEYSPACE,
+            Ulid::generate().to_bytes().to_vec(),
+            work,
+        )
+        .await;
+        let prefix = aruna_core::structs::storage::transition::cleanup_prefix("b").len();
+        let left = stage_forget(storage, txn_id, prefix, vec![cleanup.clone().into()]).await;
+
+        assert_eq!(left, Ok(1));
+        storage
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await;
+        assert!(
+            exists(storage, TRANSITION_CLEANUP_KEYSPACE, cleanup.clone(), None)
+                .await
+                .unwrap()
+        );
+        // A later check sees the queued delete instead and still keeps the copy.
+        let left = forget_removed(storage, prefix, vec![cleanup.into()]).await;
+        assert_eq!(left, Ok(1));
     }
 }
