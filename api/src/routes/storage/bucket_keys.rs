@@ -874,3 +874,7 @@ mod tests {
         assert_eq!(wire_name(AuditOutcome::Intent), "intent");
     }
 }
+
+#[cfg(test)]
+#[path = "bucket_keys_tests.rs"]
+mod route_tests;
