@@ -75,7 +75,7 @@ impl Log {
         deadline_ms: Option<u64>,
     ) -> Ulid {
         let record = BucketAuditRecord {
-            event_id: Ulid::from_parts(AT, (1 << 64) + self.records.len() as u128),
+            event_id: Ulid::from_parts(AT, (1 << 64) + 10 * self.records.len() as u128),
             bucket_id: LOCKED,
             at_ms: AT,
             action,
@@ -375,11 +375,95 @@ fn registry_order_replayed() {
                 (outcome, intent),
                 (outcome == AuditOutcome::Applied).then_some(deadline),
             );
-            log.records.last_mut().unwrap().sequence =
-                (outcome == AuditOutcome::Applied).then_some(Ulid::from_parts(AT, sequence));
+            log.records.last_mut().unwrap().sequence = (outcome == AuditOutcome::Applied)
+                .then_some(Ulid::from(u128::from(second) + sequence));
         }
         assert_eq!(replay(&log.stored(), 45_000), [1]);
         assert!(replay(&log.stored(), 90_000).is_empty());
+    }
+}
+
+#[test]
+fn unresolved_intents_kept() {
+    for action in [AuditAction::Unlock, AuditAction::Extend] {
+        let mut log = Log::default();
+        if action == AuditAction::Extend {
+            log.applied(AuditAction::Unlock, (1, session(1)), None);
+        }
+        let first = log.intent(action, (1, session(1)), Some(NOW - 1));
+        let second_session = if action == AuditAction::Unlock {
+            session(2)
+        } else {
+            session(1)
+        };
+        let second = log.intent(action, (1, second_session), None);
+        log.outcome(
+            action,
+            (1, session(1)),
+            (AuditOutcome::Applied, first),
+            Some(NOW - 1),
+        );
+        log.records.last_mut().unwrap().sequence = Some(Ulid::from(u128::from(first) + 1));
+        assert_eq!(log.open(), [1]);
+        let third = log.intent(action, (1, second_session), None);
+        log.outcome(
+            action,
+            (1, second_session),
+            (AuditOutcome::Failed, second),
+            None,
+        );
+        assert_eq!(log.open(), [1]);
+        log.outcome(
+            action,
+            (1, second_session),
+            (AuditOutcome::Failed, third),
+            None,
+        );
+        assert!(log.open().is_empty());
+    }
+}
+
+#[test]
+fn mutation_covers_intents() {
+    let mut log = Log::default();
+    let first = log.intent(AuditAction::Unlock, (1, session(1)), Some(NOW - 1));
+    let second = log.intent(AuditAction::Unlock, (1, session(2)), None);
+    log.outcome(
+        AuditAction::Unlock,
+        (1, session(1)),
+        (AuditOutcome::Applied, first),
+        Some(NOW - 1),
+    );
+    log.records.last_mut().unwrap().sequence = Some(Ulid::from(u128::from(second) + 1));
+    assert!(log.open().is_empty());
+    log.outcome(
+        AuditAction::Unlock,
+        (1, session(2)),
+        (AuditOutcome::Failed, second),
+        None,
+    );
+    assert!(log.open().is_empty());
+}
+
+#[test]
+fn confirmed_locks_replayed() {
+    for reversed in [false, true] {
+        let mut log = Log::default();
+        let first = log.intent(AuditAction::Unlock, (1, session(1)), None);
+        let second = log.intent(AuditAction::Unlock, (1, session(2)), None);
+        let mut outcomes = [
+            (AuditAction::Unlock, session(1), first, 1),
+            (AuditAction::TimedLock, session(2), second, 3),
+            (AuditAction::Unlock, session(2), second, 2),
+        ];
+        if reversed {
+            outcomes.reverse();
+        }
+        for (action, session, intent, order) in outcomes {
+            log.outcome(action, (1, session), (AuditOutcome::Applied, intent), None);
+            log.records.last_mut().unwrap().sequence = Some(Ulid::from(u128::from(second) + order));
+        }
+        assert!(log.open().is_empty());
     }
 }
 

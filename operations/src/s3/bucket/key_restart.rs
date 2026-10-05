@@ -66,24 +66,20 @@ pub enum RestartScanError {
 struct Session {
     id: Option<Ulid>,
     deadline_ms: Option<u64>,
-    /// The intent that set the deadline, so only its failure undoes it.
-    source: Option<Ulid>,
 }
 
-/// An intent whose outcome is not read yet: the session it opens or extends, and the state it
-/// replaced, restored if the outcome says it failed.
+/// An unresolved intent, applied above the confirmed registry state.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Pending {
-    session: Option<Ulid>,
-    before: Option<Session>,
-    /// The lock reason the intent cleared, restored with the session.
-    lock: Option<Lock>,
+    action: AuditAction,
+    session: Session,
+    at_ms: u64,
 }
 
 /// The action and time of the lock that ended a generation's last session.
 pub(crate) type Lock = (AuditAction, u64);
 
-/// The unlock state of one generation.
+/// Confirmed registry state and unresolved intents of one generation.
 #[derive(Debug, Default, PartialEq)]
 struct Trail {
     open: Option<Session>,
@@ -98,29 +94,30 @@ fn same(left: Option<Ulid>, right: Option<Ulid>) -> bool {
 }
 
 impl Trail {
-    fn opens(&self, session: Option<Ulid>) -> bool {
-        self.open.is_some_and(|open| same(open.id, session))
-    }
-
-    /// Intents that would restore the deadline of failed intent `source` restore `instead`, as
-    /// that deadline never applied.
-    fn unset(&mut self, source: Ulid, instead: Option<Session>) {
-        for pending in self.intents.values_mut() {
-            if pending
-                .before
-                .is_some_and(|before| before.source == Some(source))
-            {
-                pending.before = instead;
+    fn current(&self) -> (Option<Session>, Option<Lock>) {
+        let (mut open, mut lock) = (self.open, self.lock);
+        for (id, pending) in &self.intents {
+            if self.sequence.is_none_or(|sequence| *id > sequence) {
+                pending.apply(&mut open, &mut lock);
             }
         }
+        (open, lock)
     }
+}
 
-    /// Intents that would restore `ended` restore `instead`, as `ended` no longer exists.
-    fn forget(&mut self, ended: Option<Ulid>, instead: Option<Session>) {
-        for pending in self.intents.values_mut() {
-            if pending.before.is_some_and(|before| same(before.id, ended)) {
-                pending.before = instead;
+impl Pending {
+    fn apply(&self, open: &mut Option<Session>, lock: &mut Option<Lock>) {
+        let matches = open.is_some_and(|open| same(open.id, self.session.id));
+        match self.action {
+            AuditAction::Unlock => (*open, *lock) = (Some(self.session), None),
+            AuditAction::Extend if matches => *open = Some(self.session),
+            AuditAction::Lock | AuditAction::TimedLock if open.is_none() || matches => {
+                (*open, *lock) = (None, Some((self.action, self.at_ms)));
             }
+            AuditAction::RestartLock => {
+                (*open, *lock) = (None, Some((self.action, self.at_ms)));
+            }
+            _ => {}
         }
     }
 }
@@ -139,102 +136,64 @@ impl Replay {
         let Some(generation) = record.generation else {
             return;
         };
-        let trail = self.trails.entry(generation).or_default();
-        if let Some(sequence) = record
-            .sequence
-            .filter(|_| record.outcome == AuditOutcome::Applied)
-        {
-            if trail.sequence.is_some_and(|previous| previous >= sequence) {
-                if let Some(intent) = record.intent_id {
-                    trail.intents.remove(&intent);
-                }
-                return;
-            }
-            trail.sequence = Some(sequence);
+        if !matches!(
+            record.action,
+            AuditAction::Unlock
+                | AuditAction::Extend
+                | AuditAction::Lock
+                | AuditAction::TimedLock
+                | AuditAction::RestartLock
+        ) {
+            return;
         }
-        let session = record.session_id;
-        let current = Session {
-            id: session,
-            deadline_ms: record.deadline_ms,
-            source: match record.outcome {
-                AuditOutcome::Intent => Some(record.event_id),
-                AuditOutcome::Applied | AuditOutcome::Failed => record.intent_id,
+        let trail = self.trails.entry(generation).or_default();
+        let pending = Pending {
+            action: record.action,
+            session: Session {
+                id: record.session_id,
+                deadline_ms: record.deadline_ms,
             },
+            at_ms: record.at_ms,
         };
-        let pending = record.intent_id.and_then(|id| trail.intents.remove(&id));
-        match (record.action, record.outcome) {
-            (AuditAction::Unlock, AuditOutcome::Intent) => {
-                let (before, lock) = (trail.open, trail.lock.take());
-                let pending = Pending {
-                    session,
-                    before,
-                    lock,
-                };
-                trail.intents.insert(record.event_id, pending);
-                trail.open = Some(current);
-            }
-            // Registry order decides which confirmed mutation applies.
-            (AuditAction::Unlock, AuditOutcome::Applied) => {
-                if record.sequence.is_some() || pending.is_none() || trail.opens(session) {
-                    (trail.open, trail.lock) = (Some(current), None);
+        if let Some(intent) = record.intent_id {
+            trail.intents.remove(&intent);
+        }
+        match record.outcome {
+            AuditOutcome::Intent => {
+                if matches!(record.action, AuditAction::Unlock | AuditAction::Extend) {
+                    trail.intents.insert(record.event_id, pending);
                 }
             }
-            (AuditAction::Unlock, AuditOutcome::Failed) => {
-                if let Some(pending) = pending {
-                    if trail.opens(pending.session) {
-                        (trail.open, trail.lock) = (pending.before, pending.lock);
+            AuditOutcome::Applied => {
+                let sequence = record.sequence.unwrap_or(record.event_id);
+                if trail.sequence.is_none_or(|previous| previous < sequence) {
+                    trail.sequence = Some(sequence);
+                    if record.sequence.is_some() {
+                        match record.action {
+                            AuditAction::Unlock | AuditAction::Extend => {
+                                (trail.open, trail.lock) = (Some(pending.session), None);
+                            }
+                            _ => {
+                                (trail.open, trail.lock) =
+                                    (None, Some((record.action, record.at_ms)))
+                            }
+                        }
+                    } else {
+                        pending.apply(&mut trail.open, &mut trail.lock);
                     }
-                    trail.forget(pending.session, pending.before);
-                }
-            }
-            // An extension only moves the deadline of the session it names.
-            (AuditAction::Extend, AuditOutcome::Intent) if trail.opens(session) => {
-                let pending = Pending {
-                    session,
-                    before: trail.open,
-                    lock: trail.lock,
-                };
-                trail.intents.insert(record.event_id, pending);
-                trail.open = Some(current);
-            }
-            // A later registry mutation replaces an earlier deadline, regardless of intent order.
-            (AuditAction::Extend, AuditOutcome::Applied)
-                if record.sequence.is_some() || trail.opens(session) =>
-            {
-                let from = |open: Session| open.source == record.intent_id;
-                if record.sequence.is_some() || pending.is_none() || trail.open.is_some_and(from) {
-                    trail.open = Some(current);
-                }
-            }
-            // A failed extension undoes only the deadline it set itself.
-            (AuditAction::Extend, AuditOutcome::Failed) => {
-                if let (Some(pending), Some(intent)) = (pending, record.intent_id) {
-                    let own = |open: Session| open.source == Some(intent);
-                    if trail.opens(pending.session) && trail.open.is_some_and(own) {
-                        trail.open = pending.before;
+                    if record.action == AuditAction::RestartLock {
+                        trail.intents.clear();
                     }
-                    trail.unset(intent, pending.before);
                 }
             }
-            // A delayed lock of an older session leaves a newer session unlocked.
-            (AuditAction::Lock | AuditAction::TimedLock, AuditOutcome::Applied)
-                if trail.open.is_none() || trail.opens(session) =>
-            {
-                (trail.open, trail.lock) = (None, Some((record.action, record.at_ms)));
-                trail.forget(session, None);
-            }
-            (AuditAction::RestartLock, AuditOutcome::Applied) => {
-                (trail.open, trail.lock) = (None, Some((record.action, record.at_ms)));
-                trail.intents.clear();
-            }
-            _ => {}
+            AuditOutcome::Failed => {}
         }
     }
 
     /// The lock that ended each generation's last session, for the generations it applies to.
     pub(crate) fn locks(&self) -> BTreeMap<u64, Lock> {
         (self.trails.iter())
-            .filter_map(|(generation, trail)| trail.lock.map(|lock| (*generation, lock)))
+            .filter_map(|(generation, trail)| trail.current().1.map(|lock| (*generation, lock)))
             .collect()
     }
 
@@ -243,7 +202,7 @@ impl Replay {
         let live = |open: &Session| open.deadline_ms.is_none_or(|deadline| deadline > now_ms);
         self.trails
             .iter()
-            .filter(|(_, trail)| trail.open.as_ref().is_some_and(live))
+            .filter(|(_, trail)| trail.current().0.as_ref().is_some_and(live))
             .map(|(generation, _)| *generation)
             .collect()
     }
