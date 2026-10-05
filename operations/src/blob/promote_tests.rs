@@ -168,9 +168,10 @@ fn promotes_pending_alias() {
         Key::from(b"bucket".to_vec()),
         Some(Value::from(info.to_bytes().unwrap())),
     )];
-    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+    operation.step(Event::Storage(StorageEvent::BatchReadResult {
         values: buckets,
     }));
+    let effects = operation.step(no_registrations());
     let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
         panic!("one batch promotes the page")
     };
@@ -275,9 +276,10 @@ fn promote_one(operation: &mut PromotePendingOperation, version_id: [u8; 16]) ->
     operation.step(Event::Storage(StorageEvent::BatchReadResult {
         values: vec![(row, Some(Value::from(pending.to_bytes().unwrap())))],
     }));
-    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+    operation.step(Event::Storage(StorageEvent::BatchReadResult {
         values: bucket_rows(),
     }));
+    let effects = operation.step(no_registrations());
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::BatchWrite { .. })]
@@ -344,9 +346,10 @@ fn alias_behind_cursor() {
         ),
         "the pending row must stay while an alias still pends"
     );
-    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+    operation.step(Event::Storage(StorageEvent::BatchReadResult {
         values: bucket_rows(),
     }));
+    let effects = operation.step(no_registrations());
     let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
         panic!("the alias behind the cursor is promoted in the final transaction")
     };
@@ -391,4 +394,79 @@ fn conflict_restarts_scan() {
         [Effect::Storage(StorageEffect::StartTransaction { .. })]
     ));
     assert!(!operation.is_complete());
+}
+
+/// No version of the page has a placement registration.
+fn no_registrations() -> Event {
+    Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(Key::from(Vec::new()), None)],
+    })
+}
+
+#[test]
+fn governed_alias_registration() {
+    use crate::blob::managed_copy::{CopyRequest, validate_registration};
+    use aruna_core::structs::storage::blob::{ManagedCopyKey, ManagedCopyState};
+
+    let mut operation = hashed_operation();
+    operation.step(location_read());
+    operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: Key::from(Vec::new()),
+    }));
+    let version = VersionKey::new("bucket", "key", Ulid::from_bytes([6; 16]));
+    let owner = CopyOwner::new(ArchiveKey::of(&sealed()), version.clone());
+    operation.step(Event::Storage(StorageEvent::IterResult {
+        values: vec![(Key::from(owner.key().unwrap()), Value::from(Vec::new()))],
+        next_start_after: None,
+    }));
+    let pending = BlobVersion::pending(
+        ArchiveKey::of(&sealed()),
+        SystemTime::UNIX_EPOCH,
+        Default::default(),
+        None,
+    );
+    let row = Key::from(version.to_bytes().unwrap());
+    operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(row, Some(Value::from(pending.to_bytes().unwrap())))],
+    }));
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: bucket_rows(),
+    }));
+    let key = ManagedCopyKey::new(version.clone(), BackendRef::node_default());
+    let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+        panic!("the page reads its registrations")
+    };
+    assert_eq!(reads[0].1, Key::from(key.to_bytes().unwrap()));
+    let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
+    let registered = ManagedCopyRecord::new(
+        version,
+        node,
+        sealed(),
+        Vec::new(),
+        0,
+        ManagedCopyState::Registered,
+    )
+    .unwrap();
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(
+            Key::from(key.to_bytes().unwrap()),
+            Some(Value::from(registered.to_bytes().unwrap())),
+        )],
+    }));
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("one batch promotes the page")
+    };
+    let (_, _, value) = writes
+        .iter()
+        .find(|(key_space, ..)| key_space == MANAGED_COPY_KEYSPACE)
+        .expect("the registration is rewritten in the promotion transaction");
+    // A read of the promoted version asks for its hash; the registration now matches it.
+    let request = CopyRequest {
+        key: &key,
+        node_id: Some(node),
+        blake3: Some(BLAKE3),
+        refs: &[],
+        subject_generation: None,
+    };
+    assert!(validate_registration(Some(value.as_ref()), &request).is_ok());
 }

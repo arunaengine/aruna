@@ -10,7 +10,7 @@ use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, COPY_OWNER_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, COPY_OWNER_KEYSPACE, MANAGED_COPY_KEYSPACE,
     PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
@@ -19,12 +19,13 @@ use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
-    CopyOwner,
+    CopyOwner, ManagedCopyKey, ManagedCopyRecord, VersionKey,
 };
 use aruna_core::structs::storage::encryption::{BucketKeyError, BucketKeyRef};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
+use ulid::Ulid;
 
 use crate::blob::records::{HeadAliasContext, add_index_effect};
 use crate::replication::dht_registration::dht_registration_effect;
@@ -76,6 +77,7 @@ enum State {
     ScanOwners,
     ReadVersions,
     ReadBuckets,
+    ReadManaged,
     WriteVersions,
     DeletePending,
     Commit,
@@ -102,6 +104,7 @@ pub struct PromotePendingOperation {
     verifying: bool,
     restarts: u8,
     pending: Vec<(Key, BlobVersion)>,
+    groups: HashMap<String, Ulid>,
     promoted: usize,
     output: Option<Result<Promotion, PromoteError>>,
 }
@@ -128,6 +131,7 @@ impl PromotePendingOperation {
             verifying: false,
             restarts: 0,
             pending: Vec::new(),
+            groups: HashMap::new(),
             promoted: 0,
             output: None,
         }
@@ -364,6 +368,56 @@ impl PromotePendingOperation {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected("ReadBuckets", "BatchReadResult", event);
         };
+        match self.read_managed(values) {
+            Ok(effects) => {
+                self.state = State::ReadManaged;
+                effects
+            }
+            Err(error) => self.finish(Err(error)),
+        }
+    }
+
+    /// Reads the placement registrations of this page's versions on the archive's backend.
+    fn read_managed(
+        &mut self,
+        buckets: Vec<(Key, Option<Value>)>,
+    ) -> Result<Effects, PromoteError> {
+        self.groups.clear();
+        for (key, value) in buckets {
+            let bucket = String::from_utf8(key.to_vec()).map_err(ConversionError::from)?;
+            if let Some(value) = value {
+                self.groups
+                    .insert(bucket, BucketInfo::from_bytes(&value)?.group_id);
+            }
+        }
+        let backend = self
+            .location
+            .as_ref()
+            .ok_or(PromoteError::NoKey)?
+            .backend
+            .clone();
+        let reads = self
+            .pending
+            .iter()
+            .map(|(key, _)| {
+                let version = VersionKey::from_bytes(key)?;
+                let managed = ManagedCopyKey::new(version, backend.clone());
+                Ok((
+                    MANAGED_COPY_KEYSPACE.to_string(),
+                    managed.to_bytes()?.into(),
+                ))
+            })
+            .collect::<Result<Vec<_>, ConversionError>>()?;
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: self.txn_id,
+        })])
+    }
+
+    fn handle_managed(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected("ReadManaged", "BatchReadResult", event);
+        };
         match self.promote_page(values) {
             Ok(effects) => {
                 self.state = State::WriteVersions;
@@ -375,18 +429,25 @@ impl PromotePendingOperation {
 
     fn promote_page(
         &mut self,
-        buckets: Vec<(Key, Option<Value>)>,
+        managed: Vec<(Key, Option<Value>)>,
     ) -> Result<Effects, PromoteError> {
-        let mut groups = HashMap::new();
-        for (key, value) in buckets {
-            let bucket = String::from_utf8(key.to_vec()).map_err(ConversionError::from)?;
-            if let Some(value) = value {
-                groups.insert(bucket, BucketInfo::from_bytes(&value)?.group_id);
-            }
-        }
         let blake3 = self.blake3.unwrap_or_default();
         let location = self.location.as_ref().ok_or(PromoteError::NoKey)?;
         let mut writes = Vec::new();
+        // A governed version's registration names the copy by its hashes, so it gains them too.
+        for (key, value) in managed {
+            let Some(value) = value else { continue };
+            let mut record = ManagedCopyRecord::from_bytes(&value)?;
+            if record.location.same_object(location) {
+                record.location.hashes.extend(self.hashes.clone());
+                writes.push((
+                    MANAGED_COPY_KEYSPACE.to_string(),
+                    key,
+                    record.to_bytes()?.into(),
+                ));
+            }
+        }
+        let groups = std::mem::take(&mut self.groups);
         for (key, mut version) in std::mem::take(&mut self.pending) {
             let BlobVersionState::PendingContent { source, .. } = version.state else {
                 continue;
@@ -519,6 +580,7 @@ impl Operation for PromotePendingOperation {
             State::ScanOwners => self.handle_owners(event),
             State::ReadVersions => self.handle_versions(event),
             State::ReadBuckets => self.handle_buckets(event),
+            State::ReadManaged => self.handle_managed(event),
             State::WriteVersions => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.next_page(),
                 event => self.unexpected("WriteVersions", "BatchWriteResult", event),
