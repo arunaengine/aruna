@@ -14,8 +14,9 @@ use crate::jobs::runtime::key_unlocked;
 use crate::jobs::store::{
     AwaitOutcome, JobMutationError, iter_prefix_page, park_job, satisfy_key_wait, wake_key_waits,
 };
+use crate::jobs::workflow::workspace::LOCKED_INPUT;
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE};
-use aruna_core::structs::execution::job::{CapturedInput, JobRecord, KeyWait};
+use aruna_core::structs::execution::job::{CapturedInput, JobError, JobRecord, KeyWait};
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::time::unix_timestamp_millis;
@@ -113,6 +114,19 @@ pub(crate) async fn locked_contents(
             key,
         })
         .collect())
+}
+
+/// Parks a job whose preparation hit a key locked after the precheck, before any attempt
+/// intent exists. True when the job no longer runs here; any other error is left to the caller.
+pub(crate) async fn park_on_lock(
+    context: &DriverContext,
+    record: &JobRecord,
+    token: Ulid,
+    node_id: NodeId,
+    error: &JobError,
+) -> bool {
+    error.message.starts_with(LOCKED_INPUT)
+        && Box::pin(park_locked(context, record, token, node_id)).await
 }
 
 /// Parks a claimed job whose local inputs need locked keys. True when the job no longer runs
@@ -252,8 +266,8 @@ mod tests {
         assert_eq!(record.state, JobState::Queued);
     }
 
-    #[tokio::test]
-    async fn locked_input_waits() {
+    /// A node holding one copy of content `[9; 32]`, sealed with a locked key of bucket "sealed".
+    async fn sealed_node() -> (tempfile::TempDir, DriverContext, NodeId, BucketKeyRef) {
         use aruna_core::effects::StorageEffect;
         use aruna_core::structs::storage::blob::{BackendRef, BlobLocationKey};
         use aruna_core::structs::storage::encryption::EncryptionMode;
@@ -269,7 +283,6 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         };
-        let storage = &context.storage_handle;
         let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
         let key = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1);
         let settings = BucketEncryption {
@@ -314,7 +327,13 @@ mod tests {
             writes,
             txn_id: None,
         };
-        storage.send_storage_effect(effect).await;
+        context.storage_handle.send_storage_effect(effect).await;
+        (dir, context, node, key)
+    }
+
+    #[tokio::test]
+    async fn locked_input_waits() {
+        let (_dir, context, node, key) = sealed_node().await;
         let input = |blake3: [u8; 32], source_node_id| CapturedInput {
             destination_key: "in".to_string(),
             source_node_id,
@@ -340,6 +359,58 @@ mod tests {
                 group_id: None,
                 key,
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn lock_after_precheck() {
+        use crate::jobs::store::read_key_waits;
+        use aruna_core::structs::execution::job::JobError;
+
+        let (_dir, context, node, key) = sealed_node().await;
+        let storage = &context.storage_handle;
+        let job_id = JobId::from_bytes([5; 16]);
+        let payload = JobPayload::Probe {
+            steps: 1,
+            step_sleep_ms: 0,
+            fail_at: None,
+            panic_at: None,
+            cleanup_marker: None,
+        };
+        let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
+        let mut record = JobRecord::new(job_id, payload, owner, node, 1_000, 1_000, None);
+        record.captured_inputs.push(CapturedInput {
+            destination_key: "in".to_string(),
+            source_node_id: node,
+            version_id: Ulid::from_bytes([6; 16]),
+            blake3: [9; 32],
+            bytes: 100,
+            policies: Vec::new(),
+        });
+        insert_job(storage, &record).await.unwrap();
+        let ClaimOutcome::Claimed(claimed) = claim_job(storage, job_id, node, 2_000).await.unwrap()
+        else {
+            panic!("job must be claimed")
+        };
+        let token = claimed.claim.as_ref().unwrap().claim_token;
+
+        // Any other preparation failure stays with the caller.
+        let other = JobError::retryable("input read failed: offline");
+        assert!(!park_on_lock(&context, &claimed, token, node, &other).await);
+        // The precheck passed, then the key locked before the input was admitted.
+        let locked = JobError::retryable(format!("{LOCKED_INPUT}: bucket is locked"));
+        assert!(park_on_lock(&context, &claimed, token, node, &locked).await);
+
+        let parked = read_job_record(storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parked.state, JobState::AwaitingKey);
+        assert_eq!(parked.attempts, 0);
+        let waits = read_key_waits(storage, job_id).await.unwrap();
+        assert_eq!(
+            waits.iter().map(|wait| wait.key).collect::<Vec<_>>(),
+            vec![key]
         );
     }
 }

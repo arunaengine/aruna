@@ -12,7 +12,7 @@ use aruna_core::compute::{
     BackendError, FenceContext, MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES, S3Mount, TaskInput,
     has_wildcard, output_suffix,
 };
-use aruna_core::errors::{AuthorizationError, StorageError};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::id::NodeId;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{
@@ -27,6 +27,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BucketInfo, CONTENT_TYPE_KEY, HashIndex, UserAccess, bucket_permission_path,
     ensure_confined_path, group_permission_path, key_content_type, object_permission_path,
 };
+use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::replication::{ReplicationFailure, VersionedObjectArn};
 use futures_util::StreamExt;
 use std::sync::Arc;
@@ -1306,7 +1307,17 @@ fn get_input_retryable(error: &GetObjectError) -> bool {
     }
 }
 
+/// Message prefix of an input read refused because its bucket key is locked.
+pub(crate) const LOCKED_INPUT: &str = "input bucket key is locked";
+
 fn source_input_error(error: GetObjectError) -> JobError {
+    // A lock after the precheck parks the job before any attempt; it is never a verdict.
+    if matches!(
+        &error,
+        GetObjectError::ConversionError(ConversionError::BucketKey(BucketKeyError::Locked(_)))
+    ) {
+        return JobError::retryable(format!("{LOCKED_INPUT}: {error}"));
+    }
     let message = format!("input read failed: {error}");
     if get_input_retryable(&error) {
         JobError::retryable(message)
@@ -1699,6 +1710,13 @@ mod tests {
             source_input_error(GetObjectError::ReferenceAdvanceExhausted).kind,
             JobErrorKind::Permanent
         );
+        // A key locked after the precheck is a parkable condition, never a verdict.
+        let locked = GetObjectError::ConversionError(ConversionError::BucketKey(
+            BucketKeyError::Locked(Ulid::from_bytes([8; 16])),
+        ));
+        let error = source_input_error(locked);
+        assert_eq!(error.kind, JobErrorKind::Retryable);
+        assert!(error.message.starts_with(LOCKED_INPUT));
     }
 
     // Transient fjall faults now carry their source; classification must key on
