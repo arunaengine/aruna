@@ -193,10 +193,8 @@ pub(super) fn limits() -> OpenLimits {
     }
 }
 
-/// Streams the original bytes of `range` from the Pithos copy at `path`.
-///
-/// Opening fails before anything is decrypted when the archive does not match `layout`. `keys`
-/// must open a grant of the object; every block is checked against its BLAKE3 when it is read.
+/// Streams original bytes of `range` from the Pithos copy at `path`, checking each block's BLAKE3.
+/// Opening fails before decryption if the archive differs from `layout` or `keys` opens no grant.
 pub async fn read(
     operator: Operator,
     path: String,

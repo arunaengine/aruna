@@ -235,10 +235,9 @@ pub struct PartPiece {
     pub content_offset: Option<u64>,
 }
 
-/// File offset to record the content tree of `part_number` at, chosen before its bytes arrive.
-///
-/// Part 1 starts at 0. Later parts assume equal sizes: the lowest saved part that is not the
-/// highest saved part gives the size, else `declared`. Overflow or misalignment records no tree.
+/// Chooses the content tree offset before bytes arrive: part 1 starts at 0; later parts are equal.
+/// Size comes from the lowest saved part other than the highest, else `declared`.
+/// Overflow or misalignment records no tree.
 pub fn content_offset(
     part_number: u16,
     saved: &[(u16, u64)],

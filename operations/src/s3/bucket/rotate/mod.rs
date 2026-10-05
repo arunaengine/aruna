@@ -1,6 +1,5 @@
-//! Changes the encryption of an encrypted bucket: rotates its key, switches between
-//! `node_managed` and `vault_locked`, decrypts it, or changes its cipher or block keys. Stored
-//! copies move afterwards through the bucket's transition record.
+//! Rotates bucket keys or changes encryption mode, cipher or block keys, including decryption.
+//! Stored copies move afterwards through the bucket's transition record.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

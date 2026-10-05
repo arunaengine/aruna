@@ -1,6 +1,5 @@
-//! Resolves the key holders of an encrypted bucket and whether they meet the recovery rule.
-//! Holders are the creator, users with WRITE on the group admin path and explicit grants; a user
-//! who loses admin rights stops being an implicit holder at once (D30).
+//! Resolves recovery and holders: creator, explicit grants and users with WRITE on the admin path.
+//! Loss of group admin rights ends implicit holder status at once (D30).
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

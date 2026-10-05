@@ -1,6 +1,5 @@
-//! Holds unlocked bucket keys in memory and admits plaintext reads under leases.
-//! Each key lives in one allocation that its leases share, so a lock stops new reads at once
-//! while admitted reads finish; the key is zeroed when the last of them ends.
+//! Holds keys in memory under shared leases: locks stop new reads while admitted reads finish.
+//! The shared key allocation is zeroed when its last owner releases it.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -331,10 +330,8 @@ impl UnlockRegistry {
         Ok(session.status(key, now))
     }
 
-    /// Locks every generation of a bucket, or only `only` when a timer names its session. A
-    /// timer locks only a session past its deadline, checked here under the registry lock, so
-    /// an old callback of an extended session locks nothing; an expired session is reported
-    /// once, so its timed lock is recorded.
+    /// Locks all bucket generations, or the expired session named by `only` under the registry lock.
+    /// Extended sessions survive stale timers; each expired session is reported once for audit.
     pub(super) fn lock(
         &mut self,
         bucket_id: Ulid,

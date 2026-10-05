@@ -135,10 +135,8 @@ impl Pending {
     }
 }
 
-/// The unlock state an audit trail describes, rebuilt record by record in storage order.
-/// Outcomes name their intents, so a failure only undoes its own intent and session. An intent
-/// without a stored outcome counts as applied: a crash may have lost the outcome after the key
-/// was in use.
+/// Replays unlock state in storage order; failures undo only their own intent and session.
+/// An intent without an outcome counts as applied: a crash may lose the outcome after key use.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Replay {
     trails: BTreeMap<u64, Trail>,

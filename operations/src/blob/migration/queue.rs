@@ -413,10 +413,8 @@ fn uses_key(
     sealed.count() as u64
 }
 
-/// Location keys of copies whose physical deletion is still queued or failed and waits for
-/// a retry.
-/// Forgets the old copies of one page that are gone, in one transaction: a reclaim committing
-/// meanwhile is either in its snapshot or fails the commit. Returns the copies still present.
+/// Forgets deleted copies in one transaction; concurrent reclaim is in its snapshot or fails commit.
+/// Returns the count still present, including copies awaiting deletion or retry.
 async fn forget_removed(
     storage: &StorageHandle,
     prefix_len: usize,

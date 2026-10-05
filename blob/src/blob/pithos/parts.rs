@@ -41,10 +41,8 @@ const MIB: usize = 1 << 20;
 pub(in crate::blob) const PART_BLOCK: usize = 4 * MIB;
 
 impl BlobHandler {
-    /// Writes one part of an encrypted upload as a Pithos piece keyed by its part number.
-    ///
-    /// The piece records a content tree at `content_offset` when one is given. The location
-    /// carries the size and checksums of the original bytes; the piece record holds no key.
+    /// Writes a keyless Pithos piece keyed by part number, with a tree at `content_offset` if given.
+    /// The location carries the original size and checksums.
     pub async fn seal_piece(
         &self,
         part: MultipartPartKey,
@@ -251,11 +249,8 @@ impl BlobHandler {
         Ok((size, piece))
     }
 
-    /// Writes the header, the stored bytes of each part in order and the directory as one
-    /// archive at a new object path. Every stored length and offset is checked on the way.
-    ///
-    /// The location names the key of `upload`; its BLAKE3 is set only when the recorded content
-    /// trees line up with the final offsets.
+    /// Writes header, ordered stored parts and directory to a new path, checking lengths and offsets.
+    /// The location names the upload key; BLAKE3 is set only if content trees match the final offsets.
     pub async fn compose_pieces(
         &self,
         request_bucket: &str,
