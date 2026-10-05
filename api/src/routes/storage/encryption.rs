@@ -358,7 +358,7 @@ pub(crate) fn unlock_view(status: Option<&UnlockStatus>, now_ms: u64) -> UnlockV
             locked_at_ms: None,
             session_id: Some(status.session_id.to_string()),
             unlocked_at_ms: system_ms(status.unlocked_at),
-            deadline_ms: after(now_ms, status.remaining),
+            deadline_ms: status.deadline_ms,
             max_deadline_ms: after(now_ms, status.max_remaining),
         },
         None => UnlockView {
@@ -943,6 +943,17 @@ mod tests {
     }
 
     #[test]
+    fn delayed_deadline_reported() {
+        let snapshot = snapshot();
+        for now_ms in [50, 100, 200] {
+            assert_eq!(
+                unlock_view(snapshot.unlocks.first(), now_ms).deadline_ms,
+                Some(60)
+            );
+        }
+    }
+
+    #[test]
     fn reports_retained_generations() {
         let alone = build_status("bucket".to_string(), &snapshot(), None, user(1), 100);
         assert_eq!(alone.generations.len(), 1);
@@ -970,7 +981,7 @@ mod tests {
         assert_eq!(active.locked_at_ms, Some(40));
         let source = &status.generations[0].unlock;
         assert_eq!(source.state, "unlocked");
-        assert_eq!(source.deadline_ms, Some(110));
+        assert_eq!(source.deadline_ms, Some(60));
         assert_eq!(source.unlocked_at_ms, Some(50));
         assert_eq!(status.fingerprint.as_deref().map(str::len), Some(64));
         assert!(status.holders.is_none());
