@@ -3,16 +3,22 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::index::{decode_index, encode_index, owner_key};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{ACCESS_OWNER_KEYSPACE, USER_ACCESS_KEYSPACE};
+use aruna_core::keyspaces::{
+    ACCESS_OWNER_KEYSPACE, KEY_COPY_KEYSPACE, TOKEN_INDEX_KEYSPACE, USER_ACCESS_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_core::types::Effects;
+use aruna_core::structs::storage::encryption::TokenCopy;
+use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use std::time::SystemTime;
 use thiserror::Error;
+
+/// Token index rows deleted per batch.
+const TOKEN_PAGE: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RevokeUserState {
@@ -25,6 +31,8 @@ pub enum RevokeUserState {
     CommitTransaction,
     Finish,
     Error,
+    ScanTokens,
+    DeleteTokens,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -52,6 +60,8 @@ pub struct RevokeUserOperation {
     txn_id: Option<ulid::Ulid>,
     access: Option<UserAccess>,
     output: Option<Result<UserAccess, RevokeUserError>>,
+    /// Where the scan of this credential's token copies continues after the current page.
+    token_cursor: Option<Key>,
 }
 
 impl RevokeUserOperation {
@@ -62,6 +72,7 @@ impl RevokeUserOperation {
             txn_id: None,
             access: None,
             output: None,
+            token_cursor: None,
         }
     }
 
@@ -184,10 +195,67 @@ impl RevokeUserOperation {
         let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
             return self.emit_error(RevokeUserError::InvalidOperationState);
         };
+        self.scan_tokens(None)
+    }
+
+    /// The credential's token copies go in the same transaction, one index page at a time.
+    fn scan_tokens(&mut self, start: Option<Key>) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(RevokeUserError::NoTransactionFound);
         };
+        self.state = RevokeUserState::ScanTokens;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: TOKEN_INDEX_KEYSPACE.to_string(),
+            prefix: Some(TokenCopy::index_prefix(&self.access_key).into()),
+            start: start.map(IterStart::After),
+            limit: TOKEN_PAGE,
+            txn_id: Some(txn_id),
+        })]
+    }
 
+    fn tokens_scanned(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return self.emit_error(RevokeUserError::InvalidOperationState);
+        };
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(RevokeUserError::NoTransactionFound);
+        };
+        if values.is_empty() {
+            self.state = RevokeUserState::CommitTransaction;
+            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        }
+        let mut deletes = Vec::new();
+        for (key, _) in values {
+            let reference = match TokenCopy::parse_index(&key, &self.access_key) {
+                Ok(reference) => reference,
+                Err(error) => return self.emit_error(error.into()),
+            };
+            let copy = TokenCopy::copy_key(reference, &self.access_key);
+            deletes.push((KEY_COPY_KEYSPACE.to_string(), copy.into()));
+            deletes.push((TOKEN_INDEX_KEYSPACE.to_string(), key));
+        }
+        self.token_cursor = next_start_after;
+        self.state = RevokeUserState::DeleteTokens;
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn tokens_deleted(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
+            return self.emit_error(RevokeUserError::InvalidOperationState);
+        };
+        if let Some(cursor) = self.token_cursor.take() {
+            return self.scan_tokens(Some(cursor));
+        }
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(RevokeUserError::NoTransactionFound);
+        };
         self.state = RevokeUserState::CommitTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -229,6 +297,8 @@ impl Operation for RevokeUserOperation {
             RevokeUserState::CommitTransaction => self.handle_transaction_committed(event),
             RevokeUserState::Finish => smallvec![],
             RevokeUserState::Error => self.abort(),
+            RevokeUserState::ScanTokens => self.tokens_scanned(event),
+            RevokeUserState::DeleteTokens => self.tokens_deleted(event),
         }
     }
 
@@ -265,6 +335,13 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    fn no_tokens() -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        })
+    }
 
     #[test]
     fn revoke_stays_local() {
@@ -314,6 +391,12 @@ mod tests {
         }));
         assert!(matches!(
             effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
+                if key_space == TOKEN_INDEX_KEYSPACE
+        ));
+        let effects = op.step(no_tokens());
+        assert!(matches!(
+            effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { .. })]
         ));
 
@@ -359,9 +442,10 @@ mod tests {
                 if key_space == USER_ACCESS_KEYSPACE
         ));
 
-        let effects = op.step(Event::Storage(StorageEvent::DeleteResult {
+        op.step(Event::Storage(StorageEvent::DeleteResult {
             key: access.access_key.as_bytes().into(),
         }));
+        let effects = op.step(no_tokens());
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { .. })]
