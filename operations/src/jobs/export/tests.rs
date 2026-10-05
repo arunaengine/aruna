@@ -4,7 +4,6 @@
 
 use super::*;
 use aruna_core::structs::storage::format::Compression;
-use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 
 use crate::jobs::executor::ProgressReporter;
@@ -190,7 +189,7 @@ async fn seed_bao(
     let version = BlobVersion::materialized(
         hash,
         BackendRef::node_default(),
-        EncodingClass::Raw,
+        location.format.encoding(),
         std::time::SystemTime::UNIX_EPOCH,
         owner,
         None,
@@ -229,7 +228,7 @@ async fn seed_bao(
         ),
         (
             BLOB_LOCATIONS_KEYSPACE.to_string(),
-            BlobLocationKey::new(hash, EncodingClass::Raw, location.backend.clone())
+            BlobLocationKey::new(hash, location.format.encoding(), location.backend.clone())
                 .to_bytes()
                 .into(),
             location.to_bytes().unwrap().into(),
@@ -2071,4 +2070,205 @@ async fn zip64_large_entry() {
     {
         assert!(status.success());
     }
+}
+
+/// Writes a bucket's encryption settings row on `node`.
+async fn encrypting_bucket(node: &BaoNode, bucket: &str, bucket_id: Ulid) {
+    use aruna_core::structs::storage::encryption::EncryptionMode;
+    let settings = BucketEncryption {
+        mode: EncryptionMode::VaultLocked,
+        bucket_id: Some(bucket_id),
+        key_generation: 1,
+        ..Default::default()
+    };
+    let event = node
+        .driver
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            key: bucket.as_bytes().to_vec().into(),
+            value: settings.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+}
+
+#[tokio::test]
+async fn sealed_local_export() {
+    use aruna_core::compute::{SecretBytes, SharedSecret};
+    use aruna_core::structs::storage::encryption::{SealPlan, public_key_of};
+    use aruna_core::structs::storage::format::StoredLayout;
+
+    let realm_id = RealmId::from_bytes([111; 32]);
+    let owner = UserId::local(Ulid::from_bytes([112; 16]), realm_id);
+    let group_id = Ulid::from_bytes([113; 16]);
+    let version_id = Ulid::from_bytes([114; 16]);
+    let node = bao_node(realm_id).await;
+    let node_id = node.net.node_id();
+    let blob = node.driver.blob_handle.as_ref().unwrap();
+    let private = || SecretBytes::new(vec![9; 32]);
+    let key = BucketKeyRef::new(Ulid::from_bytes([115; 16]), 1);
+    let plan = SealPlan {
+        key,
+        public_key: public_key_of(&private()).unwrap(),
+        cipher: Default::default(),
+        block_keys: Default::default(),
+        storage_generation: 1,
+    };
+    let resolved = aruna_core::structs::storage::blob::ResolvedBackend::node_default()
+        .with_encryption(Some(plan));
+    let Event::Blob(BlobEvent::WriteFinished { location }) = blob
+        .send_blob_effect(BlobEffect::Write {
+            resolved,
+            bucket: "remote".to_string(),
+            key: "payload".to_string(),
+            created_by: owner,
+            blob: byte_stream(FIXTURE_BYTES),
+            size: None,
+        })
+        .await
+    else {
+        panic!("sealed blob write failed")
+    };
+    assert!(matches!(location.format.layout, StoredLayout::Pithos(_)));
+    let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
+    seed_bao(&node, node_id, owner, group_id, version_id, &location).await;
+    let candidate = ExportCandidate {
+        source: CandidateSource::Local {
+            location,
+            group_id,
+            permission_path: object_permission_path(
+                realm_id, group_id, node_id, "remote", "payload",
+            ),
+            node_id,
+            bucket: "remote".to_string(),
+            key: "payload".to_string(),
+        },
+        report_source: ExportReportSource::Local,
+        resolved_version: Some(version_id),
+        expected_blake3: Some(hash),
+    };
+    let spec = remote_spec(realm_id, owner);
+    let driver = node.driver.as_ref();
+
+    // Locked, the input parks the export on its key instead of counting as offline.
+    let opened = open_candidate(driver, &spec, &candidate, false).await;
+    let wait = match opened {
+        Err(ExportFailure::KeyLocked(wait)) => wait,
+        Err(error) => panic!("a locked input must wait for its key, got {error:?}"),
+        Ok(CandidateOpen::Status(status)) => panic!("a locked input got status {status:?}"),
+        Ok(CandidateOpen::Opened(_)) => panic!("a locked input must not open"),
+    };
+    assert_eq!((wait.key, wait.node_id), (key, node_id));
+    assert!(matches!(
+        failure_outcome(ExportFailure::KeyLocked(wait)),
+        JobRunOutcome::AwaitingKey(waits) if waits.len() == 1
+    ));
+
+    // Unlocked, the sealed copy is read under a lease and yields the original bytes.
+    let prepare = BlobEffect::PrepareKey {
+        key,
+        public_key: plan.public_key,
+        private_key: SharedSecret::new(private()),
+        duration: None,
+        max: None,
+    };
+    let Event::Blob(BlobEvent::KeyPrepared { ticket }) = blob.send_blob_effect(prepare).await
+    else {
+        panic!("prepare failed")
+    };
+    blob.send_blob_effect(BlobEffect::ActivateKey { ticket })
+        .await;
+    let CandidateOpen::Opened(BaoReadOutput::Stream { mut blob, .. }) =
+        open_candidate(driver, &spec, &candidate, false)
+            .await
+            .unwrap()
+    else {
+        panic!("an unlocked sealed input must open")
+    };
+    let mut received = Vec::new();
+    while let Some(chunk) = blob.next().await {
+        received.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(received, FIXTURE_BYTES);
+    node.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn locked_remote_export() {
+    // The source bucket encrypts but its copy is not converted yet; it is still gated.
+    let realm_id = RealmId::from_bytes([121; 32]);
+    let owner = UserId::local(Ulid::from_bytes([122; 16]), realm_id);
+    let group_id = Ulid::from_bytes([123; 16]);
+    let version_id = Ulid::from_bytes([124; 16]);
+    let client = bao_node(realm_id).await;
+    let source = bao_node(realm_id).await;
+    client.net.add_peer_addr(source.net.endpoint_addr()).await;
+    source.net.add_peer_addr(client.net.endpoint_addr()).await;
+    let Event::Blob(BlobEvent::WriteFinished { location }) = source
+        .driver
+        .blob_handle
+        .as_ref()
+        .unwrap()
+        .send_blob_effect(BlobEffect::Write {
+            resolved: aruna_core::structs::storage::blob::ResolvedBackend::node_default(),
+            bucket: "remote".to_string(),
+            key: "payload".to_string(),
+            created_by: owner,
+            blob: byte_stream(FIXTURE_BYTES),
+            size: None,
+        })
+        .await
+    else {
+        panic!("source blob write failed")
+    };
+    let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
+    seed_bao(
+        &source,
+        client.net.node_id(),
+        owner,
+        group_id,
+        version_id,
+        &location,
+    )
+    .await;
+    encrypting_bucket(&source, "remote", Ulid::from_bytes([125; 16])).await;
+    let exact = VersionedObjectArn::new(
+        realm_id,
+        source.net.node_id(),
+        "remote",
+        "payload",
+        version_id,
+    )
+    .unwrap();
+    let candidate = ExportCandidate {
+        source: CandidateSource::RemoteExact {
+            node_id: source.net.node_id(),
+            target: exact,
+        },
+        report_source: ExportReportSource::Remote,
+        resolved_version: Some(version_id),
+        expected_blake3: Some(hash),
+    };
+
+    let opened = open_candidate(
+        client.driver.as_ref(),
+        &remote_spec(realm_id, owner),
+        &candidate,
+        false,
+    )
+    .await;
+    let Err(ExportFailure::RemoteLocked {
+        node_id, content, ..
+    }) = opened
+    else {
+        panic!("a locked remote input must be typed, got another outcome")
+    };
+    assert_eq!((node_id, content), (source.net.node_id(), Some(hash)));
+    client.net.shutdown().await;
+    source.net.shutdown().await;
 }

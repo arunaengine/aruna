@@ -1249,6 +1249,25 @@ pub(super) async fn finish_export(
     error: ExportFailure,
 ) -> JobRunOutcome {
     discard_artifact(ctx, checkpoint, false).await;
+    // A remote holder with a locked key wakes this job once it registers there.
+    if let ExportFailure::RemoteLocked {
+        node_id,
+        content: Some(content),
+        auth,
+    } = &error
+    {
+        let waits = super::super::remote_key::contents_waits(
+            &ctx.driver,
+            auth,
+            ctx.job_id,
+            *node_id,
+            &[*content],
+        )
+        .await;
+        if !waits.is_empty() {
+            return JobRunOutcome::AwaitingKey(waits);
+        }
+    }
     if let ExportFailure::Validation(violations) = &error
         && let Err(message) = write_validation_rows(ctx, violations).await
     {
@@ -1295,6 +1314,8 @@ pub(super) fn failure_outcome(error: ExportFailure) -> JobRunOutcome {
     match error {
         ExportFailure::Permanent(message) => permanent(message),
         ExportFailure::Retryable(message) => retryable(message),
+        ExportFailure::KeyLocked(wait) => JobRunOutcome::AwaitingKey(vec![wait]),
+        ExportFailure::RemoteLocked { .. } => retryable("a remote input's bucket key is locked"),
         ExportFailure::Validation(violations) => permanent(validation_message(&violations)),
         ExportFailure::Candidate { message, .. } => retryable(message),
         ExportFailure::Cancelled => JobRunOutcome::Cancelled,
