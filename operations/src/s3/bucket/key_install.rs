@@ -3,7 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::key_lock::{AUDIT_ATTEMPTS, answers_timer, lock_timer};
+use crate::s3::bucket::audit_retry::{AUDIT_ATTEMPTS, retry_effect, retry_timer};
+use crate::s3::bucket::key_lock::{answers_timer, lock_timer};
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -13,7 +14,9 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::storage::encryption::{
     BucketKeyRef, KeyTicket, UnlockStatus, deadline_after,
 };
-use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
+use aruna_core::structs::storage::key_audit::{
+    AuditAction, AuditOutcome, BucketAuditRecord, next_event_id,
+};
 use aruna_core::task::TaskEffect;
 use aruna_core::types::Effects;
 use aruna_core::{NodeId, UserId};
@@ -32,6 +35,7 @@ enum InstallState {
     ArmTimer,
     DiscardKey,
     WriteOutcome,
+    ArmRetry,
     Finish,
     Error,
 }
@@ -88,6 +92,8 @@ pub struct InstallKeyOperation {
     activated: Option<UnlockStatus>,
     /// True once the intent is durable, so a failed activation records its outcome.
     intent_synced: bool,
+    /// The event id of the stored intent, which the outcome names.
+    intent_id: Option<Ulid>,
     outcome: Option<BucketAuditRecord>,
     attempts: u32,
     output: Option<Result<UnlockStatus, InstallError>>,
@@ -107,6 +113,7 @@ impl InstallKeyOperation {
             failure: None,
             activated: None,
             intent_synced: false,
+            intent_id: None,
             outcome: None,
             attempts: 0,
             output: None,
@@ -143,7 +150,7 @@ impl InstallKeyOperation {
     fn record(&self, audit: InstallAudit, outcome: AuditOutcome) -> BucketAuditRecord {
         let (duration, max) = self.bounds;
         BucketAuditRecord {
-            event_id: Ulid::generate(),
+            event_id: next_event_id(audit.now_ms),
             bucket_id: self.key.bucket_id,
             at_ms: audit.now_ms,
             action: AuditAction::Unlock,
@@ -151,6 +158,7 @@ impl InstallKeyOperation {
             node_id: audit.node_id,
             generation: Some(self.key.generation),
             session_id: self.session,
+            intent_id: None,
             deadline_ms: duration
                 .or(max)
                 .and_then(|left| deadline_after(audit.now_ms, left)),
@@ -208,7 +216,9 @@ impl InstallKeyOperation {
             Err(_) => AuditOutcome::Failed,
         };
         self.output = Some(result);
-        self.outcome = Some(self.record(audit, outcome));
+        let mut record = self.record(audit, outcome);
+        record.intent_id = self.intent_id;
+        self.outcome = Some(record);
         self.retry_outcome()
     }
 
@@ -263,6 +273,7 @@ impl Operation for InstallKeyOperation {
                     return self.activate();
                 };
                 let intent = self.record(audit, AuditOutcome::Intent);
+                self.intent_id = Some(intent.event_id);
                 self.state = InstallState::WriteIntent;
                 self.write(&intent)
             }
@@ -310,17 +321,31 @@ impl Operation for InstallKeyOperation {
                 self.key_discarded()
             }
             (InstallState::DiscardKey, Event::Blob(BlobEvent::Error(_))) => self.key_discarded(),
-            // The key state is settled; a failed outcome write is retried, and a lasting failure
-            // leaves only the unconfirmed intent.
+            // The key state is settled; a failed outcome write is retried here first.
             (InstallState::WriteOutcome, Event::Storage(StorageEvent::Error { .. }))
                 if self.attempts < AUDIT_ATTEMPTS =>
             {
                 self.retry_outcome()
             }
-            (
-                InstallState::WriteOutcome,
-                Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::Error { .. }),
-            ) => {
+            (InstallState::WriteOutcome, Event::Storage(StorageEvent::WriteResult { .. })) => {
+                self.outcome = None;
+                self.state = InstallState::Finish;
+                smallvec![]
+            }
+            // A lasting outage hands the outcome to its own retry timer.
+            (InstallState::WriteOutcome, Event::Storage(StorageEvent::Error { .. })) => {
+                let Some(record) = self.outcome.as_ref() else {
+                    return self.fail(InstallError::NotFinished);
+                };
+                self.state = InstallState::ArmRetry;
+                smallvec![retry_effect(record)]
+            }
+            (InstallState::ArmRetry, Event::Task(event))
+                if self
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|record| answers_timer(&event, &retry_timer(record))) =>
+            {
                 self.outcome = None;
                 self.state = InstallState::Finish;
                 smallvec![]

@@ -125,6 +125,7 @@ impl UnlockLimitOperation {
             node_id: self.input.node_id,
             generation: Some(settings.key_generation),
             session_id: None,
+            intent_id: None,
             deadline_ms: None,
             reason: Some("unlock maximum changed".to_string()),
             outcome: AuditOutcome::Applied,

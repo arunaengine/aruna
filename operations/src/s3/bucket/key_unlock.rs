@@ -5,7 +5,8 @@
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::key_wake::wake_unlocked;
-use crate::s3::bucket::key_lock::{AUDIT_ATTEMPTS, answers_timer, lock_timer};
+use crate::s3::bucket::audit_retry::{AUDIT_ATTEMPTS, retry_effect, retry_timer};
+use crate::s3::bucket::key_lock::{answers_timer, lock_timer};
 use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -21,7 +22,9 @@ use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRecord, BucketKeyRef, HolderOrigin, KeyState, KeyTicket,
     SealedCopy, UnlockStatus, deadline_after,
 };
-use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
+use aruna_core::structs::storage::key_audit::{
+    AuditAction, AuditOutcome, BucketAuditRecord, next_event_id,
+};
 use aruna_core::task::TaskEffect;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use aruna_core::{NodeId, UserId};
@@ -45,6 +48,7 @@ enum UnlockStep {
     ArmTimer,
     DiscardKey,
     WriteOutcome,
+    ArmRetry,
     Finish,
     Error,
 }
@@ -245,7 +249,7 @@ impl UnlockBucketOperation {
     fn record(&self, outcome: AuditOutcome, at_ms: u64) -> BucketAuditRecord {
         let deadline = self.input.duration.or(self.max);
         BucketAuditRecord {
-            event_id: Ulid::generate(),
+            event_id: next_event_id(at_ms),
             bucket_id: self.input.key.bucket_id,
             at_ms,
             action: AuditAction::Unlock,
@@ -253,6 +257,7 @@ impl UnlockBucketOperation {
             node_id: self.input.node_id,
             generation: Some(self.input.key.generation),
             session_id: self.session,
+            intent_id: None,
             deadline_ms: deadline.and_then(|deadline| deadline_after(at_ms, deadline)),
             reason: None,
             outcome,
@@ -289,6 +294,7 @@ impl UnlockBucketOperation {
             }),
             Err(_) => self.intent.as_ref().and_then(|intent| intent.deadline_ms),
         };
+        record.intent_id = self.intent.as_ref().map(|intent| intent.event_id);
         self.output = Some(result);
         self.outcome = Some(record);
         self.retry_outcome()
@@ -428,17 +434,31 @@ impl Operation for UnlockBucketOperation {
                 let error = self.failure.take().unwrap_or(UnlockError::NotFinished);
                 self.write_outcome(Err(error))
             }
-            // The key state is settled; a failed outcome write is retried, and a lasting failure
-            // leaves only the unconfirmed intent.
+            // The key state is settled; a failed outcome write is retried here first.
             (UnlockStep::WriteOutcome, Event::Storage(StorageEvent::Error { .. }))
                 if self.attempts < AUDIT_ATTEMPTS =>
             {
                 self.retry_outcome()
             }
-            (
-                UnlockStep::WriteOutcome,
-                Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::Error { .. }),
-            ) => {
+            (UnlockStep::WriteOutcome, Event::Storage(StorageEvent::WriteResult { .. })) => {
+                self.outcome = None;
+                self.step = UnlockStep::Finish;
+                smallvec![]
+            }
+            // A lasting outage hands the outcome to its own retry timer.
+            (UnlockStep::WriteOutcome, Event::Storage(StorageEvent::Error { .. })) => {
+                let Some(record) = self.outcome.as_ref() else {
+                    return self.fail(UnlockError::NotFinished);
+                };
+                self.step = UnlockStep::ArmRetry;
+                smallvec![retry_effect(record)]
+            }
+            (UnlockStep::ArmRetry, Event::Task(event))
+                if self
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|record| answers_timer(&event, &retry_timer(record))) =>
+            {
                 self.outcome = None;
                 self.step = UnlockStep::Finish;
                 smallvec![]

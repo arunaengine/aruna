@@ -6,9 +6,11 @@
 use crate::errors::ConversionError;
 use crate::{NodeId, UserId};
 use serde::{Deserialize, Serialize};
-use ulid::Ulid;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
+use ulid::{Generator, Ulid};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditAction {
     Unlock,
@@ -24,7 +26,7 @@ pub enum AuditAction {
 
 /// A volatile change records its intent before it applies, then its outcome; an intent alone
 /// never reads as success.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditOutcome {
     Intent,
@@ -33,7 +35,7 @@ pub enum AuditOutcome {
 }
 
 /// One audit event, stored in `bucket_audit` under bucket id and its time-ordered event id.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct BucketAuditRecord {
     pub event_id: Ulid,
     pub bucket_id: Ulid,
@@ -45,9 +47,27 @@ pub struct BucketAuditRecord {
     pub generation: Option<u64>,
     /// The unlock session an unlock, extension or lock names; none for actions of a generation.
     pub session_id: Option<Ulid>,
+    /// The event id of the intent an applied or failed outcome completes.
+    pub intent_id: Option<Ulid>,
     pub deadline_ms: Option<u64>,
     pub reason: Option<String>,
     pub outcome: AuditOutcome,
+}
+
+/// Event ids of this process in issue order, so the records of one bucket sort as they happened
+/// even within one millisecond.
+static EVENT_IDS: Mutex<Generator> = Mutex::new(Generator::new());
+
+/// The next audit event id at `at_ms`; it sorts after every id issued before it.
+pub fn next_event_id(at_ms: u64) -> Ulid {
+    let at = SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms);
+    let Ok(mut ids) = EVENT_IDS.lock() else {
+        return Ulid::from_datetime(at);
+    };
+    match ids.generate_from_datetime(at) {
+        Ok(id) => id,
+        Err(overflow) => overflow.commit_overflow_increment(),
+    }
 }
 
 impl BucketAuditRecord {
@@ -84,6 +104,7 @@ mod tests {
             node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
             generation: Some(1),
             session_id: None,
+            intent_id: None,
             deadline_ms: None,
             reason: None,
             outcome: AuditOutcome::Intent,
@@ -97,5 +118,15 @@ mod tests {
         );
         let names = serde_json::to_value((AuditAction::TimedLock, AuditOutcome::Applied)).unwrap();
         assert_eq!(names, serde_json::json!(["timed_lock", "applied"]));
+    }
+
+    #[test]
+    fn event_ids_monotonic() {
+        // Ids issued within one millisecond, or with an older time, still sort in issue order.
+        let first = next_event_id(1_000);
+        let same = next_event_id(1_000);
+        let older = next_event_id(999);
+        assert!(first < same && same < older);
+        assert!(older < next_event_id(2_000));
     }
 }

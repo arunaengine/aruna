@@ -62,7 +62,7 @@ fn timer_is_ephemeral(effect: &TaskEffect) -> bool {
     | TaskEffect::ShortenTimer { key, .. }
     | TaskEffect::CancelTimer { key }
     | TaskEffect::AbortRunningHandlers { key }) = effect;
-    matches!(key, TaskKey::LockBucket { .. } | TaskKey::RecordLock { .. })
+    matches!(key, TaskKey::LockBucket { .. })
 }
 
 pub(crate) async fn delete_persisted_timer(storage: &StorageHandle, key: &TaskKey) {

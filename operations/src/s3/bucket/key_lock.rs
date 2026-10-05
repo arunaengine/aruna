@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::s3::bucket::audit_retry::{AUDIT_ATTEMPTS, retry_effect, retry_timer};
 use crate::s3::bucket::key_rows::{SettingsError, authority_read, parse_authority};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -11,7 +12,9 @@ use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{BucketHolder, HolderOrigin, KeyTicket};
-use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
+use aruna_core::structs::storage::key_audit::{
+    AuditAction, AuditOutcome, BucketAuditRecord, next_event_id,
+};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
@@ -19,23 +22,17 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-/// Writes of an audit completion before the applied change is reported without its record.
-pub(crate) const AUDIT_ATTEMPTS: u32 = 3;
-/// How long a lock record that could not be stored waits before its next write.
-pub const LOCK_RECORD_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// The record of a lock of `ticket`, timed when there is no actor. Its time is that of
-/// `event_id`, so a retried write stores the same record.
+/// The record of a lock of `ticket`, timed when there is no actor.
 pub fn lock_record(
-    event_id: Ulid,
     ticket: KeyTicket,
     actor: Option<UserId>,
     node_id: NodeId,
+    at_ms: u64,
 ) -> BucketAuditRecord {
     BucketAuditRecord {
-        event_id,
+        event_id: next_event_id(at_ms),
         bucket_id: ticket.key.bucket_id,
-        at_ms: event_id.timestamp_ms(),
+        at_ms,
         action: match actor {
             Some(_) => AuditAction::Lock,
             None => AuditAction::TimedLock,
@@ -44,56 +41,10 @@ pub fn lock_record(
         node_id,
         generation: Some(ticket.key.generation),
         session_id: Some(ticket.session_id),
+        intent_id: None,
         deadline_ms: None,
         reason: None,
         outcome: AuditOutcome::Applied,
-    }
-}
-
-/// The retry timer that keeps a lock record until it is stored.
-fn record_timer(record: &BucketAuditRecord) -> Option<TaskKey> {
-    Some(TaskKey::RecordLock {
-        event_id: record.event_id,
-        bucket_id: record.bucket_id,
-        generation: record.generation?,
-        session_id: record.session_id?,
-        actor: record.actor,
-    })
-}
-
-/// Stores the lock record a `RecordLock` timer names.
-pub async fn store_lock(
-    context: &crate::driver::DriverContext,
-    key: &TaskKey,
-    node_id: NodeId,
-) -> Result<(), String> {
-    let TaskKey::RecordLock {
-        event_id,
-        bucket_id,
-        generation,
-        session_id,
-        actor,
-    } = key
-    else {
-        return Err("not a lock record timer".to_string());
-    };
-    let key = aruna_core::structs::storage::encryption::BucketKeyRef::new(*bucket_id, *generation);
-    let ticket = KeyTicket {
-        key,
-        session_id: *session_id,
-    };
-    let record = lock_record(*event_id, ticket, *actor, node_id);
-    let value = record.to_bytes().map_err(|error| error.to_string())?;
-    let write = StorageEffect::Write {
-        key_space: BUCKET_AUDIT_KEYSPACE.to_string(),
-        key: record.key().into(),
-        value: value.into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected lock record answer: {other:?}")),
     }
 }
 
@@ -252,10 +203,8 @@ impl LockBucketOperation {
         self.locked = locked;
         let mut writes = Vec::new();
         for ticket in &self.locked {
-            // The time sits in the event id, so a later retry writes the very same record.
-            let event_id = Ulid::from_parts(self.input.now_ms, Ulid::generate().random());
             let (actor, node_id) = (self.input.caller, self.input.node_id);
-            let record = lock_record(event_id, *ticket, actor, node_id);
+            let record = lock_record(*ticket, actor, node_id, self.input.now_ms);
             match record.to_bytes() {
                 Ok(value) => writes.push((
                     BUCKET_AUDIT_KEYSPACE.to_string(),
@@ -285,17 +234,7 @@ impl LockBucketOperation {
 
     /// Records still not stored move to retry timers that write them until storage answers.
     fn arm_retries(&mut self) -> Effects {
-        let arms: Effects = self
-            .records
-            .iter()
-            .filter_map(record_timer)
-            .map(|key| {
-                Effect::Task(TaskEffect::ResetTimer {
-                    key,
-                    after: LOCK_RECORD_RETRY,
-                })
-            })
-            .collect();
+        let arms: Effects = self.records.iter().map(retry_effect).collect();
         if arms.is_empty() {
             return self.finish(false);
         }
@@ -369,8 +308,7 @@ impl Operation for LockBucketOperation {
                 if self
                     .records
                     .iter()
-                    .filter_map(record_timer)
-                    .any(|key| answers_timer(&event, &key)) =>
+                    .any(|record| answers_timer(&event, &retry_timer(record))) =>
             {
                 self.retries = self.retries.saturating_sub(1);
                 match self.retries {
@@ -455,6 +393,7 @@ pub fn lock_timer(ticket: &KeyTicket) -> TaskKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::s3::bucket::audit_retry::AUDIT_RETRY;
     use crate::s3::bucket::key_rows::authority_rows;
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::encryption::{
@@ -561,35 +500,24 @@ mod tests {
             .iter()
             .map(|effect| match effect {
                 Effect::Task(TaskEffect::ResetTimer { key, after }) => {
-                    assert_eq!(*after, LOCK_RECORD_RETRY);
+                    assert_eq!(*after, AUDIT_RETRY);
                     key.clone()
                 }
                 other => panic!("expected a retry timer, got {other:?}"),
             })
             .collect();
-        assert_eq!(retries.len(), 2);
-        // A retried write rebuilds the same record from its timer.
-        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        for (key, record) in retries.iter().zip(&records) {
-            let TaskKey::RecordLock {
-                event_id,
-                bucket_id,
-                generation,
-                session_id,
-                actor,
-            } = key
-            else {
-                panic!("expected a lock record timer, got {key:?}");
-            };
-            let ticket = KeyTicket {
-                key: BucketKeyRef::new(*bucket_id, *generation),
-                session_id: *session_id,
-            };
-            assert_eq!(&lock_record(*event_id, ticket, *actor, node), record);
-        }
+        // Each timer keeps the very record that was not stored.
+        let kept: Vec<_> = retries
+            .iter()
+            .map(|key| match key {
+                TaskKey::RecordAudit { record } => (**record).clone(),
+                other => panic!("expected an audit record timer, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(kept, records);
         let mut effects = Effects::new();
         for key in retries {
-            let after = LOCK_RECORD_RETRY;
+            let after = AUDIT_RETRY;
             effects = operation.step(Event::Task(TaskEvent::TimerScheduled { key, after }));
         }
         // The sessions' timers end once the records are handed to their retry timers.

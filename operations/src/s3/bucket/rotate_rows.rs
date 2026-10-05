@@ -134,6 +134,7 @@ impl ChangeEncryptionOperation {
             node_id: self.input.node_id,
             generation: Some(generation),
             session_id: None,
+            intent_id: None,
             deadline_ms: None,
             reason: None,
             outcome: AuditOutcome::Applied,

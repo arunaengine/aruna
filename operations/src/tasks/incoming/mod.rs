@@ -632,6 +632,21 @@ impl OperationsTaskHandler {
         }
     }
 
+    /// Re-arms a timer in memory even when storage cannot persist it, so an outage does not end
+    /// the retries; the persisted copy is best effort.
+    async fn keep_retrying(&self, key: TaskKey, after: std::time::Duration) {
+        let effect = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after,
+        };
+        if let Err(message) = persist_task_effect(&self.context.storage_handle, &effect).await {
+            warn!(task_id = ?key, message = %message, "Retry timer kept in memory only");
+        }
+        if let Some(task_handle) = self.context.task_handle.as_ref() {
+            task_handle.send_effect(Effect::Task(effect)).await;
+        }
+    }
+
     // Kicks the placement reconciler immediately (not persisted; it is re-derived
     // from the realm config at startup by `restore_shard_subscriptions`).
     async fn schedule_sync_placements(&self, realm_id: RealmId, node_id: aruna_core::NodeId) {
@@ -857,18 +872,12 @@ impl OperationsTaskHandler {
                     warn!(bucket_id = %bucket_id, error = %error, "Pending promotion failed");
                 }
             }),
-            key @ TaskKey::RecordLock { .. } => Box::pin(async move {
-                let Some(net_handle) = self.context.net_handle.as_ref() else {
-                    warn!("Cannot record a bucket lock without net handle");
-                    return;
-                };
-                let node_id = net_handle.node_id();
-                let stored = crate::s3::bucket::key_lock::store_lock(&self.context, &key, node_id);
-                // The lock already applies; only its record waits for storage.
-                if let Err(error) = stored.await {
-                    warn!(error = %error, "Bucket lock record still not stored");
-                    let retry = crate::s3::bucket::key_lock::LOCK_RECORD_RETRY;
-                    self.reschedule_timer(key, retry).await;
+            key @ TaskKey::RecordAudit { .. } => Box::pin(async move {
+                use crate::s3::bucket::audit_retry::{AUDIT_RETRY, store_record};
+                // The key change already applies; only its record waits for storage.
+                if let Err(error) = store_record(&self.context, &key).await {
+                    warn!(error = %error, "Bucket key audit record still not stored");
+                    self.keep_retrying(key, AUDIT_RETRY).await;
                 }
             }),
             TaskKey::DeliverKeyWakes => Box::pin(async move {

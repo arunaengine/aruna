@@ -206,6 +206,7 @@ impl GrantHolderOperation {
             node_id: self.input.node_id,
             generation: Some(key.generation),
             session_id: None,
+            intent_id: None,
             deadline_ms: None,
             reason: Some(format!("granted to {}", grant.user_id)),
             outcome: AuditOutcome::Applied,
