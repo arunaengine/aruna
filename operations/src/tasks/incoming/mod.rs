@@ -857,6 +857,20 @@ impl OperationsTaskHandler {
                     warn!(bucket_id = %bucket_id, error = %error, "Pending promotion failed");
                 }
             }),
+            key @ TaskKey::RecordLock { .. } => Box::pin(async move {
+                let Some(net_handle) = self.context.net_handle.as_ref() else {
+                    warn!("Cannot record a bucket lock without net handle");
+                    return;
+                };
+                let node_id = net_handle.node_id();
+                let stored = crate::s3::bucket::key_lock::store_lock(&self.context, &key, node_id);
+                // The lock already applies; only its record waits for storage.
+                if let Err(error) = stored.await {
+                    warn!(error = %error, "Bucket lock record still not stored");
+                    let retry = crate::s3::bucket::key_lock::LOCK_RECORD_RETRY;
+                    self.reschedule_timer(key, retry).await;
+                }
+            }),
             TaskKey::DeliverKeyWakes => Box::pin(async move {
                 let start = (self.wake_cursor.lock())
                     .expect("wake cursor mutex poisoned")

@@ -21,6 +21,81 @@ use ulid::Ulid;
 
 /// Writes of an audit completion before the applied change is reported without its record.
 pub(crate) const AUDIT_ATTEMPTS: u32 = 3;
+/// How long a lock record that could not be stored waits before its next write.
+pub const LOCK_RECORD_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The record of a lock of `ticket`, timed when there is no actor. Its time is that of
+/// `event_id`, so a retried write stores the same record.
+pub fn lock_record(
+    event_id: Ulid,
+    ticket: KeyTicket,
+    actor: Option<UserId>,
+    node_id: NodeId,
+) -> BucketAuditRecord {
+    BucketAuditRecord {
+        event_id,
+        bucket_id: ticket.key.bucket_id,
+        at_ms: event_id.timestamp_ms(),
+        action: match actor {
+            Some(_) => AuditAction::Lock,
+            None => AuditAction::TimedLock,
+        },
+        actor,
+        node_id,
+        generation: Some(ticket.key.generation),
+        session_id: Some(ticket.session_id),
+        deadline_ms: None,
+        reason: None,
+        outcome: AuditOutcome::Applied,
+    }
+}
+
+/// The retry timer that keeps a lock record until it is stored.
+fn record_timer(record: &BucketAuditRecord) -> Option<TaskKey> {
+    Some(TaskKey::RecordLock {
+        event_id: record.event_id,
+        bucket_id: record.bucket_id,
+        generation: record.generation?,
+        session_id: record.session_id?,
+        actor: record.actor,
+    })
+}
+
+/// Stores the lock record a `RecordLock` timer names.
+pub async fn store_lock(
+    context: &crate::driver::DriverContext,
+    key: &TaskKey,
+    node_id: NodeId,
+) -> Result<(), String> {
+    let TaskKey::RecordLock {
+        event_id,
+        bucket_id,
+        generation,
+        session_id,
+        actor,
+    } = key
+    else {
+        return Err("not a lock record timer".to_string());
+    };
+    let key = aruna_core::structs::storage::encryption::BucketKeyRef::new(*bucket_id, *generation);
+    let ticket = KeyTicket {
+        key,
+        session_id: *session_id,
+    };
+    let record = lock_record(*event_id, ticket, *actor, node_id);
+    let value = record.to_bytes().map_err(|error| error.to_string())?;
+    let write = StorageEffect::Write {
+        key_space: BUCKET_AUDIT_KEYSPACE.to_string(),
+        key: record.key().into(),
+        value: value.into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected lock record answer: {other:?}")),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LockStep {
@@ -29,6 +104,7 @@ enum LockStep {
     ReadGrant,
     LockKeys,
     WriteAudit,
+    ArmRetries,
     CancelTimers,
     Finish,
     Error,
@@ -85,6 +161,9 @@ pub struct LockBucketOperation {
     locked: Vec<KeyTicket>,
     audited: bool,
     audit_writes: Vec<(String, Key, Value)>,
+    /// The records of the audit batch, kept for the retry timers if the batch is not stored.
+    records: Vec<BucketAuditRecord>,
+    retries: usize,
     attempts: u32,
     timers: usize,
     output: Option<Result<LockResult, LockError>>,
@@ -99,6 +178,8 @@ impl LockBucketOperation {
             locked: Vec::new(),
             audited: false,
             audit_writes: Vec::new(),
+            records: Vec::new(),
+            retries: 0,
             attempts: 0,
             timers: 0,
             output: None,
@@ -169,25 +250,12 @@ impl LockBucketOperation {
             return self.fail(LockError::NotFinished);
         }
         self.locked = locked;
-        let action = match self.input.caller {
-            Some(_) => AuditAction::Lock,
-            None => AuditAction::TimedLock,
-        };
         let mut writes = Vec::new();
         for ticket in &self.locked {
-            let record = BucketAuditRecord {
-                event_id: Ulid::generate(),
-                bucket_id: ticket.key.bucket_id,
-                at_ms: self.input.now_ms,
-                action,
-                actor: self.input.caller,
-                node_id: self.input.node_id,
-                generation: Some(ticket.key.generation),
-                session_id: Some(ticket.session_id),
-                deadline_ms: None,
-                reason: None,
-                outcome: AuditOutcome::Applied,
-            };
+            // The time sits in the event id, so a later retry writes the very same record.
+            let event_id = Ulid::from_parts(self.input.now_ms, Ulid::generate().random());
+            let (actor, node_id) = (self.input.caller, self.input.node_id);
+            let record = lock_record(event_id, *ticket, actor, node_id);
             match record.to_bytes() {
                 Ok(value) => writes.push((
                     BUCKET_AUDIT_KEYSPACE.to_string(),
@@ -196,6 +264,7 @@ impl LockBucketOperation {
                 )),
                 Err(error) => return self.fail(error),
             }
+            self.records.push(record);
         }
         if writes.is_empty() {
             return self.finish(true);
@@ -212,6 +281,27 @@ impl LockBucketOperation {
             writes: self.audit_writes.clone(),
             txn_id: None,
         })]
+    }
+
+    /// Records still not stored move to retry timers that write them until storage answers.
+    fn arm_retries(&mut self) -> Effects {
+        let arms: Effects = self
+            .records
+            .iter()
+            .filter_map(record_timer)
+            .map(|key| {
+                Effect::Task(TaskEffect::ResetTimer {
+                    key,
+                    after: LOCK_RECORD_RETRY,
+                })
+            })
+            .collect();
+        if arms.is_empty() {
+            return self.finish(false);
+        }
+        self.retries = arms.len();
+        self.step = LockStep::ArmRetries;
+        arms
     }
 
     /// A manual lock ends the timers of the sessions it locked; a timed lock is its own timer.
@@ -273,7 +363,20 @@ impl Operation for LockBucketOperation {
                 self.write_audit()
             }
             (LockStep::WriteAudit, Event::Storage(StorageEvent::Error { .. })) => {
-                self.finish(false)
+                self.arm_retries()
+            }
+            (LockStep::ArmRetries, Event::Task(event))
+                if self
+                    .records
+                    .iter()
+                    .filter_map(record_timer)
+                    .any(|key| answers_timer(&event, &key)) =>
+            {
+                self.retries = self.retries.saturating_sub(1);
+                match self.retries {
+                    0 => self.finish(false),
+                    _ => smallvec![],
+                }
             }
             (_, Event::Storage(StorageEvent::Error { error })) => self.fail(error),
             (LockStep::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
@@ -452,8 +555,44 @@ mod tests {
             };
             assert_eq!(writes, &batch);
         }
-        // The sessions' timers end once the audit gives up.
+        // The records move to retry timers that keep writing them; the lock stays in place.
         let effects = operation.step(failed());
+        let retries: Vec<_> = effects
+            .iter()
+            .map(|effect| match effect {
+                Effect::Task(TaskEffect::ResetTimer { key, after }) => {
+                    assert_eq!(*after, LOCK_RECORD_RETRY);
+                    key.clone()
+                }
+                other => panic!("expected a retry timer, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(retries.len(), 2);
+        // A retried write rebuilds the same record from its timer.
+        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        for (key, record) in retries.iter().zip(&records) {
+            let TaskKey::RecordLock {
+                event_id,
+                bucket_id,
+                generation,
+                session_id,
+                actor,
+            } = key
+            else {
+                panic!("expected a lock record timer, got {key:?}");
+            };
+            let ticket = KeyTicket {
+                key: BucketKeyRef::new(*bucket_id, *generation),
+                session_id: *session_id,
+            };
+            assert_eq!(&lock_record(*event_id, ticket, *actor, node), record);
+        }
+        let mut effects = Effects::new();
+        for key in retries {
+            let after = LOCK_RECORD_RETRY;
+            effects = operation.step(Event::Task(TaskEvent::TimerScheduled { key, after }));
+        }
+        // The sessions' timers end once the records are handed to their retry timers.
         let cancels: Vec<_> = locked
             .iter()
             .map(|ticket| {

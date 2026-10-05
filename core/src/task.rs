@@ -75,6 +75,15 @@ pub enum TaskKey {
     },
     /// Delivers wakes owed to nodes waiting on this node's keys; re-armed while any remain.
     DeliverKeyWakes,
+    /// Writes the audit record of an applied lock whose write failed, until it is stored. In
+    /// memory only; a restart records its own lock of every bucket that still looks unlocked.
+    RecordLock {
+        event_id: Ulid,
+        bucket_id: Ulid,
+        generation: u64,
+        session_id: Ulid,
+        actor: Option<crate::UserId>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
