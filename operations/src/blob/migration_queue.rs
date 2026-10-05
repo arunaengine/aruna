@@ -15,11 +15,13 @@ use aruna_core::keyspaces::{
     TRANSITION_QUEUE_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::structs::storage::blob::{BackendLocation, BlobCleanupWork, VersionKey};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BlobCleanupWork, BlobVersion, VersionKey,
+};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState, KeyTicket, SealPlan, UnlockStatus,
 };
-use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use aruna_core::structs::storage::transition::{
     EncryptionTransition, TransitionKind, TransitionState, TransitionTarget, cleanup_prefix,
 };
@@ -167,7 +169,7 @@ async fn advance(
         record.cursor = Some(key.to_vec());
     }
     if next.is_some() {
-        store(&context.storage_handle, bucket, &record).await?;
+        store(&context.storage_handle, bucket, &mut record).await?;
         return Ok(Some(MIGRATION_CONTINUE));
     }
     record.cursor = None;
@@ -191,7 +193,7 @@ async fn advance(
         }
     };
     record.retry_at_ms = wait.map(|wait| now.saturating_add(wait.as_millis() as u64));
-    store(&context.storage_handle, bucket, &record).await?;
+    store(&context.storage_handle, bucket, &mut record).await?;
     Ok(wait)
 }
 
@@ -227,25 +229,19 @@ async fn settle(
     let now = crate::effect_adapters::routing::now_ms();
     if left > 0 {
         record.retry_at_ms = Some(now.saturating_add(RECHECK.as_millis() as u64));
-        store(storage, bucket, &record).await?;
-        return Ok(Some(RECHECK));
-    }
-    let pending = pending_on_source(storage, &record).await?;
-    if pending > 0 {
-        // Pending archives move only after promotion; until then the source key must stay.
-        record.remaining = pending;
-        record.state = TransitionState::Blocked;
-        record.blocked_reason = Some(PENDING_REASON.to_string());
-        record.retry_at_ms = Some(now.saturating_add(RECHECK.as_millis() as u64));
-        store(storage, bucket, &record).await?;
+        store(storage, bucket, &mut record).await?;
         return Ok(Some(RECHECK));
     }
     record.remaining = 0;
     record.blocked_reason = None;
     record.state = TransitionState::Finished;
     record.finished_at_ms = Some(now);
-    if store(storage, bucket, &record).await? {
-        forget_retired(context, &record).await;
+    if store(storage, bucket, &mut record).await? {
+        if record.finished_at_ms.is_some() {
+            forget_retired(context, &record).await;
+        } else {
+            return Ok(Some(RECHECK));
+        }
     }
     Ok(None)
 }
@@ -294,6 +290,7 @@ const PENDING_REASON: &str = "archives with pending content still use the source
 async fn pending_on_source(
     storage: &StorageHandle,
     record: &EncryptionTransition,
+    txn_id: TxnId,
 ) -> Result<u64, String> {
     let Some(source) = record.source else {
         return Ok(0);
@@ -306,7 +303,7 @@ async fn pending_on_source(
             None,
             after,
             PAGE,
-            None,
+            Some(txn_id),
         )
         .await?;
         let locations = rows
@@ -445,7 +442,7 @@ async fn exists(
 async fn store(
     storage: &StorageHandle,
     bucket: &str,
-    record: &EncryptionTransition,
+    record: &mut EncryptionTransition,
 ) -> Result<bool, String> {
     let txn_id = match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
@@ -474,7 +471,7 @@ async fn stage(
     storage: &StorageHandle,
     txn_id: TxnId,
     bucket: &str,
-    record: &EncryptionTransition,
+    record: &mut EncryptionTransition,
 ) -> Result<bool, String> {
     let key: Key = bucket.as_bytes().to_vec().into();
     let read = StorageEffect::Read {
@@ -491,6 +488,28 @@ async fn stage(
     };
     if stored.started_at_ms != record.started_at_ms || stored.kind != record.kind {
         return Ok(false);
+    }
+    if record.finished_at_ms.is_some() && record.source.is_some() {
+        let pending = pending_on_source(storage, record, txn_id).await?;
+        let versions = if record.source != record.target.plan.map(|plan| plan.key) {
+            source_versions(storage, txn_id, bucket, record).await?
+        } else {
+            0
+        };
+        if pending + versions > 0 {
+            record.finished_at_ms = None;
+            record.remaining = pending + versions;
+            record.state = if versions > 0 {
+                TransitionState::Running
+            } else {
+                TransitionState::Blocked
+            };
+            record.blocked_reason = (versions == 0).then(|| PENDING_REASON.to_string());
+            record.retry_at_ms = Some(
+                crate::effect_adapters::routing::now_ms()
+                    .saturating_add(RECHECK.as_millis() as u64),
+            );
+        }
     }
     let value = record.to_bytes().map_err(|error| error.to_string())?;
     let mut effects = vec![StorageEffect::Write {
@@ -516,6 +535,55 @@ async fn stage(
         }
     }
     Ok(true)
+}
+
+async fn source_versions(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    bucket: &str,
+    record: &EncryptionTransition,
+) -> Result<u64, String> {
+    let (mut after, mut count) = (None, 0);
+    let prefix: Key = VersionKey::bucket_prefix(bucket)
+        .map_err(|e| e.to_string())?
+        .into();
+    loop {
+        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+            storage,
+            BLOB_VERSIONS_KEYSPACE,
+            Some(prefix.clone()),
+            after,
+            PAGE,
+            Some(txn_id),
+        )
+        .await?;
+        for (_, value) in rows {
+            let version = BlobVersion::from_bytes(&value).map_err(|e| e.to_string())?;
+            let Some(key) = version
+                .location_key()
+                .filter(|key| matches!(key.encoding, EncodingClass::Pithos { .. }))
+            else {
+                continue;
+            };
+            let read = StorageEffect::Read {
+                key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+                key: key.to_bytes().into(),
+                txn_id: Some(txn_id),
+            };
+            let Event::Storage(StorageEvent::ReadResult {
+                value: Some(value), ..
+            }) = storage.send_storage_effect(read).await
+            else {
+                return Err("could not read a remaining version's location".to_string());
+            };
+            let location = BackendLocation::from_bytes(&value).map_err(|e| e.to_string())?;
+            count += u64::from(location.format.bucket_key() == record.source);
+        }
+        match cursor {
+            Some(cursor) => after = Some(cursor),
+            None => return Ok(count),
+        }
+    }
 }
 
 /// No copy needs the source generation any more: it retires and its node copy is removed.
@@ -689,6 +757,113 @@ mod tests {
         assert_eq!(stored.reported_state(), TransitionState::Finished);
     }
 
+    #[tokio::test]
+    async fn promoted_source_retried() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = context(directory.path());
+        let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
+        let mut key = BucketKeyRecord::new(source, Ulid::nil(), [4; 32], 0);
+        key.state = KeyState::Retiring;
+        put(
+            &context,
+            BUCKET_KEY_KEYSPACE,
+            source.key(),
+            key.to_bytes().unwrap(),
+        )
+        .await;
+        let target = TransitionTarget {
+            compression: Compression::Off,
+            plan: None,
+        };
+        let mut record =
+            EncryptionTransition::new(TransitionKind::Decrypt, Some(source), target, 2, 1);
+        record.state = TransitionState::Cleanup;
+        put(
+            &context,
+            TRANSITION_KEYSPACE,
+            b"b".to_vec(),
+            record.to_bytes().unwrap(),
+        )
+        .await;
+        put(
+            &context,
+            TRANSITION_QUEUE_KEYSPACE,
+            b"b".to_vec(),
+            Vec::new(),
+        )
+        .await;
+        let mut location = pending(Some(source));
+        location.hashes.insert("blake3".to_string(), vec![7; 32]);
+        let version = BlobVersion::materialized(
+            [7; 32],
+            location.backend.clone(),
+            location.format.encoding(),
+            SystemTime::UNIX_EPOCH,
+            Default::default(),
+            None,
+        );
+        let version_key = VersionKey::new("b", "promoted", Ulid::generate())
+            .to_bytes()
+            .unwrap();
+        put(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            version_key.clone(),
+            version.to_bytes().unwrap(),
+        )
+        .await;
+        put(
+            &context,
+            BLOB_LOCATIONS_KEYSPACE,
+            location.location_key().unwrap().to_bytes(),
+            location.to_bytes().unwrap(),
+        )
+        .await;
+        assert_eq!(settle(&context, "b", record).await.unwrap(), Some(RECHECK));
+        let stored = read_record(&context.storage_handle, "b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (stored.state, stored.remaining, stored.finished_at_ms),
+            (TransitionState::Running, 1, None)
+        );
+        assert!(
+            exists(
+                &context.storage_handle,
+                TRANSITION_QUEUE_KEYSPACE,
+                b"b".to_vec(),
+                None
+            )
+            .await
+            .unwrap()
+        );
+        let read = StorageEffect::Read {
+            key_space: BUCKET_KEY_KEYSPACE.to_string(),
+            key: source.key().into(),
+            txn_id: None,
+        };
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = context.storage_handle.send_storage_effect(read).await
+        else {
+            panic!("source key missing")
+        };
+        assert_eq!(
+            BucketKeyRecord::from_bytes(&value).unwrap().state,
+            KeyState::Retiring
+        );
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: version_key.into(),
+                txn_id: None,
+            })
+            .await;
+        assert_eq!(settle(&context, "b", stored).await.unwrap(), None);
+    }
+
     #[test]
     fn retired_sessions_only() {
         let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
@@ -696,6 +871,8 @@ mod tests {
         let status = |key, seed| UnlockStatus {
             key,
             session_id: Ulid::from_bytes([seed; 16]),
+            sequence: ulid::Ulid::from_parts(1, 1),
+            deadline_ms: None,
             active: true,
             unlocked_at: SystemTime::UNIX_EPOCH,
             remaining: None,

@@ -10,8 +10,8 @@ use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, COPY_OWNER_KEYSPACE, MANAGED_COPY_KEYSPACE,
-    PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE,
+    MANAGED_COPY_KEYSPACE, PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::HASH_BLAKE3;
@@ -21,7 +21,9 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
     CopyOwner, ManagedCopyKey, ManagedCopyRecord, VersionKey,
 };
-use aruna_core::structs::storage::encryption::{BucketKeyError, BucketKeyRef};
+use aruna_core::structs::storage::encryption::{
+    BucketKeyError, BucketKeyRecord, BucketKeyRef, KeyState,
+};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -73,6 +75,7 @@ enum State {
     Hash,
     StartTransaction,
     Reread,
+    ReadKey,
     WriteLocation,
     ScanOwners,
     ReadVersions,
@@ -266,7 +269,32 @@ impl PromotePendingOperation {
                 })];
             }
         };
-        let mut known = location;
+        let Some(key) = location.format.bucket_key() else {
+            return self.finish(Err(PromoteError::NoKey));
+        };
+        self.state = State::ReadKey;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_KEY_KEYSPACE.to_string(),
+            key: key.key().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_key(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected("ReadKey", "ReadResult", event);
+        };
+        let record = value
+            .map(|value| BucketKeyRecord::from_bytes(&value))
+            .transpose();
+        match record {
+            Ok(Some(record)) if record.state != KeyState::Retired => {}
+            Ok(_) => return self.finish(Err(PromoteError::NoKey)),
+            Err(error) => return self.finish(Err(error.into())),
+        }
+        let Some(mut known) = self.location.clone() else {
+            return self.finish(Err(PromoteError::NoKey));
+        };
         known.hashes.extend(self.hashes.clone());
         let key = BlobLocationKey::new(
             self.blake3.unwrap_or_default(),
@@ -576,6 +604,7 @@ impl Operation for PromotePendingOperation {
             State::Hash => self.handle_hash(event),
             State::StartTransaction => self.handle_started(event),
             State::Reread => self.handle_reread(event),
+            State::ReadKey => self.handle_key(event),
             State::WriteLocation => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => self.scan_owners(),
                 event => self.unexpected("WriteLocation", "WriteResult", event),

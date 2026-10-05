@@ -51,6 +51,16 @@ fn location_read() -> Event {
     read(Some(sealed().to_bytes().unwrap()))
 }
 
+fn reread(operation: &mut PromotePendingOperation) -> Effects {
+    let effects = operation.step(location_read());
+    assert!(
+        matches!(effects.as_slice(), [Effect::Storage(StorageEffect::Read { key_space, txn_id: Some(_), .. })] if key_space == BUCKET_KEY_KEYSPACE)
+    );
+    let key = sealed().format.bucket_key().unwrap();
+    let record = BucketKeyRecord::new(key, Ulid::nil(), [1; 32], 0);
+    operation.step(read(Some(record.to_bytes().unwrap())))
+}
+
 fn lease() -> ReadLease {
     let location = sealed();
     let key = location.format.bucket_key().unwrap();
@@ -120,10 +130,80 @@ fn changed_archive_aborts() {
     assert_eq!(operation.finalize(), Ok(Promotion::Gone));
 }
 
+#[tokio::test]
+async fn retirement_fences_promotion() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = aruna_storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+    let key = sealed().format.bucket_key().unwrap();
+    let mut record = BucketKeyRecord::new(key, Ulid::nil(), [1; 32], 0);
+    record.state = KeyState::Retiring;
+    storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: BUCKET_KEY_KEYSPACE.to_string(),
+            key: key.key().into(),
+            value: record.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    else {
+        panic!("transaction missing")
+    };
+    let mut operation = hashed_operation();
+    operation.txn_id = Some(txn_id);
+    let mut effects = operation.step(location_read());
+    let Some(Effect::Storage(read)) = effects.pop() else {
+        panic!("key fence missing")
+    };
+    let mut effects = operation.step(storage.send_storage_effect(read).await);
+    let Some(Effect::Storage(write)) = effects.pop() else {
+        panic!("location write missing")
+    };
+    storage.send_storage_effect(write).await;
+    record.state = KeyState::Retired;
+    storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: BUCKET_KEY_KEYSPACE.to_string(),
+            key: key.key().into(),
+            value: record.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    let committed = storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await;
+    assert!(matches!(
+        committed,
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict
+        })
+    ));
+}
+
+#[test]
+fn retired_key_refused() {
+    let mut operation = hashed_operation();
+    operation.step(location_read());
+    let key = sealed().format.bucket_key().unwrap();
+    let mut record = BucketKeyRecord::new(key, Ulid::nil(), [1; 32], 0);
+    record.state = KeyState::Retired;
+    let effects = operation.step(read(Some(record.to_bytes().unwrap())));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    operation.step(Event::Storage(StorageEvent::TransactionAborted {
+        txn_id: Ulid::nil(),
+    }));
+    assert_eq!(operation.finalize(), Err(PromoteError::NoKey));
+}
+
 #[test]
 fn promotes_pending_alias() {
     let mut operation = hashed_operation();
-    let effects = operation.step(location_read());
+    let effects = reread(&mut operation);
     let [Effect::Storage(StorageEffect::Write { key, value, .. })] = effects.as_slice() else {
         panic!("the known location row comes first")
     };
@@ -290,7 +370,7 @@ fn promote_one(operation: &mut PromotePendingOperation, version_id: [u8; 16]) ->
 #[test]
 fn alias_behind_cursor() {
     let mut operation = hashed_operation();
-    operation.step(location_read());
+    reread(&mut operation);
     operation.step(Event::Storage(StorageEvent::WriteResult {
         key: Key::from(Vec::new()),
     }));
@@ -367,7 +447,7 @@ fn alias_behind_cursor() {
 #[test]
 fn conflict_restarts_scan() {
     let mut operation = hashed_operation();
-    operation.step(location_read());
+    reread(&mut operation);
     operation.step(Event::Storage(StorageEvent::WriteResult {
         key: Key::from(Vec::new()),
     }));
@@ -409,7 +489,7 @@ fn governed_alias_registration() {
     use aruna_core::structs::storage::blob::{ManagedCopyKey, ManagedCopyState};
 
     let mut operation = hashed_operation();
-    operation.step(location_read());
+    reread(&mut operation);
     operation.step(Event::Storage(StorageEvent::WriteResult {
         key: Key::from(Vec::new()),
     }));
