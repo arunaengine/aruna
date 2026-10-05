@@ -137,6 +137,14 @@ encrypted.
 - **While locked.** Uploads, listings and object info still work. Reading content, copying it to
   another bucket and jobs that need it wait or are refused. S3 answers `403 AccessDenied` with the
   header `x-aruna-bucket-locked: true`.
+- **Token credentials.** A key holder can create an S3 credential that reads chosen buckets while
+  they are locked: list them in `encrypted_buckets` of `POST /access/credentials`. Each bucket
+  must be unlocked at that moment. The answer contains a `session_token` once; the node does not
+  keep it. Set it as `aws_session_token` next to the access key and secret, for example in
+  `~/.aws/credentials`. The token only works in the signed request header, never in presigned
+  URLs. It stops working when the credential is revoked, when its creator stops being a key
+  holder, or after a key rotation. `GET /data/buckets/{bucket}/storage/encryption/tokens` lists
+  the token credentials of a bucket.
 - **S3 clients.** Encrypted buckets report `AES256` server-side encryption. `PutBucketEncryption`
   with `AES256` turns on `node_managed` mode; turning encryption off is only possible through the
   REST API. Other encryption headers, such as KMS or customer keys, are refused.
