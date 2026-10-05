@@ -96,6 +96,13 @@ pub enum NotificationKind {
         node_id: NodeId,
         group_id: GroupId,
     },
+    /// The holders of an encrypted bucket no longer meet the recovery rule, for example after
+    /// an admin lost the group admin role.
+    BucketRecoveryDegraded {
+        bucket: String,
+        node_id: NodeId,
+        group_id: GroupId,
+    },
 }
 
 impl NotificationKind {
@@ -112,7 +119,8 @@ impl NotificationKind {
             | NotificationKind::DataUploaded { .. }
             | NotificationKind::SyncCompleted { .. }
             | NotificationKind::SyncFailed { .. } => "resource.watch",
-            NotificationKind::BucketLockedByRestart { .. } => "bucket.encryption",
+            NotificationKind::BucketLockedByRestart { .. }
+            | NotificationKind::BucketRecoveryDegraded { .. } => "bucket.encryption",
         }
     }
 
@@ -129,6 +137,7 @@ impl NotificationKind {
             NotificationKind::SyncCompleted { .. } => "sync_completed",
             NotificationKind::SyncFailed { .. } => "sync_failed",
             NotificationKind::BucketLockedByRestart { .. } => "bucket_locked_by_restart",
+            NotificationKind::BucketRecoveryDegraded { .. } => "bucket_recovery_degraded",
         }
     }
 }
@@ -372,6 +381,11 @@ mod tests {
         let data_node_id = make_node_id(8);
         for kind in [
             NotificationKind::BucketLockedByRestart {
+                bucket: "raw".to_string(),
+                node_id: make_node_id(9),
+                group_id: Ulid::generate(),
+            },
+            NotificationKind::BucketRecoveryDegraded {
                 bucket: "raw".to_string(),
                 node_id: make_node_id(9),
                 group_id: Ulid::generate(),

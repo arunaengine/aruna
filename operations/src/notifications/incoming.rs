@@ -293,10 +293,13 @@ async fn build_response(
     }
 }
 
-/// A restart notice speaks for the node that restarted, so only that node may deliver it.
+/// A restart or recovery notice speaks for the node that holds the bucket, so only that node
+/// may deliver it.
 fn verify_node_origin(records: &[NotificationRecord], peer: NodeId) -> Result<(), String> {
-    let foreign = records.iter().any(|record| {
-        matches!(&record.kind, NotificationKind::BucketLockedByRestart { node_id, .. } if *node_id != peer)
+    let foreign = records.iter().any(|record| match &record.kind {
+        NotificationKind::BucketLockedByRestart { node_id, .. }
+        | NotificationKind::BucketRecoveryDegraded { node_id, .. } => *node_id != peer,
+        _ => false,
     });
     match foreign {
         true => Err("restart lock notification from another node".to_string()),
@@ -581,9 +584,12 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
         }
         NotificationKind::BucketLockedByRestart {
             bucket, group_id, ..
+        }
+        | NotificationKind::BucketRecoveryDegraded {
+            bucket, group_id, ..
         } => {
             if bucket.is_empty() || group_id.is_nil() {
-                return Err("restart lock notification has empty bucket or group".to_string());
+                return Err("bucket key notification has empty bucket or group".to_string());
             }
         }
     }

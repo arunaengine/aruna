@@ -376,6 +376,11 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
             bucket,
             node_id,
             group_id,
+        }
+        | NotificationKind::BucketRecoveryDegraded {
+            bucket,
+            node_id,
+            group_id,
         } => {
             response.bucket = Some(bucket.clone());
             response.node_id = Some(node_id.to_string());
