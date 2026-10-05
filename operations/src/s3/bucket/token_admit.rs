@@ -243,3 +243,7 @@ impl Operation for AdmitTokenOperation {
         smallvec![]
     }
 }
+
+#[cfg(test)]
+#[path = "token_tests.rs"]
+mod tests;
