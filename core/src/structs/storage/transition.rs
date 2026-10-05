@@ -6,9 +6,8 @@
 use crate::errors::ConversionError;
 use crate::structs::storage::blob::BackendLocation;
 use crate::structs::storage::encryption::{BucketEncryption, BucketKeyRef, SealPlan};
-use crate::structs::storage::format::{Compression, EncodingClass, StoredEncryption};
+use crate::structs::storage::format::{Compression, EncodingClass, StoredEncryption, StoredLayout};
 use serde::{Deserialize, Serialize};
-use std::time::UNIX_EPOCH;
 use ulid::Ulid;
 
 /// What a transition changes; the names are the portal's.
@@ -120,8 +119,7 @@ impl EncryptionTransition {
         settings.storage_generation == self.storage_generation && settings.active_key() == key
     }
 
-    /// Whether `location` still needs this transition. A re-encode also moves archives written
-    /// before it started, since their cipher and blocks are not in the location.
+    /// Whether the stored format and captured generation still need this transition.
     pub fn needs(&self, location: &BackendLocation) -> bool {
         let format = &location.format;
         let Some(plan) = self.target.plan else {
@@ -131,9 +129,8 @@ impl EncryptionTransition {
         if format.bucket_key() != Some(plan.key) {
             return true;
         }
-        let written = location.created_at.duration_since(UNIX_EPOCH);
-        let written_ms = written.map_or(0, |at| at.as_millis() as u64);
-        self.kind == TransitionKind::Reencode && written_ms < self.started_at_ms
+        matches!(&format.layout, StoredLayout::Pithos(layout)
+            if layout.storage_generation != self.storage_generation)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -161,7 +158,7 @@ mod tests {
     use super::*;
     use crate::structs::storage::encryption::{BlockCipher, BlockKeys, EncryptionMode};
     use crate::structs::storage::format::{PithosLayout, StoredFormat};
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn plan(generation: u64) -> SealPlan {
         SealPlan {
@@ -205,6 +202,7 @@ mod tests {
         let layout = PithosLayout {
             stored_size: 9,
             metadata_digest: [4; 32],
+            storage_generation: 4,
         };
         StoredFormat::pithos(layout, plan(generation).key)
     }
@@ -236,7 +234,7 @@ mod tests {
         assert!(!rotate.needs(&location(sealed(2), 10)));
         assert!(rotate.needs(&location(StoredFormat::default(), 10)));
         let reencode = EncryptionTransition::new(TransitionKind::Reencode, source, sealing, 4, 50);
-        assert!(reencode.needs(&location(sealed(2), 10)));
+        assert!(!reencode.needs(&location(sealed(2), 10)));
         assert!(!reencode.needs(&location(sealed(2), 60)));
         let plain = TransitionTarget {
             compression: Compression::Off,
@@ -245,6 +243,32 @@ mod tests {
         let decrypt = EncryptionTransition::new(TransitionKind::Decrypt, source, plain, 4, 50);
         assert!(decrypt.needs(&location(sealed(1), 10)));
         assert!(!decrypt.needs(&location(StoredFormat::default(), 10)));
+    }
+
+    #[test]
+    fn generation_beats_timestamp() {
+        let target = TransitionTarget {
+            compression: Compression::Off,
+            plan: Some(plan(2)),
+        };
+        let transition =
+            EncryptionTransition::new(TransitionKind::Reencode, Some(plan(2).key), target, 4, 50);
+        for written_ms in [50, 60] {
+            let mut old = location(sealed(2), written_ms);
+            let StoredLayout::Pithos(layout) = &mut old.format.layout else {
+                panic!("expected Pithos")
+            };
+            layout.storage_generation = 3;
+            assert!(transition.needs(&old));
+            let bytes = old.to_bytes().unwrap();
+            assert_eq!(
+                BackendLocation::from_bytes(&bytes)
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+                bytes
+            );
+        }
     }
 
     #[test]

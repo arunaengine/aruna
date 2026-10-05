@@ -991,6 +991,7 @@ async fn seed_pending(storage: &storage::StorageHandle, versions: &[Ulid]) -> Ba
     let layout = PithosLayout {
         stored_size: 80,
         metadata_digest: [5u8; 32],
+        storage_generation: 0,
     };
     let location = BackendLocation {
         backend: BackendRef::node_default(),

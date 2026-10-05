@@ -295,6 +295,7 @@ impl BlobHandler {
         let layout = PithosLayout {
             stored_size: composition.archive_len(),
             metadata_digest: composition.metadata_digest(),
+            storage_generation: plan.storage_generation,
         };
         let mut hashes = HashMap::new();
         if let Some(hash) = composition.content_hash() {

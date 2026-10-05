@@ -232,6 +232,7 @@ impl BlobHandler {
         let new_layout = PithosLayout {
             stored_size: replacement.archive_len(),
             metadata_digest: replacement.metadata_digest(),
+            storage_generation: plan.storage_generation,
         };
         let format = StoredFormat::pithos(new_layout, plan.key);
         let copy = (&operator, path.as_str(), &replacement);

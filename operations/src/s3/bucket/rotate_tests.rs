@@ -269,6 +269,76 @@ fn cipher_change_reencodes() {
 }
 
 #[test]
+fn concurrent_put_converted() {
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
+    for written_ms in [50, 60] {
+        let mut change = operation(KeyChange::Settings {
+            mode: EncryptionMode::NodeManaged,
+            cipher: BlockCipher::Aes256Gcm,
+            block_keys: BlockKeys::default(),
+        });
+        let old = settings(EncryptionMode::NodeManaged);
+        let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: String::new(),
+            ulid: Ulid::nil(),
+            format: StoredFormat::pithos(
+                PithosLayout {
+                    stored_size: 1,
+                    metadata_digest: [1; 32],
+                    storage_generation: old.storage_generation,
+                },
+                old.active_key().unwrap(),
+            ),
+            created_by: admin(),
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_millis(written_ms),
+            staging: false,
+            partial: false,
+            blob_size: 1,
+            hashes: Default::default(),
+        };
+        let writes = rows(&loaded(
+            &mut change,
+            EncryptionMode::NodeManaged,
+            Vec::new(),
+        ));
+        let transition =
+            EncryptionTransition::from_bytes(&row(&writes, TRANSITION_KEYSPACE)).unwrap();
+        assert!(transition.needs(&location));
+        let mut rewrite = crate::blob::migration_rewrite::RewriteVersionOperation::new(
+            aruna_core::structs::storage::blob::VersionKey::new("b", "put", Ulid::nil()),
+            transition,
+            SystemTime::UNIX_EPOCH,
+        );
+        rewrite.start();
+        let version = aruna_core::structs::storage::blob::BlobVersion::materialized(
+            [1; 32],
+            location.backend.clone(),
+            location.format.encoding(),
+            location.created_at,
+            admin(),
+            None,
+        );
+        rewrite.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(version.to_bytes().unwrap().into()),
+        }));
+        let effects = rewrite.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(location.to_bytes().unwrap().into()),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::AdmitRead { .. })]
+        ));
+    }
+}
+
+#[test]
 fn combined_settings_atomic() {
     let change = KeyChange::Settings {
         mode: EncryptionMode::NodeManaged,

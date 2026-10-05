@@ -1548,6 +1548,7 @@ fn sealed_operation(parts: &[&[u8]]) -> (CompleteUploadOperation, BackendLocatio
     let layout = PithosLayout {
         stored_size: 400,
         metadata_digest: [6; 32],
+        storage_generation: 0,
     };
     location.format = StoredFormat::pithos(layout, sealed_plan().key);
     location.blob_size = parts.iter().map(|bytes| bytes.len() as u64).sum();

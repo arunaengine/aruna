@@ -57,6 +57,7 @@ fn location(sealed: Option<u64>) -> BackendLocation {
         let layout = PithosLayout {
             stored_size: 90,
             metadata_digest: [generation as u8; 32],
+            storage_generation: 0,
         };
         StoredFormat::pithos(layout, BucketKeyRef::new(BUCKET_ID, generation))
     });

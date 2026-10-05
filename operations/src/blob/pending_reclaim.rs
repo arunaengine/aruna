@@ -348,6 +348,7 @@ mod tests {
         let layout = PithosLayout {
             stored_size: 130,
             metadata_digest: [4; 32],
+            storage_generation: 0,
         };
         let location = BackendLocation {
             backend: BackendRef::node_default(),

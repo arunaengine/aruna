@@ -700,6 +700,7 @@ mod tests {
         let layout = PithosLayout {
             stored_size: 70,
             metadata_digest: [3; 32],
+            storage_generation: 0,
         };
         location.format = StoredFormat::pithos(layout, BucketKeyRef::new(Ulid::generate(), 1));
         let archive = ArchiveKey::of(&location);

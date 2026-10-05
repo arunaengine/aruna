@@ -76,6 +76,7 @@ pub struct FrameLayout {
 pub struct PithosLayout {
     pub stored_size: u64,
     pub metadata_digest: [u8; 32],
+    pub storage_generation: u64,
 }
 
 /// Compression a write applies: off, or zstd with a level.
@@ -350,6 +351,7 @@ mod tests {
         let layout = PithosLayout {
             stored_size: 9,
             metadata_digest: [3; 32],
+            storage_generation: 4,
         };
         let sealed = StoredFormat::pithos(layout.clone(), key);
         let bytes = postcard::to_allocvec(&sealed).unwrap();

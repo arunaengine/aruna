@@ -1954,6 +1954,7 @@ mod sealed {
         let layout = PithosLayout {
             stored_size: 64,
             metadata_digest: [1; 32],
+            storage_generation: 0,
         };
         BackendLocation {
             backend: BackendRef::node_default(),

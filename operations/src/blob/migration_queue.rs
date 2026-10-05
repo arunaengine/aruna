@@ -21,7 +21,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState, KeyTicket, SealPlan, UnlockStatus,
 };
-use aruna_core::structs::storage::format::{Compression, EncodingClass};
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::transition::{
     EncryptionTransition, TransitionKind, TransitionState, TransitionTarget, cleanup_prefix,
 };
@@ -489,15 +489,12 @@ async fn stage(
     if stored.started_at_ms != record.started_at_ms || stored.kind != record.kind {
         return Ok(false);
     }
-    if record.finished_at_ms.is_some() && record.source.is_some() {
+    if record.finished_at_ms.is_some() {
         let pending = pending_on_source(storage, record, txn_id).await?;
-        let versions = if record.source != record.target.plan.map(|plan| plan.key) {
-            source_versions(storage, txn_id, bucket, record).await?
-        } else {
-            0
-        };
+        let versions = source_versions(storage, txn_id, bucket, record).await?;
         if pending + versions > 0 {
             record.finished_at_ms = None;
+            record.cursor = None;
             record.remaining = pending + versions;
             record.state = if versions > 0 {
                 TransitionState::Running
@@ -559,10 +556,7 @@ async fn source_versions(
         .await?;
         for (_, value) in rows {
             let version = BlobVersion::from_bytes(&value).map_err(|e| e.to_string())?;
-            let Some(key) = version
-                .location_key()
-                .filter(|key| matches!(key.encoding, EncodingClass::Pithos { .. }))
-            else {
+            let Some(key) = version.location_key() else {
                 continue;
             };
             let read = StorageEffect::Read {
@@ -577,7 +571,7 @@ async fn source_versions(
                 return Err("could not read a remaining version's location".to_string());
             };
             let location = BackendLocation::from_bytes(&value).map_err(|e| e.to_string())?;
-            count += u64::from(location.format.bucket_key() == record.source);
+            count += u64::from(record.needs(&location));
         }
         match cursor {
             Some(cursor) => after = Some(cursor),
@@ -640,6 +634,7 @@ mod tests {
         let layout = PithosLayout {
             stored_size: 9,
             metadata_digest: [1; 32],
+            storage_generation: 0,
         };
         let format = key.map_or_else(StoredFormat::default, |key| {
             StoredFormat::pithos(layout, key)
@@ -862,6 +857,172 @@ mod tests {
             })
             .await;
         assert_eq!(settle(&context, "b", stored).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn promoted_reencode_retried() {
+        use aruna_core::operation::Operation;
+        use aruna_core::structs::storage::blob::ArchiveKey;
+        use aruna_core::structs::storage::format::StoredLayout;
+        for kind in [
+            TransitionKind::Reencode,
+            TransitionKind::Encrypt,
+            TransitionKind::Rotate,
+            TransitionKind::Decrypt,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let context = context(directory.path());
+            let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
+            let plan = SealPlan {
+                key: if kind == TransitionKind::Rotate {
+                    BucketKeyRef::new(source.bucket_id, 2)
+                } else {
+                    source
+                },
+                public_key: [4; 32],
+                cipher: Default::default(),
+                block_keys: Default::default(),
+                storage_generation: 2,
+            };
+            let target = TransitionTarget {
+                compression: Compression::Off,
+                plan: (kind != TransitionKind::Decrypt).then_some(plan),
+            };
+            let mut record = EncryptionTransition::new(
+                kind,
+                (kind != TransitionKind::Encrypt).then_some(source),
+                target,
+                2,
+                1,
+            );
+            let mut location = pending(Some(source));
+            let version_key = VersionKey::new("b", "promoted", Ulid::generate());
+            let version = BlobVersion::pending(
+                ArchiveKey::of(&location),
+                SystemTime::UNIX_EPOCH,
+                Default::default(),
+                None,
+            );
+            let mut rewrite = RewriteVersionOperation::new(
+                version_key.clone(),
+                record.clone(),
+                SystemTime::UNIX_EPOCH,
+            );
+            rewrite.start();
+            rewrite.step(Event::Storage(StorageEvent::ReadResult {
+                key: version_key.to_bytes().unwrap().into(),
+                value: Some(version.to_bytes().unwrap().into()),
+            }));
+            assert_eq!(rewrite.finalize(), Ok(RewriteOutcome::Skipped));
+            let pending_key = ArchiveKey::of(&location).to_bytes();
+            put(
+                &context,
+                PENDING_LOCATION_KEYSPACE,
+                pending_key.clone(),
+                location.to_bytes().unwrap(),
+            )
+            .await;
+            record.state = TransitionState::Cleanup;
+            put(
+                &context,
+                TRANSITION_KEYSPACE,
+                b"b".to_vec(),
+                record.to_bytes().unwrap(),
+            )
+            .await;
+            put(
+                &context,
+                TRANSITION_QUEUE_KEYSPACE,
+                b"b".to_vec(),
+                Vec::new(),
+            )
+            .await;
+            location.hashes.insert("blake3".to_string(), vec![7; 32]);
+            let version = BlobVersion::materialized(
+                [7; 32],
+                location.backend.clone(),
+                location.format.encoding(),
+                SystemTime::UNIX_EPOCH,
+                Default::default(),
+                None,
+            );
+            put(
+                &context,
+                BLOB_VERSIONS_KEYSPACE,
+                version_key.to_bytes().unwrap(),
+                version.to_bytes().unwrap(),
+            )
+            .await;
+            put(
+                &context,
+                BLOB_LOCATIONS_KEYSPACE,
+                location.location_key().unwrap().to_bytes(),
+                location.to_bytes().unwrap(),
+            )
+            .await;
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Delete {
+                    key_space: PENDING_LOCATION_KEYSPACE.to_string(),
+                    key: pending_key.into(),
+                    txn_id: None,
+                })
+                .await;
+            assert_eq!(settle(&context, "b", record).await.unwrap(), Some(RECHECK));
+            let stored = read_record(&context.storage_handle, "b")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (stored.state, stored.remaining, stored.finished_at_ms),
+                (TransitionState::Running, 1, None)
+            );
+            assert!(
+                exists(
+                    &context.storage_handle,
+                    TRANSITION_QUEUE_KEYSPACE,
+                    b"b".to_vec(),
+                    None
+                )
+                .await
+                .unwrap()
+            );
+            if kind == TransitionKind::Decrypt {
+                location.format = StoredFormat::default();
+            } else {
+                let StoredLayout::Pithos(layout) = &mut location.format.layout else {
+                    panic!("expected Pithos")
+                };
+                layout.storage_generation = 2;
+                location.format.encryption =
+                    aruna_core::structs::storage::format::StoredEncryption::Pithos(Box::new(
+                        plan.key,
+                    ));
+            }
+            put(
+                &context,
+                BLOB_LOCATIONS_KEYSPACE,
+                location.location_key().unwrap().to_bytes(),
+                location.to_bytes().unwrap(),
+            )
+            .await;
+            let version = BlobVersion::materialized(
+                [7; 32],
+                location.backend.clone(),
+                location.format.encoding(),
+                SystemTime::UNIX_EPOCH,
+                Default::default(),
+                None,
+            );
+            put(
+                &context,
+                BLOB_VERSIONS_KEYSPACE,
+                version_key.to_bytes().unwrap(),
+                version.to_bytes().unwrap(),
+            )
+            .await;
+            assert_eq!(settle(&context, "b", stored).await.unwrap(), None);
+        }
     }
 
     #[test]

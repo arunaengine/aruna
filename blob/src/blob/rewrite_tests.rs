@@ -177,18 +177,18 @@ async fn replaces_archive_grants() {
     };
     let lease = admitted(&handler, old, old_private, old_public, &sealed).await;
 
-    let event = rewritten(
-        &handler,
-        sealed.clone(),
-        Some(lease),
-        sealing(new, new_public),
-        true,
-    );
+    let mut target = sealing(new, new_public);
+    target.encryption.as_mut().unwrap().storage_generation = 2;
+    let event = rewritten(&handler, sealed.clone(), Some(lease), target, true);
     let BlobEvent::CopyRewritten { location } = event.await else {
         panic!("grant replacement failed")
     };
 
     assert_eq!(location.format.bucket_key(), Some(new));
+    let StoredLayout::Pithos(layout) = &location.format.layout else {
+        panic!("expected Pithos")
+    };
+    assert_eq!(layout.storage_generation, 2);
     assert_ne!(location.backend_path, sealed.backend_path);
     assert_eq!(location.get_blake3(), sealed.get_blake3());
     assert_eq!(

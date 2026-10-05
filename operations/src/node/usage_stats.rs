@@ -2383,6 +2383,7 @@ mod tests {
         let layout = PithosLayout {
             stored_size: 130,
             metadata_digest: [4u8; 32],
+            storage_generation: 0,
         };
         sealed.format = StoredFormat::pithos(layout, BucketKeyRef::new(Ulid::generate(), 1));
         // A pending archive has no hash; its shard comes from its archive id alone.
@@ -2431,6 +2432,7 @@ mod tests {
         let layout = PithosLayout {
             stored_size: 130,
             metadata_digest: [4u8; 32],
+            storage_generation: 0,
         };
         sealed.format = StoredFormat::pithos(layout, BucketKeyRef::new(Ulid::generate(), 1));
         let archive = ArchiveKey::of(&sealed);

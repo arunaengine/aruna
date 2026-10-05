@@ -1945,6 +1945,7 @@ mod sealed {
             let layout = PithosLayout {
                 stored_size: 10,
                 metadata_digest: [1; 32],
+                storage_generation: plan.storage_generation,
             };
             location.format = StoredFormat::pithos(layout, plan.key);
         }
@@ -2007,6 +2008,7 @@ mod sealed {
         let layout = PithosLayout {
             stored_size: 10,
             metadata_digest: [1; 32],
+            storage_generation: 0,
         };
         location.format = StoredFormat::pithos(layout, key);
         op.version_id = Some(Ulid::generate());

@@ -333,6 +333,7 @@ pub(super) struct ArchiveEncoder {
     size: u64,
     stored: u64,
     header: [u8; 6],
+    storage_generation: u64,
     /// Working-set reservation and the content bytes it covers; it grows only without waiting.
     budget: Option<(Arc<Semaphore>, Share)>,
     covered: u64,
@@ -360,6 +361,7 @@ impl ArchiveEncoder {
             size: 0,
             stored: header.len() as u64,
             header,
+            storage_generation: plan.storage_generation,
             budget: None,
             covered: u64::MAX,
         })
@@ -437,6 +439,7 @@ impl ArchiveEncoder {
         let layout = PithosLayout {
             stored_size: composition.archive_len(),
             metadata_digest: composition.metadata_digest(),
+            storage_generation: self.storage_generation,
         };
         let mut out = Vec::new();
         if !blocks.is_empty() {

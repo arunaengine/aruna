@@ -1162,6 +1162,7 @@ async fn pending_archives_listed() {
     let layout = PithosLayout {
         stored_size: 90,
         metadata_digest: [6u8; 32],
+        storage_generation: 0,
     };
     let location = BackendLocation {
         backend: BackendRef::node_default(),

@@ -59,6 +59,7 @@ fn sealed_archive(bucket: &PrivateKey, data: &[u8]) -> (Vec<u8>, PithosLayout) {
     let layout = PithosLayout {
         stored_size: archive.len() as u64,
         metadata_digest: composition.metadata_digest(),
+        storage_generation: 0,
     };
     (archive, layout)
 }
@@ -171,6 +172,7 @@ async fn refuses_unkeyed_reads() {
     let layout = PithosLayout {
         stored_size: 12,
         metadata_digest: [3; 32],
+        storage_generation: 0,
     };
     let key = BucketKeyRef::new(ulid::Ulid::from_bytes([4; 16]), 1);
     location.format = StoredFormat::pithos(layout, key);
@@ -218,6 +220,7 @@ async fn written(
     let StoredLayout::Pithos(layout) = location.format.layout.clone() else {
         panic!("not a Pithos copy: {:?}", location.format)
     };
+    assert_eq!(layout.storage_generation, seal.storage_generation);
     let operator = handler.operator_from_location(&location).unwrap();
     let path = location.get_storage_path().unwrap();
     let stat = operator.stat(&path).await.unwrap();
@@ -385,6 +388,7 @@ async fn rejects_other_shapes() {
     let layout = PithosLayout {
         stored_size: archive.len() as u64,
         metadata_digest: opened.unwrap().metadata_digest(),
+        storage_generation: 0,
     };
     let (_dir, operator) = stored(&archive).await;
     let refused = read_all(&operator, &layout, &bucket, 0..4).await;
@@ -415,6 +419,7 @@ async fn reservations_keep_pending() {
         let layout = PithosLayout {
             stored_size: 12,
             metadata_digest: [3; 32],
+            storage_generation: 0,
         };
         location.format =
             StoredFormat::pithos(layout, BucketKeyRef::new(ulid::Ulid::generate(), 1));
@@ -474,6 +479,7 @@ async fn leases_pin_archives() {
     let layout = PithosLayout {
         stored_size: 12,
         metadata_digest: [3; 32],
+        storage_generation: 0,
     };
     location.format = StoredFormat::pithos(layout, key);
     let prepare = BlobEffect::PrepareKey {
@@ -690,6 +696,7 @@ async fn reconcile_claims_archives() {
     let layout = PithosLayout {
         stored_size: 12,
         metadata_digest: [3; 32],
+        storage_generation: 0,
     };
     location.format = StoredFormat::pithos(layout, BucketKeyRef::new(ulid::Ulid::generate(), 1));
     handler.finalize_reservation(&location).await.unwrap();

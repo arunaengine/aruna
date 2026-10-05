@@ -32,6 +32,7 @@ fn sealed_location() -> BackendLocation {
     let layout = PithosLayout {
         stored_size: 80,
         metadata_digest: [5u8; 32],
+        storage_generation: 0,
     };
     BackendLocation {
         backend: BackendRef::node_default(),
@@ -220,6 +221,7 @@ async fn materialized_archive_changed() {
             let layout = PithosLayout {
                 stored_size: 80,
                 metadata_digest: [6; 32],
+                storage_generation: 0,
             };
             current.format = StoredFormat::pithos(layout, current.format.bucket_key().unwrap());
         }
