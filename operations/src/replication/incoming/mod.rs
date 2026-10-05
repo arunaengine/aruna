@@ -34,21 +34,25 @@ use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, Storage
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    BUCKET_ENCRYPTION_KEYSPACE, OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, PENDING_CLAIM_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    BucketInfo, CopyOrigin, CurrentVersionPointer, ResolvedBackend, VersionKey, WriteOwner,
-    bucket_permission_path, object_permission_path,
+    ArchiveKey, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
+    BlobVersionState, BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend,
+    VersionKey, WriteOwner, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
-use aruna_core::structs::storage::encryption::BucketEncryption;
-use aruna_core::structs::storage::format::{Compression, EncodingClass};
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
+};
+use aruna_core::structs::storage::format::{Compression, EncodingClass, StoredLayout};
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
 use aruna_core::structs::storage::replication::{
     ReplicationItemKind, ReplicationNegotiationResult,
@@ -73,9 +77,13 @@ use ulid::Ulid;
 enum IncomingVersionState {
     Init,
     ReadDestinationBucket,
+    /// Reads the active key of an encrypting destination to capture its seal plan.
+    ReadDestinationKey,
     CreateDestinationBucket,
     LoadDestinationRouting,
     ReadExistingVersion,
+    /// Reads the claimed content hash of a pending version with the same id.
+    ReadExistingClaim,
     ReadReplacedBlob,
     ReadQuotaConfig,
     StartQuotaCheck,
@@ -198,8 +206,13 @@ pub enum IncomingVersionError {
         expected: &'static str,
         received: Event,
     },
-    #[error("the destination bucket encrypts its objects, so it accepts no replicas")]
+    #[error("the destination bucket encrypts its objects, so it accepts no references")]
     EncryptedDestination,
+    #[error(transparent)]
+    BucketKey(#[from] BucketKeyError),
+    /// The destination's key or stored format changed since the negotiation; retryable.
+    #[error("the destination seal plan is stale")]
+    StalePlan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -347,6 +360,9 @@ pub struct IncomingVersionOperation {
     /// transaction so a default or subject change cannot expose a stale replica.
     gated_bucket: Option<GatedBucket>,
     pending_negotiation: Option<ReplicationNegotiationResult>,
+    /// How an encrypting destination seals the replica, captured at negotiation.
+    seal_plan: Option<SealPlan>,
+    destination_settings: Option<BucketEncryption>,
 }
 
 impl IncomingVersionOperation {
@@ -400,6 +416,8 @@ impl IncomingVersionOperation {
             gated_refs: Vec::new(),
             gated_bucket: None,
             pending_negotiation: None,
+            seal_plan: None,
+            destination_settings: None,
         }
     }
 
@@ -502,6 +520,8 @@ impl Operation for IncomingVersionOperation {
             // Negotiation: decide and send the reply.
             IncomingVersionState::Init => self.start(),
             IncomingVersionState::ReadDestinationBucket => self.accept_destination_bucket(event),
+            IncomingVersionState::ReadDestinationKey => self.accept_destination_key(event),
+            IncomingVersionState::ReadExistingClaim => self.accept_existing_claim(event),
             IncomingVersionState::CreateDestinationBucket => self.accept_bucket_created(event),
             IncomingVersionState::LoadDestinationRouting => self.accept_routing_loaded(event),
             IncomingVersionState::ReadExistingVersion => self.accept_existing_version(event),
@@ -615,6 +635,8 @@ impl IncomingVersionOperation {
         match self.state {
             IncomingVersionState::Init => "Init",
             IncomingVersionState::ReadDestinationBucket => "ReadDestinationBucket",
+            IncomingVersionState::ReadDestinationKey => "ReadDestinationKey",
+            IncomingVersionState::ReadExistingClaim => "ReadExistingClaim",
             IncomingVersionState::CreateDestinationBucket => "CreateDestinationBucket",
             IncomingVersionState::LoadDestinationRouting => "LoadDestinationRouting",
             IncomingVersionState::ReadExistingVersion => "ReadExistingVersion",
@@ -697,6 +719,7 @@ impl IncomingVersionOperation {
             Some(
                 ReplicationNegotiationResult::NeedVersionOnly
                     | ReplicationNegotiationResult::NeedBlobVersion
+                    | ReplicationNegotiationResult::NeedSealedBlob(_)
             )
         ) && !self.apply_committed
             && !matches!(
@@ -762,6 +785,7 @@ impl IncomingVersionOperation {
         if !self.manifest.current_version
             || self.manifest.kind != ReplicationItemKind::Materialized
             || self.manifest.reference_intent
+            || self.pending_replica()
         {
             return None;
         }
@@ -923,8 +947,8 @@ impl IncomingVersionOperation {
         self.write_version()
     }
 
-    /// Reads the bucket with its encryption settings, so an encrypting bucket is refused
-    /// before any byte arrives.
+    /// Reads the bucket with its encryption settings, so an encrypting bucket captures its seal
+    /// plan before any byte arrives.
     fn read_destination_bucket(&mut self) -> Effects {
         self.state = IncomingVersionState::ReadDestinationBucket;
         smallvec![settings_read(&self.manifest.bucket, None)]
@@ -1073,6 +1097,10 @@ impl IncomingVersionOperation {
             // the blob owes the sender a reason rather than a dropped stream.
             Err(error) => return self.reject_negotiation(error),
         };
+        // An encrypting destination never adopts a plain or foreign copy of the content.
+        if self.seal_plan.is_some() {
+            return self.request_blob_version();
+        }
         self.state = IncomingVersionState::ReadExistingBlob;
         smallvec![blob_location_read(
             // Only a copy in this node's own encoding for the bucket can be reused.
@@ -1086,7 +1114,12 @@ impl IncomingVersionOperation {
     fn request_blob_version(&mut self) -> Effects {
         match self.destination_full.take() {
             Some(error) => self.reject_negotiation(IncomingVersionError::RoutingFailed(error)),
-            None => self.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion),
+            None => match self.seal_plan {
+                Some(plan) => {
+                    self.send_negotiation(ReplicationNegotiationResult::NeedSealedBlob(plan))
+                }
+                None => self.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion),
+            },
         }
     }
 
@@ -1196,7 +1229,7 @@ impl IncomingVersionOperation {
         // The receiver routes with its own snapshot; the sender's stamped
         // backend crossed the wire but is ignored.
         let resolved = match self.resolve_destination() {
-            Ok(resolved) => resolved,
+            Ok(resolved) => resolved.with_encryption(self.seal_plan),
             Err(error) => return self.fail(error),
         };
         self.state = IncomingVersionState::ReceiveBlob;
@@ -1390,12 +1423,100 @@ impl IncomingVersionOperation {
         Ok(())
     }
 
+    /// Received bytes for an encrypting destination must be sealed to its captured plan. An
+    /// archive kept as sent has no content hash yet: only its original size is checked here.
+    fn validate_received(&self, location: &BackendLocation) -> Result<(), IncomingVersionError> {
+        let StoredLayout::Pithos(layout) = &location.format.layout else {
+            return self.validate_materialized_location(location);
+        };
+        let plan = self.seal_plan.ok_or(IncomingVersionError::StalePlan)?;
+        if location.format.bucket_key() != Some(plan.key)
+            || layout.storage_generation != plan.storage_generation
+        {
+            return Err(IncomingVersionError::StalePlan);
+        }
+        if location.get_blake3().is_some() {
+            return self.validate_materialized_location(location);
+        }
+        let blob = self
+            .manifest
+            .blob
+            .as_ref()
+            .ok_or(IncomingVersionError::MissingBlobInfo)?;
+        if location.blob_size != blob.size {
+            return Err(IncomingVersionError::BlobSizeMismatch);
+        }
+        Ok(())
+    }
+
+    /// The replica is an archive kept as the sender granted it; its content hash is pending.
+    fn pending_replica(&self) -> bool {
+        self.received_blob.as_ref().is_some_and(|received| {
+            received.location.format.bucket_key().is_some()
+                && received.location.get_blake3().is_none()
+        })
+    }
+
+    /// Rows that publish an archive: its pending location with the claimed hash, or its
+    /// location, and the owner row of this version in both cases.
+    fn archive_rows(
+        &self,
+        location: &BackendLocation,
+    ) -> Result<Vec<(String, aruna_core::types::Key, aruna_core::types::Value)>, IncomingVersionError>
+    {
+        let archive = ArchiveKey::of(location);
+        let version = VersionKey::new(
+            &self.manifest.bucket,
+            &self.manifest.key,
+            self.manifest.version_id,
+        );
+        let owner = CopyOwner::new(archive.clone(), version);
+        let mut rows = vec![(
+            COPY_OWNER_KEYSPACE.to_string(),
+            owner.key()?.into(),
+            Vec::new().into(),
+        )];
+        match location.get_blake3() {
+            Some(hash) => {
+                let key = BlobLocationKey::from_blake3(
+                    hash,
+                    location.format.encoding(),
+                    location.backend.clone(),
+                )?;
+                rows.push((
+                    BLOB_LOCATIONS_KEYSPACE.to_string(),
+                    key.to_bytes().into(),
+                    location.to_bytes()?.into(),
+                ));
+            }
+            None => {
+                let claimed = self
+                    .manifest
+                    .blob
+                    .as_ref()
+                    .ok_or(IncomingVersionError::MissingBlobInfo)?
+                    .hash;
+                rows.push((
+                    PENDING_LOCATION_KEYSPACE.to_string(),
+                    archive.to_bytes().into(),
+                    location.to_bytes()?.into(),
+                ));
+                rows.push((
+                    PENDING_CLAIM_KEYSPACE.to_string(),
+                    archive.to_bytes().into(),
+                    claimed.to_vec().into(),
+                ));
+            }
+        }
+        Ok(rows)
+    }
+
     fn write_hash_lookup(&mut self) -> Effects {
         if self.is_reference_item() {
             return self.write_object_lookup();
         }
         if let Some(received) = self.received_blob.as_ref()
-            && let Err(err) = self.validate_materialized_location(&received.location)
+            && let Err(err) = self.validate_received(&received.location)
         {
             return self.fail(err);
         }
@@ -1446,6 +1567,17 @@ impl IncomingVersionOperation {
         let Ok(location) = self.effective_materialized_location() else {
             return self.write_object_lookup();
         };
+        if location.format.bucket_key().is_some() {
+            let writes = match self.archive_rows(&location) {
+                Ok(writes) => writes,
+                Err(error) => return self.fail(error),
+            };
+            self.state = IncomingVersionState::WriteBlobLocation;
+            return smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: self.txn_id,
+            })];
+        }
         let Some(blake3_hash) = location.get_blake3() else {
             return self.write_object_lookup();
         };
@@ -1606,6 +1738,40 @@ impl IncomingVersionOperation {
                         Err(error) => return self.fail(error),
                     };
                     (version, None)
+                } else if self.pending_replica() {
+                    let Ok(location) = self.effective_materialized_location() else {
+                        return self.fail(IncomingVersionError::MissingBlobLocation);
+                    };
+                    let pending = match BlobVersion::pending(
+                        ArchiveKey::of(&location),
+                        self.manifest.created_at,
+                        self.manifest.created_by,
+                        self.manifest.source.clone(),
+                    )
+                    .with_metadata(self.manifest.metadata.clone())
+                    .with_publisher(self.publisher_node_id)
+                    .with_policies(self.gated_refs.clone())
+                    {
+                        Ok(pending) => pending,
+                        Err(err) => return self.fail(err.into()),
+                    };
+                    // No hash alias and no DHT entry until promotion verified the claimed hash.
+                    match register_effect(
+                        CopyRegistration {
+                            version: version_key.clone(),
+                            node_id: self.local_node_id,
+                            location: &location,
+                            policies: &self.gated_refs,
+                            origin: self.copy_origin(),
+                            subject_generation: self.stored_subject(),
+                            registered_at_ms: self.manifest.version_id.timestamp_ms(),
+                        },
+                        self.txn_id,
+                    ) {
+                        Ok(register) => self.pending_version_effects.push_back(register),
+                        Err(err) => return self.fail(err.into()),
+                    }
+                    (pending, None)
                 } else {
                     let Ok(location) = self.effective_materialized_location() else {
                         return self.fail(IncomingVersionError::MissingBlobLocation);
@@ -1768,19 +1934,22 @@ impl IncomingVersionOperation {
             return Ok(());
         }
         let location = &received.location;
-        let Some(blake3) = location
+        let blake3 = location
             .get_blake3()
-            .and_then(|hash| <[u8; 32]>::try_from(hash).ok())
-        else {
-            return Err(IncomingVersionError::MissingBlobLocation);
-        };
-        let work = BlobCleanupWork::ReconcileWrite {
-            location: location.clone(),
-            owner: WriteOwner::Blob {
+            .and_then(|hash| <[u8; 32]>::try_from(hash).ok());
+        let owner = match blake3 {
+            Some(blake3) => WriteOwner::Blob {
                 blake3,
                 realm_id: self.local_realm_id,
                 ttl_ms: self.rocrate_limits.holder_ttl_ms,
             },
+            // A pending archive is kept while its pending location names it.
+            None if location.format.bucket_key().is_some() => WriteOwner::Pending,
+            None => return Err(IncomingVersionError::MissingBlobLocation),
+        };
+        let work = BlobCleanupWork::ReconcileWrite {
+            location: location.clone(),
+            owner,
         };
         let key = Self::cleanup_key(location);
         let value = work.to_bytes()?;
@@ -2090,12 +2259,15 @@ impl IncomingVersionOperation {
             Ok(values) => values,
             Err(_) => return self.fail(PolicyGateError::InvalidEvent.into()),
         };
-        match BucketEncryption::from_row(settings.as_deref()) {
-            Ok(settings) if settings.is_encrypted() => {
-                return self.reject_negotiation(IncomingVersionError::EncryptedDestination);
-            }
-            Ok(_) => {}
+        let settings = match BucketEncryption::from_row(settings.as_deref()) {
+            Ok(settings) => settings,
             Err(err) => return self.fail(err.into()),
+        };
+        // A reference would serve bytes this bucket never sealed.
+        if settings.is_encrypted()
+            && (self.is_reference_item() || self.manifest.reference_advance.is_some())
+        {
+            return self.reject_negotiation(IncomingVersionError::EncryptedDestination);
         }
 
         let Some(value) = value else {
@@ -2131,7 +2303,45 @@ impl IncomingVersionOperation {
         self.gated_bucket = Some(GatedBucket::observe(Some(&bucket_info)));
         self.destination_rules = bucket_info.storage_routing;
         self.destination_compression = bucket_info.compression;
-        self.load_destination_routing()
+        let Some(key) = settings
+            .active_key()
+            .filter(|_| self.manifest.kind == ReplicationItemKind::Materialized)
+        else {
+            return self.load_destination_routing();
+        };
+        self.destination_settings = Some(settings);
+        self.state = IncomingVersionState::ReadDestinationKey;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_KEY_KEYSPACE.to_string(),
+            key: key.key().into(),
+            txn_id: None,
+        })]
+    }
+
+    /// Captures how this encrypting destination seals: its active key and stored format.
+    fn accept_destination_key(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.fail(IncomingVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let Some(settings) = self.destination_settings.take() else {
+            return self.fail(IncomingVersionError::DestinationNotFound);
+        };
+        let record = match value.map(|value| BucketKeyRecord::from_bytes(&value)) {
+            Some(Ok(record)) => record,
+            Some(Err(error)) => return self.fail(error.into()),
+            None => return self.reject_negotiation(BucketKeyError::Unsupported.into()),
+        };
+        match SealPlan::capture(&settings, &record) {
+            Ok(plan) => {
+                self.seal_plan = plan;
+                self.load_destination_routing()
+            }
+            Err(error) => self.reject_negotiation(error.into()),
+        }
     }
 
     fn accept_bucket_created(&mut self, event: Event) -> Effects {
@@ -2255,6 +2465,17 @@ impl IncomingVersionOperation {
                         .send_negotiation(ReplicationNegotiationResult::AlreadyReplicatedVersion);
                 }
                 BlobVersionState::Deleted => {}
+                // Only the same content, as the earlier sender claimed it, is already here.
+                BlobVersionState::PendingContent { archive, .. }
+                    if self.manifest.blob.is_some() && !self.is_reference_item() =>
+                {
+                    self.state = IncomingVersionState::ReadExistingClaim;
+                    return smallvec![Effect::Storage(StorageEffect::Read {
+                        key_space: PENDING_CLAIM_KEYSPACE.to_string(),
+                        key: archive.to_bytes().into(),
+                        txn_id: None,
+                    })];
+                }
                 BlobVersionState::PendingContent { .. } => {
                     return self.reject_negotiation(IncomingVersionError::EncryptedVersion);
                 }
@@ -2267,6 +2488,21 @@ impl IncomingVersionOperation {
             }
             ReplicationItemKind::Materialized => self.read_quota_config(),
         }
+    }
+
+    fn accept_existing_claim(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.fail(IncomingVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let claimed = self.manifest.blob.as_ref().map(|blob| blob.hash.to_vec());
+        if value.is_some_and(|value| Some(value.to_vec()) == claimed) {
+            return self.send_negotiation(ReplicationNegotiationResult::AlreadyReplicatedVersion);
+        }
+        self.reject_negotiation(IncomingVersionError::EncryptedVersion)
     }
 
     fn accept_replaced_blob(&mut self, event: Event) -> Effects {
@@ -2455,7 +2691,10 @@ impl IncomingVersionOperation {
                 );
                 self.start_transaction()
             }
-            Some(ReplicationNegotiationResult::NeedBlobVersion) => {
+            Some(
+                ReplicationNegotiationResult::NeedBlobVersion
+                | ReplicationNegotiationResult::NeedSealedBlob(_),
+            ) => {
                 debug!(
                     bucket = %self.manifest.bucket,
                     key = %self.manifest.key,
@@ -2494,7 +2733,7 @@ impl IncomingVersionOperation {
                 });
             }
         };
-        if let Err(err) = self.validate_materialized_location(&location) {
+        if let Err(err) = self.validate_received(&location) {
             self.received_blob = Some(ReceivedBlob::reserved(location));
             return self.fail(err);
         }
@@ -2549,12 +2788,20 @@ impl IncomingVersionOperation {
         let Some((_, settings)) = values.pop().filter(|_| values.len() == 2) else {
             return self.fail(PolicyGateError::InvalidEvent.into());
         };
-        match BucketEncryption::from_row(settings.as_deref()) {
-            Ok(settings) if settings.is_encrypted() => {
-                return self.fail(IncomingVersionError::EncryptedDestination);
-            }
-            Ok(_) => {}
+        let settings = match BucketEncryption::from_row(settings.as_deref()) {
+            Ok(settings) => settings,
             Err(err) => return self.fail(err.into()),
+        };
+        // The captured plan must still be current; a bucket that started encrypting since the
+        // negotiation refuses content that was not sealed for it.
+        let stale = match self.seal_plan {
+            Some(plan) => plan.still_current(&settings).is_err(),
+            None => {
+                settings.is_encrypted() && self.manifest.kind == ReplicationItemKind::Materialized
+            }
+        };
+        if stale {
+            return self.fail(IncomingVersionError::StalePlan);
         }
         let (bucket, subject) = match split_drift_reads(values) {
             Ok(split) => split,
@@ -2571,7 +2818,10 @@ impl IncomingVersionOperation {
         }
         // A replica encoded under an older setting is never published: the bucket's
         // migration may already have passed this key.
-        let written = self.effective_materialized_location().ok();
+        let written = self
+            .effective_materialized_location()
+            .ok()
+            .filter(|written| written.format.bucket_key().is_none());
         if bucket
             .as_ref()
             .zip(written)
@@ -2692,10 +2942,13 @@ impl IncomingVersionOperation {
     }
 
     fn accept_blob_location(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+        let Event::Storage(
+            StorageEvent::WriteResult { .. } | StorageEvent::BatchWriteResult { .. },
+        ) = event
+        else {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::WriteResult)",
+                expected: "Event::Storage(StorageEvent::{WriteResult|BatchWriteResult})",
                 received: event,
             });
         };
