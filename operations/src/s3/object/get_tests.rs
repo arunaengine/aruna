@@ -2097,4 +2097,23 @@ mod sealed {
             ]
         ));
     }
+
+    #[test]
+    fn remote_lock_typed() {
+        use crate::replication::bao_read::BaoReadError;
+        use crate::replication::protocol::BaoReadRefusal;
+        use crate::s3::object::get::HolderFailures;
+
+        let mut failures = HolderFailures::default();
+        failures.record(BaoReadError::Refused(BaoReadRefusal::NotFound));
+        failures.record(BaoReadError::Refused(BaoReadRefusal::BucketLocked(
+            key().bucket_id,
+        )));
+        assert_eq!(
+            failures.into_error(),
+            GetObjectError::ConversionError(ConversionError::BucketKey(BucketKeyError::Locked(
+                key().bucket_id
+            )))
+        );
+    }
 }

@@ -25,9 +25,10 @@ use aruna_core::structs::placement::node_subject::storage_subject;
 use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSubject};
 use aruna_core::structs::placement::record::NodePlacementEntry;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo, HashIndex,
-    ManagedCopyKey, VersionKey, object_permission_path,
+    ArchiveKey, BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
+    HashIndex, ManagedCopyKey, VersionKey, object_permission_path,
 };
+use aruna_core::structs::storage::encryption::{BucketKeyError, ReadLease};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use bytes::Bytes;
@@ -450,6 +451,8 @@ enum IncomingBaoState {
     ReadLocation,
     CheckManagedCopy,
     PolicyChallenge,
+    /// A sealed copy waits for a read lease before it is offered.
+    AdmitSealed,
     SendAccepted,
     ServeRead,
     CloseMetadata,
@@ -514,6 +517,8 @@ pub struct IncomingBaoOperation {
     source_size: Option<u64>,
     source_fingerprint: Option<String>,
     now_ms: u64,
+    /// Read lease of a sealed copy; the plaintext is served only under it.
+    lease: Option<ReadLease>,
 }
 
 impl IncomingBaoOperation {
@@ -560,6 +565,7 @@ impl IncomingBaoOperation {
             source_size: None,
             source_fingerprint: None,
             now_ms: 0,
+            lease: None,
         }
     }
 
@@ -787,7 +793,42 @@ impl IncomingBaoOperation {
         smallvec![blob_location_read(&key, self.txn_id)]
     }
 
+    /// A sealed copy is offered only once its bucket admits the read; a locked bucket refuses.
     fn send_accepted(&mut self, location: BackendLocation) -> Effects {
+        match location.format.bucket_key() {
+            Some(key) if !self.request.metadata_only => {
+                let archive = ArchiveKey::of(&location);
+                self.location = Some(location);
+                self.state = IncomingBaoState::AdmitSealed;
+                smallvec![Effect::Blob(BlobEffect::AdmitRead { key, archive })]
+            }
+            _ => self.offer_location(location),
+        }
+    }
+
+    fn handle_admission(&mut self, event: Event) -> Effects {
+        let Some(location) = self.location.take() else {
+            return self.fail(BaoReadError::NotFinished);
+        };
+        let Some(key) = location.format.bucket_key() else {
+            return self.fail(BaoReadError::NotFinished);
+        };
+        match event {
+            Event::Blob(BlobEvent::ReadAdmitted { lease })
+                if lease.key == key && lease.archive == ArchiveKey::of(&location) =>
+            {
+                self.lease = Some(lease);
+                self.offer_location(location)
+            }
+            Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(id)))) => {
+                self.send_refusal(BaoReadRefusal::BucketLocked(id))
+            }
+            Event::Blob(BlobEvent::Error(_)) => self.send_refusal(BaoReadRefusal::BackendFailure),
+            other => self.unexpected(other),
+        }
+    }
+
+    fn offer_location(&mut self, location: BackendLocation) -> Effects {
         let Some(blake3) = self.blob_hash else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
@@ -895,6 +936,7 @@ impl IncomingBaoOperation {
             IncomingBaoState::ReadLocation => "read_location",
             IncomingBaoState::CheckManagedCopy => "check_managed_copy",
             IncomingBaoState::PolicyChallenge => "policy_challenge",
+            IncomingBaoState::AdmitSealed => "admit_sealed",
             IncomingBaoState::SendAccepted => "send_accepted",
             IncomingBaoState::ServeRead => "serve_read",
             IncomingBaoState::CloseMetadata => "close_metadata",
@@ -1326,7 +1368,10 @@ impl Operation for IncomingBaoOperation {
             {
                 return self.send_refusal(BaoReadRefusal::BackendFailure);
             }
-            Event::Blob(BlobEvent::Error(error)) => return self.fail(error.into()),
+            // A refused admission becomes a typed refusal to the reader, not a failed serve.
+            Event::Blob(BlobEvent::Error(error)) if self.state != IncomingBaoState::AdmitSealed => {
+                return self.fail(error.into());
+            }
             event => event,
         };
 
@@ -1362,6 +1407,7 @@ impl Operation for IncomingBaoOperation {
                     false => effects,
                 }
             }
+            IncomingBaoState::AdmitSealed => self.handle_admission(event),
             IncomingBaoState::SendAccepted => {
                 let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
                     return self.unexpected(event);
@@ -1394,6 +1440,14 @@ impl Operation for IncomingBaoOperation {
                     return self.fail(BaoReadError::NotFinished);
                 };
                 self.state = IncomingBaoState::ServeRead;
+                if let Some(lease) = self.lease.take() {
+                    return smallvec![Effect::Blob(BlobEffect::ServeSealedRead {
+                        stream_id: self.stream_id,
+                        location,
+                        expected_blake3,
+                        lease,
+                    })];
+                }
                 smallvec![Effect::Blob(BlobEffect::ServeRead {
                     stream_id: self.stream_id,
                     location,
@@ -2238,5 +2292,95 @@ mod pure_tests {
         }));
 
         assert_eq!(refusal_from(&effects), BaoReadRefusal::BackendFailure);
+    }
+
+    /// An incoming read that resolved to a sealed copy of `bucket_id`, ready to be offered.
+    fn sealed_serve(bucket_id: Ulid) -> (IncomingBaoOperation, BackendLocation) {
+        use aruna_core::structs::storage::encryption::BucketKeyRef;
+        use aruna_core::structs::storage::format::PithosLayout;
+
+        let local_node = node_from_seed(1);
+        let hash = [4u8; 32];
+        let mut operation = IncomingBaoOperation::new(
+            node_from_seed(2),
+            local_node,
+            test_realm(),
+            Ulid::from(9u128),
+            read_request(local_node, hash),
+        );
+        operation.blob_hash = Some(hash);
+        let layout = PithosLayout {
+            stored_size: 64,
+            metadata_digest: [1; 32],
+        };
+        let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/tmp".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "sealed".to_string(),
+            ulid: Ulid::from(12u128),
+            format: StoredFormat::pithos(layout, BucketKeyRef::new(bucket_id, 1)),
+            created_by: UserId::nil(test_realm()),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 10,
+            hashes: HashMap::from([(HASH_BLAKE3.to_string(), hash.to_vec())]),
+        };
+        (operation, location)
+    }
+
+    #[test]
+    fn locked_copy_refused() {
+        use aruna_core::errors::BlobError;
+        use aruna_core::structs::storage::encryption::BucketKeyError;
+
+        let bucket_id = Ulid::from(30u128);
+        let (mut operation, location) = sealed_serve(bucket_id);
+        let effects = operation.send_accepted(location);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::AdmitRead { key, .. })] if key.bucket_id == bucket_id
+        ));
+        let locked = BlobError::BucketKey(BucketKeyError::Locked(bucket_id));
+        let effects = operation.step(Event::Blob(BlobEvent::Error(locked)));
+        assert_eq!(
+            refusal_from(&effects),
+            BaoReadRefusal::BucketLocked(bucket_id)
+        );
+    }
+
+    #[test]
+    fn unlocked_copy_leased() {
+        use aruna_core::structs::storage::blob::ArchiveKey;
+        use aruna_core::structs::storage::encryption::{BucketKeyRef, ReadLease};
+        use std::sync::Arc;
+
+        let bucket_id = Ulid::from(30u128);
+        let (mut operation, location) = sealed_serve(bucket_id);
+        operation.send_accepted(location.clone());
+        let key = BucketKeyRef::new(bucket_id, 1);
+        let lease = ReadLease::new(
+            key,
+            ArchiveKey::of(&location),
+            Ulid::from(31u128),
+            Arc::new(()),
+        );
+        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+            panic!("expected the accepted frame, got {effects:?}")
+        };
+        assert!(matches!(
+            VersionReplicationMessage::from_bytes(payload).unwrap(),
+            VersionReplicationMessage::BaoReadAccepted { .. }
+        ));
+        let effects = operation.step(Event::Blob(BlobEvent::MessageSent {
+            stream_id: Ulid::from(9u128),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ServeSealedRead { lease, .. })] if lease.key == key
+        ));
     }
 }

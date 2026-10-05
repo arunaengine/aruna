@@ -1587,6 +1587,8 @@ struct HolderFailures {
     integrity: bool,
     unavailable: bool,
     metadata_only: bool,
+    /// A holder refused because its copy's bucket is locked there.
+    locked: Option<Ulid>,
 }
 
 impl HolderFailures {
@@ -1596,6 +1598,9 @@ impl HolderFailures {
             BaoReadError::Refused(BaoReadRefusal::NotFound) => {}
             BaoReadError::Refused(BaoReadRefusal::ReadDenied) => self.denied = true,
             BaoReadError::Refused(BaoReadRefusal::HashMismatch) => self.integrity = true,
+            BaoReadError::Refused(BaoReadRefusal::BucketLocked(bucket_id)) => {
+                self.locked = Some(bucket_id);
+            }
             BaoReadError::Refused(
                 BaoReadRefusal::BackendFailure
                 | BaoReadRefusal::RealmPeerDenied
@@ -1615,6 +1620,9 @@ impl HolderFailures {
     }
 
     fn into_error(self) -> GetObjectError {
+        if let Some(bucket_id) = self.locked {
+            return locked(BucketKeyError::Locked(bucket_id));
+        }
         if self.governed {
             GetObjectError::GovernedUnavailable
         } else if self.integrity {

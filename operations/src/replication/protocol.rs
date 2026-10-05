@@ -261,6 +261,8 @@ pub enum BaoReadRefusal {
     ReadDenied,
     HashMismatch,
     BackendFailure,
+    /// The copy is sealed with a key of this bucket that is locked on the serving node.
+    BucketLocked(Ulid),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
