@@ -830,32 +830,38 @@ impl IncomingBaoOperation {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected(event);
         };
-        let Some(location) = self.location.take() else {
-            return self.fail(BaoReadError::NotFinished);
-        };
+        // An observation has no location; it is offered from its source once admitted.
+        let location = self.location.take();
         let settings = match BucketEncryption::from_row(value.as_deref()) {
             Ok(settings) => settings,
             Err(error) => return self.fail(error.into()),
         };
         let Some(key) = settings.active_key() else {
-            return self.offer_location(location);
+            return self.offer_admitted(location);
         };
+        // A copy's lease pins its physical location; an observation has none to pin.
+        let archive = location
+            .as_ref()
+            .map_or_else(|| reference_archive(key), ArchiveKey::of);
         self.plain_key = Some(key);
-        self.location = Some(location);
+        self.location = location;
         self.state = IncomingBaoState::AdmitSealed;
-        smallvec![Effect::Blob(BlobEffect::AdmitRead {
-            key,
-            archive: reference_archive(key),
-        })]
+        smallvec![Effect::Blob(BlobEffect::AdmitRead { key, archive })]
     }
 
     fn handle_admission(&mut self, event: Event) -> Effects {
-        let Some(location) = self.location.take() else {
-            return self.fail(BaoReadError::NotFinished);
-        };
-        let target = match (location.format.bucket_key(), self.plain_key) {
-            (Some(key), _) => (key, ArchiveKey::of(&location)),
-            (None, Some(key)) => (key, reference_archive(key)),
+        let location = self.location.take();
+        let sealed = location
+            .as_ref()
+            .and_then(|location| Some((location.format.bucket_key()?, ArchiveKey::of(location))));
+        let target = match (sealed, self.plain_key) {
+            (Some(target), _) => target,
+            (None, Some(key)) => {
+                let archive = location
+                    .as_ref()
+                    .map_or_else(|| reference_archive(key), ArchiveKey::of);
+                (key, archive)
+            }
             (None, None) => return self.fail(BaoReadError::NotFinished),
         };
         match event {
@@ -863,13 +869,21 @@ impl IncomingBaoOperation {
                 if (lease.key, lease.archive.clone()) == target =>
             {
                 self.lease = Some(lease);
-                self.offer_location(location)
+                self.offer_admitted(location)
             }
             Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(id)))) => {
                 self.send_refusal(BaoReadRefusal::BucketLocked(id))
             }
             Event::Blob(BlobEvent::Error(_)) => self.send_refusal(BaoReadRefusal::BackendFailure),
             other => self.unexpected(other),
+        }
+    }
+
+    /// Offers the admitted copy, or the observation when no location was resolved.
+    fn offer_admitted(&mut self, location: Option<BackendLocation>) -> Effects {
+        match location {
+            Some(location) => self.offer_location(location),
+            None => self.accept_observation(),
         }
     }
 
@@ -1142,6 +1156,20 @@ impl IncomingBaoOperation {
             .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
         self.state = IncomingBaoState::ResolveSource;
         smallvec![resolve_binding_effect(ResolveBindingInput { source },)]
+    }
+
+    /// An observation of an encrypting bucket is served only under its bucket lease.
+    fn observation_settings(&mut self) -> Effects {
+        let Some(version) = self.version_key.clone() else {
+            return self.accept_observation();
+        };
+        self.location = None;
+        self.state = IncomingBaoState::ReadContentSettings;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            key: version.bucket.as_bytes().into(),
+            txn_id: self.txn_id,
+        })]
     }
 
     /// Announces an observation the same way a materialized copy is announced,
@@ -1431,7 +1459,7 @@ impl Operation for IncomingBaoOperation {
                     result: Ok(access),
                 }) => {
                     self.source_access = Some(access);
-                    self.accept_observation()
+                    self.observation_settings()
                 }
                 Event::SubOperation(SubOperationEvent::VersionAccessResolved {
                     result: Err(_),
@@ -2469,7 +2497,7 @@ mod pure_tests {
             (operation, location)
         };
         let key = BucketKeyRef::new(bucket_id, 1);
-        let archive = ArchiveKey::new(bucket_id, BackendRef::node_default());
+        let archive = ArchiveKey::new(Ulid::from(12u128), BackendRef::node_default());
 
         // Locked: a raw copy not converted yet is refused like a sealed one.
         let (mut operation, location) = plain();
@@ -2504,5 +2532,77 @@ mod pure_tests {
             effects.as_slice(),
             [Effect::Blob(BlobEffect::ServeSealedRead { lease, .. })] if lease.key == key
         ));
+    }
+
+    #[test]
+    fn locked_observation_refused() {
+        use aruna_core::errors::BlobError;
+        use aruna_core::events::SubOperationEvent;
+        use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+        use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_core::structs::storage::blob::ArchiveKey;
+        use aruna_core::structs::storage::encryption::{
+            BucketEncryption, BucketKeyError, BucketKeyRef, EncryptionMode, ReadLease,
+        };
+        use std::sync::Arc;
+
+        let bucket_id = Ulid::from(40u128);
+        let settings = BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(bucket_id),
+            key_generation: 1,
+            ..Default::default()
+        };
+        let resolved = || {
+            let mut operation = device_serve(Some([5u8; 32]));
+            operation.serve_observation(observation(5, Some("5-1")));
+            let access = ResolvedSourceAccess::OpenDal {
+                kind: SourceConnectorKind::Http,
+                config: HashMap::new(),
+                path: "file.txt".to_string(),
+                version: None,
+            };
+            let effects = operation.step(Event::SubOperation(
+                SubOperationEvent::VersionAccessResolved { result: Ok(access) },
+            ));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::Read { .. })]
+            ));
+            let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: b"bucket".to_vec().into(),
+                value: Some(settings.to_bytes().unwrap().into()),
+            }));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::AdmitRead { key, .. })] if key.bucket_id == bucket_id
+            ));
+            operation
+        };
+
+        // Locked: the device's file is refused before any accepted frame.
+        let mut operation = resolved();
+        let locked = BlobError::BucketKey(BucketKeyError::Locked(bucket_id));
+        let effects = operation.step(Event::Blob(BlobEvent::Error(locked)));
+        assert_eq!(
+            refusal_from(&effects),
+            BaoReadRefusal::BucketLocked(bucket_id)
+        );
+
+        // Unlocked: the file is served while the operation holds the bucket lease.
+        let mut operation = resolved();
+        let key = BucketKeyRef::new(bucket_id, 1);
+        let archive = ArchiveKey::new(bucket_id, BackendRef::node_default());
+        let guard = Arc::new(());
+        let lease = ReadLease::new(key, archive, Ulid::from(41u128), guard.clone());
+        operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        let effects = operation.step(Event::Blob(BlobEvent::MessageSent {
+            stream_id: Ulid::from(9u128),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ServeSourceRead { .. })]
+        ));
+        assert_eq!(Arc::strong_count(&guard), 2);
     }
 }
