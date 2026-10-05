@@ -10,16 +10,17 @@ use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE,
-    MANAGED_COPY_KEYSPACE, PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_QUARANTINE_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_KEY_KEYSPACE,
+    COPY_OWNER_KEYSPACE, MANAGED_COPY_KEYSPACE, PENDING_CLAIM_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    ArchiveKey, BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
-    CopyOwner, ManagedCopyKey, ManagedCopyRecord, VersionKey,
+    ArchiveKey, BackendLocation, BlobLocationKey, BlobQuarantineRecord, BlobVersion,
+    BlobVersionState, BucketInfo, CopyOwner, ManagedCopyKey, ManagedCopyRecord, VersionKey,
 };
 use aruna_core::structs::storage::encryption::{
     BucketKeyError, BucketKeyRecord, BucketKeyRef, KeyState,
@@ -55,6 +56,8 @@ pub enum PromoteError {
         expected: &'static str,
         received: Event,
     },
+    #[error("could not drop a version with a mismatched content hash: {0}")]
+    Dropped(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -65,6 +68,8 @@ pub enum Promotion {
     AwaitingKey(BucketKeyRef),
     /// No pending row names this archive any longer.
     Gone,
+    /// The verified hash differs from the hash a sender claimed; nothing was registered.
+    Mismatch { claimed: [u8; 32] },
 }
 
 #[derive(Debug, PartialEq)]
@@ -273,17 +278,39 @@ impl PromotePendingOperation {
             return self.finish(Err(PromoteError::NoKey));
         };
         self.state = State::ReadKey;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_KEY_KEYSPACE.to_string(),
-            key: key.key().into(),
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (BUCKET_KEY_KEYSPACE.to_string(), key.key().into()),
+                (
+                    PENDING_CLAIM_KEYSPACE.to_string(),
+                    self.archive.to_bytes().into()
+                ),
+            ],
             txn_id: self.txn_id,
         })]
     }
 
     fn handle_key(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected("ReadKey", "ReadResult", event);
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected("ReadKey", "BatchReadResult", event);
         };
+        let mut values = values.into_iter().map(|(_, value)| value);
+        let (Some(value), Some(claim)) = (values.next(), values.next()) else {
+            return self.finish(Err(PromoteError::BadHashes));
+        };
+        // A received archive registers only the content its sender claimed.
+        if let Some(claim) = claim
+            && Some(claim.as_ref()) != self.blake3.as_ref().map(<[u8; 32]>::as_slice)
+        {
+            let Ok(claimed) = <[u8; 32]>::try_from(claim.as_ref()) else {
+                return self.finish(Err(PromoteError::BadHashes));
+            };
+            self.output = Some(Ok(Promotion::Mismatch { claimed }));
+            self.state = State::Abort;
+            return smallvec![Effect::Storage(StorageEffect::AbortTransaction {
+                txn_id: self.txn_id.take().unwrap_or_default(),
+            })];
+        }
         let record = value
             .map(|value| BucketKeyRecord::from_bytes(&value))
             .transpose();
@@ -548,12 +575,15 @@ impl PromotePendingOperation {
         self.scan_owners()
     }
 
-    /// The pending row goes in the transaction that verified no pending owner remains.
+    /// The pending row and its claim go in the transaction that verified no pending owner remains.
     fn finish_pages(&mut self) -> Effects {
         self.state = State::DeletePending;
-        smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: PENDING_LOCATION_KEYSPACE.to_string(),
-            key: self.archive.to_bytes().into(),
+        let key = self.archive.to_bytes();
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes: vec![
+                (PENDING_LOCATION_KEYSPACE.to_string(), key.clone().into()),
+                (PENDING_CLAIM_KEYSPACE.to_string(), key.into()),
+            ],
             txn_id: self.txn_id,
         })]
     }
@@ -618,14 +648,14 @@ impl Operation for PromotePendingOperation {
                 event => self.unexpected("WriteVersions", "BatchWriteResult", event),
             },
             State::DeletePending => match event {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.last_page = true;
                     self.state = State::Commit;
                     smallvec![Effect::Storage(StorageEffect::CommitTransaction {
                         txn_id: self.txn_id.take().unwrap_or_default(),
                     })]
                 }
-                event => self.unexpected("DeletePending", "DeleteResult", event),
+                event => self.unexpected("DeletePending", "BatchDeleteResult", event),
             },
             State::Commit => self.handle_committed(event),
             State::Abort => {
@@ -692,18 +722,132 @@ pub async fn promote_unlocked(
             }
             let archive = ArchiveKey::from_bytes(row)?;
             let operation =
-                PromotePendingOperation::new(archive, origin.0, origin.1, limits.clone());
+                PromotePendingOperation::new(archive.clone(), origin.0, origin.1, limits.clone());
             match crate::driver::drive(operation, context).await? {
                 Promotion::Promoted { .. } => promoted += 1,
                 // A lock in between leaves the rest pending until the next unlock.
                 Promotion::AwaitingKey(_) => return Ok(promoted),
                 Promotion::Gone => {}
+                Promotion::Mismatch { claimed } => {
+                    drop_mismatch(context, &archive, claimed, origin).await?;
+                }
             }
         }
         match next {
             Some(next) if !rows.is_empty() => start_after = Some(next),
             _ => return Ok(promoted),
         }
+    }
+}
+
+/// Quarantines an archive whose content differs from the hash its sender claimed and deletes the
+/// versions that use it; none of them was registered. Returns how many versions were deleted.
+pub async fn drop_mismatch(
+    context: &crate::driver::DriverContext,
+    archive: &ArchiveKey,
+    claimed: [u8; 32],
+    (realm_id, node_id): (RealmId, NodeId),
+) -> Result<usize, PromoteError> {
+    use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
+    let storage = &context.storage_handle;
+    let reason = "replicated content hash differs from the claimed hash".to_string();
+    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let record = BlobQuarantineRecord::new(claimed, archive.backend.clone(), reason, now_ms);
+    let write = StorageEffect::Write {
+        key_space: BLOB_QUARANTINE_KEYSPACE.to_string(),
+        key: record.key().into(),
+        value: record.to_bytes()?.into(),
+        txn_id: None,
+    };
+    if let Event::Storage(StorageEvent::Error { error }) = storage.send_storage_effect(write).await
+    {
+        return Err(error.into());
+    }
+    let owners = owner_versions(storage, archive).await?;
+    let mut dropped = 0;
+    for version in owners {
+        let row = version.to_bytes()?;
+        let Some(value) = read_value(storage, BLOB_VERSIONS_KEYSPACE, row).await? else {
+            continue;
+        };
+        let stored = BlobVersion::from_bytes(&value)?;
+        let bucket = version.bucket.as_bytes().to_vec();
+        let info = read_value(storage, S3_BUCKET_KEYSPACE, bucket).await?;
+        let (Some(info), Some(_)) = (info, stored.state.pending_archive()) else {
+            continue;
+        };
+        let input = DeleteObjectInput {
+            bucket: version.bucket.clone(),
+            key: version.key.clone(),
+            version_id: Some(version.version_id),
+            group_id: BucketInfo::from_bytes(&info)?.group_id,
+            realm_id,
+            node_id,
+            deleted_by: stored.created_by,
+        };
+        match crate::driver::drive(DeleteObjectOperation::new(input), context).await {
+            Ok(_) => dropped += 1,
+            Err(error) => return Err(PromoteError::Dropped(error.to_string())),
+        }
+    }
+    let delete = StorageEffect::Delete {
+        key_space: PENDING_CLAIM_KEYSPACE.to_string(),
+        key: archive.to_bytes().into(),
+        txn_id: None,
+    };
+    if let Event::Storage(StorageEvent::Error { error }) = storage.send_storage_effect(delete).await
+    {
+        return Err(error.into());
+    }
+    Ok(dropped)
+}
+
+/// Every version that names `archive` in an owner row.
+async fn owner_versions(
+    storage: &aruna_storage::StorageHandle,
+    archive: &ArchiveKey,
+) -> Result<Vec<VersionKey>, PromoteError> {
+    let mut start_after = None;
+    let mut versions = Vec::new();
+    loop {
+        let (rows, _) = crate::jobs::store::iter_prefix_page(
+            storage,
+            COPY_OWNER_KEYSPACE,
+            Some(CopyOwner::prefix(archive).into()),
+            start_after,
+            PROMOTE_PAGE,
+            None,
+        )
+        .await
+        .map_err(|error| PromoteError::Storage(StorageError::ReadError(error)))?;
+        for (row, _) in &rows {
+            versions.push(CopyOwner::from_key(row)?.version);
+        }
+        match rows.last() {
+            Some((row, _)) if rows.len() == PROMOTE_PAGE => start_after = Some(row.clone()),
+            _ => return Ok(versions),
+        }
+    }
+}
+
+async fn read_value(
+    storage: &aruna_storage::StorageHandle,
+    key_space: &str,
+    key: Vec<u8>,
+) -> Result<Option<Value>, PromoteError> {
+    let read = StorageEffect::Read {
+        key_space: key_space.to_string(),
+        key: key.into(),
+        txn_id: None,
+    };
+    match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(PromoteError::InvalidStateEvent {
+            state: "Drop",
+            expected: "ReadResult",
+            received: other,
+        }),
     }
 }
 
