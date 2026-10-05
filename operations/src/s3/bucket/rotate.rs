@@ -22,7 +22,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
     BlockCipher, BlockKeys, BucketEncryption, BucketHolder, BucketKeyError, BucketKeyRecord,
-    BucketKeyRef, EncryptionMode, KeyState, SealPlan, SealedCopy,
+    BucketKeyRef, EncryptionMode, KeyState, SealPlan, SealedCopy, UnlockStatus,
 };
 use aruna_core::structs::storage::holders::{
     HolderReport, KeyLookup, RecoveryState, resolve_holders,
@@ -46,6 +46,7 @@ pub enum ChangeState {
     ReadBucket,
     CheckUploads,
     ReadKey,
+    CheckUnlocked,
     ReadGrants,
     GenerateKey,
     SealCopies,
@@ -90,6 +91,9 @@ pub enum ChangeError {
     OpenUploads,
     #[error("the key holders do not meet the recovery rule")]
     RecoveryUnmet,
+    /// Replacing an unfinished transition would strand the copies it still has to move.
+    #[error("the bucket's stored copies are still moving to a new encryption")]
+    TransitionRunning,
     #[error("unexpected event in state {state:?}: {received:?}")]
     InvalidStateEvent {
         state: ChangeState,
@@ -242,33 +246,64 @@ impl ChangeEncryptionOperation {
             return self.fail(ChangeError::NotEncrypted);
         };
         self.state = ChangeState::ReadKey;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_KEY_KEYSPACE.to_string(),
-            key: active.key().into(),
+        let bucket: Key = self.input.bucket.as_bytes().to_vec().into();
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (BUCKET_KEY_KEYSPACE.to_string(), active.key().into()),
+                (TRANSITION_KEYSPACE.to_string(), bucket),
+            ],
             txn_id: self.txn_id,
         })]
     }
 
-    fn read_key(&mut self, value: Option<Value>) -> Effects {
-        let record = value.map(|value| BucketKeyRecord::from_bytes(value.as_ref()));
-        let record = match record.transpose() {
-            Ok(Some(record)) => record,
-            Ok(None) => return self.fail(ChangeError::NotFinished),
+    fn read_key(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+        let mut rows = values.into_iter().map(|(_, value)| value);
+        let (Some(Some(record)), Some(transition), None) = (rows.next(), rows.next(), rows.next())
+        else {
+            return self.fail(ChangeError::NotFinished);
+        };
+        let transition = transition.map(|row| EncryptionTransition::from_bytes(row.as_ref()));
+        match transition.transpose() {
+            Ok(Some(transition)) if transition.finished_at_ms.is_none() => {
+                return self.fail(ChangeError::TransitionRunning);
+            }
+            Ok(_) => {}
+            Err(error) => return self.fail(error),
+        }
+        let record = match BucketKeyRecord::from_bytes(record.as_ref()) {
+            Ok(record) => record,
             Err(error) => return self.fail(error),
         };
-        let vault_entry = record.vault_entry;
-        let key = record.key;
-        self.active = Some(record);
         let (mode, ..) = self.wanted();
+        let key = record.key;
+        let leaves_vault = mode == EncryptionMode::NodeManaged && record.vault_entry.is_none();
+        self.active = Some(record);
+        if leaves_vault {
+            // Leaving `vault_locked` needs the unlocked key for the node vault copy.
+            self.state = ChangeState::ReadUnlocked;
+            return smallvec![Effect::Blob(BlobEffect::ReadUnlockedKey { key })];
+        }
+        // Every other change moves archives that only the unlocked source key opens.
+        self.state = ChangeState::CheckUnlocked;
+        smallvec![Effect::Blob(BlobEffect::ReadKeyStatus {
+            bucket_id: key.bucket_id
+        })]
+    }
+
+    fn check_unlocked(&mut self, generations: &[UnlockStatus]) -> Effects {
+        let Some(key) = self.active.as_ref().map(|record| record.key) else {
+            return self.fail(ChangeError::NotFinished);
+        };
+        if !generations
+            .iter()
+            .any(|status| status.key == key && status.active)
+        {
+            return self.fail(BucketKeyError::Locked(key.bucket_id));
+        }
         if self.new_generation() {
             self.state = ChangeState::ReadGrants;
             let prefix = key.bucket_id.to_bytes().to_vec().into();
             return self.scan(BUCKET_HOLDER_KEYSPACE, Some(prefix));
-        }
-        if mode == EncryptionMode::NodeManaged && vault_entry.is_none() {
-            // Leaving `vault_locked` needs the unlocked key for the node vault copy.
-            self.state = ChangeState::ReadUnlocked;
-            return smallvec![Effect::Blob(BlobEffect::ReadUnlockedKey { key })];
         }
         self.write_rows(None, Vec::new())
     }
@@ -404,8 +439,11 @@ impl Operation for ChangeEncryptionOperation {
                 ChangeState::CheckUploads,
                 Event::Storage(StorageEvent::IterResult { values, .. }),
             ) => self.check_uploads(&values),
-            (ChangeState::ReadKey, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.read_key(value)
+            (ChangeState::ReadKey, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                self.read_key(values)
+            }
+            (ChangeState::CheckUnlocked, Event::Blob(BlobEvent::KeyStatus { generations })) => {
+                self.check_unlocked(&generations)
             }
             (ChangeState::ReadGrants, Event::Storage(StorageEvent::IterResult { values, .. })) => {
                 let grants = values

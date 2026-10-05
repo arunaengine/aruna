@@ -6,6 +6,7 @@ use crate::s3::bucket::key_rows::authority_rows;
 use aruna_core::compute::SecretBytes;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::transition::TransitionState;
 use std::time::SystemTime;
 
 const BUCKET_ID: Ulid = Ulid::from_bytes([7; 16]);
@@ -67,6 +68,18 @@ fn loaded(
     mode: EncryptionMode,
     uploads: Vec<(Key, Value)>,
 ) -> Effects {
+    loaded_with(operation, mode, uploads, None, true)
+}
+
+/// Answers the reads up to the change itself: `transition` is the stored transition row and
+/// `unlocked` decides whether the active generation is unlocked on this node.
+fn loaded_with(
+    operation: &mut ChangeEncryptionOperation,
+    mode: EncryptionMode,
+    uploads: Vec<(Key, Value)>,
+    transition: Option<EncryptionTransition>,
+    unlocked: bool,
+) -> Effects {
     operation.start();
     operation.step(Event::Storage(StorageEvent::TransactionStarted {
         txn_id: TxnId::default(),
@@ -80,15 +93,37 @@ fn loaded(
     }));
     if !matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { .. })]
+        [Effect::Storage(StorageEffect::BatchRead { .. })]
     ) {
         return effects;
     }
     let record = active(mode == EncryptionMode::NodeManaged);
-    operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: Vec::new().into(),
-        value: Some(record.to_bytes().unwrap().into()),
-    }))
+    let transition = transition.map(|record| Value::from(record.to_bytes().unwrap()));
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (
+                Key::from(Vec::new()),
+                Some(record.to_bytes().unwrap().into()),
+            ),
+            (Key::from(Vec::new()), transition),
+        ],
+    }));
+    if !matches!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::ReadKeyStatus { .. })]
+    ) {
+        return effects;
+    }
+    let status = UnlockStatus {
+        key: record.key,
+        session_id: Ulid::from_bytes([4; 16]),
+        active: true,
+        unlocked_at: SystemTime::UNIX_EPOCH,
+        remaining: None,
+        max_remaining: None,
+    };
+    let generations = if unlocked { vec![status] } else { Vec::new() };
+    operation.step(Event::Blob(BlobEvent::KeyStatus { generations }))
 }
 
 fn rows(effects: &Effects) -> Vec<(String, Key, Value)> {
@@ -264,4 +299,90 @@ fn locked_bucket_stays() {
         operation.finalize(),
         Err(ChangeError::Blob(BlobError::BucketKey(locked)))
     );
+}
+
+#[test]
+fn running_transition_rejects() {
+    // Each unfinished state still owns copies of its source generation.
+    let target = TransitionTarget {
+        compression: Compression::Off,
+        plan: None,
+    };
+    let source = Some(BucketKeyRef::new(BUCKET_ID, 1));
+    for state in [
+        TransitionState::Running,
+        TransitionState::AwaitingKey,
+        TransitionState::Cleanup,
+        TransitionState::Blocked,
+    ] {
+        let mut transition =
+            EncryptionTransition::new(TransitionKind::Rotate, source, target, 4, 1);
+        transition.state = state;
+        for change in [KeyChange::Rotate, settings_change(EncryptionMode::Off)] {
+            let mut operation = operation(change);
+            let mode = EncryptionMode::NodeManaged;
+            let effects = loaded_with(
+                &mut operation,
+                mode,
+                Vec::new(),
+                Some(transition.clone()),
+                true,
+            );
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+            ));
+            assert_eq!(operation.finalize(), Err(ChangeError::TransitionRunning));
+        }
+    }
+
+    let mut finished = EncryptionTransition::new(TransitionKind::Rotate, source, target, 4, 1);
+    finished.state = TransitionState::Finished;
+    finished.finished_at_ms = Some(9);
+    let mut operation = operation(KeyChange::Rotate);
+    let effects = loaded_with(
+        &mut operation,
+        EncryptionMode::NodeManaged,
+        Vec::new(),
+        Some(finished),
+        true,
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Iter { .. })]
+    ));
+}
+
+#[test]
+fn locked_source_refuses() {
+    // No row is written: the operation stops before any batch write and aborts.
+    let changes = [
+        (KeyChange::Rotate, EncryptionMode::VaultLocked),
+        (
+            settings_change(EncryptionMode::Off),
+            EncryptionMode::VaultLocked,
+        ),
+        (
+            KeyChange::Settings {
+                mode: EncryptionMode::NodeManaged,
+                cipher: BlockCipher::Aes256Gcm,
+                block_keys: BlockKeys::default(),
+            },
+            EncryptionMode::NodeManaged,
+        ),
+    ];
+    for (change, mode) in changes {
+        let mut operation = operation(change);
+
+        let effects = loaded_with(&mut operation, mode, Vec::new(), None, false);
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert_eq!(
+            operation.finalize(),
+            Err(ChangeError::Key(BucketKeyError::Locked(BUCKET_ID)))
+        );
+    }
 }
