@@ -121,8 +121,6 @@ the whole bucket when it is not.
   `version_id` replicates exactly that version.
 - Delete markers are included in the queued work.
 - Submitting the same scope again queues the work again, so the request is not idempotent.
-
-**Encrypted buckets**
 - An encrypting target receives each copy sealed to its own key; a locked source key leaves the
   copy waiting until the next unlock of the source bucket, without retries or errors.
 - An encrypted source refuses a target bucket that does not encrypt unless `plaintext` is true and
