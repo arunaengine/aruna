@@ -31,6 +31,8 @@ use crate::replication::dht_registration::dht_registration_effect;
 
 /// Owner rows promoted per transaction.
 pub const PROMOTE_PAGE: usize = 64;
+/// Commit conflicts that restart the promotion before it reports an error.
+const MAX_RESTARTS: u8 = 3;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum PromoteError {
@@ -96,6 +98,9 @@ pub struct PromotePendingOperation {
     hashes: HashMap<String, Vec<u8>>,
     cursor: Option<Key>,
     last_page: bool,
+    /// The final pass rescans every owner in one transaction before the pending row goes.
+    verifying: bool,
+    restarts: u8,
     pending: Vec<(Key, BlobVersion)>,
     promoted: usize,
     output: Option<Result<Promotion, PromoteError>>,
@@ -120,6 +125,8 @@ impl PromotePendingOperation {
             hashes: HashMap::new(),
             cursor: None,
             last_page: false,
+            verifying: false,
+            restarts: 0,
             pending: Vec::new(),
             promoted: 0,
             output: None,
@@ -303,7 +310,7 @@ impl PromotePendingOperation {
             })
             .collect::<Result<Vec<_>, ConversionError>>();
         match reads {
-            Ok(reads) if reads.is_empty() => self.finish_pages(),
+            Ok(reads) if reads.is_empty() => self.end_of_pass(),
             Ok(reads) => {
                 self.state = State::ReadVersions;
                 smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -426,7 +433,10 @@ impl PromotePendingOperation {
 
     fn next_page(&mut self) -> Effects {
         if self.last_page {
-            return self.finish_pages();
+            return self.end_of_pass();
+        }
+        if self.verifying {
+            return self.scan_owners();
         }
         self.state = State::Commit;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction {
@@ -434,7 +444,19 @@ impl PromotePendingOperation {
         })]
     }
 
-    /// The pending row goes in the transaction that promotes the last owner.
+    /// Owner pages commit separately, so an alias may land behind the cursor. The final
+    /// transaction rescans every owner from the start; a later insert conflicts with that scan.
+    fn end_of_pass(&mut self) -> Effects {
+        if self.verifying {
+            return self.finish_pages();
+        }
+        self.verifying = true;
+        self.cursor = None;
+        self.last_page = false;
+        self.scan_owners()
+    }
+
+    /// The pending row goes in the transaction that verified no pending owner remains.
     fn finish_pages(&mut self) -> Effects {
         self.state = State::DeletePending;
         smallvec![Effect::Storage(StorageEffect::Delete {
@@ -445,6 +467,18 @@ impl PromotePendingOperation {
     }
 
     fn handle_committed(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }) = event
+            && self.restarts < MAX_RESTARTS
+        {
+            // A concurrent owner change: promote again from the first owner.
+            self.restarts += 1;
+            self.verifying = false;
+            self.last_page = false;
+            self.cursor = None;
+            return self.start_page();
+        }
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected("Commit", "TransactionCommitted", event);
         };

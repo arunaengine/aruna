@@ -183,6 +183,17 @@ fn promotes_pending_alias() {
     let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: Vec::new(),
     }));
+    // The final pass rescans from the first owner and finds nothing left pending.
+    assert_eq!(effects.as_slice(), &verify_scan());
+    let owners = vec![(Key::from(owner.key().unwrap()), Value::from(Vec::new()))];
+    operation.step(Event::Storage(StorageEvent::IterResult {
+        values: owners,
+        next_start_after: None,
+    }));
+    let versions = vec![(version_row, Some(writes[0].2.clone()))];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: versions,
+    }));
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Delete { key_space, .. })]
@@ -216,4 +227,168 @@ fn promotes_pending_alias() {
             versions: 1
         })
     );
+}
+
+/// The verification scan: every owner, from the first, inside the open transaction.
+fn verify_scan() -> [Effect; 1] {
+    [Effect::Storage(StorageEffect::Iter {
+        key_space: COPY_OWNER_KEYSPACE.to_string(),
+        prefix: Some(CopyOwner::prefix(&ArchiveKey::of(&sealed())).into()),
+        start: None,
+        limit: PROMOTE_PAGE,
+        txn_id: Some(Ulid::from_bytes([7; 16])),
+    })]
+}
+
+fn bucket_rows() -> Vec<(Key, Option<Value>)> {
+    let info = BucketInfo {
+        group_id: Ulid::from_bytes([8; 16]),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: Default::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Default::default(),
+    };
+    vec![(
+        Key::from(b"bucket".to_vec()),
+        Some(Value::from(info.to_bytes().unwrap())),
+    )]
+}
+
+/// Promotes one owner page, `version_id` being the only owner, up to its batch write.
+fn promote_one(operation: &mut PromotePendingOperation, version_id: [u8; 16]) -> Key {
+    let version_key = VersionKey::new("bucket", "key", Ulid::from_bytes(version_id));
+    let owner = CopyOwner::new(ArchiveKey::of(&sealed()), version_key.clone());
+    operation.step(Event::Storage(StorageEvent::IterResult {
+        values: vec![(Key::from(owner.key().unwrap()), Value::from(Vec::new()))],
+        next_start_after: None,
+    }));
+    let pending = BlobVersion::pending(
+        ArchiveKey::of(&sealed()),
+        SystemTime::UNIX_EPOCH,
+        Default::default(),
+        None,
+    );
+    let row = Key::from(version_key.to_bytes().unwrap());
+    operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(row, Some(Value::from(pending.to_bytes().unwrap())))],
+    }));
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: bucket_rows(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchWrite { .. })]
+    ));
+    Key::from(owner.key().unwrap())
+}
+
+#[test]
+fn alias_behind_cursor() {
+    let mut operation = hashed_operation();
+    operation.step(location_read());
+    operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: Key::from(Vec::new()),
+    }));
+    let first = promote_one(&mut operation, [6; 16]);
+    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    }));
+    assert_eq!(effects.as_slice(), &verify_scan());
+
+    // A copy committed an alias that sorts before the first owner, behind the cursor.
+    let behind = VersionKey::new("bucket", "a", Ulid::from_bytes([1; 16]));
+    let inserted = CopyOwner::new(ArchiveKey::of(&sealed()), behind.clone());
+    let promoted = BlobVersion::materialized(
+        BLAKE3,
+        BackendRef::node_default(),
+        sealed().format.encoding(),
+        SystemTime::UNIX_EPOCH,
+        Default::default(),
+        None,
+    );
+    let pending = BlobVersion::pending(
+        ArchiveKey::of(&sealed()),
+        SystemTime::UNIX_EPOCH,
+        Default::default(),
+        None,
+    );
+    operation.step(Event::Storage(StorageEvent::IterResult {
+        values: vec![
+            (Key::from(inserted.key().unwrap()), Value::from(Vec::new())),
+            (first, Value::from(Vec::new())),
+        ],
+        next_start_after: None,
+    }));
+    let behind_row = Key::from(behind.to_bytes().unwrap());
+    let first_row = Key::from(
+        VersionKey::new("bucket", "key", Ulid::from_bytes([6; 16]))
+            .to_bytes()
+            .unwrap(),
+    );
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (
+                behind_row.clone(),
+                Some(Value::from(pending.to_bytes().unwrap())),
+            ),
+            (first_row, Some(Value::from(promoted.to_bytes().unwrap()))),
+        ],
+    }));
+    assert!(
+        !matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Delete { .. })]
+        ),
+        "the pending row must stay while an alias still pends"
+    );
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: bucket_rows(),
+    }));
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("the alias behind the cursor is promoted in the final transaction")
+    };
+    assert_eq!(writes[0].1, behind_row);
+    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Delete { key_space, .. })]
+            if key_space == PENDING_LOCATION_KEYSPACE
+    ));
+}
+
+#[test]
+fn conflict_restarts_scan() {
+    let mut operation = hashed_operation();
+    operation.step(location_read());
+    operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: Key::from(Vec::new()),
+    }));
+    let first = promote_one(&mut operation, [6; 16]);
+    operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    }));
+    operation.step(Event::Storage(StorageEvent::IterResult {
+        values: vec![(first, Value::from(Vec::new()))],
+        next_start_after: None,
+    }));
+    operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: Vec::new(),
+    }));
+    operation.step(Event::Storage(StorageEvent::DeleteResult {
+        key: Key::from(Vec::new()),
+    }));
+    // An owner inserted into the scanned range makes the final commit conflict.
+    let effects = operation.step(Event::Storage(StorageEvent::Error {
+        error: StorageError::TransactionConflict,
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction { .. })]
+    ));
+    assert!(!operation.is_complete());
 }
