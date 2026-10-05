@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
 
@@ -12,7 +12,6 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::jobs::{JobRequest, JobResponse};
-use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::execution::job::{JobId, JobRecord, JobState, KeyWait};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -26,12 +25,12 @@ use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
-use crate::jobs::key_wake::locked_contents;
+use crate::jobs::key_wake::{content_aliases, version_wait};
 use crate::jobs::route::{JobRouteOperation, JobRouteOutcome};
 use crate::jobs::runtime::key_unlocked;
 use crate::jobs::store::{
-    OwedWake, ack_wake, iter_prefix_page, owed_wakes, queue_remote_wakes, read_job_record,
-    read_key_waits, register_remote_wait, satisfy_key_wait,
+    OwedWake, ack_wake, owed_wakes, queue_remote_wakes, read_job_record, read_key_waits,
+    register_remote_wait, satisfy_key_wait,
 };
 use crate::tasks::task_persistence::persist_task_effect;
 
@@ -50,13 +49,23 @@ pub(crate) async fn register_waits(
     if contents.len() > MAX_AWAITED {
         return Err(format!("at most {MAX_AWAITED} contents per key wait"));
     }
-    // Only contents the caller may READ here count, and only their buckets are named.
-    let (readable, buckets) = readable_contents(context, node_id, auth, contents).await?;
-    let waits = locked_contents(context, readable.into_iter(), node_id).await?;
-    let waits: Vec<_> = waits
-        .into_iter()
-        .filter(|wait| buckets.contains(&wait.bucket))
-        .collect();
+    // Only versions the caller may READ here count; a content waits only when none is readable.
+    let mut waits: Vec<KeyWait> = Vec::new();
+    for content in contents {
+        let mut locked = Vec::new();
+        let mut readable = false;
+        for alias in readable_aliases(context, node_id, auth, content).await? {
+            match version_wait(context, &alias).await? {
+                Some(wait) => locked.push(wait),
+                None => readable = true,
+            }
+        }
+        for wait in locked.into_iter().filter(|_| !readable) {
+            if !waits.contains(&wait) {
+                waits.push(wait);
+            }
+        }
+    }
     for wait in &waits {
         register_remote_wait(&context.storage_handle, wait.key, peer, job_id, auth).await?;
     }
@@ -69,60 +78,35 @@ pub(crate) async fn register_waits(
     Ok(locked)
 }
 
-/// Aliases on this node checked per content; a content beyond them stays unknown.
-const ALIAS_PAGE: usize = 64;
-
-/// Contents with a version on this node that `auth` may READ, within its path restrictions,
-/// and the buckets of those versions. Other contents are treated as unknown.
-async fn readable_contents(
+/// Aliases of `content` on this node that `auth` may READ, within its path restrictions.
+async fn readable_aliases(
     context: &DriverContext,
     node_id: NodeId,
     auth: &AuthContext,
-    contents: &[[u8; 32]],
-) -> Result<(Vec<[u8; 32]>, BTreeSet<String>), String> {
+    content: &[u8; 32],
+) -> Result<Vec<HashIndex>, String> {
     let mut readable = Vec::new();
-    let mut buckets = BTreeSet::new();
-    for content in contents {
-        let prefix = HashIndex::hash_prefix(content).map_err(|error| error.to_string())?;
-        let (rows, _) = iter_prefix_page(
-            &context.storage_handle,
-            PATHS_INDEX_KEYSPACE,
-            Some(prefix.into()),
-            None,
-            ALIAS_PAGE,
-            None,
-        )
-        .await?;
-        let mut allowed = false;
-        for (row, _) in &rows {
-            let Ok(alias) = HashIndex::from_bytes(row) else {
-                continue;
-            };
-            if alias.node_id != node_id || alias.realm_id != auth.realm_id {
-                continue;
-            }
-            let path = object_permission_path(
-                auth.realm_id,
-                alias.group_id,
-                node_id,
-                &alias.bucket,
-                &alias.key,
-            );
-            let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: auth.clone(),
-                path,
-                required_permission: Permission::READ,
-            });
-            if drive(check, context).await.unwrap_or(false) {
-                allowed = true;
-                buckets.insert(alias.bucket);
-            }
+    for alias in content_aliases(context, content, node_id).await? {
+        if alias.realm_id != auth.realm_id {
+            continue;
         }
-        if allowed {
-            readable.push(*content);
+        let path = object_permission_path(
+            auth.realm_id,
+            alias.group_id,
+            node_id,
+            &alias.bucket,
+            &alias.key,
+        );
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: auth.clone(),
+            path,
+            required_permission: Permission::READ,
+        });
+        if drive(check, context).await.unwrap_or(false) {
+            readable.push(alias);
         }
     }
-    Ok((readable, buckets))
+    Ok(readable)
 }
 
 /// Waiting node: applies a wake from `peer`. False while the job may still be parking, so the
@@ -352,8 +336,10 @@ pub(crate) async fn arm_delivery(context: &DriverContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::store::iter_prefix_page;
     use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, park_job};
     use aruna_core::UserId;
+    use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::execution::job::JobPayload;
     use aruna_core::structs::identity::realm::RealmId;
     use ulid::Ulid;
@@ -432,18 +418,20 @@ mod tests {
 
     /// A node holding content `[9; 32]` as `sealed/data.bin` of group `[4; 16]`, sealed with a
     /// locked key, and an owner who may read that group.
-    async fn guarded_node() -> (tempfile::TempDir, DriverContext, NodeId, UserId) {
+    async fn guarded_node(sealed: bool) -> (tempfile::TempDir, DriverContext, NodeId, UserId) {
         use aruna_core::effects::StorageEffect;
         use aruna_core::keyspaces::{
-            AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, GROUP_KEYSPACE,
-            REALM_CONFIG_KEYSPACE,
+            AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+            BUCKET_ENCRYPTION_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
         };
         use aruna_core::structs::identity::auth::Actor;
         use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
         use aruna_core::structs::identity::realm::{
             RealmAuthorizationDocument, RealmConfigDocument,
         };
-        use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, BlobLocationKey};
+        use aruna_core::structs::storage::blob::{
+            BackendLocation, BackendRef, BlobLocationKey, BlobVersion, VersionKey,
+        };
         use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
         use aruna_core::structs::storage::format::{EncodingClass, PithosLayout, StoredFormat};
 
@@ -492,7 +480,11 @@ mod tests {
             storage_bucket: "bucket".to_string(),
             backend_path: "path".to_string(),
             ulid: Ulid::from_bytes([3; 16]),
-            format: StoredFormat::pithos(layout, key),
+            // An unconverted copy is plain, yet its encrypting bucket still gates it.
+            format: match sealed {
+                true => StoredFormat::pithos(layout, key),
+                false => StoredFormat::default(),
+            },
             created_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: Default::default(),
             staging: false,
@@ -509,6 +501,16 @@ mod tests {
             node,
             "sealed".to_string(),
             "data.bin".to_string(),
+        );
+        let version_key = VersionKey::new("sealed", "data.bin", Ulid::from_bytes([6; 16]));
+        let encoding = EncodingClass::Raw;
+        let version = BlobVersion::materialized(
+            [9; 32],
+            BackendRef::node_default(),
+            encoding,
+            std::time::SystemTime::UNIX_EPOCH,
+            owner,
+            None,
         );
         let realm_doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -544,6 +546,11 @@ mod tests {
                 location.to_bytes().unwrap(),
             ),
             (PATHS_INDEX_KEYSPACE, alias.to_bytes().unwrap(), Vec::new()),
+            (
+                BLOB_VERSIONS_KEYSPACE,
+                version_key.to_bytes().unwrap(),
+                version.to_bytes().unwrap(),
+            ),
         ];
         for (key_space, key, value) in rows {
             let effect = StorageEffect::Write {
@@ -575,7 +582,7 @@ mod tests {
     async fn waits_need_read() {
         use aruna_core::structs::identity::auth::PathRestriction;
 
-        let (_dir, context, node, owner) = guarded_node().await;
+        let (_dir, context, node, owner) = guarded_node(true).await;
         let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
         let job_id = JobId::from_bytes([5; 16]);
         let auth = |user_id: UserId, path_restrictions| AuthContext {
@@ -750,5 +757,30 @@ mod tests {
                 next: None
             }
         );
+    }
+
+    #[tokio::test]
+    async fn plain_copy_waits() {
+        let (_dir, context, node, owner) = guarded_node(false).await;
+        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let job_id = JobId::from_bytes([5; 16]);
+        let auth = AuthContext {
+            user_id: owner,
+            realm_id: RealmId([1; 32]),
+            path_restrictions: None,
+            session: None,
+        };
+
+        // The copy is not converted yet, but the bucket's locked key still gates it.
+        let waits = register_waits(&context, (node, peer), &auth, job_id, &[[9; 32]]);
+        let waits = waits.await.unwrap();
+
+        assert_eq!(waits.len(), 1);
+        assert_eq!(waits[0].bucket, "sealed");
+        assert_eq!(
+            waits[0].key,
+            BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1)
+        );
+        assert_eq!(registrations(&context).await, 1);
     }
 }

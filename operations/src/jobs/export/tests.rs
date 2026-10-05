@@ -86,6 +86,11 @@ impl futures_util::io::AsyncWrite for SparseWriter {
 }
 
 async fn bao_node(realm_id: RealmId) -> BaoNode {
+    node_with(realm_id, false).await
+}
+
+/// A node as `bao_node`, with a metadata handle when `metadata` holds, so it answers job control.
+async fn node_with(realm_id: RealmId, metadata: bool) -> BaoNode {
     let tempdir = tempfile::tempdir().unwrap();
     let root = tempdir.path().to_str().unwrap();
     let blob_root = tempdir.path().join("blobstore");
@@ -118,11 +123,18 @@ async fn bao_node(realm_id: RealmId) -> BaoNode {
     )
     .await
     .unwrap();
+    let metadata_handle = metadata.then(|| {
+        let path = tempdir.path().join("metadata");
+        let node_id = net.node_id();
+        let net = Some(net.clone());
+        crate::metadata::MetadataHandle::new(path, node_id, storage.clone(), net, None, None)
+            .unwrap()
+    });
     let driver = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: Some(blob),
-        metadata_handle: None,
+        metadata_handle,
         task_handle: None,
         compute_handle: None,
     });
@@ -2269,6 +2281,116 @@ async fn locked_remote_export() {
         panic!("a locked remote input must be typed, got another outcome")
     };
     assert_eq!((node_id, content), (source.net.node_id(), Some(hash)));
+    client.net.shutdown().await;
+    source.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn plain_remote_export_parks() {
+    // The remote copy is not converted yet; its encrypting bucket's locked key parks the export.
+    let realm_id = RealmId::from_bytes([131; 32]);
+    let owner = UserId::local(Ulid::from_bytes([132; 16]), realm_id);
+    let group_id = Ulid::from_bytes([133; 16]);
+    let version_id = Ulid::from_bytes([134; 16]);
+    let bucket_id = Ulid::from_bytes([135; 16]);
+    let client = bao_node(realm_id).await;
+    let source = node_with(realm_id, true).await;
+    client.net.add_peer_addr(source.net.endpoint_addr()).await;
+    source.net.add_peer_addr(client.net.endpoint_addr()).await;
+    let Event::Blob(BlobEvent::WriteFinished { location }) = source
+        .driver
+        .blob_handle
+        .as_ref()
+        .unwrap()
+        .send_blob_effect(BlobEffect::Write {
+            resolved: aruna_core::structs::storage::blob::ResolvedBackend::node_default(),
+            bucket: "remote".to_string(),
+            key: "payload".to_string(),
+            created_by: owner,
+            blob: byte_stream(FIXTURE_BYTES),
+            size: None,
+        })
+        .await
+    else {
+        panic!("source blob write failed")
+    };
+    let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
+    seed_bao(
+        &source,
+        client.net.node_id(),
+        owner,
+        group_id,
+        version_id,
+        &location,
+    )
+    .await;
+    encrypting_bucket(&source, "remote", bucket_id).await;
+    let alias = aruna_core::structs::storage::blob::HashIndex::new(
+        hash,
+        version_id,
+        realm_id,
+        group_id,
+        source.net.node_id(),
+        "remote",
+        "payload",
+    );
+    let event = source
+        .driver
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: aruna_core::keyspaces::PATHS_INDEX_KEYSPACE.to_string(),
+            key: alias.to_bytes().unwrap().into(),
+            value: Vec::new().into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+    let exact = VersionedObjectArn::new(
+        realm_id,
+        source.net.node_id(),
+        "remote",
+        "payload",
+        version_id,
+    )
+    .unwrap();
+    let candidate = ExportCandidate {
+        source: CandidateSource::RemoteExact {
+            node_id: source.net.node_id(),
+            target: exact,
+        },
+        report_source: ExportReportSource::Remote,
+        resolved_version: Some(version_id),
+        expected_blake3: Some(hash),
+    };
+    let opened = open_candidate(
+        client.driver.as_ref(),
+        &remote_spec(realm_id, owner),
+        &candidate,
+        false,
+    )
+    .await;
+    let Err(error @ ExportFailure::RemoteLocked { .. }) = opened else {
+        panic!("a locked remote input must be typed, got another outcome")
+    };
+
+    // The source registers the wait and names the dependency, so the export parks.
+    let ctx = job_context(client.driver.clone(), client.net.node_id());
+    let mut checkpoint = ExportCheckpoint::default();
+    let outcome = finish_export(&ctx, &mut checkpoint, error).await;
+
+    let JobRunOutcome::AwaitingKey(waits) = outcome else {
+        panic!("the export must park on the source's key")
+    };
+    assert_eq!(waits.len(), 1);
+    assert_eq!(waits[0].node_id, source.net.node_id());
+    assert_eq!(waits[0].bucket, "remote");
+    assert_eq!(
+        waits[0].key,
+        aruna_core::structs::storage::encryption::BucketKeyRef::new(bucket_id, 1)
+    );
     client.net.shutdown().await;
     source.net.shutdown().await;
 }
