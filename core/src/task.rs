@@ -67,6 +67,9 @@ pub enum TaskKey {
         generation: u64,
         session_id: Ulid,
     },
+    /// Hashes the pending archives of one key generation if it is unlocked. Persisted, so a
+    /// completion during an unlock session is promoted even across a restart.
+    PromotePending { bucket_id: Ulid, generation: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

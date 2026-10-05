@@ -834,6 +834,27 @@ impl OperationsTaskHandler {
                     warn!(error = %error, "Timed bucket lock failed");
                 }
             }),
+            TaskKey::PromotePending {
+                bucket_id,
+                generation,
+            } => Box::pin(async move {
+                let Some(net_handle) = self.context.net_handle.as_ref() else {
+                    warn!("Cannot promote pending archives without net handle");
+                    return;
+                };
+                let key = BucketKeyRef::new(bucket_id, generation);
+                let origin = (*net_handle.realm_id(), net_handle.node_id());
+                let promoted = crate::blob::promote::promote_unlocked(
+                    &self.context,
+                    key,
+                    origin,
+                    &self.rocrate_limits,
+                );
+                // A locked key leaves the archives pending; its next unlock promotes them.
+                if let Err(error) = promoted.await {
+                    warn!(bucket_id = %bucket_id, error = %error, "Pending promotion failed");
+                }
+            }),
             TaskKey::DrainFamilyOutbox => Box::pin(async move {
                 self.drain_family_outbox().await;
             }),

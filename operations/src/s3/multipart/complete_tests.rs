@@ -1714,3 +1714,30 @@ fn plain_completion_refused() {
         Some(CompleteUploadError::BucketKey(_))
     ));
 }
+
+#[test]
+fn pending_schedules_promotion() {
+    // A pending completion during an unlock session asks for promotion at once; the timer is
+    // persisted, so it also runs after a restart. A known hash needs none.
+    let (mut operation, location) = sealed_operation(&[b"first"]);
+    let key = location.format.bucket_key().unwrap();
+    operation.final_location = Some(location.clone());
+    let effects = operation.finish_commit();
+    let promote = Effect::Task(TaskEffect::ShortenTimer {
+        key: TaskKey::PromotePending {
+            bucket_id: key.bucket_id,
+            generation: key.generation,
+        },
+        after: Duration::ZERO,
+    });
+    assert!(effects.contains(&promote));
+
+    let (mut operation, mut known) = sealed_operation(&[b"first"]);
+    known.hashes.insert(
+        aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+        vec![7; 32],
+    );
+    operation.final_location = Some(known);
+    let effects = operation.finish_commit();
+    assert!(!effects.contains(&promote));
+}

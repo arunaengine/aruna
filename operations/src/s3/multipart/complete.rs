@@ -51,6 +51,7 @@ use aruna_core::structs::storage::multipart::{
     MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
 };
 use aruna_core::structs::storage::usage::UsageDelta;
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -501,7 +502,22 @@ impl CompleteUploadOperation {
 
     fn finish_commit(&mut self) -> Effects {
         self.state = CompleteUploadState::Finish;
-        smallvec![schedule_snapshot_publish(), schedule_cleanup_effect()]
+        let mut effects = smallvec![schedule_snapshot_publish(), schedule_cleanup_effect()];
+        // A pending archive is hashed at once when its key is unlocked, also in this session.
+        let pending = self
+            .final_location
+            .as_ref()
+            .filter(|location| location.get_blake3().is_none());
+        if let Some(key) = pending.and_then(|location| location.format.bucket_key()) {
+            effects.push(Effect::Task(TaskEffect::ShortenTimer {
+                key: TaskKey::PromotePending {
+                    bucket_id: key.bucket_id,
+                    generation: key.generation,
+                },
+                after: std::time::Duration::ZERO,
+            }));
+        }
+        effects
     }
 
     fn abort_finalize(&mut self, event: Event) -> Effects {
