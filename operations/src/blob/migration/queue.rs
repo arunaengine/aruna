@@ -341,6 +341,16 @@ async fn finish(
         crate::replication::parking::wake_parked(context, source, now)
             .await
             .map_err(|error| error.to_string())?;
+        if let Some(tasks) = context.task_handle.as_ref() {
+            match tasks
+                .send_effect(crate::replication::queue::schedule_blob_drain())
+                .await
+            {
+                Event::Task(TaskEvent::TimerScheduled { .. }) => {}
+                Event::Task(TaskEvent::Error { message, .. }) => return Err(message),
+                other => return Err(format!("could not schedule the copy drain: {other:?}")),
+            }
+        }
     }
     forget_retired(context, &record).await;
     record.finished_at_ms = Some(now);

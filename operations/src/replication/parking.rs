@@ -1090,17 +1090,33 @@ mod tests {
         use aruna_core::structs::storage::transition::{
             EncryptionTransition, TransitionKind, TransitionState, TransitionTarget,
         };
+        use aruna_core::task::TaskKey;
 
-        for failed_page in [1, 2] {
+        struct DrainObserver(tokio::sync::mpsc::UnboundedSender<TaskKey>);
+
+        #[async_trait::async_trait]
+        impl aruna_tasks::InboundTaskHandler for DrainObserver {
+            async fn handle_timer(&self, key: TaskKey) {
+                self.0.send(key).unwrap();
+            }
+        }
+
+        for (failed_page, job_count) in [(1, WAIT_PAGE + 1), (2, WAIT_PAGE + 1), (2, WAIT_PAGE)] {
             let dir = tempfile::tempdir().unwrap();
-            let context =
+            let mut context =
                 context(aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap());
+            let tasks = aruna_tasks::TaskHandle::new();
+            let (scheduled, mut drains) = tokio::sync::mpsc::unbounded_channel();
+            tasks
+                .set_inbound_handler(std::sync::Arc::new(DrainObserver(scheduled)))
+                .await;
+            context.task_handle = Some(tasks.clone());
             let storage = &context.storage_handle;
             let old = BucketKeyRef::new(Ulid::from_parts(19, 19), 1);
             source(&context, old).await;
             let mut jobs = Vec::new();
             let mut writes = Vec::new();
-            for index in 0..=WAIT_PAGE {
+            for index in 0..job_count {
                 let mut record = job(Ulid::from_parts(20, index as u128));
                 record.due_at_ms = PARKED_DUE;
                 record.attempts = 2;
@@ -1168,6 +1184,22 @@ mod tests {
                 while let Ok((effect, response, _span, _queued, _in_flight)) =
                     receivers.foreground.recv()
                 {
+                    if let StorageEffect::Write {
+                        key_space, value, ..
+                    } = &effect
+                        && key_space == TRANSITION_KEYSPACE
+                        && EncryptionTransition::from_bytes(value)
+                            .unwrap()
+                            .finished_at_ms
+                            .is_some()
+                    {
+                        let drain = runtime.block_on(async {
+                            tokio::time::timeout(std::time::Duration::from_secs(300), drains.recv())
+                                .await
+                                .unwrap()
+                        });
+                        assert_eq!(drain, Some(TaskKey::DrainReplicationQueue));
+                    }
                     let wake_scan = matches!(&effect, StorageEffect::Iter { key_space, .. }
                         if key_space == COPY_WAIT_KEYSPACE);
                     if wake_scan {
@@ -1194,8 +1226,6 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(error.contains("injected retirement wake"));
-            drop(interrupted);
-            actor.join().unwrap();
 
             let mut parked = 0;
             for (row, original) in &jobs {
@@ -1204,7 +1234,7 @@ mod tests {
                 assert_eq!(record.attempts, original.attempts);
                 assert_eq!(record.last_error, original.last_error);
             }
-            assert_eq!(parked, WAIT_PAGE + 1 - (failed_page - 1) * WAIT_PAGE);
+            assert_eq!(parked, job_count - (failed_page - 1) * WAIT_PAGE);
             let Event::Storage(StorageEvent::ReadResult {
                 value: Some(value), ..
             }) = storage
@@ -1249,12 +1279,38 @@ mod tests {
             ));
             assert!(!key_unlocked(&context, old).await);
 
+            let mut unavailable = interrupted.clone();
+            unavailable.task_handle = Some(aruna_tasks::TaskHandle::inactive());
+            let error = crate::blob::migration::queue::process_transitions(&unavailable)
+                .await
+                .unwrap_err();
+            assert!(error.contains("task scheduler unavailable"));
+            drop(unavailable);
+            for (space, expected) in [
+                (TRANSITION_KEYSPACE, pending.to_bytes().unwrap()),
+                (TRANSITION_QUEUE_KEYSPACE, Vec::new()),
+            ] {
+                let event = storage
+                    .send_storage_effect(StorageEffect::Read {
+                        key_space: space.to_string(),
+                        key: b"source".to_vec().into(),
+                        txn_id: None,
+                    })
+                    .await;
+                assert!(matches!(
+                    event,
+                    Event::Storage(StorageEvent::ReadResult { value: Some(value), .. })
+                        if value.as_ref() == expected.as_slice()
+                ));
+            }
             assert_eq!(
-                crate::blob::migration::queue::process_transitions(&context)
+                crate::blob::migration::queue::process_transitions(&interrupted)
                     .await
                     .unwrap(),
                 None
             );
+            drop(interrupted);
+            actor.join().unwrap();
             for (row, original) in &jobs {
                 let record = read_job(storage, row, None).await.unwrap().unwrap();
                 assert_ne!(record.due_at_ms, PARKED_DUE);
