@@ -36,8 +36,8 @@ fn measurements() {
         let recovered = decapsulate(&parameters, &key, &ciphertext).unwrap();
         let decapsulate_us = start.elapsed().as_micros();
         assert_eq!(
-            *shared.derive(b"measurement write").unwrap(),
-            *recovered.derive(b"measurement write").unwrap()
+            shared.derive(b"measurement write").unwrap().as_bytes(),
+            recovered.derive(b"measurement write").unwrap().as_bytes()
         );
         std::println!(
             "attributes={} rows={} key_bytes={} ciphertext_bytes={} issue_us={} decapsulate_us={}",

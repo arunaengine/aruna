@@ -112,8 +112,10 @@ fn literal_scopes() {
         )
         .unwrap();
         assert_eq!(
-            *open(&parameters, &key, &envelope, b"write").unwrap(),
-            [5; 32]
+            open(&parameters, &key, &envelope, b"write")
+                .unwrap()
+                .as_bytes(),
+            &[5; 32]
         );
         let denied = seal(&parameters, &facts(1, denied), &[5; 32], b"write", &mut rng).unwrap();
         assert!(open(&parameters, &key, &denied, b"write").is_err());
@@ -335,7 +337,7 @@ fn envelope_binding() {
     let shared = decapsulate(&parameters, &key, &envelope.ciphertext).unwrap();
     let aes_key = shared.derive(b"write").unwrap();
     use aes_gcm_core::{Aes256Gcm, KeyInit, aead::AeadInOut};
-    let cipher = Aes256Gcm::new_from_slice(&aes_key[..]).unwrap();
+    let cipher = Aes256Gcm::new_from_slice(aes_key.as_bytes()).unwrap();
     let mut plaintext = [5u8; 32];
     let tag = cipher
         .encrypt_inout_detached(

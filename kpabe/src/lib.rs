@@ -26,7 +26,7 @@ mod vectors;
 
 pub use envelope::{Envelope, open, seal};
 pub use policy::{Attribute, Policy};
-pub use scheme::{Ciphertext, KemKey, MasterSecret, PublicParameters, UserKey};
+pub use scheme::{Ciphertext, KemKey, MasterSecret, PublicParameters, SecretKey, UserKey};
 pub use scheme::{decapsulate, encapsulate, issue, setup_from_seed};
 
 /// Maximum attributes in one ciphertext.

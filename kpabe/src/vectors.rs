@@ -63,11 +63,12 @@ fn cases() -> Value {
         let (ciphertext, shared) =
             encapsulate(&parameters, &attributes, &mut StdRng::from_seed(kem_seed)).unwrap();
         assert_eq!(
-            *shared.derive(&context).unwrap(),
-            *decapsulate(&parameters, &key, &ciphertext)
+            shared.derive(&context).unwrap().as_bytes(),
+            decapsulate(&parameters, &key, &ciphertext)
                 .unwrap()
                 .derive(&context)
                 .unwrap()
+                .as_bytes()
         );
         let envelope = seal(
             &parameters,
@@ -78,8 +79,10 @@ fn cases() -> Value {
         )
         .unwrap();
         assert_eq!(
-            *open(&parameters, &key, &envelope, &context).unwrap(),
-            [5; 32]
+            open(&parameters, &key, &envelope, &context)
+                .unwrap()
+                .as_bytes(),
+            &[5; 32]
         );
         cases.push(json!({
             "name": name, "epochs": epochs,
@@ -88,7 +91,7 @@ fn cases() -> Value {
             "kem_seed": hex::encode(kem_seed), "seal_seed": hex::encode(seal_seed),
             "user_key": hex::encode(&*encode_key(&key).unwrap()),
             "ciphertext": hex::encode(ciphertext.to_bytes().unwrap()),
-            "derived_key": hex::encode(&shared.derive(b"vector KDF").unwrap()[..]),
+            "derived_key": hex::encode(shared.derive(b"vector KDF").unwrap().as_bytes()),
             "envelope": hex::encode(envelope.to_bytes().unwrap()),
         }));
     }
@@ -121,16 +124,21 @@ fn fixed_vectors() {
         let ciphertext = Ciphertext::from_bytes(&parameters, &bytes(&case["ciphertext"])).unwrap();
         assert_eq!(
             hex::encode(
-                &decapsulate(&parameters, &key, &ciphertext)
+                decapsulate(&parameters, &key, &ciphertext)
                     .unwrap()
                     .derive(b"vector KDF")
-                    .unwrap()[..]
+                    .unwrap()
+                    .as_bytes()
             ),
             case["derived_key"].as_str().unwrap()
         );
         let envelope = Envelope::from_bytes(&parameters, &bytes(&case["envelope"])).unwrap();
         assert_eq!(
-            hex::encode(&open(&parameters, &key, &envelope, &bytes(&case["context"])).unwrap()[..]),
+            hex::encode(
+                open(&parameters, &key, &envelope, &bytes(&case["context"]))
+                    .unwrap()
+                    .as_bytes()
+            ),
             expected["object_key"].as_str().unwrap()
         );
     }

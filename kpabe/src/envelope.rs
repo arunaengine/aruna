@@ -5,7 +5,7 @@ use rand_core::TryCryptoRng;
 use zeroize::Zeroizing;
 
 use crate::encoding::{Reader, bounded, header};
-use crate::{Attribute, Ciphertext, Error, PublicParameters, UserKey, check_context};
+use crate::{Attribute, Ciphertext, Error, PublicParameters, SecretKey, UserKey, check_context};
 use crate::{decapsulate, encapsulate};
 
 /// A public KEM ciphertext and an authenticated, sealed 32-byte object private key.
@@ -55,7 +55,7 @@ pub fn seal(
     check_context(context)?;
     let (ciphertext, shared) = encapsulate(parameters, attributes, rng)?;
     let key = shared.derive(context)?;
-    let cipher = Aes256Gcm::new_from_slice(&key[..]).map_err(|_| Error)?;
+    let cipher = Aes256Gcm::new_from_slice(key.as_bytes()).map_err(|_| Error)?;
     let mut envelope = Envelope {
         ciphertext,
         nonce: [0; 12],
@@ -78,16 +78,24 @@ pub fn seal(
 
 /// Authenticates the policy, context and associated data and returns a zeroizing object key.
 /// All failures use the same error and expose no partially recovered plaintext.
+
+/// ```compile_fail,E0277
+/// let debug = |p, k, e| format!("{:?}", aruna_kpabe::open(p, k, e, b"ctx").unwrap());
+/// ```
+
+/// ```compile_fail,E0599
+/// let clone = |p, k, e| aruna_kpabe::open(p, k, e, b"ctx").unwrap().clone();
+/// ```
 pub fn open(
     parameters: &PublicParameters,
     key: &UserKey,
     envelope: &Envelope,
     context: &[u8],
-) -> Result<Zeroizing<[u8; 32]>, Error> {
+) -> Result<SecretKey, Error> {
     check_context(context)?;
     let shared = decapsulate(parameters, key, &envelope.ciphertext)?;
     let key = shared.derive(context)?;
-    let cipher = Aes256Gcm::new_from_slice(&key[..]).map_err(|_| Error)?;
+    let cipher = Aes256Gcm::new_from_slice(key.as_bytes()).map_err(|_| Error)?;
     let mut plaintext = Zeroizing::new([0u8; 32]);
     plaintext.copy_from_slice(&envelope.sealed[..32]);
     cipher
@@ -98,5 +106,5 @@ pub fn open(
             envelope.sealed[32..].try_into().map_err(|_| Error)?,
         )
         .map_err(|_| Error)?;
-    Ok(plaintext)
+    Ok(SecretKey(plaintext))
 }

@@ -33,8 +33,10 @@ fn policy_shapes() {
             let policy = Policy::new(b"bucket", epochs, scopes).unwrap();
             let key = issue(&parameters, &master, &policy, &mut rng).unwrap();
             assert_eq!(
-                *open(&parameters, &key, &imported, b"write context").unwrap(),
-                [5; 32]
+                open(&parameters, &key, &imported, b"write context")
+                    .unwrap()
+                    .as_bytes(),
+                &[5; 32]
             );
             assert!(open(&parameters, &key, &imported, b"wrong context").is_err());
         }
@@ -50,8 +52,10 @@ fn policy_shapes() {
             ];
             let envelope = seal(&parameters, &attributes, &[5; 32], b"write", &mut rng).unwrap();
             assert_eq!(
-                *open(&parameters, &key, &envelope, b"write").unwrap(),
-                [5; 32]
+                open(&parameters, &key, &envelope, b"write")
+                    .unwrap()
+                    .as_bytes(),
+                &[5; 32]
             );
         }
     }

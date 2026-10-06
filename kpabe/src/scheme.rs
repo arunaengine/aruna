@@ -74,11 +74,29 @@ impl Ciphertext {
 /// A zeroizing KEM shared secret, used through a context-bound HKDF key derivation.
 pub struct KemKey(pub(crate) Zeroizing<Gt>);
 
+/// An owned 32-byte key, cleared on drop and accessible only by deliberate borrowing.
+pub struct SecretKey(pub(crate) Zeroizing<[u8; 32]>);
+
+impl SecretKey {
+    /// Borrows the secret bytes without copying them.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 impl KemKey {
     /// Derives 32 bytes with HKDF-SHA256; refuses empty or oversized contexts.
-    pub fn derive(&self, context: &[u8]) -> Result<Zeroizing<[u8; 32]>, Error> {
+
+    /// ```compile_fail,E0277
+    /// fn check(k: &aruna_kpabe::KemKey) { format!("{:?}", k.derive(b"ctx").unwrap()); }
+    /// ```
+
+    /// ```compile_fail,E0599
+    /// fn check(k: &aruna_kpabe::KemKey) { k.derive(b"ctx").unwrap().clone(); }
+    /// ```
+    pub fn derive(&self, context: &[u8]) -> Result<SecretKey, Error> {
         check_context(context)?;
-        derive_key(&self.0, context)
+        derive_key(&self.0, context).map(SecretKey)
     }
 }
 
