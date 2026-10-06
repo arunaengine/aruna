@@ -1473,8 +1473,9 @@ pub async fn add_group_member(
     )
     .await
     .map_err(map_member_error)?;
+    let members = vec![user_id];
     let key_requests =
-        crate::routes::storage::abe::member_requests(&state, &auth, group_id, user_id).await;
+        crate::routes::storage::abe::member_requests(&state, &auth, group_id, members).await;
 
     Ok((
         StatusCode::CREATED,

@@ -101,6 +101,9 @@ pub enum SubOperationEvent {
     UserUpdated {
         result: Result<(), String>,
     },
+    KeyRequestsOpened {
+        request_ids: Vec<Ulid>,
+    },
 }
 
 #[derive(Debug, PartialEq)]

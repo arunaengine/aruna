@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod envelope;
+mod member;
 mod requests;
 mod snapshot;
 
@@ -20,6 +21,7 @@ use aruna_core::structs::storage::abe_access::*;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, BucketKeyRecord};
 use aruna_core::types::{Effects, Key, TxnId, Value};
+pub use member::MemberKeysOperation;
 use smallvec::smallvec;
 use snapshot::Snapshot;
 use thiserror::Error;
