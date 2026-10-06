@@ -54,6 +54,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::bucket::usage::router())
         .merge(storage::compression::router())
         .merge(storage::encryption::router())
+        .merge(storage::abe::router())
         .merge(storage::bucket::keys::router())
         .merge(drs::router())
         .merge(staging::router())
@@ -228,6 +229,8 @@ pub(crate) mod tests {
         ("GET", "/data/sync/quarantine"),
         ("GET", "/data/sync/quarantine/{record_id}"),
         ("GET", "/metadata/audit"),
+        ("GET", "/data/blobs/envelope"),
+        ("GET", "/data/blobs/content"),
         ("GET", "/data/blobs/locations"),
         ("GET", "/data/buckets/{bucket}/placement"),
         ("GET", "/data/buckets/{bucket}/placement/coverage"),
