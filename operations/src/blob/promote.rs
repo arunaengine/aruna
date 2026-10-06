@@ -737,7 +737,26 @@ pub async fn promote_unlocked(
             let archive = ArchiveKey::from_bytes(row)?;
             let operation =
                 PromotePendingOperation::new(archive.clone(), origin.0, origin.1, limits.clone());
-            match crate::driver::drive(operation, context).await? {
+            let outcome = match crate::driver::drive(operation, context).await {
+                Err(PromoteError::Blob(BlobError::IntegrityCheckFailed(reason))) => {
+                    let claim = read_value(
+                        &context.storage_handle,
+                        PENDING_CLAIM_KEYSPACE,
+                        archive.to_bytes(),
+                    )
+                    .await?;
+                    let Some(claimed) = claim
+                        .as_ref()
+                        .and_then(|claim| <[u8; 32]>::try_from(claim.as_ref()).ok())
+                    else {
+                        return Err(BlobError::IntegrityCheckFailed(reason).into());
+                    };
+                    drop_received(context, &archive, claimed, origin, reason).await?;
+                    continue;
+                }
+                result => result?,
+            };
+            match outcome {
                 Promotion::Promoted { .. } => promoted += 1,
                 // A lock in between leaves the rest pending until the next unlock.
                 Promotion::AwaitingKey(_) => return Ok(promoted),
@@ -760,11 +779,21 @@ pub async fn drop_mismatch(
     context: &crate::driver::DriverContext,
     archive: &ArchiveKey,
     claimed: [u8; 32],
+    origin: (RealmId, NodeId),
+) -> Result<usize, PromoteError> {
+    let reason = "replicated content hash differs from the claimed hash".to_string();
+    drop_received(context, archive, claimed, origin, reason).await
+}
+
+async fn drop_received(
+    context: &crate::driver::DriverContext,
+    archive: &ArchiveKey,
+    claimed: [u8; 32],
     (realm_id, node_id): (RealmId, NodeId),
+    reason: String,
 ) -> Result<usize, PromoteError> {
     use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
     let storage = &context.storage_handle;
-    let reason = "replicated content hash differs from the claimed hash".to_string();
     let now_ms = aruna_core::time::unix_timestamp_millis();
     let record = BlobQuarantineRecord::new(claimed, archive.backend.clone(), reason, now_ms);
     let write = StorageEffect::Write {
@@ -777,69 +806,200 @@ pub async fn drop_mismatch(
     {
         return Err(error.into());
     }
-    let owners = owner_versions(storage, archive).await?;
     let mut dropped = 0;
-    for version in owners {
-        let row = version.to_bytes()?;
-        let Some(value) = read_value(storage, BLOB_VERSIONS_KEYSPACE, row).await? else {
-            continue;
-        };
-        let stored = BlobVersion::from_bytes(&value)?;
-        let bucket = version.bucket.as_bytes().to_vec();
-        let info = read_value(storage, S3_BUCKET_KEYSPACE, bucket).await?;
-        let (Some(info), Some(_)) = (info, stored.state.pending_archive()) else {
-            continue;
-        };
-        let input = DeleteObjectInput {
-            bucket: version.bucket.clone(),
-            key: version.key.clone(),
-            version_id: Some(version.version_id),
-            group_id: BucketInfo::from_bytes(&info)?.group_id,
-            realm_id,
-            node_id,
-            deleted_by: stored.created_by,
-        };
-        match crate::driver::drive(DeleteObjectOperation::new(input), context).await {
-            Ok(_) => dropped += 1,
-            Err(error) => return Err(PromoteError::Dropped(error.to_string())),
+    loop {
+        let fence = RejectOwnersOperation::new(archive.clone(), &record)?;
+        let owners = crate::driver::drive(fence, context).await?;
+        if owners.is_empty() {
+            return Ok(dropped);
+        }
+        let before = dropped;
+        for version in owners {
+            let row = version.to_bytes()?;
+            let Some(value) = read_value(storage, BLOB_VERSIONS_KEYSPACE, row).await? else {
+                continue;
+            };
+            let stored = BlobVersion::from_bytes(&value)?;
+            let bucket = version.bucket.as_bytes().to_vec();
+            let info = read_value(storage, S3_BUCKET_KEYSPACE, bucket).await?;
+            let Some(info) = info else {
+                continue;
+            };
+            if stored.state.pending_archive() != Some(archive) {
+                continue;
+            }
+            let input = DeleteObjectInput {
+                bucket: version.bucket.clone(),
+                key: version.key.clone(),
+                version_id: Some(version.version_id),
+                group_id: BucketInfo::from_bytes(&info)?.group_id,
+                realm_id,
+                node_id,
+                deleted_by: stored.created_by,
+            };
+            match crate::driver::drive(DeleteObjectOperation::new(input), context).await {
+                Ok(_) => dropped += 1,
+                Err(error) => return Err(PromoteError::Dropped(error.to_string())),
+            }
+        }
+        if dropped == before {
+            return Err(PromoteError::Dropped(
+                "pending owners could not be removed".into(),
+            ));
         }
     }
-    let delete = StorageEffect::Delete {
-        key_space: PENDING_CLAIM_KEYSPACE.to_string(),
-        key: archive.to_bytes().into(),
-        txn_id: None,
-    };
-    if let Event::Storage(StorageEvent::Error { error }) = storage.send_storage_effect(delete).await
-    {
-        return Err(error.into());
-    }
-    Ok(dropped)
 }
 
-/// Every version that names `archive` in an owner row.
-async fn owner_versions(
-    storage: &aruna_storage::StorageHandle,
-    archive: &ArchiveKey,
-) -> Result<Vec<VersionKey>, PromoteError> {
-    let mut start_after = None;
-    let mut versions = Vec::new();
-    loop {
-        let (rows, _) = crate::jobs::store::iter_prefix_page(
-            storage,
-            COPY_OWNER_KEYSPACE,
-            Some(CopyOwner::prefix(archive).into()),
-            start_after,
-            PROMOTE_PAGE,
-            None,
-        )
-        .await
-        .map_err(|error| PromoteError::Storage(StorageError::ReadError(error)))?;
-        for (row, _) in &rows {
-            versions.push(CopyOwner::from_key(row)?.version);
+#[derive(Debug, PartialEq)]
+enum RejectState {
+    Start,
+    Scan,
+    Write,
+    Commit,
+    Abort,
+    Finish,
+    Error,
+}
+
+#[derive(Debug, PartialEq)]
+struct RejectOwnersOperation {
+    archive: ArchiveKey,
+    row: (Key, Value),
+    state: RejectState,
+    txn_id: Option<TxnId>,
+    cursor: Option<Key>,
+    owners: Vec<VersionKey>,
+    restarts: u8,
+    error: Option<PromoteError>,
+}
+
+impl RejectOwnersOperation {
+    fn new(archive: ArchiveKey, record: &BlobQuarantineRecord) -> Result<Self, PromoteError> {
+        Ok(Self {
+            archive,
+            row: (record.key().into(), record.to_bytes()?.into()),
+            state: RejectState::Start,
+            txn_id: None,
+            cursor: None,
+            owners: Vec::new(),
+            restarts: 0,
+            error: None,
+        })
+    }
+
+    fn scan(&mut self) -> Effects {
+        self.state = RejectState::Scan;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: COPY_OWNER_KEYSPACE.to_string(),
+            prefix: Some(CopyOwner::prefix(&self.archive).into()),
+            start: self.cursor.clone().map(IterStart::After),
+            limit: PROMOTE_PAGE,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn advance(&mut self, event: Event) -> Result<Effects, PromoteError> {
+        match (&self.state, event) {
+            (RejectState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
+                self.txn_id = Some(txn_id);
+                Ok(self.scan())
+            }
+            (RejectState::Scan, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                for (row, _) in &values {
+                    self.owners.push(CopyOwner::from_key(row)?.version);
+                }
+                self.cursor = values.last().map(|(row, _)| row.clone());
+                if values.len() == PROMOTE_PAGE {
+                    return Ok(self.scan());
+                }
+                self.state = RejectState::Write;
+                Ok(smallvec![Effect::Storage(StorageEffect::Write {
+                    key_space: BLOB_QUARANTINE_KEYSPACE.to_string(),
+                    key: self.row.0.clone(),
+                    value: self.row.1.clone(),
+                    txn_id: self.txn_id,
+                })])
+            }
+            (RejectState::Write, Event::Storage(StorageEvent::WriteResult { .. })) => {
+                self.state = RejectState::Commit;
+                Ok(smallvec![Effect::Storage(
+                    StorageEffect::CommitTransaction {
+                        txn_id: self.txn_id.take().ok_or(PromoteError::BadHashes)?,
+                    }
+                )])
+            }
+            (RejectState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
+                self.state = RejectState::Finish;
+                Ok(smallvec![])
+            }
+            (
+                RejectState::Commit,
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }),
+            ) if self.restarts < MAX_RESTARTS => {
+                self.restarts += 1;
+                self.cursor = None;
+                self.owners.clear();
+                Ok(self.start())
+            }
+            (RejectState::Abort, Event::Storage(StorageEvent::TransactionAborted { .. })) => {
+                self.state = RejectState::Error;
+                Ok(smallvec![])
+            }
+            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
+            (_, received) => Err(PromoteError::InvalidStateEvent {
+                state: "RejectOwners",
+                expected: "the storage result of the last effect",
+                received,
+            }),
         }
-        match rows.last() {
-            Some((row, _)) if rows.len() == PROMOTE_PAGE => start_after = Some(row.clone()),
-            _ => return Ok(versions),
+    }
+}
+
+impl Operation for RejectOwnersOperation {
+    type Output = Vec<VersionKey>;
+    type Error = PromoteError;
+
+    fn start(&mut self) -> Effects {
+        self.state = RejectState::Start;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match self.advance(event) {
+            Ok(effects) => effects,
+            Err(error) => {
+                self.error = Some(error);
+                self.abort()
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, RejectState::Finish | RejectState::Error)
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        if self.state == RejectState::Finish {
+            Ok(self.owners)
+        } else {
+            Err(self.error.unwrap_or(PromoteError::BadHashes))
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        match self.txn_id.take() {
+            Some(txn_id) => {
+                self.state = RejectState::Abort;
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            }
+            None => {
+                self.state = RejectState::Error;
+                smallvec![]
+            }
         }
     }
 }
