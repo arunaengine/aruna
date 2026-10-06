@@ -84,6 +84,7 @@ pub struct KeyOperation {
     recipient_keys: Vec<UserKeyRecord>,
     keys: Option<ReadVaultOperation>,
     request: Option<KeyRequest>,
+    queue_full: bool,
     result: Option<KeyResult>,
     output: Option<Result<KeyResult, KeyError>>,
 }
@@ -110,6 +111,7 @@ impl KeyOperation {
             recipient_keys: Vec::new(),
             keys: None,
             request: None,
+            queue_full: false,
             result: None,
             output: None,
         }

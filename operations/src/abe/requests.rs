@@ -105,9 +105,7 @@ impl KeyOperation {
         if let Err(error) = self.scope_allowed(&scope) {
             return self.fail(error);
         }
-        if values.len() > MAX_REQUESTS {
-            return self.fail(AbeError::Limit);
-        }
+        let overflow = values.len() > MAX_REQUESTS;
         let mut open = Vec::new();
         for (key, value) in values {
             let request = match KeyRequest::from_bytes(&value) {
@@ -124,9 +122,9 @@ impl KeyOperation {
         let same = open
             .iter()
             .position(|r| r.scope == scope && r.restrictions == restrictions);
+        self.queue_full = overflow || open.len() >= MAX_REQUESTS;
         let request = match (same, self.snapshot.as_ref()) {
             (Some(index), _) => open.swap_remove(index),
-            (None, _) if open.len() >= MAX_REQUESTS => return self.fail(AbeError::Limit),
             (None, None) => return self.fail(KeyError::Missing),
             (None, Some(s)) => {
                 let key = self.newest();
@@ -186,6 +184,10 @@ impl KeyOperation {
                 self.result = Some(KeyResult::Grant(grant));
                 return self.flush();
             }
+        }
+        // A full open-request queue refuses only after no reusable grant is found.
+        if self.queue_full {
+            return self.fail(AbeError::Limit);
         }
         self.issue(request)
     }

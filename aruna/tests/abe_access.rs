@@ -585,6 +585,17 @@ async fn abe_limits() -> TestResult<()> {
         )
         .await?;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+        // With a full open-request queue, a held scope still returns its grant.
+        for i in 1..MAX_REQUESTS {
+            let (status, body) = send(request(format!("bar/{i}"))).await?;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        }
+        let (status, repeated) = send(request("foo/0".into())).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(repeated["record"], first["record"]);
+        let (status, _) = send(request(format!("bar/{MAX_REQUESTS}"))).await?;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;

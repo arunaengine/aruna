@@ -125,6 +125,7 @@ fn unexpected() -> ServerError {
 - Otherwise the deduplicated open request is returned (`202`); repeating it returns its state.
 - Repeating an issued request returns its current grant (`200`).
 - A recipient holds at most 64 current grants per bucket; a new grant past that returns `413`.
+- At most 64 open requests per recipient and bucket; a new one past that returns `413`.
 - Binary fields use padded base64; request ids use ULIDs."#, params(("bucket" = String, Path, description = "Node-local S3 bucket name")),
     request_body(content = RequestBody, example = json!({"scope":{"kind":"subtree","value":"foo/"}})),
     responses((status = 200, body = RecordView, description = "Node-issued grant", example = json!({"fields":{},"record":"AA==","aad":"AA=="})),
