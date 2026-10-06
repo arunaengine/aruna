@@ -66,6 +66,7 @@ pub async fn content(
         node_id: state.get_node_id(),
     })
     .with_restrictions(auth.path_restrictions.clone());
+    let keyed = private.is_some();
     if let Some(private) = private {
         let (envelope, archive) = read_envelope(&state, &query, version).await?;
         operation = operation.with_object(envelope, archive, private);
@@ -78,9 +79,16 @@ pub async fn content(
             "download capacity exhausted".into(),
         ),
     })?;
-    let result = drive(operation, &state.get_ctx())
-        .await
-        .map_err(read_error)?;
+    let result = match drive(operation, &state.get_ctx()).await {
+        Err(GetObjectError::ConversionError(aruna_core::errors::ConversionError::BucketKey(
+            aruna_core::structs::storage::encryption::BucketKeyError::Locked(_),
+        ))) if !keyed => {
+            // A version without an envelope needs bucket unlock, not an object key.
+            read_envelope(&state, &query, version).await?;
+            return Err(abe_error(AbeError::Required));
+        }
+        result => result.map_err(read_error)?,
+    };
     let mut response = Response::new(download::body(result.blob, permit));
     let (status, length) = match result.resolved_range {
         Some(range) => {

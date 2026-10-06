@@ -41,6 +41,8 @@ pub enum AbeError {
     Limit,
     #[error("encryption cryptography failed")]
     Crypto,
+    #[error("the object version was not found")]
+    Missing,
 }
 
 impl From<aruna_kpabe::Error> for AbeError {

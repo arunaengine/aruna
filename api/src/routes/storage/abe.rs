@@ -57,6 +57,7 @@ fn abe_error(error: AbeError) -> ServerError {
         AbeError::Scope => (StatusCode::UNPROCESSABLE_ENTITY, "scope_unsupported"),
         AbeError::Limit => (StatusCode::PAYLOAD_TOO_LARGE, "encryption_limit"),
         AbeError::Crypto => (StatusCode::INTERNAL_SERVER_ERROR, "encryption_failed"),
+        AbeError::Missing => return ServerError::NotFound,
     };
     ServerError::Refused(status, code, error.to_string())
 }
@@ -117,7 +118,7 @@ async fn read_envelope(
     params(("bucket" = String, Query, description = "Node-local S3 bucket name"), ("key" = String, Query, description = "Literal object key"), ("version_id" = String, Query, description = "Pinned version ULID")),
     responses((status = 200, body = EnvelopeView, description = "Envelope of the exact authorized version", example = json!({"version_id":"01JABCDEF0123456789ABCDEFG","context":{},"parameters":{},"envelope":{}})),
         (status = 400, body = ErrorResponse, description = "Malformed version"), (status = 401, body = ErrorResponse, description = "Bearer token required"),
-        (status = 403, body = ErrorResponse, description = "READ refused"), (status = 409, body = ErrorResponse, description = "Envelope pending or stale version")), security(("bearer_auth" = [])))]
+        (status = 403, body = ErrorResponse, description = "READ refused"), (status = 404, body = ErrorResponse, description = "Version missing"), (status = 409, body = ErrorResponse, description = "Envelope pending or stale version")), security(("bearer_auth" = [])))]
 pub async fn envelope(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,

@@ -84,7 +84,7 @@ impl Operation for EnvelopeOperation {
                     .as_ref()
                     .and_then(|v| BlobVersion::from_bytes(v).ok())
                 else {
-                    return self.fail(AbeError::Stale);
+                    return self.fail(AbeError::Missing);
                 };
                 self.location = version.location_key().map(|k| k.to_bytes());
                 let Some(id) = values[1]
