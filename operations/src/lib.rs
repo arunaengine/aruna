@@ -7,6 +7,7 @@
 #![recursion_limit = "512"]
 #![allow(clippy::large_enum_variant, clippy::result_large_err)]
 
+pub mod abe;
 pub mod assistant;
 pub mod auth;
 pub mod blob;
