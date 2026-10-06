@@ -260,7 +260,7 @@ pub fn create_envelope(plan: EnvelopePlan) -> Result<(ObjectEnvelope, SharedSecr
         &context.attributes()?,
         scalar,
         &bytes,
-        &mut SystemRng,
+        &mut SysRng,
     )?
     .to_bytes()?;
     let recovery = seal_to(&plan.bucket_public, RECOVERY_PURPOSE, &bytes, scalar)
@@ -288,24 +288,7 @@ pub struct EnvelopeArchive {
     pub location_key: Vec<u8>,
 }
 
-pub struct SystemRng;
-impl hpke::rand_core::TryRng for SystemRng {
-    type Error = getrandom::Error;
-    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
-        let mut bytes = [0u8; 4];
-        getrandom::fill(&mut bytes)?;
-        Ok(u32::from_le_bytes(bytes))
-    }
-    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
-        let mut bytes = [0u8; 8];
-        getrandom::fill(&mut bytes)?;
-        Ok(u64::from_le_bytes(bytes))
-    }
-    fn try_fill_bytes(&mut self, bytes: &mut [u8]) -> Result<(), Self::Error> {
-        getrandom::fill(bytes)
-    }
-}
-impl hpke::rand_core::TryCryptoRng for SystemRng {}
+pub use getrandom::SysRng;
 
 #[derive(Debug, PartialEq)]
 pub enum AbeEffect {

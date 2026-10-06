@@ -31,7 +31,7 @@ impl BlobHandler {
                         &parameters,
                         &master,
                         &policy,
-                        &mut aruna_core::structs::storage::abe::SystemRng,
+                        &mut aruna_core::structs::storage::abe::SysRng,
                     )?;
                     let aad = context.bytes()?;
                     let recipient = r

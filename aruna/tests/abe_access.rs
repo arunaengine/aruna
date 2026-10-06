@@ -8,7 +8,7 @@ mod shared;
 use aruna_core::compute::SecretBytes;
 use aruna_core::key_seal::{SealedSecret, open_sealed, seal_to};
 use aruna_core::structs::storage::abe::{
-    AbeError, GRANT_PURPOSE, SystemRng, create_parameters, derive_master, setup_context,
+    AbeError, GRANT_PURPOSE, SysRng, create_parameters, derive_master, setup_context,
 };
 use aruna_core::structs::storage::abe_access::{GrantContext, KeyGrant, KeyScope};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
@@ -67,7 +67,7 @@ fn abe_master() {
     let (parameters, master) =
         derive_master(&SecretBytes::new(clamped.to_vec()), &context).unwrap();
     let policy = KeyScope::Subtree("foo/".into()).policy(&a, &[1]).unwrap();
-    let user = aruna_kpabe::issue(&parameters, &master, &policy, &mut SystemRng).unwrap();
+    let user = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng).unwrap();
     for epoch in [1, 2] {
         let attrs = [
             Attribute::Domain(a.domain().unwrap()),
@@ -75,7 +75,7 @@ fn abe_master() {
             Attribute::Prefix(b"foo/".to_vec()),
         ];
         let sealed =
-            aruna_kpabe::seal(&parameters, &attrs, &[8; 32], b"envelope", &mut SystemRng).unwrap();
+            aruna_kpabe::seal(&parameters, &attrs, &[8; 32], b"envelope", &mut SysRng).unwrap();
         assert_eq!(
             aruna_kpabe::open(&parameters, &user, &sealed, b"envelope").is_ok(),
             epoch == 1
@@ -145,7 +145,7 @@ async fn abe_read() -> TestResult<()> {
         let parameters = context.request.parameters.public()?;
         let master = context.request.parameters.recompute(&bucket_private)?;
         let policy = context.request.scope.policy(&context.request.parameters,&context.request.epochs)?;
-        let key = aruna_kpabe::issue(&parameters,&master,&policy,&mut SystemRng)?;
+        let key = aruna_kpabe::issue(&parameters,&master,&policy,&mut SysRng)?;
         let aad = context.bytes()?;
         assert_eq!(aad,bytes(&proposal["aad"]));
         let sealed = key.seal(|plain|seal_to(&user_public,GRANT_PURPOSE,&aad,plain).map_err(|_|aruna_kpabe::Error))?;
