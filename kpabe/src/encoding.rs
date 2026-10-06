@@ -215,12 +215,13 @@ impl UserKey {
 
     /// Opens an explicitly sealed key using a caller's authenticated opener and checked decoding.
     /// The opener must return a zeroizing plaintext and authenticate its recipient and context.
+    /// Allows 32 encapsulation bytes and a 16-byte authentication tag beyond the encoding limit.
     pub fn open(
         parameters: &PublicParameters,
         sealed: &[u8],
         open: impl FnOnce(&[u8]) -> Result<Zeroizing<Vec<u8>>, Error>,
     ) -> Result<Self, Error> {
-        if sealed.len() > MAX_BYTES {
+        if sealed.len() > MAX_BYTES + 32 + 16 {
             return Err(Error);
         }
         let bytes = open(sealed)?;
