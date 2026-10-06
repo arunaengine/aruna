@@ -83,7 +83,7 @@ use aruna_operations::s3::multipart::create::{
     CreateMultipartInput as CMPI, CreateMultipartOperation,
 };
 use aruna_operations::s3::multipart::part_copy::{
-    PartCopyInput as UploadPartCopyData, upload_part_copy,
+    PartCopyInput as UploadPartCopyData, upload_part_token,
 };
 use aruna_operations::s3::multipart::part_upload::{UploadPartInput as UPI, UploadPartOperation};
 use aruna_operations::s3::multipart::parts::{ListPartsInput as LPI, ListPartsOperation};
@@ -1307,7 +1307,8 @@ impl S3 for ArunaS3Service {
             )
             .await?;
 
-        let result = upload_part_copy(
+        let token = self.token_read(&req.extensions);
+        let result = upload_part_token(
             &self.state,
             UploadPartCopyData {
                 source_bucket,
@@ -1324,6 +1325,7 @@ impl S3 for ArunaS3Service {
                 conditions,
                 source_auth_context,
             },
+            token,
         )
         .await
         .map_err(IntoS3Error::into_s3_error)?;
