@@ -2,7 +2,9 @@
 //! Imports opened grants, opens object envelopes and issues scoped keys from a bucket key.
 //! Secret inputs are taken as mutable slices and cleared, which also clears the caller's buffer.
 
-use aruna_kpabe::{Attribute, Envelope, MasterSecret, Policy, PublicParameters, UserKey};
+use aruna_kpabe::{
+    Attribute, Envelope, MasterSecret, Policy, PublicParameters, SecretKey, UserKey,
+};
 use wasm_bindgen::prelude::wasm_bindgen;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -14,6 +16,16 @@ const SEED_SALT: &[u8] = b"aruna bucket ABE seed v1";
 pub struct ScopedKey {
     parameters: PublicParameters,
     key: UserKey,
+}
+
+#[wasm_bindgen]
+extern "C" {
+    /// A byte array owned by JavaScript.
+    #[wasm_bindgen(typescript_type = "Uint8Array")]
+    pub type Bytes;
+    /// Copies a view of WASM memory, so secret outputs leave no WASM copy behind.
+    #[wasm_bindgen(js_namespace = Uint8Array, js_name = from)]
+    fn copy_out(bytes: &[u8]) -> Bytes;
 }
 
 fn refused<T>(_: T) -> String {
@@ -30,32 +42,55 @@ fn admitted(
 }
 
 /// Imports an opened grant key under the admitted parameters and clears `plain`.
+/// Refuses a key whose policy is not exactly the expected scope and epochs.
 #[wasm_bindgen]
 pub fn import_key(
     parameters: &[u8],
     context: &[u8],
     fingerprint: &[u8],
+    kind: &str,
+    scope: &str,
+    epochs: &[u64],
     plain: &mut [u8],
 ) -> Result<ScopedKey, String> {
-    let result = admitted(parameters, context, fingerprint).and_then(|parameters| {
-        let key = UserKey::open(&parameters, plain, |value| {
-            Ok(Zeroizing::new(value.to_vec()))
-        })
-        .map_err(refused)?;
-        Ok(ScopedKey { parameters, key })
+    let result = policy(context, kind, scope, epochs).and_then(|expected| {
+        let key = open_key(parameters, context, fingerprint, plain)?;
+        if key.key.policy() != &expected {
+            return Err(REFUSED.into());
+        }
+        Ok(key)
     });
     plain.zeroize();
     result
 }
 
+fn open_key(
+    parameters: &[u8],
+    context: &[u8],
+    fingerprint: &[u8],
+    plain: &[u8],
+) -> Result<ScopedKey, String> {
+    let parameters = admitted(parameters, context, fingerprint)?;
+    let key = UserKey::open(&parameters, plain, |value| {
+        Ok(Zeroizing::new(value.to_vec()))
+    })
+    .map_err(refused)?;
+    Ok(ScopedKey { parameters, key })
+}
+
 #[wasm_bindgen]
 impl ScopedKey {
     /// Opens the 32-byte object private key of one envelope with its context bytes.
-    pub fn open_object(&self, envelope: &[u8], context: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn open_object(&self, envelope: &[u8], context: &[u8]) -> Result<Bytes, String> {
+        self.open(envelope, context)
+            .map(|key| copy_out(key.as_bytes()))
+    }
+}
+
+impl ScopedKey {
+    fn open(&self, envelope: &[u8], context: &[u8]) -> Result<SecretKey, String> {
         let envelope = Envelope::from_bytes(&self.parameters, envelope).map_err(refused)?;
-        let key =
-            aruna_kpabe::open(&self.parameters, &self.key, &envelope, context).map_err(refused)?;
-        Ok(key.as_bytes().to_vec())
+        aruna_kpabe::open(&self.parameters, &self.key, &envelope, context).map_err(refused)
     }
 }
 
@@ -70,7 +105,7 @@ pub fn issue_key(
     kind: &str,
     scope: &str,
     epochs: &[u64],
-) -> Result<Vec<u8>, String> {
+) -> Result<Bytes, String> {
     let result = issue_scope(
         bucket_key,
         parameters,
@@ -81,7 +116,7 @@ pub fn issue_key(
         epochs,
     );
     bucket_key.zeroize();
-    result
+    result?.seal(|bytes| Ok(copy_out(bytes))).map_err(refused)
 }
 
 /// Clamps the bucket key with RFC 7748 masks, then derives the setup seed like the node.
@@ -105,12 +140,17 @@ fn issue_scope(
     kind: &str,
     scope: &str,
     epochs: &[u64],
-) -> Result<Vec<u8>, String> {
+) -> Result<UserKey, String> {
     let admitted = admitted(parameters, context, fingerprint)?;
     let (derived, master) = derive_master(bucket_key, context)?;
     if derived.fingerprint() != admitted.fingerprint() || derived.to_bytes() != parameters {
         return Err(REFUSED.into());
     }
+    let policy = policy(context, kind, scope, epochs)?;
+    aruna_kpabe::issue(&derived, &master, &policy, &mut getrandom::SysRng).map_err(refused)
+}
+
+fn policy(context: &[u8], kind: &str, scope: &str, epochs: &[u64]) -> Result<Policy, String> {
     let alternatives = match (kind, scope) {
         ("subtree", "") => Vec::new(),
         ("subtree", prefix) if prefix.ends_with('/') => vec![Attribute::Prefix(prefix.into())],
@@ -121,10 +161,7 @@ fn issue_scope(
         return Err(REFUSED.into());
     }
     let domain = blake3::hash(context);
-    let policy = Policy::new(domain.as_bytes(), epochs, &alternatives).map_err(refused)?;
-    let key =
-        aruna_kpabe::issue(&derived, &master, &policy, &mut getrandom::SysRng).map_err(refused)?;
-    key.seal(|bytes| Ok(bytes.to_vec())).map_err(refused)
+    Policy::new(domain.as_bytes(), epochs, &alternatives).map_err(refused)
 }
 
 #[cfg(test)]

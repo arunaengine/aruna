@@ -75,15 +75,19 @@ fn crate_vectors() {
     );
     let fingerprint = bytes(&vectors["fingerprint"]);
     for case in vectors["cases"].as_array().unwrap() {
-        let mut plain = bytes(&case["user_key"]);
-        let key = import_key(&parameters, &context, &fingerprint, &mut plain).unwrap();
-        assert!(plain.iter().all(|byte| *byte == 0));
-        let object = key.open_object(&bytes(&case["envelope"]), &bytes(&case["context"]));
-        assert_eq!(object.unwrap(), bytes(&vectors["object_key"]));
-        assert!(
-            key.open_object(&bytes(&case["envelope"]), b"other")
-                .is_err()
+        let key = open_key(
+            &parameters,
+            &context,
+            &fingerprint,
+            &bytes(&case["user_key"]),
+        )
+        .unwrap();
+        let object = key.open(&bytes(&case["envelope"]), &bytes(&case["context"]));
+        assert_eq!(
+            object.unwrap().as_bytes()[..],
+            bytes(&vectors["object_key"])
         );
+        assert!(key.open(&bytes(&case["envelope"]), b"other").is_err());
     }
 }
 
@@ -103,8 +107,8 @@ fn issued_scopes() {
         bytes(&fixture["envelope"]),
         bytes(&fixture["envelope_context"]),
     );
-    let issue = |kind: &str, scope: &str, bucket_key: &mut [u8]| {
-        issue_key(
+    let issue = |kind: &str, scope: &str, bucket_key: &[u8]| {
+        issue_scope(
             bucket_key,
             &parameters,
             &context,
@@ -113,6 +117,7 @@ fn issued_scopes() {
             scope,
             &[1],
         )
+        .map(|key| key.seal(|bytes| Ok(bytes.to_vec())).unwrap())
     };
     for (kind, scope, opens) in [
         ("subtree", "", true),
@@ -121,12 +126,23 @@ fn issued_scopes() {
         ("subtree", "bar/", false),
         ("exact", "foo/other", false),
     ] {
-        let mut bucket_key = bytes(&fixture["bucket_key"]);
-        let mut plain = issue(kind, scope, &mut bucket_key).unwrap();
-        assert!(bucket_key.iter().all(|byte| *byte == 0));
-        let key = import_key(&parameters, &context, &fingerprint, &mut plain).unwrap();
-        let object = key.open_object(&envelope.0, &envelope.1);
-        assert_eq!(object.ok(), opens.then(|| bytes(&fixture["object_key"])));
+        let mut plain = issue(kind, scope, &bytes(&fixture["bucket_key"])).unwrap();
+        let import = |kind, scope, epochs: &[u64], plain: &mut [u8]| {
+            import_key(
+                &parameters,
+                &context,
+                &fingerprint,
+                kind,
+                scope,
+                epochs,
+                plain,
+            )
+        };
+        let key = import(kind, scope, &[1], &mut plain).unwrap();
+        assert!(plain.iter().all(|byte| *byte == 0));
+        let object = key.open(&envelope.0, &envelope.1);
+        let object = object.ok().map(|key| key.as_bytes().to_vec());
+        assert_eq!(object, opens.then(|| bytes(&fixture["object_key"])));
     }
     for (kind, scope) in [
         ("subtree", "foo"),
@@ -134,9 +150,48 @@ fn issued_scopes() {
         ("prefix", "foo/"),
         ("exact", "a\0"),
     ] {
-        assert!(issue(kind, scope, &mut bytes(&fixture["bucket_key"])).is_err());
+        assert!(issue(kind, scope, &bytes(&fixture["bucket_key"])).is_err());
     }
-    assert!(issue("subtree", "", &mut [4; 32]).is_err());
+    assert!(issue("subtree", "", &[4; 32]).is_err());
+}
+
+#[test]
+fn refuses_other_policy() {
+    let fixture = fixture();
+    let (parameters, context) = (
+        bytes(&fixture["parameters"]),
+        bytes(&fixture["setup_context"]),
+    );
+    let fingerprint = bytes(&fixture["fingerprint"]);
+    let key = issue_scope(
+        &bytes(&fixture["bucket_key"]),
+        &parameters,
+        &context,
+        &fingerprint,
+        "subtree",
+        "foo/",
+        &[1],
+    )
+    .unwrap();
+    let plain = key.seal(|bytes| Ok(bytes.to_vec())).unwrap();
+    for (kind, scope, epochs) in [
+        ("subtree", "", &[1][..]),
+        ("exact", "foo/", &[1]),
+        ("subtree", "foo/", &[1, 2]),
+    ] {
+        let mut copy = plain.clone();
+        let imported = import_key(
+            &parameters,
+            &context,
+            &fingerprint,
+            kind,
+            scope,
+            epochs,
+            &mut copy,
+        );
+        assert!(imported.is_err());
+        assert!(copy.iter().all(|byte| *byte == 0));
+    }
 }
 
 #[test]
