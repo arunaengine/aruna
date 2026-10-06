@@ -593,7 +593,6 @@ dependencies = [
  "aes-gcm 0.11.1",
  "bls12_381_plus",
  "hex",
- "hmac 0.13.0",
  "rand 0.10.2",
  "rand_core 0.10.1",
  "serde_json",

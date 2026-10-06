@@ -99,7 +99,6 @@ getrandom = "0.4.3"
 governor = "0.10.4"
 globset = "0.4.20"
 hex = "0.4.3"
-hmac = { version = "0.13.0", default-features = false, features = ["zeroize"] }
 hpke = { version = "0.14.1", default-features = false, features = [
     "alloc",
     "aes",
