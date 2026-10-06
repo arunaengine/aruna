@@ -110,6 +110,9 @@ pub enum PutObjectState {
     CleanupDuplicate,
     Finish,
     Error,
+    ReadAbe,
+    FenceAbe,
+    WriteEnvelope,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -246,6 +249,9 @@ pub struct PutObjectOperation {
     seal_settings: Option<BucketEncryption>,
     /// How the bytes are sealed, captured once before they stream; `None` writes plain bytes.
     seal_plan: Option<SealPlan>,
+    envelope_enabled: bool,
+    envelope_plan: Option<aruna_core::structs::storage::abe::EnvelopePlan>,
+    envelope: Option<aruna_core::structs::storage::abe::ObjectEnvelope>,
 }
 
 impl PutObjectOperation {
@@ -284,7 +290,16 @@ impl PutObjectOperation {
             origin: CopyOrigin::Write,
             seal_settings: None,
             seal_plan: None,
+            envelope_enabled: true,
+            envelope_plan: None,
+            envelope: None,
         }
+    }
+
+    /// Mints no object key or envelope for this copied version.
+    pub fn without_envelope(mut self) -> Self {
+        self.envelope_enabled = false;
+        self
     }
 
     /// Why this write places a copy here. A plain client write records itself;
@@ -604,7 +619,16 @@ impl PutObjectOperation {
         match SealPlan::capture(&settings, &record) {
             Ok(plan) => {
                 self.seal_plan = plan;
-                self.write_blob()
+                if self.seal_plan.is_none()
+                    || self.adopt.is_some()
+                    || !self.envelope_enabled
+                    || self.origin != CopyOrigin::Write
+                    || self.config.preassigned_version_id.is_some()
+                {
+                    self.write_blob()
+                } else {
+                    self.read_abe(false)
+                }
             }
             Err(error) => self.emit_error(seal_error(error)),
         }
@@ -647,6 +671,19 @@ impl PutObjectOperation {
         }
         self.state = PutObjectState::WriteBlob;
         if let Some(blob) = self.config.request.body.take() {
+            if let Some(plan) = self.envelope_plan.clone() {
+                return smallvec![Effect::Blob(BlobEffect::Abe(Box::new(
+                    aruna_core::structs::storage::abe::AbeEffect::Write {
+                        plan,
+                        resolved,
+                        bucket: self.config.request.bucket.clone(),
+                        key: self.config.request.key.clone(),
+                        created_by: self.config.user_id,
+                        blob,
+                        size: self.config.request.content_length,
+                    }
+                )))];
+            }
             smallvec![Effect::Blob(BlobEffect::Write {
                 bucket: self.config.request.bucket.clone(),
                 key: self.config.request.key.clone(),
@@ -666,6 +703,15 @@ impl PutObjectOperation {
 
     fn handle_write_finished(&mut self, event: Event) -> Effects {
         let location = match event {
+            Event::Blob(BlobEvent::Abe(event)) => {
+                let aruna_core::structs::storage::abe::AbeEvent::Written { location, envelope } =
+                    *event
+                else {
+                    return self.emit_error(PutObjectError::InvalidOperationState);
+                };
+                self.envelope = Some(envelope);
+                location
+            }
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
             // Only a client-sourced stream fault may become a client error; a
             // server-side write fault must stay retryable, never a bad digest.
@@ -830,6 +876,7 @@ impl PutObjectOperation {
             None => Ok(()),
         };
         match current {
+            Ok(()) if self.envelope.is_some() => self.read_abe(true),
             Ok(()) => self.start_fence(),
             Err(error) => self.emit_error(seal_error(error)),
         }
@@ -1097,7 +1144,7 @@ impl PutObjectOperation {
 
     fn version_created(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
-            self.write_copy_owner()
+            self.store_envelope()
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
         }
@@ -1671,6 +1718,12 @@ impl Operation for PutObjectOperation {
             PutObjectState::CheckPurgeWrite => self.write_fence_checked(event),
             PutObjectState::ReadSealSettings => self.seal_settings_read(event),
             PutObjectState::ReadSealKey => self.seal_key_read(event),
+            PutObjectState::ReadAbe => self.abe_read(event, false),
+            PutObjectState::FenceAbe => self.abe_read(event, true),
+            PutObjectState::WriteEnvelope => match event {
+                Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.write_copy_owner(),
+                _ => self.emit_error(PutObjectError::InvalidOperationState),
+            },
             PutObjectState::WriteBlob => self.handle_write_finished(event),
             PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
@@ -2476,3 +2529,6 @@ mod decision_tests {
         }
     }
 }
+
+#[path = "put_abe.rs"]
+mod abe;

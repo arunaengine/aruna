@@ -1912,11 +1912,37 @@ mod sealed {
         assert_eq!(key_space, BUCKET_KEY_KEYSPACE);
         assert_eq!(key.as_ref(), record().key.key().as_slice());
         let effects = op.step(row(Some(record().to_bytes().unwrap())));
-        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+            panic!("expected the ABE anchor read, got {effects:?}")
+        };
+        let (realm, node) = (op.config.realm_id, op.config.node_id);
+        let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
+        let parameters = aruna_core::structs::storage::abe::create_parameters(
+            &secret,
+            realm,
+            node,
+            record().key,
+        )
+        .unwrap();
+        let values = vec![
+            (
+                reads[0].1.clone(),
+                Some(parameters.to_bytes().unwrap().into()),
+            ),
+            (reads[1].1.clone(), Some(1u64.to_be_bytes().to_vec().into())),
+        ];
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        let [Effect::Blob(BlobEffect::Abe(effect))] = effects.as_slice() else {
             panic!("expected the write, got {effects:?}")
         };
-        let plan = SealPlan::capture(&settings(), &record()).unwrap();
-        assert_eq!(resolved.encryption, plan);
+        let aruna_core::structs::storage::abe::AbeEffect::Write { plan, resolved, .. } =
+            effect.as_ref()
+        else {
+            panic!("expected the envelope write")
+        };
+        assert_eq!((plan.epoch, &plan.parameters), (1, &parameters));
+        let seal = SealPlan::capture(&settings(), &record()).unwrap();
+        assert_eq!(resolved.encryption, seal);
     }
 
     #[test]

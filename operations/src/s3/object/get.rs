@@ -186,6 +186,8 @@ pub enum GetObjectError {
     /// The version waits for its content hash; a token credential promotes it first.
     #[error("The object content waits for its bucket key.")]
     PendingContent(ArchiveKey),
+    #[error(transparent)]
+    Abe(#[from] aruna_core::structs::storage::abe::AbeError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -335,6 +337,11 @@ pub struct GetObjectOperation {
     reference_lease: Option<ReadLease>,
     /// The request's token credential, used once when the registry reports the key locked.
     token: Option<TokenCredential>,
+    object: Option<(
+        aruna_core::structs::storage::abe::ObjectEnvelope,
+        aruna_core::structs::storage::abe::EnvelopeArchive,
+        aruna_core::compute::SharedSecret,
+    )>,
     /// The token admission of a locked key and the admission state it answers.
     token_admit: Option<(AdmitTokenOperation, GetObjectState)>,
 }
@@ -377,6 +384,7 @@ impl GetObjectOperation {
             reference_key: None,
             reference_lease: None,
             token: None,
+            object: None,
             token_admit: None,
         }
     }
@@ -389,6 +397,16 @@ impl GetObjectOperation {
     /// Admits a read of a locked key with `token`, if the credential has a copy of the key.
     pub fn with_token(mut self, token: Option<TokenCredential>) -> Self {
         self.token = token;
+        self
+    }
+
+    pub fn with_object(
+        mut self,
+        envelope: aruna_core::structs::storage::abe::ObjectEnvelope,
+        archive: aruna_core::structs::storage::abe::EnvelopeArchive,
+        private: aruna_core::compute::SharedSecret,
+    ) -> Self {
+        self.object = Some((envelope, archive, private));
         self
     }
 
@@ -822,10 +840,31 @@ impl GetObjectOperation {
         // A sealed copy is read only under a lease of its key, admitted after the commit.
         if let Some(key) = location.format.bucket_key() {
             let archive = ArchiveKey::of(&location);
+            let admit = if let Some((envelope, mapping, private)) = self.object.take() {
+                if mapping.archive != archive
+                    || location.location_key().ok().map(|k| k.to_bytes())
+                        != Some(mapping.location_key)
+                    || envelope.context.parameters.key != key
+                    || envelope.context.object_key != self.input.key
+                {
+                    return self.emit_error(GetObjectError::Abe(
+                        aruna_core::structs::storage::abe::AbeError::Context,
+                    ));
+                }
+                BlobEffect::Abe(Box::new(
+                    aruna_core::structs::storage::abe::AbeEffect::Admit {
+                        envelope,
+                        archive,
+                        private,
+                    },
+                ))
+            } else {
+                BlobEffect::AdmitRead { key, archive }
+            };
             self.state = GetObjectState::CommitTransaction;
             return smallvec![
                 Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
-                Effect::Blob(BlobEffect::AdmitRead { key, archive })
+                Effect::Blob(admit)
             ];
         }
         // A plain copy of an encrypting bucket, not converted yet, needs the bucket unlocked too.
@@ -925,6 +964,9 @@ impl GetObjectOperation {
                 lease
             }
             // A locked key stays typed: `BucketKeyError::Locked` names the bucket.
+            Event::Blob(BlobEvent::Error(BlobError::Abe(error))) => {
+                return self.emit_error(GetObjectError::Abe(error));
+            }
             Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
                 return self.emit_error(locked(error));
             }

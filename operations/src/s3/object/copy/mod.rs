@@ -358,6 +358,7 @@ async fn copy_inner(
         quota_ceiling: input.quota_ceiling,
         routing,
     })
+    .without_envelope()
     .with_metadata(metadata)
     .with_inherited_policies(source.source_policies.clone())
     .with_restrictions(input.restrictions.clone());
