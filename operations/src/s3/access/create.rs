@@ -35,7 +35,9 @@ use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::index::{MAX_ACTIVE_CREDENTIALS, decode_index, encode_index, owner_key};
+use super::index::{
+    MAX_ACTIVE_CREDENTIALS, decode_index, encode_index, owner_key, token_deletes, token_scan,
+};
 use crate::s3::bucket::key::rows::{Row, SettingsError, audit_row, parse_authority};
 
 pub const DEFAULT_CREDENTIAL_TTL: Duration = Duration::from_secs(24 * 60 * 60 * 365);
@@ -63,6 +65,12 @@ pub enum CreateUserState {
         index: std::collections::BTreeSet<String>,
     },
     SealTokens {
+        index: std::collections::BTreeSet<String>,
+    },
+    ScanStaleTokens {
+        index: std::collections::BTreeSet<String>,
+    },
+    DeleteStaleTokens {
         index: std::collections::BTreeSet<String>,
     },
 }
@@ -130,6 +138,8 @@ pub struct CreateUserOperation {
     state: CreateUserState,
     output: Result<(String, Secret, UserAccess), CreateUserError>,
     tokens: Option<TokenPlan>,
+    /// Deleted credentials whose token copies still go, and where the current one's scan stands.
+    stale_tokens: (Vec<String>, Option<Key>),
 }
 
 /// The encrypted buckets a new credential gets token copies of, and what sealing needs.
@@ -290,6 +300,7 @@ impl CreateUserOperation {
             state: CreateUserState::Init,
             output: Err(CreateUserError::NotFinished),
             tokens: None,
+            stale_tokens: (Vec::new(), None),
         }
     }
 
@@ -586,6 +597,7 @@ impl CreateUserOperation {
                 return self.handle_error(CreateUserError::CreateAccessFailed);
             };
             self.state = CreateUserState::DeleteStale { index: active };
+            self.stale_tokens = (stale.clone(), None);
             return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                 deletes: stale
                     .into_iter()
@@ -614,7 +626,71 @@ impl CreateUserOperation {
                 received: event,
             });
         };
-        self.read_token_buckets(index)
+        self.scan_stale_tokens(index)
+    }
+
+    /// The token copies of each deleted credential go in the same transaction, a page at a time.
+    fn scan_stale_tokens(&mut self, index: std::collections::BTreeSet<String>) -> Effects {
+        let (Some(txn_id), Some(access_key)) = (self.txn_id, self.stale_tokens.0.last()) else {
+            return self.read_token_buckets(index);
+        };
+        let scan = token_scan(access_key, self.stale_tokens.1.take(), txn_id);
+        self.state = CreateUserState::ScanStaleTokens { index };
+        smallvec![scan]
+    }
+
+    fn stale_tokens_scanned(
+        &mut self,
+        event: Event,
+        index: std::collections::BTreeSet<String>,
+    ) -> Effects {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return self.handle_error(CreateUserError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::IterResult)",
+                received: event,
+            });
+        };
+        let (Some(txn_id), Some(access_key)) = (self.txn_id, self.stale_tokens.0.last()) else {
+            return self.handle_error(CreateUserError::CreateAccessFailed);
+        };
+        if values.is_empty() {
+            self.stale_tokens.0.pop();
+            return self.scan_stale_tokens(index);
+        }
+        let deletes = match token_deletes(access_key, values) {
+            Ok(deletes) => deletes,
+            Err(error) => return self.handle_error(error.into()),
+        };
+        self.stale_tokens.1 = next_start_after;
+        self.state = CreateUserState::DeleteStaleTokens { index };
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn stale_tokens_deleted(
+        &mut self,
+        event: Event,
+        index: std::collections::BTreeSet<String>,
+    ) -> Effects {
+        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
+            return self.handle_error(CreateUserError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
+                received: event,
+            });
+        };
+        // The last page of this credential leaves no cursor; the next credential follows.
+        if self.stale_tokens.1.is_none() {
+            self.stale_tokens.0.pop();
+        }
+        self.scan_stale_tokens(index)
     }
 
     fn write_credentials(&mut self, index: std::collections::BTreeSet<String>) -> Effects {
@@ -735,6 +811,12 @@ impl Operation for CreateUserOperation {
                 self.token_authority_read(event, index.clone())
             }
             CreateUserState::SealTokens { ref index } => self.tokens_sealed(event, index.clone()),
+            CreateUserState::ScanStaleTokens { ref index } => {
+                self.stale_tokens_scanned(event, index.clone())
+            }
+            CreateUserState::DeleteStaleTokens { ref index } => {
+                self.stale_tokens_deleted(event, index.clone())
+            }
         }
     }
 
@@ -808,6 +890,7 @@ impl Operation for CreateTokenOperation {
 mod pure_tests {
     use super::*;
     use crate::s3::access::index::owner_key;
+    use aruna_core::effects::IterStart;
 
     fn owner_read(op: &CreateUserOperation, value: Option<aruna_core::types::Value>) -> Event {
         Event::Storage(StorageEvent::BatchReadResult {
@@ -963,6 +1046,69 @@ mod pure_tests {
             [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id: Some(id) })]
                 if *id == txn_id && deletes.len() == 1
         ));
+        let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        // The stale credential's token copies go in the same transaction: one full page, then
+        // the rest after its cursor.
+        let [
+            Effect::Storage(StorageEffect::Iter {
+                key_space,
+                prefix,
+                start: None,
+                txn_id: Some(id),
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the token index scan, got {effects:?}");
+        };
+        assert_eq!((key_space.as_str(), *id), (TOKEN_INDEX_KEYSPACE, txn_id));
+        let prefix = prefix.clone().unwrap();
+        assert_eq!(
+            prefix.as_ref(),
+            TokenCopy::index_prefix(&stale_key).as_slice()
+        );
+        let copy = |bucket: u8| TokenCopy {
+            key: BucketKeyRef::new(Ulid::from_bytes([bucket; 16]), 1),
+            access_key: stale_key.clone(),
+            created_by: user_identity,
+            nonce: [0; 12],
+            ciphertext: vec![0; 48],
+            created_at_ms: 1,
+        };
+        let page = |bucket: u8, next: bool| {
+            let key = Key::from(copy(bucket).index_key());
+            Event::Storage(StorageEvent::IterResult {
+                values: vec![(key.clone(), Value::from(Vec::new()))],
+                next_start_after: next.then_some(key),
+            })
+        };
+        let effects = op.step(page(1, true));
+        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice()
+        else {
+            panic!("expected the token deletes, got {effects:?}");
+        };
+        let deleted: Vec<_> = deletes
+            .iter()
+            .map(|(space, key)| (space.as_str(), key.to_vec()))
+            .collect();
+        assert_eq!(
+            deleted,
+            [
+                (KEY_COPY_KEYSPACE, copy(1).key()),
+                (TOKEN_INDEX_KEYSPACE, copy(1).index_key()),
+            ]
+        );
+        let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { start: Some(IterStart::After(after)), .. })]
+                if after.as_ref() == copy(1).index_key().as_slice()
+        ));
+        op.step(page(2, false));
         let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
             entries: Vec::new(),
         }));

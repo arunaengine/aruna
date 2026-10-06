@@ -2,23 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::index::{decode_index, encode_index, owner_key};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use super::index::{decode_index, encode_index, owner_key, token_deletes, token_scan};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    ACCESS_OWNER_KEYSPACE, KEY_COPY_KEYSPACE, TOKEN_INDEX_KEYSPACE, USER_ACCESS_KEYSPACE,
-};
+use aruna_core::keyspaces::{ACCESS_OWNER_KEYSPACE, USER_ACCESS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_core::structs::storage::encryption::TokenCopy;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use std::time::SystemTime;
 use thiserror::Error;
-
-/// Token index rows deleted per batch.
-const TOKEN_PAGE: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RevokeUserState {
@@ -204,13 +198,7 @@ impl RevokeUserOperation {
             return self.emit_error(RevokeUserError::NoTransactionFound);
         };
         self.state = RevokeUserState::ScanTokens;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: TOKEN_INDEX_KEYSPACE.to_string(),
-            prefix: Some(TokenCopy::index_prefix(&self.access_key).into()),
-            start: start.map(IterStart::After),
-            limit: TOKEN_PAGE,
-            txn_id: Some(txn_id),
-        })]
+        smallvec![token_scan(&self.access_key, start, txn_id)]
     }
 
     fn tokens_scanned(&mut self, event: Event) -> Effects {
@@ -228,16 +216,10 @@ impl RevokeUserOperation {
             self.state = RevokeUserState::CommitTransaction;
             return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
         }
-        let mut deletes = Vec::new();
-        for (key, _) in values {
-            let reference = match TokenCopy::parse_index(&key, &self.access_key) {
-                Ok(reference) => reference,
-                Err(error) => return self.emit_error(error.into()),
-            };
-            let copy = TokenCopy::copy_key(reference, &self.access_key);
-            deletes.push((KEY_COPY_KEYSPACE.to_string(), copy.into()));
-            deletes.push((TOKEN_INDEX_KEYSPACE.to_string(), key));
-        }
+        let deletes = match token_deletes(&self.access_key, values) {
+            Ok(deletes) => deletes,
+            Err(error) => return self.emit_error(error.into()),
+        };
         self.token_cursor = next_start_after;
         self.state = RevokeUserState::DeleteTokens;
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
@@ -329,8 +311,10 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::s3::access::index::{decode_index, encode_index, owner_key};
     use aruna_core::UserId;
+    use aruna_core::keyspaces::{KEY_COPY_KEYSPACE, TOKEN_INDEX_KEYSPACE};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::UserAccess;
+    use aruna_core::structs::storage::encryption::TokenCopy;
     use aruna_storage::storage;
     use std::time::Duration;
     use tempfile::tempdir;
