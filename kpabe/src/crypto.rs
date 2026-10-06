@@ -2,7 +2,11 @@ use alloc::vec::Vec;
 
 use bls12_381_plus::{G1Projective, Gt, Scalar, elliptic_curve_013::hash2curve::ExpandMsgXmd};
 use rand_core::TryCryptoRng;
-use sha2::{Digest, Sha256};
+use sha2::{
+    Digest, Sha256,
+    block_api::Sha256VarCore,
+    digest::block_api::{Buffer, UpdateCore, VariableOutputCore},
+};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{Attribute, Error, PROFILE, frame};
@@ -12,14 +16,25 @@ const ORDER: [u8; 32] = [
     0x53, 0xbd, 0xa4, 0x02, 0xff, 0xfe, 0x5b, 0xfe, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01,
 ];
 
+fn hash_into<'a>(
+    fields: impl IntoIterator<Item = &'a [u8]>,
+    output: &mut Zeroizing<[u8; 32]>,
+) -> Result<(), Error> {
+    let mut hash = Sha256VarCore::new(output.len()).map_err(|_| Error)?;
+    let mut buffer = Buffer::<Sha256VarCore>::default();
+    for field in fields {
+        buffer.digest_blocks(field, |blocks| hash.update_blocks(blocks));
+    }
+    hash.finalize_variable_core(&mut buffer, (&mut **output).into());
+    Ok(())
+}
+
 fn authenticate(key: &[u8], fields: &[&[u8]]) -> Result<Zeroizing<[u8; 32]>, Error> {
     let mut padded = Zeroizing::new([0u8; 64]);
-    let mut digest = Zeroizing::new(sha2::digest::Output::<Sha256>::default());
+    let mut digest = Zeroizing::new([0u8; 32]);
     if key.len() > padded.len() {
-        let mut hash = Sha256::new();
-        hash.update(key);
-        hash.finalize_into(&mut digest);
-        padded[..32].copy_from_slice(&digest);
+        hash_into([key], &mut digest)?;
+        padded[..32].copy_from_slice(&digest[..]);
         digest.zeroize();
     } else {
         padded[..key.len()].copy_from_slice(key);
@@ -27,23 +42,17 @@ fn authenticate(key: &[u8], fields: &[&[u8]]) -> Result<Zeroizing<[u8; 32]>, Err
     for byte in padded.iter_mut() {
         *byte ^= 0x36;
     }
-    let mut inner = Sha256::new();
-    inner.update(&padded[..]);
-    for field in fields {
-        inner.update(field);
-    }
-    inner.finalize_into(&mut digest);
+    hash_into(
+        core::iter::once(&padded[..]).chain(fields.iter().copied()),
+        &mut digest,
+    )?;
     for byte in padded.iter_mut() {
         *byte ^= 0x36 ^ 0x5c;
     }
-    let mut outer = Sha256::new();
-    outer.update(&padded[..]);
-    padded.zeroize();
-    outer.update(&digest[..]);
-    digest.zeroize();
-    outer.finalize_into(&mut digest);
     let mut result = Zeroizing::new([0u8; 32]);
-    result.copy_from_slice(&digest);
+    hash_into([&padded[..], &digest[..]], &mut result)?;
+    padded.zeroize();
+    digest.zeroize();
     Ok(result)
 }
 
@@ -175,6 +184,19 @@ mod tests {
     use alloc::vec;
 
     use super::*;
+
+    #[test]
+    fn sha256_boundaries() {
+        for length in [0, 1, 55, 56, 63, 64, 65, 119, 120, 127, 128, 129] {
+            let input = vec![0xab; length];
+            let expected = Sha256::digest(&input);
+            for split in 0..=length {
+                let mut output = Zeroizing::new([0xa5; 32]);
+                hash_into([&input[..split], &[], &input[split..]], &mut output).unwrap();
+                assert_eq!(&output[..], &expected[..], "{length} bytes at {split}");
+            }
+        }
+    }
 
     #[test]
     fn hmac_vectors() {
