@@ -923,8 +923,7 @@ mod received {
         }
     }
 
-    async fn bao_bytes(context: &DriverContext) -> Vec<u8> {
-        let data = vec![0; 64];
+    async fn bao_bytes(context: &DriverContext, data: Vec<u8>) -> Vec<u8> {
         let net = context.net_handle.as_ref().unwrap();
         let (sender, mut incoming) = tokio::sync::mpsc::unbounded_channel();
         net.set_inbound_handler(Arc::new(Capture(sender)));
@@ -958,9 +957,60 @@ mod received {
 
     #[tokio::test]
     async fn corrupt_copy_continues() {
+        rejected_copy(false).await;
+    }
+
+    #[tokio::test]
+    async fn wrong_size_continues() {
+        rejected_copy(true).await;
+    }
+
+    async fn rejected_copy(wrong_size: bool) {
         let (_temp, context, plan, user) = fixture().await;
-        let invalid = bao_bytes(&context).await;
-        let (bad, version) = pending(&context, plan, user, "invalid", invalid, [0; 32], true).await;
+        let (bytes, original) = if wrong_size {
+            let stream = BackendStream::new(futures_util::stream::iter([Ok::<_, std::io::Error>(
+                bytes::Bytes::from_static(b"content"),
+            )]));
+            let event = context
+                .blob_handle
+                .as_ref()
+                .unwrap()
+                .send_blob_effect(BlobEffect::Write {
+                    bucket: "bucket".into(),
+                    key: "source".into(),
+                    resolved: ResolvedBackend::node_default().with_encryption(Some(plan)),
+                    created_by: user,
+                    blob: stream,
+                    size: Some(7),
+                })
+                .await;
+            let Event::Blob(BlobEvent::WriteFinished { location }) = event else {
+                panic!("sealed write failed: {event:?}")
+            };
+            let bytes = std::fs::read(location.get_full_path().unwrap()).unwrap();
+            (bytes, Some((location.format, location.blob_size)))
+        } else {
+            (vec![0; 64], None)
+        };
+        let invalid = bao_bytes(&context, bytes).await;
+        let claimed = if wrong_size {
+            *blake3::hash(b"content").as_bytes()
+        } else {
+            [0; 32]
+        };
+        let (mut bad, version) =
+            pending(&context, plan, user, "invalid", invalid, claimed, true).await;
+        if let Some((format, size)) = original {
+            bad.format = format;
+            bad.blob_size = size + 1;
+            put(
+                &context,
+                PENDING_LOCATION_KEYSPACE,
+                ArchiveKey::of(&bad).to_bytes(),
+                bad.to_bytes().unwrap(),
+            )
+            .await;
+        }
         let data = b"valid content".to_vec();
         let hash = *blake3::hash(&data).as_bytes();
         let (_, valid) = pending(&context, plan, user, "valid", data, hash, false).await;
@@ -1007,17 +1057,19 @@ mod received {
             .unwrap()
             .is_some()
         );
-        let record = BlobQuarantineRecord::new([0; 32], bad.backend, String::new(), 0);
-        assert!(
-            read_value(
-                &context.storage_handle,
-                BLOB_QUARANTINE_KEYSPACE,
-                record.key()
-            )
-            .await
-            .unwrap()
-            .is_some()
-        );
+        let record = BlobQuarantineRecord::new(claimed, bad.backend, String::new(), 0);
+        let value = read_value(
+            &context.storage_handle,
+            BLOB_QUARANTINE_KEYSPACE,
+            record.key(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if wrong_size {
+            let record = BlobQuarantineRecord::from_bytes(&value).unwrap();
+            assert!(record.reason.contains("holds 7 bytes, recorded 8"));
+        }
     }
 
     #[tokio::test]

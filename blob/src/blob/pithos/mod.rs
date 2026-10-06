@@ -278,6 +278,15 @@ async fn open(
         let mut entries = archive.entries();
         match (entries.next(), entries.next()) {
             (Some(entry), None) => {
+                if let EntryKind::File { size, .. } = entry.kind
+                    && opening.original != u64::MAX
+                    && size != opening.original
+                {
+                    return Err(BlobError::IntegrityCheckFailed(format!(
+                        "sealed copy holds {size} bytes, recorded {}",
+                        opening.original
+                    )));
+                }
                 entry.path == OBJECT_PATH
                     && matches!(entry.kind, EntryKind::File { .. })
                     && entry.references.is_empty()
