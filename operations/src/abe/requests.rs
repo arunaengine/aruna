@@ -168,8 +168,6 @@ impl KeyOperation {
         };
         let epochs = [snapshot.epoch];
         let revisions = snapshot.revisions.clone();
-        let full = values.len() > MAX_REQUESTS;
-        let mut live = 0;
         for (key, value) in values.into_iter().take(MAX_REQUESTS) {
             let grant = match KeyGrant::from_bytes(&value) {
                 Ok(g) => g,
@@ -180,7 +178,6 @@ impl KeyOperation {
                 self.deletes.push((ABE_GRANT_KEYSPACE.to_string(), key));
                 continue;
             }
-            live += 1;
             if held.scope == request.scope
                 && held.restrictions == request.restrictions
                 && held.epochs == epochs
@@ -189,9 +186,6 @@ impl KeyOperation {
                 self.result = Some(KeyResult::Grant(grant));
                 return self.flush();
             }
-        }
-        if full && live == MAX_REQUESTS {
-            return self.fail(AbeError::Limit);
         }
         self.issue(request)
     }
@@ -211,6 +205,42 @@ impl KeyOperation {
     pub(super) fn publish_grant(&mut self, grant: KeyGrant) -> Effects {
         if let Err(error) = self.current_request(&grant.context.request) {
             return self.fail(error);
+        }
+        let prefix = grant.context.request.prefix();
+        self.result = Some(KeyResult::Grant(grant));
+        self.state = State::Count;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: ABE_GRANT_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: None,
+            limit: MAX_REQUESTS + 1,
+            txn_id: self.txn
+        })]
+    }
+    /// Writes the grant only while the recipient holds fewer than `MAX_REQUESTS` current grants.
+    pub(super) fn count_read(&mut self, values: Vec<(Key, Value)>) -> Effects {
+        let Some(KeyResult::Grant(grant)) = self.result.take() else {
+            return self.fail(AbeError::Context);
+        };
+        let full = values.len() > MAX_REQUESTS;
+        let mut live = 0;
+        for (key, value) in values {
+            let held = match KeyGrant::from_bytes(&value) {
+                Ok(g) => g,
+                Err(error) => return self.fail(error),
+            };
+            if self.grant_allowed(&held.context.request).is_ok() {
+                live += 1;
+            } else if !self
+                .deletes
+                .iter()
+                .any(|(s, k)| s == ABE_GRANT_KEYSPACE && *k == key)
+            {
+                self.deletes.push((ABE_GRANT_KEYSPACE.to_string(), key));
+            }
+        }
+        if full || live >= MAX_REQUESTS {
+            return self.fail(AbeError::Limit);
         }
         let key: Key = grant.context.request.key().into();
         let bytes = match grant.to_bytes() {

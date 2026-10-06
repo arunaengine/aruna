@@ -124,6 +124,7 @@ fn unexpected() -> ServerError {
 - An unlocked or node-managed bucket issues the grant at once (`200`).
 - Otherwise the deduplicated open request is returned (`202`); repeating it returns its state.
 - Repeating an issued request returns its current grant (`200`).
+- A recipient holds at most 64 current grants per bucket; a new grant past that returns `413`.
 - Binary fields use padded base64; request ids use ULIDs."#, params(("bucket" = String, Path, description = "Node-local S3 bucket name")),
     request_body(content = RequestBody, example = json!({"scope":{"kind":"subtree","value":"foo/"}})),
     responses((status = 200, body = RecordView, description = "Node-issued grant", example = json!({"fields":{},"record":"AA==","aad":"AA=="})),
@@ -202,13 +203,14 @@ pub async fn open_requests(
 
 **Behavior**
 - `context` echoes the listed `record`; issuer, recipient, scope, parameters and epoch are rechecked.
-- Repeating an admitted submission returns the stored grant."#,
+- Repeating an admitted submission returns the stored grant.
+- A recipient holds at most 64 current grants per bucket; a new grant past that returns `413`."#,
     params(("bucket" = String, Path, description = "Node-local S3 bucket name"),("request_id" = String, Path, description = "Key request ULID")),
     request_body(content = GrantBody, example = json!({"context":"AA==","enc":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","ciphertext":"AAAAAAAAAAAAAAAAAAAAAA=="})),
     responses((status = 200, body = RecordView, description = "Admitted grant", example = json!({"fields":{},"record":"AA==","aad":"AA=="})),
         (status = 400, body = ErrorResponse, description = "Invalid encoding"), (status = 401, body = ErrorResponse, description = "Bearer token required"),
         (status = 403, body = ErrorResponse, description = "Caller is no current issuer"), (status = 404, body = ErrorResponse, description = "Request missing"),
-        (status = 409, body = ErrorResponse, description = "Stale binding"), (status = 413, body = ErrorResponse, description = "Grant too large"),
+        (status = 409, body = ErrorResponse, description = "Stale binding"), (status = 413, body = ErrorResponse, description = "Grant too large or grant limit"),
         (status = 422, body = ErrorResponse, description = "Scope or CEL policy cannot be compiled")), security(("bearer_auth" = [])))]
 pub async fn publish_grant(
     State(state): State<Arc<ServerState>>,

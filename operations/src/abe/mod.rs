@@ -62,6 +62,7 @@ enum State {
     Existing,
     Reuse,
     Issue,
+    Count,
     Cleanup,
     Write,
     Commit,
@@ -323,6 +324,9 @@ impl Operation for KeyOperation {
             }
             (State::Reuse, Event::Storage(StorageEvent::IterResult { values, .. })) => {
                 self.reuse_read(values)
+            }
+            (State::Count, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                self.count_read(values)
             }
             (State::Issue, Event::Blob(BlobEvent::Abe(event))) => match *event {
                 AbeEvent::Grant(grant) => self.publish_grant(grant),

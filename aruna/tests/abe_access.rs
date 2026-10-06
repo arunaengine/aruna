@@ -14,7 +14,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::abe::{
     AbeError, GRANT_PURPOSE, SysRng, create_parameters, derive_master, setup_context,
 };
-use aruna_core::structs::storage::abe_access::{GrantContext, KeyGrant, KeyScope};
+use aruna_core::structs::storage::abe_access::{GrantContext, KeyGrant, KeyScope, MAX_REQUESTS};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
 use aruna_kpabe::{Attribute, Envelope, Policy, UserKey};
 use aruna_operations::abe::{KeyAction, KeyError, KeyOperation};
@@ -498,6 +498,93 @@ async fn abe_holders() -> TestResult<()> {
         assert_eq!(status, StatusCode::OK, "{body}");
         let (status, body) = send(http.post(&requests).bearer_auth(&reader).json(&subtree)).await?;
         assert_eq!((status, body["code"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("scope_unsupported")));
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+#[tokio::test]
+async fn abe_limits() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let http = reqwest::Client::new();
+        let base = seed.base_url.clone();
+        let owner = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&base, &owner, "ABE limits").await?;
+        let reader = add_member(&seed, &owner, &group.group_id, Value::Null).await?;
+        add_key(
+            &base,
+            &reader,
+            "reader-1",
+            public_key_of(&SecretBytes::new(vec![11; 32])).unwrap(),
+        )
+        .await?;
+        add_key(
+            &base,
+            &owner,
+            "owner-1",
+            public_key_of(&SecretBytes::new(vec![7; 32])).unwrap(),
+        )
+        .await?;
+        let credentials = create_s3_credentials(&base, &owner, &group.group_id).await?;
+        s3_client(seed.s3.as_ref().unwrap(), &credentials)
+            .create_bucket()
+            .bucket(BUCKET)
+            .send()
+            .await?;
+        let encryption = format!("{base}/api/v1/data/buckets/{BUCKET}/storage/encryption");
+        let (status, settings) = send(
+            http.put(&encryption)
+                .bearer_auth(&owner)
+                .json(&json!({"mode":"vault_locked","expected_generation":0})),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{settings}");
+        let requests = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/requests");
+        let scope = |key: &str| json!({"scope":{"kind":"exact","value":key}});
+        let request = |key: String| http.post(&requests).bearer_auth(&reader).json(&scope(&key));
+
+        // The node issues grants up to the cap; a new scope is refused and a held one replays.
+        let (status, first) = send(request("foo/0".into())).await?;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        for i in 1..MAX_REQUESTS {
+            let (status, body) = send(request(format!("foo/{i}"))).await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (status, _) = send(request(format!("foo/{MAX_REQUESTS}"))).await?;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let (status, repeated) = send(request("foo/0".into())).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(repeated["record"], first["record"]);
+
+        // A request queued while locked is not published past the cap.
+        let response = http
+            .post(format!("{encryption}/lock"))
+            .bearer_auth(&owner)
+            .send()
+            .await?;
+        assert!(response.status().is_success());
+        let (status, _) = send(request("bar/0".into())).await?;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (_, owned) = send(http.get(&requests).bearer_auth(&owner)).await?;
+        let record = owned["records"][0]["record"].clone();
+        let context: GrantContext = postcard::from_bytes(&bytes(&record))?;
+        let route = format!("{requests}/{}/grant", context.request.request_id);
+        let (status, _) = send(
+            http.post(&route)
+                .bearer_auth(&owner)
+                .json(&submission(&record, [1; 32], &[1; 16])),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
