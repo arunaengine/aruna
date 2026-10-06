@@ -3,7 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::queue::{BlobJobRecord, BlobQueueError, schedule_blob_drain};
+use super::queue::{BlobJobRecord, BlobQueueError, REPLICATION_POLL_AFTER, schedule_blob_drain};
+use super::version_replication::ReplicateScopeTarget;
 use crate::driver::DriverContext;
 use crate::jobs::runtime::key_unlocked;
 use crate::jobs::store::iter_prefix_page;
@@ -11,8 +12,14 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{COPY_WAIT_KEYSPACE, REPLICATION_JOB_KEYSPACE};
-use aruna_core::structs::storage::encryption::BucketKeyRef;
+use aruna_core::keyspaces::{
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+    BUCKET_KEY_KEYSPACE, COPY_WAIT_KEYSPACE, PENDING_LOCATION_KEYSPACE, REPLICATION_JOB_KEYSPACE,
+};
+use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKey};
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState,
+};
 use aruna_core::types::{Key, TxnId, Value};
 use aruna_storage::StorageHandle;
 use std::collections::BTreeSet;
@@ -41,8 +48,21 @@ pub(crate) async fn park_job(
     keys: &[BucketKeyRef],
 ) -> Result<Option<u64>, BlobQueueError> {
     let storage = &context.storage_handle;
+    let txn_id = start(storage).await?;
+    let current = match wait_current(storage, job, keys, Some(txn_id)).await {
+        Ok(current) => current,
+        Err(error) => {
+            abort(storage, txn_id).await;
+            return Err(error);
+        }
+    };
     let mut parked = job.clone();
-    parked.due_at_ms = PARKED_DUE;
+    parked.due_at_ms = if current {
+        PARKED_DUE
+    } else {
+        aruna_core::time::unix_timestamp_millis()
+            .saturating_add(REPLICATION_POLL_AFTER.as_millis() as u64)
+    };
     let relationship = postcard::to_allocvec(&job.relationship_id)
         .map_err(aruna_core::errors::ConversionError::from)?;
     let mut writes: Vec<(String, Key, Value)> = vec![(
@@ -50,14 +70,13 @@ pub(crate) async fn park_job(
         job_key.clone().into(),
         parked.to_bytes()?.into(),
     )];
-    for key in keys {
+    for key in keys.iter().filter(|_| current) {
         writes.push((
             COPY_WAIT_KEYSPACE.to_string(),
             wait_row(*key, &job_key).into(),
             relationship.clone().into(),
         ));
     }
-    let txn_id = start(storage).await?;
     let write = StorageEffect::BatchWrite {
         writes,
         txn_id: Some(txn_id),
@@ -67,15 +86,128 @@ pub(crate) async fn park_job(
         return Err(error);
     }
     commit(storage, txn_id).await?;
+    if !current {
+        return Ok(Some(parked.due_at_ms));
+    }
+    let current = wait_current(storage, job, keys, None).await?;
     // A key unlocked while the job parked wakes it here; no unlock call would.
     for key in keys {
-        if key_unlocked(context, *key).await {
+        if !current || key_unlocked(context, *key).await {
             let now_ms = aruna_core::time::unix_timestamp_millis();
             wake_job(storage, wait_row(*key, &job_key), now_ms).await?;
             return Ok(Some(now_ms));
         }
     }
     Ok(None)
+}
+
+async fn wait_current(
+    storage: &StorageHandle,
+    job: &BlobJobRecord,
+    keys: &[BucketKeyRef],
+    txn_id: Option<TxnId>,
+) -> Result<bool, BlobQueueError> {
+    let mut reads = vec![(
+        BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+        job.input.bucket.as_bytes().into(),
+    )];
+    reads.extend(
+        keys.iter()
+            .map(|key| (BUCKET_KEY_KEYSPACE.to_string(), key.key().into())),
+    );
+    let Event::Storage(event) = storage
+        .send_storage_effect(StorageEffect::BatchRead { reads, txn_id })
+        .await
+    else {
+        return Err(BlobQueueError::UnexpectedEvent(
+            "not a storage event".to_string(),
+        ));
+    };
+    let mut values = match event {
+        StorageEvent::BatchReadResult { values } if values.len() == keys.len() + 1 => {
+            values.into_iter()
+        }
+        StorageEvent::Error { error } => return Err(error.into()),
+        other => return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+    };
+    let settings = values.next().and_then(|(_, value)| value);
+    let settings = BucketEncryption::from_row(settings.as_deref())?;
+    for (key, (_, value)) in keys.iter().zip(values) {
+        let record = value
+            .map(|value| BucketKeyRecord::from_bytes(&value))
+            .transpose()?;
+        if settings.active_key() != Some(*key)
+            || !record.is_some_and(|record| record.key == *key && record.state == KeyState::Active)
+        {
+            return Ok(false);
+        }
+    }
+    let prefix = match &job.input.target {
+        ReplicateScopeTarget::Version { key, version_id } => {
+            VersionKey::new(&job.input.bucket, key, *version_id).to_bytes()?
+        }
+        ReplicateScopeTarget::Object { key } => VersionKey::object_prefix(&job.input.bucket, key)?,
+        ReplicateScopeTarget::Bucket | ReplicateScopeTarget::Prefix(_) => {
+            VersionKey::bucket_prefix(&job.input.bucket)?
+        }
+    };
+    let mut start_after = None;
+    let mut found = BTreeSet::new();
+    loop {
+        let (rows, next) = iter_prefix_page(
+            storage,
+            BLOB_VERSIONS_KEYSPACE,
+            Some(prefix.clone().into()),
+            start_after,
+            WAIT_PAGE,
+            txn_id,
+        )
+        .await
+        .map_err(StorageError::ReadError)?;
+        for (row, value) in rows {
+            let version_key = VersionKey::from_bytes(&row)?;
+            if matches!(&job.input.target, ReplicateScopeTarget::Prefix(prefix) if !version_key.key.starts_with(prefix))
+            {
+                continue;
+            }
+            let version = BlobVersion::from_bytes(&value)?;
+            let (space, row) = match (version.location_key(), version.state.pending_archive()) {
+                (Some(location), _) => (BLOB_LOCATIONS_KEYSPACE, location.to_bytes()),
+                (_, Some(archive)) => (PENDING_LOCATION_KEYSPACE, archive.to_bytes()),
+                _ => continue,
+            };
+            match storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: space.to_string(),
+                    key: row.into(),
+                    txn_id,
+                })
+                .await
+            {
+                Event::Storage(StorageEvent::ReadResult {
+                    value: Some(value), ..
+                }) => {
+                    if let Some(key) = BackendLocation::from_bytes(&value)?
+                        .format
+                        .bucket_key()
+                        .or(settings.active_key())
+                    {
+                        found.insert(key);
+                    }
+                }
+                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {}
+                Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+                other => return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+            }
+        }
+        if keys.iter().all(|key| found.contains(key)) {
+            return Ok(true);
+        }
+        match next {
+            Some(next) => start_after = Some(next),
+            None => return Ok(false),
+        }
+    }
 }
 
 /// Makes every job parked for `key` due now and schedules a drain. Returns how many woke.
@@ -288,7 +420,10 @@ mod tests {
     use aruna_core::events::BlobEvent;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::storage::encryption::public_key_of;
+    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::encryption::{EncryptionMode, public_key_of};
+    use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
+    use std::time::SystemTime;
     use tempfile::TempDir;
 
     fn context(storage: StorageHandle) -> DriverContext {
@@ -385,6 +520,201 @@ mod tests {
         key
     }
 
+    async fn source(context: &DriverContext, key: BucketKeyRef) -> BackendLocation {
+        let settings = BucketEncryption {
+            mode: EncryptionMode::VaultLocked,
+            bucket_id: Some(key.bucket_id),
+            key_generation: key.generation,
+            ..Default::default()
+        };
+        let record =
+            BucketKeyRecord::new(key, Ulid::from_parts(1, key.generation.into()), [9; 32], 0);
+        let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/tmp".to_string(),
+            storage_bucket: "source".to_string(),
+            backend_path: "object".to_string(),
+            ulid: Ulid::from_parts(2, key.generation.into()),
+            format: StoredFormat::pithos(
+                PithosLayout {
+                    stored_size: 99,
+                    metadata_digest: [key.generation as u8; 32],
+                    storage_generation: key.generation,
+                },
+                key,
+            ),
+            created_by: job(Ulid::nil()).input.auth_context.user_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 42,
+            hashes: std::collections::HashMap::from([("blake3".to_string(), vec![4; 32])]),
+        };
+        let version = BlobVersion::materialized(
+            [4; 32],
+            location.backend.clone(),
+            location.format.encoding(),
+            location.created_at,
+            location.created_by,
+            None,
+        );
+        for (space, row, value) in [
+            (
+                BUCKET_ENCRYPTION_KEYSPACE,
+                b"source".to_vec(),
+                settings.to_bytes().unwrap(),
+            ),
+            (
+                BUCKET_KEY_KEYSPACE,
+                key.key().to_vec(),
+                record.to_bytes().unwrap(),
+            ),
+            (
+                BLOB_LOCATIONS_KEYSPACE,
+                location.location_key().unwrap().to_bytes(),
+                location.to_bytes().unwrap(),
+            ),
+            (
+                BLOB_VERSIONS_KEYSPACE,
+                VersionKey::new("source", "object", Ulid::from_parts(3, 3))
+                    .to_bytes()
+                    .unwrap(),
+                version.to_bytes().unwrap(),
+            ),
+        ] {
+            run(
+                &context.storage_handle,
+                StorageEffect::Write {
+                    key_space: space.to_string(),
+                    key: row.into(),
+                    value: value.into(),
+                    txn_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        location
+    }
+
+    #[tokio::test]
+    async fn rotated_copy_retries() {
+        for state in [KeyState::Retiring, KeyState::Retired] {
+            let (_dir, context) = keyed_context().await;
+            let storage = &context.storage_handle;
+            let old = BucketKeyRef::new(Ulid::from_parts(9, 9), 1);
+            let location = source(&context, old).await;
+            let Event::Storage(StorageEvent::ReadResult {
+                value: Some(captured),
+                ..
+            }) = storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+                    key: location.location_key().unwrap().to_bytes().into(),
+                    txn_id: None,
+                })
+                .await
+            else {
+                panic!("source location not read");
+            };
+            let captured = BackendLocation::from_bytes(&captured).unwrap();
+            source(&context, BucketKeyRef::new(old.bucket_id, 2)).await;
+            let mut old_record = BucketKeyRecord::new(old, Ulid::from_parts(1, 1), [9; 32], 0);
+            old_record.state = state;
+            run(
+                storage,
+                StorageEffect::Write {
+                    key_space: BUCKET_KEY_KEYSPACE.to_string(),
+                    key: old.key().into(),
+                    value: old_record.to_bytes().unwrap().into(),
+                    txn_id: None,
+                },
+            )
+            .await
+            .unwrap();
+            let admission = context
+                .blob_handle
+                .as_ref()
+                .unwrap()
+                .send_blob_effect(BlobEffect::AdmitRead {
+                    key: old,
+                    archive: aruna_core::structs::storage::blob::ArchiveKey::of(&captured),
+                })
+                .await;
+            assert!(matches!(
+                admission,
+                Event::Blob(BlobEvent::Error(aruna_core::errors::BlobError::BucketKey(
+                    aruna_core::structs::storage::encryption::BucketKeyError::Locked(_)
+                )))
+            ));
+            let mut record = job(Ulid::from_parts(10, 10));
+            record.input.target = ReplicateScopeTarget::Version {
+                key: "object".to_string(),
+                version_id: Ulid::from_parts(3, 3),
+            };
+            record.attempts = 2;
+            let row = store(storage, &record).await;
+            let due = park_job(&context, row.clone(), &record, &[old])
+                .await
+                .unwrap();
+            let stored = read_job(storage, &row, None).await.unwrap().unwrap();
+            assert_eq!(due, Some(stored.due_at_ms));
+            assert_ne!(stored.due_at_ms, PARKED_DUE);
+            assert_eq!(stored.attempts, record.attempts);
+            assert_eq!(stored.last_error, record.last_error);
+            assert_eq!(
+                awaiting_jobs(&context, Ulid::from_parts(10, 10))
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert!(next_blob_timer(storage).await.unwrap().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn parking_fences_rotation() {
+        let (_dir, storage) = crate::tests::s3::test_storage();
+        let context = context(storage.clone());
+        let old = BucketKeyRef::new(Ulid::from_parts(11, 11), 1);
+        source(&context, old).await;
+        let record = job(Ulid::from_parts(12, 12));
+        let row = store(&storage, &record).await;
+        let txn_id = start(&storage).await.unwrap();
+        assert!(
+            wait_current(&storage, &record, &[old], Some(txn_id))
+                .await
+                .unwrap()
+        );
+        source(&context, BucketKeyRef::new(old.bucket_id, 2)).await;
+        let mut parked = record;
+        parked.due_at_ms = PARKED_DUE;
+        run(
+            &storage,
+            StorageEffect::Write {
+                key_space: REPLICATION_JOB_KEYSPACE.to_string(),
+                key: row.clone().into(),
+                value: parked.to_bytes().unwrap().into(),
+                txn_id: Some(txn_id),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            commit(&storage, txn_id).await,
+            Err(BlobQueueError::Storage(StorageError::TransactionConflict))
+        );
+        assert_ne!(
+            read_job(&storage, &row, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .due_at_ms,
+            PARKED_DUE
+        );
+    }
+
     #[tokio::test]
     async fn parked_job_wakes() {
         // A locked source parks the job without an attempt; the unlock makes it due again.
@@ -396,6 +726,7 @@ mod tests {
         record.attempts = 2;
         let key = store(&storage, &record).await;
         let locked = BucketKeyRef::new(Ulid::from_parts(6, 6), 1);
+        source(&context, locked).await;
 
         let due = park_job(&context, key.clone(), &record, &[locked])
             .await
@@ -421,6 +752,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plain_archive_waits() {
+        let (_dir, storage) = crate::tests::s3::test_storage();
+        let context = context(storage.clone());
+        let key = BucketKeyRef::new(Ulid::from_parts(13, 13), 1);
+        let mut location = source(&context, key).await;
+        location.format = StoredFormat::default();
+        let version = BlobVersion::materialized(
+            [4; 32],
+            location.backend.clone(),
+            location.format.encoding(),
+            location.created_at,
+            location.created_by,
+            None,
+        );
+        for (space, row, value) in [
+            (
+                BLOB_LOCATIONS_KEYSPACE,
+                location.location_key().unwrap().to_bytes(),
+                location.to_bytes().unwrap(),
+            ),
+            (
+                BLOB_VERSIONS_KEYSPACE,
+                VersionKey::new("source", "object", Ulid::from_parts(3, 3))
+                    .to_bytes()
+                    .unwrap(),
+                version.to_bytes().unwrap(),
+            ),
+        ] {
+            run(
+                &storage,
+                StorageEffect::Write {
+                    key_space: space.to_string(),
+                    key: row.into(),
+                    value: value.into(),
+                    txn_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let record = job(Ulid::from_parts(14, 14));
+        let row = store(&storage, &record).await;
+        assert_eq!(
+            park_job(&context, row.clone(), &record, &[key])
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            read_job(&storage, &row, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .due_at_ms,
+            PARKED_DUE
+        );
+    }
+
+    #[tokio::test]
     async fn unlock_before_park() {
         // The unlock ran before the wait row existed: the recheck after parking wakes the job.
         let (_dir, context) = keyed_context().await;
@@ -428,6 +818,7 @@ mod tests {
         let record = job(Ulid::from_parts(7, 7));
         let key = store(&storage, &record).await;
         let unlocked = BucketKeyRef::new(Ulid::from_parts(8, 8), 1);
+        source(&context, unlocked).await;
         unlock(&context, unlocked).await;
         assert_eq!(wake_parked(&context, unlocked, 1).await.unwrap(), 0);
 
