@@ -123,6 +123,7 @@ fn unexpected() -> ServerError {
 **Behavior**
 - An unlocked or node-managed bucket issues the grant at once (`200`).
 - Otherwise the deduplicated open request is returned (`202`); repeating it returns its state.
+- Repeating an issued request returns its current grant (`200`).
 - Binary fields use padded base64; request ids use ULIDs."#, params(("bucket" = String, Path, description = "Node-local S3 bucket name")),
     request_body(content = RequestBody, example = json!({"scope":{"kind":"subtree","value":"foo/"}})),
     responses((status = 200, body = RecordView, description = "Node-issued grant", example = json!({"fields":{},"record":"AA==","aad":"AA=="})),
