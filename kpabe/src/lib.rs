@@ -8,9 +8,12 @@
 extern crate alloc;
 
 mod crypto;
+mod encoding;
+mod envelope;
 mod policy;
 mod scheme;
 
+pub use envelope::{Envelope, open, seal};
 pub use policy::{Attribute, Policy};
 pub use scheme::{Ciphertext, KemKey, MasterSecret, PublicParameters, UserKey};
 pub use scheme::{decapsulate, encapsulate, issue, setup_from_seed};

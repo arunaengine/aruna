@@ -6,7 +6,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{derive_key, fingerprint, master_scalar, oracle, random_pair, random_scalar};
 use crate::policy::canonical_attributes;
-use crate::{Attribute, Error, MAX_ATTRIBUTES, Policy, check_context};
+use crate::{Attribute, Error, MAX_ATTRIBUTES, MAX_BYTES, Policy, check_context};
 
 /// Public parameters bound to one profile and caller context by their fingerprint.
 #[derive(Debug, Clone)]
@@ -190,21 +190,21 @@ pub fn issue(
                     component,
                 )? * (r[coordinate] * inverse[component]);
             }
-            values[component] += signed(
-                &(G1Projective::GENERATOR * master.scalars[4 + component]),
-                row[0],
-            );
+            let share = Zeroizing::new(G1Projective::GENERATOR * master.scalars[4 + component]);
+            values[component] += signed(&share, row[0]);
             for column in 1..columns {
                 values[component] += signed(&terms[column - 1][component], row[column]);
             }
         }
         values[2] = G1Projective::GENERATOR * -*sigma;
-        values[2] += signed(&(G1Projective::GENERATOR * master.scalars[6]), row[0]);
+        let share = Zeroizing::new(G1Projective::GENERATOR * master.scalars[6]);
+        values[2] += signed(&share, row[0]);
         for column in 1..columns {
             values[2] += signed(&terms[column - 1][2], row[column]);
         }
         key.rows.push(*values);
     }
+    crate::encoding::encode_key(&key)?;
     Ok(key)
 }
 
@@ -215,6 +215,13 @@ pub fn encapsulate(
     rng: &mut (impl TryCryptoRng + ?Sized),
 ) -> Result<(Ciphertext, KemKey), Error> {
     let attributes = canonical_attributes(attributes, MAX_ATTRIBUTES)?;
+    let mut labels = Vec::new();
+    for label in &attributes {
+        label.encode(&mut labels);
+    }
+    if 327 + 144 * attributes.len() + labels.len() > MAX_BYTES {
+        return Err(Error);
+    }
     let random = random_pair(rng)?;
     let mut ciphertext = Ciphertext {
         base: [

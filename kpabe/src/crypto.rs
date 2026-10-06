@@ -19,7 +19,8 @@ fn authenticate(key: &[u8], fields: &[&[u8]]) -> Result<Zeroizing<[u8; 32]>, Err
         mac.update(field);
     }
     let mut output = mac.finalize().into_bytes();
-    let result = Zeroizing::new(output.as_slice().try_into().map_err(|_| Error)?);
+    let mut result = Zeroizing::new([0u8; 32]);
+    result.copy_from_slice(&output);
     output.zeroize();
     Ok(result)
 }
