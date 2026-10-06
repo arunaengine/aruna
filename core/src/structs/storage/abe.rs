@@ -288,6 +288,11 @@ pub struct EnvelopeArchive {
     pub location_key: Vec<u8>,
 }
 
+/// Usage bytes charged for one version's stored envelope and archive mapping rows.
+pub fn envelope_charge(envelope: &[u8], archive: &[u8]) -> u64 {
+    (envelope.len() + archive.len()) as u64
+}
+
 pub use getrandom::SysRng;
 
 #[derive(Debug, PartialEq)]

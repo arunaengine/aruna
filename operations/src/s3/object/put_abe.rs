@@ -7,7 +7,9 @@ use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE,
     ABE_VERSION_KEYSPACE,
 };
-use aruna_core::structs::storage::abe::{AbeError, AbeParameters, EnvelopeArchive, EnvelopePlan};
+use aruna_core::structs::storage::abe::{
+    AbeError, AbeParameters, EnvelopeArchive, EnvelopePlan, envelope_charge,
+};
 
 impl PutObjectOperation {
     pub(super) fn read_abe(&mut self, fence: bool) -> Effects {
@@ -110,7 +112,8 @@ impl PutObjectOperation {
             if total as u64 > self.rocrate_limits.metadata_bytes {
                 return Err(AbeError::Limit);
             }
-            Ok(vec![
+            let charge = envelope_charge(&bytes, &archive_bytes);
+            let writes = vec![
                 (
                     ABE_ENVELOPE_KEYSPACE.to_string(),
                     id.clone().into(),
@@ -126,10 +129,12 @@ impl PutObjectOperation {
                     id.into(),
                     archive_bytes.into(),
                 ),
-            ])
+            ];
+            Ok((writes, charge))
         })();
         match result {
-            Ok(writes) => {
+            Ok((writes, charge)) => {
+                self.envelope_bytes = charge;
                 self.state = PutObjectState::WriteEnvelope;
                 smallvec![Effect::Storage(StorageEffect::BatchWrite {
                     writes,

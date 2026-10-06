@@ -9,7 +9,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NODE_STATS_KEYSPACE,
+    ABE_ARCHIVE_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NODE_STATS_KEYSPACE,
     PENDING_LOCATION_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::operation::Operation;
@@ -587,6 +588,9 @@ pub enum RebuildStatsState {
     ScanPending,
     ScanHeads,
     ScanVersions,
+    ScanEnvelopes,
+    ScanArchives,
+    ScanEnvelopeVersions,
     ScanCounters,
     StartWriteTransaction,
     WriteCounters,
@@ -628,6 +632,8 @@ pub struct RebuildStatsOperation {
     /// Pithos archives already charged: during promotion one archive has a known and a pending row.
     charged_archives: HashSet<Vec<u8>>,
     current_versions: HashMap<(String, String), ulid::Ulid>,
+    /// Envelope and archive mapping row bytes by envelope id.
+    envelope_sizes: HashMap<Vec<u8>, u64>,
     global: UsageCounters,
     global_shards: Vec<UsageCounters>,
     backend_shards: HashMap<Vec<u8>, UsageCounters>,
@@ -658,6 +664,7 @@ impl RebuildStatsOperation {
             pending_sizes: HashMap::new(),
             charged_archives: HashSet::new(),
             current_versions: HashMap::new(),
+            envelope_sizes: HashMap::new(),
             global: UsageCounters::default(),
             global_shards: vec![UsageCounters::default(); GLOBAL_SHARD_COUNT],
             backend_shards: HashMap::new(),
@@ -692,6 +699,9 @@ impl RebuildStatsOperation {
             RebuildStatsState::ScanPending => Some(PENDING_LOCATION_KEYSPACE),
             RebuildStatsState::ScanHeads => Some(BLOB_HEAD_KEYSPACE),
             RebuildStatsState::ScanVersions => Some(BLOB_VERSIONS_KEYSPACE),
+            RebuildStatsState::ScanEnvelopes => Some(ABE_ENVELOPE_KEYSPACE),
+            RebuildStatsState::ScanArchives => Some(ABE_ARCHIVE_KEYSPACE),
+            RebuildStatsState::ScanEnvelopeVersions => Some(ABE_VERSION_KEYSPACE),
             RebuildStatsState::ScanCounters => Some(USAGE_STATS_KEYSPACE),
             _ => None,
         }
@@ -837,6 +847,27 @@ impl RebuildStatsOperation {
                     }
                 }
             }
+            RebuildStatsState::ScanEnvelopes | RebuildStatsState::ScanArchives => {
+                for (key, value) in values {
+                    *self.envelope_sizes.entry(key.to_vec()).or_default() += value.len() as u64;
+                }
+            }
+            RebuildStatsState::ScanEnvelopeVersions => {
+                for (key, id) in values {
+                    let version_key = VersionKey::from_bytes(key.as_ref())?;
+                    let delta = UsageCounters {
+                        logical_bytes: self.envelope_sizes.get(id.as_ref()).copied().unwrap_or(0),
+                        ..Default::default()
+                    };
+                    self.global.add(&delta)?;
+                    if let Some(group_id) = self.bucket_groups.get(&version_key.bucket).copied() {
+                        self.group_entry(group_id).add(&delta)?;
+                        self.global_shard_entry(group_id).add(&delta)?;
+                    } else {
+                        self.global_shards[0].add(&delta)?;
+                    }
+                }
+            }
             RebuildStatsState::ScanCounters => {
                 self.existing_counter_keys
                     .extend(values.iter().map(|(key, _)| key.to_vec()));
@@ -859,8 +890,11 @@ impl RebuildStatsOperation {
                         "rebuilt usage omits versions without a blob location row"
                     );
                 }
-                RebuildStatsState::ScanCounters
+                RebuildStatsState::ScanEnvelopes
             }
+            RebuildStatsState::ScanEnvelopes => RebuildStatsState::ScanArchives,
+            RebuildStatsState::ScanArchives => RebuildStatsState::ScanEnvelopeVersions,
+            RebuildStatsState::ScanEnvelopeVersions => RebuildStatsState::ScanCounters,
             RebuildStatsState::ScanCounters => {
                 self.state = RebuildStatsState::StartWriteTransaction;
                 return smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -1033,6 +1067,9 @@ impl Operation for RebuildStatsOperation {
             | RebuildStatsState::ScanPending
             | RebuildStatsState::ScanHeads
             | RebuildStatsState::ScanVersions
+            | RebuildStatsState::ScanEnvelopes
+            | RebuildStatsState::ScanArchives
+            | RebuildStatsState::ScanEnvelopeVersions
             | RebuildStatsState::ScanCounters => self.handle_page(event),
             RebuildStatsState::StartWriteTransaction => self.handle_write_started(event),
             RebuildStatsState::WriteCounters => self.handle_counters_written(event),

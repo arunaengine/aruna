@@ -252,6 +252,7 @@ pub struct PutObjectOperation {
     envelope_enabled: bool,
     envelope_plan: Option<aruna_core::structs::storage::abe::EnvelopePlan>,
     envelope: Option<aruna_core::structs::storage::abe::ObjectEnvelope>,
+    envelope_bytes: u64,
 }
 
 impl PutObjectOperation {
@@ -293,6 +294,7 @@ impl PutObjectOperation {
             envelope_enabled: true,
             envelope_plan: None,
             envelope: None,
+            envelope_bytes: 0,
         }
     }
 
@@ -1256,7 +1258,7 @@ impl PutObjectOperation {
                 let size = i128::from(location.blob_size);
                 let group_delta = UsageDelta {
                     objects: if self.was_live { 0 } else { 1 },
-                    logical_bytes: size,
+                    logical_bytes: size + i128::from(self.envelope_bytes),
                     ..Default::default()
                 };
                 let Some(stored) = StoredDelta::for_location(&location, self.new_blob) else {
