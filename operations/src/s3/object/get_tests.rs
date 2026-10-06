@@ -2370,8 +2370,11 @@ mod token_read {
         BlockCipher, BlockKeys, BucketEncryption, BucketKeyRecord, BucketKeyRef, EncryptionMode,
         SealPlan, TokenCredential, generate_token, public_key_of, seal_token,
     };
+    use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
     use futures_util::StreamExt;
+    use std::sync::Arc;
     use std::time::SystemTime;
+    use tokio::io::AsyncWriteExt;
     use ulid::Ulid;
 
     async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
@@ -2386,15 +2389,72 @@ mod token_read {
 
     #[tokio::test]
     async fn pending_read_promoted() {
-        pending_read(false).await;
+        pending_read(false, false).await;
     }
 
     #[tokio::test]
     async fn token_claim_rejected() {
-        pending_read(true).await;
+        pending_read(true, false).await;
     }
 
-    async fn pending_read(reject: bool) {
+    #[tokio::test]
+    async fn token_corrupt_rejected() {
+        pending_read(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn token_corrupt_retained() {
+        pending_read(false, true).await;
+    }
+
+    struct Capture(tokio::sync::mpsc::UnboundedSender<aruna_net::streams::BiStream>);
+
+    #[async_trait::async_trait]
+    impl aruna_net::InboundEventHandler for Capture {
+        async fn handle_incoming_stream(
+            &self,
+            _: aruna_core::alpn::Alpn,
+            stream: aruna_net::streams::BiStream,
+            _: aruna_core::NodeId,
+        ) {
+            self.0.send(stream).unwrap();
+        }
+    }
+
+    async fn corrupt_bytes(context: &DriverContext) -> Vec<u8> {
+        let data = vec![0; 64];
+        let net = context.net_handle.as_ref().unwrap();
+        let (sender, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+        net.set_inbound_handler(Arc::new(Capture(sender)));
+        let mut stream = net
+            .open_stream(net.node_id(), aruna_core::alpn::Alpn::Bao)
+            .await
+            .unwrap();
+        let inbound = incoming.recv().await.unwrap();
+        let blob = context.blob_handle.as_ref().unwrap();
+        let id = blob.store_connection(net.node_id(), inbound).await.unwrap();
+        stream.0.write_all(&data).await.unwrap();
+        stream.0.finish().unwrap();
+        let event = blob
+            .send_blob_effect(BlobEffect::ReceiveRead {
+                stream_id: id,
+                size: data.len() as u64,
+                expected_blake3: *blake3::hash(&data).as_bytes(),
+            })
+            .await;
+        let Event::Blob(BlobEvent::ReadFinished { blob, .. }) = event else {
+            panic!("Bao read failed")
+        };
+        let chunks: Vec<_> = blob.0.collect().await;
+        let verified: Vec<u8> = chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.unwrap())
+            .collect();
+        assert_eq!(verified, data);
+        verified
+    }
+
+    async fn pending_read(reject: bool, corrupt: bool) {
         // A multipart upload whose content hash is still pending: a token promotes it while the
         // bucket stays locked, then serves its plaintext.
         let (_temp, context) = full_context().await;
@@ -2489,6 +2549,18 @@ mod token_read {
         else {
             panic!("sealing failed");
         };
+        if corrupt {
+            let bytes = corrupt_bytes(&context).await;
+            std::fs::write(sealed.get_full_path().unwrap(), &bytes).unwrap();
+            sealed.format = StoredFormat::pithos(
+                PithosLayout {
+                    stored_size: bytes.len() as u64,
+                    metadata_digest: [0; 32],
+                    storage_generation: 0,
+                },
+                key,
+            );
+        }
         sealed.hashes.clear();
         let archive = ArchiveKey::of(&sealed);
         let version_id = Ulid::generate();
@@ -2588,6 +2660,44 @@ mod token_read {
                 .await
                 .unwrap();
                 assert_eq!(rows.len(), 1, "rejection evidence missing in {key_space}");
+            }
+            return;
+        }
+        if corrupt {
+            assert!(matches!(
+                result,
+                Err(super::GetObjectError::GetObjectFailed)
+            ));
+            for key_space in [
+                BLOB_VERSIONS_KEYSPACE,
+                BLOB_HEAD_KEYSPACE,
+                COPY_OWNER_KEYSPACE,
+                PENDING_LOCATION_KEYSPACE,
+            ] {
+                let (rows, _) = crate::jobs::store::iter_prefix_page(
+                    &context.storage_handle,
+                    key_space,
+                    None,
+                    None,
+                    8,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(rows.len(), 1, "local copy missing in {key_space}");
+            }
+            for key_space in [PENDING_CLAIM_KEYSPACE, BLOB_QUARANTINE_KEYSPACE] {
+                let (rows, _) = crate::jobs::store::iter_prefix_page(
+                    &context.storage_handle,
+                    key_space,
+                    None,
+                    None,
+                    8,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(rows.is_empty(), "local copy rejected in {key_space}");
             }
             return;
         }

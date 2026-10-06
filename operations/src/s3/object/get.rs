@@ -4,7 +4,9 @@
 
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::managed_copy::ManagedCopyError;
-use crate::blob::promote::{PromotePendingOperation, Promotion, drop_mismatch};
+use crate::blob::promote::{
+    PromoteError, PromotePendingOperation, Promotion, drop_mismatch, reject_archive,
+};
 use crate::blob::records::blob_location_read;
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::driver::{DriverContext, drive};
@@ -1793,12 +1795,18 @@ async fn promote_token(
     })?;
     let promote =
         PromotePendingOperation::new(archive.clone(), realm_id, node_id, token.limits.clone());
-    let outcome = drive(promote.with_lease(lease), context)
-        .await
-        .map_err(|error| {
+    let outcome = match drive(promote.with_lease(lease), context).await {
+        Err(PromoteError::Blob(BlobError::IntegrityCheckFailed(reason))) => {
+            reject_archive(context, &archive, (realm_id, node_id), reason)
+                .await
+                .map_err(|_| GetObjectError::GetObjectFailed)?;
+            return Err(GetObjectError::GetObjectFailed);
+        }
+        result => result.map_err(|error| {
             warn!(error = %error, "Token promotion of a pending version failed");
             GetObjectError::GetObjectFailed
-        })?;
+        })?,
+    };
     match outcome {
         Promotion::Promoted { .. } | Promotion::Gone => Ok(()),
         Promotion::AwaitingKey(_) => Err(GetObjectError::GetObjectFailed),

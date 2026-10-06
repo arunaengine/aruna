@@ -739,19 +739,7 @@ pub async fn promote_unlocked(
                 PromotePendingOperation::new(archive.clone(), origin.0, origin.1, limits.clone());
             let outcome = match crate::driver::drive(operation, context).await {
                 Err(PromoteError::Blob(BlobError::IntegrityCheckFailed(reason))) => {
-                    let claim = read_value(
-                        &context.storage_handle,
-                        PENDING_CLAIM_KEYSPACE,
-                        archive.to_bytes(),
-                    )
-                    .await?;
-                    let Some(claimed) = claim
-                        .as_ref()
-                        .and_then(|claim| <[u8; 32]>::try_from(claim.as_ref()).ok())
-                    else {
-                        return Err(BlobError::IntegrityCheckFailed(reason).into());
-                    };
-                    drop_received(context, &archive, claimed, origin, reason).await?;
+                    reject_archive(context, &archive, origin, reason).await?;
                     continue;
                 }
                 result => result?,
@@ -782,6 +770,27 @@ pub async fn drop_mismatch(
     origin: (RealmId, NodeId),
 ) -> Result<usize, PromoteError> {
     let reason = "replicated content hash differs from the claimed hash".to_string();
+    drop_received(context, archive, claimed, origin, reason).await
+}
+
+pub(crate) async fn reject_archive(
+    context: &crate::driver::DriverContext,
+    archive: &ArchiveKey,
+    origin: (RealmId, NodeId),
+    reason: String,
+) -> Result<usize, PromoteError> {
+    let claim = read_value(
+        &context.storage_handle,
+        PENDING_CLAIM_KEYSPACE,
+        archive.to_bytes(),
+    )
+    .await?;
+    let Some(claimed) = claim
+        .as_ref()
+        .and_then(|claim| <[u8; 32]>::try_from(claim.as_ref()).ok())
+    else {
+        return Err(BlobError::IntegrityCheckFailed(reason).into());
+    };
     drop_received(context, archive, claimed, origin, reason).await
 }
 
