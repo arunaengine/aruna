@@ -2558,6 +2558,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rebuild_counts_envelopes() {
+        let group_id = Ulid::generate();
+        let id = ByteView::from(Ulid::generate().to_bytes().to_vec());
+        let version = VersionKey::new("b", "sealed", Ulid::generate());
+        let mut operation = RebuildStatsOperation::new();
+        operation.bucket_groups.insert("b".to_string(), group_id);
+        operation.state = RebuildStatsState::ScanEnvelopes;
+        operation
+            .consume_values(&[(id.clone(), ByteView::from(vec![1; 40]))])
+            .unwrap();
+        operation.state = RebuildStatsState::ScanArchives;
+        operation
+            .consume_values(&[(id.clone(), ByteView::from(vec![2; 9]))])
+            .unwrap();
+        operation.state = RebuildStatsState::ScanEnvelopeVersions;
+        let row = (ByteView::from(version.to_bytes().unwrap()), id);
+        operation.consume_values(&[row]).unwrap();
+        assert_eq!(operation.groups.get(&group_id).unwrap().logical_bytes, 49);
+        assert_eq!(operation.global.logical_bytes, 49);
+    }
+
     #[tokio::test]
     async fn rebuild_removes_stale() {
         let temp = tempdir().unwrap();
