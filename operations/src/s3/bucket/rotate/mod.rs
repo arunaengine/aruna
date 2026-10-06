@@ -55,6 +55,7 @@ pub enum ChangeState {
     Commit,
     Finish,
     Error,
+    PrepareAbe,
 }
 
 /// The change a holder or admin asked for.
@@ -134,6 +135,7 @@ pub struct ChangeResult {
 pub struct ChangeEncryptionOperation {
     input: ChangeInput,
     state: ChangeState,
+    abe: Option<crate::s3::bucket::key::abe::PrepareAbeOperation>,
     txn_id: Option<TxnId>,
     info: Option<BucketInfo>,
     admins: BTreeSet<UserId>,
@@ -152,6 +154,7 @@ impl ChangeEncryptionOperation {
         Self {
             input,
             state: ChangeState::Init,
+            abe: None,
             txn_id: None,
             info: None,
             admins: BTreeSet::new(),
@@ -319,7 +322,7 @@ impl ChangeEncryptionOperation {
     }
 
     fn seal(&mut self, public_key: [u8; 32], private_key: SharedSecret) -> Effects {
-        let (Some(active), Some(info)) = (self.active.as_ref(), self.info.as_ref()) else {
+        let (Some(active), Some(_info)) = (self.active.as_ref(), self.info.as_ref()) else {
             return self.fail(ChangeError::NotFinished);
         };
         let key = BucketKeyRef::new(active.key.bucket_id, active.key.generation + 1);
@@ -330,16 +333,46 @@ impl ChangeEncryptionOperation {
         if mode == EncryptionMode::NodeManaged {
             record.vault_entry = Some(record_id);
         }
-        let creator = info.created_by;
-        let report = resolve_holders(
-            creator,
-            &self.admins,
-            &self.grants,
-            &self.input.lookups,
-            &[],
-        );
-        let holders = copy_targets(&report, &self.input.lookups);
         self.new_key = Some((record, private_key.clone()));
+        let Some(txn) = self.txn_id else {
+            return self.fail(ChangeError::NotFinished);
+        };
+        let mut abe = crate::s3::bucket::key::abe::PrepareAbeOperation::new(
+            self.input.realm_id,
+            self.input.node_id,
+            key,
+            private_key,
+            txn,
+        );
+        self.state = ChangeState::PrepareAbe;
+        let effects = abe.start();
+        self.abe = Some(abe);
+        effects
+    }
+
+    fn prepare_abe(&mut self, event: Event) -> Effects {
+        let Some(abe) = self.abe.as_mut() else {
+            return self.fail(ChangeError::NotFinished);
+        };
+        let effects = abe.step(event);
+        if !abe.is_complete() {
+            return effects;
+        }
+        let Some(abe) = self.abe.take() else {
+            return self.fail(ChangeError::NotFinished);
+        };
+        if let Err(error) = abe.finalize() {
+            return self.fail(error);
+        }
+        let Some((key, public_key)) = self.new_key.as_ref().map(|(r, _)| (r.key, r.public_key))
+        else {
+            return self.fail(ChangeError::NotFinished);
+        };
+        let Some(private_key) = self.new_key.as_ref().map(|(_, s)| s.clone()) else {
+            return self.fail(ChangeError::NotFinished);
+        };
+        let report = self.report(&[]);
+        let holders = copy_targets(&report, &self.input.lookups);
         if holders.is_empty() {
             return self.write_rows(None, Vec::new());
         }
@@ -432,6 +465,7 @@ impl Operation for ChangeEncryptionOperation {
             return self.fail(error.clone());
         }
         match (self.state, event) {
+            (ChangeState::PrepareAbe, event) => self.prepare_abe(event),
             (
                 ChangeState::StartTransaction,
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }),

@@ -61,6 +61,7 @@ enum EnableState {
     CommitTransaction,
     Finish,
     Error,
+    PrepareAbe,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -133,6 +134,7 @@ pub struct EnableResult {
 pub struct EnableEncryptionOperation {
     input: EnableInput,
     state: EnableState,
+    abe: Option<crate::s3::bucket::key::abe::PrepareAbeOperation>,
     txn_id: Option<TxnId>,
     creator: Option<UserId>,
     admins: BTreeSet<UserId>,
@@ -153,6 +155,7 @@ impl EnableEncryptionOperation {
         Self {
             input,
             state: EnableState::Init,
+            abe: None,
             txn_id: None,
             creator: None,
             admins: BTreeSet::new(),
@@ -334,6 +337,42 @@ impl EnableEncryptionOperation {
         }
         self.record = Some(record);
         self.private_key = Some(private_key.clone());
+        let Some(txn) = self.txn_id else {
+            return self.fail(EnableError::NotFinished);
+        };
+        let mut abe = crate::s3::bucket::key::abe::PrepareAbeOperation::new(
+            self.input.realm_id,
+            self.input.node_id,
+            key,
+            private_key,
+            txn,
+        );
+        self.state = EnableState::PrepareAbe;
+        let effects = abe.start();
+        self.abe = Some(abe);
+        effects
+    }
+
+    fn prepare_abe(&mut self, event: Event) -> Effects {
+        let Some(abe) = self.abe.as_mut() else {
+            return self.fail(EnableError::NotFinished);
+        };
+        let effects = abe.step(event);
+        if !abe.is_complete() {
+            return effects;
+        }
+        let Some(abe) = self.abe.take() else {
+            return self.fail(EnableError::NotFinished);
+        };
+        if let Err(error) = abe.finalize() {
+            return self.fail(error);
+        }
+        let Some((key, public_key)) = self.record.as_ref().map(|r| (r.key, r.public_key)) else {
+            return self.fail(EnableError::NotFinished);
+        };
+        let Some(private_key) = self.private_key.clone() else {
+            return self.fail(EnableError::NotFinished);
+        };
         let report = self.report(&[]);
         let holders = copy_targets(&report, &self.input.lookups);
         if holders.is_empty() {
@@ -481,6 +520,7 @@ impl Operation for EnableEncryptionOperation {
             return self.fail(error.clone());
         }
         match (self.state, event) {
+            (EnableState::PrepareAbe, event) => self.prepare_abe(event),
             (
                 EnableState::StartTransaction,
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }),

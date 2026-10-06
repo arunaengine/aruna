@@ -155,10 +155,11 @@ fn generated(operation: &mut ChangeEncryptionOperation) -> Effects {
     }));
     let private = SecretBytes::new(vec![4; 32]);
     let public_key = aruna_core::structs::storage::encryption::public_key_of(&private).unwrap();
-    operation.step(Event::Blob(BlobEvent::BucketKeyGenerated {
+    let effects = operation.step(Event::Blob(BlobEvent::BucketKeyGenerated {
         public_key,
         private_key: SharedSecret::new(private),
-    }))
+    }));
+    crate::s3::bucket::key::abe::admit_parameters(operation, effects)
 }
 
 #[test]

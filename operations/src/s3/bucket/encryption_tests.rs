@@ -85,6 +85,7 @@ fn generated(operation: &mut EnableEncryptionOperation) -> (Effects, [u8; 32]) {
         public_key: public,
         private_key: SharedSecret::new(private),
     }));
+    let effects = crate::s3::bucket::key::abe::admit_parameters(operation, effects);
     (effects, public)
 }
 
