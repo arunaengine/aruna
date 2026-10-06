@@ -60,6 +60,7 @@ enum State {
     Keys,
     Records,
     Existing,
+    Reuse,
     Issue,
     Cleanup,
     Write,
@@ -124,6 +125,17 @@ impl KeyOperation {
             txn_id: self.txn
         })]
     }
+    fn fenced(&self, mut effects: Effects) -> Effects {
+        for effect in &mut effects {
+            if let Effect::Storage(
+                StorageEffect::Read { txn_id, .. } | StorageEffect::Iter { txn_id, .. },
+            ) = effect
+            {
+                *txn_id = self.txn;
+            }
+        }
+        effects
+    }
     fn newest(&self) -> Option<&UserKeyRecord> {
         self.recipient_keys
             .iter()
@@ -175,7 +187,7 @@ impl KeyOperation {
         };
         let effects = keys.step(event);
         if !keys.is_complete() {
-            return effects;
+            return self.fenced(effects);
         }
         let records = match self.keys.take().map(|k| k.finalize()) {
             Some(Ok(VaultRecords::Keys(records))) => records,
@@ -220,7 +232,10 @@ impl KeyOperation {
             return self.fail(AbeError::Context);
         };
         match value.map(|v| KeyGrant::from_bytes(&v)) {
-            Some(Ok(grant)) if grant.context == submitted.context => {
+            Some(Ok(grant)) if grant.context.request == submitted.context.request => {
+                if let Err(error) = self.grant_allowed(&grant.context.request) {
+                    return self.fail(error);
+                }
                 self.result = Some(KeyResult::Grant(grant));
                 self.flush()
             }
@@ -297,7 +312,7 @@ impl Operation for KeyOperation {
                     deadline: std::time::Duration::from_secs(10),
                 });
                 self.state = State::Keys;
-                let effects = keys.start();
+                let effects = self.fenced(keys.start());
                 self.keys = Some(keys);
                 effects
             }
@@ -305,6 +320,9 @@ impl Operation for KeyOperation {
             (State::Records, event) => self.records_read(event),
             (State::Existing, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
                 self.existing_read(value)
+            }
+            (State::Reuse, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                self.reuse_read(values)
             }
             (State::Issue, Event::Blob(BlobEvent::Abe(event))) => match *event {
                 AbeEvent::Grant(grant) => self.publish_grant(grant),

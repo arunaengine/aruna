@@ -25,13 +25,12 @@ impl KeyOperation {
     }
     fn grant_allowed(&self, request: &KeyRequest) -> Result<(), KeyError> {
         let snapshot = self.snapshot.as_ref().ok_or(KeyError::Missing)?;
+        let key = self.newest();
         if request.parameters != snapshot.parameters
             || request.bucket != self.bucket
-            || !self.recipient_keys.iter().any(|key| {
-                request.recipient_record == Some(key.record_id)
-                    && request.recipient_public == Some(key.public_key)
-                    && request.recipient_fingerprint == Some(key.fingerprint)
-            })
+            || request.recipient_record != key.map(|k| k.record_id)
+            || request.recipient_public != key.map(|k| k.public_key)
+            || request.recipient_fingerprint != key.map(|k| k.fingerprint)
         {
             return Err(AbeError::Stale.into());
         }
@@ -149,6 +148,54 @@ impl KeyOperation {
                 }
             }
         };
+        if same.is_none() {
+            let prefix = request.prefix();
+            self.request = Some(request);
+            self.state = State::Reuse;
+            return smallvec![Effect::Storage(StorageEffect::Iter {
+                key_space: ABE_GRANT_KEYSPACE.to_string(),
+                prefix: Some(prefix.into()),
+                start: None,
+                limit: MAX_REQUESTS + 1,
+                txn_id: self.txn
+            })];
+        }
+        self.issue(request)
+    }
+    pub(super) fn reuse_read(&mut self, values: Vec<(Key, Value)>) -> Effects {
+        let (Some(request), Some(snapshot)) = (self.request.take(), self.snapshot.as_ref()) else {
+            return self.fail(KeyError::Missing);
+        };
+        let epochs = [snapshot.epoch];
+        let revisions = snapshot.revisions.clone();
+        let full = values.len() > MAX_REQUESTS;
+        let mut live = 0;
+        for (key, value) in values.into_iter().take(MAX_REQUESTS) {
+            let grant = match KeyGrant::from_bytes(&value) {
+                Ok(g) => g,
+                Err(error) => return self.fail(error),
+            };
+            let held = &grant.context.request;
+            if self.grant_allowed(held).is_err() {
+                self.deletes.push((ABE_GRANT_KEYSPACE.to_string(), key));
+                continue;
+            }
+            live += 1;
+            if held.scope == request.scope
+                && held.restrictions == request.restrictions
+                && held.epochs == epochs
+                && held.revisions == revisions
+            {
+                self.result = Some(KeyResult::Grant(grant));
+                return self.flush();
+            }
+        }
+        if full && live == MAX_REQUESTS {
+            return self.fail(AbeError::Limit);
+        }
+        self.issue(request)
+    }
+    fn issue(&mut self, request: KeyRequest) -> Effects {
         if request.recipient_public.is_none() {
             self.result = Some(KeyResult::Request(request.clone()));
             return self.write_request(request);
