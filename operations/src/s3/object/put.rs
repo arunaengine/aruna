@@ -1272,12 +1272,13 @@ impl PutObjectOperation {
 
                 // Enforce the hard quota before counters commit; only a
                 // positive logical delta can breach it, so deletes pass.
+                let charged = location.blob_size.saturating_add(self.envelope_bytes);
                 if let Some(ceiling) = self.config.quota_ceiling
-                    && location.blob_size > 0
+                    && charged > 0
                 {
                     let mut gate = QuotaGate::new_for_realm(
                         ceiling,
-                        location.blob_size,
+                        charged,
                         self.config.group_id,
                         self.config.node_id,
                         self.config.realm_id,

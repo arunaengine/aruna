@@ -2215,4 +2215,54 @@ mod sealed {
                 .any(|(_, d)| d.logical_bytes == 1 + charge as i128)
         );
     }
+
+    /// Runs the quota gate for a write with a 2 byte ceiling and no prior usage.
+    fn quota_charge(payload: u64, envelope_bytes: u64) -> aruna_core::types::Effects {
+        let mut op = operation();
+        op.config.quota_ceiling = Some(2);
+        let txn_id = Ulid::generate();
+        let mut location = test_location(op.config.user_id);
+        location.blob_size = payload;
+        location.hashes.insert(
+            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+            vec![5; 32],
+        );
+        op.envelope_bytes = envelope_bytes;
+        op.txn_id = Some(txn_id);
+        op.output = Some(Ok(location));
+        op.state = PutObjectState::WriteReplicationObligation;
+        let mut effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"obligation".to_vec().into(),
+        }));
+        if op.state == PutObjectState::EnforceQuota {
+            let empty = || {
+                Event::Storage(StorageEvent::ReadResult {
+                    key: b"k".to_vec().into(),
+                    value: None,
+                })
+            };
+            op.step(empty());
+            op.step(empty());
+            effects = op.step(Event::Storage(StorageEvent::IterResult {
+                values: vec![],
+                next_start_after: None,
+            }));
+        }
+        effects
+    }
+
+    #[test]
+    fn quota_counts_envelope() {
+        let refused = |effects: aruna_core::types::Effects| {
+            matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+            )
+        };
+        // The payload alone fits, but the envelope pushes the charge over the ceiling.
+        assert!(refused(quota_charge(2, 1)));
+        assert!(refused(quota_charge(0, 3)));
+        assert!(!refused(quota_charge(0, 2)));
+        assert!(!refused(quota_charge(1, 1)));
+    }
 }
