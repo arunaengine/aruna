@@ -119,7 +119,7 @@ impl AdmitTokenOperation {
             Ok(record) => record,
             Err(error) => return self.fail(error),
         };
-        let same = state.settings.bucket_id == Some(key.bucket_id)
+        let same = state.settings.active_key() == Some(key)
             && copy.key == key
             && copy.access_key == self.input.credential.access_key
             && record.key == key

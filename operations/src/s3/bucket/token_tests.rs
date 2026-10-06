@@ -216,6 +216,25 @@ fn stale_copies_lock() {
 }
 
 #[test]
+fn retiring_token_locks() {
+    let retiring = BucketKeyRef::new(key().bucket_id, 1);
+    let mut operation = operation();
+    operation.input.key = retiring;
+    operation.start();
+    let Event::Storage(StorageEvent::BatchReadResult { mut values }) =
+        rows(&[], Some(copy(user(1), 1)), KeyState::Retiring)
+    else {
+        panic!("expected bucket rows");
+    };
+    let mut record = BucketKeyRecord::new(retiring, Ulid::from_bytes([8; 16]), [6; 32], 1);
+    record.state = KeyState::Retiring;
+    values[5].1 = Some(record.to_bytes().unwrap().into());
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(locked(operation));
+}
+
+#[test]
 fn wrong_token_typed() {
     let mut operation = operation();
     operation.start();
