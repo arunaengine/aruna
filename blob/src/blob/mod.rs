@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+mod abe;
 mod backend;
 mod control_plane;
 mod frames;
@@ -27,7 +28,6 @@ mod replication;
 mod runtime;
 mod source;
 mod unlock;
-mod abe;
 
 pub use group::{BackendClaim, GroupHold};
 pub use registry::{BackendRegistry, NodeBackend};

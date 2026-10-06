@@ -231,7 +231,10 @@ pub(crate) mod tests {
         ("GET", "/metadata/audit"),
         ("POST", "/data/buckets/{bucket}/abe/requests"),
         ("GET", "/data/buckets/{bucket}/abe/requests"),
-        ("POST", "/data/buckets/{bucket}/abe/requests/{request_id}/grant"),
+        (
+            "POST",
+            "/data/buckets/{bucket}/abe/requests/{request_id}/grant",
+        ),
         ("GET", "/data/buckets/{bucket}/abe/grants"),
         ("GET", "/data/blobs/envelope"),
         ("GET", "/data/blobs/content"),
