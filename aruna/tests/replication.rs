@@ -547,6 +547,7 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
                     mode: ApiSyncMode::Continuous,
                     reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -709,6 +710,7 @@ async fn once_syncs_prefix() -> TestResult<()> {
                     mode: ApiSyncMode::Once,
                     reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: false,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -846,6 +848,7 @@ async fn reference_syncs_lazily() -> TestResult<()> {
                     mode: ApiSyncMode::Reference,
                     reference_handling: ApiReferenceHandling::Preserve,
                     replicate_deletes: true,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -1117,6 +1120,7 @@ async fn quota_surfaces_failure() -> TestResult<()> {
                     mode: ApiSyncMode::Once,
                     reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: false,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -1207,6 +1211,7 @@ async fn permission_rechecks_creator() -> TestResult<()> {
                     mode: ApiSyncMode::Continuous,
                     reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -1319,6 +1324,7 @@ async fn chain_blocks_cycle() -> TestResult<()> {
                     mode: ApiSyncMode::Continuous,
                     reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -1339,6 +1345,7 @@ async fn chain_blocks_cycle() -> TestResult<()> {
                     mode: ApiSyncMode::Continuous,
                     reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -1359,6 +1366,7 @@ async fn chain_blocks_cycle() -> TestResult<()> {
                     mode: ApiSyncMode::Continuous,
                     reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -1875,6 +1883,92 @@ async fn compression_matrix_replicates() -> TestResult<()> {
                 );
             }
         }
+        Ok(())
+    }
+    .await;
+
+    harness.shutdown().await;
+    result
+}
+
+/// Turns on `node_managed` encryption of `bucket` through S3.
+async fn encrypt_bucket(client: &S3Client, bucket: &str) -> TestResult<()> {
+    use aws_sdk_s3::types::{
+        ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+        ServerSideEncryptionRule,
+    };
+    let default = ServerSideEncryptionByDefault::builder()
+        .sse_algorithm(ServerSideEncryption::Aes256)
+        .build()?;
+    let rule = ServerSideEncryptionRule::builder()
+        .apply_server_side_encryption_by_default(default)
+        .build();
+    let configuration = ServerSideEncryptionConfiguration::builder()
+        .rules(rule)
+        .build()?;
+    client
+        .put_bucket_encryption()
+        .bucket(bucket)
+        .server_side_encryption_configuration(configuration)
+        .send()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_sync_regrants() -> TestResult<()> {
+    // Both buckets encrypt with their own keys: the target reads the copy with its key alone.
+    let harness = ReplicationHarness::new("replication-encrypted-group").await?;
+
+    let result = async {
+        let (source, target) = ("encrypted-source", "encrypted-target");
+        let key = "sealed/object.txt";
+        let body = b"sealed on the source, granted to the target".repeat(64);
+        harness.create_bucket_pair(source, target).await?;
+        encrypt_bucket(&harness.seed_client, source).await?;
+        encrypt_bucket(&harness.joiner_client, target).await?;
+        let relationship = harness
+            .post_sync(
+                &harness.seed.base_url,
+                &harness.seed_token,
+                CreateSyncRequest {
+                    source: SyncSourceRequest {
+                        bucket: source.to_string(),
+                        prefix: None,
+                    },
+                    target: SyncTargetRequest {
+                        node_id: harness.joiner.config.node_id.to_string(),
+                        bucket: target.to_string(),
+                        prefix: None,
+                    },
+                    mode: ApiSyncMode::Continuous,
+                    reference_handling: ApiReferenceHandling::Materialize,
+                    replicate_deletes: false,
+                    plaintext: false,
+                },
+            )
+            .await?;
+        assert!(!relationship.plaintext);
+
+        harness
+            .seed_client
+            .put_object()
+            .bucket(source)
+            .key(key)
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await?;
+        harness.assert_object_matches(target, key, &body).await?;
+
+        let detail = harness
+            .get_sync(
+                &harness.seed.base_url,
+                &harness.seed_token,
+                &relationship.id,
+            )
+            .await?;
+        assert_eq!(detail.relationship.status.awaiting_key, 0);
+        assert_eq!(detail.relationship.status.last_error, None);
         Ok(())
     }
     .await;

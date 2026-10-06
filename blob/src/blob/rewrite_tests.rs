@@ -323,3 +323,183 @@ async fn retired_generations_free() {
         "{event:?}"
     );
 }
+
+/// A connection of the handler to itself: its sending end and its receiving end.
+async fn loopback(handler: &BlobHandler) -> (Ulid, Ulid) {
+    let (sender, mut streams) = tokio::sync::mpsc::unbounded_channel();
+    let capture = std::sync::Arc::new(super::StreamCapture(sender));
+    handler.net.set_inbound_handler(capture);
+    let local = handler.net.node_id();
+    let BlobEvent::ConnectionEstablished { stream_id } = handler.open_connection(local).await
+    else {
+        panic!("no connection to the local node")
+    };
+    let accepted = tokio::time::timeout(IDLE, streams.recv()).await;
+    let (_, inbound, peer) = accepted.unwrap().unwrap();
+    let inbound_id = handler.add_connection(None, peer, inbound).await.unwrap();
+    (stream_id, inbound_id)
+}
+
+/// Receives one replica on `inbound` for a destination that seals with `target`.
+fn receiving(
+    handler: &BlobHandler,
+    inbound: Ulid,
+    target: ResolvedBackend,
+) -> tokio::task::JoinHandle<BlobEvent> {
+    let handler = handler.clone();
+    tokio::spawn(async move {
+        let received = handler.handle_incoming_replication(None, inbound, target, true);
+        Box::pin(received).await
+    })
+}
+
+/// A sealed copy of `data` under a source key, and an admitted lease for it.
+async fn leased_source(
+    handler: &BlobHandler,
+    data: &[u8],
+) -> (BackendLocation, ReadLease, [u8; 32]) {
+    let (key, private, public) = bucket_key(Ulid::generate(), 1, 5);
+    let source = plain(handler, data).await;
+    let event = rewritten(handler, source, None, sealing(key, public), false).await;
+    let BlobEvent::CopyRewritten { location } = event else {
+        panic!("sealing failed: {event:?}")
+    };
+    let lease = admitted(handler, key, private, public, &location).await;
+    (location, lease, private)
+}
+
+#[tokio::test]
+async fn granted_copy_transfers() {
+    // The source grants its archive to the target key; the target keeps the bytes as sent.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let data = b"granted on the way to another node".repeat(2000);
+    let (sealed, lease, source_private) = leased_source(&handler, &data).await;
+    let (target_key, target_private, target_public) = bucket_key(Ulid::generate(), 1, 6);
+    let target = sealing(target_key, target_public);
+    let plan = target.encryption.unwrap();
+    let (sending, inbound) = loopback(&handler).await;
+
+    let received = receiving(&handler, inbound, target);
+    let ids = (Ulid::generate(), sending);
+    let sent = handler
+        .replicate_leased(ids, sealed, lease, Some(plan))
+        .await;
+    assert!(
+        matches!(sent, BlobEvent::ReplicationFinished { .. }),
+        "{sent:?}"
+    );
+
+    let received = received.await.unwrap();
+    let BlobEvent::ReplicationFinished { location } = received else {
+        panic!("receive failed: {received:?}")
+    };
+    assert_eq!(location.format.bucket_key(), Some(target_key));
+    assert!(location.hashes.is_empty());
+    assert_eq!(location.blob_size, data.len() as u64);
+    assert_eq!(
+        opened(&handler, &location, target_private).await.unwrap(),
+        data
+    );
+    assert!(opened(&handler, &location, source_private).await.is_err());
+}
+
+#[tokio::test]
+async fn tampered_transfer_fails() {
+    // Archive bytes changed in transit do not match the announced tree and are not kept.
+    use crate::bao_tree::SendStreamWrapper;
+    use crate::blob::control_plane::{read_replication_message, send_replication_message};
+    use crate::messages::{MessageType, ReplicationMessage};
+    use bao_tree::ByteRanges;
+    use bao_tree::io::fsm::{CreateOutboard, encode_ranges_validated};
+    use bao_tree::io::outboard::PreOrderOutboard;
+    use bao_tree::io::round_up_to_chunks;
+    use iroh_io::AsyncSliceReader;
+
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let data = b"tampered while it travels".repeat(2000);
+    let (sealed, lease, _) = leased_source(&handler, &data).await;
+    let (target_key, _, target_public) = bucket_key(Ulid::generate(), 1, 6);
+    let target = sealing(target_key, target_public);
+    let plan = target.encryption.unwrap();
+    let (mut reader, sent) = handler.regrant_reader(&sealed, lease, &plan).await.unwrap();
+    let size = sent.stored_size();
+    let genuine = reader.read_exact_at(0, size as usize).await.unwrap();
+    let block = crate::blob::BAO_BLOCK_SIZE;
+    let root = PreOrderOutboard::<bytes::BytesMut>::create(&mut genuine.clone(), block)
+        .await
+        .unwrap()
+        .root;
+    let mut changed = genuine.to_vec();
+    changed[size as usize / 2] ^= 1;
+    let changed = bytes::Bytes::from(changed);
+    let mut forged = PreOrderOutboard::<bytes::BytesMut>::create(&mut changed.clone(), block)
+        .await
+        .unwrap();
+    let (sending, inbound) = loopback(&handler).await;
+    let received = receiving(&handler, inbound, target);
+
+    // The genuine root is announced; the changed bytes follow with a tree of their own.
+    let stream = handler.connection_handle(sending).await.unwrap();
+    let mut stream = stream.lock().await;
+    let id = Ulid::generate();
+    let msg_type = MessageType::BaoTreeInfo {
+        location: sent,
+        root,
+    };
+    let init = ReplicationMessage { id, msg_type };
+    send_replication_message(&mut stream.0, init, IDLE, "init")
+        .await
+        .unwrap();
+    read_replication_message(&mut stream.1, IDLE, "ack")
+        .await
+        .unwrap();
+    let ranges = round_up_to_chunks(&ByteRanges::from(0..size));
+    let mut sender = SendStreamWrapper::new(&mut stream.0, IDLE);
+    let _ = encode_ranges_validated(changed, &mut forged, &ranges, &mut sender).await;
+    _ = stream.0.finish();
+    drop(stream);
+
+    let received = received.await.unwrap();
+    // A cleanup error still rejects the copy and hands its location to later cleanup.
+    assert!(
+        matches!(
+            received,
+            BlobEvent::Error(
+                BlobError::ReplicationFailed(_)
+                    | BlobError::IntegrityCheckFailed(_)
+                    | BlobError::WriteCleanup { .. }
+            )
+        ),
+        "{received:?}"
+    );
+}
+
+#[tokio::test]
+async fn plaintext_sealed_on_receipt() {
+    // A plain source sends plaintext; an encrypting target seals it with its own plan.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let data = b"plain source, sealed target".repeat(2000);
+    let source = plain(&handler, &data).await;
+    let (key, private, public) = bucket_key(Ulid::generate(), 1, 7);
+    let (sending, inbound) = loopback(&handler).await;
+
+    let received = receiving(&handler, inbound, sealing(key, public));
+    let sent = handler
+        .replicate_blob(Ulid::generate(), sending, source.clone(), true)
+        .await;
+    assert!(
+        matches!(sent, BlobEvent::ReplicationFinished { .. }),
+        "{sent:?}"
+    );
+
+    let received = received.await.unwrap();
+    let BlobEvent::ReplicationFinished { location } = received else {
+        panic!("receive failed: {received:?}")
+    };
+    assert_eq!(location.format.bucket_key(), Some(key));
+    assert_eq!(location.get_blake3(), source.get_blake3());
+    assert_eq!(opened(&handler, &location, private).await.unwrap(), data);
+}
