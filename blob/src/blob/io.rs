@@ -428,7 +428,7 @@ impl BlobHandler {
         operator: Operator,
         blob: BackendStream<Result<Bytes, StreamError>>,
         compression: Compression,
-        (seal, reserved): (Option<SealPlan>, Option<Share>),
+        (seal, reserved, object): (Option<SealPlan>, Option<Share>, Option<[u8; 32]>),
         size: Option<u64>,
     ) -> BlobEvent {
         let mut limits = WriteLimits::default();
@@ -457,7 +457,7 @@ impl BlobHandler {
                     },
                 };
                 let budget = Arc::clone(&self.pithos_budget);
-                match ArchiveEncoder::new(&plan, compression) {
+                match ArchiveEncoder::granted(&plan, compression, object) {
                     Ok(encoder) => {
                         let encoder = encoder.with_budget(budget, permit, covered);
                         Some(Encoder::Pithos(Box::new(encoder), plan.key))
@@ -1093,12 +1093,25 @@ impl BlobHandler {
     /// Like `write_sized_blob`, with the working-set share of a sealed write already reserved.
     pub(super) async fn write_reserved_blob(
         &self,
-        (request_bucket, request_key): (&str, &str),
+        path: (&str, &str),
         resolved: ResolvedBackend,
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
         size: Option<u64>,
         reserved: Option<Share>,
+    ) -> BlobEvent {
+        self.write_granted_blob(path, resolved, created_by, blob, size, (reserved, None))
+            .await
+    }
+
+    pub(super) async fn write_granted_blob(
+        &self,
+        (request_bucket, request_key): (&str, &str),
+        resolved: ResolvedBackend,
+        created_by: UserId,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+        size: Option<u64>,
+        (reserved, object): (Option<Share>, Option<[u8; 32]>),
     ) -> BlobEvent {
         let root = match self.registry.config_for(&resolved.backend) {
             Ok(config) => config.root.clone(),
@@ -1149,7 +1162,7 @@ impl BlobHandler {
             operator,
             blob,
             resolved.compression,
-            (resolved.encryption, reserved),
+            (resolved.encryption, reserved, object),
             size,
         ))
         .await

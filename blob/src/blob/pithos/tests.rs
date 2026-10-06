@@ -331,7 +331,7 @@ async fn aborts_failed_writes() {
             operator,
             stream,
             Compression::Off,
-            (Some(seal), None),
+            (Some(seal), None, None),
             None,
         )
         .await;
@@ -356,7 +356,7 @@ async fn aborts_failed_writes() {
             operator.clone(),
             stream,
             Compression::Off,
-            (Some(seal), None),
+            (Some(seal), None, None),
             None,
         )
         .await;
@@ -820,7 +820,7 @@ async fn declared_size_chunks() {
             operator,
             stream_from_bytes(&data),
             Compression::Off,
-            (Some(seal), None),
+            (Some(seal), None, None),
             Some(declared),
         )
         .await;
@@ -1203,7 +1203,7 @@ async fn oversized_seal_refused() {
             operator,
             stream_from_bytes(b"data"),
             Compression::Off,
-            (Some(seal), None),
+            (Some(seal), None, None),
             Some(MAX_SIZE + 1),
         )
         .await;

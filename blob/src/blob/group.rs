@@ -84,6 +84,11 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
 
     let mut ids = Vec::new();
     match effect {
+        BlobEffect::Abe(effect) => {
+            if let aruna_core::structs::storage::abe::AbeEffect::Write { resolved, .. } = effect.as_ref() {
+                push(&mut ids, &resolved.backend);
+            }
+        }
         BlobEffect::Write { resolved, .. }
         | BlobEffect::WritePart { resolved, .. }
         | BlobEffect::OpenUpload { resolved, .. }

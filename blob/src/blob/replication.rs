@@ -668,7 +668,7 @@ impl BlobHandler {
                     .map_err(|error| StreamError(Box::new(error)))
             },
         );
-        let seal = (Some(plan), None);
+        let seal = (Some(plan), None, None);
         let written = self.write_encoded(
             location.clone(),
             operator,

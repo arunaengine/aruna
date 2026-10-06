@@ -69,6 +69,12 @@ impl EffectClass {
 
 fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
     match effect {
+        BlobEffect::Abe(effect) => match effect.as_ref() {
+            aruna_core::structs::storage::abe::AbeEffect::Write { .. } => {
+                (EffectClass::Transfer, "write_object")
+            }
+            _ => (EffectClass::Local, "abe"),
+        },
         BlobEffect::Write { .. } => (EffectClass::Transfer, "write"),
         BlobEffect::WritePart { .. } => (EffectClass::Transfer, "write_part"),
         BlobEffect::Compose { .. } => (EffectClass::Transfer, "compose"),
@@ -122,7 +128,8 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
 fn blob_effect_mutates(effect: &BlobEffect) -> bool {
     matches!(
         effect,
-        BlobEffect::Write { .. }
+        BlobEffect::Abe(_)
+            | BlobEffect::Write { .. }
             | BlobEffect::WritePart { .. }
             | BlobEffect::Compose { .. }
             | BlobEffect::OpenUpload { .. }
@@ -656,6 +663,7 @@ impl BlobHandler {
 
     async fn dispatch_effect(&self, effect: BlobEffect) -> BlobEvent {
         match effect {
+            BlobEffect::Abe(effect) => self.abe_effect(*effect).await,
             BlobEffect::Write {
                 bucket,
                 key,

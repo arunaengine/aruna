@@ -27,6 +27,7 @@ mod replication;
 mod runtime;
 mod source;
 mod unlock;
+mod abe;
 
 pub use group::{BackendClaim, GroupHold};
 pub use registry::{BackendRegistry, NodeBackend};
