@@ -209,6 +209,9 @@ async fn advance(
 ) -> Result<Option<Duration>, String> {
     let now = crate::effect_adapters::routing::now_ms();
     record.retry_at_ms = None;
+    if record.state == TransitionState::Finished {
+        return finish(context, bucket, record).await;
+    }
     if record.state == TransitionState::Cleanup {
         return settle(context, bucket, record).await;
     }
@@ -317,20 +320,33 @@ async fn settle(
     record.remaining = 0;
     record.blocked_reason = None;
     record.state = TransitionState::Finished;
-    record.finished_at_ms = Some(now);
     if store(storage, bucket, &mut record).await? {
-        if record.finished_at_ms.is_some() {
-            if let Some(source) = record.source
-                && record.target.plan.map(|plan| plan.key) != Some(source)
-            {
-                crate::replication::parking::wake_parked(context, source, now)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
-            forget_retired(context, &record).await;
-        } else {
+        if record.state != TransitionState::Finished {
             return Ok(Some(RECHECK));
         }
+        return finish(context, bucket, record).await;
+    }
+    Ok(None)
+}
+
+async fn finish(
+    context: &DriverContext,
+    bucket: &str,
+    mut record: EncryptionTransition,
+) -> Result<Option<Duration>, String> {
+    let now = crate::effect_adapters::routing::now_ms();
+    if let Some(source) = record.source
+        && record.target.plan.map(|plan| plan.key) != Some(source)
+    {
+        crate::replication::parking::wake_parked(context, source, now)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    forget_retired(context, &record).await;
+    record.finished_at_ms = Some(now);
+    if store(&context.storage_handle, bucket, &mut record).await? && record.finished_at_ms.is_none()
+    {
+        return Ok(Some(RECHECK));
     }
     Ok(None)
 }
@@ -528,8 +544,7 @@ async fn exists(
     }
 }
 
-/// Stores the progress unless a newer change replaced the transition. A finished one leaves
-/// the queue, retires its source key and removes that key's node copy in the same commit.
+/// Stores progress unless a newer change replaced it; retirement keeps the queue until copies wake.
 async fn store(
     storage: &StorageHandle,
     bucket: &str,
@@ -580,7 +595,7 @@ async fn stage(
     if stored.started_at_ms != record.started_at_ms || stored.kind != record.kind {
         return Ok(false);
     }
-    if record.finished_at_ms.is_some() {
+    if record.state == TransitionState::Finished {
         let pending = pending_on_source(storage, record, txn_id).await?;
         let versions = source_versions(storage, txn_id, bucket, record).await?;
         if pending + versions > 0 {
@@ -612,6 +627,7 @@ async fn stage(
             key,
             txn_id: Some(txn_id),
         });
+    } else if record.state == TransitionState::Finished {
         effects.extend(retire_source(storage, txn_id, record).await?);
     }
     for effect in effects {

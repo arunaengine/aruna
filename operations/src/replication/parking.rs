@@ -1081,4 +1081,227 @@ mod tests {
         );
         assert!(next_blob_timer(storage).await.unwrap().is_some());
     }
+
+    #[tokio::test]
+    async fn retirement_wake_recovers() {
+        use aruna_core::keyspaces::{TRANSITION_KEYSPACE, TRANSITION_QUEUE_KEYSPACE};
+        use aruna_core::structs::storage::encryption::SealPlan;
+        use aruna_core::structs::storage::format::Compression;
+        use aruna_core::structs::storage::transition::{
+            EncryptionTransition, TransitionKind, TransitionState, TransitionTarget,
+        };
+
+        for failed_page in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let context =
+                context(aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap());
+            let storage = &context.storage_handle;
+            let old = BucketKeyRef::new(Ulid::from_parts(19, 19), 1);
+            source(&context, old).await;
+            let mut jobs = Vec::new();
+            let mut writes = Vec::new();
+            for index in 0..=WAIT_PAGE {
+                let mut record = job(Ulid::from_parts(20, index as u128));
+                record.due_at_ms = PARKED_DUE;
+                record.attempts = 2;
+                record.last_error = Some("previous copy failure".to_string());
+                let row = blob_job_key(&record).unwrap().to_vec();
+                writes.push((
+                    REPLICATION_JOB_KEYSPACE.to_string(),
+                    row.clone().into(),
+                    record.to_bytes().unwrap().into(),
+                ));
+                writes.push((
+                    COPY_WAIT_KEYSPACE.to_string(),
+                    wait_row(old, &row).into(),
+                    postcard::to_allocvec(&record.relationship_id)
+                        .unwrap()
+                        .into(),
+                ));
+                jobs.push((row, record));
+            }
+            let new = BucketKeyRef::new(old.bucket_id, 2);
+            source(&context, new).await;
+            let target = TransitionTarget {
+                compression: Compression::Off,
+                plan: Some(SealPlan {
+                    key: new,
+                    public_key: [9; 32],
+                    cipher: Default::default(),
+                    block_keys: Default::default(),
+                    storage_generation: 2,
+                }),
+            };
+            let mut transition =
+                EncryptionTransition::new(TransitionKind::Rotate, Some(old), target, 2, 1);
+            transition.state = TransitionState::Cleanup;
+            writes.extend([
+                (
+                    TRANSITION_KEYSPACE.to_string(),
+                    b"source".to_vec().into(),
+                    transition.to_bytes().unwrap().into(),
+                ),
+                (
+                    TRANSITION_QUEUE_KEYSPACE.to_string(),
+                    b"source".to_vec().into(),
+                    Vec::new().into(),
+                ),
+            ]);
+            run(
+                storage,
+                StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            let (proxy, receivers) = StorageHandle::new();
+            let direct = storage.clone();
+            let actor = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let mut page = 0;
+                while let Ok((effect, response, _span, _queued, _in_flight)) =
+                    receivers.foreground.recv()
+                {
+                    let wake_scan = matches!(&effect, StorageEffect::Iter { key_space, .. }
+                        if key_space == COPY_WAIT_KEYSPACE);
+                    if wake_scan {
+                        page += 1;
+                    }
+                    let event = if wake_scan && page == failed_page {
+                        StorageEvent::Error {
+                            error: StorageError::ReadError("injected retirement wake".to_string()),
+                        }
+                    } else {
+                        let Event::Storage(event) =
+                            runtime.block_on(direct.send_storage_effect(effect))
+                        else {
+                            panic!("expected a storage event")
+                        };
+                        event
+                    };
+                    assert!(response.send(event));
+                }
+            });
+            let mut interrupted = context.clone();
+            interrupted.storage_handle = proxy;
+            let error = crate::blob::migration::queue::process_transitions(&interrupted)
+                .await
+                .unwrap_err();
+            assert!(error.contains("injected retirement wake"));
+            drop(interrupted);
+            actor.join().unwrap();
+
+            let mut parked = 0;
+            for (row, original) in &jobs {
+                let record = read_job(storage, row, None).await.unwrap().unwrap();
+                parked += usize::from(record.due_at_ms == PARKED_DUE);
+                assert_eq!(record.attempts, original.attempts);
+                assert_eq!(record.last_error, original.last_error);
+            }
+            assert_eq!(parked, WAIT_PAGE + 1 - (failed_page - 1) * WAIT_PAGE);
+            let Event::Storage(StorageEvent::ReadResult {
+                value: Some(value), ..
+            }) = storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: BUCKET_KEY_KEYSPACE.to_string(),
+                    key: old.key().into(),
+                    txn_id: None,
+                })
+                .await
+            else {
+                panic!("source key missing")
+            };
+            assert_eq!(
+                BucketKeyRecord::from_bytes(&value).unwrap().state,
+                KeyState::Retired
+            );
+            let Event::Storage(StorageEvent::ReadResult {
+                value: Some(value), ..
+            }) = storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: TRANSITION_KEYSPACE.to_string(),
+                    key: b"source".to_vec().into(),
+                    txn_id: None,
+                })
+                .await
+            else {
+                panic!("transition missing")
+            };
+            let pending = EncryptionTransition::from_bytes(&value).unwrap();
+            assert_eq!(pending.state, TransitionState::Finished);
+            assert_eq!(pending.finished_at_ms, None);
+            let queued = storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: TRANSITION_QUEUE_KEYSPACE.to_string(),
+                    key: b"source".to_vec().into(),
+                    txn_id: None,
+                })
+                .await;
+            assert!(matches!(
+                queued,
+                Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
+            ));
+            assert!(!key_unlocked(&context, old).await);
+
+            assert_eq!(
+                crate::blob::migration::queue::process_transitions(&context)
+                    .await
+                    .unwrap(),
+                None
+            );
+            for (row, original) in &jobs {
+                let record = read_job(storage, row, None).await.unwrap().unwrap();
+                assert_ne!(record.due_at_ms, PARKED_DUE);
+                assert_eq!(record.attempts, original.attempts);
+                assert_eq!(record.last_error, original.last_error);
+            }
+            let (waits, _) = iter_prefix_page(
+                storage,
+                COPY_WAIT_KEYSPACE,
+                Some(old.key().into()),
+                None,
+                WAIT_PAGE,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(waits.is_empty());
+            let queued = storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: TRANSITION_QUEUE_KEYSPACE.to_string(),
+                    key: b"source".to_vec().into(),
+                    txn_id: None,
+                })
+                .await;
+            assert!(matches!(
+                queued,
+                Event::Storage(StorageEvent::ReadResult { value: None, .. })
+            ));
+            let Event::Storage(StorageEvent::ReadResult {
+                value: Some(value), ..
+            }) = storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: TRANSITION_KEYSPACE.to_string(),
+                    key: b"source".to_vec().into(),
+                    txn_id: None,
+                })
+                .await
+            else {
+                panic!("transition missing")
+            };
+            assert!(
+                EncryptionTransition::from_bytes(&value)
+                    .unwrap()
+                    .finished_at_ms
+                    .is_some()
+            );
+            assert!(next_blob_timer(storage).await.unwrap().is_some());
+        }
+    }
 }
