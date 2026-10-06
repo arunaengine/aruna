@@ -7,6 +7,7 @@ use aruna_core::structs::storage::abe_access::{
     GrantContext, KeyGrant, KeyIssuer, KeyRequest, KeyScope,
 };
 use aruna_operations::abe::{KeyAction, KeyOperation, KeyResult};
+use aruna_operations::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
 use axum::extract::Path;
 
 #[derive(Deserialize, ToSchema)]
@@ -109,6 +110,48 @@ async fn execute(
     let now = aruna_core::time::unix_timestamp_millis();
     let operation = KeyOperation::new(bucket, auth, state.get_node_id(), action, now);
     drive(operation, &state.get_ctx()).await.map_err(key_error)
+}
+/// Opens key requests for a member in each encrypted bucket of the group and returns open ids.
+pub(crate) async fn member_requests(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: Ulid,
+    member: aruna_core::UserId,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut continuation_token = None;
+    loop {
+        let input = ListBucketsInput {
+            group_id,
+            prefix: None,
+            continuation_token,
+            max_buckets: None,
+        };
+        let page = match drive(ListBucketsOperation::new(input), &state.get_ctx()).await {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::warn!(event = "abe.member_requests.list_failed", error = %error);
+                return ids;
+            }
+        };
+        for (bucket, _) in page.buckets {
+            let now = aruna_core::time::unix_timestamp_millis();
+            let action = KeyAction::Member(member);
+            let operation =
+                KeyOperation::new(bucket, auth.clone(), state.get_node_id(), action, now);
+            match drive(operation, &state.get_ctx()).await {
+                Ok(KeyResult::Opened(opened)) => ids.extend(opened.iter().map(Ulid::to_string)),
+                Ok(_) | Err(KeyError::Missing) => {}
+                Err(error) => {
+                    tracing::warn!(event = "abe.member_requests.failed", error = %error);
+                }
+            }
+        }
+        match page.continuation_token {
+            Some(next) => continuation_token = Some(next),
+            None => return ids,
+        }
+    }
 }
 fn unexpected() -> ServerError {
     ServerError::InternalError("unexpected encryption result".into())

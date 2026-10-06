@@ -128,6 +128,9 @@ pub struct AddMemberRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GroupRolesResponse {
     pub roles: Vec<RoleResponse>,
+    /// Open scoped key request ids created for the member in encrypted buckets on this node.
+    #[serde(default)]
+    pub key_requests: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
@@ -1371,6 +1374,8 @@ administrative path for the user being added, so authority can be granted per me
 - When `role_ids` is omitted or empty the user is assigned the group's `user` role, and the request
   is rejected when that role is missing or ambiguous.
 - Adding a user who already holds the roles is accepted and changes nothing.
+- `key_requests` lists open scoped key requests for the member in encrypted buckets on this node;
+  holders are notified when the caller holds no bucket key.
 - The change commits here and reaches the rest of the realm through document sync."#,
     request_body(
         content = AddMemberRequest,
@@ -1399,7 +1404,8 @@ administrative path for the user being added, so authority can be granted per me
                         ],
                         "public": false
                     }
-                ]
+                ],
+                "key_requests": ["01JABCDEF0123456789ABCDEFG"]
             })
         ),
         (status = 400, description = "Malformed ids, a user id standing for everyone, or no default `user` role to fall back on", body = ErrorResponse),
@@ -1467,11 +1473,14 @@ pub async fn add_group_member(
     )
     .await
     .map_err(map_member_error)?;
+    let key_requests =
+        crate::routes::storage::abe::member_requests(&state, &auth, group_id, user_id).await;
 
     Ok((
         StatusCode::CREATED,
         Json(GroupRolesResponse {
             roles: map_roles(auth_doc, state.get_realm_id()),
+            key_requests,
         }),
     ))
 }

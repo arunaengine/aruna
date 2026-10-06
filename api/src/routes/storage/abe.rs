@@ -17,6 +17,7 @@ use axum::extract::{Query, State};
 use axum::{Extension, Json};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http::StatusCode;
+pub(crate) use records::member_requests;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
