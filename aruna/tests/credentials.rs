@@ -323,3 +323,137 @@ async fn scoped_list_denies() -> TestResult<()> {
     seed.shutdown().await;
     Ok(())
 }
+
+/// An S3 client of `credentials`, sending `token` as `aws_session_token`; no SDK retries.
+fn token_client(
+    endpoint: &shared::S3Endpoint,
+    credentials: &shared::S3Credentials,
+    token: Option<String>,
+) -> aws_sdk_s3::Client {
+    use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+    let credentials = Credentials::new(
+        credentials.access_key_id.clone(),
+        credentials.access_secret.clone(),
+        token,
+        None,
+        "aruna-token-test",
+    );
+    let config = aws_sdk_s3::config::Builder::new()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new(shared::AWS_REGION))
+        .credentials_provider(credentials)
+        .endpoint_url(endpoint.endpoint_url.clone())
+        .force_path_style(true)
+        .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .build();
+    aws_sdk_s3::Client::from_conf(config)
+}
+
+#[tokio::test]
+async fn token_reads_locked() -> TestResult<()> {
+    const BUCKET: &str = "token-reads";
+    const DATA: &[u8] = b"content of a locked bucket";
+    let seed = spawn_complete_seed().await?;
+
+    let result = async {
+        let admin = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&seed.base_url, &admin, "token-reads-group").await?;
+        let plain = create_s3_credentials(&seed.base_url, &admin, &group.group_id).await?;
+        let endpoint = seed
+            .s3
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
+        let client = s3_client(endpoint, &plain);
+        client.create_bucket().bucket(BUCKET).send().await?;
+        let http = reqwest::Client::new();
+        let encryption = format!(
+            "{}/api/v1/data/buckets/{BUCKET}/storage/encryption",
+            seed.base_url
+        );
+        let enabled = http
+            .put(&encryption)
+            .bearer_auth(&admin)
+            .json(&serde_json::json!({ "mode": "node_managed", "expected_generation": 0 }))
+            .send()
+            .await?;
+        let status = enabled.status();
+        assert_eq!(status, StatusCode::OK, "{}", enabled.text().await?);
+        client
+            .put_object()
+            .bucket(BUCKET)
+            .key("locked.txt")
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(DATA))
+            .send()
+            .await?;
+
+        // The bucket creator takes a token credential while the bucket is unlocked.
+        let created = http
+            .post(format!("{}/api/v1/access/credentials", seed.base_url))
+            .bearer_auth(&admin)
+            .json(&aruna_api::routes::credentials::CreateS3Request {
+                group_id: group.group_id.clone(),
+                expires_in_seconds: Some(600),
+                path_restrictions: None,
+                encrypted_buckets: Some(vec![BUCKET.to_string()]),
+            })
+            .send()
+            .await?;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: aruna_api::routes::credentials::CreateS3Response = created.json().await?;
+        let token = created
+            .session_token
+            .ok_or_else(|| std::io::Error::other("no session token returned"))?;
+        let credentials = shared::S3Credentials {
+            access_key_id: created.access_key_id,
+            access_secret: created.access_secret,
+        };
+        let locked = http
+            .post(format!("{encryption}/lock"))
+            .bearer_auth(&admin)
+            .send()
+            .await?;
+        assert_eq!(locked.status(), StatusCode::OK);
+
+        // With `aws_session_token` the locked bucket reads; without it the key alone is refused.
+        let object = token_client(endpoint, &credentials, Some(token.clone()))
+            .get_object()
+            .bucket(BUCKET)
+            .key("locked.txt")
+            .send()
+            .await?;
+        assert_eq!(&object.body.collect().await?.into_bytes()[..], DATA);
+        let refused = token_client(endpoint, &credentials, None)
+            .get_object()
+            .bucket(BUCKET)
+            .key("locked.txt")
+            .send()
+            .await;
+        assert_eq!(
+            service_error_code(&refused).as_deref(),
+            Some("AccessDenied")
+        );
+        // Another token of the right length opens nothing.
+        let wrong = "0".repeat(token.len());
+        let refused = token_client(endpoint, &credentials, Some(wrong))
+            .get_object()
+            .bucket(BUCKET)
+            .key("locked.txt")
+            .send()
+            .await;
+        assert_eq!(
+            service_error_code(&refused).as_deref(),
+            Some("InvalidToken")
+        );
+        Ok(())
+    }
+    .await;
+
+    seed.shutdown().await;
+    result
+}

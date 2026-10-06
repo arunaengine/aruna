@@ -901,6 +901,7 @@ async fn initialize_context(
     full_storage_config: Option<&FullStorageConfig>,
     compute: Option<Arc<ExecutorRegistry>>,
 ) -> TestResult<Arc<DriverContext>> {
+    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
     let task_handle = TaskHandle::new();
     let metadata_handle = if let Some(config) = full_storage_config {
         config.ensure_directories()?;
