@@ -92,6 +92,7 @@ enum IncomingVersionState {
     ReadExistingBlob,
     PolicyGate,
     SendNegotiation,
+    AwaitApproval,
     ReceiveBlob,
     StartTransaction,
     CheckPurgeFence,
@@ -535,6 +536,7 @@ impl Operation for IncomingVersionOperation {
             IncomingVersionState::ReadExistingBlob => self.accept_existing_blob(event),
             IncomingVersionState::PolicyGate => self.accept_policy_gate(event),
             IncomingVersionState::SendNegotiation => self.accept_reply_sent(event),
+            IncomingVersionState::AwaitApproval => self.accept_source_approval(event),
             // Receiving: accept the bytes and open the apply.
             IncomingVersionState::ReceiveBlob => self.accept_blob_finish(event),
             IncomingVersionState::StartTransaction => self.accept_transaction_start(event),
@@ -651,6 +653,7 @@ impl IncomingVersionOperation {
             IncomingVersionState::ReadExistingBlob => "ReadExistingBlob",
             IncomingVersionState::PolicyGate => "PolicyGate",
             IncomingVersionState::SendNegotiation => "SendNegotiation",
+            IncomingVersionState::AwaitApproval => "AwaitApproval",
             IncomingVersionState::ReceiveBlob => "ReceiveBlob",
             IncomingVersionState::StartTransaction => "StartTransaction",
             IncomingVersionState::CheckPurgeFence => "CheckPurgeFence",
@@ -2718,7 +2721,14 @@ impl IncomingVersionOperation {
                     decision = ?self.negotiation_result,
                     "Negotiation sent; awaiting version apply"
                 );
-                self.start_transaction()
+                if self.manifest.blob.is_some() {
+                    self.state = IncomingVersionState::AwaitApproval;
+                    smallvec![Effect::Blob(BlobEffect::ReadMessage {
+                        stream_id: self.stream_id,
+                    })]
+                } else {
+                    self.start_transaction()
+                }
             }
             Some(
                 ReplicationNegotiationResult::NeedBlobVersion
@@ -2745,6 +2755,28 @@ impl IncomingVersionOperation {
 // Accepting the transferred blob and opening the apply transaction with
 // its purge-fence and destination-drift checks.
 impl IncomingVersionOperation {
+    fn accept_source_approval(&mut self, event: Event) -> Effects {
+        let Event::Blob(BlobEvent::MessageReceived { payload, .. }) = event else {
+            return self.fail(IncomingVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "VersionApplyApproved",
+                received: event,
+            });
+        };
+        match VersionReplicationMessage::from_bytes(&payload) {
+            Ok(VersionReplicationMessage::VersionApplyApproved) => self.start_transaction(),
+            Ok(_) => self.fail(IncomingVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "VersionApplyApproved",
+                received: Event::Blob(BlobEvent::MessageReceived {
+                    stream_id: self.stream_id,
+                    payload,
+                }),
+            }),
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
     fn accept_blob_finish(&mut self, event: Event) -> Effects {
         let location = match event {
             Event::Blob(BlobEvent::ReplicationFinished { location }) => location,

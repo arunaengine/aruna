@@ -50,6 +50,213 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 use ulid::Ulid;
 
+#[tokio::test]
+async fn refused_copy_absent() {
+    use crate::replication::protocol::{ReplicationMode, VersionReplicationRequest};
+    use crate::replication::version_replication::{ReplicateObjectError, ReplicateObjectOperation};
+    use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
+    use aruna_core::structs::storage::blob::VersionKey;
+    use aruna_core::structs::storage::encryption::{
+        BucketEncryption, BucketKeyRef, EncryptionMode,
+    };
+    use aruna_core::structs::storage::format::PithosLayout;
+    let (_source_dir, source_storage) = crate::tests::s3::test_storage();
+    let (target_dir, target_storage) = crate::tests::s3::test_storage();
+    let target_node = iroh::SecretKey::from_bytes(&[42; 32]).public();
+    let stream_id = Ulid::from_parts(42, 42);
+    let data = [7u8; 42];
+    let hash = *blake3::hash(&data).as_bytes();
+    let mut target_location = make_location();
+    target_location.root = target_dir.path().to_str().unwrap().to_string();
+    target_location
+        .hashes
+        .insert("blake3".to_string(), hash.to_vec());
+    let path = std::path::PathBuf::from(target_location.get_full_path().unwrap());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, data).unwrap();
+    let mut location = target_location.clone();
+    let key = BucketKeyRef::new(Ulid::from_parts(43, 43), 1);
+    location.format = StoredFormat::pithos(
+        PithosLayout {
+            stored_size: 99,
+            metadata_digest: [2; 32],
+            storage_generation: 1,
+        },
+        key,
+    );
+    let version = BlobVersion::materialized(
+        hash,
+        location.backend.clone(),
+        location.format.encoding(),
+        fixed_created_at(),
+        test_user_id(),
+        None,
+    );
+    let settings = BucketEncryption {
+        mode: EncryptionMode::VaultLocked,
+        bucket_id: Some(key.bucket_id),
+        key_generation: key.generation,
+        ..Default::default()
+    };
+    let version_key = VersionKey::new("bucket", "dir/file.txt", trace_version_id())
+        .to_bytes()
+        .unwrap();
+    for (storage, space, row, value) in [
+        (
+            &source_storage,
+            BLOB_VERSIONS_KEYSPACE,
+            version_key.clone(),
+            version.to_bytes().unwrap(),
+        ),
+        (
+            &source_storage,
+            BLOB_HEAD_KEYSPACE,
+            aruna_core::structs::storage::blob::BlobHeadKey::new("bucket", "dir/file.txt")
+                .to_bytes()
+                .unwrap(),
+            CurrentVersionPointer::new(trace_version_id())
+                .to_bytes()
+                .unwrap(),
+        ),
+        (
+            &source_storage,
+            BLOB_LOCATIONS_KEYSPACE,
+            location.location_key().unwrap().to_bytes(),
+            location.to_bytes().unwrap(),
+        ),
+        (
+            &source_storage,
+            BUCKET_ENCRYPTION_KEYSPACE,
+            b"bucket".to_vec(),
+            settings.to_bytes().unwrap(),
+        ),
+        (
+            &target_storage,
+            S3_BUCKET_KEYSPACE,
+            b"bucket".to_vec(),
+            make_bucket_info(test_group_id()).to_bytes().unwrap(),
+        ),
+        (
+            &target_storage,
+            BLOB_LOCATIONS_KEYSPACE,
+            target_location.location_key().unwrap().to_bytes(),
+            target_location.to_bytes().unwrap(),
+        ),
+    ] {
+        assert!(matches!(
+            storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: space.to_string(),
+                    key: row.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+    let mut source = ReplicateObjectOperation::new(VersionReplicationRequest {
+        bucket: "bucket".to_string(),
+        key: "dir/file.txt".to_string(),
+        version_id: trace_version_id(),
+        source_group_id: test_group_id(),
+        target_node_id: target_node,
+        auth_context: make_manifest(ReplicationItemKind::Materialized).auth_context,
+        mode: ReplicationMode::OnDemand,
+    });
+    let mut effects = source.start();
+    while matches!(effects.as_slice(), [Effect::Storage(_)]) {
+        let Effect::Storage(effect) = effects.remove(0) else {
+            unreachable!()
+        };
+        effects = source.step(source_storage.send_storage_effect(effect).await);
+    }
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::OpenConnection { .. })]
+    ));
+    let effects = source.step(Event::Blob(BlobEvent::ConnectionEstablished { stream_id }));
+    let VersionReplicationMessage::VersionManifest(mut manifest) = message_from_effect(&effects[0])
+    else {
+        panic!("expected source manifest");
+    };
+    assert!(manifest.current_version);
+    manifest.writer_auth_context = Some(manifest.auth_context.clone());
+    source.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+    let mut target =
+        IncomingVersionOperation::new(stream_id, target_node, test_realm_id(), manifest);
+    target.manifest_policy = Some(target.target_authorization_path(test_group_id()));
+    target.writer_policy = Some(target.target_authorization_path(test_group_id()));
+    let mut effects = target.start();
+    loop {
+        match effects.as_slice() {
+            [Effect::Storage(_)] => {
+                let Effect::Storage(effect) = effects.remove(0) else {
+                    unreachable!()
+                };
+                effects = target.step(target_storage.send_storage_effect(effect).await)
+            }
+            [Effect::SubOperation(_)]
+                if target.state == IncomingVersionState::LoadDestinationRouting =>
+            {
+                effects = target.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
+                    result: Ok(GroupRoutingInputs::default()),
+                }));
+            }
+            _ => break,
+        }
+    }
+    let negotiation = message_from_effect(&effects[0]);
+    assert_eq!(
+        negotiation,
+        VersionReplicationMessage::VersionNegotiationResponse(
+            ReplicationNegotiationResult::NeedVersionOnly
+        )
+    );
+    let waiting = target.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+    assert!(matches!(
+        waiting.as_slice(),
+        [Effect::Blob(BlobEffect::ReadMessage { .. })]
+    ));
+    let mut effects = source.step(Event::Blob(BlobEvent::MessageReceived {
+        stream_id,
+        payload: negotiation.to_bytes().unwrap(),
+    }));
+    assert_eq!(effects.len(), 1);
+    let Effect::Storage(effect) = effects.remove(0) else {
+        panic!("source must check encryption");
+    };
+    let effects = source.step(source_storage.send_storage_effect(effect).await);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::CloseConnection { .. })]
+    ));
+    assert_eq!(
+        source.finalize(),
+        Err(ReplicateObjectError::PlaintextRefused)
+    );
+    target.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
+    for space in [
+        BLOB_VERSIONS_KEYSPACE,
+        BLOB_HEAD_KEYSPACE,
+        PATHS_INDEX_KEYSPACE,
+    ] {
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = target_storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: space.to_string(),
+                prefix: None,
+                start: None,
+                limit: 2,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("target index read failed");
+        };
+        assert!(values.is_empty(), "refused copy wrote {space}");
+    }
+}
+
 fn test_realm_id() -> RealmId {
     RealmId::from_bytes([7u8; 32])
 }
@@ -2009,6 +2216,33 @@ fn probe_backend(
 
 fn group_backend_key(backend_id: Ulid) -> Vec<u8> {
     BlobLocationKey::new([1u8; 32], EncodingClass::Raw, BackendRef::Group(backend_id)).to_bytes()
+}
+
+#[test]
+fn metadata_waits_approval() {
+    let (mut op, _) = probe_backend(Vec::new(), GroupRoutingInputs::default());
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: make_location().location_key().unwrap().to_bytes().into(),
+        value: Some(make_location().to_bytes().unwrap().into()),
+    }));
+    let stream_id = op.stream_id;
+    let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::ReadMessage { .. })]
+    ));
+    let effects = op.step(Event::Blob(BlobEvent::MessageReceived {
+        stream_id,
+        payload: VersionReplicationMessage::VersionApplyApproved
+            .to_bytes()
+            .unwrap(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    ));
 }
 
 fn probed_key(effects: &aruna_core::types::Effects) -> Vec<u8> {

@@ -442,6 +442,7 @@ fn hashes_from_parts(parts: &[MultipartObjectPart]) -> HashMap<String, Vec<u8>> 
 pub enum VersionReplicationMessage {
     VersionManifest(VersionReplicationManifest),
     VersionNegotiationResponse(ReplicationNegotiationResult),
+    VersionApplyApproved,
     VersionApplyComplete,
     VersionApplyRejected(String),
     BaoReadRequest(BaoReadRequest),

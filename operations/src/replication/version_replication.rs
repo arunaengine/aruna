@@ -1116,6 +1116,7 @@ enum ReplicateObjectState {
     /// Admits the source key; the lease covers the transfer.
     AdmitSourceKey,
     TransferBlob,
+    SendApproval,
     AwaitApplyComplete,
     WriteReferenceState,
     CloseConnection,
@@ -1273,6 +1274,7 @@ impl ReplicateObjectOperation {
             ReplicateObjectState::AwaitNegotiation => "AwaitNegotiation",
             ReplicateObjectState::CheckSourceEncryption => "CheckSourceEncryption",
             ReplicateObjectState::TransferBlob => "TransferBlob",
+            ReplicateObjectState::SendApproval => "SendApproval",
             ReplicateObjectState::AwaitApplyComplete => "AwaitApplyComplete",
             ReplicateObjectState::WriteReferenceState => "WriteReferenceState",
             ReplicateObjectState::CloseConnection => "CloseConnection",
@@ -2122,6 +2124,18 @@ impl ReplicateObjectOperation {
         smallvec![Effect::Blob(BlobEffect::ReadMessage { stream_id })]
     }
 
+    fn approve_apply(&mut self) -> Effects {
+        let Some(stream_id) = self.stream_id else {
+            return self.fail(ReplicationError::ConnectionMissing.into());
+        };
+        let payload = match VersionReplicationMessage::VersionApplyApproved.to_bytes() {
+            Ok(payload) => payload,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = ReplicateObjectState::SendApproval;
+        smallvec![Effect::Blob(BlobEffect::SendMessage { stream_id, payload })]
+    }
+
     fn close_connection(&mut self) -> Effects {
         self.state = ReplicateObjectState::CloseConnection;
         let Some(stream_id) = self.stream_id else {
@@ -2215,6 +2229,7 @@ impl Operation for ReplicateObjectOperation {
             // Transfer: push the blob the target requested.
             ReplicateObjectState::CheckSourceEncryption => self.accept_source_encryption(event),
             ReplicateObjectState::TransferBlob => self.accept_blob_transfer(event),
+            ReplicateObjectState::SendApproval => self.accept_approval_sent(event),
             // Apply acknowledgement: the target reports the replica applied.
             ReplicateObjectState::AwaitApplyComplete => self.accept_apply_response(event),
             // Close/cleanup: drop local reference bytes and close the stream.
@@ -2706,16 +2721,13 @@ impl ReplicateObjectOperation {
         };
         let Some(key) = location.format.bucket_key().or(settings.active_key()) else {
             return match negotiated {
-                ReplicationNegotiationResult::NeedVersionOnly => self.await_apply_complete(),
+                ReplicationNegotiationResult::NeedVersionOnly => self.approve_apply(),
                 _ => self.replicate_plain(location),
             };
         };
         let sealed_target = matches!(negotiated, ReplicationNegotiationResult::NeedSealedBlob(_));
         if !sealed_target && !self.plaintext {
             return self.fail(ReplicateObjectError::PlaintextRefused);
-        }
-        if negotiated == ReplicationNegotiationResult::NeedVersionOnly {
-            return self.await_apply_complete();
         }
         self.admit_key = Some(key);
         self.state = ReplicateObjectState::AdmitSourceKey;
@@ -2762,6 +2774,9 @@ impl ReplicateObjectOperation {
                 });
             }
         };
+        if self.negotiated == Some(ReplicationNegotiationResult::NeedVersionOnly) {
+            return self.approve_apply();
+        }
         let (Some(replication_id), Some(stream_id), Some(location)) = (
             self.blob_replication_id,
             self.stream_id,
@@ -2802,6 +2817,17 @@ impl ReplicateObjectOperation {
                 self.state = ReplicateObjectState::Finish;
                 smallvec![]
             }
+        }
+    }
+
+    fn accept_approval_sent(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Blob(BlobEvent::MessageSent { .. }) => self.await_apply_complete(),
+            other => self.fail(ReplicateObjectError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Blob(BlobEvent::MessageSent)",
+                received: other,
+            }),
         }
     }
 
@@ -4793,6 +4819,31 @@ mod tests {
                     regrant: None,
                     ..
                 })]
+            ));
+        }
+
+        #[test]
+        fn metadata_needs_admission() {
+            let location = sealed_location();
+            let mut op = negotiating(location.clone(), true);
+            answer(&mut op, ReplicationNegotiationResult::NeedVersionOnly);
+            assert!(matches!(
+                op.step(encrypting()).as_slice(),
+                [Effect::Blob(BlobEffect::AdmitRead { .. })]
+            ));
+            let effects = op.step(admitted(source_key(), &location));
+            let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+                panic!("source approval missing");
+            };
+            assert_eq!(
+                VersionReplicationMessage::from_bytes(payload).unwrap(),
+                VersionReplicationMessage::VersionApplyApproved
+            );
+            let stream_id = op.stream_id.unwrap();
+            assert!(matches!(
+                op.step(Event::Blob(BlobEvent::MessageSent { stream_id }))
+                    .as_slice(),
+                [Effect::Blob(BlobEffect::ReadMessage { .. })]
             ));
         }
 
