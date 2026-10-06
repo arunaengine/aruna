@@ -917,12 +917,20 @@ async fn abe_members() -> TestResult<()> {
         assert_eq!(status, StatusCode::CREATED, "{body}");
         assert_eq!(body["key_requests"].as_array().unwrap().len(), 1, "{body}");
 
-        // A group without encrypted buckets pays one index scan and nothing else.
+        // A group whose last encrypted bucket was turned off pays one index scan and nothing else.
         let plain = create_group_http(&base, &owner, "ABE plain").await?;
         let credentials = create_s3_credentials(&base, &owner, &plain.group_id).await?;
         let plain_s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
         for bucket in ["abe-plain-a", "abe-plain-b", "abe-plain-c"] {
             plain_s3.create_bucket().bucket(bucket).send().await?;
+        }
+        let encryption =
+            |bucket: &str| format!("{base}/api/v1/data/buckets/{bucket}/storage/encryption");
+        for (mode, generation) in [("node_managed", 0), ("off", 1)] {
+            let body = json!({"mode":mode,"expected_generation":generation});
+            let request = http.put(encryption("abe-plain-a")).bearer_auth(&owner);
+            let response = request.json(&body).send().await?;
+            assert!(response.status().is_success(), "{mode}");
         }
         let auth = AuthContext {
             user_id: seed.user_id,
@@ -941,6 +949,32 @@ async fn abe_members() -> TestResult<()> {
         let event = seed.context.storage_handle.send_storage_effect(scan).await;
         assert!(operation.step(event).is_empty());
         assert_eq!(operation.finalize(), Ok(Vec::new()));
+
+        // An unindexed bucket joins the index when a change admits a new generation.
+        let bucket = "abe-plain-b";
+        for (mode, generation) in [("node_managed", 0), ("vault_locked", 1)] {
+            if mode == "vault_locked" {
+                let key = [&plain_id.to_bytes()[..], bucket.as_bytes()].concat();
+                let unindex = StorageEffect::Delete {
+                    key_space: aruna_core::keyspaces::GROUP_ENCRYPTED_KEYSPACE.to_string(),
+                    key: key.into(),
+                    txn_id: None,
+                };
+                seed.context
+                    .storage_handle
+                    .send_storage_effect(unindex)
+                    .await;
+            }
+            let body = json!({"mode":mode,"expected_generation":generation});
+            let request = http.put(encryption(bucket)).bearer_auth(&owner);
+            let response = request.json(&body).send().await?;
+            assert!(response.status().is_success(), "{mode}");
+        }
+        let lock = http.post(format!("{}/lock", encryption(bucket)));
+        assert!(lock.bearer_auth(&owner).send().await?.status().is_success());
+        let (member, _) = user(26).await?;
+        let body = grant_roles(&base, &owner, &plain.group_id, member, Value::Null).await?;
+        assert_eq!(body["key_requests"].as_array().unwrap().len(), 1, "{body}");
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;

@@ -4,16 +4,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::bucket::key::rows::{
-    Row, SettingsError, authority_read, copy_targets, generation_rows, parse_authority,
-    uploads_open,
+    Row, SettingsError, authority_read, copy_targets, generation_rows, group_bucket_key,
+    parse_authority, uploads_open,
 };
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, TRANSITION_KEYSPACE, TRANSITION_QUEUE_KEYSPACE,
-    UPLOAD_KEYSPACE,
+    BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, TRANSITION_KEYSPACE,
+    TRANSITION_QUEUE_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
@@ -56,6 +56,7 @@ pub enum ChangeState {
     Finish,
     Error,
     PrepareAbe,
+    DeleteIndex,
 }
 
 /// The change a holder or admin asked for.
@@ -410,6 +411,19 @@ impl ChangeEncryptionOperation {
 }
 
 impl ChangeEncryptionOperation {
+    /// A bucket turned `off` leaves the group index, so member grants no longer visit it.
+    fn delete_index(&mut self) -> Effects {
+        if self.wanted().0 != EncryptionMode::Off {
+            return self.write_vault();
+        }
+        self.state = ChangeState::DeleteIndex;
+        smallvec![Effect::Storage(StorageEffect::Delete {
+            key_space: GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            key: group_bucket_key(self.input.group_id, &self.input.bucket),
+            txn_id: self.txn_id,
+        })]
+    }
+
     fn write_vault(&mut self) -> Effects {
         let Some((id, secret)) = self.vault.take() else {
             return self.commit();
@@ -524,6 +538,9 @@ impl Operation for ChangeEncryptionOperation {
                 self.write_rows(Some(private_key), Vec::new())
             }
             (ChangeState::WriteRows, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                self.delete_index()
+            }
+            (ChangeState::DeleteIndex, Event::Storage(StorageEvent::DeleteResult { .. })) => {
                 self.write_vault()
             }
             (ChangeState::WriteVault, Event::Storage(StorageEvent::WriteResult { .. })) => {
