@@ -1186,7 +1186,7 @@ mod tests {
         assert_eq!(text.len(), 64);
         let parsed = TokenCredential::parse("KEY", text.as_bytes()).unwrap();
         assert_eq!((parsed.access_key.as_str(), &parsed.token), ("KEY", &token));
-        for invalid in [&text[..62], format!("{}00", &*text).as_str(), "zz", ""] {
+        for invalid in [&text[..62], format!("{}00", *text).as_str(), "zz", ""] {
             assert!(TokenCredential::parse("KEY", invalid.as_bytes()).is_none());
         }
     }
