@@ -43,6 +43,8 @@ pub enum AbeError {
     Crypto,
     #[error("the object version was not found")]
     Missing,
+    #[error("encryption storage is unavailable")]
+    Unavailable,
 }
 
 impl From<aruna_kpabe::Error> for AbeError {

@@ -58,6 +58,7 @@ fn abe_error(error: AbeError) -> ServerError {
         AbeError::Limit => (StatusCode::PAYLOAD_TOO_LARGE, "encryption_limit"),
         AbeError::Crypto => (StatusCode::INTERNAL_SERVER_ERROR, "encryption_failed"),
         AbeError::Missing => return ServerError::NotFound,
+        AbeError::Unavailable => return ServerError::ServiceUnavailable,
     };
     ServerError::Refused(status, code, error.to_string())
 }
@@ -118,7 +119,8 @@ async fn read_envelope(
     params(("bucket" = String, Query, description = "Node-local S3 bucket name"), ("key" = String, Query, description = "Literal object key"), ("version_id" = String, Query, description = "Pinned version ULID")),
     responses((status = 200, body = EnvelopeView, description = "Envelope of the exact authorized version", example = json!({"version_id":"01JABCDEF0123456789ABCDEFG","context":{},"parameters":{},"envelope":{}})),
         (status = 400, body = ErrorResponse, description = "Malformed version"), (status = 401, body = ErrorResponse, description = "Bearer token required"),
-        (status = 403, body = ErrorResponse, description = "READ refused"), (status = 404, body = ErrorResponse, description = "Version missing"), (status = 409, body = ErrorResponse, description = "Envelope pending or stale version")), security(("bearer_auth" = [])))]
+        (status = 403, body = ErrorResponse, description = "READ refused"), (status = 404, body = ErrorResponse, description = "Version missing"), (status = 409, body = ErrorResponse, description = "Envelope pending or stale version"),
+        (status = 503, body = ErrorResponse, description = "Storage unavailable")), security(("bearer_auth" = [])))]
 pub async fn envelope(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
@@ -140,4 +142,24 @@ pub async fn envelope(
         envelope: json!({"abe":STANDARD.encode(&envelope.abe),"recovery_enc":STANDARD.encode(envelope.recovery_enc),
             "recovery_ciphertext":STANDARD.encode(&envelope.recovery_ciphertext)}),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::operation::Operation;
+
+    #[test]
+    fn storage_unavailable_maps() {
+        let mut operation = EnvelopeOperation::new("b".into(), "k".into(), Ulid::generate());
+        operation.start();
+        operation.step(aruna_core::events::Event::Storage(
+            aruna_core::events::StorageEvent::Error {
+                error: aruna_core::errors::StorageError::Timeout,
+            },
+        ));
+        let error = operation.finalize().unwrap_err();
+        assert_eq!(error, AbeError::Unavailable);
+        assert!(matches!(abe_error(error), ServerError::ServiceUnavailable));
+    }
 }

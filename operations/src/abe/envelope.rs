@@ -168,7 +168,7 @@ impl Operation for EnvelopeOperation {
                 self.output = self.result.take().map(Ok);
                 smallvec![]
             }
-            (_, Event::Storage(StorageEvent::Error { .. })) => self.fail(AbeError::Stale),
+            (_, Event::Storage(StorageEvent::Error { .. })) => self.fail(AbeError::Unavailable),
             _ => self.fail(AbeError::Context),
         }
     }
