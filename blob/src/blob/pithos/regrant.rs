@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::rewrite::StoredBytes;
-use super::{open_limits, working_set};
+use super::{Share, open_limits, working_set};
 use crate::bao_tree::OpenDalReader;
 use crate::blob::BlobHandler;
 use crate::blob::frames::read_range;
@@ -30,6 +30,7 @@ pub(in crate::blob) struct RegrantReader {
     directory: Bytes,
     size: u64,
     _lease: ReadLease,
+    _budget: Share,
 }
 
 impl AsyncSliceReader for RegrantReader {
@@ -131,7 +132,173 @@ impl BlobHandler {
             directory: Bytes::copy_from_slice(replacement.directory()),
             size: replacement.archive_len(),
             _lease: lease,
+            _budget,
         };
         Ok((reader, sent))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::UserId;
+    use aruna_core::compute::{SecretBytes, SharedSecret};
+    use aruna_core::effects::BlobEffect;
+    use aruna_core::events::BlobEvent;
+    use aruna_core::stream::BackendStream;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::{ArchiveKey, Backend, BackendConfig, ResolvedBackend};
+    use aruna_core::structs::storage::encryption::{
+        BlockCipher, BlockKeys, BucketKeyRef, public_key_of,
+    };
+    use bao_tree::ByteRanges;
+    use bao_tree::io::fsm::{CreateOutboard, encode_ranges_validated};
+    use bao_tree::io::outboard::PreOrderOutboard;
+    use bao_tree::io::round_up_to_chunks;
+    use iroh_io::AsyncStreamWriter;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use ulid::Ulid;
+
+    struct StalledWriter {
+        started: Option<oneshot::Sender<()>>,
+        release: Option<oneshot::Receiver<()>>,
+    }
+
+    impl AsyncStreamWriter for StalledWriter {
+        async fn write(&mut self, _data: &[u8]) -> io::Result<()> {
+            if let Some(started) = self.started.take() {
+                started.send(()).unwrap();
+                self.release.take().unwrap().await.unwrap();
+            }
+            Ok(())
+        }
+
+        async fn sync(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn write_bytes(&mut self, data: Bytes) -> io::Result<()> {
+            self.write(&data).await
+        }
+    }
+
+    #[tokio::test]
+    async fn regrant_keeps_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("blobs");
+        std::fs::create_dir(&root).unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let net = aruna_net::NetHandle::new(
+            aruna_net::NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                discovery_method: aruna_net::DiscoveryMethod::None,
+                relay_method: aruna_net::RelayMethod::None,
+                ..Default::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .unwrap();
+        let handle = BlobHandler::new(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                root: root.to_str().unwrap().to_string(),
+                service_config: HashMap::new(),
+                bucket_prefix: Some("test-".to_string()),
+                max_bucket_size: None,
+                multipart_bucket: Some("parts".to_string()),
+                timeouts: Default::default(),
+            },
+            storage,
+            net.clone(),
+        )
+        .await
+        .unwrap();
+        let handler = &handle.handler;
+        let private = SharedSecret::new(SecretBytes::new(vec![5; 32]));
+        let key = BucketKeyRef::new(Ulid::generate(), 1);
+        let plan = SealPlan {
+            key,
+            public_key: public_key_of(private.bytes()).unwrap(),
+            cipher: BlockCipher::default(),
+            block_keys: BlockKeys::default(),
+            storage_generation: 1,
+        };
+        let data = Bytes::from_static(b"retained while the granted archive transfer waits");
+        let stream = BackendStream::new(futures::stream::iter([Ok(data)]));
+        let written = handler
+            .write_blob(
+                "bucket",
+                "object",
+                ResolvedBackend::node_default().with_encryption(Some(plan)),
+                UserId::new(Ulid::generate(), RealmId::from_bytes([1; 32])),
+                stream,
+            )
+            .await;
+        let BlobEvent::WriteFinished { location } = written else {
+            panic!("archive write failed: {written:?}");
+        };
+        let BlobEvent::KeyPrepared { ticket } = handler.unlock_effect(BlobEffect::PrepareKey {
+            key,
+            public_key: plan.public_key,
+            private_key: private,
+            duration: None,
+            max: None,
+        }) else {
+            panic!("key preparation failed");
+        };
+        assert!(matches!(
+            handler.unlock_effect(BlobEffect::ActivateKey { ticket }),
+            BlobEvent::KeyActivated { .. }
+        ));
+        let BlobEvent::ReadAdmitted { lease } =
+            handler.admit_read(key, ArchiveKey::of(&location)).await
+        else {
+            panic!("read admission failed");
+        };
+        let target = SecretBytes::new(vec![6; 32]);
+        let plan = SealPlan {
+            key: BucketKeyRef::new(Ulid::generate(), 1),
+            public_key: public_key_of(&target).unwrap(),
+            ..plan
+        };
+        let budget = handler.pithos_budget.clone();
+        let capacity = budget.available_permits();
+        let charged = working_set(location.blob_size).div_ceil(1 << 20) as usize;
+        let (mut reader, sent) = handler
+            .regrant_reader(&location, lease, &plan)
+            .await
+            .unwrap();
+        assert_eq!(budget.available_permits(), capacity - charged);
+        let mut outboard =
+            PreOrderOutboard::<BytesMut>::create(&mut reader, crate::blob::BAO_BLOCK_SIZE)
+                .await
+                .unwrap();
+        assert_eq!(budget.available_permits(), capacity - charged);
+        let (started, waiting) = oneshot::channel();
+        let (release, resume) = oneshot::channel();
+        let mut writer = StalledWriter {
+            started: Some(started),
+            release: Some(resume),
+        };
+        let ranges = round_up_to_chunks(&ByteRanges::from(0..sent.stored_size()));
+        let transfer = tokio::spawn(async move {
+            encode_ranges_validated(reader, &mut outboard, &ranges, &mut writer)
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(60), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.available_permits(), capacity - charged);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(60), transfer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.available_permits(), capacity);
+        net.shutdown().await;
     }
 }
