@@ -78,11 +78,11 @@ pub fn seal(
 
 /// Authenticates the policy, context and associated data and returns a zeroizing object key.
 /// All failures use the same error and expose no partially recovered plaintext.
-
+#[doc = ""]
 /// ```compile_fail,E0277
 /// let debug = |p, k, e| format!("{:?}", aruna_kpabe::open(p, k, e, b"ctx").unwrap());
 /// ```
-
+#[doc = ""]
 /// ```compile_fail,E0599
 /// let clone = |p, k, e| aruna_kpabe::open(p, k, e, b"ctx").unwrap().clone();
 /// ```

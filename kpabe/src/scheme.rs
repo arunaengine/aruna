@@ -86,11 +86,11 @@ impl SecretKey {
 
 impl KemKey {
     /// Derives 32 bytes with HKDF-SHA256; refuses empty or oversized contexts.
-
+    #[doc = ""]
     /// ```compile_fail,E0277
     /// fn check(k: &aruna_kpabe::KemKey) { format!("{:?}", k.derive(b"ctx").unwrap()); }
     /// ```
-
+    #[doc = ""]
     /// ```compile_fail,E0599
     /// fn check(k: &aruna_kpabe::KemKey) { k.derive(b"ctx").unwrap().clone(); }
     /// ```
