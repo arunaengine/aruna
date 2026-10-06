@@ -60,24 +60,39 @@ mod tests {
                     assert!(!request.headers().contains_key("x-aruna-object-key"));
                     let key = request.extensions().get::<ObjectKey>().unwrap();
                     assert!(!format!("{key:?}").contains(&STANDARD.encode([17; 32])));
-                    assert_eq!(
-                        key.0.as_ref().unwrap().as_ref().unwrap().bytes().expose(),
-                        &[17; 32]
-                    );
-                    StatusCode::NO_CONTENT
+                    match &key.0 {
+                        Ok(Some(key)) => {
+                            assert_eq!(key.bytes().expose(), &[17; 32]);
+                            StatusCode::NO_CONTENT
+                        }
+                        Ok(None) => StatusCode::OK,
+                        Err(()) => StatusCode::BAD_REQUEST,
+                    }
                 }),
             )
             .layer(axum::middleware::from_fn(middleware));
-        let response = router
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/probe")
-                    .header("x-aruna-object-key", secret)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let (secret, short) = (secret.as_str(), STANDARD.encode([17; 31]));
+        let cases: [(&[&str], StatusCode); 5] = [
+            (&[secret], StatusCode::NO_CONTENT),
+            (&[], StatusCode::OK),
+            (&[short.as_str()], StatusCode::BAD_REQUEST),
+            (
+                &["not base64 at all, but forty-four bytes long"],
+                StatusCode::BAD_REQUEST,
+            ),
+            (&[secret, secret], StatusCode::BAD_REQUEST),
+        ];
+        for (headers, expected) in cases {
+            let mut request = HttpRequest::builder().uri("/probe");
+            for header in headers {
+                request = request.header("x-aruna-object-key", *header);
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{headers:?}");
+        }
     }
 }
