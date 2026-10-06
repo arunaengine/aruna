@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::auth::permission_rules::{CollectedRole, PermissionRules};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
 use aruna_core::structs::placement::policy::document::group_admin_path;
@@ -17,6 +18,7 @@ pub(super) struct Snapshot {
     pub revisions: Vec<[u8; 32]>,
     pub rules: PermissionRules,
     pub holder: bool,
+    pub holders: std::collections::BTreeSet<aruna_core::UserId>,
     pub policies: bool,
 }
 impl KeyOperation {
@@ -45,11 +47,12 @@ impl KeyOperation {
             return Err(AbeError::Parameters.into());
         }
         let info = self.info.as_ref().ok_or(KeyError::Missing)?;
-        let admin = admin_users(
+        let mut holders = admin_users(
             realm.roles.values().chain(group.roles.values()),
             &group_admin_path(self.auth.realm_id, info.group_id),
-        )
-        .contains(&self.auth.user_id);
+        );
+        let admin = holders.contains(&self.auth.user_id);
+        holders.insert(info.created_by);
         let explicit = values[6]
             .1
             .as_ref()
@@ -74,6 +77,7 @@ impl KeyOperation {
             .collect();
         let restrictions = match &self.action {
             KeyAction::Publish(grant) => grant.context.request.restrictions.as_deref(),
+            KeyAction::Member(_) => None,
             _ => self.auth.path_restrictions.as_deref(),
         };
         let rules =
@@ -93,6 +97,7 @@ impl KeyOperation {
             revisions,
             rules,
             holder: info.created_by == self.auth.user_id || admin || explicit,
+            holders,
             policies,
         });
         Ok(())
@@ -107,6 +112,43 @@ impl KeyOperation {
         }
         Ok(())
     }
+    /// Literal scopes of the recipient's direct READ or WRITE rules; the whole bucket wins.
+    pub(super) fn member_scopes(&self) -> Result<Vec<KeyScope>, KeyError> {
+        let snapshot = self.snapshot.as_ref().ok_or(KeyError::Missing)?;
+        if snapshot.policies {
+            return Ok(Vec::new());
+        }
+        let root = self.root()?;
+        let inner = format!("{root}/");
+        let glob = |v: &str| v.contains(['*', '?', '[', ']', '{', '}', '\\']);
+        let mut scopes = Vec::new();
+        for (pattern, permission) in snapshot.rules.direct_patterns() {
+            let scope = match pattern.strip_suffix("**") {
+                _ if permission == Permission::DENY => continue,
+                Some(base) if !glob(base) && inner.starts_with(base) => {
+                    KeyScope::Subtree(String::new())
+                }
+                Some(base) if !glob(base) => match base.strip_prefix(&inner) {
+                    Some(prefix) => KeyScope::Subtree(prefix.to_string()),
+                    None => continue,
+                },
+                None if !glob(&pattern) => match pattern.strip_prefix(&inner) {
+                    Some(key) => KeyScope::Exact(key.to_string()),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if !scopes.contains(&scope) && snapshot.rules.admits_scope(&root, &scope) {
+                scopes.push(scope);
+            }
+        }
+        let whole = KeyScope::Subtree(String::new());
+        if scopes.contains(&whole) {
+            return Ok(vec![whole]);
+        }
+        scopes.truncate(MAX_REQUESTS);
+        Ok(scopes)
+    }
     pub(super) fn root(&self) -> Result<String, KeyError> {
         let info = self.info.as_ref().ok_or(KeyError::Missing)?;
         Ok(aruna_core::structs::storage::blob::bucket_permission_path(
@@ -119,6 +161,7 @@ impl KeyOperation {
     pub(super) fn recipient(&self) -> aruna_core::UserId {
         match &self.action {
             KeyAction::Publish(grant) => grant.context.request.recipient_user,
+            KeyAction::Member(user) => *user,
             _ => self.auth.user_id,
         }
     }

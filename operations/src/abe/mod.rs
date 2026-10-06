@@ -31,6 +31,8 @@ pub enum KeyAction {
     Open(Option<Vec<u8>>),
     Grants(Option<Vec<u8>>),
     Publish(KeyGrant),
+    /// Opens requests for a member's direct read scopes after a role grant by the caller.
+    Member(aruna_core::UserId),
 }
 #[derive(Debug, PartialEq)]
 pub enum KeyResult {
@@ -38,6 +40,7 @@ pub enum KeyResult {
     Requests(Vec<KeyRequest>, Option<Vec<u8>>),
     Grants(Vec<KeyGrant>, Option<Vec<u8>>),
     Grant(KeyGrant),
+    Opened(Vec<Ulid>),
 }
 #[derive(Debug, Error, PartialEq)]
 pub enum KeyError {
@@ -63,9 +66,11 @@ enum State {
     Reuse,
     Issue,
     Count,
+    Holders,
     Cleanup,
     Write,
     Commit,
+    Drain,
     Done,
 }
 #[derive(Debug, PartialEq)]
@@ -85,6 +90,9 @@ pub struct KeyOperation {
     keys: Option<ReadVaultOperation>,
     request: Option<KeyRequest>,
     queue_full: bool,
+    scopes: Vec<KeyScope>,
+    opened: Vec<Ulid>,
+    notify: bool,
     result: Option<KeyResult>,
     output: Option<Result<KeyResult, KeyError>>,
 }
@@ -112,6 +120,9 @@ impl KeyOperation {
             keys: None,
             request: None,
             queue_full: false,
+            scopes: Vec::new(),
+            opened: Vec::new(),
+            notify: false,
             result: None,
             output: None,
         }
@@ -210,7 +221,7 @@ impl KeyOperation {
             return self.fail(KeyError::Missing);
         };
         let bucket = snapshot.parameters.key.bucket_id.to_bytes().to_vec();
-        let own = [bucket.clone(), self.auth.user_id.to_storage_key()].concat();
+        let own = [bucket.clone(), self.recipient().to_storage_key()].concat();
         let (space, prefix, cursor) = match &self.action {
             KeyAction::Publish(grant) => {
                 self.state = State::Records;
@@ -218,7 +229,7 @@ impl KeyOperation {
             }
             KeyAction::Open(_) if !snapshot.holder => return self.fail(KeyError::Denied),
             KeyAction::Open(cursor) => (ABE_REQUEST_KEYSPACE, bucket, cursor.clone()),
-            KeyAction::Request(_) => (ABE_REQUEST_KEYSPACE, own, None),
+            KeyAction::Request(_) | KeyAction::Member(_) => (ABE_REQUEST_KEYSPACE, own, None),
             KeyAction::Grants(cursor) => (ABE_GRANT_KEYSPACE, own, cursor.clone()),
         };
         self.state = State::Records;
@@ -260,6 +271,11 @@ impl KeyOperation {
                 writes: std::mem::take(&mut self.writes),
                 txn_id: self.txn
             })];
+        }
+        if matches!(self.action, KeyAction::Member(_))
+            && !matches!(self.result, Some(KeyResult::Opened(_)))
+        {
+            return self.next_scope();
         }
         let Some(txn_id) = self.txn else {
             return self.fail(KeyError::Storage);
@@ -308,6 +324,16 @@ impl Operation for KeyOperation {
                 if matches!(self.action, KeyAction::Open(_)) {
                     return self.records();
                 }
+                if matches!(self.action, KeyAction::Member(_)) {
+                    match self.member_scopes() {
+                        Ok(scopes) if scopes.is_empty() => {
+                            self.result = Some(KeyResult::Opened(Vec::new()));
+                            return self.flush();
+                        }
+                        Ok(scopes) => self.scopes = scopes,
+                        Err(error) => return self.fail(error),
+                    }
+                }
                 let mut keys = ReadVaultOperation::new(ReadVaultConfig {
                     node_id: self.node,
                     user_id: self.recipient(),
@@ -329,6 +355,9 @@ impl Operation for KeyOperation {
             }
             (State::Count, Event::Storage(StorageEvent::IterResult { values, .. })) => {
                 self.count_read(values)
+            }
+            (State::Holders, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                self.notify_holders(values)
             }
             (State::Issue, Event::Blob(BlobEvent::Abe(event))) => match *event {
                 AbeEvent::Grant(grant) => self.publish_grant(grant),
@@ -353,6 +382,16 @@ impl Operation for KeyOperation {
                 if self.txn == Some(txn_id) =>
             {
                 self.txn = None;
+                if self.notify {
+                    self.state = State::Drain;
+                    return smallvec![crate::notifications::outbox::schedule_drain_effect()];
+                }
+                self.state = State::Done;
+                self.output = self.result.take().map(Ok);
+                smallvec![]
+            }
+            // Delivery is retried from the stored outbox, so a lost drain timer only delays it.
+            (State::Drain, Event::Task(_)) => {
                 self.state = State::Done;
                 self.output = self.result.take().map(Ok);
                 smallvec![]

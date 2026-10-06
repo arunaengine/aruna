@@ -3,6 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::notifications::outbox::new_outbox_record;
+use aruna_core::storage_entries::outbox_write_entry;
+use aruna_core::structs::execution::notification::{
+    NotificationClass, NotificationKind, NotificationRecord,
+};
+use aruna_core::structs::storage::encryption::{BucketHolder, HolderOrigin};
 
 impl KeyOperation {
     fn current_request(&self, request: &KeyRequest) -> Result<(), KeyError> {
@@ -65,6 +71,12 @@ impl KeyOperation {
                 KeyAction::Request(scope),
                 Event::Storage(StorageEvent::IterResult { values, .. }),
             ) => self.request_read(scope, values),
+            (KeyAction::Member(_), Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                match self.scopes.pop() {
+                    Some(scope) => self.request_read(scope, values),
+                    None => self.fail(AbeError::Context),
+                }
+            }
             (KeyAction::Open(_), Event::Storage(StorageEvent::IterResult { values, .. })) => {
                 let next = page_end(&values);
                 let mut requests = Vec::new();
@@ -118,7 +130,10 @@ impl KeyOperation {
                 open.push(request);
             }
         }
-        let restrictions = self.auth.path_restrictions.clone();
+        let restrictions = match self.action {
+            KeyAction::Member(_) => None,
+            _ => self.auth.path_restrictions.clone(),
+        };
         let same = open
             .iter()
             .position(|r| r.scope == scope && r.restrictions == restrictions);
@@ -130,8 +145,8 @@ impl KeyOperation {
                 let key = self.newest();
                 KeyRequest {
                     request_id: Ulid::generate(),
-                    requesting_user: self.auth.user_id,
-                    recipient_user: self.auth.user_id,
+                    requesting_user: self.recipient(),
+                    recipient_user: self.recipient(),
                     recipient_record: key.map(|k| k.record_id),
                     recipient_public: key.map(|k| k.public_key),
                     recipient_fingerprint: key.map(|k| k.fingerprint),
@@ -250,6 +265,67 @@ impl KeyOperation {
             request.key().into(),
             bytes.into(),
         ));
+        self.flush()
+    }
+}
+
+impl KeyOperation {
+    /// Records the finished scope, then starts the next one or notifies the holders once.
+    pub(super) fn next_scope(&mut self) -> Effects {
+        if let Some(KeyResult::Request(request)) = self.result.take() {
+            self.opened.push(request.request_id);
+        }
+        if !self.scopes.is_empty() {
+            return self.records();
+        }
+        let opened = std::mem::take(&mut self.opened);
+        let holder = self.snapshot.as_ref().is_some_and(|s| s.holder);
+        let notify = !opened.is_empty() && !holder;
+        self.result = Some(KeyResult::Opened(opened));
+        let Some(snapshot) = self.snapshot.as_ref().filter(|_| notify) else {
+            return self.flush();
+        };
+        self.state = State::Holders;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BUCKET_HOLDER_KEYSPACE.to_string(),
+            prefix: Some(snapshot.parameters.key.bucket_id.to_bytes().to_vec().into()),
+            start: None,
+            limit: usize::MAX,
+            txn_id: self.txn
+        })]
+    }
+    /// Tells every current holder except the member that the member waits for keys.
+    pub(super) fn notify_holders(&mut self, values: Vec<(Key, Value)>) -> Effects {
+        let (Some(info), Some(snapshot)) = (&self.info, &self.snapshot) else {
+            return self.fail(KeyError::Missing);
+        };
+        let mut holders = snapshot.holders.clone();
+        for (_, value) in values {
+            match BucketHolder::from_bytes(&value) {
+                Ok(holder) if holder.origin == HolderOrigin::Explicit => {
+                    holders.insert(holder.user_id);
+                }
+                Ok(_) => {}
+                Err(_) => return self.fail(AbeError::Context),
+            }
+        }
+        let member = self.recipient();
+        holders.remove(&member);
+        let kind = NotificationKind::BucketKeyPending {
+            bucket: self.bucket.clone(),
+            node_id: self.node,
+            group_id: info.group_id,
+            member_user_id: member,
+        };
+        for holder in holders {
+            let class = NotificationClass::Direct;
+            let record = NotificationRecord::new(holder, class, kind.clone(), self.now);
+            match outbox_write_entry(&new_outbox_record(record)) {
+                Ok(entry) => self.writes.push(entry),
+                Err(_) => return self.fail(KeyError::Storage),
+            }
+        }
+        self.notify = !self.writes.is_empty();
         self.flush()
     }
 }
