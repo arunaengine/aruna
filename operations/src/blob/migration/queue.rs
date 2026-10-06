@@ -320,6 +320,13 @@ async fn settle(
     record.finished_at_ms = Some(now);
     if store(storage, bucket, &mut record).await? {
         if record.finished_at_ms.is_some() {
+            if let Some(source) = record.source
+                && record.target.plan.map(|plan| plan.key) != Some(source)
+            {
+                crate::replication::parking::wake_parked(context, source, now)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
             forget_retired(context, &record).await;
         } else {
             return Ok(Some(RECHECK));

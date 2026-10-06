@@ -136,9 +136,14 @@ async fn wait_current(
         let record = value
             .map(|value| BucketKeyRecord::from_bytes(&value))
             .transpose()?;
-        if settings.active_key() != Some(*key)
-            || !record.is_some_and(|record| record.key == *key && record.state == KeyState::Active)
-        {
+        if !record.is_some_and(|record| {
+            record.key == *key
+                && match record.state {
+                    KeyState::Active => settings.active_key() == Some(*key),
+                    KeyState::Retiring => settings.bucket_id == Some(key.bucket_id),
+                    KeyState::Retired => false,
+                }
+        }) {
             return Ok(false);
         }
     }
@@ -835,5 +840,245 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    async fn retiring_wait(mode: EncryptionMode) {
+        let (_dir, context) = keyed_context().await;
+        let storage = &context.storage_handle;
+        let old = BucketKeyRef::new(Ulid::from_parts(15, 15), 1);
+        let location = source(&context, old).await;
+        let settings = BucketEncryption {
+            mode,
+            bucket_id: Some(old.bucket_id),
+            key_generation: 2,
+            ..Default::default()
+        };
+        let mut retiring = BucketKeyRecord::new(old, Ulid::from_parts(1, 1), [9; 32], 0);
+        retiring.state = KeyState::Retiring;
+        run(
+            storage,
+            StorageEffect::BatchWrite {
+                writes: vec![
+                    (
+                        BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                        b"source".to_vec().into(),
+                        settings.to_bytes().unwrap().into(),
+                    ),
+                    (
+                        BUCKET_KEY_KEYSPACE.to_string(),
+                        old.key().into(),
+                        retiring.to_bytes().unwrap().into(),
+                    ),
+                ],
+                txn_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let admission = context
+            .blob_handle
+            .as_ref()
+            .unwrap()
+            .send_blob_effect(BlobEffect::AdmitRead {
+                key: old,
+                archive: aruna_core::structs::storage::blob::ArchiveKey::of(&location),
+            })
+            .await;
+        assert!(matches!(
+            admission,
+            Event::Blob(BlobEvent::Error(aruna_core::errors::BlobError::BucketKey(
+                aruna_core::structs::storage::encryption::BucketKeyError::Locked(_)
+            )))
+        ));
+        let mut record = job(Ulid::from_parts(16, 16));
+        record.input.target = ReplicateScopeTarget::Version {
+            key: "object".to_string(),
+            version_id: Ulid::from_parts(3, 3),
+        };
+        record.attempts = 2;
+        record.last_error = Some("previous copy failure".to_string());
+        let row = store(storage, &record).await;
+        assert_eq!(
+            park_job(&context, row.clone(), &record, &[old])
+                .await
+                .unwrap(),
+            None
+        );
+        let parked = read_job(storage, &row, None).await.unwrap().unwrap();
+        assert_eq!(parked.due_at_ms, PARKED_DUE);
+        assert_eq!(parked.attempts, record.attempts);
+        assert_eq!(parked.last_error, record.last_error);
+        let wait = storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: COPY_WAIT_KEYSPACE.to_string(),
+                key: wait_row(old, &row).into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            wait,
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
+        ));
+        assert_eq!(
+            awaiting_jobs(&context, record.relationship_id.unwrap())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(next_blob_timer(storage).await.unwrap(), None);
+        assert_eq!(
+            wake_parked(&context, BucketKeyRef::new(old.bucket_id, 2), 5_000)
+                .await
+                .unwrap(),
+            0
+        );
+        unlock(&context, old).await;
+        assert_eq!(wake_parked(&context, old, 5_000).await.unwrap(), 1);
+        let woken = read_job(storage, &row, None).await.unwrap().unwrap();
+        assert_eq!(woken.due_at_ms, 5_000);
+        assert_eq!(woken.attempts, record.attempts);
+        assert_eq!(woken.last_error, record.last_error);
+        assert_eq!(
+            awaiting_jobs(&context, record.relationship_id.unwrap())
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(next_blob_timer(storage).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn rotation_key_waits() {
+        retiring_wait(EncryptionMode::VaultLocked).await;
+    }
+
+    #[tokio::test]
+    async fn decrypt_key_waits() {
+        retiring_wait(EncryptionMode::Off).await;
+    }
+
+    #[tokio::test]
+    async fn retirement_wakes_copy() {
+        use aruna_core::keyspaces::{TRANSITION_KEYSPACE, TRANSITION_QUEUE_KEYSPACE};
+        use aruna_core::structs::storage::encryption::SealPlan;
+        use aruna_core::structs::storage::format::Compression;
+        use aruna_core::structs::storage::transition::{
+            EncryptionTransition, TransitionKind, TransitionState, TransitionTarget,
+        };
+
+        let (_dir, context) = keyed_context().await;
+        let storage = &context.storage_handle;
+        let old = BucketKeyRef::new(Ulid::from_parts(17, 17), 1);
+        source(&context, old).await;
+        unlock(&context, old).await;
+        assert_eq!(wake_parked(&context, old, 1).await.unwrap(), 0);
+        let record = job(Ulid::from_parts(18, 18));
+        let row = store(storage, &record).await;
+        let (proxy, receivers) = StorageHandle::new();
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let direct = storage.clone();
+        let actor = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut read_tx = Some(read_tx);
+            while let Ok((effect, response, _span, _queued, _in_flight)) =
+                receivers.foreground.recv()
+            {
+                let gated = read_tx.is_some()
+                    && matches!(&effect, StorageEffect::Read { key_space, txn_id: None, .. }
+                        if key_space == BLOB_LOCATIONS_KEYSPACE);
+                let Event::Storage(event) = runtime.block_on(direct.send_storage_effect(effect))
+                else {
+                    panic!("expected a storage event");
+                };
+                if gated {
+                    assert!(matches!(
+                        &event,
+                        StorageEvent::ReadResult { value: Some(_), .. }
+                    ));
+                    read_tx.take().unwrap().send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+                assert!(response.send(event));
+            }
+        });
+        let mut parking = context.clone();
+        parking.storage_handle = proxy;
+        let parked_row = row.clone();
+        let parked_record = record.clone();
+        let task =
+            tokio::spawn(
+                async move { park_job(&parking, parked_row, &parked_record, &[old]).await },
+            );
+        read_rx.await.unwrap();
+        assert_eq!(
+            read_job(storage, &row, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .due_at_ms,
+            PARKED_DUE
+        );
+
+        // The source read saw generation 1; retirement finishes before the registry recheck.
+        let new = BucketKeyRef::new(old.bucket_id, 2);
+        source(&context, new).await;
+        let target = TransitionTarget {
+            compression: Compression::Off,
+            plan: Some(SealPlan {
+                key: new,
+                public_key: [9; 32],
+                cipher: Default::default(),
+                block_keys: Default::default(),
+                storage_generation: 2,
+            }),
+        };
+        let mut transition =
+            EncryptionTransition::new(TransitionKind::Rotate, Some(old), target, 2, 1);
+        transition.state = TransitionState::Cleanup;
+        run(
+            storage,
+            StorageEffect::BatchWrite {
+                writes: vec![
+                    (
+                        TRANSITION_KEYSPACE.to_string(),
+                        b"source".to_vec().into(),
+                        transition.to_bytes().unwrap().into(),
+                    ),
+                    (
+                        TRANSITION_QUEUE_KEYSPACE.to_string(),
+                        b"source".to_vec().into(),
+                        Vec::new().into(),
+                    ),
+                ],
+                txn_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::blob::migration::queue::process_transitions(&context)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(!key_unlocked(&context, old).await);
+        release_tx.send(()).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), None);
+        actor.join().unwrap();
+        let woken = read_job(storage, &row, None).await.unwrap().unwrap();
+        assert_ne!(woken.due_at_ms, PARKED_DUE);
+        assert_eq!(woken.attempts, record.attempts);
+        assert_eq!(woken.last_error, record.last_error);
+        assert_eq!(
+            awaiting_jobs(&context, record.relationship_id.unwrap())
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(next_blob_timer(storage).await.unwrap().is_some());
     }
 }
