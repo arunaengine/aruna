@@ -109,6 +109,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
             state.clone(),
             request_tracing_middleware,
         ))
+        .layer(axum::middleware::from_fn(crate::object_key::middleware))
         .with_state(state)
 }
 
