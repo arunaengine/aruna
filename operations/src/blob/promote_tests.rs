@@ -606,3 +606,453 @@ fn claim_mismatch_unregistered() {
             if key_space == BLOB_LOCATIONS_KEYSPACE
     ));
 }
+
+mod received {
+    use super::*;
+    use crate::driver::{DriverContext, drive};
+    use crate::s3::object::copy::sealed::{SealedCopyInput, SealedCopyOperation};
+    use crate::s3::object::copy::test::{full_context, seed_authority, seed_bucket};
+    use aruna_core::UserId;
+    use aruna_core::compute::{SecretBytes, SharedSecret};
+    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};
+    use aruna_core::stream::BackendStream;
+    use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer, ResolvedBackend};
+    use aruna_core::structs::storage::encryption::{SealPlan, public_key_of};
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    async fn put(context: &DriverContext, space: &str, key: Vec<u8>, value: Vec<u8>) {
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: space.into(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    async fn fixture() -> (tempfile::TempDir, DriverContext, SealPlan, UserId) {
+        let (temp, context) = full_context().await;
+        let realm = RealmId([1; 32]);
+        let user = UserId::local(Ulid::generate(), realm);
+        let group = Ulid::from_bytes([8; 16]);
+        seed_bucket(&context, "bucket", group, user, Vec::new()).await;
+        seed_authority(&context, realm, group, user).await;
+        let private = SecretBytes::new(vec![9; 32]);
+        let key = BucketKeyRef::new(Ulid::generate(), 1);
+        let public = public_key_of(&private).unwrap();
+        let record = BucketKeyRecord::new(key, Ulid::generate(), public, 0);
+        put(
+            &context,
+            BUCKET_KEY_KEYSPACE,
+            key.key(),
+            record.to_bytes().unwrap(),
+        )
+        .await;
+        let blob = context.blob_handle.as_ref().unwrap();
+        let prepared = blob
+            .send_blob_effect(BlobEffect::PrepareKey {
+                key,
+                public_key: public,
+                private_key: SharedSecret::new(private),
+                duration: None,
+                max: None,
+            })
+            .await;
+        let Event::Blob(BlobEvent::KeyPrepared { ticket }) = prepared else {
+            panic!("key missing")
+        };
+        blob.send_blob_effect(BlobEffect::ActivateKey { ticket })
+            .await;
+        let plan = SealPlan {
+            key,
+            public_key: public,
+            cipher: Default::default(),
+            block_keys: Default::default(),
+            storage_generation: 0,
+        };
+        (temp, context, plan, user)
+    }
+
+    async fn pending(
+        context: &DriverContext,
+        plan: SealPlan,
+        user: UserId,
+        name: &str,
+        data: Vec<u8>,
+        claimed: [u8; 32],
+        invalid: bool,
+    ) -> (BackendLocation, VersionKey) {
+        let resolved = ResolvedBackend::node_default().with_encryption((!invalid).then_some(plan));
+        let blob = BackendStream::new(futures_util::stream::iter([Ok::<_, std::io::Error>(
+            bytes::Bytes::from(data),
+        )]));
+        let written = context
+            .blob_handle
+            .as_ref()
+            .unwrap()
+            .send_blob_effect(BlobEffect::Write {
+                bucket: "bucket".into(),
+                key: name.into(),
+                resolved,
+                created_by: user,
+                blob,
+                size: None,
+            })
+            .await;
+        let Event::Blob(BlobEvent::WriteFinished { mut location }) = written else {
+            panic!("write failed: {written:?}")
+        };
+        if invalid {
+            location.format = StoredFormat::pithos(
+                PithosLayout {
+                    stored_size: location.blob_size,
+                    metadata_digest: [0; 32],
+                    storage_generation: 0,
+                },
+                plan.key,
+            );
+            location.ulid = Ulid::nil();
+        }
+        location.hashes.clear();
+        let archive = ArchiveKey::of(&location);
+        let version = VersionKey::new("bucket", name, Ulid::generate());
+        let stored = BlobVersion::pending(archive.clone(), SystemTime::UNIX_EPOCH, user, None);
+        let owner = CopyOwner::new(archive.clone(), version.clone());
+        put(
+            context,
+            PENDING_LOCATION_KEYSPACE,
+            archive.to_bytes(),
+            location.to_bytes().unwrap(),
+        )
+        .await;
+        put(
+            context,
+            PENDING_CLAIM_KEYSPACE,
+            archive.to_bytes(),
+            claimed.to_vec(),
+        )
+        .await;
+        put(
+            context,
+            BLOB_VERSIONS_KEYSPACE,
+            version.to_bytes().unwrap(),
+            stored.to_bytes().unwrap(),
+        )
+        .await;
+        put(
+            context,
+            COPY_OWNER_KEYSPACE,
+            owner.key().unwrap(),
+            Vec::new(),
+        )
+        .await;
+        put(
+            context,
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new("bucket", name).to_bytes().unwrap(),
+            CurrentVersionPointer::new(version.version_id)
+                .to_bytes()
+                .unwrap(),
+        )
+        .await;
+        (location, version)
+    }
+
+    fn origin(context: &DriverContext) -> (RealmId, NodeId) {
+        (
+            RealmId([1; 32]),
+            context.net_handle.as_ref().unwrap().node_id(),
+        )
+    }
+
+    async fn sweep(context: &DriverContext, key: BucketKeyRef) -> Result<usize, PromoteError> {
+        promote_unlocked(context, key, origin(context), &RoCrateLimits::default()).await
+    }
+
+    async fn rejected(context: &DriverContext, archive: &ArchiveKey) {
+        for space in [
+            BLOB_VERSIONS_KEYSPACE,
+            BLOB_HEAD_KEYSPACE,
+            COPY_OWNER_KEYSPACE,
+            BLOB_LOCATIONS_KEYSPACE,
+            PATHS_INDEX_KEYSPACE,
+        ] {
+            let (rows, _) = crate::jobs::store::iter_prefix_page(
+                &context.storage_handle,
+                space,
+                None,
+                None,
+                8,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(rows.is_empty(), "rejected archive remains in {space}");
+        }
+        assert!(
+            read_value(
+                &context.storage_handle,
+                PENDING_LOCATION_KEYSPACE,
+                archive.to_bytes()
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(
+            read_value(
+                &context.storage_handle,
+                PENDING_CLAIM_KEYSPACE,
+                archive.to_bytes()
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+            &[0; 32]
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatch_resweep_blocked() {
+        let (_temp, context, plan, user) = fixture().await;
+        let (location, _) = pending(
+            &context,
+            plan,
+            user,
+            "rejected",
+            b"content".to_vec(),
+            [0; 32],
+            false,
+        )
+        .await;
+        let archive = ArchiveKey::of(&location);
+        assert_eq!(sweep(&context, plan.key).await.unwrap(), 0);
+        rejected(&context, &archive).await;
+        assert_eq!(sweep(&context, plan.key).await.unwrap(), 0);
+        rejected(&context, &archive).await;
+    }
+
+    async fn storage_step(
+        context: &DriverContext,
+        operation: &mut RejectOwnersOperation,
+        effects: Effects,
+    ) -> Effects {
+        assert_eq!(effects.len(), 1);
+        let Some(Effect::Storage(effect)) = effects.into_iter().next() else {
+            panic!("storage effect missing")
+        };
+        operation.step(context.storage_handle.send_storage_effect(effect).await)
+    }
+
+    #[tokio::test]
+    async fn mismatch_alias_fenced() {
+        let (_temp, context, plan, user) = fixture().await;
+        let (location, version) = pending(
+            &context,
+            plan,
+            user,
+            "rejected",
+            b"content".to_vec(),
+            [0; 32],
+            false,
+        )
+        .await;
+        let archive = ArchiveKey::of(&location);
+        let record =
+            BlobQuarantineRecord::new([0; 32], archive.backend.clone(), "mismatch".into(), 0);
+        let mut fence = RejectOwnersOperation::new(archive.clone(), &record).unwrap();
+        let effects = fence.start();
+        let effects = storage_step(&context, &mut fence, effects).await;
+        let effects = storage_step(&context, &mut fence, effects).await;
+        let alias = SealedCopyOperation::new(SealedCopyInput {
+            bucket: "bucket".into(),
+            source_key: version.key,
+            source_version_id: version.version_id,
+            location: location.clone(),
+            source_policies: Vec::new(),
+            size: location.blob_size,
+            dest_key: "alias".into(),
+            metadata: None,
+            user_id: user,
+            group_id: Ulid::from_bytes([8; 16]),
+            realm_id: origin(&context).0,
+            node_id: origin(&context).1,
+            quota_ceiling: None,
+        });
+        drive(alias, &context).await.unwrap();
+        let effects = storage_step(&context, &mut fence, effects).await;
+        let effects = storage_step(&context, &mut fence, effects).await;
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+        let mut effects = effects;
+        while !fence.is_complete() {
+            effects = storage_step(&context, &mut fence, effects).await;
+        }
+        assert_eq!(fence.finalize().unwrap().len(), 2);
+        assert_eq!(
+            drop_mismatch(&context, &archive, [0; 32], origin(&context))
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(sweep(&context, plan.key).await.unwrap(), 0);
+        rejected(&context, &archive).await;
+    }
+
+    struct Capture(tokio::sync::mpsc::UnboundedSender<aruna_net::streams::BiStream>);
+
+    #[async_trait::async_trait]
+    impl aruna_net::InboundEventHandler for Capture {
+        async fn handle_incoming_stream(
+            &self,
+            _: aruna_core::alpn::Alpn,
+            stream: aruna_net::streams::BiStream,
+            _: NodeId,
+        ) {
+            self.0.send(stream).unwrap();
+        }
+    }
+
+    async fn bao_bytes(context: &DriverContext) -> Vec<u8> {
+        let data = vec![0; 64];
+        let net = context.net_handle.as_ref().unwrap();
+        let (sender, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+        net.set_inbound_handler(Arc::new(Capture(sender)));
+        let mut stream = net
+            .open_stream(net.node_id(), aruna_core::alpn::Alpn::Bao)
+            .await
+            .unwrap();
+        let inbound = incoming.recv().await.unwrap();
+        let blob = context.blob_handle.as_ref().unwrap();
+        let id = blob.store_connection(net.node_id(), inbound).await.unwrap();
+        stream.0.write_all(&data).await.unwrap();
+        stream.0.finish().unwrap();
+        let event = blob
+            .send_blob_effect(BlobEffect::ReceiveRead {
+                stream_id: id,
+                size: data.len() as u64,
+                expected_blake3: *blake3::hash(&data).as_bytes(),
+            })
+            .await;
+        let Event::Blob(BlobEvent::ReadFinished { blob, .. }) = event else {
+            panic!("Bao read failed")
+        };
+        let chunks: Vec<_> = blob.0.collect().await;
+        let verified: Vec<u8> = chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.unwrap())
+            .collect();
+        assert_eq!(verified, data);
+        verified
+    }
+
+    #[tokio::test]
+    async fn corrupt_copy_continues() {
+        let (_temp, context, plan, user) = fixture().await;
+        let invalid = bao_bytes(&context).await;
+        let (bad, version) = pending(&context, plan, user, "invalid", invalid, [0; 32], true).await;
+        let data = b"valid content".to_vec();
+        let hash = *blake3::hash(&data).as_bytes();
+        let (_, valid) = pending(&context, plan, user, "valid", data, hash, false).await;
+        assert_eq!(sweep(&context, plan.key).await.unwrap(), 1);
+        assert!(
+            read_value(
+                &context.storage_handle,
+                BLOB_VERSIONS_KEYSPACE,
+                version.to_bytes().unwrap()
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            read_value(
+                &context.storage_handle,
+                COPY_OWNER_KEYSPACE,
+                CopyOwner::new(ArchiveKey::of(&bad), version).key().unwrap()
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let stored = read_value(
+            &context.storage_handle,
+            BLOB_VERSIONS_KEYSPACE,
+            valid.to_bytes().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            BlobVersion::from_bytes(&stored).unwrap().state.blob_hash(),
+            Some(&hash)
+        );
+        assert!(
+            read_value(
+                &context.storage_handle,
+                PENDING_CLAIM_KEYSPACE,
+                ArchiveKey::of(&bad).to_bytes()
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        let record = BlobQuarantineRecord::new([0; 32], bad.backend, String::new(), 0);
+        assert!(
+            read_value(
+                &context.storage_handle,
+                BLOB_QUARANTINE_KEYSPACE,
+                record.key()
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_copy_retained() {
+        let (_temp, context, plan, user) = fixture().await;
+        let data = b"content".to_vec();
+        let hash = *blake3::hash(&data).as_bytes();
+        let (location, version) = pending(&context, plan, user, "missing", data, hash, false).await;
+        std::fs::remove_file(
+            std::path::Path::new(&location.root).join(location.get_storage_path().unwrap()),
+        )
+        .unwrap();
+        assert!(matches!(
+            sweep(&context, plan.key).await,
+            Err(PromoteError::Blob(BlobError::ReadError(_)))
+        ));
+        assert!(
+            read_value(
+                &context.storage_handle,
+                BLOB_VERSIONS_KEYSPACE,
+                version.to_bytes().unwrap()
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            read_value(
+                &context.storage_handle,
+                PENDING_CLAIM_KEYSPACE,
+                ArchiveKey::of(&location).to_bytes()
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+    }
+}
