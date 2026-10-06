@@ -7,9 +7,13 @@
 
 extern crate alloc;
 
+mod crypto;
 mod policy;
+mod scheme;
 
 pub use policy::{Attribute, Policy};
+pub use scheme::{Ciphertext, KemKey, MasterSecret, PublicParameters, UserKey};
+pub use scheme::{decapsulate, encapsulate, issue, setup_from_seed};
 
 /// Maximum attributes in one ciphertext.
 pub const MAX_ATTRIBUTES: usize = 64;
