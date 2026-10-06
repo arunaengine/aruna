@@ -25,6 +25,13 @@ use thiserror::Error;
 
 pub type Row = (String, Key, Value);
 
+/// The `group_encrypted_buckets` key of a bucket: group id, then bucket name.
+pub fn group_bucket_key(group_id: GroupId, bucket: &str) -> Key {
+    [&group_id.to_bytes()[..], bucket.as_bytes()]
+        .concat()
+        .into()
+}
+
 /// The audit row of a key change, written in the same batch as the change it records.
 pub fn audit_row(
     record: &aruna_core::structs::storage::key_audit::BucketAuditRecord,

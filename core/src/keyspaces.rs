@@ -115,6 +115,8 @@ pub const BUCKET_HOLDER_KEYSPACE: &str = "bucket_holders";
 pub const KEY_COPY_KEYSPACE: &str = "bucket_key_copies";
 /// Encryption settings of node-local buckets, keyed by bucket name. No row means off.
 pub const BUCKET_ENCRYPTION_KEYSPACE: &str = "bucket_encryption";
+/// Encrypted node-local buckets of each group, keyed by group id and bucket name. Values are empty.
+pub const GROUP_ENCRYPTED_KEYSPACE: &str = "group_encrypted_buckets";
 /// Key state audit of encrypted buckets, keyed by bucket id and time-ordered event id.
 pub const BUCKET_AUDIT_KEYSPACE: &str = "bucket_audit";
 /// Complete locations of archives whose content hash is unknown, keyed by archive id and backend.
@@ -517,6 +519,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     PENDING_CLAIM_KEYSPACE,
     COPY_WAIT_KEYSPACE,
     PLAINTEXT_COPY_KEYSPACE,
+    GROUP_ENCRYPTED_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

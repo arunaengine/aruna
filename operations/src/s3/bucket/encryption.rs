@@ -5,8 +5,8 @@
 
 use crate::blob::migration::queue::encrypt_rows;
 use crate::s3::bucket::key::rows::{
-    SettingsError, audit_row, authority_read, copy_targets, generation_rows, parse_authority,
-    uploads_open,
+    SettingsError, audit_row, authority_read, copy_targets, generation_rows, group_bucket_key,
+    parse_authority, uploads_open,
 };
 use aruna_blob::blob::pithos::MAX_SIZE;
 use aruna_core::compute::SharedSecret;
@@ -15,8 +15,8 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_HOLDER_KEYSPACE, TRANSITION_KEYSPACE,
-    UPLOAD_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_HOLDER_KEYSPACE,
+    GROUP_ENCRYPTED_KEYSPACE, TRANSITION_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
@@ -455,6 +455,12 @@ impl EnableEncryptionOperation {
             Ok(row) => writes.push(row),
             Err(error) => return self.fail(error),
         }
+        let group = group_bucket_key(self.input.group_id, &self.input.bucket);
+        writes.push((
+            GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            group,
+            Vec::new().into(),
+        ));
         self.result = Some(EnableResult {
             settings: self.settings.clone(),
             key: record,

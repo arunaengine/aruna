@@ -9,8 +9,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE,
-    BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE, NODE_VAULT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
-    RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+    BUCKET_KEY_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, KEY_COPY_KEYSPACE, NODE_VAULT_KEYSPACE,
+    RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
@@ -422,6 +422,10 @@ impl DeleteBucketOperation {
             // A bucket created again under this name starts without encryption.
             (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.into()),
         ];
+        if let Some(group_id) = self.group_id {
+            let key = crate::s3::bucket::key::rows::group_bucket_key(group_id, &self.bucket);
+            deletes.push((GROUP_ENCRYPTED_KEYSPACE.to_string(), key));
+        }
         deletes.append(&mut self.relationship_deletes);
         deletes.append(&mut self.key_deletes);
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
