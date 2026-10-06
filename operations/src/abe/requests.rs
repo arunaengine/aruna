@@ -219,29 +219,13 @@ impl KeyOperation {
             txn_id: self.txn
         })]
     }
-    /// Writes the grant only while the recipient holds fewer than `MAX_REQUESTS` current grants.
+    /// Writes the grant only while the recipient stores fewer than `MAX_REQUESTS` grants.
     pub(super) fn count_read(&mut self, values: Vec<(Key, Value)>) -> Effects {
         let Some(KeyResult::Grant(grant)) = self.result.take() else {
             return self.fail(AbeError::Context);
         };
-        let full = values.len() > MAX_REQUESTS;
-        let mut live = 0;
-        for (key, value) in values {
-            let held = match KeyGrant::from_bytes(&value) {
-                Ok(g) => g,
-                Err(error) => return self.fail(error),
-            };
-            if self.grant_allowed(&held.context.request).is_ok() {
-                live += 1;
-            } else if !self
-                .deletes
-                .iter()
-                .any(|(s, k)| s == ABE_GRANT_KEYSPACE && *k == key)
-            {
-                self.deletes.push((ABE_GRANT_KEYSPACE.to_string(), key));
-            }
-        }
-        if full || live >= MAX_REQUESTS {
+        // Stored grants are only counted: this request's restrictions cannot judge other grants.
+        if values.len() >= MAX_REQUESTS {
             return self.fail(AbeError::Limit);
         }
         let key: Key = grant.context.request.key().into();

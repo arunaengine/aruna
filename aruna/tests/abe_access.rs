@@ -10,11 +10,12 @@ use aruna_core::compute::SecretBytes;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::key_seal::{SealedSecret, open_sealed, seal_to};
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::abe::{
     AbeError, GRANT_PURPOSE, SysRng, create_parameters, derive_master, setup_context,
 };
 use aruna_core::structs::storage::abe_access::{GrantContext, KeyGrant, KeyScope, MAX_REQUESTS};
+use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
 use aruna_kpabe::{Attribute, Envelope, Policy, UserKey};
 use aruna_operations::abe::{KeyAction, KeyError, KeyOperation};
@@ -23,7 +24,7 @@ use reqwest::StatusCode;
 use serde_json::{Value, json};
 use shared::{
     SeedNode, TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
-    spawn_complete_seed,
+    sign_scoped_token, sign_token, spawn_complete_seed,
 };
 use ulid::Ulid;
 
@@ -596,6 +597,118 @@ async fn abe_limits() -> TestResult<()> {
         assert_eq!(repeated["record"], first["record"]);
         let (status, _) = send(request(format!("bar/{MAX_REQUESTS}"))).await?;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+#[tokio::test]
+async fn abe_queued_grants() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let http = reqwest::Client::new();
+        let base = seed.base_url.clone();
+        let owner = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&base, &owner, "ABE queued").await?;
+        let user = UserId::local(Ulid::generate(), seed.realm_id);
+        let (status, _) = send(
+            http.post(format!(
+                "{base}/api/v1/access/groups/{}/members",
+                group.group_id
+            ))
+            .bearer_auth(&owner)
+            .json(&json!({"user_id":user.to_string(),"role_ids":null})),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        let reader = sign_token(&seed, user, None, 600)?;
+        let root =
+            group_permission_path(seed.realm_id, group.group_id.parse()?, seed.net.node_id());
+        let restricted = sign_scoped_token(
+            &seed,
+            user,
+            vec![PathRestriction {
+                pattern: format!("{root}/{BUCKET}/bar/**"),
+                permission: Permission::READ,
+            }],
+        )?;
+        let reader_public = public_key_of(&SecretBytes::new(vec![11; 32])).unwrap();
+        add_key(&base, &reader, "reader-1", reader_public).await?;
+        let owner_public = public_key_of(&SecretBytes::new(vec![7; 32])).unwrap();
+        add_key(&base, &owner, "owner-1", owner_public).await?;
+        let credentials = create_s3_credentials(&base, &owner, &group.group_id).await?;
+        s3_client(seed.s3.as_ref().unwrap(), &credentials)
+            .create_bucket()
+            .bucket(BUCKET)
+            .send()
+            .await?;
+        let encryption = format!("{base}/api/v1/data/buckets/{BUCKET}/storage/encryption");
+        let (status, settings) = send(
+            http.put(&encryption)
+                .bearer_auth(&owner)
+                .json(&json!({"mode":"vault_locked","expected_generation":0})),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{settings}");
+        let response = http
+            .post(format!("{encryption}/lock"))
+            .bearer_auth(&owner)
+            .send()
+            .await?;
+        assert!(response.status().is_success());
+
+        // The restricted request is queued first, then an unrestricted one.
+        let requests = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/requests");
+        let subtree = |value: &str| json!({"scope":{"kind":"subtree","value":value}});
+        let (status, body) = send(
+            http.post(&requests)
+                .bearer_auth(&restricted)
+                .json(&subtree("bar/")),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let (status, body) = send(
+            http.post(&requests)
+                .bearer_auth(&reader)
+                .json(&subtree("foo/")),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+        // Publishing `bar/` after `foo/` keeps the `foo/` grant.
+        let (_, owned) = send(http.get(&requests).bearer_auth(&owner)).await?;
+        for prefix in ["foo/", "bar/"] {
+            let record = owned["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["record"].clone())
+                .find(|r| {
+                    let context: GrantContext = postcard::from_bytes(&bytes(r)).unwrap();
+                    context.request.scope == KeyScope::Subtree(prefix.into())
+                })
+                .unwrap();
+            let context: GrantContext = postcard::from_bytes(&bytes(&record))?;
+            let route = format!("{requests}/{}/grant", context.request.request_id);
+            let (status, body) = send(
+                http.post(&route)
+                    .bearer_auth(&owner)
+                    .json(&submission(&record, [1; 32], &[1; 16])),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let grants = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/grants");
+        let (_, own) = send(http.get(&grants).bearer_auth(&reader)).await?;
+        assert_eq!(own["records"].as_array().unwrap().len(), 2, "{own}");
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
