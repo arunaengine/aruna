@@ -288,7 +288,7 @@ node checks WRITE on the target bucket before it accepts its half of the relatio
 - An encrypted source refuses a target bucket that does not encrypt unless `plaintext` is true and
   the creator is a current key holder of the source bucket, checked here and before each run. A
   refusal found later fails the relationship with `failure_reason` `plaintext_required`.
-- `plaintext` on a source bucket that does not encrypt is accepted and has no effect.
+- With encryption off and no retained encrypted archives, `plaintext` has no effect.
 - Completion is observed by polling the relationship, whose `pending_jobs`, `last_synced_at` and
   counters advance as replication drains.
 

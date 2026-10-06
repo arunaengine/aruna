@@ -5,15 +5,19 @@
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::key_wake::read_row;
+use crate::jobs::store::iter_prefix_page;
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::bucket::key::rows::{authority_read, parse_authority};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, PLAINTEXT_COPY_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
+    PLAINTEXT_COPY_KEYSPACE,
 };
-use aruna_core::structs::storage::encryption::{BucketEncryption, BucketHolder, HolderOrigin};
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketHolder, BucketKeyRecord, HolderOrigin, KeyState,
+};
 use aruna_core::types::Key;
 use ulid::Ulid;
 
@@ -75,6 +79,42 @@ pub async fn source_encrypted(context: &DriverContext, bucket: &str) -> Result<b
     BucketEncryption::from_row(settings.as_deref())
         .map(|settings| settings.is_encrypted())
         .map_err(|error| error.to_string())
+}
+
+/// Whether plaintext copying needs consent for new or retained encrypted objects.
+pub async fn consent_required(context: &DriverContext, bucket: &str) -> Result<bool, String> {
+    let row = bucket.as_bytes().to_vec();
+    let settings = read_row(&context.storage_handle, BUCKET_ENCRYPTION_KEYSPACE, row).await?;
+    let settings =
+        BucketEncryption::from_row(settings.as_deref()).map_err(|error| error.to_string())?;
+    if settings.is_encrypted() {
+        return Ok(true);
+    }
+    let Some(bucket_id) = settings.bucket_id else {
+        return Ok(false);
+    };
+    let mut start_after = None;
+    loop {
+        let (rows, next) = iter_prefix_page(
+            &context.storage_handle,
+            BUCKET_KEY_KEYSPACE,
+            Some(bucket_id.to_bytes().to_vec().into()),
+            start_after,
+            64,
+            None,
+        )
+        .await?;
+        for (_, value) in rows {
+            let record = BucketKeyRecord::from_bytes(&value).map_err(|error| error.to_string())?;
+            if record.state != KeyState::Retired {
+                return Ok(true);
+            }
+        }
+        match next {
+            Some(next) => start_after = Some(next),
+            None => return Ok(false),
+        }
+    }
 }
 
 /// Whether `user` holds the key of `bucket` now: its creator, a current group admin, or an

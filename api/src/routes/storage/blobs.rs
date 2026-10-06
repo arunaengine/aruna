@@ -15,7 +15,7 @@ use aruna_operations::replication::locations::{
     LocationSummaryError, LocationSummaryOperation, QueuedNodesOperation, QueuedReplicas,
     RelationshipNodesOperation, RemoteLocationOperation,
 };
-use aruna_operations::replication::plaintext::{is_holder, source_encrypted};
+use aruna_operations::replication::plaintext::{consent_required, is_holder};
 use aruna_operations::replication::protocol::{
     CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest, ReplicationMode,
 };
@@ -125,7 +125,7 @@ the whole bucket when it is not.
   copy waiting until the next unlock of the source bucket, without retries or errors.
 - An encrypted source refuses a target bucket that does not encrypt unless `plaintext` is true and
   the caller is a current key holder of the source bucket, checked here and before each run.
-- `plaintext` on a source bucket that does not encrypt is accepted and has no effect."#,
+- With encryption off and no retained encrypted archives, `plaintext` has no effect."#,
     request_body(
         content = ReplicateBlobRequest,
         description = "Replication scope and the hex id of the destination node",
@@ -250,15 +250,14 @@ pub async fn replicate_blob(
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
-/// Whether a plaintext request on `bucket` takes effect: only on an encrypting bucket, and only
-/// for a current key holder, else `not_holder`.
+/// Encrypted sources, including retained archives, need a current holder, else `not_holder`.
 pub(crate) async fn plaintext_holder(
     state: &ServerState,
     bucket: &str,
     user: aruna_core::UserId,
 ) -> ServerResult<bool> {
     let context = state.get_ctx();
-    let encrypted = source_encrypted(&context, bucket)
+    let encrypted = consent_required(&context, bucket)
         .await
         .map_err(ServerError::InternalError)?;
     if !encrypted {
