@@ -386,8 +386,10 @@ impl PreparedRequest {
             .request
             .take()
             .expect("request is present before the handler runs");
-        // Stage: a query token of a long-lived key is refused before s3s logs the URI.
-        if super::auth::query_token_refused(request.headers(), request.uri()) {
+        // Stage: refuse token forms that s3s would log before signature validation.
+        if super::auth::query_token_refused(request.headers(), request.uri())
+            || super::auth::header_token_refused(request.headers(), request.uri())
+        {
             drop(request);
             self.finish_request();
             return self
@@ -1014,6 +1016,180 @@ async fn load_bucket_cors(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::instrument::WithSubscriber;
+
+    const TOKEN_CANARY: &str = "group-s-token-canary";
+    const TOKEN_AUTH: &str = "AWS4-HMAC-SHA256 Credential=TOKENKEY/20261005/us-east-1/s3/aws4_request, \
+        SignedHeaders=host;x-amz-date;x-amz-security-token, Signature=00";
+
+    struct TestS3;
+
+    #[async_trait::async_trait]
+    impl s3s::S3 for TestS3 {}
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn request_trace(mut request: s3s::HttpRequest) -> (http::StatusCode, String) {
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || LogWriter(writer.clone()))
+            .finish();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let mut builder = S3ServiceBuilder::new(TestS3);
+        builder.set_auth(s3s::auth::SimpleAuth::from_single(
+            "TOKENKEY",
+            "signing-secret",
+        ));
+        let service = WrappingService {
+            shared: builder.build(),
+            cors: CorsConfig::default(),
+            domain: "localhost".to_string(),
+            driver_ctx,
+            metrics: Arc::new(NodeMetrics::new()),
+            peer_ip: None,
+            rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
+            control_limit: Arc::new(Semaphore::new(1)),
+            bulk_limit: Arc::new(Semaphore::new(1)),
+            read_limit: Arc::new(Semaphore::new(1)),
+            mutation_limit: Arc::new(Semaphore::new(1)),
+            capture_limit: Arc::new(Semaphore::new(1)),
+            activity: None,
+            trusted_proxies: Arc::new(Vec::new()),
+            timeouts: S3ServerTimeouts::default(),
+        };
+        let status = async {
+            super::super::auth::hide_tokens(request.headers_mut());
+            let (parts, body) = request.into_parts();
+            let classification = RequestClassification::classify(&parts, &service.domain);
+            let trace =
+                RequestTrace::begin(&classification, &parts.headers, service.metrics.clone());
+            let prepared = PreparedRequest {
+                classification,
+                trace,
+                op_label: S3OpLabel::new(),
+                request: Some(s3s::HttpRequest::from_parts(parts, body)),
+                capture: None,
+                admission: None,
+                capture_permit: None,
+                lease: LocalLease::default(),
+                connection: Arc::new(ConnectionActivity::with_idle(
+                    service.timeouts.connection_idle,
+                )),
+                stream: Arc::new(ConnectionActivity::with_idle(
+                    service.timeouts.connection_idle,
+                )),
+                active: None,
+                body_end: true,
+                charged_ip: None,
+                admission_limit: service.bulk_limit.clone(),
+                egress_limit: service.read_limit.clone(),
+                capture_limit: service.capture_limit.clone(),
+                service,
+            };
+            prepared.run().await.unwrap().status()
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        (status, logs)
+    }
+
+    #[tokio::test]
+    async fn sigv2_token_hidden() {
+        let request = |token| {
+            let mut request = Request::builder()
+                .uri("/bucket/key")
+                .header(header::HOST, "localhost")
+                .header(header::DATE, "Mon, 05 Oct 2026 12:00:00 GMT")
+                .header(header::AUTHORIZATION, "AWS TOKENKEY:invalid")
+                .body(s3s::Body::empty())
+                .unwrap();
+            if token {
+                request
+                    .headers_mut()
+                    .insert("x-amz-security-token", TOKEN_CANARY.parse().unwrap());
+            }
+            request
+        };
+        let (_, control) = request_trace(request(false)).await;
+        assert!(control.contains("sig_v2 header_auth"), "{control}");
+        let (status, logs) = request_trace(request(true)).await;
+        assert_eq!(status, http::StatusCode::BAD_REQUEST);
+        assert!(logs.contains("request.received"), "{logs}");
+        assert!(!logs.contains(TOKEN_CANARY), "{logs}");
+        assert!(!logs.contains("sig_v2 header_auth"), "{logs}");
+        let request = Request::builder()
+            .uri("/bucket/key?AWSAccessKeyId=TOKENKEY&Expires=2000000000&Signature=invalid")
+            .header(header::HOST, "localhost")
+            .header(header::AUTHORIZATION, TOKEN_AUTH)
+            .header("x-amz-security-token", TOKEN_CANARY)
+            .body(s3s::Body::empty())
+            .unwrap();
+        let (status, logs) = request_trace(request).await;
+        assert_eq!(status, http::StatusCode::BAD_REQUEST);
+        assert!(!logs.contains(TOKEN_CANARY), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn mixed_tokens_hidden() {
+        for (query, authorization) in [
+            ("X-Amz-Credential=ASIAKEY%2Fscope", Some(TOKEN_AUTH)),
+            (
+                "X-Amz-Credential=TOKENKEY%2Fscope&X-Amz-Credential=ASIAKEY%2Fscope",
+                None,
+            ),
+            (
+                "X-Amz-Credential=ASIAKEY%2Fscope&X-Amz-Credential=TOKENKEY%2Fscope",
+                None,
+            ),
+            (
+                "X-Amz-Credential=ASIAKEY%2Fscope&X-Amz-Credential=ASIAKEY%2Fscope",
+                None,
+            ),
+        ] {
+            let query = query.replace("%2Fscope", "%2F20261005%2Fus-east-1%2Fs3%2Faws4_request");
+            let uri = format!("/bucket/key?{query}&X-Amz-Security-Token={TOKEN_CANARY}");
+            let mut request = Request::builder()
+                .uri(uri)
+                .header(header::HOST, "localhost")
+                .body(s3s::Body::empty())
+                .unwrap();
+            if let Some(authorization) = authorization {
+                request
+                    .headers_mut()
+                    .insert(header::AUTHORIZATION, authorization.parse().unwrap());
+            }
+            let (status, logs) = request_trace(request).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST);
+            assert!(logs.contains("request.received"), "{logs}");
+            assert!(!logs.contains(TOKEN_CANARY), "{logs}");
+        }
+    }
 
     #[test]
     fn refuses_full_connection() {

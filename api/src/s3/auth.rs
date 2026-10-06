@@ -351,24 +351,116 @@ pub(crate) fn hide_tokens(headers: &mut HeaderMap) {
 /// would sit in the logged URI, so it is refused before the request is parsed.
 pub(crate) fn query_token_refused(headers: &HeaderMap, uri: &Uri) -> bool {
     let query = uri.query().unwrap_or_default();
-    let mut token = false;
+    let mut tokens = 0;
+    let mut credentials = 0;
+    let mut legacy = false;
+    let mut presigned = false;
     let mut access_key = None;
     for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
         match name.as_ref() {
-            TOKEN_QUERY => token = true,
-            "X-Amz-Credential" => access_key = value.split('/').next().map(str::to_string),
+            TOKEN_QUERY => tokens += 1,
+            "X-Amz-Credential" => {
+                credentials += 1;
+                access_key = value.split('/').next().map(str::to_string);
+            }
+            "AWSAccessKeyId" | "Signature" => legacy = true,
+            "X-Amz-Signature" => presigned = true,
             _ => {}
         }
     }
-    let header_key = || {
-        let value = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
-        let (_, credential) = value.split_once("Credential=")?;
-        credential.split('/').next().map(str::to_string)
-    };
-    token
-        && !access_key
-            .or_else(header_key)
-            .is_some_and(|key| S3Session::is_session_key(&key))
+    if tokens == 0 {
+        return false;
+    }
+    let authorizations = headers.get_all(http::header::AUTHORIZATION).iter().count();
+    if tokens != 1
+        || credentials > 1
+        || authorizations > 1
+        || ((credentials != 0 || presigned) && authorizations != 0)
+        || headers.contains_key(TOKEN_HEADER)
+        || legacy
+    {
+        return true;
+    }
+    !access_key
+        .or_else(|| authorization_key(headers).map(str::to_string))
+        .is_some_and(|key| S3Session::is_session_key(&key))
+}
+
+fn authorization_key(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
+    let value = value.strip_prefix("AWS4-HMAC-SHA256 ")?;
+    let mut credentials = value
+        .split(',')
+        .filter_map(|field| field.trim().strip_prefix("Credential="));
+    let credential = credentials.next()?;
+    if credentials.next().is_some() {
+        return None;
+    }
+    credential.split('/').next()
+}
+
+/// Refuses unsupported long-lived token authentication before s3s logs canonical strings.
+pub(crate) fn header_token_refused(headers: &HeaderMap, uri: &Uri) -> bool {
+    if !headers.contains_key(TOKEN_HEADER) {
+        return false;
+    }
+    let query: Vec<_> =
+        url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()).collect();
+    if query
+        .iter()
+        .any(|(name, _)| name == "Signature" || name == "AWSAccessKeyId")
+    {
+        let credentials: Vec<_> = query
+            .iter()
+            .filter(|(name, _)| name == "AWSAccessKeyId")
+            .collect();
+        return headers.get_all(TOKEN_HEADER).iter().count() != 1
+            || headers.contains_key(http::header::AUTHORIZATION)
+            || query
+                .iter()
+                .any(|(name, _)| name == "X-Amz-Credential" || name == "X-Amz-Signature")
+            || credentials.len() != 1
+            || !S3Session::is_session_key(&credentials[0].1)
+            || query.iter().filter(|(name, _)| name == "Signature").count() != 1;
+    }
+    if !headers.contains_key(http::header::AUTHORIZATION) {
+        let credentials: Vec<_> = query
+            .iter()
+            .filter(|(name, _)| name == "X-Amz-Credential")
+            .collect();
+        return headers.get_all(TOKEN_HEADER).iter().count() != 1
+            || credentials.len() != 1
+            || !credentials[0]
+                .1
+                .split('/')
+                .next()
+                .is_some_and(S3Session::is_session_key)
+            || query
+                .iter()
+                .filter(|(name, _)| name == "X-Amz-Algorithm")
+                .count()
+                != 1
+            || !query
+                .iter()
+                .any(|(name, value)| name == "X-Amz-Algorithm" && value == "AWS4-HMAC-SHA256");
+    }
+    headers.get_all(TOKEN_HEADER).iter().count() != 1
+        || headers.get_all(http::header::AUTHORIZATION).iter().count() != 1
+        || query
+            .iter()
+            .any(|(name, _)| name == "X-Amz-Credential" || name == "X-Amz-Signature")
+        || !headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .strip_prefix("AWS ")
+                    .and_then(|value| value.split_once(':'))
+                    .is_some_and(|(key, _)| S3Session::is_session_key(key))
+                    || authorization_key(headers).is_some_and(|key| {
+                        S3Session::is_session_key(key) || signs_header(headers, TOKEN_HEADER)
+                    })
+            })
 }
 
 /// Whether the SigV4 `Authorization` header lists `name` among its signed headers.
@@ -1181,6 +1273,43 @@ mod token_tests {
         assert!(refused(checked(&headers(SIGNED, &[CANARY]), presigned)));
         let token_query = "/bucket/key?X-Amz-Security-Token=00";
         assert!(refused(checked(&headers(SIGNED, &[]), token_query)));
+    }
+
+    #[test]
+    fn session_tokens_preserved() {
+        let plain = Uri::from_static("/bucket/key");
+        assert!(!header_token_refused(&headers(SIGNED, &[CANARY]), &plain));
+        let session = SIGNED.replace("TOKENKEY", "ASIAKEY");
+        assert!(!header_token_refused(&headers(&session, &[CANARY]), &plain));
+        let unsigned = UNSIGNED.replace("TOKENKEY", "ASIAKEY");
+        assert!(!header_token_refused(
+            &headers(&unsigned, &[CANARY]),
+            &plain
+        ));
+        assert!(!header_token_refused(
+            &headers("AWS ASIAKEY:00", &[CANARY]),
+            &plain
+        ));
+        let query = Uri::from_static("/bucket/key?X-Amz-Security-Token=session-token");
+        assert!(!query_token_refused(&headers(&session, &[]), &query));
+        let presigned = Uri::from_static(
+            "/bucket/key?X-Amz-Credential=ASIAKEY%2F20261005%2Fus-east-1%2Fs3%2Faws4_request\
+             &X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=00",
+        );
+        let mut token = HeaderMap::new();
+        token.insert(
+            TOKEN_HEADER,
+            http::HeaderValue::from_static("session-token"),
+        );
+        assert!(!header_token_refused(&token, &presigned));
+        let legacy =
+            Uri::from_static("/bucket/key?AWSAccessKeyId=ASIAKEY&Signature=00&Expires=2000000000");
+        assert!(!header_token_refused(&token, &legacy));
+        assert!(header_token_refused(&headers(UNSIGNED, &[CANARY]), &plain));
+        assert!(header_token_refused(
+            &headers("AWS TOKENKEY:00", &[CANARY]),
+            &plain
+        ));
     }
 
     #[test]
