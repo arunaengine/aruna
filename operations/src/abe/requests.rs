@@ -138,6 +138,7 @@ impl KeyOperation {
             .iter()
             .position(|r| r.scope == scope && r.restrictions == restrictions);
         self.queue_full = overflow || open.len() >= MAX_REQUESTS;
+        self.reused = same.is_some();
         let request = match (same, self.snapshot.as_ref()) {
             (Some(index), _) => open.swap_remove(index),
             (None, None) => return self.fail(KeyError::Missing),
@@ -270,17 +271,18 @@ impl KeyOperation {
 }
 
 impl KeyOperation {
-    /// Records the finished scope, then starts the next one or notifies the holders once.
+    /// Records the finished scope, then starts the next or notifies holders of new requests.
     pub(super) fn next_scope(&mut self) -> Effects {
         if let Some(KeyResult::Request(request)) = self.result.take() {
             self.opened.push(request.request_id);
+            self.fresh |= !self.reused;
         }
         if !self.scopes.is_empty() {
             return self.records();
         }
         let opened = std::mem::take(&mut self.opened);
         let holder = self.snapshot.as_ref().is_some_and(|s| s.holder);
-        let notify = !opened.is_empty() && !holder;
+        let notify = self.fresh && !holder;
         self.result = Some(KeyResult::Opened(opened));
         let Some(snapshot) = self.snapshot.as_ref().filter(|_| notify) else {
             return self.flush();
