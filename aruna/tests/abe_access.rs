@@ -5,19 +5,24 @@
 #![recursion_limit = "256"]
 mod shared;
 
+use aruna_core::UserId;
 use aruna_core::compute::SecretBytes;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::key_seal::{SealedSecret, open_sealed, seal_to};
+use aruna_core::operation::Operation;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::abe::{
     AbeError, GRANT_PURPOSE, SysRng, create_parameters, derive_master, setup_context,
 };
 use aruna_core::structs::storage::abe_access::{GrantContext, KeyGrant, KeyScope};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
 use aruna_kpabe::{Attribute, Envelope, Policy, UserKey};
+use aruna_operations::abe::{KeyAction, KeyError, KeyOperation};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use shared::{
-    TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
+    SeedNode, TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
     spawn_complete_seed,
 };
 use ulid::Ulid;
@@ -270,4 +275,232 @@ fn abe_scopes() {
         PermissionRules::from_roles(vec![role(&[("**", Permission::WRITE)], false, true)], None)
             .unwrap();
     assert!(!rules.admits_scope(root, &KeyScope::Subtree(String::new())));
+}
+
+async fn add_key(base: &str, token: &str, key_id: &str, public: [u8; 32]) -> TestResult<Value> {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/access/users/me/keys"))
+        .bearer_auth(token)
+        .json(&json!({"key_id":key_id,"public_key":STANDARD.encode(public),"has_recovery":true}))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    Ok(response.json().await?)
+}
+
+async fn add_member(seed: &SeedNode, token: &str, group: &str, roles: Value) -> TestResult<String> {
+    let user = UserId::local(Ulid::generate(), seed.realm_id);
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/access/groups/{group}/members",
+            seed.base_url
+        ))
+        .bearer_auth(token)
+        .json(&json!({"user_id":user.to_string(),"role_ids":roles}))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    create_bearer_token(
+        seed.context.as_ref(),
+        user,
+        seed.realm_id,
+        seed.capabilities.clone(),
+    )
+    .await
+}
+
+async fn send(request: reqwest::RequestBuilder) -> TestResult<(StatusCode, Value)> {
+    let response = request.send().await?;
+    let status = response.status();
+    Ok((status, response.json().await.unwrap_or(Value::Null)))
+}
+
+fn submission(record: &Value, enc: [u8; 32], ciphertext: &[u8]) -> Value {
+    json!({"context":record,"enc":STANDARD.encode(enc),"ciphertext":STANDARD.encode(ciphertext)})
+}
+
+#[tokio::test]
+async fn abe_holders() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let http = reqwest::Client::new();
+        let base = seed.base_url.clone();
+        let owner = create_bearer_token(seed.context.as_ref(), seed.user_id, seed.realm_id, seed.capabilities.clone()).await?;
+        let group = create_group_http(&base, &owner, "ABE holders").await?;
+        let admin = &group.roles.iter().find(|r| r.name == "admin").unwrap().role_id;
+        let holder = add_member(&seed, &owner, &group.group_id, json!([admin])).await?;
+        let reader = add_member(&seed, &owner, &group.group_id, Value::Null).await?;
+        let reader_private = SecretBytes::new(vec![11; 32]);
+        let reader_public = public_key_of(&reader_private).unwrap();
+        add_key(&base, &reader, "reader-1", reader_public).await?;
+        let owner_private = SecretBytes::new(vec![7; 32]);
+        let owner_key = add_key(&base, &owner, "owner-1", public_key_of(&owner_private).unwrap()).await?;
+        let credentials = create_s3_credentials(&base, &owner, &group.group_id).await?;
+        let s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
+        s3.create_bucket().bucket(BUCKET).send().await?;
+        let encryption = format!("{base}/api/v1/data/buckets/{BUCKET}/storage/encryption");
+        let (status, settings) = send(http.put(&encryption).bearer_auth(&owner).json(&json!({"mode":"vault_locked","expected_generation":0}))).await?;
+        assert_eq!(status, StatusCode::OK, "{settings}");
+        let generation = settings["key_generation"].as_u64().unwrap();
+        let bucket_id = Ulid::from_string(settings["bucket_id"].as_str().unwrap())?;
+        let (_, copies) = send(http.get(format!("{encryption}/copies/me?generation={generation}")).bearer_auth(&owner)).await?;
+        let copy = &copies["copies"][0];
+        let record_id = Ulid::from_string(owner_key["record_id"].as_str().unwrap())?;
+        let info = copy_info(seed.realm_id, seed.net.node_id(), BucketKeyRef::new(bucket_id, generation), seed.user_id, record_id);
+        let owner_secret: &[u8; 32] = owner_private.expose().try_into()?;
+        let opened = open_sealed(owner_secret, &SealedSecret { enc: bytes(&copy["enc"]).try_into().unwrap(), ciphertext: bytes(&copy["ciphertext"]) }, &info, &[])?;
+        let bucket_private = SecretBytes::new(opened.to_vec());
+        let upload = s3.put_object().bucket(BUCKET).key("foo/data").body(b"scoped bytes".to_vec().into()).send().await?;
+        let version = upload.version_id().unwrap().to_string();
+        let copied = s3.copy_object().bucket(BUCKET).key("foo/copy").copy_source(format!("{BUCKET}/foo/data")).send().await?;
+        let copy_version = copied.version_id().unwrap().to_string();
+        let requests = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/requests");
+        let grants = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/grants");
+        let subtree = json!({"scope":{"kind":"subtree","value":"foo/"}});
+        let exact = json!({"scope":{"kind":"exact","value":"foo/data"}});
+
+        // An unlocked bucket issues at once; repeating returns the same node grant.
+        let (status, node_grant) = send(http.post(&requests).bearer_auth(&reader).json(&subtree)).await?;
+        assert_eq!(status, StatusCode::OK, "{node_grant}");
+        assert_eq!(node_grant["fields"]["issuer"]["kind"], "node");
+        let (status, repeated) = send(http.post(&requests).bearer_auth(&reader).json(&subtree)).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(repeated["record"], node_grant["record"]);
+        let response = http.post(format!("{encryption}/lock")).bearer_auth(&owner).send().await?;
+        assert!(response.status().is_success());
+
+        // A copied version has no envelope and a missing version is not found.
+        let content = format!("{base}/api/v1/data/blobs/content");
+        let envelope_route = format!("{base}/api/v1/data/blobs/envelope");
+        let copy_query = [("bucket", BUCKET), ("key", "foo/copy"), ("version_id", &copy_version)];
+        let (status, body) = send(http.get(query_url(&content, &copy_query)?).bearer_auth(&reader)).await?;
+        assert_eq!((status, body["code"].as_str()), (StatusCode::CONFLICT, Some("envelope_pending")));
+        let missing = Ulid::generate().to_string();
+        let missing_query = [("bucket", BUCKET), ("key", "foo/data"), ("version_id", &missing)];
+        let (status, _) = send(http.get(query_url(&envelope_route, &missing_query)?).bearer_auth(&reader)).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Holders see the reader's request; the reader is no issuer.
+        let (status, pending) = send(http.post(&requests).bearer_auth(&reader).json(&exact)).await?;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let request_id = pending["fields"]["request_id"].as_str().unwrap().to_string();
+        let (status, _) = send(http.get(&requests).bearer_auth(&reader)).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (_, owned) = send(http.get(&requests).bearer_auth(&owner)).await?;
+        let (_, held) = send(http.get(&requests).bearer_auth(&holder)).await?;
+        let owner_record = &owned["records"][0]["record"];
+        let holder_record = &held["records"][0]["record"];
+        let context: GrantContext = postcard::from_bytes(&bytes(owner_record))?;
+        assert_eq!(context.request.request_id.to_string(), request_id);
+        let parameters = context.request.parameters.public()?;
+        let master = context.request.parameters.recompute(&bucket_private)?;
+        let policy = context.request.scope.policy(&context.request.parameters, &context.request.epochs)?;
+        let issued = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
+        let seal = |record: &Value| -> TestResult<Value> {
+            let context: GrantContext = postcard::from_bytes(&bytes(record))?;
+            let sealed = issued.seal(|plain| seal_to(&reader_public, GRANT_PURPOSE, &context.bytes().unwrap(), plain).map_err(|_| aruna_kpabe::Error))?;
+            Ok(submission(record, sealed.enc, &sealed.ciphertext))
+        };
+        let grant_route = format!("{requests}/{request_id}/grant");
+        let (status, _) = send(http.post(&grant_route).bearer_auth(&reader).json(&seal(owner_record)?)).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let mut substituted = context.clone();
+        substituted.request.recipient_public = Some([9; 32]);
+        let forged = json!(STANDARD.encode(postcard::to_allocvec(&substituted)?));
+        let (status, _) = send(http.post(&grant_route).bearer_auth(&owner).json(&submission(&forged, [1; 32], &[1; 16]))).await?;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // Two holders publish the same request; the second gets the first grant.
+        let (status, admitted) = send(http.post(&grant_route).bearer_auth(&owner).json(&seal(owner_record)?)).await?;
+        assert_eq!(status, StatusCode::OK, "{admitted}");
+        let (status, replay) = send(http.post(&grant_route).bearer_auth(&holder).json(&seal(holder_record)?)).await?;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["record"], admitted["record"]);
+        assert_eq!(replay["fields"]["issuer"]["id"], seed.user_id.to_string());
+        let (status, repeated) = send(http.post(&requests).bearer_auth(&reader).json(&exact)).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(repeated["record"], admitted["record"]);
+
+        // Only the recipient fetches grants, and the grant opens the locked object.
+        let (_, own) = send(http.get(&grants).bearer_auth(&reader)).await?;
+        assert_eq!(own["records"].as_array().unwrap().len(), 2);
+        let (_, foreign) = send(http.get(&grants).bearer_auth(&owner)).await?;
+        assert!(foreign["records"].as_array().unwrap().is_empty());
+        let grant = KeyGrant::from_bytes(&bytes(&admitted["record"]))?;
+        let reader_secret: &[u8; 32] = reader_private.expose().try_into()?;
+        let transport = [&grant.enc[..], &grant.ciphertext].concat();
+        let key = UserKey::open(&parameters, &transport, |_| open_sealed(reader_secret, &SealedSecret { enc: grant.enc, ciphertext: grant.ciphertext.clone() }, GRANT_PURPOSE, &grant.context.bytes().unwrap()).map_err(|_| aruna_kpabe::Error))?;
+        let query = [("bucket", BUCKET), ("key", "foo/data"), ("version_id", &version)];
+        let (_, envelope) = send(http.get(query_url(&envelope_route, &query)?).bearer_auth(&reader)).await?;
+        let cipher = Envelope::from_bytes(&parameters, &bytes(&envelope["envelope"]["abe"]))?;
+        let object = aruna_kpabe::open(&parameters, &key, &cipher, &bytes(&envelope["context"]["bytes"]))?;
+        let header = STANDARD.encode(object.as_bytes());
+        let response = http.get(query_url(&content, &query)?).header("x-aruna-object-key", &header).send().await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        for malformed in [vec!["AAAA"], vec![header.as_str(), header.as_str()]] {
+            let mut request = http.get(query_url(&content, &query)?).bearer_auth(&reader);
+            for value in malformed {
+                request = request.header("x-aruna-object-key", value);
+            }
+            assert_eq!(request.send().await?.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = http.get(query_url(&content, &query)?).bearer_auth(&reader).header("x-aruna-object-key", &header).send().await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await?.as_ref(), b"scoped bytes");
+
+        // A replacement recipient key invalidates grants while the old record remains.
+        add_key(&base, &reader, "reader-2", public_key_of(&SecretBytes::new(vec![12; 32])).unwrap()).await?;
+        let (_, own) = send(http.get(&grants).bearer_auth(&reader)).await?;
+        assert!(own["records"].as_array().unwrap().is_empty());
+        let (status, pending) = send(http.post(&requests).bearer_auth(&reader).json(&exact)).await?;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_ne!(pending["fields"]["request_id"].as_str(), Some(request_id.as_str()));
+
+        // A key published between recipient lookup and grant commit aborts the publication.
+        let (_, owned) = send(http.get(&requests).bearer_auth(&owner)).await?;
+        let context: GrantContext = postcard::from_bytes(&bytes(&owned["records"][0]["record"]))?;
+        let racing = KeyGrant { context: context.clone(), enc: [1; 32], ciphertext: vec![1; 16] };
+        let auth = AuthContext { user_id: seed.user_id, realm_id: seed.realm_id, path_restrictions: None, session: None };
+        let now = aruna_core::time::unix_timestamp_millis();
+        let mut operation = KeyOperation::new(BUCKET.into(), auth, seed.net.node_id(), KeyAction::Publish(racing), now);
+        let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
+        while let Some(effect) = effects.pop_front() {
+            let Effect::Storage(effect) = effect else { panic!("unexpected effect {effect:?}") };
+            if matches!(effect, StorageEffect::CommitTransaction { .. }) {
+                add_key(&base, &reader, "reader-3", public_key_of(&SecretBytes::new(vec![13; 32])).unwrap()).await?;
+            }
+            let event = seed.context.storage_handle.send_storage_effect(effect).await;
+            if !operation.is_complete() {
+                effects.extend(operation.step(event));
+            }
+        }
+        assert_eq!(operation.finalize(), Err(KeyError::Storage));
+        let record = json!(STANDARD.encode(postcard::to_allocvec(&context)?));
+        let route = format!("{requests}/{}/grant", context.request.request_id);
+        let (status, _) = send(http.post(&route).bearer_auth(&owner).json(&submission(&record, [1; 32], &[1; 16]))).await?;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // An authority change before publication refuses the proposal.
+        let (status, _) = send(http.post(&requests).bearer_auth(&reader).json(&exact)).await?;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (_, owned) = send(http.get(&requests).bearer_auth(&owner)).await?;
+        let record = owned["records"][0]["record"].clone();
+        let context: GrantContext = postcard::from_bytes(&bytes(&record))?;
+        add_member(&seed, &owner, &group.group_id, Value::Null).await?;
+        let route = format!("{requests}/{}/grant", context.request.request_id);
+        let (status, _) = send(http.post(&route).bearer_auth(&owner).json(&submission(&record, [1; 32], &[1; 16]))).await?;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // A group CEL policy that can apply to reads refuses continuing keys.
+        let policies = format!("{base}/api/v1/access/policies/group/{}", group.group_id);
+        let policy = json!({"policies":[{"name":"no-tmp","kind":"deny","expression":"path.startsWith('/tmp')","enabled":true}]});
+        let (status, body) = send(http.put(&policies).bearer_auth(&owner).json(&policy)).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = send(http.post(&requests).bearer_auth(&reader).json(&subtree)).await?;
+        assert_eq!((status, body["code"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("scope_unsupported")));
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
 }
