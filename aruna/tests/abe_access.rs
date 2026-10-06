@@ -715,3 +715,169 @@ async fn abe_queued_grants() -> TestResult<()> {
     seed.shutdown().await;
     result
 }
+
+async fn grant_roles(
+    base: &str,
+    actor: &str,
+    group: &str,
+    user: UserId,
+    roles: Value,
+) -> TestResult<Value> {
+    let route = format!("{base}/api/v1/access/groups/{group}/members");
+    let request = reqwest::Client::new().post(route).bearer_auth(actor);
+    let (status, body) =
+        send(request.json(&json!({"user_id":user.to_string(),"role_ids":roles}))).await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    Ok(body)
+}
+
+#[tokio::test]
+async fn abe_members() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let http = reqwest::Client::new();
+        let base = seed.base_url.clone();
+        let owner = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&base, &owner, "ABE members").await?;
+        add_key(
+            &base,
+            &owner,
+            "owner-1",
+            public_key_of(&SecretBytes::new(vec![7; 32])).unwrap(),
+        )
+        .await?;
+        let credentials = create_s3_credentials(&base, &owner, &group.group_id).await?;
+        let s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
+        let (vault, node) = ("abe-members-vault", "abe-members-node");
+        for (bucket, mode) in [(vault, "vault_locked"), (node, "node_managed")] {
+            s3.create_bucket().bucket(bucket).send().await?;
+            let encryption = format!("{base}/api/v1/data/buckets/{bucket}/storage/encryption");
+            let (status, body) = send(
+                http.put(&encryption)
+                    .bearer_auth(&owner)
+                    .json(&json!({"mode":mode,"expected_generation":0})),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let lock = format!("{base}/api/v1/data/buckets/{vault}/storage/encryption/lock");
+        assert!(
+            http.post(lock)
+                .bearer_auth(&owner)
+                .send()
+                .await?
+                .status()
+                .is_success()
+        );
+        let group_ulid = Ulid::from_string(&group.group_id)?;
+        let data = group_permission_path(seed.realm_id, group_ulid, seed.net.node_id());
+        let roles = format!("{base}/api/v1/access/groups/{}/roles", group.group_id);
+        let mut role_ids = Vec::new();
+        for (name, path, permission) in [
+            (
+                "member-manager",
+                format!("/{}/g/{}/admin/users/**", seed.realm_id, group.group_id),
+                "write",
+            ),
+            ("other-reader", format!("{data}/other/**"), "read"),
+        ] {
+            let permissions = std::collections::HashMap::from([(path, permission)]);
+            let (status, role) = send(
+                http.post(&roles)
+                    .bearer_auth(&owner)
+                    .json(&json!({"name":name,"permissions":permissions})),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::CREATED, "{role}");
+            role_ids.push(role["role_id"].clone());
+        }
+        let seed_ref = &seed;
+        let user = |n: u8| async move {
+            let seed = seed_ref;
+            let id = UserId::local(Ulid::generate(), seed.realm_id);
+            let token = create_bearer_token(
+                seed.context.as_ref(),
+                id,
+                seed.realm_id,
+                seed.capabilities.clone(),
+            )
+            .await?;
+            add_key(
+                &seed.base_url,
+                &token,
+                "member-1",
+                public_key_of(&SecretBytes::new(vec![n; 32])).unwrap(),
+            )
+            .await?;
+            Ok::<_, Box<dyn std::error::Error>>((id, token))
+        };
+        let ((first, first_token), (manager, manager_token), (second, _)) =
+            (user(21).await?, user(22).await?, user(23).await?);
+
+        // A holder grant opens the locked bucket's request, while node_managed issues at once.
+        let body = grant_roles(&base, &owner, &group.group_id, first, Value::Null).await?;
+        let opened = body["key_requests"].as_array().unwrap().clone();
+        assert_eq!(opened.len(), 1, "{body}");
+        let (_, held) = send(
+            http.get(format!("{base}/api/v1/data/buckets/{vault}/abe/requests"))
+                .bearer_auth(&owner),
+        )
+        .await?;
+        assert_eq!(held["records"][0]["fields"]["request_id"], opened[0]);
+        let (_, grants) = send(
+            http.get(format!("{base}/api/v1/data/buckets/{node}/abe/grants"))
+                .bearer_auth(&first_token),
+        )
+        .await?;
+        assert_eq!(grants["records"].as_array().unwrap().len(), 1);
+
+        // Roles without a read scope in these buckets open nothing.
+        let body = grant_roles(
+            &base,
+            &owner,
+            &group.group_id,
+            manager,
+            json!([role_ids[0], role_ids[1]]),
+        )
+        .await?;
+        assert_eq!(body["key_requests"], json!([]));
+
+        // A grant by a non-holder notifies each holder once per member and bucket.
+        let body = grant_roles(&base, &manager_token, &group.group_id, second, Value::Null).await?;
+        assert_eq!(body["key_requests"].as_array().unwrap().len(), 1, "{body}");
+        let inbox = format!("{base}/api/v1/system/notifications");
+        let pending = || async {
+            let (_, list) = send(http.get(&inbox).bearer_auth(&owner))
+                .await
+                .unwrap_or((StatusCode::OK, Value::Null));
+            list["notifications"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|n| n["kind"] == "bucket_key_pending")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        shared::wait_until(
+            "key pending notification",
+            std::time::Duration::from_secs(120),
+            std::time::Duration::from_millis(50),
+            || async { !pending().await.is_empty() },
+        )
+        .await?;
+        let notices = pending().await;
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0]["bucket"], vault);
+        assert_eq!(notices[0]["member_user_id"], second.to_string());
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
