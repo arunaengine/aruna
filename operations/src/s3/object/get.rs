@@ -4,7 +4,7 @@
 
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::managed_copy::ManagedCopyError;
-use crate::blob::promote::PromotePendingOperation;
+use crate::blob::promote::{PromotePendingOperation, Promotion, drop_mismatch};
 use crate::blob::records::blob_location_read;
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::driver::{DriverContext, drive};
@@ -1791,14 +1791,24 @@ async fn promote_token(
         TokenAdmitError::Conversion(error) => error.into(),
         _ => GetObjectError::GetObjectFailed,
     })?;
-    let promote = PromotePendingOperation::new(archive, realm_id, node_id, token.limits.clone());
-    drive(promote.with_lease(lease), context)
+    let promote =
+        PromotePendingOperation::new(archive.clone(), realm_id, node_id, token.limits.clone());
+    let outcome = drive(promote.with_lease(lease), context)
         .await
-        .map(|_| ())
         .map_err(|error| {
             warn!(error = %error, "Token promotion of a pending version failed");
             GetObjectError::GetObjectFailed
-        })
+        })?;
+    match outcome {
+        Promotion::Promoted { .. } | Promotion::Gone => Ok(()),
+        Promotion::AwaitingKey(_) => Err(GetObjectError::GetObjectFailed),
+        Promotion::Mismatch { claimed } => {
+            drop_mismatch(context, &archive, claimed, (realm_id, node_id))
+                .await
+                .map_err(|_| GetObjectError::GetObjectFailed)?;
+            Err(GetObjectError::GetObjectFailed)
+        }
+    }
 }
 
 /// Resolves complete object facts without transferring holder bytes.

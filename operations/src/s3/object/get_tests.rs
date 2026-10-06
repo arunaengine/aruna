@@ -2355,8 +2355,10 @@ mod token_read {
     use aruna_core::effects::{BlobEffect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event};
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
-        BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE, KEY_COPY_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_QUARANTINE_KEYSPACE,
+        BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE,
+        COPY_OWNER_KEYSPACE, KEY_COPY_KEYSPACE, PATHS_INDEX_KEYSPACE, PENDING_CLAIM_KEYSPACE,
+        PENDING_LOCATION_KEYSPACE,
     };
     use aruna_core::structs::execution::job::RoCrateLimits;
     use aruna_core::structs::identity::realm::RealmId;
@@ -2384,6 +2386,15 @@ mod token_read {
 
     #[tokio::test]
     async fn pending_read_promoted() {
+        pending_read(false).await;
+    }
+
+    #[tokio::test]
+    async fn token_claim_rejected() {
+        pending_read(true).await;
+    }
+
+    async fn pending_read(reject: bool) {
         // A multipart upload whose content hash is still pending: a token promotes it while the
         // bucket stays locked, then serves its plaintext.
         let (_temp, context) = full_context().await;
@@ -2527,9 +2538,60 @@ mod token_read {
             },
             limits: RoCrateLimits::default(),
         };
-        let result = get_object_token(&context, input, None, Some(token))
-            .await
-            .unwrap();
+        if reject {
+            put(
+                &context,
+                PENDING_CLAIM_KEYSPACE,
+                archive.to_bytes(),
+                vec![0; 32],
+            )
+            .await;
+        }
+        let result = get_object_token(&context, input, None, Some(token)).await;
+        if reject {
+            assert!(matches!(
+                result,
+                Err(super::GetObjectError::GetObjectFailed)
+            ));
+            for key_space in [
+                BLOB_VERSIONS_KEYSPACE,
+                BLOB_HEAD_KEYSPACE,
+                COPY_OWNER_KEYSPACE,
+                PATHS_INDEX_KEYSPACE,
+                BLOB_LOCATIONS_KEYSPACE,
+            ] {
+                let (rows, _) = crate::jobs::store::iter_prefix_page(
+                    &context.storage_handle,
+                    key_space,
+                    None,
+                    None,
+                    8,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(rows.is_empty(), "rejected copy remains in {key_space}");
+            }
+            for key_space in [
+                PENDING_CLAIM_KEYSPACE,
+                PENDING_LOCATION_KEYSPACE,
+                BLOB_QUARANTINE_KEYSPACE,
+            ] {
+                let (rows, _) = crate::jobs::store::iter_prefix_page(
+                    &context.storage_handle,
+                    key_space,
+                    None,
+                    None,
+                    8,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(rows.len(), 1, "rejection evidence missing in {key_space}");
+            }
+            return;
+        }
+        let result = result.unwrap();
         let chunks: Vec<_> = result.blob.0.collect().await;
         let read: Vec<u8> = chunks
             .into_iter()
