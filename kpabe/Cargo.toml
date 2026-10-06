@@ -13,7 +13,7 @@ hmac = { workspace = true }
 rand_core = { workspace = true }
 sha2 = { workspace = true, features = ["zeroize"] }
 sha2_010 = { workspace = true }
-thiserror = { workspace = true }
+thiserror-core = { workspace = true }
 zeroize = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]

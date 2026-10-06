@@ -101,7 +101,7 @@ pub fn setup_from_seed(
         scalars[4] * scalars[0] + scalars[6],
         scalars[5] * scalars[1] + scalars[6],
     ]);
-    if exponents.iter().any(|exponent| *exponent == Scalar::ZERO) {
+    if exponents.contains(&Scalar::ZERO) {
         return Err(Error);
     }
     let mut parameters = PublicParameters {

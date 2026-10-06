@@ -6,12 +6,19 @@
 #![forbid(unsafe_code)]
 
 extern crate alloc;
+extern crate thiserror_core as thiserror;
+
+#[cfg(test)]
+extern crate std;
 
 mod crypto;
 mod encoding;
 mod envelope;
 mod policy;
 mod scheme;
+
+#[cfg(test)]
+mod adversarial;
 
 pub use envelope::{Envelope, open, seal};
 pub use policy::{Attribute, Policy};

@@ -202,6 +202,7 @@ sysinfo = { version = "0.39.6", default-features = false, features = [
 tar = "0.4.46"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
+thiserror-core = { package = "thiserror", version = "2.0.20", default-features = false }
 tokio = { version = "1.53.1", features = ["full", "tracing"] }
 toml = "1.1.6"
 tokio-util = { version = "0.7.19", features = ["compat", "io-util", "rt"] }
