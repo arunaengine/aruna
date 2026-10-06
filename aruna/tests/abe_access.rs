@@ -15,10 +15,10 @@ use aruna_core::structs::storage::abe::{
     AbeError, GRANT_PURPOSE, SysRng, create_parameters, derive_master, setup_context,
 };
 use aruna_core::structs::storage::abe_access::{GrantContext, KeyGrant, KeyScope, MAX_REQUESTS};
-use aruna_core::structs::storage::blob::group_permission_path;
+use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
 use aruna_kpabe::{Attribute, Envelope, Policy, UserKey};
-use aruna_operations::abe::{KeyAction, KeyError, KeyOperation};
+use aruna_operations::abe::{KeyAction, KeyError, KeyOperation, MemberKeysOperation};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -848,6 +848,26 @@ async fn abe_members() -> TestResult<()> {
         .await?;
         assert_eq!(body["key_requests"], json!([]));
 
+        // A repeated approval by a non-holder returns the same request and notifies once.
+        let ((third, third_token), (fourth, _)) = (user(24).await?, user(25).await?);
+        let joins = format!(
+            "{base}/api/v1/access/groups/{}/join-requests",
+            group.group_id
+        );
+        let (status, join) =
+            send(http.post(&joins).bearer_auth(&third_token).json(&json!({}))).await?;
+        assert_eq!(status, StatusCode::CREATED, "{join}");
+        let decide = format!("{joins}/{}/decide", join["request_id"].as_str().unwrap());
+        let mut decided = Vec::new();
+        for _ in 0..2 {
+            let approve = http.post(&decide).bearer_auth(&manager_token);
+            let (status, body) = send(approve.json(&json!({"approve":true}))).await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            decided.push(body["key_requests"].clone());
+        }
+        assert_eq!(decided[0].as_array().unwrap().len(), 1, "{decided:?}");
+        assert_eq!(decided[0], decided[1]);
+
         // A grant by a non-holder notifies each holder once per member and bucket.
         let body = grant_roles(&base, &manager_token, &group.group_id, second, Value::Null).await?;
         assert_eq!(body["key_requests"].as_array().unwrap().len(), 1, "{body}");
@@ -868,13 +888,59 @@ async fn abe_members() -> TestResult<()> {
             "key pending notification",
             std::time::Duration::from_secs(120),
             std::time::Duration::from_millis(50),
-            || async { !pending().await.is_empty() },
+            || async {
+                pending()
+                    .await
+                    .iter()
+                    .any(|n| n["member_user_id"] == second.to_string())
+            },
         )
         .await?;
+        // The outbox drains in order, so a notice from the repeated approval would be here.
         let notices = pending().await;
-        assert_eq!(notices.len(), 1, "{notices:?}");
-        assert_eq!(notices[0]["bucket"], vault);
-        assert_eq!(notices[0]["member_user_id"], second.to_string());
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(notices.iter().all(|n| n["bucket"] == vault));
+        for member in [third, second] {
+            assert!(
+                notices
+                    .iter()
+                    .any(|n| n["member_user_id"] == member.to_string())
+            );
+        }
+
+        // A created role with assigned users opens their requests too.
+        let path = bucket_permission_path(seed.realm_id, group_ulid, seed.net.node_id(), vault);
+        let permissions = json!({format!("{path}/**"): "read"});
+        let role = json!({"name":"vault-reader","permissions":permissions,
+            "assigned_users":[fourth.to_string()]});
+        let (status, body) = send(http.post(&roles).bearer_auth(&owner).json(&role)).await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["key_requests"].as_array().unwrap().len(), 1, "{body}");
+
+        // A group without encrypted buckets pays one index scan and nothing else.
+        let plain = create_group_http(&base, &owner, "ABE plain").await?;
+        let credentials = create_s3_credentials(&base, &owner, &plain.group_id).await?;
+        let plain_s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
+        for bucket in ["abe-plain-a", "abe-plain-b", "abe-plain-c"] {
+            plain_s3.create_bucket().bucket(bucket).send().await?;
+        }
+        let auth = AuthContext {
+            user_id: seed.user_id,
+            realm_id: seed.realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let (node_id, plain_id) = (seed.net.node_id(), Ulid::from_string(&plain.group_id)?);
+        let now = aruna_core::time::unix_timestamp_millis();
+        let mut operation = MemberKeysOperation::new(auth, node_id, plain_id, vec![first], now);
+        let mut effects = operation.start();
+        assert_eq!(effects.len(), 1, "{effects:?}");
+        let Some(Effect::Storage(scan)) = effects.pop() else {
+            panic!("expected the index scan")
+        };
+        let event = seed.context.storage_handle.send_storage_effect(scan).await;
+        assert!(operation.step(event).is_empty());
+        assert_eq!(operation.finalize(), Ok(Vec::new()));
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
