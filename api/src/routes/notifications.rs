@@ -386,6 +386,17 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
             response.node_id = Some(node_id.to_string());
             response.group_id = Some(group_id.to_string());
         }
+        NotificationKind::BucketKeyPending {
+            bucket,
+            node_id,
+            group_id,
+            member_user_id,
+        } => {
+            response.bucket = Some(bucket.clone());
+            response.node_id = Some(node_id.to_string());
+            response.group_id = Some(group_id.to_string());
+            response.member_user_id = Some(member_user_id.to_string());
+        }
     }
     response
 }

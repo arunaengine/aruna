@@ -104,6 +104,13 @@ pub enum NotificationKind {
         node_id: NodeId,
         group_id: GroupId,
     },
+    /// A member waits for scoped bucket keys after a grant by an admin who holds no key.
+    BucketKeyPending {
+        bucket: String,
+        node_id: NodeId,
+        group_id: GroupId,
+        member_user_id: UserId,
+    },
 }
 
 impl NotificationKind {
@@ -121,7 +128,8 @@ impl NotificationKind {
             | NotificationKind::SyncCompleted { .. }
             | NotificationKind::SyncFailed { .. } => "resource.watch",
             NotificationKind::BucketRestartLocked { .. }
-            | NotificationKind::BucketRecoveryDegraded { .. } => "bucket.encryption",
+            | NotificationKind::BucketRecoveryDegraded { .. }
+            | NotificationKind::BucketKeyPending { .. } => "bucket.encryption",
         }
     }
 
@@ -139,6 +147,7 @@ impl NotificationKind {
             NotificationKind::SyncFailed { .. } => "sync_failed",
             NotificationKind::BucketRestartLocked { .. } => "bucket_locked_by_restart",
             NotificationKind::BucketRecoveryDegraded { .. } => "bucket_recovery_degraded",
+            NotificationKind::BucketKeyPending { .. } => "bucket_key_pending",
         }
     }
 }
@@ -390,6 +399,12 @@ mod tests {
                 bucket: "raw".to_string(),
                 node_id: make_node_id(9),
                 group_id: Ulid::generate(),
+            },
+            NotificationKind::BucketKeyPending {
+                bucket: "raw".to_string(),
+                node_id: make_node_id(9),
+                group_id: Ulid::generate(),
+                member_user_id: user(1, 4),
             },
             NotificationKind::GroupJoinRequested {
                 group_id: Ulid::generate(),
