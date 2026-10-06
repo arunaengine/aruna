@@ -173,3 +173,119 @@ impl KeyGrant {
         Ok(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structs::identity::realm::RealmId;
+    use crate::structs::storage::encryption::BucketKeyRef;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde_json::{Value, json};
+
+    fn ulid(text: &str) -> Ulid {
+        Ulid::from_string(text).unwrap()
+    }
+
+    fn user(text: &str, realm: u8) -> UserId {
+        UserId::new(ulid(text), RealmId::from_bytes([realm; 32]))
+    }
+
+    /// The API proposal view: named fields, postcard record and associated data.
+    fn view(context: &GrantContext) -> Value {
+        let (r, p) = (&context.request, &context.request.parameters);
+        let (kind, value) = match &r.scope {
+            KeyScope::Exact(value) => ("exact", value),
+            KeyScope::Subtree(value) => ("subtree", value),
+        };
+        let issuer = match context.issuer {
+            KeyIssuer::User(user) => json!({"kind":"user","id":user.to_string()}),
+            KeyIssuer::Node(node) => json!({"kind":"node","id":node.to_string()}),
+        };
+        json!({"fields":{"request_id":r.request_id.to_string(),
+            "requesting_user":r.requesting_user.to_string(),
+            "recipient_user":r.recipient_user.to_string(),
+            "recipient_record":r.recipient_record.map(|v|v.to_string()),
+            "recipient_public":r.recipient_public.map(|v|STANDARD.encode(v)),
+            "recipient_fingerprint":r.recipient_fingerprint.map(|v|STANDARD.encode(v)),
+            "bucket":r.bucket,"parameters":{"realm_id":p.realm_id.to_string(),
+            "node_id":p.node_id.to_string(),"bucket_id":p.key.bucket_id.to_string(),
+            "generation":p.key.generation,"fingerprint":STANDARD.encode(p.fingerprint),
+            "parameters":STANDARD.encode(&p.parameters),"epoch":r.epochs[0],
+            "context":STANDARD.encode(p.context().unwrap())},
+            "scope":{"kind":kind,"value":value},"epochs":r.epochs,
+            "credential_id":r.credential_id,"restrictions":r.restrictions,
+            "revisions":r.revisions.iter().map(|v|STANDARD.encode(v)).collect::<Vec<_>>(),
+            "created_at_ms":r.created_at_ms,"issuer":issuer},
+            "record":STANDARD.encode(postcard::to_allocvec(context).unwrap()),
+            "aad":STANDARD.encode(context.bytes().unwrap())})
+    }
+
+    fn fixture() -> Value {
+        let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let request = KeyRequest {
+            request_id: ulid("01K6YQ8ZQ9V3X2N4M5P6R7S8T9"),
+            requesting_user: user("01K6YQ8ZQ9V3X2N4M5P6R7S8TA", 1),
+            recipient_user: user("01K6YQ8ZQ9V3X2N4M5P6R7S8TB", 1),
+            recipient_record: Some(ulid("01K6YQ8ZQ9V3X2N4M5P6R7S8TC")),
+            recipient_public: Some([5; 32]),
+            recipient_fingerprint: Some([6; 32]),
+            bucket: "reef".into(),
+            parameters: AbeParameters {
+                realm_id: RealmId::from_bytes([1; 32]),
+                node_id: node,
+                key: BucketKeyRef::new(ulid("01K6YQ8ZQ9V3X2N4M5P6R7S8TD"), 1),
+                fingerprint: [7; 32],
+                parameters: vec![9; 3],
+            },
+            scope: KeyScope::Exact("data/a.csv".into()),
+            epochs: vec![1],
+            credential_id: None,
+            restrictions: None,
+            revisions: vec![[8; 32]],
+            created_at_ms: 1_700_000_000_000,
+        };
+        let mut wide = request.clone();
+        wide.request_id = ulid("01K6YQ8ZQ9V3X2N4M5P6R7S8TE");
+        wide.recipient_user = user("01K6YQ8ZQ9V3X2N4M5P6R7S8TF", 2);
+        wide.parameters.key.generation = 300;
+        wide.parameters.parameters = vec![10; 200];
+        wide.scope = KeyScope::Subtree(format!("{}/", "é".repeat(70)));
+        wide.epochs = vec![300, 70_000, 1 << 40];
+        wide.revisions = vec![[11; 32], [12; 32]];
+        wide.created_at_ms = 1_760_000_000_000;
+        let mut root = request.clone();
+        root.scope = KeyScope::Subtree(String::new());
+        json!([
+            view(&GrantContext {
+                request,
+                issuer: KeyIssuer::User(user("01K6YQ8ZQ9V3X2N4M5P6R7S8TG", 1)),
+            }),
+            view(&GrantContext {
+                request: wide,
+                issuer: KeyIssuer::Node(node),
+            }),
+            view(&GrantContext {
+                request: root,
+                issuer: KeyIssuer::User(user("01K6YQ8ZQ9V3X2N4M5P6R7S8TG", 3)),
+            }),
+        ])
+    }
+
+    #[test]
+    fn grant_fixture() {
+        let expected: Value =
+            serde_json::from_str(include_str!("../../../tests/vectors/abe-grant.json")).unwrap();
+        assert_eq!(fixture(), expected);
+    }
+
+    #[test]
+    #[ignore = "writes deterministic fixture data for explicit regeneration"]
+    fn write_fixture() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/abe-grant.json");
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&fixture()).unwrap() + "\n",
+        )
+        .unwrap();
+    }
+}
