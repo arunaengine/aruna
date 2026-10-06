@@ -11,6 +11,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+zeroize = { workspace = true }
 # Aruna modules
 aruna-core = { workspace = true }
 aruna-blob = { workspace = true }

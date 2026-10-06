@@ -29,7 +29,7 @@ fn hash_into<'a>(
     Ok(())
 }
 
-fn authenticate(key: &[u8], fields: &[&[u8]]) -> Result<Zeroizing<[u8; 32]>, Error> {
+pub(crate) fn authenticate(key: &[u8], fields: &[&[u8]]) -> Result<Zeroizing<[u8; 32]>, Error> {
     let mut padded = Zeroizing::new([0u8; 64]);
     let mut digest = Zeroizing::new([0u8; 32]);
     if key.len() > padded.len() {

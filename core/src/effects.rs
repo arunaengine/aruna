@@ -330,6 +330,7 @@ pub enum BlobEffect {
         lease: Box<ReadLease>,
         regrant: Option<Box<crate::structs::storage::encryption::SealPlan>>,
     },
+    Abe(Box<crate::structs::storage::abe::AbeEffect>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

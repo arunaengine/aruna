@@ -218,6 +218,7 @@ pub enum BlobEvent {
         copies: Vec<TokenCopy>,
         token: SharedSecret,
     },
+    Abe(Box<crate::structs::storage::abe::AbeEvent>),
 }
 
 #[derive(Debug, PartialEq)]

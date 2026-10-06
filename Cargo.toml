@@ -29,6 +29,7 @@ repository = "https://github.com/arunaengine/aruna"
 rust-version = "1.97.1"
 
 [workspace.dependencies]
+aruna-kpabe = { path = "kpabe" }
 # Workspace crates
 aruna = { path = "aruna" }
 aruna-api = { path = "api" }

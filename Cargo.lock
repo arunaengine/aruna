@@ -305,6 +305,7 @@ dependencies = [
  "aruna-blob",
  "aruna-compute",
  "aruna-core",
+ "aruna-kpabe",
  "aruna-net",
  "aruna-operations",
  "aruna-storage",
@@ -406,6 +407,7 @@ dependencies = [
  "utoipa-axum",
  "utoipa-swagger-ui",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -413,6 +415,7 @@ name = "aruna-blob"
 version = "3.0.0-alpha.105"
 dependencies = [
  "aruna-core",
+ "aruna-kpabe",
  "aruna-net",
  "aruna-storage",
  "async-trait",
@@ -501,6 +504,7 @@ name = "aruna-core"
 version = "3.0.0-alpha.105"
 dependencies = [
  "aes-gcm 0.11.1",
+ "aruna-kpabe",
  "async-trait",
  "base64 0.23.1",
  "blake3",

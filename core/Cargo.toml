@@ -11,6 +11,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aruna-kpabe = { workspace = true }
 bytes = { workspace = true }
 smallvec = { workspace = true }
 ulid = { workspace = true }

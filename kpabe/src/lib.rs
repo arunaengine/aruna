@@ -29,6 +29,15 @@ pub use policy::{Attribute, Policy};
 pub use scheme::{Ciphertext, KemKey, MasterSecret, PublicParameters, SecretKey, UserKey};
 pub use scheme::{decapsulate, encapsulate, issue, setup_from_seed};
 
+/// Derives a guarded 32-byte seed with RFC 5869 HKDF-SHA256.
+pub fn derive_seed(ikm: &[u8], salt: &[u8], info: &[u8]) -> Result<SecretKey, Error> {
+    check_context(info)?;
+    let prk = crypto::authenticate(salt, &[ikm])?;
+    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+    crypto::expand(&prk[..], info, &mut seed[..])?;
+    Ok(SecretKey(seed))
+}
+
 /// Maximum attributes in one ciphertext.
 pub const MAX_ATTRIBUTES: usize = 64;
 /// Maximum LSSS rows in one key.
