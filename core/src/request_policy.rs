@@ -87,6 +87,33 @@ pub struct RequestPolicy {
     pub enabled: bool,
 }
 
+impl RequestPolicy {
+    pub fn applies_to_reads(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let Some(when) = &self.when else {
+            return true;
+        };
+        let Ok(program) = Program::compile(when) else {
+            return true;
+        };
+        if program
+            .references()
+            .variables()
+            .iter()
+            .any(|v| *v != "permission")
+        {
+            return true;
+        }
+        let mut context = Context::default();
+        if context.add_variable("permission", "read").is_err() {
+            return true;
+        }
+        !matches!(program.execute(&context), Ok(Value::Bool(false)))
+    }
+}
+
 /// The request attributes a policy expression may reference.
 #[derive(Clone, Debug)]
 pub struct PolicyRequest {

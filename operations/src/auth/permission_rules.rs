@@ -160,6 +160,66 @@ impl PermissionRules {
             .collect()
     }
 
+    pub fn admits_scope(
+        &self,
+        root: &str,
+        scope: &aruna_core::structs::storage::abe_access::KeyScope,
+    ) -> bool {
+        use aruna_core::structs::storage::abe_access::KeyScope;
+        if scope.validate().is_err() {
+            return false;
+        }
+        match scope {
+            KeyScope::Exact(key) => self.allows(&format!("{root}/{key}"), &Permission::READ),
+            KeyScope::Subtree(prefix) => {
+                let path = format!("{root}/{prefix}");
+                let patterns: Vec<_> = self
+                    .rules
+                    .iter()
+                    .filter_map(|rule| {
+                        if rule.direct || rule.public && rule.permission == Permission::READ {
+                            Some((rule.matcher.glob().glob(), &rule.permission))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let covers = |patterns: &[(&str, &Permission)]| {
+                    let mut allowed = false;
+                    for (pattern, permission) in patterns {
+                        let literal = pattern
+                            .split(['*', '?', '[', ']', '{', '}', '\\'])
+                            .next()
+                            .unwrap_or_default();
+                        if **permission == Permission::DENY {
+                            if literal.starts_with(&path) || path.starts_with(literal) {
+                                return false;
+                            }
+                        } else if let Some(base) = pattern.strip_suffix("**")
+                            && !base.contains(['*', '?', '[', ']', '{', '}', '\\'])
+                            && path.starts_with(base)
+                        {
+                            allowed = true;
+                        }
+                    }
+                    allowed
+                };
+                if !covers(&patterns) {
+                    return false;
+                }
+                match &self.restrictions {
+                    None => true,
+                    Some(rules) => covers(
+                        &rules
+                            .iter()
+                            .map(|rule| (rule.matcher.glob().glob(), &rule.permission))
+                            .collect::<Vec<_>>(),
+                    ),
+                }
+            }
+        }
+    }
+
     fn restrictions_allow(&self, path: &str, required: &Permission) -> bool {
         let Some(restrictions) = self.restrictions.as_ref() else {
             return true;

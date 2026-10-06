@@ -1,0 +1,132 @@
+//! Compiles scopes from the same authority rows that fence publication.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+use crate::auth::permission_rules::{CollectedRole, PermissionRules};
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
+use aruna_core::structs::placement::policy::document::group_admin_path;
+use aruna_core::structs::storage::encryption::{BucketHolder, HolderOrigin, KeyState};
+use aruna_core::structs::storage::holders::admin_users;
+
+#[derive(Debug, PartialEq)]
+pub(super) struct Snapshot {
+    pub facts: serde_json::Value,
+    pub parameters: AbeParameters,
+    pub epoch: u64,
+    pub revisions: Vec<[u8; 32]>,
+    pub rules: PermissionRules,
+    pub holder: bool,
+    pub policies: bool,
+}
+impl KeyOperation {
+    pub(super) fn snapshot_read(
+        &mut self,
+        values: Vec<(Key, Option<Value>)>,
+    ) -> Result<(), KeyError> {
+        if values.len() != 7 {
+            return Err(AbeError::Context.into());
+        }
+        let bytes = |index: usize| values[index].1.as_deref().ok_or(KeyError::Missing);
+        let realm =
+            RealmAuthorizationDocument::from_bytes(bytes(0)?).map_err(|_| AbeError::Context)?;
+        let group =
+            GroupAuthorizationDocument::from_bytes(bytes(1)?).map_err(|_| AbeError::Context)?;
+        let config = RealmConfigDocument::from_bytes(bytes(2)?).map_err(|_| AbeError::Context)?;
+        let parameters = AbeParameters::from_bytes(bytes(3)?)?;
+        let epoch = u64::from_be_bytes(bytes(4)?.try_into().map_err(|_| AbeError::Epoch)?);
+        let key = BucketKeyRecord::from_bytes(bytes(5)?).map_err(|_| AbeError::Context)?;
+        if parameters.key != key.key
+            || key.state == KeyState::Retired
+            || epoch == 0
+            || parameters.realm_id != self.auth.realm_id
+            || parameters.node_id != self.node
+        {
+            return Err(AbeError::Parameters.into());
+        }
+        let info = self.info.as_ref().ok_or(KeyError::Missing)?;
+        let admin = admin_users(
+            realm.roles.values().chain(group.roles.values()),
+            &group_admin_path(self.auth.realm_id, info.group_id),
+        )
+        .contains(&self.auth.user_id);
+        let explicit = values[6]
+            .1
+            .as_ref()
+            .map(|v| BucketHolder::from_bytes(v))
+            .transpose()
+            .map_err(|_| AbeError::Context)?
+            .is_some_and(|h| h.user_id == self.auth.user_id && h.origin == HolderOrigin::Explicit);
+        let recipient = self.recipient();
+        let facts = serde_json::json!({"realm_authority":&realm,"group_authority":&group,"realm_policies":&config.request_policies});
+        let mut roles = realm.roles;
+        roles.extend(group.roles.clone());
+        let roles = roles
+            .into_values()
+            .filter_map(|role| {
+                let public = role.is_public(self.auth.realm_id);
+                let direct = !recipient.is_nil() && role.assigned_users.contains(&recipient);
+                (direct || public).then_some(CollectedRole {
+                    role,
+                    direct,
+                    public,
+                })
+            })
+            .collect();
+        let restrictions = match &self.action {
+            KeyAction::Publish(grant) => grant.context.request.restrictions.as_deref(),
+            KeyAction::Facts(request) | KeyAction::NodeIssue(request) => {
+                request.restrictions.as_deref()
+            }
+            _ => self.auth.path_restrictions.as_deref(),
+        };
+        let rules =
+            PermissionRules::from_roles(roles, restrictions).map_err(|_| KeyError::Denied)?;
+        let revisions = values[..3]
+            .iter()
+            .map(|(_, v)| *blake3::hash(v.as_deref().unwrap_or_default()).as_bytes())
+            .collect();
+        let policies = config
+            .request_policies
+            .iter()
+            .chain(group.policies.iter())
+            .any(|p| p.applies_to_reads());
+        self.snapshot = Some(Snapshot {
+            facts,
+            parameters,
+            epoch,
+            revisions,
+            rules,
+            holder: info.created_by == self.auth.user_id || admin || explicit,
+            policies,
+        });
+        Ok(())
+    }
+    pub(super) fn scope_allowed(&self, scope: &KeyScope) -> Result<(), KeyError> {
+        let snapshot = self.snapshot.as_ref().ok_or(KeyError::Missing)?;
+        if snapshot.policies {
+            return Err(AbeError::Scope.into());
+        }
+        if !snapshot.rules.admits_scope(&self.root()?, scope) {
+            return Err(KeyError::Denied);
+        }
+        Ok(())
+    }
+    pub(super) fn root(&self) -> Result<String, KeyError> {
+        let info = self.info.as_ref().ok_or(KeyError::Missing)?;
+        Ok(aruna_core::structs::storage::blob::bucket_permission_path(
+            self.auth.realm_id,
+            info.group_id,
+            self.node,
+            &self.bucket,
+        ))
+    }
+    pub(super) fn recipient(&self) -> aruna_core::UserId {
+        match &self.action {
+            KeyAction::Publish(grant) => grant.context.request.recipient_user,
+            KeyAction::Facts(request) | KeyAction::NodeIssue(request) => request.recipient_user,
+            _ => self.auth.user_id,
+        }
+    }
+}
