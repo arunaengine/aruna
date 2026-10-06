@@ -19,6 +19,10 @@ mod scheme;
 
 #[cfg(test)]
 mod adversarial;
+#[cfg(test)]
+mod measure;
+#[cfg(test)]
+mod vectors;
 
 pub use envelope::{Envelope, open, seal};
 pub use policy::{Attribute, Policy};
