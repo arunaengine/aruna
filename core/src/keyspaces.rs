@@ -107,8 +107,6 @@ pub const ABE_EPOCH_KEYSPACE: &str = "abe_epochs";
 pub const ABE_ENVELOPE_KEYSPACE: &str = "abe_envelopes";
 pub const ABE_VERSION_KEYSPACE: &str = "abe_versions";
 pub const ABE_ARCHIVE_KEYSPACE: &str = "abe_archives";
-pub const ABE_TERMINAL_KEYSPACE: &str = "abe_terminal";
-pub const ABE_OPEN_KEYSPACE: &str = "abe_open";
 pub const ABE_REQUEST_KEYSPACE: &str = "abe_requests";
 pub const ABE_GRANT_KEYSPACE: &str = "abe_grants";
 /// Key holders of encrypted buckets, keyed by bucket id and user.
@@ -404,8 +402,6 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     ABE_ENVELOPE_KEYSPACE,
     ABE_VERSION_KEYSPACE,
     ABE_ARCHIVE_KEYSPACE,
-    ABE_TERMINAL_KEYSPACE,
-    ABE_OPEN_KEYSPACE,
     ABE_REQUEST_KEYSPACE,
     ABE_GRANT_KEYSPACE,
     BUCKET_KEY_KEYSPACE,

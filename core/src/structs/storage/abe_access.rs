@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 pub const REQUEST_TTL: u64 = 30 * 24 * 60 * 60 * 1000;
-pub const CLEANUP_TTL: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const MAX_REQUESTS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,15 +48,6 @@ impl KeyScope {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequestState {
-    Open,
-    Issued,
-    Refused,
-    Expired,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyRequest {
     pub request_id: Ulid,
@@ -73,9 +63,7 @@ pub struct KeyRequest {
     pub credential_id: Option<String>,
     pub restrictions: Option<Vec<PathRestriction>>,
     pub revisions: Vec<[u8; 32]>,
-    pub state: RequestState,
     pub created_at_ms: u64,
-    pub changed_at_ms: u64,
 }
 
 impl KeyRequest {
@@ -88,14 +76,6 @@ impl KeyRequest {
     }
     pub fn key(&self) -> Vec<u8> {
         [self.prefix(), self.request_id.to_bytes().to_vec()].concat()
-    }
-    pub fn terminal_key(&self) -> Vec<u8> {
-        [
-            self.prefix(),
-            self.changed_at_ms.to_be_bytes().to_vec(),
-            self.request_id.to_bytes().to_vec(),
-        ]
-        .concat()
     }
     pub fn to_bytes(&self) -> Result<Vec<u8>, AbeError> {
         self.scope.policy(&self.parameters, &self.epochs)?;
@@ -114,7 +94,7 @@ impl KeyRequest {
         Ok(value)
     }
     pub fn expired(&self, now: u64) -> bool {
-        self.state == RequestState::Open && now.saturating_sub(self.created_at_ms) >= REQUEST_TTL
+        now.saturating_sub(self.created_at_ms) >= REQUEST_TTL
     }
 }
 

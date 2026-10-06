@@ -12,7 +12,6 @@ use aruna_core::structs::storage::holders::admin_users;
 
 #[derive(Debug, PartialEq)]
 pub(super) struct Snapshot {
-    pub facts: serde_json::Value,
     pub parameters: AbeParameters,
     pub epoch: u64,
     pub revisions: Vec<[u8; 32]>,
@@ -59,7 +58,6 @@ impl KeyOperation {
             .map_err(|_| AbeError::Context)?
             .is_some_and(|h| h.user_id == self.auth.user_id && h.origin == HolderOrigin::Explicit);
         let recipient = self.recipient();
-        let facts = serde_json::json!({"realm_authority":&realm,"group_authority":&group,"realm_policies":&config.request_policies});
         let mut roles = realm.roles;
         roles.extend(group.roles.clone());
         let roles = roles
@@ -76,9 +74,6 @@ impl KeyOperation {
             .collect();
         let restrictions = match &self.action {
             KeyAction::Publish(grant) => grant.context.request.restrictions.as_deref(),
-            KeyAction::Facts(request) | KeyAction::NodeIssue(request) => {
-                request.restrictions.as_deref()
-            }
             _ => self.auth.path_restrictions.as_deref(),
         };
         let rules =
@@ -93,7 +88,6 @@ impl KeyOperation {
             .chain(group.policies.iter())
             .any(|p| p.applies_to_reads());
         self.snapshot = Some(Snapshot {
-            facts,
             parameters,
             epoch,
             revisions,
@@ -125,7 +119,6 @@ impl KeyOperation {
     pub(super) fn recipient(&self) -> aruna_core::UserId {
         match &self.action {
             KeyAction::Publish(grant) => grant.context.request.recipient_user,
-            KeyAction::Facts(request) | KeyAction::NodeIssue(request) => request.recipient_user,
             _ => self.auth.user_id,
         }
     }
