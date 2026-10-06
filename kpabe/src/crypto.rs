@@ -1,7 +1,6 @@
 use alloc::vec::Vec;
 
 use bls12_381_plus::{G1Projective, Gt, Scalar, elliptic_curve_013::hash2curve::ExpandMsgXmd};
-use hmac::{Hmac, KeyInit, Mac};
 use rand_core::TryCryptoRng;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
@@ -14,14 +13,37 @@ const ORDER: [u8; 32] = [
 ];
 
 fn authenticate(key: &[u8], fields: &[&[u8]]) -> Result<Zeroizing<[u8; 32]>, Error> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|_| Error)?;
-    for field in fields {
-        mac.update(field);
+    let mut padded = Zeroizing::new([0u8; 64]);
+    let mut digest = Zeroizing::new(sha2::digest::Output::<Sha256>::default());
+    if key.len() > padded.len() {
+        let mut hash = Sha256::new();
+        hash.update(key);
+        hash.finalize_into(&mut digest);
+        padded[..32].copy_from_slice(&digest);
+        digest.zeroize();
+    } else {
+        padded[..key.len()].copy_from_slice(key);
     }
-    let mut output = mac.finalize().into_bytes();
+    for byte in padded.iter_mut() {
+        *byte ^= 0x36;
+    }
+    let mut inner = Sha256::new();
+    inner.update(&padded[..]);
+    for field in fields {
+        inner.update(field);
+    }
+    inner.finalize_into(&mut digest);
+    for byte in padded.iter_mut() {
+        *byte ^= 0x36 ^ 0x5c;
+    }
+    let mut outer = Sha256::new();
+    outer.update(&padded[..]);
+    padded.zeroize();
+    outer.update(&digest[..]);
+    digest.zeroize();
+    outer.finalize_into(&mut digest);
     let mut result = Zeroizing::new([0u8; 32]);
-    result.copy_from_slice(&output);
-    output.zeroize();
+    result.copy_from_slice(&digest);
     Ok(result)
 }
 
@@ -146,4 +168,59 @@ pub(crate) fn checked_target(bytes: &[u8; Gt::BYTES]) -> Result<Gt, Error> {
         return Err(Error);
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+
+    #[test]
+    fn hmac_vectors() {
+        for (key, data, expected) in [
+            (
+                vec![0x0b; 20],
+                b"Hi There".to_vec(),
+                "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+            ),
+            (
+                b"Jefe".to_vec(),
+                b"what do ya want for nothing?".to_vec(),
+                "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+            ),
+            (
+                vec![0xaa; 20],
+                vec![0xdd; 50],
+                "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe",
+            ),
+            (
+                (1..=25).collect(),
+                vec![0xcd; 50],
+                "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b",
+            ),
+            (
+                vec![0x0c; 20],
+                b"Test With Truncation".to_vec(),
+                "a3b6167473100ee06e0c796c2955552b",
+            ),
+            (
+                vec![0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First".to_vec(),
+                "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+            ),
+            (
+                vec![0xaa; 131],
+                b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.".to_vec(),
+                "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2",
+            ),
+        ] {
+            let length = expected.len() / 2;
+            let output = authenticate(&key, &[&data]).unwrap();
+            assert_eq!(hex::encode(&output[..length]), expected);
+            let (first, second) = data.split_at(data.len() / 2);
+            let split = authenticate(&key, &[first, &[], second]).unwrap();
+            assert_eq!(&split[..], &output[..]);
+        }
+    }
 }
