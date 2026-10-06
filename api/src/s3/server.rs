@@ -7,6 +7,7 @@ mod activity;
 mod body;
 mod classification;
 mod keepalive;
+mod post;
 mod response;
 
 pub(crate) use body::DeleteObjectsBody;
@@ -56,6 +57,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tracing::instrument::WithSubscriber;
 use tracing::{Instrument, error, info, trace};
 
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -382,7 +384,7 @@ impl PreparedRequest {
 
         let shared = self.service.shared.clone();
         let span = self.trace.span.clone();
-        let request = self
+        let mut request = self
             .request
             .take()
             .expect("request is present before the handler runs");
@@ -397,10 +399,28 @@ impl PreparedRequest {
                 .respond("invalid_token", invalid_token_response()?);
         }
         let token = super::auth::request_token(request.headers(), request.uri());
-        let mut handler: BoxFuture<'static, Result<HttpResponse, HttpError>> = Box::pin(
-            super::auth::with_request_token(token, async move { shared.call(request).await })
-                .instrument(span),
-        );
+        let mut handler: BoxFuture<'static, Result<HttpResponse, HttpError>> =
+            Box::pin(async move {
+                let form_token = match post::prepare(&mut request).await {
+                    Ok(form_token) => form_token,
+                    Err(error) => {
+                        return error
+                            .to_http_response()
+                            .map_err(|error| HttpError::new(Box::new(error)));
+                    }
+                };
+                let handler =
+                    super::auth::with_request_token(
+                        token,
+                        async move { shared.call(request).await },
+                    )
+                    .instrument(span);
+                if form_token {
+                    handler.with_subscriber(post::safe_dispatch()).await
+                } else {
+                    handler.await
+                }
+            });
         let connection = self.connection.clone();
         let stream = self.stream.clone();
         let deadline = deadline_activity.clone();
@@ -1016,7 +1036,6 @@ async fn load_bucket_cors(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tracing::instrument::WithSubscriber;
 
     const TOKEN_CANARY: &str = "group-s-token-canary";
     const TOKEN_AUTH: &str = "AWS4-HMAC-SHA256 Credential=TOKENKEY/20261005/us-east-1/s3/aws4_request, \
@@ -1025,7 +1044,67 @@ mod tests {
     struct TestS3;
 
     #[async_trait::async_trait]
-    impl s3s::S3 for TestS3 {}
+    impl s3s::S3 for TestS3 {
+        async fn put_object(
+            &self,
+            request: s3s::S3Request<s3s::dto::PutObjectInput>,
+        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::PutObjectOutput>> {
+            use futures_util::StreamExt;
+            assert_eq!(request.input.key, "key");
+            let mut body = request.input.body.unwrap();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next().await {
+                bytes.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(bytes, b"file-data");
+            Ok(s3s::S3Response::new(Default::default()))
+        }
+    }
+
+    struct FormChunks(std::collections::VecDeque<bytes::Bytes>);
+
+    impl futures_core::Stream for FormChunks {
+        type Item = Result<bytes::Bytes, s3s::StdError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(self.0.pop_front().map(Ok))
+        }
+    }
+
+    impl s3s::stream::ByteStream for FormChunks {}
+
+    fn form_request(fields: &[(&str, &str)], chunk: usize) -> s3s::HttpRequest {
+        let mut body = String::new();
+        for (name, value) in fields {
+            body.push_str(&format!(
+                "--boundary\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            ));
+        }
+        body.push_str(
+            "--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"file\"\r\n\r\n\
+             file-data\r\n--boundary--\r\n",
+        );
+        let stream: s3s::stream::DynByteStream = Box::pin(FormChunks(
+            body.as_bytes()
+                .chunks(chunk)
+                .map(bytes::Bytes::copy_from_slice)
+                .collect(),
+        ));
+        Request::builder()
+            .method(Method::POST)
+            .uri("/bucket")
+            .header(header::HOST, "localhost")
+            .header(
+                header::CONTENT_TYPE,
+                "Multipart/Form-Data; boundary=\"boundary\"",
+            )
+            .header(header::CONTENT_LENGTH, body.len())
+            .body(s3s::Body::from(stream))
+            .unwrap()
+    }
 
     #[derive(Clone)]
     struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1061,10 +1140,9 @@ mod tests {
             compute_handle: None,
         });
         let mut builder = S3ServiceBuilder::new(TestS3);
-        builder.set_auth(s3s::auth::SimpleAuth::from_single(
-            "TOKENKEY",
-            "signing-secret",
-        ));
+        let mut auth = s3s::auth::SimpleAuth::from_single("TOKENKEY", "signing-secret");
+        auth.register("ASIAKEY".to_string(), "signing-secret".into());
+        builder.set_auth(auth);
         let service = WrappingService {
             shared: builder.build(),
             cors: CorsConfig::default(),
@@ -1188,6 +1266,98 @@ mod tests {
             assert_eq!(status, http::StatusCode::BAD_REQUEST);
             assert!(logs.contains("request.received"), "{logs}");
             assert!(!logs.contains(TOKEN_CANARY), "{logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_tokens_hidden() {
+        for chunk in [1, usize::MAX] {
+            for authentication in [
+                vec![],
+                vec![("AWSAccessKeyId", "TOKENKEY"), ("signature", "invalid")],
+                vec![
+                    ("x-amz-credential", "TOKENKEY/scope"),
+                    ("x-amz-signature", "invalid"),
+                ],
+                vec![
+                    ("x-amz-credential", "ASIAKEY/scope"),
+                    ("x-amz-credential", "TOKENKEY/scope"),
+                    ("x-amz-signature", "invalid"),
+                ],
+                vec![
+                    ("AWSAccessKeyId", "TOKENKEY"),
+                    ("signature", "invalid"),
+                    ("x-amz-credential", "ASIAKEY/scope"),
+                ],
+            ] {
+                let mut fields = vec![("X-Amz-Security-Token", TOKEN_CANARY), ("key", "key")];
+                fields.extend(authentication);
+                let (status, logs) = request_trace(form_request(&fields, chunk)).await;
+                assert_eq!(status, http::StatusCode::BAD_REQUEST);
+                assert!(logs.contains("request.received"), "{logs}");
+                assert!(!logs.contains(TOKEN_CANARY), "{logs}");
+                assert!(!logs.contains("multipart=Multipart"), "{logs}");
+                assert!(!logs.contains("checking post signature"), "{logs}");
+            }
+            let fields = [
+                ("key", "key"),
+                ("x-amz-credential", "ASIAKEY/scope"),
+                ("x-amz-signature", "invalid"),
+                ("x-amz-security-token", TOKEN_CANARY),
+            ];
+            let (_, logs) = request_trace(form_request(&fields, chunk)).await;
+            assert!(logs.contains("checking post signature v4"), "{logs}");
+            assert!(!logs.contains(TOKEN_CANARY), "{logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_forms_preserved() {
+        for (key, policy, signature) in [
+            (
+                "TOKENKEY",
+                concat!(
+                    "eyJleHBpcmF0aW9uIjoiMjA5OS0wMS0wMVQwMDowMDowMFoiLCJjb25kaXRpb25zIjpb",
+                    "eyJidWNrZXQiOiJidWNrZXQifSx7ImtleSI6ImtleSJ9LHsiQVdTQWNjZXNzS2V5SWQi",
+                    "OiJUT0tFTktFWSJ9XX0="
+                ),
+                "L7yNZXWFl14ABWx96cAKjT2/AIk=",
+            ),
+            (
+                "ASIAKEY",
+                concat!(
+                    "eyJleHBpcmF0aW9uIjoiMjA5OS0wMS0wMVQwMDowMDowMFoiLCJjb25kaXRpb25zIjpb",
+                    "eyJidWNrZXQiOiJidWNrZXQifSx7ImtleSI6ImtleSJ9LHsiQVdTQWNjZXNzS2V5SWQi",
+                    "OiJBU0lBS0VZIn0seyJ4LWFtei1zZWN1cml0eS10b2tlbiI6Imdyb3VwLXMtdG9rZW4t",
+                    "Y2FuYXJ5In1dfQ=="
+                ),
+                "+GIXoKtq0QhLb4CjVaFrr/MYczE=",
+            ),
+        ] {
+            for chunk in [1, usize::MAX] {
+                let mut fields = vec![
+                    ("key", "key"),
+                    ("AWSAccessKeyId", key),
+                    ("policy", policy),
+                    ("signature", signature),
+                ];
+                if key == "ASIAKEY" {
+                    fields.push(("x-amz-security-token", TOKEN_CANARY));
+                    if chunk == 1 {
+                        fields.insert(1, ("AWSAccessKeyId", "TOKENKEY"));
+                        fields.push(("X-Amz-Security-Token", TOKEN_CANARY));
+                    }
+                }
+                let (status, logs) = request_trace(form_request(&fields, chunk)).await;
+                assert_eq!(status, http::StatusCode::NO_CONTENT, "{logs}");
+                assert!(logs.contains("checking post signature v2"), "{logs}");
+                assert!(!logs.contains(TOKEN_CANARY), "{logs}");
+                assert_eq!(
+                    logs.contains("multipart=Multipart"),
+                    key == "TOKENKEY",
+                    "{logs}"
+                );
+            }
         }
     }
 

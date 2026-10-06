@@ -61,6 +61,9 @@ async-trait = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
+httparse = { workspace = true }
+mime = { workspace = true }
+tracing-core = { workspace = true }
 tower-http = { workspace = true }
 tower = { workspace = true }
 hyper = { workspace = true }

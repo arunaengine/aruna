@@ -104,6 +104,7 @@ hpke = { version = "0.14.1", default-features = false, features = [
 ] }
 http = "1.5.0"
 http-body = "1.1.0"
+httparse = "1.10.1"
 hyper = { version = "1.11.1", features = ["full"] }
 hyper-util = { version = "0.1.20", features = [
     "server",
@@ -125,6 +126,7 @@ jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 json-patch = "4.2.0"
 lru = "0.18.4"
 md5 = "0.8.1"
+mime = "0.3.17"
 nix = { version = "0.31.3", features = ["time", "fs", "process", "signal"] }
 opendal = { version = "0.57.0", features = [
     "services-azblob",
@@ -200,6 +202,7 @@ tokio-util = { version = "0.7.19", features = ["compat", "io-util", "rt"] }
 tower = { version = "0.5.3", features = ["limit"] }
 tower-http = { version = "0.7.1", features = ["compression-br", "compression-gzip", "cors", "fs", "timeout"] }
 tracing = "0.1.44"
+tracing-core = "0.1.36"
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", features = [
     "env-filter",
