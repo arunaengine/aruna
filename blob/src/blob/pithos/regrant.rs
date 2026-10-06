@@ -226,7 +226,7 @@ mod tests {
             storage_generation: 1,
         };
         let data = Bytes::from_static(b"retained while the granted archive transfer waits");
-        let stream = BackendStream::new(futures::stream::iter([Ok(data)]));
+        let stream = BackendStream::new(futures::stream::iter([Ok::<_, std::io::Error>(data)]));
         let written = handler
             .write_blob(
                 "bucket",
