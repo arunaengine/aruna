@@ -607,6 +607,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-kpabe-wasm"
+version = "3.0.0-alpha.105"
+dependencies = [
+ "aruna-kpabe",
+ "blake3",
+ "getrandom 0.4.3",
+ "hex",
+ "rand 0.10.2",
+ "serde_json",
+ "wasm-bindgen",
+ "zeroize",
+]
+
+[[package]]
 name = "aruna-net"
 version = "3.0.0-alpha.105"
 dependencies = [

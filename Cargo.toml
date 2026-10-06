@@ -10,6 +10,7 @@ members = [
     "compute",
     "core",
     "kpabe",
+    "kpabe/wasm",
     "storage",
     "net",
     "tasks",
@@ -230,6 +231,8 @@ utoipa = { version = "5.5.0", features = [
 ] }
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+# Exact: the portal's wasm-bindgen-cli must match this version.
+wasm-bindgen = "=0.2.127"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
 zeroize = "1.9.0"
