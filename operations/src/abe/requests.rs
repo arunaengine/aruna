@@ -23,7 +23,7 @@ impl KeyOperation {
         }
         self.scope_allowed(&request.scope)
     }
-    fn grant_allowed(&self, request: &KeyRequest) -> Result<(), KeyError> {
+    pub(super) fn grant_allowed(&self, request: &KeyRequest) -> Result<(), KeyError> {
         let snapshot = self.snapshot.as_ref().ok_or(KeyError::Missing)?;
         let key = self.newest();
         if request.parameters != snapshot.parameters
