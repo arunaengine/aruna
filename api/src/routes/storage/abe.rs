@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod content;
+mod records;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -27,6 +28,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
         .routes(routes!(envelope))
         .routes(routes!(content::content))
+        .merge(records::router())
 }
 
 #[derive(Serialize, ToSchema)]
