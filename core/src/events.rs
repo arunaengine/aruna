@@ -104,6 +104,10 @@ pub enum SubOperationEvent {
     KeyRequestsOpened {
         request_ids: Vec<Ulid>,
     },
+    /// Epoch due markers were written in the caller's transaction.
+    EpochsMarked {
+        result: Result<(), StorageError>,
+    },
 }
 
 #[derive(Debug, PartialEq)]

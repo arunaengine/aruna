@@ -598,6 +598,16 @@ impl AddRoleOperation {
             admin_outbox_written,
             new_members,
         };
+        // A DENY rule can narrow existing READ scopes.
+        if self
+            .input
+            .role
+            .permissions
+            .values()
+            .any(|p| *p == Permission::DENY)
+        {
+            return smallvec![crate::abe::mark_due(Some(self.input.group_id), txn_id)];
+        }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -839,6 +849,11 @@ impl Operation for AddRoleOperation {
             Ok(event) => event,
             Err(effects) => return effects,
         };
+        if let AddRoleState::CommitTransaction { txn_id, .. } = self.state
+            && let Some(next) = crate::abe::marked(&event, txn_id)
+        {
+            return next.unwrap_or_else(|error| self.fail(error.into()));
+        }
 
         match self.state.clone() {
             AddRoleState::Auth => self.handle_authorization(event),

@@ -161,8 +161,8 @@ pub(crate) async fn epoch_run(
     }
     Ok(epoch)
 }
-/// Marks a raise due after a lost READ scope in a group, or in every group without one; the node
-/// raises its node managed buckets at once.
+/// Raises the node managed buckets of a group, or of every group without one, after the change
+/// that lost a READ scope marked them due in its transaction.
 pub(crate) async fn epoch_due(state: &ServerState, auth: &AuthContext, group_id: Option<Ulid>) {
     let now = aruna_core::time::unix_timestamp_millis();
     let managed = match drive(EpochDueOperation::new(group_id, now), &state.get_ctx()).await {

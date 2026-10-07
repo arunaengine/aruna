@@ -9,7 +9,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ACCESS_OWNER_KEYSPACE, USER_ACCESS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_core::types::{Effects, Key};
+use aruna_core::types::{Effects, Key, TxnId};
 use smallvec::smallvec;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -213,8 +213,7 @@ impl RevokeUserOperation {
             return self.emit_error(RevokeUserError::NoTransactionFound);
         };
         if values.is_empty() {
-            self.state = RevokeUserState::CommitTransaction;
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+            return self.commit(txn_id);
         }
         let deletes = match token_deletes(&self.access_key, values) {
             Ok(deletes) => deletes,
@@ -238,8 +237,14 @@ impl RevokeUserOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(RevokeUserError::NoTransactionFound);
         };
+        self.commit(txn_id)
+    }
+
+    /// Marks the credential group's encrypted buckets due, then commits.
+    fn commit(&mut self, txn_id: TxnId) -> Effects {
         self.state = RevokeUserState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        let group = self.access.as_ref().map(|access| access.group_id);
+        smallvec![crate::abe::mark_due(group, txn_id)]
     }
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
@@ -269,6 +274,11 @@ impl Operation for RevokeUserOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let (RevokeUserState::CommitTransaction, Some(txn_id)) = (&self.state, self.txn_id)
+            && let Some(next) = crate::abe::marked(&event, txn_id)
+        {
+            return next.unwrap_or_else(|error| self.emit_error(error.into()));
+        }
         match self.state {
             RevokeUserState::Init => self.handle_init(),
             RevokeUserState::StartTransaction => self.handle_transaction_started(event),
@@ -327,6 +337,26 @@ mod tests {
         })
     }
 
+    fn marked() -> Event {
+        Event::SubOperation(aruna_core::events::SubOperationEvent::EpochsMarked { result: Ok(()) })
+    }
+
+    #[test]
+    fn aborts_unmarked() {
+        let mut op = RevokeUserOperation::new("userkey".to_string());
+        let txn_id = Ulid::generate();
+        op.state = RevokeUserState::CommitTransaction;
+        op.txn_id = Some(txn_id);
+        let result = Err(StorageError::TransactionConflict);
+        let event = aruna_core::events::SubOperationEvent::EpochsMarked { result };
+        let effects = op.step(Event::SubOperation(event));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        );
+        assert!(op.finalize().is_err());
+    }
+
     #[test]
     fn revoke_stays_local() {
         // Issuer-local credentials: a revocation commits and emits nothing more.
@@ -378,7 +408,10 @@ mod tests {
             [Effect::Storage(StorageEffect::Iter { key_space, .. })]
                 if key_space == TOKEN_GRANT_KEYSPACE
         ));
+        // The due markers are written in the revocation's transaction before it commits.
         let effects = op.step(no_tokens());
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let effects = op.step(marked());
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { .. })]
@@ -429,7 +462,8 @@ mod tests {
         op.step(Event::Storage(StorageEvent::DeleteResult {
             key: access.access_key.as_bytes().into(),
         }));
-        let effects = op.step(no_tokens());
+        op.step(no_tokens());
+        let effects = op.step(marked());
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { .. })]

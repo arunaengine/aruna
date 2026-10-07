@@ -26,7 +26,7 @@ use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, EncryptionMode,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
-pub use epoch::EpochDueOperation;
+pub use epoch::{EpochDueOperation, mark_due, marked};
 pub use member::MemberKeysOperation;
 pub use reissue::ReissueOperation;
 use smallvec::smallvec;

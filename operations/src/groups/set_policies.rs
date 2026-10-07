@@ -286,7 +286,7 @@ impl SetGroupOperation {
             return self.fail(SetGroupError::MissingTransaction);
         };
         self.state = SetGroupState::CommitTransaction { document };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        smallvec![crate::abe::mark_due(Some(self.config.group_id), txn_id)]
     }
 
     fn fail(&mut self, error: SetGroupError) -> Effects {
@@ -326,6 +326,11 @@ impl Operation for SetGroupOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let (SetGroupState::CommitTransaction { .. }, Some(txn_id)) = (&self.state, self.txn_id)
+            && let Some(next) = crate::abe::marked(&event, txn_id)
+        {
+            return next.unwrap_or_else(|error| self.fail(error.into()));
+        }
         match self.state.clone() {
             SetGroupState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {

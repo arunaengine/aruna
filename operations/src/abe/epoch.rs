@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::errors::StorageError;
+use aruna_core::events::SubOperationEvent;
+use aruna_core::operation::boxed_suboperation;
 use aruna_core::types::GroupId;
 
 /// Progress row value: the raised epoch, the phase (grants, then requests) and the last key.
@@ -54,9 +57,6 @@ impl KeyOperation {
     }
 }
 
-/// Marks a raise due in every encrypted bucket of a group, or of the node without a group.
-/// Returns the node managed buckets, which the node raises at once. A group without encrypted
-/// buckets costs one index scan and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum DueState {
     Scan,
@@ -64,10 +64,14 @@ enum DueState {
     Write,
     Done,
 }
+/// Marks a raise due in every encrypted bucket of a group, or of the node without a group, inside
+/// the transaction of `mark_due`; without one it only lists the node managed buckets to raise.
+/// A group without encrypted buckets costs one index scan and nothing else.
 #[derive(Debug, PartialEq)]
 pub struct EpochDueOperation {
     group_id: Option<GroupId>,
     now: u64,
+    txn: Option<TxnId>,
     state: DueState,
     buckets: Vec<String>,
     managed: Vec<String>,
@@ -78,6 +82,7 @@ impl EpochDueOperation {
         Self {
             group_id,
             now,
+            txn: None,
             state: DueState::Scan,
             buckets: Vec::new(),
             managed: Vec::new(),
@@ -99,7 +104,7 @@ impl Operation for EpochDueOperation {
             prefix: self.group_id.map(|g| g.to_bytes().to_vec().into()),
             start: None,
             limit: usize::MAX,
-            txn_id: None
+            txn_id: self.txn
         })]
     }
     fn step(&mut self, event: Event) -> Effects {
@@ -126,7 +131,7 @@ impl Operation for EpochDueOperation {
                 self.state = DueState::Read;
                 smallvec![Effect::Storage(StorageEffect::BatchRead {
                     reads,
-                    txn_id: None
+                    txn_id: self.txn
                 })]
             }
             (DueState::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
@@ -146,13 +151,13 @@ impl Operation for EpochDueOperation {
                         self.managed.push(bucket.clone());
                     }
                 }
-                if writes.is_empty() {
+                if writes.is_empty() || self.txn.is_none() {
                     return self.done();
                 }
                 self.state = DueState::Write;
                 smallvec![Effect::Storage(StorageEffect::BatchWrite {
                     writes,
-                    txn_id: None
+                    txn_id: self.txn
                 })]
             }
             (DueState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => self.done(),
@@ -172,6 +177,27 @@ impl Operation for EpochDueOperation {
     fn abort(&mut self) -> Effects {
         smallvec![]
     }
+}
+
+/// Marks a raise due for a lost READ scope inside the caller's transaction `txn_id`.
+pub fn mark_due(group_id: Option<GroupId>, txn_id: TxnId) -> Effect {
+    let mut operation = EpochDueOperation::new(group_id, aruna_core::time::unix_timestamp_millis());
+    operation.txn = Some(txn_id);
+    Effect::SubOperation(boxed_suboperation(operation, |result| {
+        let result = result
+            .map(|_| ())
+            .map_err(|error| StorageError::WriteError(error.to_string()));
+        Event::SubOperation(SubOperationEvent::EpochsMarked { result })
+    }))
+}
+
+/// Commits `txn_id` after `mark_due` succeeded, or returns the marking error.
+pub fn marked(event: &Event, txn_id: TxnId) -> Option<Result<Effects, StorageError>> {
+    let Event::SubOperation(SubOperationEvent::EpochsMarked { result }) = event else {
+        return None;
+    };
+    let commit = Effect::Storage(StorageEffect::CommitTransaction { txn_id });
+    Some(result.clone().map(|()| smallvec![commit]))
 }
 
 #[cfg(test)]
