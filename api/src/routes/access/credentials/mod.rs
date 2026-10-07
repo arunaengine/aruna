@@ -383,7 +383,8 @@ to the group data root and can never widen them.
             body = ErrorResponse
         ),
         (status = 404, description = "A named encrypted bucket does not exist on this node", body = ErrorResponse),
-        (status = 409, description = "The caller already holds 16 active credentials", body = ErrorResponse)
+        (status = 409, description = "The caller already holds 16 active credentials", body = ErrorResponse),
+        (status = 413, description = "`encryption_limit` when a named bucket already holds the caller's 64 key grants; the new credential is revoked", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -469,7 +470,7 @@ pub async fn create_s3_credentials(
         }
         Err(error) => return Err(token_refusal(error)),
     };
-    // Like member requests: a bucket that cannot open requests leaves the token pending there.
+    // A bucket that gets neither a grant nor an open request revokes the new credential.
     let mut key_requests = Vec::new();
     if let Some(public_key) = token_key {
         for bucket in buckets {
@@ -482,7 +483,14 @@ pub async fn create_s3_credentials(
             match drive(operation, &state.get_ctx()).await {
                 Ok(KeyResult::Opened(ids)) => key_requests.extend(ids.iter().map(Ulid::to_string)),
                 Ok(_) => {}
-                Err(error) => tracing::warn!(event = "abe.token_keys.failed", error = %error),
+                Err(error) => {
+                    tracing::warn!(event = "abe.token_keys.failed", error = %error);
+                    let revoke = RevokeUserOperation::new(access_key_id.clone());
+                    if let Err(failed) = drive(revoke, &state.get_ctx()).await {
+                        tracing::warn!(event = "abe.token_revoke.failed", error = %failed);
+                    }
+                    return Err(crate::routes::storage::abe::key_error(error));
+                }
             }
         }
     }

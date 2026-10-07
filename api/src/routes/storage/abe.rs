@@ -64,7 +64,7 @@ fn abe_error(error: AbeError) -> ServerError {
     };
     ServerError::Refused(status, code, error.to_string())
 }
-fn key_error(error: KeyError) -> ServerError {
+pub(crate) fn key_error(error: KeyError) -> ServerError {
     match error {
         KeyError::Abe(e) => abe_error(e),
         KeyError::Missing => ServerError::NotFound,

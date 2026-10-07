@@ -849,6 +849,118 @@ async fn token_needs_credential() -> TestResult<()> {
     result
 }
 
+#[tokio::test]
+async fn token_limit_revokes() -> TestResult<()> {
+    use aruna_api::routes::credentials::{
+        CreateS3Request, CredentialStatusResponse, ListS3Response,
+    };
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    const BUCKET: &str = "token-limit";
+    let seed = spawn_complete_seed().await?;
+
+    let result = async {
+        let admin = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&seed.base_url, &admin, "token-limit-group").await?;
+        let plain = create_s3_credentials(&seed.base_url, &admin, &group.group_id).await?;
+        let endpoint = seed
+            .s3
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
+        s3_client(endpoint, &plain)
+            .create_bucket()
+            .bucket(BUCKET)
+            .send()
+            .await?;
+        let http = reqwest::Client::new();
+        let enabled = http
+            .put(format!(
+                "{}/api/v1/data/buckets/{BUCKET}/storage/encryption",
+                seed.base_url
+            ))
+            .bearer_auth(&admin)
+            .json(&serde_json::json!({ "mode": "node_managed", "expected_generation": 0 }))
+            .send()
+            .await?;
+        assert_eq!(enabled.status(), StatusCode::OK);
+        let (public, _) = aruna_core::structs::storage::encryption::generate_key()?;
+        let request = CreateS3Request {
+            group_id: group.group_id.clone(),
+            expires_in_seconds: Some(600),
+            path_restrictions: None,
+            encrypted_buckets: Some(vec![BUCKET.to_string()]),
+            token_public_key: Some(base64::Engine::encode(&STANDARD, public)),
+        };
+        let route = format!("{}/api/v1/access/credentials", seed.base_url);
+        let created = http
+            .post(&route)
+            .bearer_auth(&admin)
+            .json(&request)
+            .send()
+            .await?;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: aruna_api::routes::credentials::CreateS3Response = created.json().await?;
+
+        // Copies of the first grant fill the caller's 64 grants of the bucket.
+        let grant = token_grants(&seed, &created.access_key_id).await?.remove(0);
+        let value = grant.to_bytes()?;
+        let prefix = grant.context.request.prefix();
+        let writes = (1..64u64)
+            .map(|id| {
+                let key = [
+                    prefix.clone(),
+                    ulid::Ulid::from_parts(id, 0).to_bytes().to_vec(),
+                ];
+                let space = aruna_core::keyspaces::ABE_GRANT_KEYSPACE.to_string();
+                (space, key.concat().into(), value.clone().into())
+            })
+            .collect();
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        let written = seed.context.storage_handle.send_storage_effect(write).await;
+        assert!(matches!(
+            written,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+
+        // The next token gets no grant, so its credential is revoked and the request fails.
+        let refused = http
+            .post(&route)
+            .bearer_auth(&admin)
+            .json(&request)
+            .send()
+            .await?;
+        assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let listed: ListS3Response = http
+            .get(&route)
+            .bearer_auth(&admin)
+            .send()
+            .await?
+            .json()
+            .await?;
+        let revoked: Vec<_> = listed
+            .credentials
+            .iter()
+            .filter(|c| c.status == CredentialStatusResponse::Revoked)
+            .collect();
+        assert_eq!(revoked.len(), 1);
+        assert_ne!(revoked[0].access_key_id, created.access_key_id);
+        Ok(())
+    }
+    .await;
+
+    seed.shutdown().await;
+    result
+}
+
 /// Changes a signed request: lists `listed` among its signed headers and sets the object key.
 #[derive(Debug)]
 struct Tamper {
