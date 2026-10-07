@@ -2382,6 +2382,13 @@ async fn abe_rekey() -> TestResult<()> {
         // A page before the due raise covers no removal: the route raises and walks again.
         let (progress, done) = rekey_page(&seed.context, BUCKET, "foo/", 1).await?;
         assert_eq!((progress.epoch, progress.rekeyed, done), (1, 1, false));
+        let abe = || async {
+            let (status, body) = send(http.get(&encryption).bearer_auth(&owner)).await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            Ok::<_, Box<dyn std::error::Error>>(body["abe"].clone())
+        };
+        let running = json!({"epoch":1,"raise_due":true,"rekey":{"prefix":"foo/","rekeyed":1}});
+        assert_eq!(abe().await?, running);
         let rekey = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/rekey");
         let prefix = json!({"prefix":"foo/"});
         let (status, _) = send(http.post(&rekey).bearer_auth(&reader).json(&prefix)).await?;
@@ -2390,6 +2397,10 @@ async fn abe_rekey() -> TestResult<()> {
         assert_eq!(status, StatusCode::OK, "{view}");
         let expected = json!({"prefix":"foo/","epoch":2,"rekeyed":2,"done":true});
         assert_eq!(view, expected);
+        assert_eq!(
+            abe().await?,
+            json!({"epoch":2,"raise_due":false,"rekey":null})
+        );
 
         // A removed reader's old key opens no re-keyed envelope; a remaining reader's new one does.
         let reader_keys = user_keys(&base, &reader, &reader_private).await?;
