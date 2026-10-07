@@ -69,6 +69,8 @@ pub enum RewriteOutcome {
     Skipped,
     /// The source copy needs a key generation that is locked on this node.
     AwaitingKey,
+    /// A re-key must come back: the version's content or format is still pending.
+    Unfinished,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -179,6 +181,14 @@ impl RewriteVersionOperation {
         self
     }
 
+    /// A re-key waits for a pending version instead of skipping it.
+    fn waits(&self, pending: bool) -> RewriteOutcome {
+        match self.rekey && pending {
+            true => RewriteOutcome::Unfinished,
+            false => RewriteOutcome::Skipped,
+        }
+    }
+
     fn unexpected(&mut self, received: Event) -> Effects {
         let state = self.state;
         self.fail(RewriteError::InvalidStateEvent {
@@ -255,7 +265,9 @@ impl RewriteVersionOperation {
             _ => None,
         };
         let Some(key) = key else {
-            return self.end(RewriteOutcome::Skipped);
+            // Pending content keeps its old envelope until promotion.
+            let pending = matches!(version.state, BlobVersionState::PendingContent { .. });
+            return self.end(self.waits(pending));
         };
         self.version = Some(version);
         self.state = RewriteState::ReadLocation;
@@ -270,7 +282,9 @@ impl RewriteVersionOperation {
             Err(effects) => return effects,
         };
         if old.staging || old.partial || !self.moves(&old) {
-            return self.end(RewriteOutcome::Skipped);
+            // A sealed archive in another format or generation waits for its transition.
+            let sealed = old.staging || old.partial || old.format.bucket_key().is_some();
+            return self.end(self.waits(sealed));
         }
         self.old = Some(old);
         self.read_envelope()

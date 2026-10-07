@@ -128,6 +128,8 @@ pub enum RekeyOutcome {
     /// The bucket key is locked on this node.
     Locked,
     Failed,
+    /// The version needs a later page; this page stops before it.
+    Unfinished,
 }
 
 #[derive(Debug, PartialEq)]

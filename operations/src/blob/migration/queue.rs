@@ -249,7 +249,8 @@ async fn advance(
         }
         match crate::driver::drive(operation, context).await {
             Ok(RewriteOutcome::Moved) => record.done += 1,
-            Ok(RewriteOutcome::Skipped) => {}
+            // Only a re-key returns `Unfinished`.
+            Ok(RewriteOutcome::Skipped | RewriteOutcome::Unfinished) => {}
             Ok(RewriteOutcome::AwaitingKey) => record.remaining += 1,
             Err(error) => {
                 record.failed += 1;

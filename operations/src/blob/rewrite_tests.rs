@@ -325,6 +325,32 @@ fn rejects_wrong_event() {
     ));
 }
 
+#[test]
+fn rekey_waits_pending() {
+    // Completed multipart content stays pending on its old envelope: the re-key comes back.
+    let rekey = || operation(transition(TransitionKind::Rotate, Some(2), Some(2))).rekey();
+    let archive = ArchiveKey::of(&location(Some(2)));
+    let pending = BlobVersion::pending(archive, SystemTime::UNIX_EPOCH, Default::default(), None);
+    let mut waiting = rekey();
+    waiting.start();
+    waiting.step(read_result(Some(pending.to_bytes().unwrap())));
+    assert_eq!(waiting.finalize(), Ok(RewriteOutcome::Unfinished));
+    // A deleted version has no envelope left to replace.
+    let deleted = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
+    let mut skipped = rekey();
+    skipped.start();
+    skipped.step(read_result(Some(deleted.to_bytes().unwrap())));
+    assert_eq!(skipped.finalize(), Ok(RewriteOutcome::Skipped));
+}
+
+#[test]
+fn rekey_waits_transition() {
+    // An archive still in an older generation waits for its transition.
+    let mut operation = operation(transition(TransitionKind::Rotate, Some(2), Some(2))).rekey();
+    located(&mut operation, &location(Some(1)));
+    assert_eq!(operation.finalize(), Ok(RewriteOutcome::Unfinished));
+}
+
 mod envelopes {
     use super::*;
     use crate::node::usage_stats::StoredDelta;

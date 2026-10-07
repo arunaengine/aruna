@@ -265,6 +265,7 @@ impl RekeyOperation {
                 Ok(RewriteOutcome::Moved) => RekeyOutcome::Moved,
                 Ok(RewriteOutcome::Skipped) => RekeyOutcome::Skipped,
                 Ok(RewriteOutcome::AwaitingKey) => RekeyOutcome::Locked,
+                Ok(RewriteOutcome::Unfinished) => RekeyOutcome::Unfinished,
                 Err(error) => {
                     tracing::warn!(event = "abe.rekey.failed", bucket = %bucket, error = %error);
                     RekeyOutcome::Failed
@@ -287,6 +288,8 @@ impl RekeyOperation {
             RekeyOutcome::Skipped => {}
             RekeyOutcome::Locked => self.stopped = Some(KeyError::Locked),
             RekeyOutcome::Failed => self.stopped = Some(KeyError::Storage),
+            // The pass stays unfinished while an in-scope version still waits.
+            RekeyOutcome::Unfinished => return self.save(),
         }
         // A stopped page keeps its cursor before this version.
         if self.stopped.is_some() {
@@ -528,6 +531,33 @@ mod tests {
             txn_id,
         }));
         assert_eq!(operation.finalize(), Err(KeyError::Locked));
+    }
+
+    fn committed(operation: &mut RekeyOperation) {
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        let txn_id = TxnId::generate();
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+    }
+
+    #[test]
+    fn unfinished_version_stops() {
+        // A pending version keeps the pass open with the cursor before it, on the last page too.
+        let mut operation = scanning(4);
+        scanned(&mut operation, &["foo/a", "foo/b", "foo/c"]);
+        ended(&mut operation, RekeyOutcome::Moved);
+        ended(&mut operation, RekeyOutcome::Unfinished);
+        let progress = written(&saved(&mut operation, None));
+        assert_eq!(
+            (progress.cursor, progress.rekeyed),
+            (row("foo/a").0.to_vec(), 1)
+        );
+        committed(&mut operation);
+        let (_, done) = operation.finalize().unwrap();
+        assert!(!done);
     }
 
     #[test]
