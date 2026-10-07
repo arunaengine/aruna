@@ -402,6 +402,7 @@ impl KeyOperation {
         let opened = std::mem::take(&mut self.opened);
         self.result = Some(KeyResult::Opened(opened));
         if self.fresh
+            && !self.quiet
             && let Some(effects) = self.holders()
         {
             return effects;

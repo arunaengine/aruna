@@ -6,6 +6,7 @@ pub mod copies;
 pub mod envelope;
 mod epoch;
 mod member;
+mod reissue;
 mod requests;
 mod snapshot;
 
@@ -27,6 +28,7 @@ use aruna_core::structs::storage::encryption::{
 use aruna_core::types::{Effects, Key, TxnId, Value};
 pub use epoch::EpochDueOperation;
 pub use member::MemberKeysOperation;
+pub use reissue::ReissueOperation;
 use smallvec::smallvec;
 use snapshot::Snapshot;
 use thiserror::Error;
@@ -116,6 +118,7 @@ pub struct KeyOperation {
     reused: bool,
     fresh: bool,
     notify: bool,
+    quiet: bool,
     managed: bool,
     result: Option<KeyResult>,
     output: Option<Result<KeyResult, KeyError>>,
@@ -149,10 +152,16 @@ impl KeyOperation {
             reused: false,
             fresh: false,
             notify: false,
+            quiet: false,
             managed: false,
             result: None,
             output: None,
         }
+    }
+    /// Sends no holder notifications, for requests a holder or the node issues next.
+    pub fn quiet(mut self) -> Self {
+        self.quiet = true;
+        self
     }
     fn fail(&mut self, error: impl Into<KeyError>) -> Effects {
         self.state = State::Done;
