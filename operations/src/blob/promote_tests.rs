@@ -505,11 +505,77 @@ fn conflict_restarts_scan() {
     assert!(!operation.is_complete());
 }
 
-/// No version of the page has a placement registration.
+/// The one version of the page has no placement registration and no envelope.
 fn no_registrations() -> Event {
     Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![(Key::from(Vec::new()), None)],
+        values: vec![(Key::from(Vec::new()), None), (Key::from(Vec::new()), None)],
     })
+}
+
+#[test]
+fn envelope_mapping_rebound() {
+    // A promoted version's envelope mapping names the location key; the larger row is charged.
+    let mut operation = hashed_operation();
+    reread(&mut operation);
+    operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: Key::from(Vec::new()),
+    }));
+    let version = VersionKey::new("bucket", "key", Ulid::from_bytes([6; 16]));
+    let owner = CopyOwner::new(ArchiveKey::of(&sealed()), version.clone());
+    operation.step(Event::Storage(StorageEvent::IterResult {
+        values: vec![(Key::from(owner.key().unwrap()), Value::from(Vec::new()))],
+        next_start_after: None,
+    }));
+    let pending = BlobVersion::pending(
+        ArchiveKey::of(&sealed()),
+        SystemTime::UNIX_EPOCH,
+        Default::default(),
+        None,
+    );
+    let row = Key::from(version.to_bytes().unwrap());
+    operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(row.clone(), Some(Value::from(pending.to_bytes().unwrap())))],
+    }));
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: bucket_rows(),
+    }));
+    let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+        panic!("the page reads its registrations and envelope ids")
+    };
+    assert_eq!(reads[1], (ABE_VERSION_KEYSPACE.to_string(), row));
+    let id = Key::from(vec![2; 16]);
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (reads[0].1.clone(), None),
+            (reads[1].1.clone(), Some(id.clone())),
+        ],
+    }));
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("one batch promotes the page")
+    };
+    let (_, key, value) = writes
+        .iter()
+        .find(|(key_space, ..)| key_space == ABE_ARCHIVE_KEYSPACE)
+        .expect("the envelope mapping is rewritten in the promotion transaction");
+    assert_eq!(key, &id);
+    let mut archive: EnvelopeArchive = postcard::from_bytes(value).unwrap();
+    let location = sealed();
+    let location_key = BlobLocationKey::new(BLAKE3, location.format.encoding(), location.backend);
+    assert_eq!(archive.archive, ArchiveKey::of(&sealed()));
+    assert_eq!(archive.location_key, location_key.to_bytes());
+    archive.location_key.clear();
+    let growth = value.len() - postcard::to_allocvec(&archive).unwrap().len();
+    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    }));
+    let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
+        panic!("the group is charged in the same transaction, got {effects:?}")
+    };
+    assert!(
+        deltas
+            .iter()
+            .all(|(_, delta)| delta.logical_bytes == growth as i128)
+    );
 }
 
 #[test]
@@ -557,10 +623,13 @@ fn governed_alias_registration() {
     )
     .unwrap();
     let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![(
-            Key::from(key.to_bytes().unwrap()),
-            Some(Value::from(registered.to_bytes().unwrap())),
-        )],
+        values: vec![
+            (
+                Key::from(key.to_bytes().unwrap()),
+                Some(Value::from(registered.to_bytes().unwrap())),
+            ),
+            (Key::from(Vec::new()), None),
+        ],
     }));
     let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
         panic!("one batch promotes the page")
