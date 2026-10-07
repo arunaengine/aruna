@@ -10,18 +10,22 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    ABE_COPY_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
+    ABE_COPY_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+    S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::storage::abe::{
     AbeEffect, AbeError, AbeEvent, EnvelopeArchive, ObjectEnvelope, PendingCopy,
 };
-use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, BucketInfo, VersionKey};
+use aruna_core::structs::storage::blob::{
+    ArchiveKey, BackendLocation, BlobVersion, BlobVersionState, BucketInfo, VersionKey,
+};
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRef};
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
+use std::collections::HashMap;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -44,6 +48,7 @@ enum State {
     Create,
     Start,
     Check,
+    Locate,
     Write,
     Delete,
     Usage,
@@ -60,6 +65,8 @@ pub struct CopyEnvelopeOperation {
     state: State,
     txn: Option<TxnId>,
     envelope: Option<ObjectEnvelope>,
+    /// Metadata, group and location key of the checked version, kept until it is published.
+    stored: Option<(HashMap<String, String>, GroupId, Vec<u8>)>,
     usage: Option<UsageCounterUpdate>,
     output: Option<Result<CopyOutcome, AbeError>>,
 }
@@ -73,6 +80,7 @@ impl CopyEnvelopeOperation {
             state: State::Init,
             txn: None,
             envelope: None,
+            stored: None,
             usage: None,
             output: None,
         }
@@ -133,26 +141,64 @@ impl CopyEnvelopeOperation {
             let (parameters, epoch) = parse_abe(anchors, self.key())?;
             let envelope = self.envelope.as_ref().ok_or(AbeError::Context)?;
             envelope.anchored(&parameters, epoch)?;
-            let archive = &self.pending.archive;
-            match &version.state {
-                BlobVersionState::PendingContent { archive: used, .. } if used == archive => {}
-                BlobVersionState::Materialized { backend, .. } if *backend == archive.backend => {}
-                _ => return Err(AbeError::Context),
-            }
-            let archive = EnvelopeArchive {
-                archive: archive.clone(),
-                location_key: version
-                    .location_key()
-                    .map(|k| k.to_bytes())
-                    .unwrap_or_default(),
-            };
-            let limit = RoCrateLimits::default().metadata_bytes;
-            let rows = (&version.metadata, limit, self.txn);
-            let (effect, charge) = envelope_rows(envelope, &self.version, &archive, rows)?;
-            Ok((effect, charge, bucket.group_id))
+            Ok(bucket.group_id)
         })();
-        match result {
-            Ok((effect, charge, group)) => {
+        let group = match result {
+            Ok(group) => group,
+            Err(error) => return self.finish(Err(error)),
+        };
+        let location = version.location_key().map(|key| key.to_bytes());
+        let pending = matches!(
+            &version.state,
+            BlobVersionState::PendingContent { archive, .. } if *archive == self.pending.archive
+        );
+        self.stored = Some((
+            version.metadata,
+            group,
+            location.clone().unwrap_or_default(),
+        ));
+        match (pending, location) {
+            (true, _) => self.publish(),
+            (false, Some(key)) => {
+                self.state = State::Locate;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+                    key: key.into(),
+                    txn_id: self.txn,
+                })]
+            }
+            (false, None) => self.finish(Err(AbeError::Context)),
+        }
+    }
+
+    /// The materialized location must still be the pending source's archive and bucket key.
+    fn located(&mut self, value: Option<Value>) -> Effects {
+        let location = value.as_deref().map(BackendLocation::from_bytes);
+        let Some(Ok(location)) = location else {
+            return self.finish(Err(AbeError::Context));
+        };
+        if ArchiveKey::of(&location) != self.pending.archive
+            || location.format.bucket_key() != Some(self.key())
+        {
+            return self.finish(Err(AbeError::Context));
+        }
+        self.publish()
+    }
+
+    fn publish(&mut self) -> Effects {
+        let (Some((metadata, group, location_key)), Some(envelope)) =
+            (self.stored.take(), self.envelope.as_ref())
+        else {
+            return self.finish(Err(AbeError::Context));
+        };
+        let archive = EnvelopeArchive {
+            archive: self.pending.archive.clone(),
+            location_key,
+        };
+        let limit = RoCrateLimits::default().metadata_bytes;
+        let rows = (&metadata, limit, self.txn);
+        match envelope_rows(envelope, &self.version, &archive, rows) {
+            Ok((effect, charge)) => {
                 let delta = UsageDelta {
                     logical_bytes: i128::from(charge),
                     ..Default::default()
@@ -218,6 +264,9 @@ impl Operation for CopyEnvelopeOperation {
             }
             (State::Check, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.checked(&values)
+            }
+            (State::Locate, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.located(value)
             }
             (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
                 let Ok(version) = self.version.to_bytes() else {

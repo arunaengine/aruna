@@ -7,7 +7,7 @@ use crate::abe::copies::{CopyEnvelopeOperation, CopyOutcome};
 use crate::abe::envelope::EnvelopeOperation;
 use crate::s3::object::put::abe::envelope_write;
 use aruna_core::compute::SecretBytes;
-use aruna_core::keyspaces::{ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE};
+use aruna_core::keyspaces::{ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
 use aruna_core::structs::storage::abe::{
     EnvelopeArchive, EnvelopePlan, copy_envelope, create_envelope, create_parameters,
 };
@@ -212,6 +212,36 @@ async fn complete(
     run(operation, storage, unlocked, race).await
 }
 
+/// Materializes `key` on archive `ulid` of the source's backend, as a migration there would.
+async fn materialize(storage: &StorageHandle, sealed: &Sealed, key: &str, id: Ulid, ulid: Ulid) {
+    let mut location = sealed.location.clone();
+    location.ulid = ulid;
+    let version_key = VersionKey::new("bucket", key, id).to_bytes().unwrap();
+    let row = get(storage, BLOB_VERSIONS_KEYSPACE, version_key.clone()).await;
+    let mut version = BlobVersion::from_bytes(&row.unwrap()).unwrap();
+    version.state = BlobVersionState::Materialized {
+        blob_hash: [7; 32],
+        backend: location.backend.clone(),
+        encoding: location.format.encoding(),
+        source: None,
+    };
+    let location_key = version.location_key().unwrap().to_bytes();
+    put(
+        storage,
+        BLOB_VERSIONS_KEYSPACE,
+        version_key,
+        version.to_bytes().unwrap(),
+    )
+    .await;
+    put(
+        storage,
+        BLOB_LOCATIONS_KEYSPACE,
+        location_key,
+        location.to_bytes().unwrap(),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn unlocked_copy_envelope() {
     // An unlocked copy gets its own envelope for its own path around the same object key.
@@ -364,4 +394,26 @@ async fn stale_generation_refused() {
     let outcome = complete(storage, "copy", version_id, Some(&sealed), race).await;
     assert_eq!(outcome, Err(AbeError::Parameters));
     assert!(pending_row(storage, "copy", version_id).await.is_some());
+}
+
+#[tokio::test]
+async fn changed_archive_refused() {
+    // A pending copy whose version moved to another archive on the same backend stays pending.
+    let (_temp, context) = context();
+    let storage = &context.storage_handle;
+    let (sealed, source_id, _) = sealed(storage).await;
+    let copy = copy_input(&sealed, (SOURCE, source_id), "copy");
+    let version_id = run(SealedCopyOperation::new(copy), storage, None, Race::Off)
+        .await
+        .unwrap()
+        .version_id;
+    materialize(storage, &sealed, "copy", version_id, Ulid::generate()).await;
+    let outcome = complete(storage, "copy", version_id, Some(&sealed), Race::Off).await;
+    assert_eq!(outcome, Err(AbeError::Context));
+    assert!(pending_row(storage, "copy", version_id).await.is_some());
+    materialize(storage, &sealed, "copy", version_id, sealed.location.ulid).await;
+    let outcome = complete(storage, "copy", version_id, Some(&sealed), Race::Off).await;
+    assert_eq!(outcome, Ok(CopyOutcome::Completed));
+    let (_, archive) = envelope_of(storage, "copy", version_id).await.unwrap();
+    assert_eq!(archive.archive, ArchiveKey::of(&sealed.location));
 }
