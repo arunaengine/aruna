@@ -171,6 +171,8 @@ impl PermissionRules {
         }
         match scope {
             KeyScope::Exact(key) => self.allows(&format!("{root}/{key}"), &Permission::READ),
+            KeyScope::Writes(writes) => (writes.iter())
+                .all(|(key, _)| self.allows(&format!("{root}/{key}"), &Permission::READ)),
             KeyScope::Subtree(prefix) => {
                 let path = format!("{root}/{prefix}");
                 let patterns: Vec<_> = self

@@ -377,6 +377,8 @@ fn token_view(entry: TokenEntry, active: Option<BucketKeyRef>) -> TokenView {
         scope: match request.scope {
             KeyScope::Exact(value) => ScopeView::Exact(value),
             KeyScope::Subtree(value) => ScopeView::Subtree(value),
+            // Token credentials never get enumerated grants.
+            KeyScope::Writes(_) => ScopeView::Writes(String::new()),
         },
         epochs: request.epochs,
     }

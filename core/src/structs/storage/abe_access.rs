@@ -18,6 +18,8 @@ pub const REQUEST_TTL: u64 = 30 * 24 * 60 * 60 * 1000;
 pub const MAX_REQUESTS: usize = 64;
 /// Epochs one scoped key may admit.
 pub const MAX_EPOCHS: usize = aruna_kpabe::MAX_EPOCHS;
+/// Writes one enumerated key may name: the key rows beside its domain and its one epoch.
+pub const MAX_WRITES: usize = aruna_kpabe::MAX_ROWS - 2;
 
 /// Bucket names in rows of the group's encrypted bucket index.
 pub fn indexed_buckets(rows: &[(Key, Value)]) -> Vec<String> {
@@ -58,12 +60,15 @@ pub fn due_rows(
 pub enum KeyScope {
     Exact(String),
     Subtree(String),
+    /// Exact writes with their object keys, all of one epoch; later writes are never covered.
+    Writes(Vec<(String, Ulid)>),
 }
 
 impl KeyScope {
     pub fn validate(&self) -> Result<(), AbeError> {
         let value = match self {
             Self::Exact(value) | Self::Subtree(value) => value,
+            Self::Writes(writes) => return check_writes(writes),
         };
         if value.len() > aruna_kpabe::MAX_ATTRIBUTE_BYTES
             || value.contains('\0')
@@ -79,6 +84,13 @@ impl KeyScope {
         let attribute = match self {
             Self::Exact(key) => Attribute::Key(key.as_bytes().to_vec()),
             Self::Subtree(prefix) => Attribute::Prefix(prefix.as_bytes().to_vec()),
+            // Each write keeps its own epoch, so one key names writes of one epoch only.
+            Self::Writes(_) if epochs.len() != 1 => return Err(AbeError::Scope),
+            Self::Writes(writes) => {
+                let writes = writes.iter().map(|(_, id)| Attribute::Write(id.to_bytes()));
+                let alternatives: Vec<_> = writes.collect();
+                return Ok(Policy::new(&parameters.domain()?, epochs, &alternatives)?);
+            }
         };
         let alternatives = if matches!(self, Self::Subtree(prefix) if prefix.is_empty()) {
             Vec::new()
@@ -147,6 +159,7 @@ impl KeyRequest {
         match &self.scope {
             KeyScope::Exact(exact) => exact == key,
             KeyScope::Subtree(prefix) => key.starts_with(prefix.as_str()),
+            KeyScope::Writes(writes) => writes.iter().any(|(written, _)| written == key),
         }
     }
     /// Whether both bind everything but the epoch set alike, so their keys may be merged.
@@ -159,6 +172,22 @@ impl KeyRequest {
         };
         rebound == *other
     }
+}
+
+fn check_writes(writes: &[(String, Ulid)]) -> Result<(), AbeError> {
+    let mut ids: Vec<Ulid> = writes.iter().map(|(_, id)| *id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if writes.is_empty()
+        || writes.len() > MAX_WRITES
+        || ids.len() != writes.len()
+        || writes.iter().any(|(key, _)| {
+            key.is_empty() || key.contains('\0') || key.len() > aruna_kpabe::MAX_ATTRIBUTE_BYTES
+        })
+    {
+        return Err(AbeError::Scope);
+    }
+    Ok(())
 }
 
 /// Scan prefix of one credential's `token_grants` rows; access keys are alphanumeric.
@@ -295,9 +324,15 @@ mod tests {
     /// The API proposal view: named fields, postcard record and associated data.
     fn view(context: &GrantContext) -> Value {
         let (r, p) = (&context.request, &context.request.parameters);
-        let (kind, value) = match &r.scope {
-            KeyScope::Exact(value) => ("exact", value),
-            KeyScope::Subtree(value) => ("subtree", value),
+        let scope = match &r.scope {
+            KeyScope::Exact(value) => json!({"kind":"exact","value":value}),
+            KeyScope::Subtree(value) => json!({"kind":"subtree","value":value}),
+            KeyScope::Writes(writes) => {
+                let value: Vec<_> = (writes.iter())
+                    .map(|(key, id)| json!({"key":key,"write_id":id.to_string()}))
+                    .collect();
+                json!({"kind":"writes","value":value})
+            }
         };
         let issuer = match context.issuer {
             KeyIssuer::User(user) => json!({"kind":"user","id":user.to_string()}),
@@ -314,7 +349,7 @@ mod tests {
             "generation":p.key.generation,"fingerprint":STANDARD.encode(p.fingerprint),
             "parameters":STANDARD.encode(&p.parameters),"epoch":r.epochs[0],
             "context":STANDARD.encode(p.context().unwrap())},
-            "scope":{"kind":kind,"value":value},"epochs":r.epochs,
+            "scope":scope,"epochs":r.epochs,
             "credential_id":r.credential_id,"restrictions":r.restrictions,
             "revisions":r.revisions.iter().map(|v|STANDARD.encode(v)).collect::<Vec<_>>(),
             "created_at_ms":r.created_at_ms,"issuer":issuer},
@@ -360,6 +395,13 @@ mod tests {
         let mut token = request.clone();
         token.request_id = ulid("01K6YQ8ZQ9V3X2N4M5P6R7S8TH");
         token.credential_id = Some("01K6YQ8ZQ9V3X2N4M5P6R7S8TJ".into());
+        let mut writes = request.clone();
+        writes.request_id = ulid("01K6YQ8ZQ9V3X2N4M5P6R7S8TK");
+        writes.scope = KeyScope::Writes(vec![
+            ("data/a.csv".into(), ulid("01K6YQ8ZQ9V3X2N4M5P6R7S8TM")),
+            ("data/λ b.csv".into(), ulid("01K6YQ8ZQ9V3X2N4M5P6R7S8TN")),
+        ]);
+        writes.epochs = vec![3];
         json!([
             view(&GrantContext {
                 request,
@@ -377,6 +419,10 @@ mod tests {
                 request: token,
                 issuer: KeyIssuer::Node(node),
             }),
+            view(&GrantContext {
+                request: writes,
+                issuer: KeyIssuer::User(user("01K6YQ8ZQ9V3X2N4M5P6R7S8TG", 1)),
+            }),
         ])
     }
 
@@ -385,6 +431,82 @@ mod tests {
         let expected: Value =
             serde_json::from_str(include_str!("../../../tests/vectors/abe-grant.json")).unwrap();
         assert_eq!(fixture(), expected);
+    }
+
+    #[test]
+    fn scope_grammar() {
+        use super::super::abe::{EnvelopePlan, SysRng, create_envelope, create_parameters};
+        use crate::structs::storage::encryption::public_key_of;
+        let secret = SecretBytes::new(vec![9; 32]);
+        let bucket_public = public_key_of(&secret).unwrap();
+        let (node, other) = (iroh::SecretKey::from_bytes(&[4; 32]).public(), [5; 32]);
+        let other = iroh::SecretKey::from_bytes(&other).public();
+        let realm = RealmId::from_bytes([1; 32]);
+        let bucket = |id: u8, node| {
+            let key = BucketKeyRef::new(Ulid::from_bytes([id; 16]), 1);
+            create_parameters(&secret, realm, node, key).unwrap()
+        };
+        let here = bucket(3, node);
+        let (public, master) = (here.public().unwrap(), here.recompute(&secret).unwrap());
+        // Whether a key for `scope` at epoch 1 opens the envelope of one write.
+        let opens =
+            |scope: &KeyScope,
+             (parameters, object, write, epoch): (&AbeParameters, &str, u8, u64)| {
+                let policy = scope.policy(&here, &[1]).unwrap();
+                let key = aruna_kpabe::issue(&public, &master, &policy, &mut SysRng).unwrap();
+                let plan = EnvelopePlan {
+                    parameters: parameters.clone(),
+                    epoch,
+                    write_id: Ulid::from_bytes([write; 16]),
+                    object_key: object.into(),
+                    bucket_public,
+                };
+                let (envelope, _) = create_envelope(plan).unwrap();
+                let context = envelope.context.bytes().unwrap();
+                Envelope::from_bytes(&public, &envelope.abe)
+                    .is_ok_and(|abe| aruna_kpabe::open(&public, &key, &abe, &context).is_ok())
+            };
+        let (sub, exact) = (
+            |v: &str| KeyScope::Subtree(v.into()),
+            |v: &str| KeyScope::Exact(v.into()),
+        );
+        let writes = KeyScope::Writes(vec![("w".into(), Ulid::from_bytes([1; 16]))]);
+        for (scope, object, expected) in [
+            (sub("foo/"), "foo/a", true),
+            (sub("foo/"), "foobar/a", false),
+            (sub(""), "x/y/z", true),
+            (exact("foo"), "foo", true),
+            (exact("foo"), "foo/a", false),
+            (sub("a//"), "a//b", true),
+            (sub("a//"), "a/b", false),
+            (sub("a/"), "a//b", true),
+            (exact("dir/"), "dir/", true),
+            (exact("dir"), "dir/", false),
+            (sub("λ/"), "λ/ü", true),
+            (sub("λ/"), "Λ/ü", false),
+            (sub("a*/"), "a*/b", true),
+            (sub("a*/"), "ab/b", false),
+            (exact("f?"), "fx", false),
+        ] {
+            assert_eq!(
+                opens(&scope, (&here, object, 1, 1)),
+                expected,
+                "{scope:?} {object}"
+            );
+        }
+        // A listed write opens only itself at its own epoch: no other or later write.
+        assert!(opens(&writes, (&here, "w", 1, 1)));
+        assert!(!opens(&writes, (&here, "w", 2, 1)));
+        assert!(!opens(&writes, (&here, "w", 1, 2)));
+        // A recreated bucket or the same bucket name on another node has other parameters.
+        assert!(!opens(&sub(""), (&bucket(4, node), "a", 1, 1)));
+        assert!(!opens(&sub(""), (&bucket(3, other), "a", 1, 1)));
+        // Duplicate labels are refused.
+        let id = Ulid::from_bytes([1; 16]);
+        let twice = KeyScope::Writes(vec![("a".into(), id), ("b".into(), id)]);
+        assert_eq!(twice.validate(), Err(AbeError::Scope));
+        assert!(writes.policy(&here, &[1, 2]).is_err());
+        assert!(sub("a/").policy(&here, &[1, 1]).is_err());
     }
 
     #[test]

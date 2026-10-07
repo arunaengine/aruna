@@ -125,6 +125,13 @@ fn issued_scopes() {
         ("exact", "foo/file", true),
         ("subtree", "bar/", false),
         ("exact", "foo/other", false),
+        ("writes", &"09".repeat(16), true),
+        (
+            "writes",
+            &format!("{},{}", "0a".repeat(16), "09".repeat(16)),
+            true,
+        ),
+        ("writes", &"0a".repeat(16), false),
     ] {
         let mut plain = issue(kind, scope, &bytes(&fixture["bucket_key"])).unwrap();
         let import = |kind, scope, epochs: &[u64], plain: &mut [u8]| {
@@ -149,9 +156,14 @@ fn issued_scopes() {
         ("exact", ""),
         ("prefix", "foo/"),
         ("exact", "a\0"),
+        ("writes", ""),
+        ("writes", "09"),
+        ("writes", &format!("{0},{0}", "09".repeat(16))),
     ] {
         assert!(issue(kind, scope, &bytes(&fixture["bucket_key"])).is_err());
     }
+    // An enumerated key names writes of one epoch only.
+    assert!(policy(&context, "writes", &"09".repeat(16), &[1, 2]).is_err());
     assert!(issue("subtree", "", &[4; 32]).is_err());
 }
 

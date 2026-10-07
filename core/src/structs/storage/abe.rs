@@ -33,7 +33,10 @@ pub enum AbeError {
     Pending,
     #[error("the bucket is locked; an object key is required")]
     Required,
-    #[error("the scope cannot be represented by a continuing encryption key")]
+    #[error(
+        "the scope cannot be a continuing encryption key; request an enumerated grant of its \
+         files with the scope kind `writes`"
+    )]
     Scope,
     #[error("the key request is stale")]
     Stale,

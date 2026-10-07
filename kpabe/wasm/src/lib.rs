@@ -155,6 +155,12 @@ fn policy(context: &[u8], kind: &str, scope: &str, epochs: &[u64]) -> Result<Pol
         ("subtree", "") => Vec::new(),
         ("subtree", prefix) if prefix.ends_with('/') => vec![Attribute::Prefix(prefix.into())],
         ("exact", key) if !key.is_empty() => vec![Attribute::Key(key.into())],
+        // Write ids in hex, comma separated; all of the one epoch they were written in.
+        ("writes", ids) if epochs.len() == 1 => ids
+            .split(',')
+            .map(|id| hex::decode(id).ok()?.try_into().ok().map(Attribute::Write))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(REFUSED)?,
         _ => return Err(REFUSED.into()),
     };
     if scope.contains('\0') {

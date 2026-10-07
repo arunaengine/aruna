@@ -17,6 +17,8 @@ use axum::extract::Path;
 pub enum ScopeView {
     Exact(String),
     Subtree(String),
+    /// The current files under a prefix, each named exactly; later files are not covered.
+    Writes(String),
 }
 #[derive(Deserialize, ToSchema)]
 pub struct RequestBody {
@@ -80,6 +82,12 @@ fn request_fields(r: &KeyRequest) -> ServerResult<Value> {
     let scope = match &r.scope {
         KeyScope::Exact(value) => json!({"kind":"exact","value":value}),
         KeyScope::Subtree(value) => json!({"kind":"subtree","value":value}),
+        KeyScope::Writes(writes) => {
+            let value: Vec<_> = (writes.iter())
+                .map(|(key, id)| json!({"key":key,"write_id":id.to_string()}))
+                .collect();
+            json!({"kind":"writes","value":value})
+        }
     };
     let epoch = r.epochs.first().copied().unwrap_or_default();
     Ok(
@@ -234,6 +242,7 @@ pub async fn request_key(
     let scope = match body.scope {
         ScopeView::Exact(v) => KeyScope::Exact(v),
         ScopeView::Subtree(v) => KeyScope::Subtree(v),
+        ScopeView::Writes(_) => return Err(abe_error(AbeError::Scope)),
     };
     scope.validate().map_err(|_| ServerError::BadRequest)?;
     match execute(&state, auth, bucket, KeyAction::Request(scope)).await? {
