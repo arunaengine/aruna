@@ -6,7 +6,8 @@
 use crate::blob::cleanup::schedule_cleanup_effect;
 use crate::blob::managed_copy::{ManagedCopyError, check_serveable, read_effect};
 use crate::blob::records::{blob_location_read, owner_delete_effect, read_version_effect};
-use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
+use crate::node::usage_stats::{QuotaGate, StoredDelta, UsageCounterUpdate, UsageUpdateError};
+use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -16,6 +17,7 @@ use aruna_core::keyspaces::{
     TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::storage::abe::{ObjectEnvelope, PendingCopy};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobVersion, BlobVersionState, CopyOwner, ManagedCopyKey,
@@ -49,6 +51,7 @@ pub enum RewriteState {
     WriteRows,
     DropOwner,
     DropEnvelope,
+    Quota,
     UpdateUsage,
     Commit,
     Abort,
@@ -114,6 +117,9 @@ pub struct RewriteVersionOperation {
     pending: Option<PendingCopy>,
     /// The bucket's group and the usage charge of the replaced envelope rows.
     charge: Option<(GroupId, u64)>,
+    /// Realm quota and origin; none leaves the group unlimited.
+    quota: Option<(QuotaConfig, RealmId, NodeId)>,
+    gate: Option<QuotaGate>,
     deletes: Vec<(String, Key)>,
     output: Option<Result<RewriteOutcome, RewriteError>>,
 }
@@ -137,9 +143,16 @@ impl RewriteVersionOperation {
             envelope: None,
             pending: None,
             charge: None,
+            quota: None,
+            gate: None,
             deletes: Vec::new(),
             output: None,
         }
+    }
+
+    pub fn with_quota(mut self, quota: QuotaConfig, realm: RealmId, node: NodeId) -> Self {
+        self.quota = Some((quota, realm, node));
+        self
     }
 
     fn unexpected(&mut self, received: Event) -> Effects {
@@ -458,6 +471,7 @@ impl Operation for RewriteVersionOperation {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.update_usage(),
                 other => self.unexpected(other),
             },
+            RewriteState::Quota => self.handle_quota(event),
             RewriteState::UpdateUsage => self.handle_usage(event),
             RewriteState::Commit => self.handle_commit(event),
             RewriteState::Abort => match event {

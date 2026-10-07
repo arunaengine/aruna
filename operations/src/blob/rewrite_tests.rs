@@ -263,9 +263,10 @@ mod envelopes {
     use crate::node::usage_stats::StoredDelta;
     use aruna_core::compute::SecretBytes;
     use aruna_core::keyspaces::*;
+    use aruna_core::structs::identity::realm::QuotaConfig;
     use aruna_core::structs::storage::abe::{
-        AbeEffect, AbeEvent, AbeParameters, EnvelopeArchive, EnvelopePlan, create_envelope,
-        create_parameters,
+        AbeEffect, AbeError, AbeEvent, AbeParameters, EnvelopeArchive, EnvelopePlan,
+        create_envelope, create_parameters,
     };
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::usage::UsageDelta;
@@ -576,6 +577,67 @@ mod envelopes {
                 assert_eq!(mapping.location_key, location);
             }
             assert!(deletes(&mut operation).is_empty());
+        }
+    }
+
+    /// Answers the quota gate's realm config, local counter and remote scan reads.
+    fn gated(operation: &mut RewriteVersionOperation) -> Effects {
+        operation.step(read_result(None));
+        operation.step(read_result(None));
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }))
+    }
+
+    #[test]
+    fn quota_bounds_charge() {
+        // The rotation charges a larger envelope: it passes at the ceiling, one byte less fails.
+        for slack in [0, 1] {
+            let quota = |bytes| QuotaConfig {
+                default_quota_bytes: Some(bytes),
+                grace_factor_percent: 100,
+                ..QuotaConfig::default()
+            };
+            let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([3; 32]);
+            let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+            let mut probe = operation(transition(TransitionKind::Rotate, Some(1), Some(2)));
+            let (old, new) = (location(Some(1)), location(Some(2)));
+            let writes = publish(
+                &mut probe,
+                (&old, rows(true, false, 2)),
+                settings(2, 3),
+                new,
+            );
+            let charge = aruna_core::structs::storage::abe::envelope_charge(
+                written(&writes, ABE_ENVELOPE_KEYSPACE).unwrap(),
+                written(&writes, ABE_ARCHIVE_KEYSPACE).unwrap(),
+            );
+            let added =
+                charge - aruna_core::structs::storage::abe::envelope_charge(&[1; 40], &[2; 9]);
+            let operation = operation(transition(TransitionKind::Rotate, Some(1), Some(2)));
+            let mut operation = operation.with_quota(quota(added - slack), realm, node);
+            let answer = (&old, rows(true, false, 2));
+            publish(&mut operation, answer, settings(2, 3), location(Some(2)));
+            deletes(&mut operation);
+
+            let effects = gated(&mut operation);
+
+            let aborted = matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+            );
+            assert_eq!(aborted, slack == 1);
+            if aborted {
+                // Nothing commits: the old version, copy and envelope rows stay as they were.
+                operation.step(Event::Storage(StorageEvent::TransactionAborted {
+                    txn_id: TxnId::default(),
+                }));
+                let id = operation.new.as_ref().unwrap().ulid;
+                operation.step(Event::Blob(BlobEvent::ReservationReleased { id }));
+                let limit = Err(RewriteError::Blob(AbeError::Limit.into()));
+                assert_eq!(operation.finalize(), limit);
+            }
         }
     }
 }

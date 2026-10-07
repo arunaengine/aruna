@@ -6,6 +6,8 @@
 use crate::blob::migration::MIGRATION_CONTINUE;
 use crate::blob::migration::rewrite::{RewriteOutcome, RewriteVersionOperation};
 use crate::driver::DriverContext;
+use crate::realm::get_config::{GetConfigError, GetConfigOperation};
+use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -17,6 +19,7 @@ use aruna_core::keyspaces::{
     TRANSITION_QUEUE_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
+use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::storage::abe::{ObjectEnvelope, PendingCopy};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobVersion, VersionKey,
@@ -233,10 +236,17 @@ async fn advance(
         None,
     )
     .await?;
+    let quota = match versions.is_empty() {
+        true => None,
+        false => quota_origin(context).await?,
+    };
     for (key, _) in &versions {
         let version_key = VersionKey::from_bytes(key.as_ref()).map_err(|e| e.to_string())?;
-        let operation =
+        let mut operation =
             RewriteVersionOperation::new(version_key, record.clone(), SystemTime::now());
+        if let Some((quota, realm, node)) = &quota {
+            operation = operation.with_quota(quota.clone(), *realm, *node);
+        }
         match crate::driver::drive(operation, context).await {
             Ok(RewriteOutcome::Moved) => record.done += 1,
             Ok(RewriteOutcome::Skipped) => {}
@@ -282,6 +292,22 @@ async fn advance(
         return Ok(Some(Duration::ZERO));
     }
     Ok(wait)
+}
+
+/// The realm quota and origin that the envelope charges of rewritten versions must fit.
+async fn quota_origin(
+    context: &DriverContext,
+) -> Result<Option<(QuotaConfig, RealmId, NodeId)>, String> {
+    let Some(net) = context.net_handle.as_ref() else {
+        return Ok(None);
+    };
+    let realm = *net.realm_id();
+    // A realm without a config document has no quota.
+    match crate::driver::drive(GetConfigOperation::new(realm), context).await {
+        Ok(config) => Ok(Some((config.quota, realm, net.node_id()))),
+        Err(GetConfigError::DocumentNotFound) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Counts old copies whose location rows still exist and forgets removed ones. With none
@@ -1451,7 +1477,7 @@ mod tests {
         use aruna_core::compute::SecretBytes;
         use aruna_core::structs::storage::abe::{EnvelopePlan, create_envelope, create_parameters};
         let private = SecretBytes::new(vec![9; 32]);
-        let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([3; 32]);
+        let realm = RealmId::from_bytes([3; 32]);
         let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let parameters = create_parameters(&private, realm, node, source);
         let plan = EnvelopePlan {

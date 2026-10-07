@@ -62,6 +62,7 @@ impl RewriteVersionOperation {
         }
         let (envelope, added) = self.envelope_writes(&published, &version.metadata)?;
         writes.extend(envelope);
+        self.gate = self.quota_gate(added);
         self.usage = self.usage_with(stored, added);
         let mut moved = version;
         if let BlobVersionState::Materialized { encoding, .. } = &mut moved.state {
@@ -125,6 +126,10 @@ impl RewriteVersionOperation {
     }
 
     pub(super) fn update_usage(&mut self) -> Effects {
+        if let (Some(txn_id), Some(gate)) = (self.txn_id, self.gate.as_mut()) {
+            self.state = RewriteState::Quota;
+            return gate.start(txn_id);
+        }
         let usage = self.usage.as_mut().filter(|usage| !usage.is_noop());
         let (Some(txn_id), Some(usage)) = (self.txn_id, usage) else {
             return self.commit();

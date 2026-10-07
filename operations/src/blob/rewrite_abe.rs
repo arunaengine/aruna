@@ -290,6 +290,32 @@ impl RewriteVersionOperation {
         Ok((writes, i128::from(charge) - i128::from(old_charge)))
     }
 
+    /// A gate for a positive envelope charge change, when the group has a quota.
+    pub(super) fn quota_gate(&self, added: i128) -> Option<QuotaGate> {
+        let ((quota, realm, node), (group, _)) = (self.quota.as_ref()?, self.charge?);
+        let ceiling = quota.effective_group_ceiling(&group)?;
+        let added = u64::try_from(added).ok().filter(|added| *added > 0)?;
+        Some(QuotaGate::new_for_realm(
+            ceiling, added, group, *node, *realm,
+        ))
+    }
+
+    /// The new envelope charge must fit the group quota before the usage update.
+    pub(super) fn handle_quota(&mut self, event: Event) -> Effects {
+        let (Some(txn_id), Some(gate)) = (self.txn_id, self.gate.as_mut()) else {
+            return self.fail(RewriteError::NotFinished);
+        };
+        match gate.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) if gate.is_exceeded() => self.fail(abe_error(AbeError::Limit)),
+            Ok(None) => {
+                self.gate = None;
+                self.update_usage()
+            }
+            Err(_) => self.fail(abe_error(AbeError::Unavailable)),
+        }
+    }
+
     /// The stored change of a new copy and the group's envelope charge change, as one update.
     pub(super) fn usage_with(
         &self,
