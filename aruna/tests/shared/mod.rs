@@ -23,6 +23,7 @@ use aruna_compute::ExecutorRegistry;
 use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metrics::NodeMetrics;
+use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::onboarding::{
     CreateSecretRequest, CreateSecretResponse, OnboardingMode, OnboardingPhase,
 };
@@ -56,7 +57,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::StatusCode;
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -112,8 +113,7 @@ struct FullStorageConfig {
 }
 
 impl FullStorageConfig {
-    fn for_temp_dir(temp_dir: &TempDir) -> Self {
-        let root = temp_dir.path();
+    fn for_root(root: &Path) -> Self {
         Self {
             metadata_storage_path: root.join("craqle").display().to_string(),
             blob_root: root.join("blobstore").display().to_string(),
@@ -156,7 +156,7 @@ impl FullStorageConfig {
 
 #[allow(dead_code)]
 pub(crate) struct SeedNode {
-    _temp_dir: TempDir,
+    _temp_dir: Option<TempDir>,
     pub(crate) net: NetHandle,
     pub(crate) context: Arc<DriverContext>,
     pub(crate) realm_id: RealmId,
@@ -579,6 +579,12 @@ pub(crate) async fn spawn_compute_seed(compute: Arc<ExecutorRegistry>) -> TestRe
     spawn_seed_mode(NodeServiceMode::Full, Some(compute)).await
 }
 
+/// A full seed in `root` with fixed keys; `reopen` starts it again on the state a process left.
+#[allow(dead_code)]
+pub(crate) async fn spawn_fixed_seed(root: &Path, reopen: bool) -> TestResult<SeedNode> {
+    spawn_seed_at(NodeServiceMode::Full, None, Some((root, reopen))).await
+}
+
 pub(crate) async fn create_onboarding_secret(
     seed: &SeedNode,
     mode: OnboardingMode,
@@ -635,48 +641,80 @@ async fn spawn_seed_mode(
     mode: NodeServiceMode,
     compute: Option<Arc<ExecutorRegistry>>,
 ) -> TestResult<SeedNode> {
-    let temp_dir = tempfile::tempdir()?;
-    let storage_path = temp_dir
-        .path()
+    spawn_seed_at(mode, compute, None).await
+}
+
+async fn spawn_seed_at(
+    mode: NodeServiceMode,
+    compute: Option<Arc<ExecutorRegistry>>,
+    fixed: Option<(&Path, bool)>,
+) -> TestResult<SeedNode> {
+    let temp_dir = fixed.is_none().then(tempfile::tempdir).transpose()?;
+    let root = match (fixed, temp_dir.as_ref()) {
+        (Some((root, _)), _) => root.to_path_buf(),
+        (None, Some(temp_dir)) => temp_dir.path().to_path_buf(),
+        (None, None) => return Err(std::io::Error::other("no seed root").into()),
+    };
+    let reopen = fixed.is_some_and(|(_, reopen)| reopen);
+    let storage_path = root
         .to_str()
         .ok_or_else(|| std::io::Error::other("invalid temp path"))?;
     let storage = FjallStorage::open(storage_path)?;
-    let realm_signing_key = generate_signing_key();
+    // A fixed seed keeps its realm, user, node and vault keys across processes.
+    let realm_signing_key = match fixed {
+        Some(_) => ed25519_dalek::SigningKey::from_bytes(&[11; 32]),
+        None => generate_signing_key(),
+    };
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-    let user_id = UserId::new(Ulid::generate(), realm_id);
+    let user = fixed.map_or_else(Ulid::generate, |_| Ulid::from_bytes([12; 16]));
+    let user_id = UserId::new(user, realm_id);
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+            secret_key: fixed.map(|_| iroh::SecretKey::from_bytes(&[13; 32])),
             realm_id,
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,
+            sync_storage_path: fixed.map(|(root, _)| root.join("document-sync")),
             ..NetConfig::default()
         },
         storage.clone(),
     )
     .await?;
     let full_storage_config =
-        (mode == NodeServiceMode::Full).then(|| FullStorageConfig::for_temp_dir(&temp_dir));
+        (mode == NodeServiceMode::Full).then(|| FullStorageConfig::for_root(&root));
     let compute_enabled = compute.is_some();
-    let context =
-        initialize_context(storage, net.clone(), full_storage_config.as_ref(), compute).await?;
-
-    drive(
-        CreateRealmOperation::new(CreateRealmConfig {
-            actor: Actor {
-                node_id: net.node_id(),
-                user_id,
-                realm_id,
-            },
-            realm_description: "Test Realm".to_string(),
-            oidc_providers: Vec::new(),
-            node_location: None,
-            node_weight: None,
-            node_labels: Default::default(),
-        }),
-        context.as_ref(),
+    let vault = match fixed {
+        Some(_) => NodeVaultKey::derive(&[13; 32]),
+        None => NodeVaultKey::random(),
+    };
+    let context = initialize_context(
+        storage,
+        net.clone(),
+        full_storage_config.as_ref(),
+        compute,
+        vault,
     )
     .await?;
+
+    if !reopen {
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: Actor {
+                    node_id: net.node_id(),
+                    user_id,
+                    realm_id,
+                },
+                realm_description: "Test Realm".to_string(),
+                oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
+            }),
+            context.as_ref(),
+        )
+        .await?;
+    }
     // Advertised executors need this node's placement subject, which main.rs
     // reconciles before it seeds the document.
     if compute_enabled {
@@ -711,17 +749,19 @@ async fn spawn_seed_mode(
         net.node_id(),
     )
     .await;
-    drive(
-        ClaimInitialOperation::new(ClaimInitialInput {
-            actor: Actor {
-                node_id: net.node_id(),
-                user_id,
-                realm_id,
-            },
-        }),
-        context.as_ref(),
-    )
-    .await?;
+    if !reopen {
+        drive(
+            ClaimInitialOperation::new(ClaimInitialInput {
+                actor: Actor {
+                    node_id: net.node_id(),
+                    user_id,
+                    realm_id,
+                },
+            }),
+            context.as_ref(),
+        )
+        .await?;
+    }
     announce_realm_presence(context.as_ref(), &realm_id, net.node_id()).await?;
 
     let capabilities = NodeCapabilities::management_node(realm_signing_key)?;
@@ -794,6 +834,7 @@ async fn spawn_joiner_mode(
         joiner_net.clone(),
         full_storage_config.as_ref(),
         None,
+        NodeVaultKey::random(),
     )
     .await?;
     seed.net.add_peer_addr(joiner_net.endpoint_addr()).await;
@@ -900,8 +941,9 @@ async fn initialize_context(
     net: NetHandle,
     full_storage_config: Option<&FullStorageConfig>,
     compute: Option<Arc<ExecutorRegistry>>,
+    vault: NodeVaultKey,
 ) -> TestResult<Arc<DriverContext>> {
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage_handle.open_vault(vault);
     let task_handle = TaskHandle::new();
     let metadata_handle = if let Some(config) = full_storage_config {
         config.ensure_directories()?;

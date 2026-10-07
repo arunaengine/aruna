@@ -24,8 +24,9 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use shared::{
-    SeedNode, TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
-    sign_scoped_token, sign_token, spawn_complete_seed,
+    S3Credentials, SeedNode, TestResult, create_bearer_token, create_group_http,
+    create_s3_credentials, s3_client, sign_scoped_token, sign_token, spawn_complete_seed,
+    spawn_fixed_seed,
 };
 use ulid::Ulid;
 
@@ -295,6 +296,250 @@ async fn abe_read() -> TestResult<()> {
     }.await;
     seed.shutdown().await;
     result
+}
+
+const RESTART_ROOT: &str = "ARUNA_ABE_RESTART_ROOT";
+
+#[tokio::test]
+async fn abe_restart() -> TestResult<()> {
+    // A child process creates and uploads; this one reopens its state, completes while locked
+    // and reads with the scoped object key.
+    let root = tempfile::tempdir()?;
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args(["--ignored", "--exact", "abe_restart_child", "--nocapture"])
+        .env(RESTART_ROOT, root.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state: Value = serde_json::from_slice(&std::fs::read(root.path().join("restart.json"))?)?;
+    let seed = spawn_fixed_seed(root.path(), true).await?;
+    let result = async {
+        let client = reqwest::Client::new();
+        let token = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let credentials = S3Credentials {
+            access_key_id: state["access"].as_str().unwrap().into(),
+            access_secret: state["secret"].as_str().unwrap().into(),
+        };
+        let s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
+        let parts = CompletedMultipartUpload::builder()
+            .parts(
+                CompletedPart::builder()
+                    .part_number(1)
+                    .e_tag(state["etag"].as_str().unwrap())
+                    .build(),
+            )
+            .build();
+        let completed = s3
+            .complete_multipart_upload()
+            .bucket(BUCKET)
+            .key("foo/multi")
+            .upload_id(state["upload_id"].as_str().unwrap())
+            .multipart_upload(parts)
+            .send()
+            .await?;
+        let version = completed.version_id().unwrap().to_string();
+        let grant = KeyGrant::from_bytes(&bytes(&state["grant"]))?;
+        let parameters = grant.context.request.parameters.public()?;
+        let transport = [&grant.enc[..], &grant.ciphertext].concat();
+        let key = UserKey::open(&parameters, &transport, |_| {
+            open_sealed(
+                &[7; 32],
+                &SealedSecret {
+                    enc: grant.enc,
+                    ciphertext: grant.ciphertext.clone(),
+                },
+                GRANT_PURPOSE,
+                &grant.context.bytes().unwrap(),
+            )
+            .map_err(|_| aruna_kpabe::Error)
+        })?;
+        let query = [
+            ("bucket", BUCKET),
+            ("key", "foo/multi"),
+            ("version_id", &version),
+        ];
+        let envelope_route = format!("{}/api/v1/data/blobs/envelope", seed.base_url);
+        let response = client
+            .get(query_url(&envelope_route, &query)?)
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        let status = response.status();
+        let env: Value = response.json().await?;
+        assert_eq!(status, StatusCode::OK, "{env}");
+        let cipher = Envelope::from_bytes(&parameters, &bytes(&env["envelope"]["abe"]))?;
+        let object =
+            aruna_kpabe::open(&parameters, &key, &cipher, &bytes(&env["context"]["bytes"]))?;
+        let content_route = format!("{}/api/v1/data/blobs/content", seed.base_url);
+        let response = client
+            .get(query_url(&content_route, &query)?)
+            .bearer_auth(&token)
+            .header("x-aruna-object-key", STANDARD.encode(object.as_bytes()))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await?.as_ref(), b"restart bytes");
+        let encryption = format!(
+            "{}/api/v1/data/buckets/{BUCKET}/storage/encryption",
+            seed.base_url
+        );
+        let status: Value = client
+            .get(&encryption)
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(status["unlock"]["state"], "locked");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "spawned by abe_restart"]
+async fn abe_restart_child() -> TestResult<()> {
+    let Some(root) = std::env::var_os(RESTART_ROOT) else {
+        return Ok(());
+    };
+    let root = std::path::PathBuf::from(root);
+    let seed = spawn_fixed_seed(&root, false).await?;
+    let client = reqwest::Client::new();
+    let token = create_bearer_token(
+        seed.context.as_ref(),
+        seed.user_id,
+        seed.realm_id,
+        seed.capabilities.clone(),
+    )
+    .await?;
+    let group = create_group_http(&seed.base_url, &token, "ABE restart").await?;
+    let credentials = create_s3_credentials(&seed.base_url, &token, &group.group_id).await?;
+    let s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
+    s3.create_bucket().bucket(BUCKET).send().await?;
+    let user_public = public_key_of(&SecretBytes::new(vec![7; 32])).unwrap();
+    let response = client.post(format!("{}/api/v1/access/users/me/keys",seed.base_url)).bearer_auth(&token)
+        .json(&json!({"key_id":"abe-client","public_key":STANDARD.encode(user_public),"has_recovery":true})).send().await?;
+    let key_record: Value = response.json().await?;
+    let encryption = format!(
+        "{}/api/v1/data/buckets/{BUCKET}/storage/encryption",
+        seed.base_url
+    );
+    let settings: Value = client
+        .put(&encryption)
+        .bearer_auth(&token)
+        .json(&json!({"mode":"vault_locked","expected_generation":0}))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let generation = settings["key_generation"].as_u64().unwrap();
+    let copies: Value = client
+        .get(format!("{encryption}/copies/me?generation={generation}"))
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    let copy = &copies["copies"][0];
+    let reference = BucketKeyRef::new(
+        Ulid::from_string(settings["bucket_id"].as_str().unwrap())?,
+        generation,
+    );
+    let recipient_record = Ulid::from_string(key_record["record_id"].as_str().unwrap())?;
+    let info = copy_info(
+        seed.realm_id,
+        seed.net.node_id(),
+        reference,
+        seed.user_id,
+        recipient_record,
+    );
+    let opened = open_sealed(
+        &[7; 32],
+        &SealedSecret {
+            enc: bytes(&copy["enc"]).try_into().unwrap(),
+            ciphertext: bytes(&copy["ciphertext"]),
+        },
+        &info,
+        &[],
+    )?;
+    let bucket_private = SecretBytes::new(opened.to_vec());
+    let multi = s3
+        .create_multipart_upload()
+        .bucket(BUCKET)
+        .key("foo/multi")
+        .send()
+        .await?;
+    let upload_id = multi.upload_id().unwrap();
+    let part = s3
+        .upload_part()
+        .bucket(BUCKET)
+        .key("foo/multi")
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(b"restart bytes".to_vec().into())
+        .send()
+        .await?;
+    let response = client
+        .post(format!("{encryption}/lock"))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    assert!(response.status().is_success());
+    let request_route = format!(
+        "{}/api/v1/data/buckets/{BUCKET}/abe/requests",
+        seed.base_url
+    );
+    let response = client
+        .post(&request_route)
+        .bearer_auth(&token)
+        .json(&json!({"scope":{"kind":"subtree","value":"foo/"}}))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let requests: Value = client
+        .get(&request_route)
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    let proposal = &requests["records"][0];
+    let context: GrantContext = postcard::from_bytes(&bytes(&proposal["record"]))?;
+    let parameters = context.request.parameters.public()?;
+    let master = context.request.parameters.recompute(&bucket_private)?;
+    let policy = context
+        .request
+        .scope
+        .policy(&context.request.parameters, &context.request.epochs)?;
+    let key = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
+    let aad = context.bytes()?;
+    let sealed = key.seal(|plain| {
+        seal_to(&user_public, GRANT_PURPOSE, &aad, plain).map_err(|_| aruna_kpabe::Error)
+    })?;
+    let grant_route = format!("{request_route}/{}/grant", context.request.request_id);
+    let response = client.post(&grant_route).bearer_auth(&token).json(&json!({
+        "context":proposal["record"],"enc":STANDARD.encode(sealed.enc),"ciphertext":STANDARD.encode(sealed.ciphertext)})).send().await?;
+    let status = response.status();
+    let admitted: Value = response.json().await?;
+    assert_eq!(status, StatusCode::OK, "{admitted}");
+    let state = json!({"access":credentials.access_key_id,"secret":credentials.access_secret,
+        "upload_id":upload_id,"etag":part.e_tag().unwrap(),"grant":admitted["record"]});
+    std::fs::write(root.join("restart.json"), serde_json::to_vec(&state)?)?;
+    let storage = seed.context.storage_handle.clone();
+    seed.shutdown().await;
+    storage.sync_all().await?;
+    std::process::exit(0);
 }
 
 #[test]
