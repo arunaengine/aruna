@@ -54,7 +54,7 @@ pub struct RevokeUserOperation {
     txn_id: Option<ulid::Ulid>,
     access: Option<UserAccess>,
     output: Option<Result<UserAccess, RevokeUserError>>,
-    /// Where the scan of this credential's token copies continues after the current page.
+    /// Where the scan of this credential's token grants continues after the current page.
     token_cursor: Option<Key>,
 }
 
@@ -192,7 +192,7 @@ impl RevokeUserOperation {
         self.scan_tokens(None)
     }
 
-    /// The credential's token copies go in the same transaction, one index page at a time.
+    /// The credential's token requests and grants go in the same transaction, one page at a time.
     fn scan_tokens(&mut self, start: Option<Key>) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(RevokeUserError::NoTransactionFound);
@@ -311,10 +311,10 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::s3::access::index::{decode_index, encode_index, owner_key};
     use aruna_core::UserId;
-    use aruna_core::keyspaces::{KEY_COPY_KEYSPACE, TOKEN_INDEX_KEYSPACE};
+    use aruna_core::keyspaces::{ABE_GRANT_KEYSPACE, ABE_REQUEST_KEYSPACE, TOKEN_GRANT_KEYSPACE};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::abe_access::token_prefix;
     use aruna_core::structs::storage::blob::UserAccess;
-    use aruna_core::structs::storage::encryption::TokenCopy;
     use aruna_storage::storage;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -522,7 +522,6 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_deletes_tokens() {
-        use aruna_core::structs::storage::encryption::BucketKeyRef;
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -557,27 +556,22 @@ mod tests {
                 user_access.to_bytes().unwrap(),
             ))
             .await;
-        // Copies of two buckets, and one of another credential whose key extends this one.
-        let copy = |access_key: &str, bucket: u8| TokenCopy {
-            key: BucketKeyRef::new(Ulid::from_bytes([bucket; 16]), 1),
-            access_key: access_key.to_string(),
-            created_by: user_access.user_identity,
-            nonce: [0; 12],
-            ciphertext: vec![0; 48],
-            created_at_ms: 1,
-        };
-        let copies = [
-            copy("tokenkey", 1),
-            copy("tokenkey", 2),
-            copy("tokenkeyx", 1),
+        // An open request and a grant of this credential, and a grant of another credential
+        // whose key extends this one.
+        let rows = [
+            ("tokenkey", ABE_REQUEST_KEYSPACE, 1u8),
+            ("tokenkey", ABE_GRANT_KEYSPACE, 2),
+            ("tokenkeyx", ABE_GRANT_KEYSPACE, 3),
         ];
-        for copy in &copies {
-            let value = copy.to_bytes().unwrap();
+        let row = |access_key: &str, request: u8| [token_prefix(access_key), vec![request; 80]];
+        for (access_key, key_space, request) in rows {
+            let [prefix, key] = row(access_key, request);
             storage_handle
-                .send_storage_effect(write(KEY_COPY_KEYSPACE, copy.key(), value))
+                .send_storage_effect(write(key_space, key.clone(), vec![1]))
                 .await;
+            let index = [prefix, key].concat();
             storage_handle
-                .send_storage_effect(write(TOKEN_INDEX_KEYSPACE, copy.index_key(), Vec::new()))
+                .send_storage_effect(write(TOKEN_GRANT_KEYSPACE, index, Vec::new()))
                 .await;
         }
 
@@ -588,11 +582,10 @@ mod tests {
         .await
         .unwrap();
 
-        for (copy, kept) in copies.iter().zip([false, false, true]) {
-            for (key_space, key) in [
-                (KEY_COPY_KEYSPACE, copy.key()),
-                (TOKEN_INDEX_KEYSPACE, copy.index_key()),
-            ] {
+        for ((access_key, key_space, request), kept) in rows.into_iter().zip([false, false, true]) {
+            let [prefix, key] = row(access_key, request);
+            let index = [prefix, key.clone()].concat();
+            for (key_space, key) in [(key_space, key), (TOKEN_GRANT_KEYSPACE, index)] {
                 let read = StorageEffect::Read {
                     key_space: key_space.to_string(),
                     key: key.into(),
@@ -603,7 +596,7 @@ mod tests {
                 else {
                     panic!("token row read failed");
                 };
-                assert_eq!(value.is_some(), kept, "{key_space} of {}", copy.access_key);
+                assert_eq!(value.is_some(), kept, "{key_space} of {access_key}");
             }
         }
     }
