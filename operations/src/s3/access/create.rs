@@ -18,7 +18,7 @@ use aruna_core::operation::Operation;
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::UserAccess;
+use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::key_audit::{
     AuditAction, AuditOutcome, BucketAuditRecord, next_event_id,
@@ -97,6 +97,8 @@ pub enum CreateUserError {
     NoSuchBucket(String),
     #[error("bucket {0} is not encrypted")]
     NotEncrypted(String),
+    #[error("bucket {0} is not in the credential's group")]
+    OtherGroup(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -133,12 +135,13 @@ struct TokenPlan {
 }
 
 impl TokenPlan {
-    /// Every bucket must exist and encrypt; each gets one audit entry with the credential.
+    /// Every bucket must exist in `group` and encrypt; each gets one audit entry.
     fn check_buckets(
         &mut self,
         values: Vec<(Key, Option<Value>)>,
         caller: UserId,
         access_key: &str,
+        group: GroupId,
     ) -> Result<(), CreateUserError> {
         let (_, node_id) = self.origin.ok_or(CreateUserError::CreateAccessFailed)?;
         let mut values = values.into_iter();
@@ -146,8 +149,11 @@ impl TokenPlan {
             let (Some(info), Some(settings)) = (values.next(), values.next()) else {
                 return Err(CreateUserError::CreateAccessFailed);
             };
-            if info.1.is_none() {
+            let Some(info) = info.1 else {
                 return Err(CreateUserError::NoSuchBucket(bucket.clone()));
+            };
+            if BucketInfo::from_bytes(&info)?.group_id != group {
+                return Err(CreateUserError::OtherGroup(bucket.clone()));
             }
             let active = BucketEncryption::from_row(settings.1.as_deref())?.active_key();
             let key = active.ok_or_else(|| CreateUserError::NotEncrypted(bucket.clone()))?;
@@ -255,7 +261,9 @@ impl CreateUserOperation {
             .as_ref()
             .map(|access| access.access_key.as_str());
         let checked = match (self.tokens.as_mut(), access_key) {
-            (Some(plan), Some(access_key)) => plan.check_buckets(values, caller, access_key),
+            (Some(plan), Some(access_key)) => {
+                plan.check_buckets(values, caller, access_key, self.config.group_id)
+            }
             _ => Err(CreateUserError::CreateAccessFailed),
         };
         match checked {
@@ -1161,6 +1169,21 @@ mod pure_tests {
             assert_eq!(
                 failed(operation),
                 CreateUserError::NotEncrypted("sealed".to_string())
+            );
+
+            // A bucket of another group gets no token keys from this credential.
+            let mut operation = started(user(1));
+            let other = BucketInfo {
+                group_id: Ulid::from_bytes([4; 16]),
+                ..info()
+            };
+            operation.step(rows(vec![
+                Some(other.to_bytes().unwrap()),
+                Some(sealed().to_bytes().unwrap()),
+            ]));
+            assert_eq!(
+                failed(operation),
+                CreateUserError::OtherGroup("sealed".to_string())
             );
         }
     }

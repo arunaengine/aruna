@@ -504,6 +504,9 @@ fn token_refusal(error: CreateUserError) -> ServerError {
         CreateUserError::NotEncrypted(_) => {
             ServerError::Refused(StatusCode::BAD_REQUEST, "bucket_not_encrypted", message)
         }
+        CreateUserError::OtherGroup(_) => {
+            ServerError::Refused(StatusCode::BAD_REQUEST, "bucket_outside_group", message)
+        }
         _ => ServerError::InternalError(message),
     }
 }
