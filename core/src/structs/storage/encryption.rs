@@ -11,8 +11,6 @@ use crate::key_seal::seal_to;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::ArchiveKey;
 use crate::vault_format::key_fingerprint;
-use aes_gcm::Aes256Gcm;
-use aes_gcm::aead::{Aead, KeyInit, Nonce, Payload};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fmt;
@@ -26,12 +24,8 @@ use zeroize::Zeroizing;
 
 /// HPKE purpose label of a bucket private key sealed to a user key.
 pub const COPY_PURPOSE: &[u8] = b"aruna bucket key copy v1";
-/// AES-GCM purpose label of a bucket private key sealed with a token key.
-pub const TOKEN_PURPOSE: &[u8] = b"aruna bucket key token v1";
 /// Holder tag of a user copy in a copy key.
 const USER_TAG: u8 = 1;
-/// Holder tag of a token credential copy: tag, then the access key.
-const TOKEN_TAG: u8 = 2;
 const REF_LEN: usize = 24;
 const USER_KEY_LEN: usize = 48;
 const TOKEN_LEN: usize = 32;
@@ -374,77 +368,10 @@ impl SealedCopy {
                     Ulid::from_bytes(record.try_into()?),
                 ))
             }
-            Some((&TOKEN_TAG, _)) => Err(BucketKeyError::Unsupported.into()),
             _ => Err(ConversionError::InvalidLength(
                 "sealed copy holder".to_string(),
             )),
         }
-    }
-
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(self)?)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
-    }
-}
-
-/// A bucket private key sealed with AES-256-GCM under the random key of a token credential,
-/// stored in `bucket_key_copies`. Only the client holds the token key.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TokenCopy {
-    pub key: BucketKeyRef,
-    pub access_key: String,
-    /// The holder who created the credential; the copy opens only while they hold the key.
-    pub created_by: UserId,
-    pub nonce: [u8; 12],
-    pub ciphertext: Vec<u8>,
-    pub created_at_ms: u64,
-}
-
-impl TokenCopy {
-    pub fn key(&self) -> Vec<u8> {
-        Self::copy_key(self.key, &self.access_key)
-    }
-
-    /// Reference, token tag and access key.
-    pub fn copy_key(key: BucketKeyRef, access_key: &str) -> Vec<u8> {
-        [&key.key()[..], &[TOKEN_TAG], access_key.as_bytes()].concat()
-    }
-
-    /// Reads the reference and access key of a token copy key; a user copy key is refused.
-    pub fn parse_key(bytes: &[u8]) -> Result<(BucketKeyRef, String), ConversionError> {
-        let (reference, rest) = bytes
-            .split_at_checked(REF_LEN)
-            .ok_or_else(|| ConversionError::InvalidLength("token copy key".to_string()))?;
-        match rest.split_first() {
-            Some((&TOKEN_TAG, access_key)) if !access_key.is_empty() => Ok((
-                BucketKeyRef::from_key(reference)?,
-                String::from_utf8(access_key.to_vec())?,
-            )),
-            _ => Err(ConversionError::InvalidLength(
-                "token copy holder".to_string(),
-            )),
-        }
-    }
-
-    /// The `bucket_key_tokens` key of this copy: access key, a zero byte, then the reference.
-    pub fn index_key(&self) -> Vec<u8> {
-        [&Self::index_prefix(&self.access_key)[..], &self.key.key()].concat()
-    }
-
-    /// Scan prefix of the copies of one credential; access keys are alphanumeric.
-    pub fn index_prefix(access_key: &str) -> Vec<u8> {
-        [access_key.as_bytes(), &[0]].concat()
-    }
-
-    /// The reference an index key of `access_key` names.
-    pub fn parse_index(bytes: &[u8], access_key: &str) -> Result<BucketKeyRef, ConversionError> {
-        let reference = bytes
-            .strip_prefix(Self::index_prefix(access_key).as_slice())
-            .ok_or_else(|| ConversionError::InvalidLength("token index key".to_string()))?;
-        BucketKeyRef::from_key(reference)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -652,99 +579,6 @@ pub fn copy_info(
     .concat()
 }
 
-/// A fresh random token key from the system random number generator.
-pub fn generate_token() -> Result<SharedSecret, BucketKeyError> {
-    let mut bytes = Zeroizing::new(vec![0u8; TOKEN_LEN]);
-    getrandom::fill(&mut bytes).map_err(|_| BucketKeyError::Seal)?;
-    Ok(SharedSecret::new(SecretBytes::new(std::mem::take(
-        &mut *bytes,
-    ))))
-}
-
-/// Seals the private key of `key` with `token`, bound to this realm, node and access key.
-/// The key must match `public_key`, so a wrong key is never handed out.
-pub fn seal_token(
-    key: BucketKeyRef,
-    public_key: &[u8; 32],
-    private: &SecretBytes,
-    origin: (RealmId, NodeId),
-    holder: (&str, UserId),
-    token: &SecretBytes,
-    now_ms: u64,
-) -> Result<TokenCopy, BucketKeyError> {
-    if !key_matches(private, public_key) {
-        return Err(BucketKeyError::WrongKey);
-    }
-    let (access_key, created_by) = holder;
-    let cipher = token_cipher(token).ok_or(BucketKeyError::Seal)?;
-    let mut nonce = [0u8; 12];
-    getrandom::fill(&mut nonce).map_err(|_| BucketKeyError::Seal)?;
-    let aad = token_info(origin.0, origin.1, key, access_key);
-    let payload = Payload {
-        msg: private.expose(),
-        aad: &aad,
-    };
-    let ciphertext = cipher
-        .encrypt(&Nonce::<Aes256Gcm>::from(nonce), payload)
-        .map_err(|_| BucketKeyError::Seal)?;
-    Ok(TokenCopy {
-        key,
-        access_key: access_key.to_string(),
-        created_by,
-        nonce,
-        ciphertext,
-        created_at_ms: now_ms,
-    })
-}
-
-/// Opens `copy` with `token`. Another token or binding fails as `InvalidToken`; a key that does
-/// not match `public_key` fails as `WrongKey`.
-pub fn open_token(
-    copy: &TokenCopy,
-    public_key: &[u8; 32],
-    origin: (RealmId, NodeId),
-    token: &SecretBytes,
-) -> Result<SecretBytes, BucketKeyError> {
-    let cipher = token_cipher(token).ok_or(BucketKeyError::InvalidToken)?;
-    let aad = token_info(origin.0, origin.1, copy.key, &copy.access_key);
-    let payload = Payload {
-        msg: &copy.ciphertext,
-        aad: &aad,
-    };
-    let private = cipher
-        .decrypt(&Nonce::<Aes256Gcm>::from(copy.nonce), payload)
-        .map(SecretBytes::new)
-        .map_err(|_| BucketKeyError::InvalidToken)?;
-    if !key_matches(&private, public_key) {
-        return Err(BucketKeyError::WrongKey);
-    }
-    Ok(private)
-}
-
-fn token_cipher(token: &SecretBytes) -> Option<Aes256Gcm> {
-    let key = <&[u8; TOKEN_LEN]>::try_from(token.expose()).ok()?;
-    Some(Aes256Gcm::new(key.into()))
-}
-
-/// AAD of a token copy: the purpose label, then the realm, node, bucket and generation, and the
-/// access key last, so the encoding is canonical.
-pub fn token_info(
-    realm_id: RealmId,
-    node_id: NodeId,
-    key: BucketKeyRef,
-    access_key: &str,
-) -> Vec<u8> {
-    [
-        TOKEN_PURPOSE,
-        &[0],
-        realm_id.as_bytes(),
-        node_id.as_bytes(),
-        &key.key(),
-        access_key.as_bytes(),
-    ]
-    .concat()
-}
-
 /// Typed failures of bucket keys, unlock state and encrypted content access.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum BucketKeyError {
@@ -811,8 +645,6 @@ mod tests {
                 .key()
                 .starts_with(&SealedCopy::user_prefix(reference, user(6)))
         );
-        let token = [&reference.key()[..], &[TOKEN_TAG], b"ACCESSKEY"].concat();
-        assert!(SealedCopy::parse_key(&token).is_err());
         assert_eq!(
             SealedCopy::from_bytes(&copy.to_bytes().unwrap()).unwrap(),
             copy
@@ -1064,124 +896,8 @@ mod tests {
     }
 
     #[test]
-    fn token_copies_bound() {
-        let (public, private) = generate_key().unwrap();
-        let realm = RealmId::from_bytes([1; 32]);
-        let node = SecretKey::from_bytes(&[2; 32]).public();
-        let key = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
-        let token = generate_token().unwrap();
-        let holder = ("TOKENKEY", user(5));
-        let copy = seal_token(
-            key,
-            &public,
-            private.bytes(),
-            (realm, node),
-            holder,
-            token.bytes(),
-            9,
-        );
-        let copy = copy.unwrap();
-        let opened = open_token(&copy, &public, (realm, node), token.bytes()).unwrap();
-        assert_eq!(opened.expose(), private.bytes().expose());
-        assert_eq!((copy.created_by, copy.created_at_ms), (user(5), 9));
-
-        // Another token, binding or changed byte opens nothing.
-        let other = generate_token().unwrap();
-        let wrong = open_token(&copy, &public, (realm, node), other.bytes());
-        assert_eq!(wrong, Err(BucketKeyError::InvalidToken));
-        let short = SecretBytes::new(vec![1; 16]);
-        let wrong = open_token(&copy, &public, (realm, node), &short);
-        assert_eq!(wrong, Err(BucketKeyError::InvalidToken));
-        let other_node = SecretKey::from_bytes(&[3; 32]).public();
-        let wrong = open_token(&copy, &public, (realm, other_node), token.bytes());
-        assert_eq!(wrong, Err(BucketKeyError::InvalidToken));
-        let other_realm = RealmId::from_bytes([2; 32]);
-        let wrong = open_token(&copy, &public, (other_realm, node), token.bytes());
-        assert_eq!(wrong, Err(BucketKeyError::InvalidToken));
-        for changed in [
-            TokenCopy {
-                key: BucketKeyRef::new(key.bucket_id, 2),
-                ..copy.clone()
-            },
-            TokenCopy {
-                access_key: "OTHERKEY".to_string(),
-                ..copy.clone()
-            },
-            TokenCopy {
-                nonce: [7; 12],
-                ..copy.clone()
-            },
-        ] {
-            let wrong = open_token(&changed, &public, (realm, node), token.bytes());
-            assert_eq!(wrong, Err(BucketKeyError::InvalidToken));
-        }
-        let mut tampered = copy.clone();
-        tampered.ciphertext[0] ^= 1;
-        let wrong = open_token(&tampered, &public, (realm, node), token.bytes());
-        assert_eq!(wrong, Err(BucketKeyError::InvalidToken));
-        // A copy whose key does not match the generation's public key is neither made nor used.
-        let (other_public, _) = generate_key().unwrap();
-        let wrong = open_token(&copy, &other_public, (realm, node), token.bytes());
-        assert_eq!(wrong, Err(BucketKeyError::WrongKey));
-        let sealed = seal_token(
-            key,
-            &other_public,
-            private.bytes(),
-            (realm, node),
-            holder,
-            token.bytes(),
-            9,
-        );
-        assert_eq!(sealed, Err(BucketKeyError::WrongKey));
-    }
-
-    #[test]
-    fn token_keys_separate() {
-        let key = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 2);
-        let copy = TokenCopy {
-            key,
-            access_key: "AB".to_string(),
-            created_by: user(5),
-            nonce: [0; 12],
-            ciphertext: vec![0; 48],
-            created_at_ms: 1,
-        };
-        assert_eq!(
-            TokenCopy::parse_key(&copy.key()).unwrap(),
-            (key, "AB".to_string())
-        );
-        assert_eq!(
-            TokenCopy::from_bytes(&copy.to_bytes().unwrap()).unwrap(),
-            copy
-        );
-        assert!(SealedCopy::parse_key(&copy.key()).is_err());
-        let holder = SealedCopy::user_prefix(key, user(5));
-        assert!(TokenCopy::parse_key(&holder).is_err());
-        // A scan of a bucket's copies keeps user copies only.
-        let rows = vec![(copy.key(), 1), ([&holder[..], &[0; 16]].concat(), 2)];
-        let users: Vec<_> = SealedCopy::user_rows(rows)
-            .into_iter()
-            .map(|row| row.1)
-            .collect();
-        assert_eq!(users, [2]);
-
-        // The index of one credential never covers another whose access key extends it.
-        assert_eq!(TokenCopy::parse_index(&copy.index_key(), "AB"), Ok(key));
-        let longer = TokenCopy {
-            access_key: "ABC".to_string(),
-            ..copy.clone()
-        };
-        assert!(
-            !longer
-                .index_key()
-                .starts_with(&TokenCopy::index_prefix("AB"))
-        );
-        assert!(TokenCopy::parse_index(&longer.index_key(), "AB").is_err());
-    }
-
-    #[test]
     fn tokens_parse_strictly() {
-        let token = generate_token().unwrap();
+        let (_, token) = generate_key().unwrap();
         let text = TokenCredential::encode(token.bytes());
         assert_eq!(text.len(), 64);
         let parsed = TokenCredential::parse("KEY", text.as_bytes()).unwrap();
@@ -1193,41 +909,12 @@ mod tests {
 
     #[test]
     fn tokens_never_formatted() {
-        use crate::effects::BlobEffect;
-        use crate::events::BlobEvent;
-        use crate::structs::storage::blob::BackendRef;
-
         const CANARY: [u8; 32] = *b"canary-token-key-7a2c-0000-00000";
-        let shared = || SharedSecret::new(SecretBytes::new(CANARY.to_vec()));
-        let key = BucketKeyRef::new(Ulid::from_bytes([1; 16]), 2);
         let text = TokenCredential::encode(&SecretBytes::new(CANARY.to_vec()));
         let credential = TokenCredential::parse("TOKENKEY", text.as_bytes()).unwrap();
-        let copy = TokenCopy {
-            key,
-            access_key: "TOKENKEY".to_string(),
-            created_by: user(5),
-            nonce: [0; 12],
-            ciphertext: vec![0; 48],
-            created_at_ms: 1,
-        };
-        let admit = BlobEffect::AdmitToken {
-            key,
-            archive: ArchiveKey::new(Ulid::from_bytes([4; 16]), BackendRef::node_default()),
-            copy: Box::new(copy.clone()),
-            public_key: [3; 32],
-            token: shared(),
-            realm_id: RealmId::from_bytes([1; 32]),
-            node_id: SecretKey::from_bytes(&[2; 32]).public(),
-        };
-        let sealed = BlobEvent::TokenSealed {
-            copies: vec![copy],
-            token: shared(),
-        };
         let canary = String::from_utf8_lossy(&CANARY).to_string();
         for formatted in [
             format!("{credential:?}"),
-            format!("{admit:?}"),
-            format!("{sealed:?}"),
             BucketKeyError::InvalidToken.to_string(),
         ] {
             assert!(!formatted.contains(&canary), "{formatted}");
