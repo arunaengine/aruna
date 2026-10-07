@@ -142,6 +142,17 @@ async fn abe_read() -> TestResult<()> {
         let upload_id = multi.upload_id().unwrap();
         let part = s3.upload_part().bucket(BUCKET).key("foo/multi").upload_id(upload_id).part_number(1)
             .body(b"multipart bytes".to_vec().into()).send().await?;
+        // Part 2 starts at an unaligned offset, so this archive publishes without a content hash.
+        let mut expected = vec![b'p';5*1024*1024];
+        let pending = s3.create_multipart_upload().bucket(BUCKET).key("foo/pending").send().await?;
+        let pending_id = pending.upload_id().unwrap();
+        let mut pending_parts = Vec::new();
+        for (number,body) in [(1,expected.clone()),(2,b"tail".to_vec())] {
+            let part = s3.upload_part().bucket(BUCKET).key("foo/pending").upload_id(pending_id).part_number(number)
+                .body(body.into()).send().await?;
+            pending_parts.push(CompletedPart::builder().part_number(number).e_tag(part.e_tag().unwrap()).build());
+        }
+        expected.extend_from_slice(b"tail");
         let response = client.post(format!("{encryption}/lock")).bearer_auth(&token).send().await?;
         assert!(response.status().is_success());
         // Copies made while locked wait for their envelope; foo/c copies the pending foo/b.
@@ -158,6 +169,9 @@ async fn abe_read() -> TestResult<()> {
         let completed = s3.complete_multipart_upload().bucket(BUCKET).key("foo/multi").upload_id(upload_id)
             .multipart_upload(parts).send().await?;
         let multi_version = completed.version_id().unwrap().to_string();
+        let completed = s3.complete_multipart_upload().bucket(BUCKET).key("foo/pending").upload_id(pending_id)
+            .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(pending_parts)).build()).send().await?;
+        let pending_version = completed.version_id().unwrap().to_string();
         let request_route = format!("{}/api/v1/data/buckets/{BUCKET}/abe/requests",seed.base_url);
         let response = client.post(&request_route).bearer_auth(&token)
             .json(&json!({"scope":{"kind":"subtree","value":"foo/"}})).send().await?;
@@ -222,6 +236,19 @@ async fn abe_read() -> TestResult<()> {
             .header("x-aruna-object-key",STANDARD.encode(multi_key.as_bytes())).send().await?;
         assert_eq!(response.status(),StatusCode::OK);
         assert_eq!(response.bytes().await?.as_ref(),b"multipart bytes");
+        // The first keyed read promotes the pending archive under its object key; the second reads it.
+        let pending_query = [("bucket",BUCKET),("key","foo/pending"),("version_id",&pending_version)];
+        for _ in 0..2 {
+            let response = client.get(query_url(&envelope_route,&pending_query)?).bearer_auth(&token).send().await?;
+            let status = response.status(); let env: Value = response.json().await?;
+            assert_eq!(status,StatusCode::OK,"{env}");
+            let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
+            let pending_key = aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
+            let response = client.get(query_url(&content_route,&pending_query)?).bearer_auth(&token)
+                .header("x-aruna-object-key",STANDARD.encode(pending_key.as_bytes())).send().await?;
+            assert_eq!(response.status(),StatusCode::OK);
+            assert!(response.bytes().await?.as_ref() == expected.as_slice());
+        }
         let wrong_query = [("bucket",BUCKET),("key","foobar/data"),("version_id",&other_version)];
         let response = client.get(query_url(&content_route,&wrong_query)?).bearer_auth(&token)
             .header("x-aruna-object-key",&object_header).send().await?;
