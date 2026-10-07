@@ -6,8 +6,8 @@ use super::BlobHandler;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::structs::storage::abe::{
-    AbeEffect, AbeError, AbeEvent, EnvelopePlan, check_object, copy_envelope, create_envelope,
-    create_parameters,
+    AbeEffect, AbeError, AbeEvent, EnvelopePlan, check_copy, check_object, copy_envelope,
+    create_envelope, create_parameters,
 };
 
 impl BlobHandler {
@@ -117,7 +117,11 @@ impl BlobHandler {
                     Err(_) => return BlobEvent::Error(BlobError::HandleMissing),
                 };
                 let Ok((secret, bucket_public)) = unlocked else {
-                    return BlobEvent::Error(AbeError::Required.into());
+                    // A destination no envelope can describe fails now, not at every later unlock.
+                    return match check_copy(&source, object_key) {
+                        Ok(()) => BlobEvent::Error(AbeError::Required.into()),
+                        Err(error) => BlobEvent::Error(error.into()),
+                    };
                 };
                 let plan = EnvelopePlan {
                     parameters: source.context.parameters.clone(),

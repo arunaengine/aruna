@@ -29,8 +29,7 @@ use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::abe::{
-    AbeEffect, AbeError, AbeEvent, AbeParameters, EnvelopePlan, ObjectEnvelope, PendingCopy,
-    create_envelope,
+    AbeEffect, AbeError, AbeEvent, AbeParameters, ObjectEnvelope, PendingCopy,
 };
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
@@ -339,15 +338,6 @@ impl SealedCopyOperation {
             BlobEvent::Error(BlobError::Abe(AbeError::Required)) => {
                 let source = self.source_envelope.take();
                 let source = source.ok_or(SealedCopyError::InvalidState)?;
-                // A destination no envelope can describe fails now, not at every later unlock.
-                create_envelope(EnvelopePlan {
-                    parameters: source.context.parameters.clone(),
-                    epoch: source.context.epoch,
-                    write_id: Ulid::generate(),
-                    object_key: self.input.dest_key.clone(),
-                    bucket_public: source.context.public_key,
-                })
-                .map_err(abe)?;
                 let archive = self.archive();
                 self.pending = Some(PendingCopy { source, archive });
             }

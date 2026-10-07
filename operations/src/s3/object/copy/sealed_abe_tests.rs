@@ -9,7 +9,7 @@ use crate::s3::object::put::abe::envelope_write;
 use aruna_core::compute::SecretBytes;
 use aruna_core::keyspaces::{ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
 use aruna_core::structs::storage::abe::{
-    EnvelopeArchive, EnvelopePlan, copy_envelope, create_envelope, create_parameters,
+    EnvelopeArchive, EnvelopePlan, check_copy, copy_envelope, create_envelope, create_parameters,
 };
 use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode, public_key_of};
 
@@ -165,7 +165,10 @@ async fn run<O: Operation>(
                         let envelope = copy_envelope(&source, &sealed.secret, plan).unwrap();
                         BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope)))
                     }
-                    None => BlobEvent::Error(AbeError::Required.into()),
+                    None => match check_copy(&source, object_key) {
+                        Ok(()) => BlobEvent::Error(AbeError::Required.into()),
+                        Err(error) => BlobEvent::Error(error.into()),
+                    },
                 })
             }
             effect => panic!("unexpected effect {effect:?}"),
@@ -566,10 +569,25 @@ async fn locked_unrepresentable_refused() {
     // A locked copy to a path no envelope can describe is refused, not left pending.
     let (_temp, context) = context();
     let storage = &context.storage_handle;
-    let (sealed, source_id, _) = sealed(storage).await;
+    let (sealed, source_id, source) = sealed(storage).await;
     // Too many prefixes, then 64 attributes whose ciphertext exceeds the byte limit.
     let long = "a".repeat(906) + &"/a".repeat(59);
-    for (dest, error) in [("a/".repeat(60), AbeError::Limit), (long, AbeError::Crypto)] {
+    // Fits at the source's epoch 1, but no longer at the bucket's current epoch 128.
+    let wide = "a".repeat(820) + &"/a".repeat(59) + &"a".repeat(15);
+    let plan = EnvelopePlan {
+        parameters: source.context.parameters,
+        epoch: 1,
+        write_id: Ulid::generate(),
+        object_key: wide.clone(),
+        bucket_public: sealed.public,
+    };
+    create_envelope(plan).unwrap();
+    set_epoch(storage, &sealed.location, 128).await;
+    for (dest, error) in [
+        ("a/".repeat(60), AbeError::Limit),
+        (long, AbeError::Crypto),
+        (wide, AbeError::Limit),
+    ] {
         let copy = copy_input(&sealed, (SOURCE, source_id), &dest);
         let refused = run(SealedCopyOperation::new(copy), storage, None, Race::Off).await;
         assert_eq!(refused, Err(SealedCopyError::Blob(BlobError::Abe(error))));

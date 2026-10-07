@@ -267,6 +267,18 @@ pub fn copy_envelope(
     seal_envelope(plan, source.context.public_key, &private)
 }
 
+/// Fails if no envelope for a copy of `source` to `object_key` fits, even at the widest epoch.
+pub fn check_copy(source: &ObjectEnvelope, object_key: String) -> Result<(), AbeError> {
+    let plan = EnvelopePlan {
+        parameters: source.context.parameters.clone(),
+        epoch: u64::MAX,
+        write_id: Ulid::generate(),
+        object_key,
+        bucket_public: source.context.public_key,
+    };
+    create_envelope(plan).map(drop)
+}
+
 fn seal_envelope(
     plan: EnvelopePlan,
     public_key: [u8; 32],
