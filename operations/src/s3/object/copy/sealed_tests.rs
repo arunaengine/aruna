@@ -394,3 +394,6 @@ async fn governed_copy_registered() {
     let refused = drive(SealedCopyOperation::new(request), &context).await;
     assert!(matches!(refused, Err(SealedCopyError::PolicyGate(_))));
 }
+
+#[path = "sealed_abe_tests.rs"]
+mod abe;
