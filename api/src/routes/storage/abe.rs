@@ -4,6 +4,7 @@
 
 mod content;
 mod records;
+pub(crate) use records::ScopeView;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};

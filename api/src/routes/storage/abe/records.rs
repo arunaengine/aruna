@@ -9,7 +9,7 @@ use aruna_core::structs::storage::abe_access::{
 use aruna_operations::abe::{KeyAction, KeyOperation, KeyResult, MemberKeysOperation};
 use axum::extract::Path;
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ScopeView {
     Exact(String),

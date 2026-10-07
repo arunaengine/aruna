@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::abe::ScopeView;
 use super::routing::ensure_group_admin;
 use crate::auth::require_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -11,6 +12,7 @@ use aruna_core::errors::BlobError;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::abe_access::KeyScope;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::encryption::{
     BlockCipher, BlockKeys, BucketKeyError, BucketKeyRef, EncryptionMode, KeyState, UnlockStatus,
@@ -238,17 +240,20 @@ pub(crate) fn key_refusal(error: &BucketKeyError) -> ServerError {
     ServerError::Refused(status, code, message)
 }
 
-/// One token copy of a bucket key.
+/// One scoped key grant of a token credential.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct TokenView {
     pub access_key_id: String,
-    /// The key holder who created the token credential.
+    /// The user who created the token credential.
     pub user_id: String,
-    /// RFC 3339 time the copy was sealed.
+    /// RFC 3339 time the key request of the grant was created.
     pub created_at: String,
     pub generation: u64,
-    /// True when the copy is of another generation than the active one, or its credential no
-    /// longer authenticates; such a token reads nothing any more.
+    /// The literal object key or prefix the grant opens.
+    pub scope: ScopeView,
+    pub epochs: Vec<u64>,
+    /// True when the grant is of another generation than the active one, or its credential no
+    /// longer authenticates; such a grant reads nothing any more.
     pub stale: bool,
 }
 
@@ -262,22 +267,23 @@ pub struct TokenListView {
     path = "/data/buckets/{bucket}/storage/encryption/tokens",
     tag = "data/storage",
     summary = "List a bucket's token credentials",
-    description = r#"Lists the token credentials that hold a sealed copy of a bucket key on this node.
+    description = r#"Lists the scoped key grants of the token credentials of a bucket on this node.
 
 **Authentication**: realm bearer token of a current key holder of the bucket, or WRITE on the
 owning group's admin path.
 
 **Behavior**
-- One entry per sealed copy: a credential gets one copy per key generation it was created for.
-- `stale` marks a copy of a generation that is no longer active, or of a credential that was
-  revoked, expired or deleted. A key rotation leaves every older token stale; create a new
+- One entry per issued grant: a credential gets one grant per scope and key generation. Open
+  key requests of a token are not listed.
+- `stale` marks a grant of a generation that is no longer active, or of a credential that was
+  revoked, expired or deleted. A key rotation leaves every older grant stale; create a new
   credential to read again while the bucket is locked.
-- Tokens themselves are never stored or shown."#,
+- Tokens themselves are never stored or shown; the node keeps only their public keys."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     responses(
         (
             status = 200,
-            description = "The bucket's token copies",
+            description = "The bucket's token grants",
             body = TokenListView,
             example = json!({
                 "tokens": [{
@@ -285,6 +291,8 @@ owning group's admin path.
                     "user_id": "01JUSER0123456789ABCDEFGHJ",
                     "created_at": "2026-10-05T12:00:00Z",
                     "generation": 1,
+                    "scope": {"kind": "subtree", "value": "raw/"},
+                    "epochs": [1],
                     "stale": false
                 }]
             })
@@ -322,14 +330,20 @@ pub async fn list_bucket_tokens(
     Ok(Json(TokenListView { tokens }))
 }
 
-/// A token copy is stale unless it is of the `active` generation and its credential still works.
+/// A grant is stale unless it is of the `active` generation and its credential still works.
 fn token_view(entry: TokenEntry, active: Option<BucketKeyRef>) -> TokenView {
+    let request = entry.grant.context.request;
     TokenView {
-        stale: Some(entry.copy.key) != active || !entry.credential_active,
-        access_key_id: entry.copy.access_key,
-        user_id: entry.copy.created_by.to_string(),
-        created_at: rfc3339(entry.copy.created_at_ms),
-        generation: entry.copy.key.generation,
+        stale: Some(request.parameters.key) != active || !entry.credential_active,
+        access_key_id: request.credential_id.unwrap_or_default(),
+        user_id: request.recipient_user.to_string(),
+        created_at: rfc3339(request.created_at_ms),
+        generation: request.parameters.key.generation,
+        scope: match request.scope {
+            KeyScope::Exact(value) => ScopeView::Exact(value),
+            KeyScope::Subtree(value) => ScopeView::Subtree(value),
+        },
+        epochs: request.epochs,
     }
 }
 
@@ -1008,17 +1022,43 @@ mod tests {
 
     #[test]
     fn stale_tokens_marked() {
-        use aruna_core::structs::storage::encryption::TokenCopy;
+        use aruna_core::structs::storage::abe::AbeParameters;
+        use aruna_core::structs::storage::abe_access::{
+            GrantContext, KeyGrant, KeyIssuer, KeyRequest,
+        };
         let bucket_id = Ulid::from_bytes([4; 16]);
-        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), RealmId::from_bytes([1; 32]));
+        let realm = RealmId::from_bytes([1; 32]);
+        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm);
+        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
         let entry = |generation, credential_active| TokenEntry {
-            copy: TokenCopy {
-                key: BucketKeyRef::new(bucket_id, generation),
-                access_key: "TOKENKEY".to_string(),
-                created_by: user,
-                nonce: [0; 12],
+            grant: KeyGrant {
+                context: GrantContext {
+                    request: KeyRequest {
+                        request_id: Ulid::from_bytes([1; 16]),
+                        requesting_user: user,
+                        recipient_user: user,
+                        recipient_record: Some(Ulid::from_bytes([7; 16])),
+                        recipient_public: Some([5; 32]),
+                        recipient_fingerprint: Some([6; 32]),
+                        bucket: "reef".to_string(),
+                        parameters: AbeParameters {
+                            realm_id: realm,
+                            node_id: node,
+                            key: BucketKeyRef::new(bucket_id, generation),
+                            fingerprint: [7; 32],
+                            parameters: vec![9; 3],
+                        },
+                        scope: KeyScope::Subtree("raw/".to_string()),
+                        epochs: vec![1],
+                        credential_id: Some("TOKENKEY".to_string()),
+                        restrictions: None,
+                        revisions: Vec::new(),
+                        created_at_ms: 1_791_000_000_000,
+                    },
+                    issuer: KeyIssuer::Node(node),
+                },
+                enc: [0; 32],
                 ciphertext: vec![0; 48],
-                created_at_ms: 1_791_000_000_000,
             },
             credential_active,
         };
@@ -1031,6 +1071,8 @@ mod tests {
                 user_id: user.to_string(),
                 created_at: "2026-10-03T04:00:00Z".to_string(),
                 generation: 2,
+                scope: ScopeView::Subtree("raw/".to_string()),
+                epochs: vec![1],
                 stale: false,
             }
         );
