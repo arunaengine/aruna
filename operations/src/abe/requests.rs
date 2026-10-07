@@ -281,20 +281,26 @@ impl KeyOperation {
             return self.records();
         }
         let opened = std::mem::take(&mut self.opened);
-        let holder = self.snapshot.as_ref().is_some_and(|s| s.holder);
-        let notify = self.fresh && !holder;
         self.result = Some(KeyResult::Opened(opened));
-        let Some(snapshot) = self.snapshot.as_ref().filter(|_| notify) else {
-            return self.flush();
-        };
+        if self.fresh
+            && let Some(effects) = self.holders()
+        {
+            return effects;
+        }
+        self.flush()
+    }
+    /// Reads the bucket holders unless the caller already holds the bucket key.
+    pub(super) fn holders(&mut self) -> Option<Effects> {
+        let snapshot = self.snapshot.as_ref().filter(|s| !s.holder)?;
+        let prefix = snapshot.parameters.key.bucket_id.to_bytes().to_vec();
         self.state = State::Holders;
-        smallvec![Effect::Storage(StorageEffect::Iter {
+        Some(smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BUCKET_HOLDER_KEYSPACE.to_string(),
-            prefix: Some(snapshot.parameters.key.bucket_id.to_bytes().to_vec().into()),
+            prefix: Some(prefix.into()),
             start: None,
             limit: usize::MAX,
             txn_id: self.txn
-        })]
+        })])
     }
     /// Tells every current holder except the member that the member waits for keys.
     pub(super) fn notify_holders(&mut self, values: Vec<(Key, Value)>) -> Effects {

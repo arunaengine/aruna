@@ -385,6 +385,29 @@ async fn abe_holders() -> TestResult<()> {
         let (status, pending) = send(http.post(&requests).bearer_auth(&reader).json(&exact)).await?;
         assert_eq!(status, StatusCode::ACCEPTED);
         let request_id = pending["fields"]["request_id"].as_str().unwrap().to_string();
+
+        // A new own request notifies each holder once; the reused repeat sends nothing.
+        let (status, again) = send(http.post(&requests).bearer_auth(&reader).json(&exact)).await?;
+        assert_eq!((status, again["fields"]["request_id"].as_str()), (StatusCode::ACCEPTED, Some(request_id.as_str())));
+        let inbox = format!("{base}/api/v1/system/notifications");
+        let notices = |token: String| {
+            let request = http.get(&inbox).bearer_auth(token);
+            async move {
+                let (_, list) = send(request).await.unwrap_or((StatusCode::OK, Value::Null));
+                list["notifications"].as_array().into_iter().flatten().filter(|n| n["kind"] == "bucket_key_pending" && n["bucket"] == BUCKET).count()
+            }
+        };
+        let (holders, notices) = (&[owner.clone(), holder.clone()], &notices);
+        let notified = |count: usize| async move {
+            for token in holders {
+                let wait = std::time::Duration::from_millis(50);
+                shared::wait_until("key pending notice", std::time::Duration::from_secs(120), wait, || async { notices(token.clone()).await >= count }).await?;
+                // The outbox drains in order, so an extra notice would be here already.
+                assert_eq!(notices(token.clone()).await, count);
+            }
+            Ok::<(), Box<dyn std::error::Error>>(())
+        };
+        notified(1).await?;
         let (status, _) = send(http.get(&requests).bearer_auth(&reader)).await?;
         assert_eq!(status, StatusCode::FORBIDDEN);
         let (_, owned) = send(http.get(&requests).bearer_auth(&owner)).await?;
@@ -456,6 +479,7 @@ async fn abe_holders() -> TestResult<()> {
         let (status, pending) = send(http.post(&requests).bearer_auth(&reader).json(&exact)).await?;
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_ne!(pending["fields"]["request_id"].as_str(), Some(request_id.as_str()));
+        notified(2).await?;
 
         // A key published between recipient lookup and grant commit aborts the publication.
         let (_, owned) = send(http.get(&requests).bearer_auth(&owner)).await?;

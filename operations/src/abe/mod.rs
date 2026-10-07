@@ -278,6 +278,15 @@ impl KeyOperation {
                 txn_id: self.txn
             })];
         }
+        // A member's own new request notifies holders once; reused requests send nothing.
+        if matches!(self.action, KeyAction::Request(_))
+            && matches!(self.result, Some(KeyResult::Request(_)))
+            && !self.reused
+            && !std::mem::replace(&mut self.fresh, true)
+            && let Some(effects) = self.holders()
+        {
+            return effects;
+        }
         if matches!(self.action, KeyAction::Member(_))
             && !matches!(self.result, Some(KeyResult::Opened(_)))
         {
