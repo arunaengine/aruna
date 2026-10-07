@@ -199,13 +199,19 @@ impl ReissueOperation {
             })];
         };
         self.step = Step::Run;
-        let sub = boxed_suboperation(run, |result| {
-            if let Err(error) = result {
-                tracing::warn!(event = "abe.reissue.failed", error = %error);
+        // Only a recipient no longer eligible is skipped; other failures keep the page for a retry.
+        let sub = boxed_suboperation(run, |result| match result {
+            Ok(_)
+            | Err(KeyError::Denied | KeyError::Missing)
+            | Err(KeyError::Abe(AbeError::Stale | AbeError::Scope)) => {
+                Event::SubOperation(SubOperationEvent::KeyRequestsOpened {
+                    request_ids: Vec::new(),
+                })
             }
-            Event::SubOperation(SubOperationEvent::KeyRequestsOpened {
-                request_ids: Vec::new(),
-            })
+            Err(error) => {
+                tracing::warn!(event = "abe.reissue.failed", error = %error);
+                Event::SubOperation(SubOperationEvent::KeyRequestsFailed)
+            }
         });
         smallvec![Effect::SubOperation(sub)]
     }
@@ -272,6 +278,9 @@ impl Operation for ReissueOperation {
             (Step::Run, Event::SubOperation(SubOperationEvent::KeyRequestsOpened { .. })) => {
                 self.run_next()
             }
+            (Step::Run, Event::SubOperation(SubOperationEvent::KeyRequestsFailed)) => {
+                self.finish(Err(KeyError::Storage))
+            }
             (Step::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
                 self.txn = Some(txn_id);
                 self.step = Step::Check;
@@ -314,5 +323,29 @@ impl Operation for ReissueOperation {
         self.txn.take().map_or_else(Effects::new, |txn_id| {
             smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_run_keeps_cursor() {
+        let realm_id = aruna_core::structs::identity::realm::RealmId([1; 32]);
+        let auth = AuthContext {
+            user_id: UserId::nil(realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let mut operation = ReissueOperation::new("bucket".into(), auth, node, 1, 1);
+        operation.step = Step::Run;
+        operation.next = Some(progress(2, false, b"next"));
+        let failed = Event::SubOperation(SubOperationEvent::KeyRequestsFailed);
+        // No progress write follows: a later run resumes from the saved cursor.
+        assert!(operation.step(failed).is_empty());
+        assert_eq!(operation.finalize(), Err(KeyError::Storage));
     }
 }

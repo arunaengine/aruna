@@ -108,6 +108,8 @@ pub enum SubOperationEvent {
     EpochsMarked {
         result: Result<(), StorageError>,
     },
+    /// A key request run failed and may succeed on retry.
+    KeyRequestsFailed,
 }
 
 #[derive(Debug, PartialEq)]
