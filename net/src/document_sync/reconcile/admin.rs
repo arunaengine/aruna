@@ -200,17 +200,11 @@ pub(in crate::document_sync) async fn apply_user_operation(
         conflict_write_entries(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     );
-    if deactivating {
-        writes.extend(due_writes(storage, &event, true, None, None).await?);
-    }
 
     let deletes = stale_conflict_deletes(previous_state.as_ref(), Some(&reducer_state));
     let subject_ids = changed_subject_id
         .map(|subject_id| vec![subject_id])
         .unwrap_or_else(|| user.subject_ids.clone());
-    if subject_ids.is_empty() {
-        return replace_batch_transactionally(storage, deletes, writes).await;
-    }
 
     // A transient SSI conflict must never wedge the topic: retry with yields,
     // bounded as a livelock safety valve.
@@ -219,6 +213,13 @@ pub(in crate::document_sync) async fn apply_user_operation(
         let txn_id = start_storage_transaction(storage).await?;
         let mut attempt_writes = writes.clone();
         let mut attempt_deletes = deletes.clone();
+        // Markers come from this attempt so a bucket encrypted meanwhile is included.
+        if deactivating {
+            match due_writes(storage, &event, true, None, Some(txn_id)).await {
+                Ok(due) => attempt_writes.extend(due),
+                Err(error) => return Err(abort_error(storage, txn_id, error).await),
+            }
+        }
         for subject_id in &subject_ids {
             let subject_key = subject_index_key(subject_id);
             let mut claims = match transaction_read(

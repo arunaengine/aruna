@@ -868,6 +868,87 @@ async fn deactivation_marks_due() {
 }
 
 #[tokio::test]
+async fn deactivation_rescans_retry() {
+    // A bucket encrypted before the first commit conflicts it; the retry marks that bucket due.
+    use aruna_core::keyspaces::{
+        ABE_DUE_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+    };
+    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+    use aruna_core::user::validation::DEACTIVATED_ATTRIBUTE;
+    let (_dir, real) = test_storage();
+    let realm_id = RealmId::from_bytes([70; 32]);
+    let user_id = UserId::local(Ulid::from_parts(1_660, 1), realm_id);
+    let actor = test_actor(13, user_id, realm_id);
+    let bucket_id = Ulid::from_parts(1_661, 1);
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(bucket_id),
+        key_generation: 1,
+        ..Default::default()
+    };
+    let index = [&Ulid::from_parts(1_662, 1).to_bytes()[..], b"bucket-b"].concat();
+    let rows = vec![
+        (
+            BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            b"bucket-b".to_vec().into(),
+            settings.to_bytes().unwrap().into(),
+        ),
+        (
+            GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            index.into(),
+            Vec::new().into(),
+        ),
+    ];
+
+    let (storage, receivers) = StorageHandle::new();
+    let backing = real.clone();
+    let worker = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("worker runtime");
+        let mut rows = Some(rows);
+        while let Ok((effect, response, ..)) = receivers.foreground.recv() {
+            if matches!(effect, StorageEffect::CommitTransaction { .. })
+                && let Some(rows) = rows.take()
+            {
+                runtime.block_on(batch_write_to(&backing, rows)).unwrap();
+            }
+            let Event::Storage(event) = runtime.block_on(backing.send_storage_effect(effect))
+            else {
+                panic!("storage event expected");
+            };
+            response.send(event);
+        }
+    });
+
+    apply_admin_operation(
+        &storage,
+        DocumentTarget::User { user_id },
+        test_admin_event(
+            Ulid::from_parts(1_663, 1),
+            AdminDocumentTarget::User { user_id },
+            &actor,
+            1,
+            AdminDocumentOperation::UserAttributeSet {
+                key: DEACTIVATED_ATTRIBUTE.to_string(),
+                value: "true".to_string(),
+            },
+        ),
+    )
+    .await
+    .expect("deactivation applies");
+    drop(storage);
+    worker.join().expect("storage worker");
+    let due: ByteView = bucket_id.to_bytes().to_vec().into();
+    assert!(
+        read_storage_value(&real, ABE_DUE_KEYSPACE, due)
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn replicated_revocation_applies() {
     // A revocation replicated from another node must pass the realm-config
     // storage-apply whitelist and deny the token on this node.
