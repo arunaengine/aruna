@@ -703,12 +703,12 @@ async fn abe_holders() -> TestResult<()> {
         let response = http.post(format!("{encryption}/lock")).bearer_auth(&owner).send().await?;
         assert!(response.status().is_success());
 
-        // A copied version has no envelope and a missing version is not found.
+        // An unlocked copy has its own envelope and a missing version is not found.
         let content = format!("{base}/api/v1/data/blobs/content");
         let envelope_route = format!("{base}/api/v1/data/blobs/envelope");
         let copy_query = [("bucket", BUCKET), ("key", "foo/copy"), ("version_id", &copy_version)];
         let (status, body) = send(http.get(query_url(&content, &copy_query)?).bearer_auth(&reader)).await?;
-        assert_eq!((status, body["code"].as_str()), (StatusCode::CONFLICT, Some("envelope_pending")));
+        assert_eq!((status, body["code"].as_str()), (StatusCode::LOCKED, Some("object_key_required")));
         let missing = Ulid::generate().to_string();
         let missing_query = [("bucket", BUCKET), ("key", "foo/data"), ("version_id", &missing)];
         let (status, _) = send(http.get(query_url(&envelope_route, &missing_query)?).bearer_auth(&reader)).await?;
