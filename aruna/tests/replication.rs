@@ -1934,6 +1934,7 @@ async fn encrypted_sync_regrants() -> TestResult<()> {
         let body = b"sealed on the source, granted to the target".repeat(64);
         let (http, token) = (reqwest::Client::new(), &harness.seed_token);
         let base = &harness.joiner.base_url;
+        shared::add_user(harness.joiner.context.as_ref(), harness.seed.user_id).await?;
         harness.create_bucket_pair(source, target).await?;
         encrypt_bucket(&harness.seed_client, source).await?;
         let user_private = SecretBytes::new(vec![7; 32]);
