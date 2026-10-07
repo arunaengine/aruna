@@ -1509,3 +1509,110 @@ async fn abe_rotation() -> TestResult<()> {
     seed.shutdown().await;
     result
 }
+
+#[tokio::test]
+async fn abe_conversion() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let http = &reqwest::Client::new();
+        let base = seed.base_url.clone();
+        let token = &create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&base, token, "ABE conversion").await?;
+        let user_private = SecretBytes::new(vec![7; 32]);
+        let public = public_key_of(&user_private).unwrap();
+        add_key(&base, token, "conversion-1", public).await?;
+        let credentials = create_s3_credentials(&base, token, &group.group_id).await?;
+        let s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
+        let bucket = "abe-conversion";
+        s3.create_bucket().bucket(bucket).send().await?;
+        let upload = s3
+            .put_object()
+            .bucket(bucket)
+            .key("foo/data")
+            .body(b"plain bytes".to_vec().into())
+            .send()
+            .await?;
+        let version = upload.version_id().unwrap().to_string();
+        let encryption = &format!("{base}/api/v1/data/buckets/{bucket}/storage/encryption");
+        let body = json!({"mode":"vault_locked","expected_generation":0});
+        let (status, settings) = send(http.put(encryption).bearer_auth(token).json(&body)).await?;
+        assert_eq!(status, StatusCode::OK, "{settings}");
+        let query = [
+            ("bucket", bucket),
+            ("key", "foo/data"),
+            ("version_id", version.as_str()),
+        ];
+        let envelope_url = &query_url(&format!("{base}/api/v1/data/blobs/envelope"), &query)?;
+        shared::wait_until(
+            "converted version",
+            std::time::Duration::from_secs(120),
+            std::time::Duration::from_millis(100),
+            || async move {
+                let Ok((_, status)) = send(http.get(encryption).bearer_auth(token)).await else {
+                    return false;
+                };
+                let request = http.get(envelope_url.clone()).bearer_auth(token);
+                // The old plaintext waits out its reclaim grace, so the transition stays in cleanup.
+                status["transition"]["done"] == 1
+                    && send(request)
+                        .await
+                        .is_ok_and(|(code, _)| code == StatusCode::OK)
+            },
+        )
+        .await?;
+        let request = format!("{base}/api/v1/data/buckets/{bucket}/abe/requests");
+        let scope = json!({"scope":{"kind":"subtree","value":"foo/"}});
+        let (status, issued) = send(http.post(&request).bearer_auth(token).json(&scope)).await?;
+        assert_eq!(status, StatusCode::OK, "{issued}");
+        let grant = KeyGrant::from_bytes(&bytes(&issued["record"]))?;
+        let parameters = grant.context.request.parameters.public()?;
+        let private: &[u8; 32] = user_private.expose().try_into()?;
+        let sealed = SealedSecret {
+            enc: grant.enc,
+            ciphertext: grant.ciphertext.clone(),
+        };
+        let (aad, transport) = (
+            grant.context.bytes()?,
+            [&grant.enc[..], &grant.ciphertext].concat(),
+        );
+        let key = UserKey::open(&parameters, &transport, |_| {
+            open_sealed(private, &sealed, GRANT_PURPOSE, &aad).map_err(|_| aruna_kpabe::Error)
+        })?;
+        let (status, env) = send(http.get(envelope_url.clone()).bearer_auth(token)).await?;
+        assert_eq!(status, StatusCode::OK, "{env}");
+        let cipher = Envelope::from_bytes(&parameters, &bytes(&env["envelope"]["abe"]))?;
+        let context = bytes(&env["context"]["bytes"]);
+        let object = aruna_kpabe::open(&parameters, &key, &cipher, &context)?;
+        let response = http
+            .post(format!("{encryption}/lock"))
+            .bearer_auth(token)
+            .send()
+            .await?;
+        assert!(response.status().is_success());
+        let content_url = query_url(&format!("{base}/api/v1/data/blobs/content"), &query)?;
+        let response = http
+            .get(content_url.clone())
+            .bearer_auth(token)
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::LOCKED);
+        let response = http
+            .get(content_url)
+            .bearer_auth(token)
+            .header("x-aruna-object-key", STANDARD.encode(object.as_bytes()))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await?.as_ref(), b"plain bytes");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
