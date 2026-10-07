@@ -1306,10 +1306,10 @@ async fn removes_pending_copy() {
         compute_handle: None,
     };
     let version_id = Ulid::generate();
-    seed_pending(&storage_handle, &[version_id]).await;
-    let version = VersionKey::new("bucket", "sealed", version_id)
-        .to_bytes()
-        .unwrap();
+    let location = seed_pending(&storage_handle, &[version_id]).await;
+    let version = VersionKey::new("bucket", "sealed", version_id);
+    let key = location.format.bucket_key().unwrap();
+    let version = crate::abe::copies::copy_row(key, &version).unwrap();
     storage_handle
         .send_storage_effect(StorageEffect::Write {
             key_space: ABE_COPY_KEYSPACE.to_string(),

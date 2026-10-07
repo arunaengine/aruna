@@ -3,18 +3,26 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::abe::copies::copy_row;
 use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
 };
 use aruna_core::structs::storage::abe::envelope_charge;
 
 impl DeleteObjectOperation {
-    fn envelope_key(&self) -> Result<Vec<u8>, DeleteObjectError> {
+    fn target_key(&self) -> Result<VersionKey, DeleteObjectError> {
         let version_id = self
             .input
             .version_id
             .ok_or(DeleteObjectError::InvalidOperationState)?;
-        Ok(VersionKey::new(&self.input.bucket, &self.input.key, version_id).to_bytes()?)
+        Ok(VersionKey::new(
+            &self.input.bucket,
+            &self.input.key,
+            version_id,
+        ))
+    }
+    fn envelope_key(&self) -> Result<Vec<u8>, DeleteObjectError> {
+        Ok(self.target_key()?.to_bytes()?)
     }
     pub(super) fn read_envelope_version(&mut self) -> Effects {
         let key = match self.envelope_key() {
@@ -33,8 +41,15 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
         let Some(id) = value else {
-            // A pending copy has no envelope yet, only its pending row.
-            let key = match self.envelope_key() {
+            // A pending copy has no envelope yet, only its pending row under its bucket key.
+            let location = self.target_archive.as_ref().and_then(|(_, l)| l.as_ref());
+            let Some(bucket_key) = location.and_then(|l| l.format.bucket_key()) else {
+                return self.remove_managed_copies();
+            };
+            let key = match self
+                .target_key()
+                .and_then(|version| Ok(copy_row(bucket_key, &version)?))
+            {
                 Ok(key) => key,
                 Err(err) => return self.emit_error(err),
             };

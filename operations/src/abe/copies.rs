@@ -7,7 +7,7 @@ use crate::jobs::store::iter_prefix_page;
 use crate::node::usage_stats::UsageCounterUpdate;
 use crate::s3::object::put::abe::{abe_reads, envelope_rows, parse_abe};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::errors::BlobError;
+use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     ABE_COPY_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
@@ -245,12 +245,14 @@ impl Operation for CopyEnvelopeOperation {
             (State::Create, Event::Blob(event)) => self.created(event),
             (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
                 self.txn = Some(txn_id);
-                let Ok(version) = self.version.to_bytes() else {
+                let (Ok(row), Ok(version)) =
+                    (copy_row(self.key(), &self.version), self.version.to_bytes())
+                else {
                     return self.finish(Err(AbeError::Context));
                 };
                 let bucket = self.version.bucket.as_bytes().to_vec();
                 let mut reads = vec![
-                    (ABE_COPY_KEYSPACE.to_string(), version.clone().into()),
+                    (ABE_COPY_KEYSPACE.to_string(), row.into()),
                     (BLOB_VERSIONS_KEYSPACE.to_string(), version.into()),
                     (S3_BUCKET_KEYSPACE.to_string(), bucket.clone().into()),
                     (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.into()),
@@ -269,12 +271,12 @@ impl Operation for CopyEnvelopeOperation {
                 self.located(value)
             }
             (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                let Ok(version) = self.version.to_bytes() else {
+                let Ok(row) = copy_row(self.key(), &self.version) else {
                     return self.finish(Err(AbeError::Context));
                 };
                 self.state = State::Delete;
                 smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: vec![(ABE_COPY_KEYSPACE.to_string(), version.into())],
+                    deletes: vec![(ABE_COPY_KEYSPACE.to_string(), row.into())],
                     txn_id: self.txn,
                 })]
             }
@@ -326,6 +328,14 @@ impl Operation for CopyEnvelopeOperation {
     }
 }
 
+/// Key of the pending copy row of `version`, prefixed by the bucket key its source names.
+pub(crate) fn copy_row(
+    key: BucketKeyRef,
+    version: &VersionKey,
+) -> Result<Vec<u8>, ConversionError> {
+    Ok([key.key(), version.to_bytes()?].concat())
+}
+
 /// Fails unless the bucket settings `row` still seal new writes to `key`.
 pub(crate) fn still_active(row: Option<&[u8]>, key: BucketKeyRef) -> Result<(), AbeError> {
     let settings = BucketEncryption::from_row(row).map_err(|_| AbeError::Context)?;
@@ -343,7 +353,7 @@ pub async fn complete_copies(context: &DriverContext, key: BucketKeyRef) -> Resu
         let (rows, next) = iter_prefix_page(
             &context.storage_handle,
             ABE_COPY_KEYSPACE,
-            None,
+            Some(key.key().into()),
             start_after,
             COPY_PAGE,
             None,
@@ -351,10 +361,8 @@ pub async fn complete_copies(context: &DriverContext, key: BucketKeyRef) -> Resu
         .await?;
         for (row, value) in &rows {
             let pending = PendingCopy::from_bytes(value).map_err(|error| error.to_string())?;
-            if pending.source.context.parameters.key != key {
-                continue;
-            }
-            let version = VersionKey::from_bytes(row).map_err(|error| error.to_string())?;
+            let version = row.get(key.key().len()..).unwrap_or_default();
+            let version = VersionKey::from_bytes(version).map_err(|error| error.to_string())?;
             let operation = CopyEnvelopeOperation::new(version, value.to_vec(), pending);
             match drive(operation, context).await {
                 Ok(CopyOutcome::Completed) => completed += 1,

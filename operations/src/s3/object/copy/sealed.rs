@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::abe::copies::still_active;
+use crate::abe::copies::{copy_row, still_active};
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, owner_write_effect, write_head_effect, write_version_effect,
@@ -236,13 +236,12 @@ impl SealedCopyOperation {
         self.read_abe()
     }
 
-    fn source_version(&self) -> Result<Vec<u8>, ConversionError> {
+    fn source_version(&self) -> VersionKey {
         VersionKey::new(
             &self.input.bucket,
             &self.input.source_key,
             self.input.source_version_id,
         )
-        .to_bytes()
     }
 
     /// Reads the source's envelope or pending copy row and the admitted parameters and epoch.
@@ -250,10 +249,13 @@ impl SealedCopyOperation {
         let Some(key) = self.input.location.format.bucket_key() else {
             return Ok(self.begin());
         };
-        let source = self.source_version()?;
+        let source = self.source_version();
         let mut reads = vec![
-            (ABE_VERSION_KEYSPACE.to_string(), source.clone().into()),
-            (ABE_COPY_KEYSPACE.to_string(), source.into()),
+            (ABE_VERSION_KEYSPACE.to_string(), source.to_bytes()?.into()),
+            (
+                ABE_COPY_KEYSPACE.to_string(),
+                copy_row(key, &source)?.into(),
+            ),
         ];
         reads.extend(abe_reads(key));
         self.step = Step::ReadAbe;
@@ -528,7 +530,7 @@ impl SealedCopyOperation {
     /// Fences the copy's own envelope or writes its pending row; a source without either skips.
     fn publish_envelope(&mut self) -> Result<Effects, SealedCopyError> {
         if let Some(pending) = &self.pending {
-            let key = self.dest_version().to_bytes()?;
+            let key = copy_row(pending.source.context.parameters.key, &self.dest_version())?;
             let value = pending.to_bytes().map_err(abe)?;
             self.step = Step::WriteEnvelope;
             return Ok(smallvec![Effect::Storage(StorageEffect::Write {

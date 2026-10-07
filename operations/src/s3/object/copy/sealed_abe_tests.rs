@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::abe::copies::{CopyEnvelopeOperation, CopyOutcome};
+use crate::abe::copies::{CopyEnvelopeOperation, CopyOutcome, copy_row};
 use crate::abe::envelope::EnvelopeOperation;
 use crate::s3::object::put::abe::envelope_write;
 use aruna_core::compute::SecretBytes;
@@ -193,9 +193,27 @@ async fn envelope_of(
     run(operation, storage, None, Race::Off).await
 }
 
+/// The pending row of a version, whatever bucket key prefixes it.
 async fn pending_row(storage: &StorageHandle, key: &str, version_id: Ulid) -> Option<Vec<u8>> {
-    let version = VersionKey::new("bucket", key, version_id);
-    get(storage, ABE_COPY_KEYSPACE, version.to_bytes().unwrap()).await
+    let version = VersionKey::new("bucket", key, version_id)
+        .to_bytes()
+        .unwrap();
+    let event = storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: ABE_COPY_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 100,
+            txn_id: None,
+        })
+        .await;
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+        panic!("unexpected storage event: {event:?}");
+    };
+    let mut rows = values
+        .into_iter()
+        .filter(|(row, _)| row.ends_with(&version));
+    rows.next().map(|(_, value)| value.to_vec())
 }
 
 async fn complete(
@@ -316,7 +334,9 @@ async fn pending_chain_completes() {
     let row = PendingCopy::from_bytes(&pending_row(storage, "c", c).await.unwrap()).unwrap();
     assert_eq!(row.source, source);
     let a_key = VersionKey::new("bucket", SOURCE, a).to_bytes().unwrap();
-    let b_key = VersionKey::new("bucket", "b", b).to_bytes().unwrap();
+    let b_key = VersionKey::new("bucket", "b", b);
+    let b_row = copy_row(source.context.parameters.key, &b_key).unwrap();
+    let b_key = b_key.to_bytes().unwrap();
     let id = source.context.write_id.to_bytes().to_vec();
     let deletes = vec![
         (BLOB_VERSIONS_KEYSPACE.to_string(), a_key.clone().into()),
@@ -326,8 +346,8 @@ async fn pending_chain_completes() {
             aruna_core::keyspaces::ABE_ARCHIVE_KEYSPACE.to_string(),
             id.into(),
         ),
-        (BLOB_VERSIONS_KEYSPACE.to_string(), b_key.clone().into()),
-        (ABE_COPY_KEYSPACE.to_string(), b_key.into()),
+        (BLOB_VERSIONS_KEYSPACE.to_string(), b_key.into()),
+        (ABE_COPY_KEYSPACE.to_string(), b_row.into()),
     ];
     let effect = StorageEffect::BatchDelete {
         deletes,
