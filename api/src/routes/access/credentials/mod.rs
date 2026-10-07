@@ -372,7 +372,7 @@ to the group data root and can never widen them.
         ),
         (
             status = 400,
-            description = "The group id is not a ULID, the lifetime is out of range, a restriction is malformed or exceeds the count limit, too many encrypted buckets are named, `token_public_key` is missing or malformed, or `bucket_not_encrypted` when a named bucket does not encrypt",
+            description = "The group id is not a ULID, the lifetime is out of range, a restriction is malformed or exceeds the count limit, too many encrypted buckets are named, `token_public_key` is missing or malformed, `bucket_not_encrypted` when a named bucket does not encrypt, or `bucket_outside_group` when it belongs to another group",
             body = ErrorResponse,
             example = json!({"error": "bucket research-raw is not encrypted", "code": "bucket_not_encrypted"})
         ),
