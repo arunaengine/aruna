@@ -99,6 +99,9 @@ pub(crate) fn describe_event(event: &Event) -> String {
             SubOperationEvent::ReissuePaged { .. } => {
                 "Event::SubOperation(SubOperationEvent::ReissuePaged)".to_string()
             }
+            SubOperationEvent::VersionRekeyed { .. } => {
+                "Event::SubOperation(SubOperationEvent::VersionRekeyed)".to_string()
+            }
         },
         Event::Task(_) => "Event::Task".to_string(),
         Event::Search() => "Event::Search".to_string(),

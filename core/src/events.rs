@@ -114,6 +114,20 @@ pub enum SubOperationEvent {
     ReissuePaged {
         more: bool,
     },
+    /// One version of a re-key page ended.
+    VersionRekeyed {
+        outcome: RekeyOutcome,
+    },
+}
+
+/// How the re-key of one version ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RekeyOutcome {
+    Moved,
+    Skipped,
+    /// The bucket key is locked on this node.
+    Locked,
+    Failed,
 }
 
 #[derive(Debug, PartialEq)]
