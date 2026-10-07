@@ -1950,7 +1950,7 @@ async fn encrypted_sync_regrants() -> TestResult<()> {
             .await?;
         assert!(!relationship.plaintext);
 
-        harness
+        let put = harness
             .seed_client
             .put_object()
             .bucket(source)
@@ -1959,6 +1959,26 @@ async fn encrypted_sync_regrants() -> TestResult<()> {
             .send()
             .await?;
         harness.assert_object_matches(target, key, &body).await?;
+        // The target published its own envelope and object key for the copy.
+        let version = put.version_id().unwrap_or_default();
+        let mut object_keys = Vec::new();
+        for (base, bucket) in [
+            (&harness.joiner.base_url, target),
+            (&harness.seed.base_url, source),
+        ] {
+            let mut url = reqwest::Url::parse(&format!("{base}/api/v1/data/blobs/envelope"))?;
+            let query = [("bucket", bucket), ("key", key), ("version_id", version)];
+            url.query_pairs_mut().extend_pairs(query);
+            let response = reqwest::Client::new()
+                .get(url)
+                .bearer_auth(&harness.seed_token)
+                .send()
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let envelope: serde_json::Value = response.json().await?;
+            object_keys.push(envelope["context"]["public_key"].clone());
+        }
+        assert_ne!(object_keys[0], object_keys[1]);
 
         let detail = harness
             .get_sync(

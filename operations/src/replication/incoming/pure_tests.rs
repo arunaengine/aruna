@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{IncomingVersionError, IncomingVersionOperation, IncomingVersionState, ReceivedBlob};
+use aruna_core::structs::storage::abe::{
+    AbeEffect, AbeEvent, AbeParameters, EnvelopePlan, ObjectEnvelope, create_envelope,
+    create_parameters,
+};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
@@ -3540,11 +3544,10 @@ fn destination_rows(group_id: Ulid, settings: &[u8]) -> Event {
     })
 }
 
-#[test]
-fn encrypting_target_negotiates() {
-    // The plan rides on the reply, and no plain or foreign copy is probed or adopted.
-    use aruna_core::keyspaces::BUCKET_KEY_KEYSPACE;
-    let (settings, record, plan) = encrypting_target();
+/// An encrypting target that has read its plan and now reads its ABE parameters.
+fn reading_abe() -> IncomingVersionOperation {
+    use aruna_core::keyspaces::{ABE_PARAMETERS_KEYSPACE, BUCKET_KEY_KEYSPACE};
+    let (settings, record, _) = encrypting_target();
     let group_id = test_group_id();
     let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(94, 94),
@@ -3574,6 +3577,40 @@ fn encrypting_target_negotiates() {
         key: Vec::new().into(),
         value: None,
     }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { reads, txn_id: None })]
+            if reads[0].0 == ABE_PARAMETERS_KEYSPACE
+    ));
+    op
+}
+
+fn abe_rows(parameters: Option<&AbeParameters>, epoch: u64) -> Event {
+    Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (
+                vec![0u8].into(),
+                parameters.map(|p| p.to_bytes().unwrap().into()),
+            ),
+            (vec![1u8].into(), Some(epoch.to_be_bytes().to_vec().into())),
+        ],
+    })
+}
+
+fn target_parameters() -> AbeParameters {
+    let (_, _, plan) = encrypting_target();
+    let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
+    let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+    create_parameters(&secret, test_realm_id(), node, plan.key).unwrap()
+}
+
+#[test]
+fn encrypting_target_negotiates() {
+    // Without ABE parameters the plan alone rides on the reply, and no plain or foreign copy is
+    // probed or adopted.
+    let (_, _, plan) = encrypting_target();
+    let mut op = reading_abe();
+    let effects = op.step(abe_rows(None, 1));
 
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     assert_eq!(
@@ -3587,8 +3624,47 @@ fn encrypting_target_negotiates() {
     }));
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Blob(BlobEffect::HandleReplication { resolved, .. })]
+        [Effect::Blob(BlobEffect::HandleReplication { resolved, object: None, .. })]
             if resolved.encryption == Some(plan)
+    ));
+    assert_eq!(op.envelope, None);
+}
+
+#[test]
+fn abe_target_negotiates() {
+    // Admitted parameters give the replica its own object key and envelope before the transfer,
+    // and the reply carries that object key with the plan.
+    let (_, _, plan) = encrypting_target();
+    let parameters = target_parameters();
+    let mut op = reading_abe();
+    let effects = op.step(abe_rows(Some(&parameters), 2));
+    let [Effect::Blob(BlobEffect::Abe(effect))] = effects.as_slice() else {
+        panic!("expected the envelope effect, got {effects:?}")
+    };
+    let AbeEffect::Envelope(envelope_plan) = effect.as_ref() else {
+        panic!("expected an envelope plan, got {effect:?}")
+    };
+    assert_eq!(envelope_plan.epoch, 2);
+    assert_eq!(envelope_plan.bucket_public, plan.public_key);
+    assert_eq!(envelope_plan.object_key, op.manifest.key);
+    let (envelope, _) = create_envelope(envelope_plan.clone()).unwrap();
+    let object = envelope.context.public_key;
+    let event = Box::new(AbeEvent::Envelope(envelope));
+    let effects = op.step(Event::Blob(BlobEvent::Abe(event)));
+
+    assert_eq!(
+        message_from_effect(&effects[0]),
+        VersionReplicationMessage::VersionNegotiationResponse(
+            ReplicationNegotiationResult::NeedAbeBlob(plan, object)
+        )
+    );
+    let effects = op.step(Event::Blob(BlobEvent::MessageSent {
+        stream_id: Ulid::from_parts(94, 94),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::HandleReplication { object: Some(sent), .. })]
+            if *sent == object
     ));
 }
 
@@ -3751,4 +3827,120 @@ fn received_archive_pends() {
         version.map(|version| version.state),
         Some(BlobVersionState::PendingContent { .. })
     ));
+}
+
+fn target_envelope(epoch: u64) -> ObjectEnvelope {
+    let (_, _, plan) = encrypting_target();
+    let plan = EnvelopePlan {
+        parameters: target_parameters(),
+        epoch,
+        write_id: Ulid::from_parts(90, 90),
+        object_key: make_manifest(ReplicationItemKind::Materialized).key,
+        bucket_public: plan.public_key,
+    };
+    create_envelope(plan).unwrap().0
+}
+
+#[test]
+fn stale_epoch_refused() {
+    // An epoch raised since the negotiation refuses the envelope; nothing of it was stored.
+    let (settings, _, plan) = encrypting_target();
+    let settings = settings.to_bytes().unwrap();
+    let parameters = target_parameters();
+    let with_abe = |epoch: u64| {
+        let Event::Storage(StorageEvent::BatchReadResult { mut values }) = drift_rows(&settings)
+        else {
+            unreachable!()
+        };
+        let Event::Storage(StorageEvent::BatchReadResult { values: abe }) =
+            abe_rows(Some(&parameters), epoch)
+        else {
+            unreachable!()
+        };
+        values.extend(abe);
+        Event::Storage(StorageEvent::BatchReadResult { values })
+    };
+    let mut op = sealed_drift(Some(plan));
+    op.envelope = Some(target_envelope(1));
+    let effects = op.check_drift();
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 5
+    ));
+    let effects = op.step(with_abe(2));
+    assert_eq!(op.output, Some(Err(IncomingVersionError::StalePlan)));
+    assert!(effects.iter().all(|effect| !matches!(
+        effect,
+        Effect::Storage(StorageEffect::Write { .. } | StorageEffect::BatchWrite { .. })
+    )));
+
+    let mut op = sealed_drift(Some(plan));
+    op.envelope = Some(target_envelope(1));
+    op.step(with_abe(1));
+    assert_eq!(op.state, IncomingVersionState::VerifyReplaced);
+}
+
+#[test]
+fn replica_publishes_envelope() {
+    // The envelope, its mappings and its charge are written in the version's transaction.
+    use aruna_core::keyspaces::{
+        ABE_ARCHIVE_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
+    };
+    use aruna_core::structs::storage::abe::EnvelopeArchive;
+    use aruna_core::structs::storage::blob::ArchiveKey;
+    use aruna_core::structs::storage::format::PithosLayout;
+    let (_, _, plan) = encrypting_target();
+    let mut location = make_location();
+    location.hashes.clear();
+    let layout = PithosLayout {
+        stored_size: 300,
+        metadata_digest: [6; 32],
+        storage_generation: plan.storage_generation,
+    };
+    location.format = StoredFormat::pithos(layout, plan.key);
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(98, 98),
+        iroh::SecretKey::from_bytes(&[98; 32]).public(),
+        test_realm_id(),
+        make_manifest(ReplicationItemKind::Materialized),
+    );
+    let envelope = target_envelope(1);
+    op.seal_plan = Some(plan);
+    op.envelope = Some(envelope.clone());
+    op.destination_group_id = Some(test_group_id());
+    op.txn_id = Some(Ulid::from_parts(99, 99));
+    op.received_blob = Some(ReceivedBlob::reserved(location.clone()));
+
+    let mut effects = op.write_blob_version();
+    let mut writes = None;
+    while let Some(effect) = effects.first() {
+        if let Effect::Storage(StorageEffect::BatchWrite { writes: rows, .. }) = effect {
+            writes = Some(rows.clone());
+            break;
+        }
+        effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: Vec::new().into(),
+        }));
+    }
+    let writes = writes.expect("the envelope rows are written");
+    let spaces: Vec<_> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
+    assert_eq!(
+        spaces,
+        [
+            ABE_ENVELOPE_KEYSPACE,
+            ABE_VERSION_KEYSPACE,
+            ABE_ARCHIVE_KEYSPACE
+        ]
+    );
+    assert_eq!(ObjectEnvelope::from_bytes(&writes[0].2).unwrap(), envelope);
+    let archive: EnvelopeArchive = postcard::from_bytes(&writes[2].2).unwrap();
+    assert_eq!(archive.archive, ArchiveKey::of(&location));
+    assert!(archive.location_key.is_empty());
+    assert!(op.envelope_bytes > 0);
+    let delta = op.usage_delta().unwrap();
+    let size = op.manifest.blob.as_ref().unwrap().size;
+    assert_eq!(
+        delta.logical_bytes,
+        i128::from(size + op.envelope_bytes) - i128::from(op.replaced_logical_bytes)
+    );
 }
