@@ -223,6 +223,11 @@ fn unexpected() -> ServerError {
 - Repeating an issued request returns its current grant (`200`).
 - A recipient holds at most 64 current grants per bucket; a new grant past that returns `413`.
 - At most 64 open requests per recipient and bucket; a new one past that returns `413`.
+- A scope that cannot be a continuing key returns `422` `scope_unsupported`; the kind `writes`
+  with a prefix then asks for enumerated grants of the current files there the caller may read.
+- `writes` gives one grant per epoch of those files, never for later files, and returns
+  `{ "request_ids": [...] }`: `200` when all are issued, `202` while some wait for a holder.
+- More than 62 readable files under the prefix return `413` `enumeration_limit` with the count.
 - Binary fields use padded base64; request ids use ULIDs."#, params(("bucket" = String, Path, description = "Node-local S3 bucket name")),
     request_body(content = RequestBody, example = json!({"scope":{"kind":"subtree","value":"foo/"}})),
     responses((status = 200, body = RecordView, description = "Node-issued grant", example = json!({"fields":{},"record":"AA==","aad":"AA=="})),
@@ -242,7 +247,7 @@ pub async fn request_key(
     let scope = match body.scope {
         ScopeView::Exact(v) => KeyScope::Exact(v),
         ScopeView::Subtree(v) => KeyScope::Subtree(v),
-        ScopeView::Writes(_) => return Err(abe_error(AbeError::Scope)),
+        ScopeView::Writes(prefix) => return request_writes(&state, auth, bucket, prefix).await,
     };
     scope.validate().map_err(|_| ServerError::BadRequest)?;
     match execute(&state, auth, bucket, KeyAction::Request(scope)).await? {
@@ -257,6 +262,33 @@ pub async fn request_key(
         }
         _ => Err(unexpected()),
     }
+}
+
+/// Opens enumerated grants for the readable current files under `prefix`; `200` once all are
+/// issued, else `202` with the open request ids.
+async fn request_writes(
+    state: &ServerState,
+    auth: AuthContext,
+    bucket: String,
+    prefix: String,
+) -> ServerResult<(StatusCode, Json<RecordView>)> {
+    let scope = KeyScope::Subtree(prefix.clone());
+    scope.validate().map_err(|_| ServerError::BadRequest)?;
+    let KeyResult::Opened(ids) = execute(state, auth, bucket, KeyAction::Writes(prefix)).await?
+    else {
+        return Err(unexpected());
+    };
+    let status = match ids.is_empty() {
+        true => StatusCode::OK,
+        false => StatusCode::ACCEPTED,
+    };
+    let ids: Vec<String> = ids.iter().map(Ulid::to_string).collect();
+    let view = RecordView {
+        fields: json!({"request_ids":ids}),
+        record: String::new(),
+        aad: None,
+    };
+    Ok((status, Json(view)))
 }
 
 #[utoipa::path(get, path = "/data/buckets/{bucket}/abe/requests", tag = "data/blobs",
