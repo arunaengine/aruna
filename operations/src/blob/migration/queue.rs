@@ -319,6 +319,7 @@ async fn settle(
         store(storage, bucket, &mut record).await?;
         return Ok(Some(RECHECK));
     }
+    reclaim_uploads(storage, &record).await?;
     record.remaining = 0;
     record.blocked_reason = None;
     record.state = TransitionState::Finished;
@@ -700,32 +701,6 @@ async fn source_versions(
     }
 }
 
-/// Every row of `key_space` under `prefix`, read in `txn_id`.
-async fn scan(
-    storage: &StorageHandle,
-    key_space: &str,
-    prefix: Option<Key>,
-    txn_id: TxnId,
-) -> Result<Vec<(Key, Value)>, String> {
-    let (mut after, mut all) = (None, Vec::new());
-    loop {
-        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
-            storage,
-            key_space,
-            prefix.clone(),
-            after,
-            PAGE,
-            Some(txn_id),
-        )
-        .await?;
-        all.extend(rows);
-        match cursor {
-            Some(cursor) => after = Some(cursor),
-            None => return Ok(all),
-        }
-    }
-}
-
 /// The retiring source generation of `record`, if it has one.
 fn retiring(record: &EncryptionTransition) -> Option<BucketKeyRef> {
     let source = record.source?;
@@ -747,27 +722,110 @@ async fn envelopes_on_source(
     let Some(source) = retiring(record) else {
         return Ok(0);
     };
-    let prefix = VersionKey::bucket_prefix(bucket).map_err(|e| e.to_string())?;
-    let mut count = 0;
-    for (_, id) in scan(storage, ABE_VERSION_KEYSPACE, Some(prefix.into()), txn_id).await? {
-        let read = StorageEffect::Read {
-            key_space: ABE_ENVELOPE_KEYSPACE.to_string(),
-            key: id,
+    let prefix: Key = VersionKey::bucket_prefix(bucket)
+        .map_err(|e| e.to_string())?
+        .into();
+    let (mut after, mut count) = (None, 0);
+    loop {
+        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+            storage,
+            ABE_VERSION_KEYSPACE,
+            Some(prefix.clone()),
+            after,
+            PAGE,
+            Some(txn_id),
+        )
+        .await?;
+        let reads = rows
+            .into_iter()
+            .map(|(_, id)| (ABE_ENVELOPE_KEYSPACE.to_string(), id))
+            .collect();
+        let read = StorageEffect::BatchRead {
+            reads,
             txn_id: Some(txn_id),
         };
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) =
+        let Event::Storage(StorageEvent::BatchReadResult { values }) =
             storage.send_storage_effect(read).await
         else {
-            return Err("could not read an envelope".to_string());
+            return Err("could not read envelopes".to_string());
         };
-        count += u64::from(value.is_some_and(|value| envelope_key(&value) == Some(source)));
+        let used = values.iter().filter_map(|(_, value)| value.as_deref());
+        count += used
+            .filter(|value| envelope_key(value) == Some(source))
+            .count() as u64;
+        match cursor {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
     }
-    let prefix = source.bucket_id.to_bytes().to_vec().into();
-    for (_, row) in scan(storage, ABE_COPY_KEYSPACE, Some(prefix), txn_id).await? {
-        let pending = PendingCopy::from_bytes(&row).map_err(|e| e.to_string())?;
-        count += u64::from(pending.source.context.parameters.key == source);
+    let prefix: Key = source.bucket_id.to_bytes().to_vec().into();
+    let mut after = None;
+    loop {
+        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+            storage,
+            ABE_COPY_KEYSPACE,
+            Some(prefix.clone()),
+            after,
+            PAGE,
+            Some(txn_id),
+        )
+        .await?;
+        for (_, row) in rows {
+            let pending = PendingCopy::from_bytes(&row).map_err(|e| e.to_string())?;
+            count += u64::from(pending.source.context.parameters.key == source);
+        }
+        match cursor {
+            Some(cursor) => after = Some(cursor),
+            None => return Ok(count),
+        }
     }
-    Ok(count)
+}
+
+/// Uploads that captured the retiring source can never complete, so their envelopes go, one
+/// page per atomic batch.
+async fn reclaim_uploads(
+    storage: &StorageHandle,
+    record: &EncryptionTransition,
+) -> Result<u64, String> {
+    let Some(source) = retiring(record) else {
+        return Ok(0);
+    };
+    let (mut after, mut count) = (None, 0);
+    loop {
+        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+            storage,
+            ABE_PENDING_KEYSPACE,
+            None,
+            after,
+            PAGE,
+            None,
+        )
+        .await?;
+        let deletes: Vec<_> = rows
+            .into_iter()
+            .filter(|(_, value)| envelope_key(value) == Some(source))
+            .map(|(upload, _)| (ABE_PENDING_KEYSPACE.to_string(), upload))
+            .collect();
+        count += deletes.len() as u64;
+        if !deletes.is_empty() {
+            let delete = StorageEffect::BatchDelete {
+                deletes,
+                txn_id: None,
+            };
+            match storage.send_storage_effect(delete).await {
+                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
+                other => {
+                    return Err(format!(
+                        "could not remove stale upload envelopes: {other:?}"
+                    ));
+                }
+            }
+        }
+        match cursor {
+            Some(cursor) => after = Some(cursor),
+            None => return Ok(count),
+        }
+    }
 }
 
 /// No copy needs the source generation any more: it retires and its node copy is removed.
@@ -803,16 +861,6 @@ async fn retire_source(
         value: key.to_bytes().map_err(|e| e.to_string())?.into(),
         txn_id: Some(txn_id),
     }];
-    // Uploads that captured the source can never complete, so their envelopes go with it.
-    for (upload, value) in scan(storage, ABE_PENDING_KEYSPACE, None, txn_id).await? {
-        if envelope_key(&value) == Some(source) {
-            effects.push(StorageEffect::Delete {
-                key_space: ABE_PENDING_KEYSPACE.to_string(),
-                key: upload,
-                txn_id: Some(txn_id),
-            });
-        }
-    }
     if let Some(id) = vault {
         effects.push(StorageEffect::VaultDelete {
             entry: VaultEntry::new(VaultPurpose::BucketKey, id),
@@ -1399,10 +1447,83 @@ mod tests {
         assert_eq!(left, Ok(1));
     }
 
-    #[tokio::test]
-    async fn retirement_waits_envelopes() {
+    fn source_envelope(source: BucketKeyRef) -> ObjectEnvelope {
         use aruna_core::compute::SecretBytes;
         use aruna_core::structs::storage::abe::{EnvelopePlan, create_envelope, create_parameters};
+        let private = SecretBytes::new(vec![9; 32]);
+        let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([3; 32]);
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let parameters = create_parameters(&private, realm, node, source);
+        let plan = EnvelopePlan {
+            parameters: parameters.unwrap(),
+            epoch: 1,
+            write_id: Ulid::generate(),
+            object_key: "k".to_string(),
+            bucket_public: [4; 32],
+        };
+        create_envelope(plan).unwrap().0
+    }
+
+    #[tokio::test]
+    async fn retirement_pages_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = context(directory.path());
+        let storage = &context.storage_handle;
+        let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
+        let target = TransitionTarget {
+            compression: Compression::Off,
+            plan: None,
+        };
+        let record = EncryptionTransition::new(TransitionKind::Decrypt, Some(source), target, 2, 1);
+        let envelope = source_envelope(source).to_bytes().unwrap();
+        let id = Ulid::generate().to_bytes().to_vec();
+        put(
+            &context,
+            ABE_ENVELOPE_KEYSPACE,
+            id.clone(),
+            envelope.clone(),
+        )
+        .await;
+        let rows = 2 * PAGE + 1;
+        for _ in 0..rows {
+            let version = VersionKey::new("b", "k", Ulid::generate())
+                .to_bytes()
+                .unwrap();
+            put(&context, ABE_VERSION_KEYSPACE, version, id.clone()).await;
+            let upload = Ulid::generate().to_bytes().to_vec();
+            put(&context, ABE_PENDING_KEYSPACE, upload, envelope.clone()).await;
+        }
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
+            .send_storage_effect(StorageEffect::StartTransaction { read: true })
+            .await
+        else {
+            panic!("no transaction")
+        };
+
+        let counted = envelopes_on_source(storage, txn_id, "b", &record).await;
+        storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+        let reclaimed = reclaim_uploads(storage, &record).await;
+        let (left, _) = crate::jobs::store::iter_prefix_page(
+            storage,
+            ABE_PENDING_KEYSPACE,
+            None,
+            None,
+            PAGE,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Both walks cross two page boundaries; reclaim deletes one page per batch.
+        assert_eq!(counted, Ok(rows as u64));
+        assert_eq!(reclaimed, Ok(rows as u64));
+        assert!(left.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retirement_waits_envelopes() {
         let directory = tempfile::tempdir().unwrap();
         let context = context(directory.path());
         let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
@@ -1433,18 +1554,7 @@ mod tests {
             Vec::new(),
         )
         .await;
-        let private = SecretBytes::new(vec![9; 32]);
-        let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([3; 32]);
-        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
-        let parameters = create_parameters(&private, realm, node, source);
-        let plan = EnvelopePlan {
-            parameters: parameters.unwrap(),
-            epoch: 1,
-            write_id: Ulid::generate(),
-            object_key: "k".to_string(),
-            bucket_public: [4; 32],
-        };
-        let (envelope, _) = create_envelope(plan).unwrap();
+        let envelope = source_envelope(source);
         // An unfinished upload that captured the source never completes and never blocks.
         let upload = Ulid::generate().to_bytes().to_vec();
         let upload_row = envelope.to_bytes().unwrap();
