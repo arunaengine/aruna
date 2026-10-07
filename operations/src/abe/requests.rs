@@ -319,8 +319,8 @@ impl KeyOperation {
         epochs.truncate(MAX_EPOCHS);
         epochs.sort_unstable();
         request.epochs = epochs;
-        // A full open-request queue refuses only after no reusable grant is found.
-        if self.queue_full {
+        // A full open-request queue refuses only a first batch without a reusable grant.
+        if self.queue_full && self.result.is_none() {
             return self.fail(AbeError::Limit);
         }
         // After a holder's grant the next batch waits as one open request for a holder.
@@ -378,8 +378,8 @@ impl KeyOperation {
             .push((ABE_GRANT_KEYSPACE.to_string(), key, bytes.into()));
         self.index_token(&grant.context.request);
         self.result = Some(KeyResult::Grant(grant));
-        // A holder's batch may leave older epochs, which a follow-up request covers.
-        self.more |= matches!(self.action, KeyAction::Publish(_));
+        // Any batch, even of a reused open request, may leave older epochs: rescan the coverage.
+        self.more = true;
         self.flush()
     }
     /// Scans the recipient's grants again for the next batch of `request`'s scope.

@@ -2103,6 +2103,29 @@ async fn abe_epochs() -> TestResult<()> {
                 (epoch, true)
             );
         }
+
+        // A request opened while locked and repeated after unlock gets every epoch from the node.
+        let after = add_member(&seed, &owner, &group.group_id, Value::Null).await?;
+        let after_private = SecretBytes::new(vec![15; 32]);
+        let after_public = public_key_of(&after_private).unwrap();
+        add_key(&base, &after, "after-1", after_public).await?;
+        let (status, body) = send(http.post(&requests).bearer_auth(&after).json(&subtree)).await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let unlock = format!("{encryption}/unlock?bucket_id={bucket_id}&generation={generation}");
+        let response = http
+            .post(unlock)
+            .bearer_auth(&owner)
+            .header("content-type", "application/octet-stream")
+            .body(bucket_private.expose().to_vec())
+            .send()
+            .await?;
+        assert!(response.status().is_success());
+        let (status, body) = send(http.post(&requests).bearer_auth(&after).json(&subtree)).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let keys = user_keys(&base, &after, &after_private).await?;
+        let epochs: std::collections::BTreeSet<u64> =
+            keys.iter().flat_map(|(e, _, _)| e.clone()).collect();
+        assert_eq!(epochs, (1..=18).collect());
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
