@@ -1075,11 +1075,9 @@ pub(crate) mod test {
         // A reference of a locked encrypting bucket is not preserved into another bucket, where
         // its external bytes would be readable without the source's key.
         use aruna_core::compute::{SecretBytes, SharedSecret};
-        use aruna_core::keyspaces::{BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE};
         use aruna_core::structs::execution::job::RoCrateLimits;
         use aruna_core::structs::storage::encryption::{
-            BucketKeyRecord, BucketKeyRef, EncryptionMode, TokenCredential, generate_token,
-            public_key_of, seal_token,
+            BucketKeyError, EncryptionMode, TokenCredential,
         };
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([6u8; 32]);
@@ -1176,64 +1174,21 @@ pub(crate) mod test {
         // Within its own bucket the reference stays behind the same lock, so it is kept.
         copy_object(&context, request("locked")).await.unwrap();
 
-        // A token credential of a key holder admits the copy while the bucket stays locked.
-        let key = BucketKeyRef::new(settings.bucket_id.unwrap(), 1);
-        let private = SecretBytes::new(vec![9; 32]);
-        let public = public_key_of(&private).unwrap();
-        seed_authority(&context, realm_id, group_id, user_id).await;
-        let record = BucketKeyRecord::new(key, Ulid::generate(), public, 1);
-        let token = generate_token().unwrap();
-        let other = UserId::local(Ulid::generate(), realm_id);
-        let sealed = |access_key: &str, creator| {
-            let holder = (access_key, creator);
-            let origin = (realm_id, node_id);
-            seal_token(key, &public, &private, origin, holder, token.bytes(), 1).unwrap()
-        };
-        for (space, row_key, value) in [
-            (BUCKET_KEY_KEYSPACE, key.key(), record.to_bytes().unwrap()),
-            (
-                KEY_COPY_KEYSPACE,
-                sealed("HOLDER", user_id).key(),
-                sealed("HOLDER", user_id).to_bytes().unwrap(),
-            ),
-            (
-                KEY_COPY_KEYSPACE,
-                sealed("FORMER", other).key(),
-                sealed("FORMER", other).to_bytes().unwrap(),
-            ),
-        ] {
-            let write = StorageEffect::Write {
-                key_space: space.to_string(),
-                key: row_key.into(),
-                value: value.into(),
-                txn_id: None,
-            };
-            context.storage_handle.send_storage_effect(write).await;
-        }
-        let read = |access_key: &str, token: &SharedSecret| {
-            Some(TokenRead {
-                credential: TokenCredential {
-                    access_key: access_key.to_string(),
-                    token: token.clone(),
-                },
-                limits: RoCrateLimits::default(),
-            })
-        };
-        let key_error = |result: Result<CopyResultData, CopyObjectError>| match result {
+        // A token opens single objects only, so it admits no reference copy of a locked bucket.
+        let token = Some(TokenRead {
+            credential: TokenCredential {
+                access_key: "HOLDER".to_string(),
+                token: SharedSecret::new(SecretBytes::new(vec![9; 32])),
+            },
+            limits: RoCrateLimits::default(),
+        });
+        let refused = copy_object_token(&context, request("plain"), token).await;
+        assert!(matches!(
+            refused,
             Err(CopyObjectError::Get(GetObjectError::ConversionError(
-                ConversionError::BucketKey(error),
-            ))) => error,
-            other => panic!("expected a key refusal, got {other:?}"),
-        };
-        // A wrong token fails typed, and a token whose creator holds no key opens nothing.
-        let wrong = generate_token().unwrap();
-        let refused = copy_object_token(&context, request("plain"), read("HOLDER", &wrong)).await;
-        assert_eq!(key_error(refused), BucketKeyError::InvalidToken);
-        let refused = copy_object_token(&context, request("plain"), read("FORMER", &token)).await;
-        assert_eq!(key_error(refused), BucketKeyError::Locked(key.bucket_id));
-        copy_object_token(&context, request("plain"), read("HOLDER", &token))
-            .await
-            .unwrap();
+                ConversionError::BucketKey(BucketKeyError::Locked(_))
+            )))
+        ));
     }
 
     /// Stores the realm and group documents, so `owner` holds the group's roles.
