@@ -1348,3 +1348,164 @@ async fn abe_members() -> TestResult<()> {
     seed.shutdown().await;
     result
 }
+
+#[tokio::test]
+async fn abe_rotation() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let http = &reqwest::Client::new();
+        let base = seed.base_url.clone();
+        let token = &create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&base, token, "ABE rotation").await?;
+        let user_private = SecretBytes::new(vec![7; 32]);
+        add_key(
+            &base,
+            token,
+            "rotation-1",
+            public_key_of(&user_private).unwrap(),
+        )
+        .await?;
+        let credentials = create_s3_credentials(&base, token, &group.group_id).await?;
+        let s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
+        let bucket = "abe-rotation";
+        s3.create_bucket().bucket(bucket).send().await?;
+        let encryption = format!("{base}/api/v1/data/buckets/{bucket}/storage/encryption");
+        let body = json!({"mode":"node_managed","expected_generation":0});
+        let (status, settings) = send(http.put(&encryption).bearer_auth(token).json(&body)).await?;
+        assert_eq!(status, StatusCode::OK, "{settings}");
+        let upload = s3
+            .put_object()
+            .bucket(bucket)
+            .key("foo/data")
+            .body(b"rotated bytes".to_vec().into())
+            .send()
+            .await?;
+        let first = upload.version_id().unwrap().to_string();
+        let source = format!("{bucket}/foo/data?versionId={first}");
+        // Every copy shares the archive and object key; each version moves in its own unit.
+        let mut versions = vec![("foo/data".to_string(), first)];
+        for n in 0..12 {
+            let key = format!("foo/copy-{n}");
+            let copied = s3
+                .copy_object()
+                .bucket(bucket)
+                .key(&key)
+                .copy_source(&source)
+                .send()
+                .await?;
+            versions.push((key, copied.version_id().unwrap().to_string()));
+        }
+        let versions = &versions;
+        let private: &[u8; 32] = user_private.expose().try_into()?;
+        let request = &format!("{base}/api/v1/data/buckets/{bucket}/abe/requests");
+        let envelope_route = &format!("{base}/api/v1/data/blobs/envelope");
+        let content_route = &format!("{base}/api/v1/data/blobs/content");
+        // Issues a foo/ key and opens the object key of every version with it.
+        let open_all = || async move {
+            let scope = json!({"scope":{"kind":"subtree","value":"foo/"}});
+            let (status, issued) = send(http.post(request).bearer_auth(token).json(&scope)).await?;
+            assert_eq!(status, StatusCode::OK, "{issued}");
+            let grant = KeyGrant::from_bytes(&bytes(&issued["record"]))?;
+            let parameters = grant.context.request.parameters.public()?;
+            let sealed = SealedSecret {
+                enc: grant.enc,
+                ciphertext: grant.ciphertext.clone(),
+            };
+            let (aad, transport) = (
+                grant.context.bytes()?,
+                [&grant.enc[..], &grant.ciphertext].concat(),
+            );
+            let key = UserKey::open(&parameters, &transport, |_| {
+                open_sealed(private, &sealed, GRANT_PURPOSE, &aad).map_err(|_| aruna_kpabe::Error)
+            })?;
+            let mut objects = Vec::new();
+            for (name, version) in versions {
+                let query = [
+                    ("bucket", bucket),
+                    ("key", name.as_str()),
+                    ("version_id", version.as_str()),
+                ];
+                let request = http
+                    .get(query_url(envelope_route, &query)?)
+                    .bearer_auth(token);
+                let (status, env) = send(request).await?;
+                assert_eq!(status, StatusCode::OK, "{env}");
+                let cipher = Envelope::from_bytes(&parameters, &bytes(&env["envelope"]["abe"]))?;
+                let context = bytes(&env["context"]["bytes"]);
+                let object = aruna_kpabe::open(&parameters, &key, &cipher, &context)?;
+                objects.push(STANDARD.encode(object.as_bytes()));
+            }
+            Ok::<_, Box<dyn std::error::Error>>(objects)
+        };
+        let old = open_all().await?;
+        let rotate = json!({"expected_generation":settings["storage_generation"]});
+        let (status, rotated) = send(
+            http.post(format!("{encryption}/rotate"))
+                .bearer_auth(token)
+                .json(&rotate),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{rotated}");
+        let generation = rotated["key_generation"].as_u64();
+        shared::wait_until(
+            "rotated envelopes",
+            std::time::Duration::from_secs(120),
+            std::time::Duration::from_millis(100),
+            || async move {
+                for (name, version) in versions {
+                    let query = [
+                        ("bucket", bucket),
+                        ("key", name.as_str()),
+                        ("version_id", version.as_str()),
+                    ];
+                    let Ok(url) = query_url(envelope_route, &query) else {
+                        return false;
+                    };
+                    match send(http.get(url).bearer_auth(token)).await {
+                        Ok((_, env)) if env["context"]["generation"].as_u64() == generation => {}
+                        _ => return false,
+                    }
+                }
+                true
+            },
+        )
+        .await?;
+        let new = open_all().await?;
+        let distinct: std::collections::HashSet<_> = new.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            versions.len(),
+            "every version gets its own object key"
+        );
+        for (((name, version), old), new) in versions.iter().zip(&old).zip(&new) {
+            let query = [
+                ("bucket", bucket),
+                ("key", name.as_str()),
+                ("version_id", version.as_str()),
+            ];
+            let read = |object: &str| {
+                let url = query_url(content_route, &query).unwrap();
+                http.get(url)
+                    .bearer_auth(token)
+                    .header("x-aruna-object-key", object)
+                    .send()
+            };
+            let response = read(new).await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.bytes().await?.as_ref(), b"rotated bytes");
+            // The old object key opens nothing current.
+            let status = read(old).await?.status();
+            assert!(!status.is_success(), "{name}: {status}");
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
