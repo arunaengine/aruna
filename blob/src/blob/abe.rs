@@ -100,6 +100,10 @@ impl BlobHandler {
                     event => event,
                 }
             }
+            AbeEffect::Envelope(plan) => match create_envelope(plan) {
+                Ok((envelope, _)) => BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope))),
+                Err(error) => BlobEvent::Error(error.into()),
+            },
             AbeEffect::Admit {
                 envelope,
                 archive,

@@ -322,6 +322,8 @@ pub enum AbeEffect {
         archive: ArchiveKey,
         private: SharedSecret,
     },
+    /// Creates an object key and its envelope without writing bytes.
+    Envelope(EnvelopePlan),
 }
 
 #[derive(Debug, PartialEq)]
@@ -332,4 +334,5 @@ pub enum AbeEvent {
         location: super::blob::BackendLocation,
         envelope: ObjectEnvelope,
     },
+    Envelope(ObjectEnvelope),
 }

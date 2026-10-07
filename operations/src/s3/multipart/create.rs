@@ -7,15 +7,19 @@ use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
 };
 use crate::s3::bucket::key::rows::settings_read;
+use crate::s3::object::put::abe::{abe_reads, parse_abe};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, UPLOAD_KEYSPACE};
+use aruna_core::keyspaces::{
+    ABE_PENDING_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, UPLOAD_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
+use aruna_core::structs::storage::abe::{AbeEffect, AbeEvent, EnvelopePlan, ObjectEnvelope};
 use aruna_core::structs::storage::blob::{BucketInfo, ResolvedBackend};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
@@ -40,11 +44,14 @@ pub enum CreateMultipartState {
     PolicyGate,
     CheckOpenFence,
     OpenUpload,
+    ReadAbe,
+    CreateEnvelope,
     StartTransaction,
     CheckPurgeFence,
     FenceBackend,
     CheckSettings,
     WriteUpload,
+    WritePending,
     CommitTransaction,
     AbortBackendUpload,
     Finish,
@@ -125,6 +132,8 @@ pub struct CreateMultipartOperation {
     /// Bucket and settings read before the gate, kept until the key record completes the plan.
     settings: Option<(Option<BucketInfo>, BucketEncryption)>,
     encryption: Option<UploadEncryption>,
+    /// The pending envelope of an encrypted upload, stored beside its record.
+    envelope: Option<ObjectEnvelope>,
     pending_error: Option<CreateMultipartError>,
     output: Option<Result<CreateMultipartResult, CreateMultipartError>>,
 }
@@ -146,6 +155,7 @@ impl CreateMultipartOperation {
             backend_upload: None,
             settings: None,
             encryption: None,
+            envelope: None,
             pending_error: None,
             output: None,
         }
@@ -205,8 +215,12 @@ impl CreateMultipartOperation {
             return self.emit_error(error.into());
         }
         // Encrypted parts are sealed pieces of their own; completion composes them.
-        if self.encryption.is_some() {
-            return self.start_transaction();
+        if let Some(encryption) = self.encryption {
+            self.state = CreateMultipartState::ReadAbe;
+            return smallvec![Effect::Storage(StorageEffect::BatchRead {
+                reads: abe_reads(encryption.plan.key),
+                txn_id: None,
+            })];
         }
         let Some(resolved) = self.resolved.clone() else {
             return self.emit_error(CreateMultipartError::CreateUploadFailed);
@@ -231,6 +245,48 @@ impl CreateMultipartOperation {
             event => self.emit_error(CreateMultipartError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Blob(BlobEvent::UploadOpened)",
+                received: event,
+            }),
+        }
+    }
+
+    /// Creates the object key and envelope now, so completion needs no private key.
+    fn abe_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+        };
+        let Some(plan) = self.encryption.map(|encryption| encryption.plan) else {
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+        };
+        let (parameters, epoch) = match parse_abe(&values, plan.key) {
+            Ok(parsed) => parsed,
+            Err(error) => return self.emit_error(BlobError::from(error).into()),
+        };
+        self.state = CreateMultipartState::CreateEnvelope;
+        smallvec![Effect::Blob(BlobEffect::Abe(Box::new(
+            AbeEffect::Envelope(EnvelopePlan {
+                parameters,
+                epoch,
+                write_id: Ulid::generate(),
+                object_key: self.input.key.clone(),
+                bucket_public: plan.public_key,
+            })
+        )))]
+    }
+
+    fn envelope_created(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Blob(BlobEvent::Abe(event)) => match *event {
+                AbeEvent::Envelope(envelope) => {
+                    self.envelope = Some(envelope);
+                    self.start_transaction()
+                }
+                _ => self.emit_error(CreateMultipartError::CreateUploadFailed),
+            },
+            Event::Blob(BlobEvent::Error(error)) => self.emit_error(error.into()),
+            event => self.emit_error(CreateMultipartError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Blob(BlobEvent::Abe)",
                 received: event,
             }),
         }
@@ -493,6 +549,19 @@ impl CreateMultipartOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(CreateMultipartError::TransactionMissing);
         };
+        if let Some(envelope) = self.envelope.take() {
+            let value = match envelope.to_bytes() {
+                Ok(value) => value,
+                Err(error) => return self.emit_error(BlobError::from(error).into()),
+            };
+            self.state = CreateMultipartState::WritePending;
+            return smallvec![Effect::Storage(StorageEffect::Write {
+                key_space: ABE_PENDING_KEYSPACE.to_string(),
+                key: self.upload_id.to_bytes().to_vec().into(),
+                value: value.into(),
+                txn_id: Some(txn_id),
+            })];
+        }
         self.state = CreateMultipartState::CommitTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -569,11 +638,15 @@ impl Operation for CreateMultipartOperation {
             CreateMultipartState::PolicyGate => self.handle_policy_gate(event),
             CreateMultipartState::CheckOpenFence => self.open_upload(event),
             CreateMultipartState::OpenUpload => self.upload_opened(event),
+            CreateMultipartState::ReadAbe => self.abe_read(event),
+            CreateMultipartState::CreateEnvelope => self.envelope_created(event),
             CreateMultipartState::StartTransaction => self.handle_transaction_started(event),
             CreateMultipartState::CheckPurgeFence => self.fence_checked(event),
             CreateMultipartState::FenceBackend => self.handle_backend_fenced(event),
             CreateMultipartState::CheckSettings => self.settings_checked(event),
-            CreateMultipartState::WriteUpload => self.handle_record_written(event),
+            CreateMultipartState::WriteUpload | CreateMultipartState::WritePending => {
+                self.handle_record_written(event)
+            }
             CreateMultipartState::CommitTransaction => self.handle_transaction_committed(event),
             CreateMultipartState::AbortBackendUpload => self.backend_aborted(event),
             CreateMultipartState::Finish => smallvec![],
@@ -618,9 +691,12 @@ mod pure_tests {
     use crate::groups::backends::BackendFenceError;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
-    use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE};
+    use aruna_core::keyspaces::{
+        ABE_PENDING_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE,
+    };
     use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::ChecksumAlgorithm;
+    use aruna_core::structs::storage::abe::ObjectEnvelope;
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::encryption::{
         BucketEncryption, BucketKeyRecord, EncryptionMode, SealPlan,
@@ -775,12 +851,54 @@ mod pure_tests {
         (operation, effects)
     }
 
+    /// Clears the open fence of a sealed upload and answers its ABE read and envelope effect.
+    fn open_sealed(operation: &mut CreateMultipartOperation) -> Effects {
+        use aruna_core::structs::storage::abe::{
+            AbeEffect, AbeEvent, create_envelope, create_parameters,
+        };
+        let effects = operation.step(fence_clear());
+        let [
+            Effect::Storage(StorageEffect::BatchRead {
+                reads,
+                txn_id: None,
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the ABE read, got {effects:?}")
+        };
+        let key = sealed_settings().0.active_key().unwrap();
+        let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
+        let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([3; 32]);
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let parameters = create_parameters(&secret, realm, node, key).unwrap();
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    reads[0].1.clone(),
+                    Some(parameters.to_bytes().unwrap().into()),
+                ),
+                (reads[1].1.clone(), Some(1u64.to_be_bytes().to_vec().into())),
+            ],
+        }));
+        let [Effect::Blob(BlobEffect::Abe(effect))] = effects.as_slice() else {
+            panic!("expected the envelope effect, got {effects:?}")
+        };
+        let AbeEffect::Envelope(plan) = effect.as_ref() else {
+            panic!("expected an envelope plan, got {effect:?}")
+        };
+        assert_eq!(plan.bucket_public, [5; 32]);
+        let (envelope, _) = create_envelope(plan.clone()).unwrap();
+        let event = AbeEvent::Envelope(envelope);
+        operation.step(Event::Blob(BlobEvent::Abe(Box::new(event))))
+    }
+
     #[test]
     fn sealed_upload_snapshot() {
         // An encrypted upload opens no provider upload and records its plan after a reread.
+        // Its pending envelope commits beside the record.
         let (settings, record) = sealed_settings();
         let (mut operation, _) = sealed_create(None);
-        let effects = operation.step(fence_clear());
+        let effects = open_sealed(&mut operation);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::StartTransaction { .. })]
@@ -814,6 +932,33 @@ mod pure_tests {
             Some(plan)
         );
         assert_eq!(upload.backend_upload, None);
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"upload".to_vec().into(),
+        }));
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: write_txn,
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the pending envelope, got {effects:?}")
+        };
+        assert_eq!(key_space, ABE_PENDING_KEYSPACE);
+        assert_eq!(key.as_ref(), upload.upload_id.to_bytes());
+        assert_eq!(*write_txn, Some(txn_id));
+        let envelope = ObjectEnvelope::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(envelope.context.object_key, upload.key);
+        assert_eq!(envelope.context.epoch, 1);
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: key.clone(),
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        );
     }
 
     #[test]
@@ -821,7 +966,7 @@ mod pure_tests {
         // A key generation that moved before the record commits fails the upload.
         let (mut settings, _) = sealed_settings();
         let (mut operation, _) = sealed_create(None);
-        operation.step(fence_clear());
+        open_sealed(&mut operation);
         let txn_id = TxnId::from_bytes([3u8; 16]);
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(fence_clear());
@@ -853,7 +998,7 @@ mod pure_tests {
             Err(CreateMultipartError::UnsupportedChecksum("SHA256"))
         );
         let (mut operation, _) = sealed_create(Some(hint(ChecksumAlgorithm::Crc64Nvme)));
-        let effects = operation.step(fence_clear());
+        let effects = open_sealed(&mut operation);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::StartTransaction { .. })]

@@ -6,7 +6,7 @@ use crate::blob::cleanup::PendingCleanup;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};
+use aruna_core::keyspaces::{ABE_PENDING_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};
 use aruna_core::structs::storage::blob::BlobCleanupWork;
 use aruna_core::structs::storage::multipart::{MultipartPart, MultipartPartKey};
 use aruna_core::types::TxnId;
@@ -109,19 +109,23 @@ impl<E> WriteCleanup<E> {
     }
 }
 
-/// The batch delete that removes every part row and the upload record itself.
+/// The batch delete that removes every part row, the upload record and its pending envelope.
 pub(crate) fn delete_records_effect(
     upload_id: Ulid,
     parts: &[MultipartPart],
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
-    let mut deletes = Vec::with_capacity(parts.len() + 1);
+    let mut deletes = Vec::with_capacity(parts.len() + 2);
     for part in parts {
         let key = MultipartPartKey::new(upload_id, part.part_number).to_bytes()?;
         deletes.push((UPLOAD_PART_KEYSPACE.to_string(), key.into()));
     }
     deletes.push((
         UPLOAD_KEYSPACE.to_string(),
+        upload_id.to_bytes().to_vec().into(),
+    ));
+    deletes.push((
+        ABE_PENDING_KEYSPACE.to_string(),
         upload_id.to_bytes().to_vec().into(),
     ));
     Ok(Effect::Storage(StorageEffect::BatchDelete {

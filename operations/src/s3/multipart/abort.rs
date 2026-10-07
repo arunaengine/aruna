@@ -738,8 +738,8 @@ mod pure_tests {
 
     #[test]
     fn delete_batches_records() {
-        // The abort removes every part row and the upload record in one batch
-        // inside the delete transaction.
+        // The abort removes every part row, the upload record and its pending envelope in one
+        // batch inside the delete transaction.
         let mut operation = AbortUploadOperation::new(input());
         operation.upload_parts.push(MultipartPart {
             part_number: 1,
@@ -763,11 +763,13 @@ mod pure_tests {
             panic!("expected upload records delete, got {effects:?}")
         };
         assert_eq!(*observed, Some(txn_id));
-        assert_eq!(deletes.len(), 2);
+        assert_eq!(deletes.len(), 3);
         let upload_key = operation.input.upload_id.to_bytes().to_vec();
-        assert!(deletes.iter().any(|(key_space, key)| {
-            key_space == UPLOAD_KEYSPACE && key.as_ref() == upload_key.as_slice()
-        }));
+        for keyspace in [UPLOAD_KEYSPACE, aruna_core::keyspaces::ABE_PENDING_KEYSPACE] {
+            assert!(deletes.iter().any(|(key_space, key)| {
+                key_space == keyspace && key.as_ref() == upload_key.as_slice()
+            }));
+        }
         let part_key = MultipartPartKey::new(operation.input.upload_id, 1)
             .to_bytes()
             .unwrap();
