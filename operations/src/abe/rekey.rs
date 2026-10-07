@@ -63,6 +63,10 @@ pub async fn rekey_page(
 enum Step {
     Settings,
     Rows,
+    Claim,
+    ClaimRead,
+    ClaimWrite,
+    ClaimCommit,
     Scan,
     Run,
     Start,
@@ -158,15 +162,14 @@ impl RekeyOperation {
             reads: vec![
                 (BUCKET_KEY_KEYSPACE.to_string(), key.key().into()),
                 (ABE_EPOCH_KEYSPACE.to_string(), self.id.clone()),
-                (ABE_REKEY_KEYSPACE.to_string(), self.id.clone()),
             ],
             txn_id: None,
         })]
     }
 
     fn rows_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let (Some((settings, info)), Ok([(_, record), (_, epoch), (_, seen)])) =
-            (self.settings.take(), <[_; 3]>::try_from(values))
+        let (Some((settings, info)), Ok([(_, record), (_, epoch)])) =
+            (self.settings.take(), <[_; 2]>::try_from(values))
         else {
             return self.finish(Err(KeyError::Storage));
         };
@@ -180,21 +183,12 @@ impl RekeyOperation {
         else {
             return self.finish(Err(KeyError::Missing));
         };
-        let fresh = RekeyProgress {
+        self.progress = Some(RekeyProgress {
             prefix: self.prefix.clone(),
             epoch,
             cursor: Vec::new(),
             rekeyed: 0,
-        };
-        let progress = match seen.as_deref().map(postcard::from_bytes::<RekeyProgress>) {
-            None => fresh,
-            Some(Ok(saved)) if saved.prefix != self.prefix => {
-                return self.finish(Err(KeyError::Busy));
-            }
-            Some(Ok(saved)) if saved.epoch != epoch => fresh,
-            Some(Ok(saved)) => saved,
-            Some(Err(_)) => return self.finish(Err(AbeError::Context.into())),
-        };
+        });
         let target = TransitionTarget {
             compression: info.compression,
             plan: Some(plan),
@@ -204,12 +198,46 @@ impl RekeyOperation {
         let now = now.as_millis() as u64;
         let unit = EncryptionTransition::new(kind, Some(key), target, generation, now);
         self.unit = Some(unit);
-        let Ok(versions) = VersionKey::bucket_prefix(&self.bucket) else {
+        self.step = Step::Claim;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    /// Stores the pass before any rewrite, so a call for another prefix finds it and stops.
+    fn claim_read(&mut self, value: Option<Value>) -> Effects {
+        let (Some(txn_id), Some(fresh)) = (self.txn, self.progress.take()) else {
+            return self.finish(Err(KeyError::Storage));
+        };
+        let progress = match value.as_deref().map(postcard::from_bytes::<RekeyProgress>) {
+            None => fresh,
+            Some(Ok(saved)) if saved.prefix != self.prefix => {
+                return self.finish(Err(KeyError::Busy));
+            }
+            Some(Ok(saved)) if saved.epoch != fresh.epoch => fresh,
+            Some(Ok(saved)) => saved,
+            Some(Err(_)) => return self.finish(Err(AbeError::Context.into())),
+        };
+        let Ok(row) = postcard::to_allocvec(&progress) else {
+            return self.finish(Err(KeyError::Storage));
+        };
+        self.seen = Some(row.clone().into());
+        self.progress = Some(progress);
+        self.step = Step::ClaimWrite;
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes: vec![(ABE_REKEY_KEYSPACE.to_string(), self.id.clone(), row.into())],
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn scan(&mut self) -> Effects {
+        let (Ok(versions), Some(progress)) = (
+            VersionKey::bucket_prefix(&self.bucket),
+            self.progress.as_ref(),
+        ) else {
             return self.finish(Err(KeyError::Storage));
         };
         let after = (!progress.cursor.is_empty()).then(|| progress.cursor.clone().into());
-        self.seen = seen;
-        self.progress = Some(progress);
         self.step = Step::Scan;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -358,6 +386,31 @@ impl Operation for RekeyOperation {
             }
             (Step::Rows, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.rows_read(values)
+            }
+            (Step::Claim, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
+                self.txn = Some(txn_id);
+                self.step = Step::ClaimRead;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: ABE_REKEY_KEYSPACE.to_string(),
+                    key: self.id.clone(),
+                    txn_id: Some(txn_id),
+                })]
+            }
+            (Step::ClaimRead, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.claim_read(value)
+            }
+            (Step::ClaimWrite, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                match self.txn {
+                    Some(txn_id) => {
+                        self.step = Step::ClaimCommit;
+                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                    }
+                    None => self.finish(Err(KeyError::Storage)),
+                }
+            }
+            (Step::ClaimCommit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
+                self.txn = None;
+                self.scan()
             }
             (
                 Step::Scan,
@@ -558,6 +611,55 @@ mod tests {
         committed(&mut operation);
         let (_, done) = operation.finalize().unwrap();
         assert!(!done);
+    }
+
+    /// A first page for `prefix` that waits for the progress row read in its claim.
+    fn claiming(prefix: &str) -> RekeyOperation {
+        let mut operation = scanning(1);
+        operation.prefix = prefix.into();
+        operation.progress.as_mut().unwrap().prefix = prefix.into();
+        operation.txn = Some(TxnId::generate());
+        operation.step = Step::ClaimRead;
+        operation
+    }
+
+    fn claim_read(operation: &mut RekeyOperation, value: Option<Value>) -> Effects {
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value,
+        }))
+    }
+
+    #[test]
+    fn claims_before_rewriting() {
+        // Two first pages for different prefixes: the second stops before changing any version.
+        let mut first = claiming("foo/");
+        let effects = claim_read(&mut first, None);
+        let claimed = written(&effects);
+        assert_eq!(claimed.prefix, "foo/");
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("one claim write");
+        };
+        let row = writes[0].2.clone();
+        let mut second = claiming("bar/");
+        let effects = claim_read(&mut second, Some(row));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert_eq!(second.finalize(), Err(KeyError::Busy));
+        // The first scans only after its claim committed.
+        first.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        let txn_id = TxnId::generate();
+        let effects = first.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { .. })]
+        ));
     }
 
     #[test]
