@@ -38,7 +38,9 @@ use aruna_operations::s3::bucket::rotate::{
     ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
 };
 use aruna_operations::s3::bucket::token_list::{ListTokensOperation, TokenEntry};
-use aruna_operations::s3::key_status::{KeySnapshot, KeyStatusError, KeyStatusOperation};
+use aruna_operations::s3::key_status::{
+    AbeSnapshot, KeySnapshot, KeyStatusError, KeyStatusOperation,
+};
 use aruna_operations::s3::unlock_limit::{
     UnlockLimitError, UnlockLimitInput, UnlockLimitOperation,
 };
@@ -147,6 +149,33 @@ impl From<&EncryptionTransition> for TransitionView {
     }
 }
 
+/// The ABE epoch of a bucket, whether a raise is due and its unfinished re-key pass.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct AbeView {
+    pub epoch: u64,
+    pub raise_due: bool,
+    pub rekey: Option<RekeyView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct RekeyView {
+    pub prefix: String,
+    pub rekeyed: u64,
+}
+
+impl From<&AbeSnapshot> for AbeView {
+    fn from(abe: &AbeSnapshot) -> Self {
+        Self {
+            epoch: abe.epoch,
+            raise_due: abe.due,
+            rekey: abe.rekey.as_ref().map(|rekey| RekeyView {
+                prefix: rekey.prefix.clone(),
+                rekeyed: rekey.rekeyed,
+            }),
+        }
+    }
+}
+
 /// What the caller may do; display only, every route checks again.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct CallerView {
@@ -189,6 +218,8 @@ pub struct EncryptionStatus {
     pub holders: Option<HolderCounts>,
     pub recovery: Option<RecoveryView>,
     pub transition: Option<TransitionView>,
+    /// ABE epoch state; null for a bucket without ABE.
+    pub abe: Option<AbeView>,
     pub caller: CallerView,
 }
 
@@ -594,6 +625,7 @@ pub(crate) fn build_status(
         }),
         recovery: report.map(|report| RecoveryView::from(&report.recovery)),
         transition: snapshot.transition.as_ref().map(TransitionView::from),
+        abe: snapshot.abe.as_ref().map(AbeView::from),
         caller: CallerView {
             holder: is_holder(snapshot, caller),
             ready_copy,
@@ -633,6 +665,8 @@ pub(crate) async fn current_status(
 - `generations` lists every key generation this node still needs; `unlock`, `public_key` and
   `fingerprint` describe the active one.
 - `holders` and `recovery` come from the key directory; a failed lookup reads as unknown.
+- `abe` reports the epoch, whether a raise is due after lost access, and the unfinished re-key
+  pass with its prefix and count; it is null for a bucket without ABE.
 - `caller` is for display only; every key route checks the caller again."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     responses(
@@ -660,6 +694,7 @@ pub(crate) async fn current_status(
                 "holders": { "ready": 2, "pending": 0, "missing_key": 0 },
                 "recovery": { "state": "met", "ready_holders": 2, "ready_with_recovery": 1 },
                 "transition": null,
+                "abe": { "epoch": 2, "raise_due": true, "rekey": { "prefix": "raw/", "rekeyed": 120 } },
                 "caller": { "holder": true, "ready_copy": true, "admin": true }
             })
         ),
@@ -709,7 +744,7 @@ pub async fn get_bucket_encryption(
         example = json!({ "mode": "vault_locked", "max_unlock_ms": 3600000, "expected_generation": 0 })
     ),
     responses(
-        (status = 200, description = "The status after the change", body = EncryptionStatus, example = json!({ "bucket": "research-raw", "mode": "node_managed", "bucket_id": "01JAMXQ7B1D7Q8E7Q2F3R8Z9KC", "storage_generation": 1, "key_generation": 1, "public_key": "qL3UuCZ0XkWbQZ2yZ8m1qL3UuCZ0XkWbQZ2yZ8m1qL0=", "fingerprint": "5d1c0a6f9e1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5", "cipher": "chacha20_poly1305", "block_keys": "content_derived", "max_unlock_ms": null, "unlock": { "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": null, "max_deadline_ms": null }, "generations": [], "holders": { "ready": 2, "pending": 0, "missing_key": 0 }, "recovery": { "state": "met", "ready_holders": 2, "ready_with_recovery": 1 }, "transition": null, "caller": { "holder": true, "ready_copy": true, "admin": true } })),
+        (status = 200, description = "The status after the change", body = EncryptionStatus, example = json!({ "bucket": "research-raw", "mode": "node_managed", "bucket_id": "01JAMXQ7B1D7Q8E7Q2F3R8Z9KC", "storage_generation": 1, "key_generation": 1, "public_key": "qL3UuCZ0XkWbQZ2yZ8m1qL3UuCZ0XkWbQZ2yZ8m1qL0=", "fingerprint": "5d1c0a6f9e1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5", "cipher": "chacha20_poly1305", "block_keys": "content_derived", "max_unlock_ms": null, "unlock": { "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": null, "max_deadline_ms": null }, "generations": [], "holders": { "ready": 2, "pending": 0, "missing_key": 0 }, "recovery": { "state": "met", "ready_holders": 2, "ready_with_recovery": 1 }, "transition": null, "abe": null, "caller": { "holder": true, "ready_copy": true, "admin": true } })),
         (status = 400, description = "An invalid mode, cipher or unlock maximum", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
@@ -1220,6 +1255,33 @@ mod tests {
         assert_eq!(json["mode"], "off");
         assert!(json["unlock"].is_null() && json["public_key"].is_null());
         assert_eq!(json["generations"], serde_json::json!([]));
+        assert!(json["abe"].is_null());
+    }
+
+    #[test]
+    fn reports_abe_state() {
+        use aruna_operations::abe::rekey::RekeyProgress;
+        let mut abe = snapshot();
+        abe.abe = Some(AbeSnapshot {
+            epoch: 4,
+            due: true,
+            rekey: Some(RekeyProgress {
+                prefix: "raw/".to_string(),
+                epoch: 4,
+                cursor: b"raw/a".to_vec(),
+                rekeyed: 7,
+            }),
+        });
+        let status = build_status("bucket".to_string(), &abe, None, user(1), 100);
+        let json = serde_json::to_value(&status).unwrap();
+        let expected = serde_json::json!({
+            "epoch": 4, "raise_due": true, "rekey": { "prefix": "raw/", "rekeyed": 7 }
+        });
+        assert_eq!(json["abe"], expected);
+        abe.abe.as_mut().unwrap().rekey = None;
+        let status = build_status("bucket".to_string(), &abe, None, user(1), 100);
+        let json = serde_json::to_value(&status).unwrap();
+        assert!(json["abe"]["rekey"].is_null());
     }
 
     #[test]
