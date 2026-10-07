@@ -20,8 +20,7 @@ use aruna_core::structs::storage::blob::{bucket_permission_path, group_permissio
 use aruna_core::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
 use aruna_kpabe::{Attribute, Envelope, Policy, UserKey};
 use aruna_operations::abe::{
-    EpochDueOperation, KeyAction, KeyError, KeyOperation, KeyResult, MemberKeysOperation,
-    ReissueOperation,
+    KeyAction, KeyError, KeyOperation, KeyResult, MemberKeysOperation, ReissueOperation,
 };
 use aruna_operations::driver::drive;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
@@ -1734,7 +1733,6 @@ async fn abe_epochs() -> TestResult<()> {
         )
         .await?;
         let group = create_group_http(&base, &owner, "ABE epochs").await?;
-        let group_id = Ulid::from_string(&group.group_id)?;
         let owner_private = SecretBytes::new(vec![7; 32]);
         let owner_key = add_key(
             &base,
@@ -1894,6 +1892,16 @@ async fn abe_epochs() -> TestResult<()> {
         let id = bucket_id.to_bytes().to_vec();
         let epoch_row = || stored(&seed, aruna_core::keyspaces::ABE_EPOCH_KEYSPACE, id.clone());
         let due_row = || stored(&seed, aruna_core::keyspaces::ABE_DUE_KEYSPACE, id.clone());
+        // A removal's marker is a blind write of the due row.
+        let mark = || {
+            let write = StorageEffect::Write {
+                key_space: aruna_core::keyspaces::ABE_DUE_KEYSPACE.to_string(),
+                key: id.clone().into(),
+                value: vec![1].into(),
+                txn_id: None,
+            };
+            seed.context.storage_handle.send_storage_effect(write)
+        };
         let progress_row = || {
             stored(
                 &seed,
@@ -1923,7 +1931,7 @@ async fn abe_epochs() -> TestResult<()> {
                 panic!("unexpected effect {effect:?}")
             };
             if matches!(effect, StorageEffect::CommitTransaction { .. }) {
-                drive(EpochDueOperation::new(Some(group_id), now), &seed.context).await?;
+                mark().await;
             }
             let event = seed
                 .context
@@ -1965,7 +1973,7 @@ async fn abe_epochs() -> TestResult<()> {
         );
 
         // A removal after a committed raise leaves a new due state for the next run.
-        drive(EpochDueOperation::new(Some(group_id), now), &seed.context).await?;
+        mark().await;
         assert!(due_row().await.is_some());
         issue_open(&base, &owner, &bucket_private).await?;
         assert_eq!(epoch_row().await, Some(4u64.to_be_bytes().to_vec()));
