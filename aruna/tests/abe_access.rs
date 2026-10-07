@@ -2722,7 +2722,7 @@ async fn abe_enumerated() -> TestResult<()> {
         let credentials = create_s3_credentials(&base, &owner, &group.group_id).await?;
         let s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
         s3.create_bucket().bucket(BUCKET).send().await?;
-        locked_key(&seed, &owner, &owner_key, &owner_private).await?;
+        let (bucket_id, _, bucket_private) = locked_key(&seed, &owner, &owner_key, &owner_private).await?;
         let put = |key: String| {
             let request = s3
                 .put_object()
@@ -2780,6 +2780,21 @@ async fn abe_enumerated() -> TestResult<()> {
         for (key, version, opened) in [("foo/a", &a, true), ("foo/b", &b, false), ("foo/c", &later, true)] {
             assert_eq!(opens(&base, &owner, &keys, key, version).await?, (1, opened));
         }
+
+        // While locked the requests wait for a holder, who issues them like any other.
+        let encryption = format!("{base}/api/v1/data/buckets/{BUCKET}/storage/encryption");
+        let lock = http.post(format!("{encryption}/lock")).bearer_auth(&owner);
+        assert!(lock.send().await?.status().is_success());
+        put("foo/d".into()).await?;
+        let (status, body) = request("writes", "foo/").await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["fields"]["request_ids"].as_array().map(Vec::len), Some(1));
+        issue_open(&base, &owner, &bucket_private).await?;
+        // Each write keeps its own epoch; the identical epoch 1 grant was reused.
+        let held = grant_epochs(&seed, bucket_id, reader_id).await;
+        assert_eq!(held, vec![vec![1], vec![2]]);
+        let listed = listed_writes(&base, &reader).await?;
+        assert_eq!(listed, ["foo/a", "foo/c", "foo/d"]);
 
         // More readable files than one grant names are refused with the count, not truncated.
         for index in 0..=MAX_WRITES {
