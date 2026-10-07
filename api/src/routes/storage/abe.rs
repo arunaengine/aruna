@@ -18,7 +18,7 @@ use axum::{Extension, Json};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http::StatusCode;
 pub(crate) use records::ScopeView;
-pub(crate) use records::member_requests;
+pub(crate) use records::{epoch_due, epoch_run, member_requests};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;

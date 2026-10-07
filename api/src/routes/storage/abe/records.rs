@@ -4,9 +4,11 @@
 
 use super::*;
 use aruna_core::structs::storage::abe_access::{
-    GrantContext, KeyGrant, KeyIssuer, KeyRequest, KeyScope,
+    GrantContext, KeyGrant, KeyIssuer, KeyRequest, KeyScope, MAX_REQUESTS,
 };
-use aruna_operations::abe::{KeyAction, KeyOperation, KeyResult, MemberKeysOperation};
+use aruna_operations::abe::{
+    EpochDueOperation, KeyAction, KeyOperation, KeyResult, MemberKeysOperation, ReissueOperation,
+};
 use axum::extract::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -36,6 +38,10 @@ pub struct RecordList {
     pub next_cursor: Option<String>,
     pub records: Vec<RecordView>,
 }
+#[derive(Serialize, ToSchema)]
+pub struct EpochView {
+    pub epoch: u64,
+}
 #[derive(Deserialize)]
 pub struct PageQuery {
     pub cursor: Option<String>,
@@ -55,6 +61,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(request_key, open_requests))
         .routes(routes!(publish_grant))
         .routes(routes!(own_grants))
+        .routes(routes!(raise_epoch))
 }
 fn request_fields(r: &KeyRequest) -> ServerResult<Value> {
     let scope = match &r.scope {
@@ -128,6 +135,49 @@ pub(crate) async fn member_requests(
         }
     }
 }
+/// Raises the epoch when instant or due, then reopens requests page by page until done.
+pub(crate) async fn epoch_run(
+    state: &ServerState,
+    auth: &AuthContext,
+    bucket: &str,
+    instant: bool,
+) -> ServerResult<u64> {
+    let action = KeyAction::Epoch { instant };
+    let KeyResult::Epoch(epoch) = execute(state, auth.clone(), bucket.into(), action).await? else {
+        return Err(unexpected());
+    };
+    let node = state.get_node_id();
+    for _ in 0..100_000 {
+        let now = aruna_core::time::unix_timestamp_millis();
+        let page = ReissueOperation::new(bucket.into(), auth.clone(), node, now, MAX_REQUESTS);
+        match drive(page, &state.get_ctx()).await {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => {
+                tracing::warn!(event = "abe.reissue.failed", error = %error);
+                break;
+            }
+        }
+    }
+    Ok(epoch)
+}
+/// Marks a raise due after a lost READ scope in a group, or in every group without one; the node
+/// raises its node managed buckets at once.
+pub(crate) async fn epoch_due(state: &ServerState, auth: &AuthContext, group_id: Option<Ulid>) {
+    let now = aruna_core::time::unix_timestamp_millis();
+    let managed = match drive(EpochDueOperation::new(group_id, now), &state.get_ctx()).await {
+        Ok(managed) => managed,
+        Err(error) => {
+            tracing::warn!(event = "abe.epoch_due.failed", error = %error);
+            return;
+        }
+    };
+    for bucket in managed {
+        if let Err(error) = epoch_run(state, auth, &bucket, false).await {
+            tracing::warn!(event = "abe.epoch_raise.failed", error = %error);
+        }
+    }
+}
 fn unexpected() -> ServerError {
     ServerError::InternalError("unexpected encryption result".into())
 }
@@ -198,6 +248,12 @@ pub async fn open_requests(
     Query(page): Query<PageQuery>,
 ) -> ServerResult<Json<RecordList>> {
     let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
+    // A holder opening the list is an issuance run: a due raise happens before listing.
+    if page.cursor.is_none()
+        && let Err(error) = epoch_run(&state, &auth, &bucket, false).await
+    {
+        tracing::debug!(event = "abe.epoch_raise.skipped", error = %error);
+    }
     let issuer = KeyIssuer::User(auth.user_id);
     let KeyResult::Requests(requests, next) =
         execute(&state, auth, bucket, KeyAction::Open(page.decode()?)).await?
@@ -294,4 +350,30 @@ pub async fn own_grants(
         records,
         next_cursor: next.map(|v| STANDARD.encode(v)),
     }))
+}
+
+#[utoipa::path(post, path = "/data/buckets/{bucket}/abe/epoch", tag = "data/blobs",
+    summary = "Raise the encryption epoch",
+    description = r#"Raises the bucket epoch now, so keys issued before it open no later envelope.
+
+**Authentication**: An unrestricted realm bearer token of a current key holder.
+
+**Behavior**
+- New writes carry the new epoch; existing objects, envelopes and grants stay unchanged.
+- Remaining readers and token credentials get new key requests for the new epoch, in pages.
+- The node issues them at once while it can; otherwise holders issue them as usual.
+- A raise that was due after a lost READ scope is consumed by this one."#,
+    params(("bucket" = String, Path, description = "Node-local S3 bucket name")),
+    responses((status = 200, body = EpochView, description = "The new epoch", example = json!({"epoch":2})),
+        (status = 401, body = ErrorResponse, description = "Bearer token required"), (status = 403, body = ErrorResponse, description = "Caller is no current key holder"),
+        (status = 404, body = ErrorResponse, description = "Bucket missing or not encrypted"), (status = 503, body = ErrorResponse, description = "A concurrent change or busy storage; retry")),
+    security(("bearer_auth" = [])))]
+pub async fn raise_epoch(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+) -> ServerResult<Json<EpochView>> {
+    let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
+    let epoch = epoch_run(&state, &auth, &bucket, true).await?;
+    Ok(Json(EpochView { epoch }))
 }

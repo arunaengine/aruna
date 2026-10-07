@@ -520,7 +520,7 @@ pub async fn set_realm_policies(
                 user_id: auth.user_id,
                 realm_id: state.get_realm_id(),
             },
-            auth_context: auth,
+            auth_context: auth.clone(),
             policies,
             expected_hash,
         }),
@@ -543,6 +543,7 @@ pub async fn set_realm_policies(
         }
         other => ServerError::InternalError(other.to_string()),
     })?;
+    crate::routes::storage::abe::epoch_due(&state, &auth, None).await;
 
     Ok((
         StatusCode::OK,
@@ -699,7 +700,7 @@ pub async fn set_group_policies(
                 user_id: auth.user_id,
                 realm_id: state.get_realm_id(),
             },
-            auth_context: auth,
+            auth_context: auth.clone(),
             group_id,
             policies,
             expected_hash,
@@ -721,6 +722,7 @@ pub async fn set_group_policies(
         }
         other => ServerError::InternalError(other.to_string()),
     })?;
+    crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok((StatusCode::OK, Json(policies_response(&document.policies))))
 }

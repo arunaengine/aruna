@@ -1570,6 +1570,7 @@ pub async fn remove_group_member(
     )
     .await
     .map_err(map_removal_error)?;
+    crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1621,6 +1622,7 @@ pub async fn leave_group(
     )
     .await
     .map_err(map_removal_error)?;
+    crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1747,6 +1749,7 @@ pub async fn create_group_role(
         assigned_users.insert(UserId::nil(realm_id));
     }
 
+    let narrows = permissions.values().any(|p| p == &Permission::DENY);
     let role_id = Ulid::generate();
     let (_, auth_doc) = drive(
         AddRoleOperation::new(AddRoleConfig {
@@ -1771,6 +1774,10 @@ pub async fn create_group_role(
         .find(|role| role.role_id == role_id.to_string())
         .ok_or_else(|| ServerError::InternalError("created role missing".to_string()))?;
 
+    // A DENY rule can narrow existing READ scopes.
+    if narrows {
+        crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
+    }
     let members = assigned_users.into_iter().collect();
     let key_requests =
         crate::routes::storage::abe::member_requests(&state, &auth, group_id, members).await;
@@ -1846,6 +1853,7 @@ pub async fn delete_group_role(
         }
         other => ServerError::InternalError(other.to_string()),
     })?;
+    crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

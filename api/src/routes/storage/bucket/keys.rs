@@ -330,6 +330,11 @@ pub async fn unlock_bucket(
             other => ServerError::InternalError(other.to_string()),
         })?;
     seal_missing(&state, &bucket, group_id, status.key).await;
+    // An unlocked node is an issuer: a due raise happens now and its requests are issued.
+    if let Err(error) = crate::routes::storage::abe::epoch_run(&state, &auth, &bucket, false).await
+    {
+        tracing::warn!(event = "abe.epoch_raise.failed", error = %error);
+    }
     Ok(Json(status_view(&status)))
 }
 

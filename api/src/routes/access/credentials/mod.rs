@@ -577,7 +577,11 @@ pub async fn revoke_s3_credentials(
     }
 
     match drive(RevokeUserOperation::new(access_key_id), &state.get_ctx()).await {
-        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Ok(_) => {
+            let group = Some(credential.group_id);
+            crate::routes::storage::abe::epoch_due(&state, &auth, group).await;
+            Ok(StatusCode::NO_CONTENT)
+        }
         Err(RevokeUserError::NotFound) => Err(ServerError::NotFound),
         Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
