@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::abe::rekey::RekeyProgress;
 use crate::driver::DriverContext;
 use crate::s3::bucket::key::restart::Replay;
 use crate::s3::bucket::key::rows::{SettingsError, authority_read, parse_authority};
@@ -11,8 +12,9 @@ use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BUCKET_AUDIT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
-    KEY_COPY_KEYSPACE, TRANSITION_KEYSPACE,
+    ABE_DUE_KEYSPACE, ABE_EPOCH_KEYSPACE, ABE_REKEY_KEYSPACE, BUCKET_AUDIT_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE,
+    TRANSITION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
@@ -65,6 +67,16 @@ pub struct KeySnapshot {
     pub locks: BTreeMap<u64, (AuditAction, u64)>,
     /// This node's mode change or rotation of the bucket's copies, if one was started.
     pub transition: Option<EncryptionTransition>,
+    /// The ABE epoch state; none without an epoch row.
+    pub abe: Option<AbeSnapshot>,
+}
+
+/// A bucket's ABE epoch, whether a raise is due and its unfinished re-key pass.
+#[derive(Debug, PartialEq)]
+pub struct AbeSnapshot {
+    pub epoch: u64,
+    pub due: bool,
+    pub rekey: Option<RekeyProgress>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,19 +157,40 @@ impl KeyStatusOperation {
         self.snapshot.settings = state.settings;
         self.snapshot.admins = state.admins;
         self.step = StatusStep::Transition;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: TRANSITION_KEYSPACE.to_string(),
-            key: self.bucket.as_bytes().to_vec().into(),
-            txn_id: None,
+        let mut reads = vec![(
+            TRANSITION_KEYSPACE.to_string(),
+            self.bucket.as_bytes().to_vec().into(),
+        )];
+        if let Some(bucket_id) = self.bucket_id() {
+            let id: Key = bucket_id.to_bytes().to_vec().into();
+            reads.extend(
+                [ABE_EPOCH_KEYSPACE, ABE_DUE_KEYSPACE, ABE_REKEY_KEYSPACE]
+                    .map(|key_space| (key_space.to_string(), id.clone())),
+            );
+        }
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: None
         })]
     }
 
-    fn read_transition(&mut self, value: Option<Value>) -> Effects {
-        match value
+    fn read_transition(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+        let mut values = values.into_iter().map(|(_, value)| value);
+        match values
+            .next()
+            .flatten()
             .map(|value| EncryptionTransition::from_bytes(&value))
             .transpose()
         {
             Ok(transition) => self.snapshot.transition = transition,
+            Err(error) => return self.fail(error),
+        }
+        match parse_abe(
+            values.next().flatten(),
+            values.next().flatten(),
+            values.next().flatten(),
+        ) {
+            Ok(abe) => self.snapshot.abe = abe,
             Err(error) => return self.fail(error),
         }
         match self.bucket_id() {
@@ -234,8 +267,8 @@ impl Operation for KeyStatusOperation {
             (StatusStep::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.read_bucket(values)
             }
-            (StatusStep::Transition, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.read_transition(value)
+            (StatusStep::Transition, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                self.read_transition(values)
             }
             (
                 StatusStep::Records | StatusStep::Grants | StatusStep::Copies | StatusStep::Audit,
@@ -274,6 +307,25 @@ impl Operation for KeyStatusOperation {
             KeyStatusError::Settings(SettingsError::NoSuchBucket | SettingsError::GroupMismatch)
         )
     }
+}
+
+fn parse_abe(
+    epoch: Option<Value>,
+    due: Option<Value>,
+    rekey: Option<Value>,
+) -> Result<Option<AbeSnapshot>, ConversionError> {
+    let Some(epoch) = epoch else {
+        return Ok(None);
+    };
+    let epoch = <[u8; 8]>::try_from(epoch.as_ref())
+        .map_err(|_| ConversionError::InvalidLength("abe epoch".to_string()))?;
+    Ok(Some(AbeSnapshot {
+        epoch: u64::from_be_bytes(epoch),
+        due: due.is_some(),
+        rekey: rekey
+            .map(|value| postcard::from_bytes(&value))
+            .transpose()?,
+    }))
 }
 
 /// The encryption settings of `bucket`; a bucket without a settings row is plain.
@@ -429,6 +481,14 @@ mod tests {
         })
     }
 
+    fn batch(values: Vec<Option<Vec<u8>>>) -> Event {
+        let values = values
+            .into_iter()
+            .map(|value| (Key::from(Vec::new()), value.map(Value::from)))
+            .collect();
+        Event::Storage(StorageEvent::BatchReadResult { values })
+    }
+
     #[test]
     fn plain_bucket_stops() {
         let mut operation = operation();
@@ -439,8 +499,8 @@ mod tests {
         }));
         assert!(matches!(
             &effects[..],
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == TRANSITION_KEYSPACE
+            [Effect::Storage(StorageEffect::BatchRead { reads, .. })]
+                if reads.len() == 1 && reads[0].0 == TRANSITION_KEYSPACE
         ));
         // A decrypt that finished its mode change still reports its transition.
         let transition = EncryptionTransition::new(
@@ -453,16 +513,14 @@ mod tests {
             2,
             7,
         );
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(Vec::new()),
-            value: Some(Value::from(transition.to_bytes().unwrap())),
-        }));
+        let effects = operation.step(batch(vec![Some(transition.to_bytes().unwrap())]));
         assert!(effects.is_empty());
         let snapshot = operation.finalize().unwrap();
         assert_eq!(snapshot.transition, Some(transition));
         assert_eq!(snapshot.settings.mode, EncryptionMode::Off);
         assert_eq!(snapshot.admins, BTreeSet::from([user(2)]));
         assert!(snapshot.records.is_empty());
+        assert_eq!(snapshot.abe, None);
     }
 
     #[test]
@@ -479,11 +537,22 @@ mod tests {
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: rows,
         }));
-        assert_eq!(effects.len(), 1);
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(Vec::new()),
-            value: None,
-        }));
+        assert!(matches!(
+            &effects[..],
+            [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 4
+        ));
+        let progress = RekeyProgress {
+            prefix: "raw/".to_string(),
+            epoch: 3,
+            cursor: b"raw/a".to_vec(),
+            rekeyed: 5,
+        };
+        let effects = operation.step(batch(vec![
+            None,
+            Some(3_u64.to_be_bytes().to_vec()),
+            Some(vec![1]),
+            Some(postcard::to_allocvec(&progress).unwrap()),
+        ]));
         assert!(matches!(
             &effects[..],
             [Effect::Storage(StorageEffect::Iter { key_space, start: None, .. })]
@@ -552,6 +621,12 @@ mod tests {
             (3, (AuditAction::TimedLock, 4)),
         ]);
         assert_eq!(snapshot.locks, locks);
+        let abe = AbeSnapshot {
+            epoch: 3,
+            due: true,
+            rekey: Some(progress),
+        };
+        assert_eq!(snapshot.abe, Some(abe));
     }
 
     #[test]
@@ -568,10 +643,7 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: rows,
         }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(Vec::new()),
-            value: None,
-        }));
+        operation.step(batch(vec![None; 4]));
         for _ in 0..3 {
             operation.step(iter(Vec::new(), None));
         }
