@@ -282,7 +282,10 @@ impl KeyOperation {
                 continue;
             }
             if self.grant_allowed(held).is_err() {
-                self.deletes.push((ABE_GRANT_KEYSPACE.to_string(), key));
+                // A holder's restrictions cannot judge the recipient's other grants.
+                if !matches!(self.action, KeyAction::Publish(_)) {
+                    self.deletes.push((ABE_GRANT_KEYSPACE.to_string(), key));
+                }
                 continue;
             }
             if held.scope == request.scope
