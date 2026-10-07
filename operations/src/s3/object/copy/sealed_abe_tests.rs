@@ -7,7 +7,9 @@ use crate::abe::copies::{CopyEnvelopeOperation, CopyOutcome, copy_row};
 use crate::abe::envelope::EnvelopeOperation;
 use crate::s3::object::put::abe::envelope_write;
 use aruna_core::compute::SecretBytes;
-use aruna_core::keyspaces::{ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
+use aruna_core::keyspaces::{
+    ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE, ABE_REKEY_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+};
 use aruna_core::structs::storage::abe::{
     EnvelopeArchive, EnvelopePlan, check_copy, copy_envelope, create_envelope, create_parameters,
 };
@@ -291,6 +293,41 @@ async fn unlocked_copy_envelope() {
             .await
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn copy_restarts_rekey() {
+    // An alias inside a re-key prefix restarts the pass, which may have passed its row already.
+    let (_temp, context) = context();
+    let storage = &context.storage_handle;
+    let (sealed, source_id, source) = sealed(storage).await;
+    let key = sealed.location.format.bucket_key().unwrap();
+    let id = key.bucket_id.to_bytes().to_vec();
+    let progress = RekeyProgress {
+        prefix: "foo/".into(),
+        epoch: 1,
+        cursor: b"foo/b".to_vec(),
+        rekeyed: 2,
+    };
+    let row = postcard::to_allocvec(&progress).unwrap();
+    put(storage, ABE_REKEY_KEYSPACE, id.clone(), row).await;
+    // A copy outside the prefix leaves the pass as it is.
+    for (dest, rekeyed) in [("bar/copy", 2), ("foo/a", 0)] {
+        let copy = copy_input(&sealed, (SOURCE, source_id), dest);
+        let operation = SealedCopyOperation::new(copy);
+        run(operation, storage, Some(&sealed), Race::Off)
+            .await
+            .unwrap();
+        let row = get(storage, ABE_REKEY_KEYSPACE, id.clone()).await.unwrap();
+        let saved: RekeyProgress = postcard::from_bytes(&row).unwrap();
+        assert_eq!(
+            (saved.cursor.is_empty(), saved.rekeyed),
+            (rekeyed == 0, rekeyed)
+        );
+    }
+    // The source outside the prefix keeps its envelope.
+    let (kept, _) = envelope_of(storage, SOURCE, source_id).await.unwrap();
+    assert_eq!(kept, source);
 }
 
 #[tokio::test]

@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::abe::copies::{copy_row, still_active};
+use crate::abe::rekey::RekeyProgress;
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, owner_write_effect, write_head_effect, write_version_effect,
@@ -21,8 +22,8 @@ use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
+    ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_REKEY_KEYSPACE, ABE_VERSION_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -122,6 +123,8 @@ enum Step {
     WriteOwner,
     FenceAbe,
     WriteEnvelope,
+    ReadRekey,
+    ResetRekey,
     Register,
     Quota,
     Usage,
@@ -584,6 +587,43 @@ impl SealedCopyOperation {
         Ok(smallvec![effect])
     }
 
+    /// The alias reuses the old object key, so a re-key pass of its prefix starts again.
+    fn read_rekey(&mut self) -> Result<Effects, SealedCopyError> {
+        let Some(key) = self.input.location.format.bucket_key() else {
+            return self.register();
+        };
+        self.step = Step::ReadRekey;
+        Ok(smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: ABE_REKEY_KEYSPACE.to_string(),
+            key: key.bucket_id.to_bytes().to_vec().into(),
+            txn_id: self.txn_id,
+        })])
+    }
+
+    fn rekey_read(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
+        let Event::Storage(StorageEvent::ReadResult { key, value }) = event else {
+            return Err(SealedCopyError::InvalidState);
+        };
+        let Some(value) = value else {
+            return self.register();
+        };
+        let mut progress: RekeyProgress =
+            postcard::from_bytes(&value).map_err(|_| abe(AbeError::Context))?;
+        if !self.input.dest_key.starts_with(&progress.prefix) {
+            return self.register();
+        }
+        progress.cursor.clear();
+        progress.rekeyed = 0;
+        let value = postcard::to_allocvec(&progress).map_err(|_| abe(AbeError::Context))?;
+        self.step = Step::ResetRekey;
+        Ok(smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: ABE_REKEY_KEYSPACE.to_string(),
+            key,
+            value: value.into(),
+            txn_id: self.txn_id,
+        })])
+    }
+
     /// Registers the copy like any write, so governed reads find this node's copy of it.
     fn register(&mut self) -> Result<Effects, SealedCopyError> {
         let subject_generation = self
@@ -700,8 +740,10 @@ impl SealedCopyOperation {
             (Step::FenceAbe, event) => self.abe_fenced(event),
             (Step::WriteEnvelope, Event::Storage(StorageEvent::WriteResult { .. }))
             | (Step::WriteEnvelope, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.register()
+                self.read_rekey()
             }
+            (Step::ReadRekey, event) => self.rekey_read(event),
+            (Step::ResetRekey, _) if written => self.register(),
             (Step::Register, _) if written => self.start_quota(),
             (Step::Quota, event) => self.quota_step(event),
             (Step::Usage, event) => self.usage_step(event),
