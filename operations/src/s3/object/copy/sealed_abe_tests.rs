@@ -437,3 +437,37 @@ async fn changed_archive_refused() {
     let (_, archive) = envelope_of(storage, "copy", version_id).await.unwrap();
     assert_eq!(archive.archive, ArchiveKey::of(&sealed.location));
 }
+
+async fn group_bytes(storage: &StorageHandle, sealed: &Sealed) -> u64 {
+    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
+    use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
+    let key = usage_group_key(input(&sealed.location, Ulid::nil()).group_id);
+    let value = get(storage, USAGE_STATS_KEYSPACE, key).await.unwrap();
+    UsageCounters::from_bytes(&value).unwrap().logical_bytes
+}
+
+#[tokio::test]
+async fn pending_charge_replaced() {
+    // A pending copy is charged its row; completion swaps that charge for the envelope's.
+    let (_temp, context) = context();
+    let storage = &context.storage_handle;
+    let (sealed, source_id, _) = sealed(storage).await;
+    let copy = copy_input(&sealed, (SOURCE, source_id), "copy");
+    let version_id = run(SealedCopyOperation::new(copy), storage, None, Race::Off)
+        .await
+        .unwrap()
+        .version_id;
+    let row = pending_row(storage, "copy", version_id).await.unwrap();
+    assert_eq!(group_bytes(storage, &sealed).await, 50 + row.len() as u64);
+    let outcome = complete(storage, "copy", version_id, Some(&sealed), Race::Off).await;
+    assert_eq!(outcome, Ok(CopyOutcome::Completed));
+    let (envelope, _) = envelope_of(storage, "copy", version_id).await.unwrap();
+    let id = envelope.context.write_id.to_bytes().to_vec();
+    let bytes = get(storage, ABE_ENVELOPE_KEYSPACE, id.clone())
+        .await
+        .unwrap();
+    let archive_keyspace = aruna_core::keyspaces::ABE_ARCHIVE_KEYSPACE;
+    let archive = get(storage, archive_keyspace, id).await.unwrap();
+    let charge = (bytes.len() + archive.len()) as u64;
+    assert_eq!(group_bytes(storage, &sealed).await, 50 + charge);
+}

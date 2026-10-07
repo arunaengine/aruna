@@ -9,8 +9,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    ABE_ARCHIVE_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE,
-    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NODE_STATS_KEYSPACE,
+    ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NODE_STATS_KEYSPACE,
     PENDING_LOCATION_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::operation::Operation;
@@ -39,6 +39,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
 
+use crate::abe::copies::copy_version;
 use crate::driver::{DriverContext, drive};
 use crate::storage_read::scan_all;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
@@ -591,6 +592,7 @@ pub enum RebuildStatsState {
     ScanEnvelopes,
     ScanArchives,
     ScanEnvelopeVersions,
+    ScanCopies,
     ScanCounters,
     StartWriteTransaction,
     WriteCounters,
@@ -702,6 +704,7 @@ impl RebuildStatsOperation {
             RebuildStatsState::ScanEnvelopes => Some(ABE_ENVELOPE_KEYSPACE),
             RebuildStatsState::ScanArchives => Some(ABE_ARCHIVE_KEYSPACE),
             RebuildStatsState::ScanEnvelopeVersions => Some(ABE_VERSION_KEYSPACE),
+            RebuildStatsState::ScanCopies => Some(ABE_COPY_KEYSPACE),
             RebuildStatsState::ScanCounters => Some(USAGE_STATS_KEYSPACE),
             _ => None,
         }
@@ -852,11 +855,22 @@ impl RebuildStatsOperation {
                     *self.envelope_sizes.entry(key.to_vec()).or_default() += value.len() as u64;
                 }
             }
-            RebuildStatsState::ScanEnvelopeVersions => {
-                for (key, id) in values {
-                    let version_key = VersionKey::from_bytes(key.as_ref())?;
+            RebuildStatsState::ScanEnvelopeVersions | RebuildStatsState::ScanCopies => {
+                let copies = self.state == RebuildStatsState::ScanCopies;
+                for (key, value) in values {
+                    // A pending copy is charged its stored row until its envelope replaces it.
+                    let (version_key, logical_bytes) = match copies {
+                        true => (copy_version(key)?, value.len() as u64),
+                        false => (
+                            VersionKey::from_bytes(key.as_ref())?,
+                            self.envelope_sizes
+                                .get(value.as_ref())
+                                .copied()
+                                .unwrap_or(0),
+                        ),
+                    };
                     let delta = UsageCounters {
-                        logical_bytes: self.envelope_sizes.get(id.as_ref()).copied().unwrap_or(0),
+                        logical_bytes,
                         ..Default::default()
                     };
                     self.global.add(&delta)?;
@@ -894,7 +908,8 @@ impl RebuildStatsOperation {
             }
             RebuildStatsState::ScanEnvelopes => RebuildStatsState::ScanArchives,
             RebuildStatsState::ScanArchives => RebuildStatsState::ScanEnvelopeVersions,
-            RebuildStatsState::ScanEnvelopeVersions => RebuildStatsState::ScanCounters,
+            RebuildStatsState::ScanEnvelopeVersions => RebuildStatsState::ScanCopies,
+            RebuildStatsState::ScanCopies => RebuildStatsState::ScanCounters,
             RebuildStatsState::ScanCounters => {
                 self.state = RebuildStatsState::StartWriteTransaction;
                 return smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -1070,6 +1085,7 @@ impl Operation for RebuildStatsOperation {
             | RebuildStatsState::ScanEnvelopes
             | RebuildStatsState::ScanArchives
             | RebuildStatsState::ScanEnvelopeVersions
+            | RebuildStatsState::ScanCopies
             | RebuildStatsState::ScanCounters => self.handle_page(event),
             RebuildStatsState::StartWriteTransaction => self.handle_write_started(event),
             RebuildStatsState::WriteCounters => self.handle_counters_written(event),
@@ -2578,6 +2594,22 @@ mod tests {
         operation.consume_values(&[row]).unwrap();
         assert_eq!(operation.groups.get(&group_id).unwrap().logical_bytes, 49);
         assert_eq!(operation.global.logical_bytes, 49);
+    }
+
+    #[test]
+    fn rebuild_counts_copies() {
+        // A pending copy row is charged its stored length, as the copy and its delete charge it.
+        let group_id = Ulid::generate();
+        let version = VersionKey::new("b", "copy", Ulid::generate());
+        let key = aruna_core::structs::storage::encryption::BucketKeyRef::new(Ulid::generate(), 1);
+        let row = crate::abe::copies::copy_row(key, &version).unwrap();
+        let mut operation = RebuildStatsOperation::new();
+        operation.bucket_groups.insert("b".to_string(), group_id);
+        operation.state = RebuildStatsState::ScanCopies;
+        let row = (ByteView::from(row), ByteView::from(vec![3; 70]));
+        operation.consume_values(&[row]).unwrap();
+        assert_eq!(operation.groups.get(&group_id).unwrap().logical_bytes, 70);
+        assert_eq!(operation.global.logical_bytes, 70);
     }
 
     #[tokio::test]

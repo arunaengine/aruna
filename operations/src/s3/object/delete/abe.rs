@@ -53,9 +53,9 @@ impl DeleteObjectOperation {
                 Ok(key) => key,
                 Err(err) => return self.emit_error(err),
             };
-            self.state = DeleteObjectState::DeleteEnvelopeRows;
-            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes: vec![(ABE_COPY_KEYSPACE.to_string(), key.into())],
+            self.state = DeleteObjectState::ReadEnvelopeRows;
+            return smallvec![Effect::Storage(StorageEffect::BatchRead {
+                reads: vec![(ABE_COPY_KEYSPACE.to_string(), key.into())],
                 txn_id: self.txn_id,
             })];
         };
@@ -76,6 +76,14 @@ impl DeleteObjectOperation {
             Ok(key) => key,
             Err(err) => return self.emit_error(err),
         };
+        if let [(row, pending)] = values.as_slice() {
+            self.envelope_bytes = pending.as_ref().map_or(0, |value| value.len() as u64);
+            self.state = DeleteObjectState::DeleteEnvelopeRows;
+            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                deletes: vec![(ABE_COPY_KEYSPACE.to_string(), row.clone())],
+                txn_id: self.txn_id,
+            })];
+        }
         let [(id, envelope), (_, archive)] = values.as_slice() else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };

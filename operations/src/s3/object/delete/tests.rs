@@ -1292,8 +1292,10 @@ async fn removes_envelope_rows() {
 
 #[tokio::test]
 async fn removes_pending_copy() {
-    // Deleting a copy that waits for its envelope deletes its pending row.
+    // Deleting a copy that waits for its envelope deletes its pending row and its charge.
+    use crate::node::usage_stats::StoredDelta;
     use aruna_core::keyspaces::ABE_COPY_KEYSPACE;
+    use aruna_core::structs::storage::usage::usage_group_key;
 
     let temp_handle = tempdir().unwrap();
     let storage_handle = storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -1318,8 +1320,20 @@ async fn removes_pending_copy() {
             txn_id: None,
         })
         .await;
+    let group_id = Ulid::generate();
+    let published = UsageDelta {
+        objects: 1,
+        logical_bytes: 50 + 8,
+        ..Default::default()
+    };
+    let stored = StoredDelta::of_copy(&location, 1, 80).unwrap();
+    apply_usage(
+        &storage_handle,
+        UsageCounterUpdate::with_stored(group_id, published, stored),
+    )
+    .await;
 
-    drive(delete_pending(Ulid::generate(), version_id), &context)
+    drive(delete_pending(group_id, version_id), &context)
         .await
         .unwrap();
 
@@ -1328,4 +1342,6 @@ async fn removes_pending_copy() {
             .await
             .is_none()
     );
+    let group = read_counters(&context, usage_group_key(group_id)).await;
+    assert_eq!((group.objects, group.logical_bytes), (0, 0));
 }

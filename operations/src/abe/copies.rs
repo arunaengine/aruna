@@ -31,6 +31,8 @@ use ulid::Ulid;
 
 /// Pending copies read per page while an unlock completes them.
 const COPY_PAGE: usize = 64;
+/// Length of the bucket key that prefixes each pending copy row.
+const ROW_PREFIX: usize = 24;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CopyOutcome {
@@ -199,8 +201,9 @@ impl CopyEnvelopeOperation {
         let rows = (&metadata, limit, self.txn);
         match envelope_rows(envelope, &self.version, &archive, rows) {
             Ok((effect, charge)) => {
+                // The envelope replaces the pending row and its charge.
                 let delta = UsageDelta {
-                    logical_bytes: i128::from(charge),
+                    logical_bytes: i128::from(charge) - self.row.len() as i128,
                     ..Default::default()
                 };
                 self.usage = Some(UsageCounterUpdate::for_group(group, delta));
@@ -336,6 +339,15 @@ pub(crate) fn copy_row(
     Ok([key.key(), version.to_bytes()?].concat())
 }
 
+/// The version of a pending copy row, after its bucket key prefix.
+pub(crate) fn copy_version(row: &[u8]) -> Result<VersionKey, ConversionError> {
+    let (key, version) = row
+        .split_at_checked(ROW_PREFIX)
+        .ok_or_else(|| ConversionError::InvalidLength("pending copy row".to_string()))?;
+    BucketKeyRef::from_key(key)?;
+    VersionKey::from_bytes(version)
+}
+
 /// Fails unless the bucket settings `row` still seal new writes to `key`.
 pub(crate) fn still_active(row: Option<&[u8]>, key: BucketKeyRef) -> Result<(), AbeError> {
     let settings = BucketEncryption::from_row(row).map_err(|_| AbeError::Context)?;
@@ -361,8 +373,7 @@ pub async fn complete_copies(context: &DriverContext, key: BucketKeyRef) -> Resu
         .await?;
         for (row, value) in &rows {
             let pending = PendingCopy::from_bytes(value).map_err(|error| error.to_string())?;
-            let version = row.get(key.key().len()..).unwrap_or_default();
-            let version = VersionKey::from_bytes(version).map_err(|error| error.to_string())?;
+            let version = copy_version(row).map_err(|error| error.to_string())?;
             let operation = CopyEnvelopeOperation::new(version, value.to_vec(), pending);
             match drive(operation, context).await {
                 Ok(CopyOutcome::Completed) => completed += 1,

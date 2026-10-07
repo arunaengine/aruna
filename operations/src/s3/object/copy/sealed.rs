@@ -532,6 +532,7 @@ impl SealedCopyOperation {
         if let Some(pending) = &self.pending {
             let key = copy_row(pending.source.context.parameters.key, &self.dest_version())?;
             let value = pending.to_bytes().map_err(abe)?;
+            self.envelope_bytes = value.len() as u64;
             self.step = Step::WriteEnvelope;
             return Ok(smallvec![Effect::Storage(StorageEffect::Write {
                 key_space: ABE_COPY_KEYSPACE.to_string(),
