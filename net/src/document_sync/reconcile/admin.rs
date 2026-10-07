@@ -181,6 +181,9 @@ pub(in crate::document_sync) async fn apply_user_operation(
     .transpose()
     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     let user = materialize_user_operation(user_id, previous_user.as_ref(), &reducer_state, &event);
+    // Turning inactive ends READ; a replay or repeat leaves the status unchanged.
+    let deactivating =
+        !previous_user.as_ref().is_some_and(User::is_deactivated) && user.is_deactivated();
 
     let mut writes = vec![
         (
@@ -197,6 +200,9 @@ pub(in crate::document_sync) async fn apply_user_operation(
         conflict_write_entries(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     );
+    if deactivating {
+        writes.extend(due_writes(storage, &event, true, None, None).await?);
+    }
 
     let deletes = stale_conflict_deletes(previous_state.as_ref(), Some(&reducer_state));
     let subject_ids = changed_subject_id

@@ -796,6 +796,78 @@ async fn cutoff_marks_due() {
 }
 
 #[tokio::test]
+async fn deactivation_marks_due() {
+    // A replicated change to inactive marks encrypted buckets due; replay and repeat do not.
+    use aruna_core::keyspaces::{
+        ABE_DUE_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+    };
+    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+    use aruna_core::user::validation::DEACTIVATED_ATTRIBUTE;
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([69; 32]);
+    let user_id = UserId::local(Ulid::from_parts(1_650, 1), realm_id);
+    let actor = test_actor(12, user_id, realm_id);
+    let bucket_id = Ulid::from_parts(1_651, 1);
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(bucket_id),
+        key_generation: 1,
+        ..Default::default()
+    };
+    let index = [&Ulid::from_parts(1_652, 1).to_bytes()[..], b"bucket-a"].concat();
+    let rows = vec![
+        (
+            BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            b"bucket-a".to_vec().into(),
+            settings.to_bytes().unwrap().into(),
+        ),
+        (
+            GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            index.into(),
+            Vec::new().into(),
+        ),
+    ];
+    batch_write_to(&storage, rows).await.unwrap();
+    let document_target = DocumentTarget::User { user_id };
+    let deactivate = |id: u128, seq: u64| {
+        test_admin_event(
+            Ulid::from_parts(1_653, id),
+            AdminDocumentTarget::User { user_id },
+            &actor,
+            seq,
+            AdminDocumentOperation::UserAttributeSet {
+                key: DEACTIVATED_ATTRIBUTE.to_string(),
+                value: "true".to_string(),
+            },
+        )
+    };
+    let due: ByteView = bucket_id.to_bytes().to_vec().into();
+    let first = deactivate(1, 1);
+    apply_admin_operation(&storage, document_target.clone(), first.clone())
+        .await
+        .expect("deactivation applies");
+    assert!(
+        read_storage_value(&storage, ABE_DUE_KEYSPACE, due.clone())
+            .await
+            .is_some()
+    );
+
+    for event in [first, deactivate(2, 2)] {
+        batch_delete_to(&storage, vec![(ABE_DUE_KEYSPACE.to_string(), due.clone())])
+            .await
+            .unwrap();
+        apply_admin_operation(&storage, document_target.clone(), event)
+            .await
+            .expect("unchanged status applies");
+        assert!(
+            read_storage_value(&storage, ABE_DUE_KEYSPACE, due.clone())
+                .await
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
 async fn replicated_revocation_applies() {
     // A revocation replicated from another node must pass the realm-config
     // storage-apply whitelist and deny the token on this node.
