@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::abe::copies::copy_row;
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, build_transition_effects,
@@ -35,6 +36,7 @@ use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, Storage
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
+    ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE,
     OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, PENDING_CLAIM_KEYSPACE,
@@ -44,7 +46,9 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
-use aruna_core::structs::storage::abe::{AbeEffect, AbeEvent, EnvelopePlan, ObjectEnvelope};
+use aruna_core::structs::storage::abe::{
+    AbeEffect, AbeEvent, EnvelopePlan, ObjectEnvelope, envelope_charge,
+};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend,
@@ -103,6 +107,8 @@ enum IncomingVersionState {
     CheckPurgeFence,
     CheckDrift,
     VerifyReplaced,
+    ReadReplacedEnvelope,
+    ReadReplacedRows,
     ReadReplacedMetadata,
     DeleteReplacedMetadata,
     WriteReclaimCandidate,
@@ -346,6 +352,8 @@ pub struct IncomingVersionOperation {
     object_delta: i128,
     replaced_logical_bytes: u64,
     replaced_reference_bytes: u64,
+    /// Envelope rows of the replaced version, deleted with its metadata.
+    replaced_envelope: Vec<(String, aruna_core::types::Key)>,
     pending_head: Option<PendingHeadTransition>,
     head_transition_effects: VecDeque<Effect>,
     pending_version_effects: VecDeque<Effect>,
@@ -413,6 +421,7 @@ impl IncomingVersionOperation {
             object_delta: 0,
             replaced_logical_bytes: 0,
             replaced_reference_bytes: 0,
+            replaced_envelope: Vec::new(),
             pending_head: None,
             head_transition_effects: VecDeque::new(),
             pending_version_effects: VecDeque::new(),
@@ -558,6 +567,8 @@ impl Operation for IncomingVersionOperation {
             IncomingVersionState::CheckDrift => self.accept_drift_check(event),
             // Apply/commit: expose the version and settle ownership.
             IncomingVersionState::VerifyReplaced => self.accept_replaced_version(event),
+            IncomingVersionState::ReadReplacedEnvelope => self.accept_replaced_envelope(event),
+            IncomingVersionState::ReadReplacedRows => self.accept_replaced_rows(event),
             IncomingVersionState::ReadReplacedMetadata => self.accept_metadata_iterated(event),
             IncomingVersionState::DeleteReplacedMetadata => self.accept_metadata_deleted(event),
             IncomingVersionState::WriteReclaimCandidate => self.accept_reclaim_candidate(event),
@@ -675,6 +686,8 @@ impl IncomingVersionOperation {
             IncomingVersionState::CheckPurgeFence => "CheckPurgeFence",
             IncomingVersionState::CheckDrift => "CheckDrift",
             IncomingVersionState::VerifyReplaced => "VerifyReplaced",
+            IncomingVersionState::ReadReplacedEnvelope => "ReadReplacedEnvelope",
+            IncomingVersionState::ReadReplacedRows => "ReadReplacedRows",
             IncomingVersionState::ReadReplacedMetadata => "ReadReplacedMetadata",
             IncomingVersionState::DeleteReplacedMetadata => "DeleteReplacedMetadata",
             IncomingVersionState::WriteReclaimCandidate => "WriteReclaimCandidate",
@@ -1433,6 +1446,7 @@ impl IncomingVersionOperation {
                 .into_iter()
                 .map(|(key, _)| (OBJECT_METADATA_KEYSPACE.to_string(), key)),
         );
+        deletes.append(&mut self.replaced_envelope);
         if let Some(hash) = self
             .replaced_version
             .as_ref()
@@ -3043,6 +3057,103 @@ impl IncomingVersionOperation {
         if self.advance_version_exists {
             return self.write_hash_lookup();
         }
+        if current.is_some_and(|version| version.location_key().is_some()) {
+            return self.read_replaced_envelope();
+        }
+        self.read_replaced_metadata()
+    }
+
+    /// Like a delete, a replacement removes the replaced envelope or pending copy and its charge.
+    fn read_replaced_envelope(&mut self) -> Effects {
+        let key = match self.version_key_bytes() {
+            Ok(key) => key,
+            Err(error) => return self.fail(error.into()),
+        };
+        let bucket = self.manifest.bucket.as_bytes().to_vec();
+        self.state = IncomingVersionState::ReadReplacedEnvelope;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (ABE_VERSION_KEYSPACE.to_string(), key.into()),
+                (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.into()),
+            ],
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn accept_replaced_envelope(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.fail(IncomingVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                received: event,
+            });
+        };
+        let [(key, id), (_, settings)] = values.as_slice() else {
+            return self.fail(PolicyGateError::InvalidEvent.into());
+        };
+        let reads = match id {
+            Some(id) => {
+                self.replaced_envelope = vec![(ABE_VERSION_KEYSPACE.to_string(), key.clone())];
+                vec![
+                    (ABE_ENVELOPE_KEYSPACE.to_string(), id.clone()),
+                    (ABE_ARCHIVE_KEYSPACE.to_string(), id.clone()),
+                ]
+            }
+            None => {
+                let settings = match BucketEncryption::from_row(settings.as_deref()) {
+                    Ok(settings) => settings,
+                    Err(error) => return self.fail(error.into()),
+                };
+                let Some(bucket_id) = settings.bucket_id else {
+                    return self.read_replaced_metadata();
+                };
+                let version = VersionKey::new(
+                    &self.manifest.bucket,
+                    &self.manifest.key,
+                    self.manifest.version_id,
+                );
+                match copy_row(bucket_id, &version) {
+                    Ok(row) => vec![(ABE_COPY_KEYSPACE.to_string(), row.into())],
+                    Err(error) => return self.fail(error.into()),
+                }
+            }
+        };
+        self.state = IncomingVersionState::ReadReplacedRows;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn accept_replaced_rows(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.fail(IncomingVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                received: event,
+            });
+        };
+        let charge = match values.as_slice() {
+            [(row, pending)] => {
+                let Some(pending) = pending else {
+                    return self.read_replaced_metadata();
+                };
+                self.replaced_envelope = vec![(ABE_COPY_KEYSPACE.to_string(), row.clone())];
+                pending.len() as u64
+            }
+            [(id, envelope), (_, archive)] => {
+                self.replaced_envelope.extend([
+                    (ABE_ENVELOPE_KEYSPACE.to_string(), id.clone()),
+                    (ABE_ARCHIVE_KEYSPACE.to_string(), id.clone()),
+                ]);
+                envelope_charge(
+                    envelope.as_deref().unwrap_or_default(),
+                    archive.as_deref().unwrap_or_default(),
+                )
+            }
+            _ => return self.fail(PolicyGateError::InvalidEvent.into()),
+        };
+        self.replaced_logical_bytes = self.replaced_logical_bytes.saturating_add(charge);
         self.read_replaced_metadata()
     }
 

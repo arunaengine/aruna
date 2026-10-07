@@ -3944,3 +3944,119 @@ fn replica_publishes_envelope() {
         i128::from(size + op.envelope_bytes) - i128::from(op.replaced_logical_bytes)
     );
 }
+
+#[test]
+fn replacement_drops_envelope() {
+    // Replacing an ABE version deletes its old envelope rows and returns their charge.
+    use aruna_core::keyspaces::{
+        ABE_ARCHIVE_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
+    };
+    use aruna_core::structs::storage::abe::envelope_charge;
+    use aruna_core::structs::storage::format::PithosLayout;
+    let (_, _, plan) = encrypting_target();
+    let mut location = make_location();
+    location.hashes.clear();
+    location.format = StoredFormat::pithos(
+        PithosLayout {
+            stored_size: 300,
+            metadata_digest: [6; 32],
+            storage_generation: plan.storage_generation,
+        },
+        plan.key,
+    );
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(97, 97),
+        iroh::SecretKey::from_bytes(&[97; 32]).public(),
+        test_realm_id(),
+        make_manifest(ReplicationItemKind::Materialized),
+    );
+    let txn_id = Ulid::from_parts(99, 99);
+    op.seal_plan = Some(plan);
+    op.envelope = Some(target_envelope(1));
+    op.destination_group_id = Some(test_group_id());
+    op.txn_id = Some(txn_id);
+    op.received_blob = Some(ReceivedBlob::reserved(location));
+    let replaced = BlobVersion::materialized(
+        [9u8; 32],
+        BackendRef::node_default(),
+        EncodingClass::Raw,
+        SystemTime::UNIX_EPOCH,
+        test_user_id(),
+        None,
+    );
+    op.replaced_version = Some(replaced.clone());
+    op.replaced_logical_bytes = 42;
+    op.state = IncomingVersionState::VerifyReplaced;
+
+    let version = op.version_key_bytes().unwrap();
+    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        key: version.clone().into(),
+        value: Some(replaced.to_bytes().unwrap().into()),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { reads, txn_id: Some(id) })]
+            if reads[0] == (ABE_VERSION_KEYSPACE.to_string(), version.clone().into())
+                && *id == txn_id
+    ));
+    let old_id = vec![7u8; 16];
+    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (version.clone().into(), Some(old_id.clone().into())),
+            (b"bucket".to_vec().into(), None),
+        ],
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads == &vec![
+            (ABE_ENVELOPE_KEYSPACE.to_string(), old_id.clone().into()),
+            (ABE_ARCHIVE_KEYSPACE.to_string(), old_id.clone().into()),
+        ]
+    ));
+    op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (old_id.clone().into(), Some(vec![1; 40].into())),
+            (old_id.clone().into(), Some(vec![2; 9].into())),
+        ],
+    }));
+    assert_eq!(op.state, IncomingVersionState::ReadReplacedMetadata);
+    let effects = op.step(Event::Storage(StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: None,
+    }));
+    let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice() else {
+        panic!("the replaced rows are deleted together: {effects:?}")
+    };
+    for row in [
+        (ABE_VERSION_KEYSPACE.to_string(), version.clone().into()),
+        (ABE_ENVELOPE_KEYSPACE.to_string(), old_id.clone().into()),
+        (ABE_ARCHIVE_KEYSPACE.to_string(), old_id.into()),
+    ] {
+        assert!(deletes.contains(&row), "missing delete {row:?}");
+    }
+
+    // The new envelope maps the same version after the old rows are gone.
+    let mut effects = op.write_blob_version();
+    let writes = loop {
+        match effects.first() {
+            Some(Effect::Storage(StorageEffect::BatchWrite { writes, .. })) => {
+                break writes.clone();
+            }
+            Some(_) => {}
+            None => panic!("the envelope rows are written"),
+        }
+        effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: Vec::new().into(),
+        }));
+    };
+    let new_id = Ulid::from_parts(90, 90).to_bytes().to_vec();
+    assert_eq!(writes[1].0, ABE_VERSION_KEYSPACE);
+    assert_eq!(writes[1].1.as_ref(), version.as_slice());
+    assert_eq!(writes[1].2.as_ref(), new_id.as_slice());
+    let size = op.manifest.blob.as_ref().unwrap().size;
+    let old = 42 + envelope_charge(&[1; 40], &[2; 9]);
+    assert_eq!(
+        op.usage_delta().unwrap().logical_bytes,
+        i128::from(size + op.envelope_bytes) - i128::from(old)
+    );
+}
