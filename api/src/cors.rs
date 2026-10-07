@@ -288,7 +288,7 @@ mod tests {
                 .headers()
                 .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
                 .unwrap(),
-            "content-disposition,retry-after"
+            "content-disposition,retry-after,content-range,accept-ranges"
         );
     }
 
