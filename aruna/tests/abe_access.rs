@@ -1149,6 +1149,87 @@ async fn abe_restricted_keeps() -> TestResult<()> {
     result
 }
 
+#[tokio::test]
+async fn abe_issuance_reissues() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let http = reqwest::Client::new();
+        let base = seed.base_url.clone();
+        let owner = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&base, &owner, "ABE issuance").await?;
+        let mut readers = Vec::new();
+        for seed_byte in [11, 12] {
+            let user = UserId::local(Ulid::generate(), seed.realm_id);
+            grant_roles(&base, &owner, &group.group_id, user, Value::Null).await?;
+            let token = sign_token(&seed, user, None, 600)?;
+            let public = public_key_of(&SecretBytes::new(vec![seed_byte; 32])).unwrap();
+            add_key(&base, &token, "reader-1", public).await?;
+            readers.push(token);
+        }
+        let credentials = create_s3_credentials(&base, &owner, &group.group_id).await?;
+        s3_client(seed.s3.as_ref().unwrap(), &credentials)
+            .create_bucket()
+            .bucket(BUCKET)
+            .send()
+            .await?;
+        let encryption = format!("{base}/api/v1/data/buckets/{BUCKET}/storage/encryption");
+        let (status, settings) = send(
+            http.put(&encryption)
+                .bearer_auth(&owner)
+                .json(&json!({"mode":"node_managed","expected_generation":0})),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{settings}");
+        let bucket_id = Ulid::from_string(settings["bucket_id"].as_str().unwrap())?;
+        let requests = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/requests");
+        let subtree = json!({"scope":{"kind":"subtree","value":"foo/"}});
+        let (status, body) =
+            send(http.post(&requests).bearer_auth(&readers[0]).json(&subtree)).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // A synced removal left the bucket due; the next node issuance raises and reissues.
+        let id = bucket_id.to_bytes().to_vec();
+        let due = StorageEffect::Write {
+            key_space: aruna_core::keyspaces::ABE_DUE_KEYSPACE.to_string(),
+            key: id.clone().into(),
+            value: vec![1].into(),
+            txn_id: None,
+        };
+        seed.context.storage_handle.send_storage_effect(due).await;
+        let (status, body) =
+            send(http.post(&requests).bearer_auth(&readers[1]).json(&subtree)).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["fields"]["request"]["epochs"], json!([1, 2]));
+        let progress = aruna_core::keyspaces::ABE_REISSUE_KEYSPACE;
+        assert!(stored(&seed, progress, id).await.is_none());
+        let grants = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/grants");
+        let (_, own) = send(http.get(&grants).bearer_auth(&readers[0])).await?;
+        let epochs: Vec<u64> = own["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|r| {
+                KeyGrant::from_bytes(&bytes(&r["record"]))
+                    .unwrap()
+                    .context
+                    .request
+                    .epochs
+            })
+            .collect();
+        assert!(epochs.contains(&2), "{own}");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
 async fn grant_roles(
     base: &str,
     actor: &str,

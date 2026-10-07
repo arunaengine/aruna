@@ -14,7 +14,7 @@ use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect, VaultQuery};
 use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::*;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
@@ -96,6 +96,7 @@ enum State {
     Commit,
     Drain,
     Done,
+    Reissue,
 }
 #[derive(Debug, PartialEq)]
 pub struct KeyOperation {
@@ -161,7 +162,7 @@ impl KeyOperation {
             output: None,
         }
     }
-    /// Sends no holder notifications, for requests a holder or the node issues next.
+    /// Sends no holder notifications and walks no reissue pages, for reissue's own runs.
     pub fn quiet(mut self) -> Self {
         self.quiet = true;
         self
@@ -488,12 +489,14 @@ impl Operation for KeyOperation {
                     self.state = State::Drain;
                     return smallvec![crate::notifications::outbox::schedule_drain_effect()];
                 }
-                self.state = State::Done;
-                self.output = self.result.take().map(Ok);
-                smallvec![]
+                self.walk()
             }
             // Delivery is retried from the stored outbox, so a lost drain timer only delays it.
-            (State::Drain, Event::Task(_)) => {
+            (State::Drain, Event::Task(_)) => self.walk(),
+            (State::Reissue, Event::SubOperation(SubOperationEvent::ReissuePaged { more })) => {
+                if more {
+                    return self.walk();
+                }
                 self.state = State::Done;
                 self.output = self.result.take().map(Ok);
                 smallvec![]

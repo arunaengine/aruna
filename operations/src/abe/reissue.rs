@@ -240,6 +240,32 @@ impl ReissueOperation {
         smallvec![Effect::Storage(effect)]
     }
 }
+impl KeyOperation {
+    /// After node issuance, runs the next page of a raise's saved reissue progress, if any.
+    pub(super) fn walk(&mut self) -> Effects {
+        let issuing = matches!(
+            self.action,
+            KeyAction::Request(_) | KeyAction::Member(_) | KeyAction::Token { .. }
+        );
+        if self.quiet || !issuing {
+            self.state = State::Done;
+            self.output = self.result.take().map(Ok);
+            return smallvec![];
+        }
+        self.state = State::Reissue;
+        let bucket = self.bucket.clone();
+        let page =
+            ReissueOperation::new(bucket, self.auth.clone(), self.node, self.now, MAX_REQUESTS);
+        let sub = boxed_suboperation(page, |result| {
+            let more = result.unwrap_or_else(|error| {
+                tracing::warn!(event = "abe.reissue.failed", error = %error);
+                false
+            });
+            Event::SubOperation(SubOperationEvent::ReissuePaged { more })
+        });
+        smallvec![Effect::SubOperation(sub)]
+    }
+}
 impl Operation for ReissueOperation {
     type Output = bool;
     type Error = KeyError;
