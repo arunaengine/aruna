@@ -11,11 +11,13 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
+    ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_PENDING_KEYSPACE, ABE_VERSION_KEYSPACE,
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_KEY_KEYSPACE,
     PENDING_LOCATION_KEYSPACE, TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE,
     TRANSITION_QUEUE_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
+use aruna_core::structs::storage::abe::{ObjectEnvelope, PendingCopy};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobVersion, VersionKey,
 };
@@ -399,7 +401,7 @@ async fn forget_retired(context: &DriverContext, record: &EncryptionTransition) 
 }
 
 /// Why a transition waits after every other copy moved.
-const PENDING_REASON: &str = "archives with pending content still use the source key";
+const PENDING_REASON: &str = "pending archives, envelopes or copies still use the source key";
 
 /// Pending archives sealed to the transition's source generation, on every backend.
 async fn pending_on_source(
@@ -606,7 +608,8 @@ async fn stage(
         return Ok(false);
     }
     if record.state == TransitionState::Finished {
-        let pending = pending_on_source(storage, record, txn_id).await?;
+        let pending = pending_on_source(storage, record, txn_id).await?
+            + envelopes_on_source(storage, txn_id, bucket, record).await?;
         let versions = source_versions(storage, txn_id, bucket, record).await?;
         if pending + versions > 0 {
             record.finished_at_ms = None;
@@ -697,6 +700,76 @@ async fn source_versions(
     }
 }
 
+/// Every row of `key_space` under `prefix`, read in `txn_id`.
+async fn scan(
+    storage: &StorageHandle,
+    key_space: &str,
+    prefix: Option<Key>,
+    txn_id: TxnId,
+) -> Result<Vec<(Key, Value)>, String> {
+    let (mut after, mut all) = (None, Vec::new());
+    loop {
+        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+            storage,
+            key_space,
+            prefix.clone(),
+            after,
+            PAGE,
+            Some(txn_id),
+        )
+        .await?;
+        all.extend(rows);
+        match cursor {
+            Some(cursor) => after = Some(cursor),
+            None => return Ok(all),
+        }
+    }
+}
+
+/// The retiring source generation of `record`, if it has one.
+fn retiring(record: &EncryptionTransition) -> Option<BucketKeyRef> {
+    let source = record.source?;
+    (record.target.plan.map(|plan| plan.key) != Some(source)).then_some(source)
+}
+
+fn envelope_key(bytes: &[u8]) -> Option<BucketKeyRef> {
+    let envelope = postcard::from_bytes::<ObjectEnvelope>(bytes).ok()?;
+    Some(envelope.context.parameters.key)
+}
+
+/// Envelopes and pending copy rows of `bucket` that still need the retiring generation.
+async fn envelopes_on_source(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    bucket: &str,
+    record: &EncryptionTransition,
+) -> Result<u64, String> {
+    let Some(source) = retiring(record) else {
+        return Ok(0);
+    };
+    let prefix = VersionKey::bucket_prefix(bucket).map_err(|e| e.to_string())?;
+    let mut count = 0;
+    for (_, id) in scan(storage, ABE_VERSION_KEYSPACE, Some(prefix.into()), txn_id).await? {
+        let read = StorageEffect::Read {
+            key_space: ABE_ENVELOPE_KEYSPACE.to_string(),
+            key: id,
+            txn_id: Some(txn_id),
+        };
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) =
+            storage.send_storage_effect(read).await
+        else {
+            return Err("could not read an envelope".to_string());
+        };
+        count += u64::from(value.is_some_and(|value| envelope_key(&value) == Some(source)));
+    }
+    let prefix = source.bucket_id.to_bytes().to_vec().into();
+    for (_, row) in scan(storage, ABE_COPY_KEYSPACE, Some(prefix), txn_id).await? {
+        let pending = PendingCopy::from_bytes(&row).map_err(|e| e.to_string())?;
+        count += u64::from(pending.source.context.parameters.key == source);
+    }
+    Ok(count)
+}
+
 /// No copy needs the source generation any more: it retires and its node copy is removed.
 async fn retire_source(
     storage: &StorageHandle,
@@ -730,6 +803,16 @@ async fn retire_source(
         value: key.to_bytes().map_err(|e| e.to_string())?.into(),
         txn_id: Some(txn_id),
     }];
+    // Uploads that captured the source can never complete, so their envelopes go with it.
+    for (upload, value) in scan(storage, ABE_PENDING_KEYSPACE, None, txn_id).await? {
+        if envelope_key(&value) == Some(source) {
+            effects.push(StorageEffect::Delete {
+                key_space: ABE_PENDING_KEYSPACE.to_string(),
+                key: upload,
+                txn_id: Some(txn_id),
+            });
+        }
+    }
     if let Some(id) = vault {
         effects.push(StorageEffect::VaultDelete {
             entry: VaultEntry::new(VaultPurpose::BucketKey, id),
@@ -1314,5 +1397,104 @@ mod tests {
         // A later check sees the queued delete instead and still keeps the copy.
         let left = forget_removed(storage, prefix, vec![cleanup.into()]).await;
         assert_eq!(left, Ok(1));
+    }
+
+    #[tokio::test]
+    async fn retirement_waits_envelopes() {
+        use aruna_core::compute::SecretBytes;
+        use aruna_core::structs::storage::abe::{EnvelopePlan, create_envelope, create_parameters};
+        let directory = tempfile::tempdir().unwrap();
+        let context = context(directory.path());
+        let source = BucketKeyRef::new(Ulid::from_bytes([3; 16]), 1);
+        let mut key = BucketKeyRecord::new(source, Ulid::nil(), [4; 32], 0);
+        key.state = KeyState::Retiring;
+        let key_row = key.to_bytes().unwrap();
+        put(&context, BUCKET_KEY_KEYSPACE, source.key(), key_row).await;
+        let plan = SealPlan {
+            key: BucketKeyRef::new(source.bucket_id, 2),
+            public_key: [4; 32],
+            cipher: Default::default(),
+            block_keys: Default::default(),
+            storage_generation: 2,
+        };
+        let target = TransitionTarget {
+            compression: Compression::Off,
+            plan: Some(plan),
+        };
+        let mut record =
+            EncryptionTransition::new(TransitionKind::Rotate, Some(source), target, 2, 1);
+        record.state = TransitionState::Cleanup;
+        let row = record.to_bytes().unwrap();
+        put(&context, TRANSITION_KEYSPACE, b"b".to_vec(), row).await;
+        put(
+            &context,
+            TRANSITION_QUEUE_KEYSPACE,
+            b"b".to_vec(),
+            Vec::new(),
+        )
+        .await;
+        let private = SecretBytes::new(vec![9; 32]);
+        let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([3; 32]);
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let parameters = create_parameters(&private, realm, node, source);
+        let plan = EnvelopePlan {
+            parameters: parameters.unwrap(),
+            epoch: 1,
+            write_id: Ulid::generate(),
+            object_key: "k".to_string(),
+            bucket_public: [4; 32],
+        };
+        let (envelope, _) = create_envelope(plan).unwrap();
+        // An unfinished upload that captured the source never completes and never blocks.
+        let upload = Ulid::generate().to_bytes().to_vec();
+        let upload_row = envelope.to_bytes().unwrap();
+        put(&context, ABE_PENDING_KEYSPACE, upload.clone(), upload_row).await;
+        // A pending copy still needs the source key's recovery wrap.
+        let copy = PendingCopy {
+            source: envelope,
+            archive: aruna_core::structs::storage::blob::ArchiveKey::of(&pending(Some(source))),
+        };
+        let version = VersionKey::new("b", "copy", Ulid::generate());
+        let copy_row = crate::abe::copies::copy_row(source.bucket_id, &version).unwrap();
+        let value = copy.to_bytes().unwrap();
+        put(&context, ABE_COPY_KEYSPACE, copy_row.clone(), value).await;
+        let storage = &context.storage_handle;
+
+        assert_eq!(settle(&context, "b", record).await.unwrap(), Some(RECHECK));
+        let stored = read_record(storage, "b").await.unwrap().unwrap();
+        assert_eq!(
+            (stored.state, stored.remaining),
+            (TransitionState::Blocked, 1)
+        );
+
+        let delete = StorageEffect::Delete {
+            key_space: ABE_COPY_KEYSPACE.to_string(),
+            key: copy_row.into(),
+            txn_id: None,
+        };
+        storage.send_storage_effect(delete).await;
+        assert_eq!(settle(&context, "b", stored).await.unwrap(), None);
+        let stored = read_record(storage, "b").await.unwrap().unwrap();
+        assert_eq!(stored.reported_state(), TransitionState::Finished);
+        let read = StorageEffect::Read {
+            key_space: BUCKET_KEY_KEYSPACE.to_string(),
+            key: source.key().into(),
+            txn_id: None,
+        };
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(row), ..
+        }) = storage.send_storage_effect(read).await
+        else {
+            panic!("source key missing")
+        };
+        assert_eq!(
+            BucketKeyRecord::from_bytes(&row).unwrap().state,
+            KeyState::Retired
+        );
+        assert!(
+            !exists(storage, ABE_PENDING_KEYSPACE, upload, None)
+                .await
+                .unwrap()
+        );
     }
 }
