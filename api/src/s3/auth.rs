@@ -512,16 +512,62 @@ pub(crate) fn header_token_refused(headers: &HeaderMap, uri: &Uri) -> bool {
             })
 }
 
-/// Whether the SigV4 `Authorization` header lists `name` among its signed headers. The list
-/// is read as s3s reads it, which signs only names that exactly match a lowercase header.
+/// Whether the one SigV4 `Authorization` header lists `name` among its signed headers.
+/// Only a strict form that s3s reads the same way counts; anything else signs nothing.
 pub(crate) fn signs_header(headers: &HeaderMap, name: &str) -> bool {
-    headers
-        .get(http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split_once(','))
-        .and_then(|(_, rest)| rest.trim_start().strip_prefix("SignedHeaders="))
-        .and_then(|rest| rest.split_once(','))
-        .is_some_and(|(names, _)| names.split(';').any(|signed| signed == name))
+    let mut values = headers.get_all(http::header::AUTHORIZATION).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return false;
+    };
+    value
+        .to_str()
+        .ok()
+        .and_then(signed_names)
+        .is_some_and(|names| names.split(';').any(|signed| signed == name))
+}
+
+/// The SignedHeaders list of `AWS4-HMAC-SHA256 Credential=<key>/<date>/<region>/<service>/
+/// aws4_request, SignedHeaders=<names>, Signature=<hex>`, with the spacing s3s accepts.
+fn signed_names(value: &str) -> Option<&str> {
+    let blank = |c: char| c == ' ' || c == '\t';
+    let rest = value
+        .strip_prefix("AWS4-HMAC-SHA256")?
+        .strip_prefix(blank)?;
+    let (credential, rest) = rest
+        .trim_start_matches(blank)
+        .strip_prefix("Credential=")?
+        .split_once(',')?;
+    let (names, rest) = rest
+        .trim_start_matches(blank)
+        .strip_prefix("SignedHeaders=")?
+        .split_once(',')?;
+    let signature = rest
+        .trim_start_matches(blank)
+        .strip_prefix("Signature=")?
+        .trim_end_matches(blank);
+    let part = |part: &str| !part.is_empty() && !part.contains([',', '/', ';', ' ', '\t', '=']);
+    let date = |date: &str| date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit());
+    // s3s refuses any other region after the signature check.
+    let region = |region: &str| {
+        !region.is_empty()
+            && region
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    let scope: Vec<&str> = credential.split('/').collect();
+    let scoped = matches!(scope[..], [key, day, zone, service, "aws4_request"]
+        if part(key) && date(day) && region(zone) && part(service));
+    let token = |name: &str| {
+        !name.is_empty()
+            && name.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&b)
+            })
+    };
+    let hex = signature.len() == 64
+        && signature
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    (scoped && names.split(';').all(token) && hex).then_some(names)
 }
 
 /// The token credential a long-lived key sends in a signed `x-amz-security-token` header.
@@ -1241,9 +1287,11 @@ mod token_tests {
     /// The hex of `canary-token-key-7a2c-0000-00000`, a token no log or error may show.
     const CANARY: &str = "63616e6172792d746f6b656e2d6b65792d376132632d303030302d3030303030";
     const SIGNED: &str = "AWS4-HMAC-SHA256 Credential=TOKENKEY/20261005/us-east-1/s3/aws4_request, \
-        SignedHeaders=host;x-amz-date;x-amz-security-token, Signature=00";
+        SignedHeaders=host;x-amz-date;x-amz-security-token, Signature=\
+        0000000000000000000000000000000000000000000000000000000000000000";
     const UNSIGNED: &str = "AWS4-HMAC-SHA256 Credential=TOKENKEY/20261005/us-east-1/s3/aws4_request, \
-        SignedHeaders=host;x-amz-date, Signature=00";
+        SignedHeaders=host;x-amz-date, Signature=\
+        0000000000000000000000000000000000000000000000000000000000000000";
 
     fn headers(authorization: &str, tokens: &[&str]) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -1316,7 +1364,7 @@ mod token_tests {
         let plain = Uri::from_static("/bucket/key?X-Amz-Signature=00");
         assert!(!query_token_refused(&HeaderMap::new(), &plain));
         // The access check refuses a presigned request with a header token, and a query token.
-        let presigned = "/bucket/key?X-Amz-Signature=00";
+        let presigned = "/bucket/key?X-Amz-Signature=0000000000000000000000000000000000000000000000000000000000000000";
         assert!(refused(checked(&headers(SIGNED, &[CANARY]), presigned)));
         let token_query = "/bucket/key?X-Amz-Security-Token=00";
         assert!(refused(checked(&headers(SIGNED, &[]), token_query)));
@@ -1399,7 +1447,8 @@ mod token_tests {
     #[test]
     fn object_key_signed() {
         let signed = "AWS4-HMAC-SHA256 Credential=KEY/20261005/us-east-1/s3/aws4_request, \
-            SignedHeaders=host;x-amz-date;x-aruna-object-key, Signature=00";
+            SignedHeaders=host;x-amz-date;x-aruna-object-key, Signature=\
+        0000000000000000000000000000000000000000000000000000000000000000";
         assert!(keyed(signed, "/bucket/key", "GetObject").unwrap());
         // Unsigned, presigned or on another operation, the header is refused.
         let denied = |result: S3Result<bool>| {
@@ -1432,5 +1481,56 @@ mod token_tests {
         headers.insert(OBJECT_KEY_HEADER, OBJECT_KEY.parse().unwrap());
         hide_tokens(&mut headers);
         assert!(!format!("{headers:?}").contains(OBJECT_KEY));
+    }
+
+    #[test]
+    fn strict_authorization() {
+        let names = |value: &str| signs_header(&headers(value, &[]), TOKEN_HEADER);
+        assert!(names(SIGNED));
+        // s3s accepts tabs and repeated blanks between fields and trailing blanks.
+        assert!(names(
+            &SIGNED
+                .replace(" Credential", "\t Credential")
+                .replace(", S", ",S")
+        ));
+        assert!(names(&format!("{SIGNED} \t")));
+        let malformed = [
+            SIGNED.replace("SHA256 ", "SHA256"),
+            SIGNED.replace("aws4_request,", "aws4_request ,"),
+            SIGNED.replace("SignedHeaders=", "SignedHeaders ="),
+            SIGNED.replace("host;", "host;;"),
+            SIGNED.replace("host;", "Host;"),
+            SIGNED.replace("Signature=0", "Signature=X"),
+            SIGNED.replace("/s3/", "//"),
+            SIGNED.replace("20261005", "2026105"),
+            SIGNED.replace("us-east-1", "US-EAST-1"),
+            SIGNED.replace("Credential=", "Credential=/"),
+            SIGNED.replace("SignedHeaders=host;x-amz-date;x-amz-security-token, ", ""),
+            SIGNED.replace(", Signature=", ", Extra=1, Signature="),
+            SIGNED.replace("AWS4-HMAC-SHA256 ", "AWS4-HMAC-SHA256 Signature=00, "),
+            format!("{SIGNED}, SignedHeaders=x-amz-security-token"),
+            // A region that holds a decoy list, which s3s reads as part of the region.
+            SIGNED.replace(
+                "us-east-1/",
+                "us-east-1,SignedHeaders=x-amz-security-token,/",
+            ),
+        ];
+        for value in &malformed {
+            assert!(!names(value), "{value}");
+        }
+        // Fields in another order are refused.
+        let (credential, rest) = SIGNED.split_once(", ").unwrap();
+        let (signed, signature) = rest.split_once(", ").unwrap();
+        let (algorithm, credential) = credential.split_once(' ').unwrap();
+        assert!(!names(&format!(
+            "{algorithm} {signed}, {credential}, {signature}"
+        )));
+        assert!(!names(&format!(
+            "{algorithm} {credential}, {signature}, {signed}"
+        )));
+        // Two Authorization values sign nothing, even when both are well formed.
+        let mut twice = headers(SIGNED, &[]);
+        twice.append(http::header::AUTHORIZATION, SIGNED.parse().unwrap());
+        assert!(!signs_header(&twice, TOKEN_HEADER));
     }
 }

@@ -577,7 +577,7 @@ async fn token_opens_scope() -> TestResult<()> {
             access_secret: created.access_secret,
         };
         let token = hex::encode(private.bytes().expose());
-        let reader = token_client(endpoint, &credentials, Some(token));
+        let reader = token_client(endpoint, &credentials, Some(token.clone()));
         let object = reader
             .get_object()
             .bucket(BUCKET)
@@ -622,6 +622,7 @@ async fn token_opens_scope() -> TestResult<()> {
         );
         for listed in ["X-Aruna-Object-Key", " x-aruna-object-key"] {
             let tamper = Tamper {
+                header: "x-aruna-object-key",
                 listed: Some(listed),
                 key: header.clone(),
             };
@@ -634,6 +635,7 @@ async fn token_opens_scope() -> TestResult<()> {
         }
         let value = header.clone();
         let tamper = Tamper {
+            header: "x-aruna-object-key",
             listed: None,
             key: base64::Engine::encode(&STANDARD, [7u8; 32]),
         };
@@ -651,6 +653,43 @@ async fn token_opens_scope() -> TestResult<()> {
             service_error_code(&read).as_deref(),
             Some("SignatureDoesNotMatch")
         );
+
+        // A region holding a decoy SignedHeaders list, signed validly, protects neither header.
+        for (header, value, client) in [
+            ("x-aruna-object-key", header.clone(), &plain),
+            ("x-amz-security-token", token.clone(), &credentials),
+        ] {
+            let region = format!("us-east-1,SignedHeaders={header},");
+            let config = token_client(endpoint, client, None)
+                .config()
+                .to_builder()
+                .region(aws_sdk_s3::config::Region::new(region))
+                .build();
+            let tamper = Tamper {
+                header,
+                listed: None,
+                key: value,
+            };
+            let read = aws_sdk_s3::Client::from_conf(config)
+                .get_object()
+                .bucket(BUCKET)
+                .key("allowed/a.txt")
+                .customize()
+                .interceptor(tamper)
+                .send()
+                .await;
+            // s3s refuses the region before the object key check; the token is refused first.
+            let expected = if header == "x-aruna-object-key" {
+                "InvalidRequest"
+            } else {
+                "InvalidToken"
+            };
+            assert_eq!(
+                service_error_code(&read).as_deref(),
+                Some(expected),
+                "{header}"
+            );
+        }
 
         // Revoking the credential deletes its grants.
         let revoked = http
@@ -961,9 +1000,10 @@ async fn token_limit_revokes() -> TestResult<()> {
     result
 }
 
-/// Changes a signed request: lists `listed` among its signed headers and sets the object key.
+/// Changes a signed request: lists `listed` among its signed headers and sets `header` to `key`.
 #[derive(Debug)]
 struct Tamper {
+    header: &'static str,
     listed: Option<&'static str>,
     key: String,
 }
@@ -980,7 +1020,7 @@ impl aws_sdk_s3::config::Intercept for Tamper {
         _cfg: &mut aws_sdk_s3::config::ConfigBag,
     ) -> Result<(), aws_sdk_s3::error::BoxError> {
         let headers = context.request_mut().headers_mut();
-        headers.insert("x-aruna-object-key", self.key.clone());
+        headers.insert(self.header, self.key.clone());
         if let Some(listed) = self.listed {
             let authorization = headers.get("authorization").unwrap_or_default();
             let authorization =

@@ -1039,7 +1039,8 @@ mod tests {
 
     const TOKEN_CANARY: &str = "group-s-token-canary";
     const TOKEN_AUTH: &str = "AWS4-HMAC-SHA256 Credential=TOKENKEY/20261005/us-east-1/s3/aws4_request, \
-        SignedHeaders=host;x-amz-date;x-amz-security-token, Signature=00";
+        SignedHeaders=host;x-amz-date;x-amz-security-token, Signature=\
+        0000000000000000000000000000000000000000000000000000000000000000";
 
     struct TestS3;
 
