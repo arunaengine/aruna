@@ -334,6 +334,7 @@ impl KeyOperation {
         if matches!(self.action, KeyAction::Request(_))
             && matches!(self.result, Some(KeyResult::Request(_)))
             && !self.reused
+            && !self.quiet
             && !std::mem::replace(&mut self.fresh, true)
             && let Some(effects) = self.holders()
         {

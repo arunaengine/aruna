@@ -37,7 +37,7 @@ pub struct ReissueOperation {
     bucket_id: Option<Ulid>,
     seen: Vec<u8>,
     next: Option<Vec<u8>>,
-    users: Vec<UserId>,
+    users: Vec<(UserId, KeyScope, Option<Vec<PathRestriction>>)>,
     tokens: Vec<(String, [u8; 32])>,
     runs: Vec<KeyOperation>,
     txn: Option<TxnId>,
@@ -130,22 +130,24 @@ impl ReissueOperation {
                     }
                 }
                 (Some(_), None) => {}
+                // A saved scope is reopened as it was, so it is neither dropped nor broadened.
                 (None, _) => {
-                    if !self.users.contains(&request.recipient_user) {
-                        self.users.push(request.recipient_user);
+                    let saved = (request.recipient_user, request.scope, request.restrictions);
+                    if !self.users.contains(&saved) {
+                        self.users.push(saved);
                     }
                 }
             }
         }
-        for user in std::mem::take(&mut self.users) {
-            let action = KeyAction::Member(user);
-            let run = KeyOperation::new(
-                self.bucket.clone(),
-                self.auth.clone(),
-                self.node,
-                action,
-                self.now,
-            );
+        for (user_id, scope, path_restrictions) in std::mem::take(&mut self.users) {
+            let auth = AuthContext {
+                user_id,
+                realm_id: self.auth.realm_id,
+                path_restrictions,
+                session: None,
+            };
+            let action = KeyAction::Request(scope);
+            let run = KeyOperation::new(self.bucket.clone(), auth, self.node, action, self.now);
             self.runs.push(run.quiet());
         }
         if self.tokens.is_empty() {
@@ -329,6 +331,63 @@ impl Operation for ReissueOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reopens_saved_scopes() {
+        let realm_id = aruna_core::structs::identity::realm::RealmId([1; 32]);
+        let user = UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let restricted = Some(vec![PathRestriction {
+            pattern: "foo/**".into(),
+            permission: aruna_core::structs::identity::auth::Permission::READ,
+        }]);
+        let saved = |id: u8, scope: &str, restrictions: Option<Vec<PathRestriction>>| {
+            let request = KeyRequest {
+                request_id: Ulid::from_bytes([id; 16]),
+                requesting_user: user,
+                recipient_user: user,
+                recipient_record: None,
+                recipient_public: None,
+                recipient_fingerprint: None,
+                bucket: "bucket".into(),
+                parameters: AbeParameters {
+                    realm_id,
+                    node_id: node,
+                    key: aruna_core::structs::storage::encryption::BucketKeyRef::new(
+                        Ulid::from_bytes([4; 16]),
+                        1,
+                    ),
+                    fingerprint: [7; 32],
+                    parameters: vec![9; 3],
+                },
+                scope: KeyScope::Subtree(scope.into()),
+                epochs: vec![1],
+                credential_id: None,
+                restrictions,
+                revisions: Vec::new(),
+                created_at_ms: 1,
+            };
+            (request.key().into(), request.to_bytes().unwrap().into())
+        };
+        let auth = AuthContext::anonymous(realm_id);
+        let mut operation = ReissueOperation::new("bucket".into(), auth, node, 1, 64);
+        operation.step = Step::Page;
+        operation.next = Some(progress(2, true, &[]));
+        let rows = vec![saved(1, "foo/", restricted.clone()), saved(2, "bar/", None)];
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: rows,
+            next_start_after: None,
+        }));
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        // The narrow scope keeps its restrictions instead of a scope derived from direct roles.
+        let [waiting] = operation.runs.as_slice() else {
+            panic!("one run waits");
+        };
+        let scope = KeyScope::Subtree("foo/".into());
+        assert_eq!(waiting.action, KeyAction::Request(scope));
+        assert_eq!(waiting.auth.user_id, user);
+        assert_eq!(waiting.auth.path_restrictions, restricted);
+    }
 
     #[test]
     fn failed_run_keeps_cursor() {
