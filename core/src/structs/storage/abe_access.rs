@@ -13,6 +13,8 @@ use ulid::Ulid;
 
 pub const REQUEST_TTL: u64 = 30 * 24 * 60 * 60 * 1000;
 pub const MAX_REQUESTS: usize = 64;
+/// Epochs one scoped key may admit.
+pub const MAX_EPOCHS: usize = aruna_kpabe::MAX_EPOCHS;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

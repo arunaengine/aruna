@@ -18,7 +18,7 @@ impl KeyOperation {
         let snapshot = self.snapshot.as_ref().ok_or(KeyError::Missing)?;
         if request.expired(self.now)
             || request.parameters != snapshot.parameters
-            || request.epochs != [snapshot.epoch]
+            || request.epochs.iter().max() != Some(&snapshot.epoch)
             || request.revisions != snapshot.revisions
             || request.bucket != self.bucket
         {
@@ -260,11 +260,14 @@ impl KeyOperation {
         self.issue(request)
     }
     pub(super) fn reuse_read(&mut self, values: Vec<(Key, Value)>) -> Effects {
-        let (Some(request), Some(snapshot)) = (self.request.take(), self.snapshot.as_ref()) else {
+        let (Some(mut request), Some(snapshot)) = (self.request.take(), self.snapshot.as_ref())
+        else {
             return self.fail(KeyError::Missing);
         };
-        let epochs = [snapshot.epoch];
+        let current = snapshot.epoch;
         let revisions = snapshot.revisions.clone();
+        let mut covered = std::collections::BTreeSet::new();
+        let mut held_grant = None;
         for (key, value) in values.into_iter().take(MAX_REQUESTS) {
             let grant = match KeyGrant::from_bytes(&value) {
                 Ok(g) => g,
@@ -280,13 +283,30 @@ impl KeyOperation {
             }
             if held.scope == request.scope
                 && held.restrictions == request.restrictions
-                && held.epochs == epochs
                 && held.revisions == revisions
             {
-                self.result = Some(KeyResult::Grant(grant));
-                return self.flush();
+                covered.extend(held.epochs.iter().copied());
+                if held.epochs.contains(&current) {
+                    held_grant = Some(grant);
+                }
             }
         }
+        // Every epoch may hold data in scope: ask for the newest uncovered ones and the current one.
+        let mut epochs: Vec<u64> = (1..=current)
+            .rev()
+            .filter(|e| !covered.contains(e))
+            .take(MAX_EPOCHS)
+            .collect();
+        if let (true, Some(grant)) = (epochs.is_empty(), held_grant) {
+            self.result = Some(KeyResult::Grant(grant));
+            return self.flush();
+        }
+        if epochs.first() != Some(&current) {
+            epochs.truncate(MAX_EPOCHS - 1);
+            epochs.insert(0, current);
+        }
+        epochs.sort_unstable();
+        request.epochs = epochs;
         // A full open-request queue refuses only after no reusable grant is found.
         if self.queue_full {
             return self.fail(AbeError::Limit);
