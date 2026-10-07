@@ -1928,7 +1928,6 @@ mod sealed {
     use aruna_core::structs::storage::blob::{BlobVersion, BucketInfo};
     use aruna_core::structs::storage::encryption::{
         BucketEncryption, BucketKeyError, BucketKeyRecord, BucketKeyRef, EncryptionMode, ReadLease,
-        TokenCopy, TokenCredential,
     };
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
@@ -2214,119 +2213,10 @@ mod sealed {
         ));
     }
 
-    fn credential() -> TokenCredential {
-        TokenCredential {
-            access_key: "TOKENKEY".to_string(),
-            token: SharedSecret::new(SecretBytes::new(vec![9; 32])),
-        }
-    }
-
-    /// What a token admission reads: a bucket whose creator made the token, its copy and key.
-    fn token_rows(operation: &GetObjectOperation) -> Event {
-        let creator = UserId::new(Ulid::from_bytes([5; 16]), RealmId::from_bytes([3; 32]));
-        let info = BucketInfo {
-            group_id: operation.input.group_id,
-            created_at: SystemTime::UNIX_EPOCH,
-            created_by: creator,
-            cors_configuration: None,
-            storage_routing: Vec::new(),
-            placement_policies: Vec::new(),
-            placement_policy_generation: 0,
-            compression: Compression::Off,
-        };
-        let mut values = authority_rows(&info, Some(&encrypting()), &[]);
-        let copy = TokenCopy {
-            key: key(),
-            access_key: "TOKENKEY".to_string(),
-            created_by: creator,
-            nonce: [0; 12],
-            ciphertext: vec![0; 48],
-            created_at_ms: 1,
-        };
-        let record = BucketKeyRecord::new(key(), Ulid::from_bytes([8; 16]), [6; 32], 1);
-        values.push((Vec::new().into(), Some(copy.to_bytes().unwrap().into())));
-        values.push((Vec::new().into(), Some(record.to_bytes().unwrap().into())));
-        Event::Storage(StorageEvent::BatchReadResult { values })
-    }
-
-    /// Steps a sealed read with a token up to the adapter's token admission.
-    fn token_read() -> (GetObjectOperation, BackendLocation) {
-        let mut operation = operation().with_token(Some(credential()));
-        let location = sealed_location();
-        operation.location = Some(location.clone());
-        operation.read_blob();
-        operation.step(committed());
-        let locked = BlobError::BucketKey(BucketKeyError::Locked(key().bucket_id));
-        let effects = operation.step(Event::Blob(BlobEvent::Error(locked)));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead {
-                txn_id: None,
-                ..
-            })]
-        ));
-        let rows = token_rows(&operation);
-        let effects = operation.step(rows);
-        let archive = ArchiveKey::of(&location);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::AdmitToken { key: admitted, archive: named, token, .. })]
-                if *admitted == key() && *named == archive && *token == credential().token
-        ));
-        (operation, location)
-    }
-
-    #[test]
-    fn locked_read_token() {
-        let (mut operation, location) = token_read();
-        let lease = ReadLease::new(key(), ArchiveKey::of(&location), Ulid::nil(), Arc::new(()));
-        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::ReadSealed { range: None, .. })]
-        ));
-    }
-
-    #[test]
-    fn wrong_token_once() {
-        // A wrong token fails typed and is not tried again.
-        let (mut operation, _) = token_read();
-        let wrong = BlobError::BucketKey(BucketKeyError::InvalidToken);
-        let effects = operation.step(Event::Blob(BlobEvent::Error(wrong)));
-        assert!(effects.is_empty());
-        assert_eq!(
-            operation.finalize().err(),
-            Some(GetObjectError::ConversionError(ConversionError::BucketKey(
-                BucketKeyError::InvalidToken
-            )))
-        );
-    }
-
-    #[test]
-    fn reference_token_admits() {
-        let (mut operation, _) = reference(&encrypting());
-        operation.token = Some(credential());
-        let locked = BlobError::BucketKey(BucketKeyError::Locked(key().bucket_id));
-        operation.step(Event::Blob(BlobEvent::Error(locked)));
-        let rows = token_rows(&operation);
-        let effects = operation.step(rows);
-        let archive = ArchiveKey::new(key().bucket_id, BackendRef::node_default());
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::AdmitToken { archive: named, .. })] if *named == archive
-        ));
-        let lease = ReadLease::new(key(), archive, Ulid::nil(), Arc::new(()));
-        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::StagingSource(StagingSourceEffect::Head { .. })]
-        ));
-    }
-
     #[test]
     fn pending_token_promotes() {
         // With a token, a pending version ends the read typed, so the caller promotes it.
-        let mut operation = operation().with_token(Some(credential()));
+        let mut operation = operation().with_token(true);
         let archive = ArchiveKey::new(Ulid::generate(), BackendRef::node_default());
         let version = BlobVersion::pending(
             archive.clone(),

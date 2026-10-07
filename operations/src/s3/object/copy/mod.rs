@@ -8,7 +8,6 @@ use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     routing_snapshot,
 };
-use crate::s3::bucket::token_admit::{AdmitTokenOperation, TokenAdmitError, TokenAdmitInput};
 use crate::s3::object::copy::sealed::{SealedCopyError, SealedCopyInput, SealedCopyOperation};
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, TokenRead, read_local, reference_archive,
@@ -34,7 +33,7 @@ use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBind
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BackendLocation;
-use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError};
+use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::resolve_backend;
 use aruna_core::types::GroupId;
@@ -282,7 +281,7 @@ async fn copy_inner(
     if head.location.is_none() && input.references == CopyReferences::Preserve {
         // Another bucket reads the reference without the source's lock, so admit it here.
         if input.source_bucket != input.dest_bucket {
-            admit_source(context, &input, token).await?;
+            admit_source(context, &input).await?;
         }
         return preserve_reference(context, input, head, source_last_modified).await;
     }
@@ -431,11 +430,10 @@ async fn sealed_copy(
 }
 
 /// Admits a plaintext read of the source bucket the way GET does: an encrypting bucket must be
-/// unlocked, or `token` must open its key. No bytes move, so the lease ends at once.
+/// unlocked, since a token opens single objects only. No bytes move, so the lease ends at once.
 async fn admit_source(
     context: &DriverContext,
     input: &CopyObjectInput,
-    token: Option<&TokenRead>,
 ) -> Result<(), CopyObjectError> {
     let failed = || CopyObjectError::Get(GetObjectError::GetObjectFailed);
     let read = StorageEffect::Read {
@@ -464,28 +462,9 @@ async fn admit_source(
         key,
         archive: archive.clone(),
     };
-    match (blob_handle.send_blob_effect(admit).await, token) {
-        (Event::Blob(BlobEvent::ReadAdmitted { .. }), _) => Ok(()),
-        (
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))),
-            Some(token),
-        ) => {
-            let operation = AdmitTokenOperation::new(TokenAdmitInput {
-                bucket: input.source_bucket.clone(),
-                group_id: input.source_group_id,
-                realm_id: input.realm_id,
-                node_id: input.node_id,
-                key,
-                archive,
-                credential: token.credential.clone(),
-            });
-            match drive(operation, context).await {
-                Ok(_) => Ok(()),
-                Err(TokenAdmitError::Key(error)) => Err(locked(error)),
-                Err(_) => Err(failed()),
-            }
-        }
-        (Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))), _) => Err(locked(error)),
+    match blob_handle.send_blob_effect(admit).await {
+        Event::Blob(BlobEvent::ReadAdmitted { .. }) => Ok(()),
+        Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => Err(locked(error)),
         _ => Err(failed()),
     }
 }

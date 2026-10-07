@@ -19,7 +19,7 @@ use crate::replication::protocol::{
 use crate::replication::queue::{
     LiveObligationRecord, LiveVersionInput, LiveVersionOperation, live_obligation_entry,
 };
-use crate::s3::bucket::token_admit::{AdmitTokenOperation, TokenAdmitError, TokenAdmitInput};
+use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
     multipart_summary_read, summary_from_read,
@@ -31,8 +31,8 @@ use aruna_core::errors::{
 };
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    ABE_GRANT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
@@ -43,6 +43,8 @@ use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::abe::AbeEffect;
+use aruna_core::structs::storage::abe::AbeError;
+use aruna_core::structs::storage::abe_access::{KeyGrant, MAX_REQUESTS};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, CurrentVersionPointer, ManagedCopyKey, VersionKey,
@@ -107,8 +109,6 @@ pub enum GetObjectState {
     CheckReferenceKey,
     Finish,
     Error,
-    /// A locked key is admitted with the request's token credential instead of the registry.
-    AdmitToken,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -338,15 +338,13 @@ pub struct GetObjectOperation {
     reference_key: Option<BucketKeyRef>,
     /// Admitted plaintext read of that bucket; the served stream keeps it until it ends.
     reference_lease: Option<ReadLease>,
-    /// The request's token credential, used once when the registry reports the key locked.
-    token: Option<TokenCredential>,
+    /// The request has a token, so a pending version answers `PendingContent`.
+    token: bool,
     object: Option<(
         aruna_core::structs::storage::abe::ObjectEnvelope,
         aruna_core::structs::storage::abe::EnvelopeArchive,
         aruna_core::compute::SharedSecret,
     )>,
-    /// The token admission of a locked key and the admission state it answers.
-    token_admit: Option<(AdmitTokenOperation, GetObjectState)>,
 }
 
 impl GetObjectOperation {
@@ -386,9 +384,8 @@ impl GetObjectOperation {
             output: None,
             reference_key: None,
             reference_lease: None,
-            token: None,
+            token: false,
             object: None,
-            token_admit: None,
         }
     }
 
@@ -397,8 +394,8 @@ impl GetObjectOperation {
         self
     }
 
-    /// Admits a read of a locked key with `token`, if the credential has a copy of the key.
-    pub fn with_token(mut self, token: Option<TokenCredential>) -> Self {
+    /// Marks a request with a token, which can open the object key of a pending version.
+    pub fn with_token(mut self, token: bool) -> Self {
         self.token = token;
         self
     }
@@ -411,73 +408,6 @@ impl GetObjectOperation {
     ) -> Self {
         self.object = Some((envelope, archive, private));
         self
-    }
-
-    /// The key and archive an admission state waits for.
-    fn admission(&self) -> Option<(BucketKeyRef, ArchiveKey)> {
-        let location = self.location.as_ref();
-        match self.state {
-            GetObjectState::AdmitRead => {
-                let location = location?;
-                Some((location.format.bucket_key()?, ArchiveKey::of(location)))
-            }
-            GetObjectState::AdmitPlain => Some((self.reference_key?, ArchiveKey::of(location?))),
-            GetObjectState::CheckReferenceKey => {
-                let key = self.reference_key?;
-                Some((key, reference_archive(key)))
-            }
-            _ => None,
-        }
-    }
-
-    /// A locked key with a token credential starts the token admission; the token is used once.
-    fn admit_token(&mut self, event: Event) -> Result<Effects, Event> {
-        let locked = matches!(
-            event,
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(
-                BucketKeyError::Locked(_)
-            )))
-        );
-        let Some((key, archive)) = self.admission().filter(|_| locked && self.token.is_some())
-        else {
-            return Err(event);
-        };
-        let Some(credential) = self.token.take() else {
-            return Err(event);
-        };
-        let mut operation = AdmitTokenOperation::new(TokenAdmitInput {
-            bucket: self.input.bucket.clone(),
-            group_id: self.input.group_id,
-            realm_id: self.input.user_identity.realm_id,
-            node_id: self.input.node_id,
-            key,
-            archive,
-            credential,
-        });
-        let effects = operation.start();
-        self.token_admit = Some((operation, self.state.clone()));
-        self.state = GetObjectState::AdmitToken;
-        Ok(effects)
-    }
-
-    /// Steps the token admission; its lease answers the admission state it stands in for.
-    fn token_step(&mut self, event: Event) -> Effects {
-        let Some((mut operation, resume)) = self.token_admit.take() else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
-        let effects = operation.step(event);
-        if !operation.is_complete() {
-            self.token_admit = Some((operation, resume));
-            return effects;
-        }
-        self.state = resume;
-        match operation.finalize() {
-            Ok(lease) => self.step(Event::Blob(BlobEvent::ReadAdmitted { lease })),
-            Err(TokenAdmitError::Key(error)) => self.emit_error(locked(error)),
-            Err(TokenAdmitError::Storage(error)) => self.emit_error(error.into()),
-            Err(TokenAdmitError::Conversion(error)) => self.emit_error(error.into()),
-            Err(_) => self.emit_error(GetObjectError::GetObjectFailed),
-        }
     }
 
     fn auth_context(&self) -> AuthContext {
@@ -687,7 +617,7 @@ impl GetObjectOperation {
                 smallvec![resolve_binding_effect(ResolveBindingInput { source },)]
             }
             BlobVersionState::PendingContent { archive, .. }
-                if self.token.is_some() || self.object.is_some() =>
+                if self.token || self.object.is_some() =>
             {
                 self.abort_with_error(GetObjectError::PendingContent(archive))
             }
@@ -1665,10 +1595,6 @@ impl Operation for GetObjectOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.admit_token(event) {
-            Ok(effects) => return effects,
-            Err(event) => event,
-        };
         match &self.state {
             GetObjectState::Init => self.handle_init(),
             GetObjectState::StartTransaction => self.handle_transaction_started(event),
@@ -1697,7 +1623,6 @@ impl Operation for GetObjectOperation {
             GetObjectState::CheckReferenceKey => self.reference_key_checked(event),
             GetObjectState::Finish => smallvec![],
             GetObjectState::Error => self.abort(),
-            GetObjectState::AdmitToken => self.token_step(event),
         }
     }
 
@@ -1774,73 +1699,91 @@ pub async fn get_object_token(
     routed_blob(context, read).await
 }
 
-/// Reads the local copy; with a token, a pending version is promoted once and read again.
+/// Reads the local copy; with a token, a locked or pending version is read with the object key
+/// that a grant of the credential opens.
 pub(crate) async fn read_local(
     context: &DriverContext,
     input: GetObjectInput,
     restrictions: Option<Vec<PathRestriction>>,
     token: Option<&TokenRead>,
 ) -> Result<GetObjectResult, GetObjectError> {
-    let operation = |input| {
-        GetObjectOperation::new(input)
-            .with_restrictions(restrictions.clone())
-            .with_token(token.map(|token| token.credential.clone()))
-    };
+    let operation = GetObjectOperation::new(input.clone())
+        .with_restrictions(restrictions.clone())
+        .with_token(token.is_some());
+    let result = drive(operation, context).await;
     let Some(token) = token else {
-        return drive(operation(input), context).await;
+        return result;
     };
-    match drive(operation(input.clone()), context).await {
-        Err(GetObjectError::PendingContent(archive)) => {
-            promote_token(context, &input, archive, token).await?;
-            drive(operation(input), context).await
-        }
-        result => result,
+    match result {
+        Err(GetObjectError::PendingContent(_)) => {}
+        Err(GetObjectError::ConversionError(ConversionError::BucketKey(
+            BucketKeyError::Locked(_),
+        ))) => {}
+        result => return result,
     }
+    let (input, private) = token_object(context, input, &token.credential).await?;
+    read_object(context, input, restrictions, private, &token.limits).await
 }
 
-/// Promotes the pending `archive` with a lease the token admits, as an unlock would.
-async fn promote_token(
+/// Pins the version and opens its object key with a grant of `credential` that covers it.
+async fn token_object(
     context: &DriverContext,
-    input: &GetObjectInput,
-    archive: ArchiveKey,
-    token: &TokenRead,
-) -> Result<(), GetObjectError> {
-    let read = StorageEffect::Read {
-        key_space: PENDING_LOCATION_KEYSPACE.to_string(),
-        key: archive.to_bytes().into(),
+    mut input: GetObjectInput,
+    credential: &TokenCredential,
+) -> Result<(GetObjectInput, SharedSecret), GetObjectError> {
+    let version = match input.version_id {
+        Some(version) => version,
+        None => {
+            let head = HeadObjectOperation::new(HeadObjectInput {
+                bucket: input.bucket.clone(),
+                key: input.key.clone(),
+                version_id: None,
+            });
+            let head = drive(head, context)
+                .await
+                .map_err(|_| GetObjectError::GetObjectFailed)?;
+            head.resolved_version_id
+                .or(head.version_id)
+                .ok_or(GetObjectError::NoSuchKey)?
+        }
+    };
+    input.version_id = Some(version);
+    let read = EnvelopeOperation::new(input.bucket.clone(), input.key.clone(), version);
+    let (envelope, _) = drive(read, context).await?;
+    let key = envelope.context.parameters.key;
+    let user = input.user_identity.to_storage_key();
+    let scan = StorageEffect::Iter {
+        key_space: ABE_GRANT_KEYSPACE.to_string(),
+        prefix: Some([&key.bucket_id.to_bytes()[..], &user].concat().into()),
+        start: None,
+        limit: MAX_REQUESTS + 1,
         txn_id: None,
     };
-    let value = match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+    let values = match context.storage_handle.send_storage_effect(scan).await {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         _ => return Err(GetObjectError::GetObjectFailed),
     };
-    // Promoted in between: the second read finds the content hash.
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let location = BackendLocation::from_bytes(&value)?;
-    let key = location
-        .format
-        .bucket_key()
-        .ok_or(GetObjectError::GetObjectFailed)?;
-    let (realm_id, node_id) = (input.user_identity.realm_id, input.node_id);
-    let admit = AdmitTokenOperation::new(TokenAdmitInput {
-        bucket: input.bucket.clone(),
-        group_id: input.group_id,
-        realm_id,
-        node_id,
-        key,
-        archive: archive.clone(),
-        credential: token.credential.clone(),
-    });
-    let lease = drive(admit, context).await.map_err(|error| match error {
-        TokenAdmitError::Key(error) => locked(error),
-        TokenAdmitError::Storage(error) => error.into(),
-        TokenAdmitError::Conversion(error) => error.into(),
-        _ => GetObjectError::GetObjectFailed,
-    })?;
-    promote_leased(context, input, archive, lease, &token.limits).await
+    let mut error = locked(BucketKeyError::Locked(key.bucket_id));
+    for (_, value) in values {
+        let Ok(grant) = KeyGrant::from_bytes(&value) else {
+            continue;
+        };
+        let request = &grant.context.request;
+        if request.credential_id.as_deref() != Some(credential.access_key.as_str())
+            || request.parameters != envelope.context.parameters
+            || !request.epochs.contains(&envelope.context.epoch)
+            || !request.covers(&input.key)
+        {
+            continue;
+        }
+        match grant.open_object(credential.token.bytes(), &envelope) {
+            Ok(private) => return Ok((input, private)),
+            Err(AbeError::WrongKey) => error = locked(BucketKeyError::InvalidToken),
+            Err(other) => error = other.into(),
+        }
+    }
+    Err(error)
 }
 
 /// Reads a pinned version with an object key; a pending version is promoted under that key once.
