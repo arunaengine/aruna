@@ -45,6 +45,7 @@ pub struct AssignRolesOperation {
     input: AssignRolesInput,
     state: AssignRolesState,
     output: Option<Result<RealmAuthorizationDocument, AssignRolesError>>,
+    narrowed: bool,
 }
 
 impl std::fmt::Debug for AssignRolesOperation {
@@ -129,6 +130,7 @@ impl AssignRolesOperation {
             input,
             state: AssignRolesState::Init,
             output: None,
+            narrowed: false,
         }
     }
 
@@ -265,6 +267,7 @@ impl AssignRolesOperation {
             .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_events = apply_reducer_updates(&mut reducer_state, &self.input, &role_ids)?;
 
+        let roles_before = auth_doc.roles.clone();
         let materialized_assignments = reducer_state.materialized_realm_assignments();
         for role_id in role_ids {
             let role = auth_doc
@@ -280,6 +283,7 @@ impl AssignRolesOperation {
                 role.assigned_users.remove(&self.input.user_id);
             }
         }
+        self.narrowed = aruna_core::admin_documents::roles_narrowed(&roles_before, &auth_doc.roles);
 
         let key = (*auth_doc.realm_id.as_bytes()).into();
         let value = auth_doc.to_bytes(&self.input.actor)?.into();
@@ -383,6 +387,9 @@ impl AssignRolesOperation {
             auth_doc,
             admin_outbox_written,
         };
+        if self.narrowed {
+            return smallvec![crate::abe::mark_due(None, txn_id)];
+        }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -533,6 +540,11 @@ impl Operation for AssignRolesOperation {
             Ok(event) => event,
             Err(effects) => return effects,
         };
+        if let AssignRolesState::CommitTransaction { txn_id, .. } = self.state
+            && let Some(next) = crate::abe::marked(&event, txn_id)
+        {
+            return next.unwrap_or_else(|error| self.fail(error.into()));
+        }
 
         match self.state.clone() {
             AssignRolesState::Auth => self.handle_authorization(event),
