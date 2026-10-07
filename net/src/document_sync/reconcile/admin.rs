@@ -1356,6 +1356,7 @@ async fn apply_realm_config(
         );
         let mut revocation_index =
             needs_index.then(|| reducer_state.revocation_index(effective_now));
+        let mut applied = false;
         if is_revocation {
             let Some(index) = revocation_index.as_mut() else {
                 return Err(abort_error(
@@ -1370,8 +1371,18 @@ async fn apply_realm_config(
                     abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
                 );
             }
-        } else if let Err(error) = reducer_state.apply(&event) {
-            return Err(abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await);
+        } else {
+            match reducer_state.apply(&event) {
+                Ok(status) => applied = status == AdminApplyStatus::Applied,
+                Err(error) => {
+                    return Err(abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(error.to_string()),
+                    )
+                    .await);
+                }
+            }
         }
         reducer_state.advance_revocation_floor(effective_now);
         if let Some(index) = revocation_index.as_mut() {
@@ -1426,9 +1437,12 @@ async fn apply_realm_config(
             }
         };
         writes.push(reducer_write);
-        match due_writes(storage, &event, false, None, Some(txn_id)).await {
-            Ok(due) => writes.extend(due),
-            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        // A replayed policy event is a duplicate and writes no new due marker.
+        if applied {
+            match due_writes(storage, &event, false, None, Some(txn_id)).await {
+                Ok(due) => writes.extend(due),
+                Err(error) => return Err(abort_error(storage, txn_id, error).await),
+            }
         }
         if previous_state
             .as_ref()

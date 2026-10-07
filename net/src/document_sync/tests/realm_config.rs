@@ -602,6 +602,100 @@ async fn realm_policies_replicate() {
 }
 
 #[tokio::test]
+async fn policy_replay_unmarked() {
+    use aruna_core::keyspaces::{
+        ABE_DUE_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+    };
+    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([67; 32]);
+    let actor = test_actor(
+        11,
+        UserId::local(Ulid::from_parts(1_613, 1), realm_id),
+        realm_id,
+    );
+    let target = AdminDocumentTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
+    let bucket_id = Ulid::from_parts(1_614, 1);
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(bucket_id),
+        key_generation: 1,
+        ..Default::default()
+    };
+    let index = [&Ulid::from_parts(1_615, 1).to_bytes()[..], b"bucket-a"].concat();
+    let rows = vec![
+        (
+            BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            b"bucket-a".to_vec().into(),
+            settings.to_bytes().unwrap().into(),
+        ),
+        (
+            GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            index.into(),
+            Vec::new().into(),
+        ),
+    ];
+    batch_write_to(&storage, rows).await.unwrap();
+    let settings_set = AdminDocumentOperation::ConfigSettingsSet {
+        metadata_replication: MetadataReplicationConfig::new(3),
+        discovery: test_discovery(25, "https://replay.example:443"),
+    };
+    let policies = AdminDocumentOperation::ConfigPoliciesSet {
+        policies: Vec::new(),
+    };
+    let policy_event = test_admin_event(
+        Ulid::from_parts(1_617, 1),
+        target.clone(),
+        &actor,
+        2,
+        policies,
+    );
+    let settings_event = test_admin_event(
+        Ulid::from_parts(1_616, 1),
+        target.clone(),
+        &actor,
+        1,
+        settings_set,
+    );
+    for event in [settings_event, policy_event.clone()] {
+        apply_admin_operation(&storage, document_target.clone(), event)
+            .await
+            .expect("config event applies");
+    }
+    let due: ByteView = bucket_id.to_bytes().to_vec().into();
+    assert!(
+        read_storage_value(&storage, ABE_DUE_KEYSPACE, due.clone())
+            .await
+            .is_some()
+    );
+
+    // A raise consumed the marker, and an older floor makes the replay change reducer state.
+    let state = read_storage_value(
+        &storage,
+        DOCUMENT_STATE_KEYSPACE,
+        reducer_state_key(&target),
+    )
+    .await
+    .expect("reducer state exists");
+    let mut state: AdminDocumentState = postcard::from_bytes(&state).unwrap();
+    state.revocation_floor = 0;
+    let rows = vec![aruna_core::storage_entries::reducer_state_entry(&state).unwrap()];
+    batch_write_to(&storage, rows).await.unwrap();
+    batch_delete_to(&storage, vec![(ABE_DUE_KEYSPACE.to_string(), due.clone())])
+        .await
+        .unwrap();
+    apply_admin_operation(&storage, document_target, policy_event)
+        .await
+        .expect("replayed policy event applies");
+    assert!(
+        read_storage_value(&storage, ABE_DUE_KEYSPACE, due)
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn replicated_revocation_applies() {
     // A revocation replicated from another node must pass the realm-config
     // storage-apply whitelist and deny the token on this node.
