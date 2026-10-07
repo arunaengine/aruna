@@ -295,7 +295,7 @@ async fn advance(
 }
 
 /// The realm quota and origin that the envelope charges of rewritten versions must fit.
-async fn quota_origin(
+pub(crate) async fn quota_origin(
     context: &DriverContext,
 ) -> Result<Option<(QuotaConfig, RealmId, NodeId)>, String> {
     let Some(net) = context.net_handle.as_ref() else {

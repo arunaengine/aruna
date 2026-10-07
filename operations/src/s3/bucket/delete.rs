@@ -8,10 +8,10 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    ABE_DUE_KEYSPACE, ABE_REISSUE_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
-    GROUP_ENCRYPTED_KEYSPACE, KEY_COPY_KEYSPACE, NODE_VAULT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
-    RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+    ABE_DUE_KEYSPACE, ABE_REISSUE_KEYSPACE, ABE_REKEY_KEYSPACE, BLOB_HEAD_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE,
+    BUCKET_KEY_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, KEY_COPY_KEYSPACE, NODE_VAULT_KEYSPACE,
+    RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
@@ -430,7 +430,8 @@ impl DeleteBucketOperation {
         if let Some(bucket_id) = self.bucket_id {
             let id: Key = bucket_id.to_bytes().to_vec().into();
             deletes.push((ABE_DUE_KEYSPACE.to_string(), id.clone()));
-            deletes.push((ABE_REISSUE_KEYSPACE.to_string(), id));
+            deletes.push((ABE_REISSUE_KEYSPACE.to_string(), id.clone()));
+            deletes.push((ABE_REKEY_KEYSPACE.to_string(), id));
         }
         deletes.append(&mut self.relationship_deletes);
         deletes.append(&mut self.key_deletes);
@@ -720,6 +721,7 @@ mod test {
             (NODE_VAULT_KEYSPACE, vault_key.clone(), vec![1]),
             (ABE_DUE_KEYSPACE, bucket_id.to_bytes().to_vec(), vec![1]),
             (ABE_REISSUE_KEYSPACE, bucket_id.to_bytes().to_vec(), vec![1]),
+            (ABE_REKEY_KEYSPACE, bucket_id.to_bytes().to_vec(), vec![1]),
         ];
         for (key_space, key, value) in rows.clone() {
             storage_handle

@@ -7,6 +7,7 @@ pub mod envelope;
 mod epoch;
 mod member;
 mod reissue;
+pub mod rekey;
 mod requests;
 mod snapshot;
 
@@ -54,6 +55,8 @@ pub enum KeyAction {
     Epoch {
         instant: bool,
     },
+    /// Refuses all but unrestricted key holders, then raises a due epoch, before a re-key.
+    Rekey,
 }
 #[derive(Debug, PartialEq)]
 pub enum KeyResult {
@@ -74,6 +77,10 @@ pub enum KeyError {
     Denied,
     #[error("encryption storage is unavailable")]
     Storage,
+    #[error("a re-key of another prefix is unfinished in this bucket")]
+    Busy,
+    #[error("the bucket key is locked on this node")]
+    Locked,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum State {
@@ -317,7 +324,7 @@ impl KeyOperation {
                 (ABE_REQUEST_KEYSPACE, own, None)
             }
             KeyAction::Grants(cursor) => (ABE_GRANT_KEYSPACE, own, cursor.clone()),
-            KeyAction::Epoch { .. } => return self.fail(AbeError::Context),
+            KeyAction::Epoch { .. } | KeyAction::Rekey => return self.fail(AbeError::Context),
         };
         self.state = State::Records;
         smallvec![Effect::Storage(StorageEffect::Iter {
@@ -428,8 +435,10 @@ impl Operation for KeyOperation {
                 if matches!(self.action, KeyAction::Open(_)) {
                     return self.records();
                 }
-                if let KeyAction::Epoch { instant } = self.action {
-                    return self.raise(instant);
+                match self.action {
+                    KeyAction::Epoch { instant } => return self.raise(instant),
+                    KeyAction::Rekey => return self.raise(false),
+                    _ => {}
                 }
                 if self.snapshot.as_ref().is_some_and(|s| s.due) {
                     return self.due_check();

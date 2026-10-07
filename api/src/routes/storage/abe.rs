@@ -65,11 +65,14 @@ fn abe_error(error: AbeError) -> ServerError {
     ServerError::Refused(status, code, error.to_string())
 }
 pub(crate) fn key_error(error: KeyError) -> ServerError {
+    let message = error.to_string();
     match error {
         KeyError::Abe(e) => abe_error(e),
         KeyError::Missing => ServerError::NotFound,
         KeyError::Denied => ServerError::Forbidden,
         KeyError::Storage => ServerError::ServiceUnavailable,
+        KeyError::Busy => ServerError::Refused(StatusCode::CONFLICT, "rekey_running", message),
+        KeyError::Locked => ServerError::Refused(StatusCode::CONFLICT, "bucket_locked", message),
     }
 }
 fn parameter_view(p: &AbeParameters, epoch: u64) -> ServerResult<Value> {

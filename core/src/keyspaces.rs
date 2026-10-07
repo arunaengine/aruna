@@ -152,6 +152,8 @@ pub const PLAINTEXT_COPY_KEYSPACE: &str = "replication_plaintext";
 pub const ABE_DUE_KEYSPACE: &str = "abe_epoch_due";
 /// Key reissue progress after an epoch raise, keyed by bucket id: epoch, phase and cursor.
 pub const ABE_REISSUE_KEYSPACE: &str = "abe_reissues";
+/// Scoped re-key progress, keyed by bucket id: prefix, epoch, cursor and count.
+pub const ABE_REKEY_KEYSPACE: &str = "abe_rekeys";
 /// Durable evidence of a copy that failed hash/bao verification (§8.2), keyed
 /// per (hash, backend) so re-hitting the same corrupt copy overwrites its row.
 pub const BLOB_QUARANTINE_KEYSPACE: &str = "blob_quarantine";
@@ -533,6 +535,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     TOKEN_GRANT_KEYSPACE,
     ABE_DUE_KEYSPACE,
     ABE_REISSUE_KEYSPACE,
+    ABE_REKEY_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

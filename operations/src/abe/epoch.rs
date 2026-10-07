@@ -30,7 +30,7 @@ impl KeyOperation {
             return self.fail(KeyError::Missing);
         };
         let holder = snapshot.holder && self.auth.path_restrictions.is_none();
-        if instant && !holder {
+        if (instant || self.action == KeyAction::Rekey) && !holder {
             return self.fail(KeyError::Denied);
         }
         if !instant && !(snapshot.due && (holder || self.managed)) {
