@@ -20,13 +20,14 @@ pub(super) struct Snapshot {
     pub holder: bool,
     pub holders: std::collections::BTreeSet<aruna_core::UserId>,
     pub policies: bool,
+    pub due: bool,
 }
 impl KeyOperation {
     pub(super) fn snapshot_read(
         &mut self,
         values: Vec<(Key, Option<Value>)>,
     ) -> Result<(), KeyError> {
-        if values.len() != 7 {
+        if !matches!(values.len(), 7 | 8) {
             return Err(AbeError::Context.into());
         }
         let bytes = |index: usize| values[index].1.as_deref().ok_or(KeyError::Missing);
@@ -100,6 +101,7 @@ impl KeyOperation {
             holder: info.created_by == self.auth.user_id || admin || explicit,
             holders,
             policies,
+            due: values.get(7).is_some_and(|(_, v)| v.is_some()),
         });
         Ok(())
     }

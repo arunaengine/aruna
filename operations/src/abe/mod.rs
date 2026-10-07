@@ -4,6 +4,7 @@
 
 pub mod copies;
 pub mod envelope;
+mod epoch;
 mod member;
 mod requests;
 mod snapshot;
@@ -20,8 +21,11 @@ use aruna_core::structs::identity::user::vault::{UserKeyRecord, VaultRecords};
 use aruna_core::structs::storage::abe::{AbeEffect, AbeError, AbeEvent, AbeParameters};
 use aruna_core::structs::storage::abe_access::*;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, BucketKeyRecord};
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketKeyError, BucketKeyRecord, EncryptionMode,
+};
 use aruna_core::types::{Effects, Key, TxnId, Value};
+pub use epoch::EpochDueOperation;
 pub use member::MemberKeysOperation;
 use smallvec::smallvec;
 use snapshot::Snapshot;
@@ -43,6 +47,11 @@ pub enum KeyAction {
         public_key: [u8; 32],
         restrictions: Option<Vec<PathRestriction>>,
     },
+    /// Raises the bucket epoch: always when instant, else only when a raise is due and the caller
+    /// holds the bucket key or the node manages it.
+    Epoch {
+        instant: bool,
+    },
 }
 #[derive(Debug, PartialEq)]
 pub enum KeyResult {
@@ -51,6 +60,7 @@ pub enum KeyResult {
     Grants(Vec<KeyGrant>, Option<Vec<u8>>),
     Grant(KeyGrant),
     Opened(Vec<Ulid>),
+    Epoch(u64),
 }
 #[derive(Debug, Error, PartialEq)]
 pub enum KeyError {
@@ -106,6 +116,7 @@ pub struct KeyOperation {
     reused: bool,
     fresh: bool,
     notify: bool,
+    managed: bool,
     result: Option<KeyResult>,
     output: Option<Result<KeyResult, KeyError>>,
 }
@@ -138,6 +149,7 @@ impl KeyOperation {
             reused: false,
             fresh: false,
             notify: false,
+            managed: false,
             result: None,
             output: None,
         }
@@ -171,12 +183,11 @@ impl KeyOperation {
             .max_by_key(|k| (k.created_at_ms, k.record_id))
     }
     fn settings_read(&mut self, value: Option<Value>) -> Effects {
-        let Some(key) = BucketEncryption::from_row(value.as_deref())
-            .ok()
-            .and_then(|s| s.active_key())
-        else {
+        let settings = BucketEncryption::from_row(value.as_deref()).ok();
+        let Some(key) = settings.as_ref().and_then(|s| s.active_key()) else {
             return self.fail(KeyError::Missing);
         };
+        self.managed = settings.is_some_and(|s| s.mode == EncryptionMode::NodeManaged);
         if let KeyAction::Publish(grant) = &self.action
             && grant.context.request.parameters.key != key
         {
@@ -191,6 +202,10 @@ impl KeyOperation {
             self.auth.user_id.to_storage_key(),
         ];
         self.state = State::Snapshot;
+        let bucket_id = key.bucket_id.to_bytes().to_vec();
+        // Only a raise reads the due row, so other runs never conflict with a new marker.
+        let due = matches!(self.action, KeyAction::Epoch { .. })
+            .then(|| (ABE_DUE_KEYSPACE.to_string(), bucket_id.into()));
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![
                 (AUTH_KEYSPACE.to_string(), realm.clone().into()),
@@ -206,7 +221,10 @@ impl KeyOperation {
                 ),
                 (BUCKET_KEY_KEYSPACE.to_string(), key.key().into()),
                 (BUCKET_HOLDER_KEYSPACE.to_string(), holder.concat().into())
-            ],
+            ]
+            .into_iter()
+            .chain(due)
+            .collect(),
             txn_id: self.txn
         })]
     }
@@ -261,6 +279,7 @@ impl KeyOperation {
                 (ABE_REQUEST_KEYSPACE, own, None)
             }
             KeyAction::Grants(cursor) => (ABE_GRANT_KEYSPACE, own, cursor.clone()),
+            KeyAction::Epoch { .. } => return self.fail(AbeError::Context),
         };
         self.state = State::Records;
         smallvec![Effect::Storage(StorageEffect::Iter {
@@ -362,6 +381,9 @@ impl Operation for KeyOperation {
                 }
                 if matches!(self.action, KeyAction::Open(_)) {
                     return self.records();
+                }
+                if let KeyAction::Epoch { instant } = self.action {
+                    return self.raise(instant);
                 }
                 if matches!(self.action, KeyAction::Member(_) | KeyAction::Token { .. }) {
                     match self.member_scopes() {

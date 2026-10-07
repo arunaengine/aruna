@@ -148,6 +148,10 @@ pub const PENDING_CLAIM_KEYSPACE: &str = "pending_claims";
 pub const COPY_WAIT_KEYSPACE: &str = "replication_key_waits";
 /// Plaintext copy requests of encrypted sources, keyed by job key or relationship id.
 pub const PLAINTEXT_COPY_KEYSPACE: &str = "replication_plaintext";
+/// Buckets whose epoch must rise after a lost READ scope, keyed by bucket id. Values are times.
+pub const ABE_DUE_KEYSPACE: &str = "abe_epoch_due";
+/// Key reissue progress after an epoch raise, keyed by bucket id: epoch, phase and cursor.
+pub const ABE_REISSUE_KEYSPACE: &str = "abe_reissues";
 /// Durable evidence of a copy that failed hash/bao verification (§8.2), keyed
 /// per (hash, backend) so re-hitting the same corrupt copy overwrites its row.
 pub const BLOB_QUARANTINE_KEYSPACE: &str = "blob_quarantine";
@@ -527,6 +531,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     PLAINTEXT_COPY_KEYSPACE,
     GROUP_ENCRYPTED_KEYSPACE,
     TOKEN_GRANT_KEYSPACE,
+    ABE_DUE_KEYSPACE,
+    ABE_REISSUE_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

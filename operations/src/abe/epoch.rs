@@ -1,0 +1,162 @@
+//! Marks and raises bucket epochs after lost READ scopes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+use aruna_core::types::GroupId;
+
+/// Progress row value: the raised epoch, the phase (grants, then requests) and the last key.
+pub(super) fn progress(epoch: u64, requests: bool, cursor: &[u8]) -> Vec<u8> {
+    [&epoch.to_be_bytes()[..], &[u8::from(requests)], cursor].concat()
+}
+
+pub(super) fn parse_progress(value: &[u8]) -> Option<(u64, bool, Vec<u8>)> {
+    let epoch = u64::from_be_bytes(value.get(..8)?.try_into().ok()?);
+    match value.get(8)? {
+        0 => Some((epoch, false, value[9..].to_vec())),
+        1 => Some((epoch, true, value[9..].to_vec())),
+        _ => None,
+    }
+}
+
+impl KeyOperation {
+    /// Raises the epoch and restarts reissue in one transaction; a due marker written meanwhile
+    /// conflicts with it and stays due.
+    pub(super) fn raise(&mut self, instant: bool) -> Effects {
+        let Some(snapshot) = &self.snapshot else {
+            return self.fail(KeyError::Missing);
+        };
+        let holder = snapshot.holder && self.auth.path_restrictions.is_none();
+        if instant && !holder {
+            return self.fail(KeyError::Denied);
+        }
+        let epoch = snapshot.epoch;
+        let bucket: Key = snapshot.parameters.key.bucket_id.to_bytes().to_vec().into();
+        if !instant && !(snapshot.due && (holder || self.managed)) {
+            self.result = Some(KeyResult::Epoch(epoch));
+            return self.flush();
+        }
+        let Some(next) = epoch.checked_add(1) else {
+            return self.fail(AbeError::Limit);
+        };
+        let row = progress(next, false, &[]);
+        self.deletes
+            .push((ABE_DUE_KEYSPACE.to_string(), bucket.clone()));
+        self.writes.push((
+            ABE_EPOCH_KEYSPACE.to_string(),
+            bucket.clone(),
+            next.to_be_bytes().to_vec().into(),
+        ));
+        self.writes
+            .push((ABE_REISSUE_KEYSPACE.to_string(), bucket, row.into()));
+        self.result = Some(KeyResult::Epoch(next));
+        self.flush()
+    }
+}
+
+/// Marks a raise due in every encrypted bucket of a group, or of the node without a group.
+/// Returns the node managed buckets, which the node raises at once. A group without encrypted
+/// buckets costs one index scan and nothing else.
+#[derive(Debug, PartialEq)]
+pub struct EpochDueOperation {
+    group_id: Option<GroupId>,
+    now: u64,
+    buckets: Vec<String>,
+    managed: Vec<String>,
+    output: Option<Result<Vec<String>, KeyError>>,
+}
+impl EpochDueOperation {
+    pub fn new(group_id: Option<GroupId>, now: u64) -> Self {
+        Self {
+            group_id,
+            now,
+            buckets: Vec::new(),
+            managed: Vec::new(),
+            output: None,
+        }
+    }
+    fn done(&mut self) -> Effects {
+        self.output = Some(Ok(std::mem::take(&mut self.managed)));
+        smallvec![]
+    }
+}
+impl Operation for EpochDueOperation {
+    type Output = Vec<String>;
+    type Error = KeyError;
+    fn start(&mut self) -> Effects {
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            prefix: self.group_id.map(|g| g.to_bytes().to_vec().into()),
+            start: None,
+            limit: usize::MAX,
+            txn_id: None
+        })]
+    }
+    fn step(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::IterResult { values, .. }) if self.buckets.is_empty() => {
+                self.buckets = values
+                    .iter()
+                    .filter_map(|(key, _)| std::str::from_utf8(key.get(16..)?).ok())
+                    .map(str::to_string)
+                    .collect();
+                if self.buckets.is_empty() {
+                    return self.done();
+                }
+                let reads = self
+                    .buckets
+                    .iter()
+                    .map(|b| {
+                        (
+                            BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                            b.as_bytes().to_vec().into(),
+                        )
+                    })
+                    .collect();
+                smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads,
+                    txn_id: None
+                })]
+            }
+            Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                let mut writes = Vec::new();
+                for (bucket, (_, value)) in self.buckets.iter().zip(values) {
+                    let Ok(settings) = BucketEncryption::from_row(value.as_deref()) else {
+                        continue;
+                    };
+                    let Some(key) = settings.active_key() else {
+                        continue;
+                    };
+                    // A blind write, so a raise that read the old marker conflicts and stays due.
+                    let id = key.bucket_id.to_bytes().to_vec().into();
+                    let at = self.now.to_be_bytes().to_vec().into();
+                    writes.push((ABE_DUE_KEYSPACE.to_string(), id, at));
+                    if settings.mode == EncryptionMode::NodeManaged {
+                        self.managed.push(bucket.clone());
+                    }
+                }
+                if writes.is_empty() {
+                    return self.done();
+                }
+                smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None
+                })]
+            }
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.done(),
+            _ => {
+                self.output = Some(Err(KeyError::Storage));
+                smallvec![]
+            }
+        }
+    }
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+    fn finalize(self) -> Result<Vec<String>, KeyError> {
+        self.output.unwrap_or(Err(KeyError::Storage))
+    }
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
