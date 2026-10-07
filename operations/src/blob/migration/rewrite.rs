@@ -16,7 +16,7 @@ use aruna_core::keyspaces::{
     TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::storage::abe::ObjectEnvelope;
+use aruna_core::structs::storage::abe::{ObjectEnvelope, PendingCopy};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobVersion, BlobVersionState, CopyOwner, ManagedCopyKey,
     ManagedCopyRecord, ResolvedBackend, VersionKey,
@@ -37,6 +37,7 @@ pub enum RewriteState {
     ReadVersion,
     ReadLocation,
     ReadEnvelope,
+    KeepEnvelope,
     CreateEnvelope,
     Admit,
     Rewrite,
@@ -107,8 +108,10 @@ pub struct RewriteVersionOperation {
     usage: Option<UsageCounterUpdate>,
     /// The version's envelope rows read before the rewrite, when the transition moves them.
     envelope_rows: Option<abe::EnvelopeRows>,
-    /// The new envelope around the new object key of a new generation.
+    /// The envelope to publish: a new one for a new generation, else the version's own.
     envelope: Option<ObjectEnvelope>,
+    /// The pending copy row that a re-encoding in the same generation points at the new copy.
+    pending: Option<PendingCopy>,
     /// The bucket's group and the usage charge of the replaced envelope rows.
     charge: Option<(GroupId, u64)>,
     deletes: Vec<(String, Key)>,
@@ -132,6 +135,7 @@ impl RewriteVersionOperation {
             usage: None,
             envelope_rows: None,
             envelope: None,
+            pending: None,
             charge: None,
             deletes: Vec::new(),
             output: None,
@@ -231,17 +235,8 @@ impl RewriteVersionOperation {
         if old.staging || old.partial || !self.transition.needs(&old) {
             return self.end(RewriteOutcome::Skipped);
         }
-        let source = old.format.bucket_key();
-        let archive = ArchiveKey::of(&old);
-        let moves = source.is_some() && self.transition.target.plan.map(|p| p.key) != source;
         self.old = Some(old);
-        let Some(key) = source else {
-            return self.rewrite();
-        };
-        if moves {
-            return self.read_envelope();
-        }
-        self.admit(key, archive)
+        self.read_envelope()
     }
 
     fn admit(&mut self, key: BucketKeyRef, archive: ArchiveKey) -> Effects {
@@ -281,9 +276,8 @@ impl RewriteVersionOperation {
             lease: self.lease.take().map(Box::new),
             target: Box::new(resolved),
             grants_only: sealed && self.transition.kind == TransitionKind::Rotate,
-            object: self
-                .envelope
-                .as_ref()
+            object: (self.envelope.as_ref())
+                .or(self.pending.as_ref().map(|pending| &pending.source))
                 .map(|envelope| Box::new(envelope.context.public_key)),
         })]
     }
@@ -446,6 +440,7 @@ impl Operation for RewriteVersionOperation {
             RewriteState::ReadVersion => self.handle_version(event),
             RewriteState::ReadLocation => self.handle_location(event),
             RewriteState::ReadEnvelope => self.handle_envelope(event),
+            RewriteState::KeepEnvelope => self.handle_kept(event),
             RewriteState::CreateEnvelope => self.handle_created(event),
             RewriteState::Admit => self.handle_admit(event),
             RewriteState::Rewrite => self.handle_rewritten(event),

@@ -163,45 +163,6 @@ fn published(
 }
 
 #[test]
-fn encrypts_plain_copy() {
-    let mut operation = operation(transition(TransitionKind::Encrypt, None, Some(1)));
-    let old = location(None);
-    let effects = located(&mut operation, &old);
-    let [
-        Effect::Blob(BlobEffect::RewriteCopy {
-            lease,
-            target,
-            grants_only,
-            ..
-        }),
-    ] = effects.as_slice()
-    else {
-        panic!("expected a rewrite, got {effects:?}")
-    };
-    assert!(lease.is_none() && !grants_only);
-    assert_eq!(target.encryption, Some(plan(1)));
-
-    let effects = published(&mut operation, &old, location(Some(1)), settings(1, 3));
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected the row writes, got {effects:?}")
-    };
-    let spaces: Vec<&str> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
-    assert_eq!(
-        spaces,
-        [
-            BLOB_LOCATIONS_KEYSPACE,
-            COPY_OWNER_KEYSPACE,
-            BLOB_VERSIONS_KEYSPACE,
-            TRANSITION_CLEANUP_KEYSPACE,
-            BLOB_RECLAIM_KEYSPACE,
-        ]
-    );
-    let stored = BlobVersion::from_bytes(&writes[2].2).unwrap();
-    let encoding = stored.location_key().unwrap().encoding;
-    assert_eq!(encoding, EncodingClass::Pithos { digest: [1; 32] });
-}
-
-#[test]
 fn locked_source_waits() {
     let mut operation = operation(transition(TransitionKind::Decrypt, Some(1), None));
     let effects = located(&mut operation, &location(Some(1)));
@@ -220,11 +181,21 @@ fn locked_source_waits() {
 #[test]
 fn stale_target_discards() {
     // A newer change advanced the storage generation: the new copy is never published.
-    let mut operation = operation(transition(TransitionKind::Encrypt, None, Some(1)));
-    let old = location(None);
+    let mut operation = operation(transition(TransitionKind::Decrypt, Some(1), None));
+    let old = location(Some(1));
     located(&mut operation, &old);
+    operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease: lease(&old) }));
+    let newer = BucketEncryption {
+        storage_generation: 4,
+        ..BucketEncryption::default()
+    };
 
-    let effects = published(&mut operation, &old, location(Some(1)), settings(1, 4));
+    let effects = published(
+        &mut operation,
+        &old,
+        location(None),
+        newer.to_bytes().unwrap(),
+    );
 
     assert!(matches!(
         effects.as_slice(),
@@ -276,8 +247,8 @@ fn rotation_keeps_blocks() {
 
 #[test]
 fn rejects_wrong_event() {
-    let mut operation = operation(transition(TransitionKind::Encrypt, None, Some(1)));
-    located(&mut operation, &location(None));
+    let mut operation = operation(transition(TransitionKind::Decrypt, Some(1), None));
+    located(&mut operation, &location(Some(1)));
 
     operation.step(read_result(None));
 
@@ -293,7 +264,8 @@ mod envelopes {
     use aruna_core::compute::SecretBytes;
     use aruna_core::keyspaces::*;
     use aruna_core::structs::storage::abe::{
-        AbeEffect, AbeEvent, EnvelopePlan, create_envelope, create_parameters,
+        AbeEffect, AbeEvent, AbeParameters, EnvelopeArchive, EnvelopePlan, create_envelope,
+        create_parameters,
     };
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::usage::UsageDelta;
@@ -346,11 +318,10 @@ mod envelopes {
     /// Drives a version with envelope rows through its fence reads, the envelope made at `epoch`.
     fn fenced(
         operation: &mut RewriteVersionOperation,
-        answer: impl Fn(&str) -> Option<Vec<u8>>,
+        (old, answer): (&BackendLocation, impl Fn(&str) -> Option<Vec<u8>>),
         (settings, new, epoch): (Vec<u8>, BackendLocation, u64),
     ) -> Effects {
-        let old = location(Some(1));
-        let mut effects = located_with(operation, &old, &answer);
+        let mut effects = located_with(operation, old, &answer);
         if let [Effect::Blob(BlobEffect::Abe(effect))] = effects.as_slice() {
             let AbeEffect::Envelope(plan) = effect.as_ref() else {
                 panic!("expected an envelope, got {effect:?}")
@@ -363,15 +334,18 @@ mod envelopes {
             let event = BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope)));
             effects = operation.step(Event::Blob(event));
         }
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::AdmitRead { .. })]
-        ));
-        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease: lease(&old) }));
+        // A kept envelope is read before the source is admitted.
+        if let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() {
+            effects = operation.step(read_result(answer(key_space)));
+        }
+        if let [Effect::Blob(BlobEffect::AdmitRead { .. })] = effects.as_slice() {
+            effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease: lease(old) }));
+        }
         let [Effect::Blob(BlobEffect::RewriteCopy { object, .. })] = effects.as_slice() else {
             panic!("expected a rewrite, got {effects:?}")
         };
-        let envelope = operation.envelope.as_ref();
+        let pending = operation.pending.as_ref().map(|pending| &pending.source);
+        let envelope = operation.envelope.as_ref().or(pending);
         assert_eq!(
             object.as_deref().copied(),
             envelope.map(|envelope| envelope.context.public_key)
@@ -396,12 +370,11 @@ mod envelopes {
     /// Drives a version with envelope rows up to its row writes and returns them.
     fn publish(
         operation: &mut RewriteVersionOperation,
-        answer: impl Fn(&str) -> Option<Vec<u8>>,
+        (old, answer): (&BackendLocation, impl Fn(&str) -> Option<Vec<u8>>),
         settings: Vec<u8>,
         new: BackendLocation,
     ) -> Vec<(String, Key, Value)> {
-        fenced(operation, answer, (settings, new, 1));
-        let old = location(Some(1));
+        fenced(operation, (old, answer), (settings, new, 1));
         operation.step(read_result(Some(version(&old).to_bytes().unwrap())));
         let effects = operation.step(read_result(None));
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
@@ -432,8 +405,9 @@ mod envelopes {
     fn rotation_replaces_envelope() {
         for copy in [false, true] {
             let mut operation = operation(transition(TransitionKind::Rotate, Some(1), Some(2)));
-            let new = location(Some(2));
-            let writes = publish(&mut operation, rows(!copy, copy, 2), settings(2, 3), new);
+            let (old, new) = (location(Some(1)), location(Some(2)));
+            let answer = (&old, rows(!copy, copy, 2));
+            let writes = publish(&mut operation, answer, settings(2, 3), new);
             let envelope = operation.envelope.clone().unwrap();
             // A complete envelope keeps its write id; a pending copy gets a new one.
             assert_eq!(envelope.context.write_id == Ulid::from_bytes(WRITE), !copy);
@@ -461,7 +435,8 @@ mod envelopes {
         // The epoch advanced after the envelope was made: the fence refuses to publish it.
         let mut operation = operation(transition(TransitionKind::Rotate, Some(1), Some(2)));
         let input = (settings(2, 3), location(Some(2)), 2);
-        let effects = fenced(&mut operation, rows(true, false, 2), input);
+        let old = location(Some(1));
+        let effects = fenced(&mut operation, (&old, rows(true, false, 2)), input);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::AbortTransaction { .. })]
@@ -476,9 +451,10 @@ mod envelopes {
             storage_generation: 3,
             ..BucketEncryption::default()
         };
+        let old = location(Some(1));
         let writes = publish(
             &mut operation,
-            rows(true, true, 1),
+            (&old, rows(true, true, 1)),
             off.to_bytes().unwrap(),
             new.clone(),
         );
@@ -506,5 +482,100 @@ mod envelopes {
         let stored = StoredDelta::for_location(&new, true).unwrap();
         let expected = UsageCounterUpdate::with_stored(GROUP, delta, stored);
         assert_eq!(operation.usage, Some(expected));
+    }
+
+    /// A real envelope of generation 1 for `object`, made with the write id `WRITE`.
+    fn sealed(object: &str) -> ObjectEnvelope {
+        let (parameters, _) = anchors(1);
+        let plan = EnvelopePlan {
+            parameters: AbeParameters::from_bytes(&parameters).unwrap(),
+            epoch: 1,
+            write_id: Ulid::from_bytes(WRITE),
+            object_key: object.to_string(),
+            bucket_public: [2; 32],
+        };
+        create_envelope(plan).unwrap().0
+    }
+
+    fn written<'a>(writes: &'a [(String, Key, Value)], space: &str) -> Option<&'a Value> {
+        let mut found = writes.iter().filter(|(written, ..)| written == space);
+        found.next().map(|(_, _, value)| value)
+    }
+
+    #[test]
+    fn encrypts_plain_copy() {
+        let mut operation = operation(transition(TransitionKind::Encrypt, None, Some(1)));
+        let (old, new) = (location(None), location(Some(1)));
+        let writes = publish(
+            &mut operation,
+            (&old, rows(false, false, 1)),
+            settings(1, 3),
+            new,
+        );
+        // The new archive grants to the new object key, so its envelope's scoped keys read it.
+        let envelope = operation.envelope.clone().unwrap();
+        assert_eq!(
+            envelope.context.parameters.key,
+            BucketKeyRef::new(BUCKET_ID, 1)
+        );
+        assert_eq!(
+            spaces(&writes),
+            [
+                BLOB_LOCATIONS_KEYSPACE,
+                COPY_OWNER_KEYSPACE,
+                ABE_ENVELOPE_KEYSPACE,
+                ABE_VERSION_KEYSPACE,
+                ABE_ARCHIVE_KEYSPACE,
+                BLOB_VERSIONS_KEYSPACE,
+                TRANSITION_CLEANUP_KEYSPACE,
+                BLOB_RECLAIM_KEYSPACE,
+            ]
+        );
+        let row = written(&writes, ABE_ENVELOPE_KEYSPACE).unwrap();
+        assert_eq!(ObjectEnvelope::from_bytes(row).unwrap(), envelope);
+        let stored = BlobVersion::from_bytes(written(&writes, BLOB_VERSIONS_KEYSPACE).unwrap());
+        let encoding = stored.unwrap().location_key().unwrap().encoding;
+        assert_eq!(encoding, EncodingClass::Pithos { digest: [1; 32] });
+    }
+
+    #[test]
+    fn reencoding_keeps_envelope() {
+        for copy in [false, true] {
+            let mut operation = operation(transition(TransitionKind::Reencode, Some(1), Some(1)));
+            let (old, new) = (location(Some(1)), location(Some(1)));
+            let kept = sealed(if copy { "source" } else { "k" });
+            let pending = PendingCopy {
+                source: kept.clone(),
+                archive: ArchiveKey::of(&old),
+            };
+            let (envelope, row) = (kept.to_bytes().unwrap(), pending.to_bytes().unwrap());
+            let answer = move |space: &str| match space {
+                ABE_VERSION_KEYSPACE if !copy => Some(WRITE.to_vec()),
+                ABE_COPY_KEYSPACE if copy => Some(row.clone()),
+                ABE_ENVELOPE_KEYSPACE => Some(envelope.clone()),
+                ABE_ARCHIVE_KEYSPACE => Some(vec![2; 9]),
+                S3_BUCKET_KEYSPACE => Some(bucket()),
+                _ => None,
+            };
+
+            let writes = publish(&mut operation, (&old, answer), settings(1, 3), new.clone());
+
+            let archive = ArchiveKey::of(&new);
+            if copy {
+                let row = written(&writes, ABE_COPY_KEYSPACE).unwrap();
+                let moved = PendingCopy::from_bytes(row).unwrap();
+                assert_eq!((moved.source, moved.archive), (kept, archive));
+                assert!(written(&writes, ABE_ENVELOPE_KEYSPACE).is_none());
+            } else {
+                let row = written(&writes, ABE_ENVELOPE_KEYSPACE).unwrap();
+                assert_eq!(ObjectEnvelope::from_bytes(row).unwrap(), kept);
+                let row = written(&writes, ABE_ARCHIVE_KEYSPACE).unwrap();
+                let mapping: EnvelopeArchive = postcard::from_bytes(row).unwrap();
+                assert_eq!(mapping.archive, archive);
+                let location = new.location_key().unwrap().to_bytes();
+                assert_eq!(mapping.location_key, location);
+            }
+            assert!(deletes(&mut operation).is_empty());
+        }
     }
 }

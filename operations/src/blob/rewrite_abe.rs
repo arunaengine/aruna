@@ -1,5 +1,5 @@
 //! Moves a version's envelope with its copy: a new generation gets a new object key and envelope,
-//! decryption drops the envelope rows. Both commit in the version's transaction.
+//! the same generation keeps them, decryption drops them. All commit in the version's transaction.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -34,7 +34,8 @@ fn abe_error(error: AbeError) -> RewriteError {
 impl RewriteVersionOperation {
     fn copy_key(&self) -> Result<Key, RewriteError> {
         let source = self.old.as_ref().and_then(|old| old.format.bucket_key());
-        let source = source.ok_or(RewriteError::NotFinished)?;
+        let target = self.transition.target.plan.map(|plan| plan.key);
+        let source = source.or(target).ok_or(RewriteError::NotFinished)?;
         Ok(copy_row(source.bucket_id, &self.version_key)?.into())
     }
 
@@ -56,7 +57,27 @@ impl RewriteVersionOperation {
         })]
     }
 
-    /// A version with envelope rows gets its new envelope before the rewrite grants to it.
+    fn same_generation(&self) -> bool {
+        let source = self.old.as_ref().and_then(|old| old.format.bucket_key());
+        source.is_some() && self.transition.target.plan.map(|plan| plan.key) == source
+    }
+
+    /// Admits a sealed source for reading; a plain source is rewritten directly.
+    fn proceed(&mut self) -> Effects {
+        let Some(old) = self.old.as_ref() else {
+            return self.fail(RewriteError::NotFinished);
+        };
+        match old.format.bucket_key() {
+            Some(key) => {
+                let archive = ArchiveKey::of(old);
+                self.admit(key, archive)
+            }
+            None => self.rewrite(),
+        }
+    }
+
+    /// A version with envelope rows, or a plain version, gets its new envelope before the
+    /// rewrite grants to it.
     pub(super) fn handle_envelope(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected(event);
@@ -64,22 +85,20 @@ impl RewriteVersionOperation {
         let Some(([(_, id), (_, copy)], anchors)) = values.split_first_chunk() else {
             return self.fail(RewriteError::NotFinished);
         };
-        let Some(old) = self.old.as_ref() else {
-            return self.fail(RewriteError::NotFinished);
-        };
-        let (Some(source), archive) = (old.format.bucket_key(), ArchiveKey::of(old)) else {
-            return self.fail(RewriteError::NotFinished);
-        };
-        if id.is_none() && copy.is_none() {
-            return self.admit(source, archive);
+        let plain = (self.old.as_ref()).is_some_and(|old| old.format.bucket_key().is_none());
+        if id.is_none() && copy.is_none() && !plain {
+            return self.proceed();
         }
         self.envelope_rows = Some(EnvelopeRows {
             id: id.clone(),
             copy: copy.clone(),
         });
         let Some(target) = self.transition.target.plan else {
-            return self.admit(source, archive);
+            return self.proceed();
         };
+        if self.same_generation() {
+            return self.keep_envelope();
+        }
         let (parameters, epoch) = match parse_abe(anchors, target.key) {
             Ok(value) => value,
             Err(error) => return self.fail(abe_error(error)),
@@ -109,11 +128,53 @@ impl RewriteVersionOperation {
             other => return self.unexpected(other),
         };
         self.envelope = Some(envelope);
-        let old = self.old.as_ref();
-        match old.and_then(|old| Some((old.format.bucket_key()?, ArchiveKey::of(old)))) {
-            Some((source, archive)) => self.admit(source, archive),
-            None => self.fail(RewriteError::NotFinished),
+        self.proceed()
+    }
+
+    /// A re-encoding in the same generation keeps the object key, write id and envelope.
+    fn keep_envelope(&mut self) -> Effects {
+        let Some(rows) = self.envelope_rows.as_ref() else {
+            return self.fail(RewriteError::NotFinished);
+        };
+        if let Some(id) = rows.id.clone() {
+            self.state = RewriteState::KeepEnvelope;
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: ABE_ENVELOPE_KEYSPACE.to_string(),
+                key: id,
+                txn_id: None,
+            })];
         }
+        match rows
+            .copy
+            .as_deref()
+            .map(PendingCopy::from_bytes)
+            .transpose()
+        {
+            Ok(pending) => {
+                self.pending = pending;
+                self.proceed()
+            }
+            Err(error) => self.fail(abe_error(error)),
+        }
+    }
+
+    pub(super) fn handle_kept(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected(event);
+        };
+        match value.as_deref().map(ObjectEnvelope::from_bytes) {
+            Some(Ok(envelope)) => {
+                self.envelope = Some(envelope);
+                self.proceed()
+            }
+            Some(Err(error)) => self.fail(abe_error(error)),
+            None => self.fail(abe_error(AbeError::Pending)),
+        }
+    }
+
+    /// The envelope made for this rewrite, which the epoch fence checks; a kept one is older.
+    fn fresh_envelope(&self) -> Option<&ObjectEnvelope> {
+        self.envelope.as_ref().filter(|_| !self.same_generation())
     }
 
     /// Transaction reads that recheck the envelope rows and anchor the new envelope.
@@ -134,7 +195,7 @@ impl RewriteVersionOperation {
             reads.push((ABE_ENVELOPE_KEYSPACE.to_string(), id.clone()));
             reads.push((ABE_ARCHIVE_KEYSPACE.to_string(), id));
         }
-        if let Some(envelope) = self.envelope.as_ref() {
+        if let Some(envelope) = self.fresh_envelope() {
             reads.extend(abe_reads(envelope.context.parameters.key));
         }
         Ok(reads)
@@ -162,7 +223,7 @@ impl RewriteVersionOperation {
                 archive.as_deref().unwrap_or_default(),
             );
         }
-        if let Some(envelope) = self.envelope.as_ref() {
+        if let Some(envelope) = self.fresh_envelope() {
             let key = envelope.context.parameters.key;
             let (parameters, epoch) = parse_abe(anchors, key).map_err(abe_error)?;
             envelope.anchored(&parameters, epoch).map_err(abe_error)?;
@@ -184,6 +245,19 @@ impl RewriteVersionOperation {
         };
         let (id, copy) = (rows.id.clone(), rows.copy.is_some());
         let version: Key = self.version_key.to_bytes()?.into();
+        if let Some(mut pending) = self.pending.clone() {
+            // The pending row names the new copy, whose grants include its source object key.
+            if !self.owns_row {
+                return Err(RewriteError::ContentMismatch);
+            }
+            pending.archive = ArchiveKey::of(published);
+            let row = pending.to_bytes().map_err(abe_error)?;
+            let added = row.len() as i128 - i128::from(old_charge);
+            return Ok((
+                vec![(ABE_COPY_KEYSPACE.to_string(), self.copy_key()?, row.into())],
+                added,
+            ));
+        }
         if copy {
             self.deletes
                 .push((ABE_COPY_KEYSPACE.to_string(), self.copy_key()?));
