@@ -15,7 +15,9 @@ use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permissi
 use aruna_core::structs::storage::abe::{
     AbeError, GRANT_PURPOSE, SysRng, create_parameters, derive_master, setup_context,
 };
-use aruna_core::structs::storage::abe_access::{GrantContext, KeyGrant, KeyScope, MAX_REQUESTS};
+use aruna_core::structs::storage::abe_access::{
+    GrantContext, KeyGrant, KeyScope, MAX_REQUESTS, MAX_WRITES,
+};
 use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
 use aruna_kpabe::{Attribute, Envelope, Policy, UserKey};
@@ -2654,6 +2656,139 @@ async fn abe_merge_races() -> TestResult<()> {
         ] {
             assert_eq!(opens(&base, &owner, &keys, key, version).await?, expected);
         }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+/// The object keys of the enumerated grants the caller holds.
+async fn listed_writes(base: &str, token: &str) -> TestResult<Vec<String>> {
+    let route = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/grants");
+    let (status, own) = send(reqwest::Client::new().get(route).bearer_auth(token)).await?;
+    assert_eq!(status, StatusCode::OK, "{own}");
+    let mut keys = Vec::new();
+    for record in own["records"].as_array().unwrap() {
+        let scope = &record["fields"]["request"]["scope"];
+        assert_eq!(scope["kind"], json!("writes"), "{scope}");
+        for write in scope["value"].as_array().unwrap() {
+            keys.push(write["key"].as_str().unwrap().to_string());
+        }
+    }
+    keys.sort();
+    Ok(keys)
+}
+
+#[tokio::test]
+async fn abe_enumerated() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let http = reqwest::Client::new();
+        let base = seed.base_url.clone();
+        let owner = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&base, &owner, "ABE enumerated").await?;
+        let owner_private = SecretBytes::new(vec![7; 32]);
+        let owner_public = public_key_of(&owner_private).unwrap();
+        let owner_key = add_key(&base, &owner, "owner-1", owner_public).await?;
+        // READ on foo/ and bulk/ with a DENY inside foo/: no continuing key fits.
+        let group_ulid = Ulid::from_string(&group.group_id)?;
+        let data = group_permission_path(seed.realm_id, group_ulid, seed.net.node_id());
+        let permissions = std::collections::HashMap::from([
+            (format!("{data}/{BUCKET}/foo/**"), "read"),
+            (format!("{data}/{BUCKET}/bulk/**"), "read"),
+            (format!("{data}/{BUCKET}/foo/private/**"), "deny"),
+        ]);
+        let roles = format!("{base}/api/v1/access/groups/{}/roles", group.group_id);
+        let role = json!({"name":"enumerated","permissions":permissions});
+        let (status, role) = send(http.post(&roles).bearer_auth(&owner).json(&role)).await?;
+        assert_eq!(status, StatusCode::CREATED, "{role}");
+        let reader_id = UserId::local(Ulid::generate(), seed.realm_id);
+        let role_ids = json!([role["role_id"].clone()]);
+        grant_roles(&base, &owner, &group.group_id, reader_id, role_ids).await?;
+        let context = seed.context.as_ref();
+        let reader =
+            create_bearer_token(context, reader_id, seed.realm_id, seed.capabilities.clone())
+                .await?;
+        let reader_private = SecretBytes::new(vec![11; 32]);
+        let reader_public = public_key_of(&reader_private).unwrap();
+        add_key(&base, &reader, "reader-1", reader_public).await?;
+        let credentials = create_s3_credentials(&base, &owner, &group.group_id).await?;
+        let s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
+        s3.create_bucket().bucket(BUCKET).send().await?;
+        locked_key(&seed, &owner, &owner_key, &owner_private).await?;
+        let put = |key: String| {
+            let request = s3
+                .put_object()
+                .bucket(BUCKET)
+                .key(&key)
+                .body(key.as_bytes().to_vec().into());
+            async move {
+                Ok::<_, Box<dyn std::error::Error>>(
+                    request.send().await?.version_id().unwrap().to_string(),
+                )
+            }
+        };
+        let a = put("foo/a".into()).await?;
+        let b = put("foo/b".into()).await?;
+        let private = put("foo/private/s".into()).await?;
+        let requests = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/requests");
+        let request = |kind: &str, value: &str| {
+            let body = json!({"scope":{"kind":kind,"value":value}});
+            send(http.post(&requests).bearer_auth(&reader).json(&body))
+        };
+
+        // The continuing scope is refused and points to an enumerated grant.
+        let (status, body) = request("subtree", "foo/").await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], json!("scope_unsupported"));
+        assert!(body["error"].as_str().unwrap().contains("writes"), "{body}");
+        let (status, body) = request("writes", "foo/").await?;
+        assert_eq!((status, &body["fields"]), (StatusCode::OK, &json!({"request_ids":[]})));
+        assert_eq!(listed_writes(&base, &reader).await?, ["foo/a", "foo/b"]);
+        let keys = user_keys(&base, &reader, &reader_private).await?;
+        assert_eq!(keys.len(), 1);
+        for (key, version, opened) in [("foo/a", &a, true), ("foo/b", &b, true)] {
+            assert_eq!(opens(&base, &owner, &keys, key, version).await?, (1, opened));
+        }
+        assert_eq!(
+            opens(&base, &owner, &keys, "foo/private/s", &private).await?,
+            (1, false)
+        );
+        // A write created later is not covered.
+        let later = put("foo/c".into()).await?;
+        assert_eq!(opens(&base, &owner, &keys, "foo/c", &later).await?, (1, false));
+
+        // A CEL deny policy refuses continuing keys; the denied file leaves the enumerated grant.
+        let policies = format!("{base}/api/v1/access/policies/group/{}", group.group_id);
+        let expression = format!("user == '{reader_id}' && path.endsWith('/foo/b')");
+        let policy = json!({"policies":[{"name":"no-b","kind":"deny","expression":expression,"enabled":true}]});
+        let (status, body) = send(http.put(&policies).bearer_auth(&owner).json(&policy)).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = request("exact", "foo/a").await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let (status, body) = request("writes", "foo/").await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(listed_writes(&base, &reader).await?, ["foo/a", "foo/c"]);
+        let keys = user_keys(&base, &reader, &reader_private).await?;
+        for (key, version, opened) in [("foo/a", &a, true), ("foo/b", &b, false), ("foo/c", &later, true)] {
+            assert_eq!(opens(&base, &owner, &keys, key, version).await?, (1, opened));
+        }
+
+        // More readable files than one grant names are refused with the count, not truncated.
+        for index in 0..=MAX_WRITES {
+            put(format!("bulk/{index:02}")).await?;
+        }
+        let (status, body) = request("writes", "bulk/").await?;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert_eq!(body["code"], json!("enumeration_limit"));
+        assert!(body["error"].as_str().unwrap().contains("at least 1 more"), "{body}");
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
