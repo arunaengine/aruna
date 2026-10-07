@@ -105,7 +105,14 @@ async fn rewritten(
     target: ResolvedBackend,
     grants_only: bool,
 ) -> BlobEvent {
-    let rewrite = handler.rewrite_copy("bucket", "object", source, lease, target, grants_only);
+    let rewrite = handler.rewrite_copy(
+        "bucket",
+        "object",
+        source,
+        lease,
+        target,
+        (grants_only, None),
+    );
     Box::pin(rewrite).await
 }
 

@@ -1062,7 +1062,7 @@ async fn rewrites_never_deadlock() {
                     location,
                     Some(lease),
                     target,
-                    false,
+                    (false, None),
                 )
                 .await
         }));
