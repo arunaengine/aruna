@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::keyspaces::{ABE_ARCHIVE_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE};
+use aruna_core::keyspaces::{
+    ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
+};
 use aruna_core::structs::storage::abe::envelope_charge;
 
 impl DeleteObjectOperation {
@@ -31,7 +33,16 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
         let Some(id) = value else {
-            return self.remove_managed_copies();
+            // A pending copy has no envelope yet, only its pending row.
+            let key = match self.envelope_key() {
+                Ok(key) => key,
+                Err(err) => return self.emit_error(err),
+            };
+            self.state = DeleteObjectState::DeleteEnvelopeRows;
+            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                deletes: vec![(ABE_COPY_KEYSPACE.to_string(), key.into())],
+                txn_id: self.txn_id,
+            })];
         };
         self.state = DeleteObjectState::ReadEnvelopeRows;
         smallvec![Effect::Storage(StorageEffect::BatchRead {

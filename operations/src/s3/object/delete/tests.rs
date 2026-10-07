@@ -1289,3 +1289,43 @@ async fn removes_envelope_rows() {
     let group = read_counters(&context, usage_group_key(group_id)).await;
     assert_eq!((group.objects, group.logical_bytes), (0, 0));
 }
+
+#[tokio::test]
+async fn removes_pending_copy() {
+    // Deleting a copy that waits for its envelope deletes its pending row.
+    use aruna_core::keyspaces::ABE_COPY_KEYSPACE;
+
+    let temp_handle = tempdir().unwrap();
+    let storage_handle = storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+    let context = DriverContext {
+        storage_handle: storage_handle.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let version_id = Ulid::generate();
+    seed_pending(&storage_handle, &[version_id]).await;
+    let version = VersionKey::new("bucket", "sealed", version_id)
+        .to_bytes()
+        .unwrap();
+    storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: ABE_COPY_KEYSPACE.to_string(),
+            key: version.clone().into(),
+            value: vec![1; 8].into(),
+            txn_id: None,
+        })
+        .await;
+
+    drive(delete_pending(Ulid::generate(), version_id), &context)
+        .await
+        .unwrap();
+
+    assert!(
+        read_value(&context, ABE_COPY_KEYSPACE, version)
+            .await
+            .is_none()
+    );
+}

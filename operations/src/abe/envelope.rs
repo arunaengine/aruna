@@ -122,7 +122,7 @@ impl Operation for EnvelopeOperation {
                         postcard::from_bytes(values[1].1.as_deref().ok_or(AbeError::Pending)?)
                             .map_err(|_| AbeError::Context)?;
                     if self.id != Some(envelope.context.write_id)
-                        || self.location.as_ref() != Some(&archive.location_key)
+                        || self.location.as_deref().unwrap_or_default() != archive.location_key
                         || envelope.context.object_key != self.version.key
                     {
                         return Err(AbeError::Context);

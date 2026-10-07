@@ -116,7 +116,8 @@ async fn read_envelope(
 
 **Behavior**
 - Binary fields use padded base64; version ids use ULIDs.
-- Multipart and copied versions have no envelope and require bucket unlock."#,
+- A same-bucket copy made while the bucket is locked answers 409 until the next unlock writes
+  its envelope. Copies from other buckets have no envelope and require bucket unlock."#,
     params(("bucket" = String, Query, description = "Node-local S3 bucket name"), ("key" = String, Query, description = "Literal object key"), ("version_id" = String, Query, description = "Pinned version ULID")),
     responses((status = 200, body = EnvelopeView, description = "Envelope of the exact authorized version", example = json!({"version_id":"01JABCDEF0123456789ABCDEFG","context":{},"parameters":{},"envelope":{}})),
         (status = 400, body = ErrorResponse, description = "Malformed version"), (status = 401, body = ErrorResponse, description = "Bearer token required"),
