@@ -243,6 +243,8 @@ pub(crate) fn key_refusal(error: &BucketKeyError) -> ServerError {
 /// One scoped key grant of a token credential.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct TokenView {
+    /// The key request the grant answers; unique per listed grant.
+    pub request_id: String,
     pub access_key_id: String,
     /// The user who created the token credential.
     pub user_id: String,
@@ -287,6 +289,7 @@ owning group's admin path.
             body = TokenListView,
             example = json!({
                 "tokens": [{
+                    "request_id": "01JREQ00123456789ABCDEFGHJ",
                     "access_key_id": "01JAKEY0123456789ABCDEFGHJ",
                     "user_id": "01JUSER0123456789ABCDEFGHJ",
                     "created_at": "2026-10-05T12:00:00Z",
@@ -335,6 +338,7 @@ fn token_view(entry: TokenEntry, active: Option<BucketKeyRef>) -> TokenView {
     let request = entry.grant.context.request;
     TokenView {
         stale: Some(request.parameters.key) != active || !entry.credential_active,
+        request_id: request.request_id.to_string(),
         access_key_id: request.credential_id.unwrap_or_default(),
         user_id: request.recipient_user.to_string(),
         created_at: rfc3339(request.created_at_ms),
@@ -1067,6 +1071,7 @@ mod tests {
         assert_eq!(
             view,
             TokenView {
+                request_id: Ulid::from_bytes([1; 16]).to_string(),
                 access_key_id: "TOKENKEY".to_string(),
                 user_id: user.to_string(),
                 created_at: "2026-10-03T04:00:00Z".to_string(),
