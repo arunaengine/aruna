@@ -825,10 +825,13 @@ impl BlobHandler {
                 resolved,
                 created_by,
                 content_offset,
+                object,
                 blob,
             } => {
                 let part = MultipartPartKey::new(upload_id, part_number);
-                Box::pin(self.seal_piece(part, resolved, created_by, content_offset, blob)).await
+                let piece =
+                    self.seal_piece(part, resolved, created_by, (content_offset, object), blob);
+                Box::pin(piece).await
             }
             BlobEffect::ComposePieces {
                 bucket,

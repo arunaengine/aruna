@@ -11,11 +11,14 @@ use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};
+use aruna_core::keyspaces::{
+    ABE_PENDING_KEYSPACE, NODE_SUBJECT_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::storage::abe::ObjectEnvelope;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, ResolvedBackend, WriteOwner,
 };
@@ -140,6 +143,8 @@ pub struct UploadPartOperation {
     sealing: Option<(ResolvedBackend, BackendStream<Result<Bytes, StreamError>>)>,
     /// The piece record of a part of an encrypted upload.
     piece: Option<PartPiece>,
+    /// The object public key of the upload's pending envelope, granted every piece.
+    object: Option<[u8; 32]>,
     replaced_location: Option<BackendLocation>,
     rollback_location: Option<BackendLocation>,
     cleanup: WriteCleanup<UploadPartError>,
@@ -157,6 +162,7 @@ impl UploadPartOperation {
             backend_etag: None,
             sealing: None,
             piece: None,
+            object: None,
             replaced_location: None,
             rollback_location: None,
             cleanup: WriteCleanup::default(),
@@ -203,6 +209,10 @@ impl UploadPartOperation {
                     Key::from(NODE_SUBJECT_KEY.to_vec()),
                 ),
                 (UPLOAD_PART_KEYSPACE.to_string(), part_key.into()),
+                (
+                    ABE_PENDING_KEYSPACE.to_string(),
+                    self.input.upload_id.to_bytes().to_vec().into(),
+                ),
             ],
             txn_id: None,
         })]
@@ -225,6 +235,9 @@ impl UploadPartOperation {
             None => return self.emit_error(UploadPartError::InvalidOperationState),
         };
         let Some((_, acknowledged)) = values.next() else {
+            return self.emit_error(UploadPartError::InvalidOperationState);
+        };
+        let Some((_, pending)) = values.next() else {
             return self.emit_error(UploadPartError::InvalidOperationState);
         };
 
@@ -257,6 +270,14 @@ impl UploadPartOperation {
             return self.emit_error(UploadPartError::MissingBody);
         };
         if let Some(encryption) = record.encryption {
+            // Without a pending envelope the piece goes to the bucket key only; completion refuses.
+            match pending.map(|value| ObjectEnvelope::from_bytes(value.as_ref())) {
+                Some(Ok(envelope)) => self.object = Some(envelope.context.public_key),
+                Some(Err(error)) => {
+                    return self.emit_error(UploadPartError::BlobWriteFailed(error.to_string()));
+                }
+                None => {}
+            }
             let resolved = ResolvedBackend::new(record.backend, record.storage_class)
                 .with_compression(encryption.compression)
                 .with_encryption(Some(encryption.plan));
@@ -324,6 +345,7 @@ impl UploadPartOperation {
             resolved,
             created_by: self.input.created_by,
             content_offset: content_offset(number, &saved, self.input.content_length),
+            object: self.object,
             blob,
         })]
     }
@@ -948,6 +970,7 @@ mod test {
                 ),
                 (NODE_SUBJECT_KEY.to_vec().into(), None),
                 (b"part".to_vec().into(), None),
+                (upload_id.to_bytes().to_vec().into(), None),
             ],
         }));
 
@@ -1105,6 +1128,7 @@ mod test {
                 ),
                 (NODE_SUBJECT_KEY.to_vec().into(), None),
                 (b"part".to_vec().into(), acknowledged.map(Into::into)),
+                (record.upload_id.to_bytes().to_vec().into(), None),
             ],
         })
     }

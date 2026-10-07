@@ -109,6 +109,8 @@ pub const ABE_VERSION_KEYSPACE: &str = "abe_versions";
 pub const ABE_ARCHIVE_KEYSPACE: &str = "abe_archives";
 pub const ABE_REQUEST_KEYSPACE: &str = "abe_requests";
 pub const ABE_GRANT_KEYSPACE: &str = "abe_grants";
+/// Envelopes of open multipart uploads, keyed by upload id. Never served while pending.
+pub const ABE_PENDING_KEYSPACE: &str = "abe_pending";
 /// Key holders of encrypted buckets, keyed by bucket id and user.
 pub const BUCKET_HOLDER_KEYSPACE: &str = "bucket_holders";
 /// Bucket private keys sealed to user keys, keyed by bucket id, generation and holder.
@@ -406,6 +408,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     ABE_ARCHIVE_KEYSPACE,
     ABE_REQUEST_KEYSPACE,
     ABE_GRANT_KEYSPACE,
+    ABE_PENDING_KEYSPACE,
     BUCKET_KEY_KEYSPACE,
     BUCKET_HOLDER_KEYSPACE,
     KEY_COPY_KEYSPACE,

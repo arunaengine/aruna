@@ -257,6 +257,8 @@ pub enum BlobEffect {
         resolved: ResolvedBackend,
         created_by: UserId,
         content_offset: Option<u64>,
+        /// The upload's object public key, a second recipient of the piece.
+        object: Option<[u8; 32]>,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
     /// Composes the stored pieces of `parts`, in order, into one archive without a key, within
