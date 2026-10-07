@@ -4060,3 +4060,56 @@ fn replacement_drops_envelope() {
         i128::from(size + op.envelope_bytes) - i128::from(old)
     );
 }
+
+#[test]
+fn encrypted_replacement_defers_quota() {
+    // One payload byte more replaces a larger old envelope at the exact ceiling.
+    let (_, _, plan) = encrypting_target();
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(98, 98),
+        iroh::SecretKey::from_bytes(&[98; 32]).public(),
+        test_realm_id(),
+        make_manifest(ReplicationItemKind::Materialized),
+    );
+    op.seal_plan = Some(plan);
+    op.destination_group_id = Some(test_group_id());
+    op.state = IncomingVersionState::ReadReplacedBlob;
+    let mut old = make_location();
+    old.blob_size -= 1;
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0u8; 4].into(),
+        value: Some(old.to_bytes().unwrap().into()),
+    }));
+    assert_eq!(op.state, IncomingVersionState::ReadQuotaConfig);
+
+    let mut config = RealmConfigDocument::default_for_realm(test_realm_id(), Vec::new());
+    config.quota = QuotaConfig {
+        default_quota_bytes: Some(1),
+        grace_factor_percent: 100,
+        ..QuotaConfig::default()
+    };
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0u8; 4].into(),
+        value: Some(postcard::to_allocvec(&config).unwrap().into()),
+    }));
+    assert_eq!(op.state, IncomingVersionState::ReadAbe);
+    assert_eq!(op.quota_ceiling, Some(1));
+
+    // The transaction adds the old envelope charge, so the net charge needs no quota.
+    let mut location = make_location();
+    location.hashes.clear();
+    location.format = StoredFormat::pithos(
+        aruna_core::structs::storage::format::PithosLayout {
+            stored_size: 300,
+            metadata_digest: [6; 32],
+            storage_generation: plan.storage_generation,
+        },
+        plan.key,
+    );
+    op.received_blob = Some(ReceivedBlob::reserved(location));
+    op.txn_id = Some(Ulid::from_parts(99, 99));
+    op.envelope_bytes = 10;
+    op.replaced_logical_bytes += 11;
+    op.start_commit_quota();
+    assert_eq!(op.state, IncomingVersionState::UpdateUsage);
+}

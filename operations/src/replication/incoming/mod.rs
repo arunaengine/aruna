@@ -351,6 +351,9 @@ pub struct IncomingVersionOperation {
     existing_current_pointer: Option<CurrentVersionPointer>,
     object_delta: i128,
     replaced_logical_bytes: u64,
+    /// Set when an encrypted replacement leaves quota to the commit check, which knows the old
+    /// envelope charge.
+    defer_quota: bool,
     replaced_reference_bytes: u64,
     /// Envelope rows of the replaced version, deleted with its metadata.
     replaced_envelope: Vec<(String, aruna_core::types::Key)>,
@@ -420,6 +423,7 @@ impl IncomingVersionOperation {
             existing_current_pointer: None,
             object_delta: 0,
             replaced_logical_bytes: 0,
+            defer_quota: false,
             replaced_reference_bytes: 0,
             replaced_envelope: Vec::new(),
             pending_head: None,
@@ -2677,6 +2681,7 @@ impl IncomingVersionOperation {
             Ok(location) => location.map_or(0, |location| location.blob_size),
             Err(error) => return self.fail(error.into()),
         };
+        self.defer_quota = self.seal_plan.is_some();
         if self.is_reference_item() {
             self.send_negotiation(ReplicationNegotiationResult::NeedVersionOnly)
         } else {
@@ -2707,6 +2712,10 @@ impl IncomingVersionOperation {
         match ceiling {
             _ if self.is_reference_item() => {
                 self.send_negotiation(ReplicationNegotiationResult::NeedVersionOnly)
+            }
+            Some(ceiling) if self.defer_quota => {
+                self.quota_ceiling = Some(ceiling);
+                self.read_existing_blob()
             }
             Some(ceiling) => self.start_quota_check(ceiling),
             None => self.read_existing_blob(),
