@@ -6,7 +6,6 @@ use super::KeyError;
 use crate::blob::migration::queue::quota_origin;
 use crate::blob::migration::rewrite::{RewriteOutcome, RewriteVersionOperation};
 use crate::driver::{DriverContext, drive};
-use crate::jobs::store::iter_prefix_page;
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, RekeyOutcome, StorageEvent, SubOperationEvent};
@@ -23,7 +22,6 @@ use aruna_core::structs::storage::transition::{
     EncryptionTransition, TransitionKind, TransitionTarget,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
-use aruna_storage::StorageHandle;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,219 +40,24 @@ pub struct RekeyProgress {
     pub rekeyed: u64,
 }
 
-async fn read_rows(
-    storage: &StorageHandle,
-    reads: Vec<(String, Key)>,
-    txn_id: Option<TxnId>,
-) -> Result<Vec<Option<Value>>, KeyError> {
-    match storage
-        .send_storage_effect(StorageEffect::BatchRead { reads, txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            Ok(values.into_iter().map(|(_, value)| value).collect())
-        }
-        _ => Err(KeyError::Storage),
-    }
-}
-
 fn epoch_of(row: Option<&Value>) -> Option<u64> {
     Some(u64::from_be_bytes(row?.as_ref().try_into().ok()?))
 }
 
-/// Re-keys up to `page` versions under `prefix` after the saved cursor through the rotation
-/// unit, then saves the cursor. Returns the progress and whether the pass is done.
+/// Realm quota and origin that new envelope charges must fit.
+type Quota = Option<(QuotaConfig, RealmId, NodeId)>;
+
+/// Re-keys one page under `prefix` and returns the progress and whether the pass is done.
 pub async fn rekey_page(
     context: &DriverContext,
     bucket: &str,
     prefix: &str,
     page: usize,
 ) -> Result<(RekeyProgress, bool), KeyError> {
-    let storage = &context.storage_handle;
-    let name: Key = bucket.as_bytes().to_vec().into();
-    let reads = vec![
-        (BUCKET_ENCRYPTION_KEYSPACE.to_string(), name.clone()),
-        (S3_BUCKET_KEYSPACE.to_string(), name),
-    ];
-    let [settings, info] = <[_; 2]>::try_from(read_rows(storage, reads, None).await?)
-        .map_err(|_| KeyError::Storage)?;
-    let settings =
-        BucketEncryption::from_row(settings.as_deref()).map_err(|_| KeyError::Missing)?;
-    let info = info.as_deref().map(BucketInfo::from_bytes);
-    let (Some(key), Some(Ok(info))) = (settings.active_key(), info) else {
-        return Err(KeyError::Missing);
-    };
-    let id: Key = key.bucket_id.to_bytes().to_vec().into();
-    let reads = vec![
-        (BUCKET_KEY_KEYSPACE.to_string(), key.key().into()),
-        (ABE_EPOCH_KEYSPACE.to_string(), id.clone()),
-        (ABE_REKEY_KEYSPACE.to_string(), id.clone()),
-    ];
-    let [record, epoch, seen] = <[_; 3]>::try_from(read_rows(storage, reads, None).await?)
-        .map_err(|_| KeyError::Storage)?;
-    let record = record.as_deref().map(BucketKeyRecord::from_bytes);
-    let plan = match record {
-        Some(Ok(record)) => SealPlan::capture(&settings, &record).ok().flatten(),
-        _ => None,
-    };
-    let (Some(plan), Some(epoch)) = (plan, epoch_of(epoch.as_ref())) else {
-        return Err(KeyError::Missing);
-    };
-    let fresh = RekeyProgress {
-        prefix: prefix.to_string(),
-        epoch,
-        cursor: Vec::new(),
-        rekeyed: 0,
-    };
-    let mut progress = match seen.as_deref().map(postcard::from_bytes::<RekeyProgress>) {
-        None => fresh,
-        Some(Ok(saved)) if saved.prefix != prefix => return Err(KeyError::Busy),
-        Some(Ok(saved)) if saved.epoch != epoch => fresh,
-        Some(Ok(saved)) => saved,
-        Some(Err(_)) => return Err(AbeError::Context.into()),
-    };
-    let target = TransitionTarget {
-        compression: info.compression,
-        plan: Some(plan),
-    };
-    let now = aruna_core::time::unix_timestamp_millis();
-    let generation = settings.storage_generation;
-    let unit =
-        EncryptionTransition::new(TransitionKind::Rotate, Some(key), target, generation, now);
     let quota = quota_origin(context).await.map_err(|_| KeyError::Storage)?;
-    let versions = VersionKey::bucket_prefix(bucket).map_err(|_| KeyError::Storage)?;
-    let after = (!progress.cursor.is_empty()).then(|| progress.cursor.clone().into());
-    let scan = iter_prefix_page(
-        storage,
-        BLOB_VERSIONS_KEYSPACE,
-        Some(versions.into()),
-        after,
-        SCAN,
-        None,
-    );
-    let (rows, next) = scan.await.map_err(|_| KeyError::Storage)?;
-    let (mut moved, mut handled, mut stopped) = (0, 0, None);
-    for (row, _) in &rows {
-        if moved >= page.max(1) {
-            break;
-        }
-        let version = VersionKey::from_bytes(row).map_err(|_| KeyError::Storage)?;
-        if version.key.starts_with(prefix) {
-            let mut operation =
-                RewriteVersionOperation::new(version, unit.clone(), SystemTime::now()).rekey();
-            if let Some((quota, realm, node)) = &quota {
-                operation = operation.with_quota(quota.clone(), *realm, *node);
-            }
-            match drive(operation, context).await {
-                Ok(RewriteOutcome::Moved) => {
-                    progress.rekeyed += 1;
-                    moved += 1;
-                }
-                Ok(RewriteOutcome::Skipped) => {}
-                Ok(RewriteOutcome::AwaitingKey) => {
-                    stopped = Some(KeyError::Locked);
-                    break;
-                }
-                Err(error) => {
-                    tracing::warn!(event = "abe.rekey.failed", bucket, error = %error);
-                    stopped = Some(KeyError::Storage);
-                    break;
-                }
-            }
-        }
-        progress.cursor = row.to_vec();
-        handled += 1;
-    }
-    let more = stopped.is_some() || handled < rows.len() || next.is_some();
-    let done = save(storage, id, seen, &mut progress, more).await?;
-    match stopped {
-        Some(error) => Err(error),
-        None => Ok((progress, done)),
-    }
+    let operation = RekeyOperation::new(bucket, prefix, page, quota, SystemTime::now());
+    drive(operation, context).await
 }
-
-/// Saves the cursor while the row is still the one this page read. The last page finishes the
-/// pass only without a raise or due removal since it began; otherwise the pass starts again.
-async fn save(
-    storage: &StorageHandle,
-    id: Key,
-    seen: Option<Value>,
-    progress: &mut RekeyProgress,
-    more: bool,
-) -> Result<bool, KeyError> {
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        _ => return Err(KeyError::Storage),
-    };
-    let staged = stage(storage, txn_id, id, seen, progress, more).await;
-    let commit = match staged {
-        Ok(Some(_)) => StorageEffect::CommitTransaction { txn_id },
-        _ => StorageEffect::AbortTransaction { txn_id },
-    };
-    let event = storage.send_storage_effect(commit).await;
-    match (staged, event) {
-        (Ok(Some(done)), Event::Storage(StorageEvent::TransactionCommitted { .. })) => Ok(done),
-        (Ok(Some(_)), _) => Err(KeyError::Storage),
-        // Another call moved the pass meanwhile; its own save stands.
-        (Ok(None), _) => Ok(false),
-        (Err(error), _) => Err(error),
-    }
-}
-
-async fn stage(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    id: Key,
-    seen: Option<Value>,
-    progress: &mut RekeyProgress,
-    more: bool,
-) -> Result<Option<bool>, KeyError> {
-    let reads = vec![
-        (ABE_REKEY_KEYSPACE.to_string(), id.clone()),
-        (ABE_EPOCH_KEYSPACE.to_string(), id.clone()),
-        (ABE_DUE_KEYSPACE.to_string(), id.clone()),
-    ];
-    let [row, epoch, due] = <[_; 3]>::try_from(read_rows(storage, reads, Some(txn_id)).await?)
-        .map_err(|_| KeyError::Storage)?;
-    if row != seen {
-        return Ok(None);
-    }
-    // A removal during the walk is not covered by it, so the subtree is walked again.
-    let restart = !more && (epoch_of(epoch.as_ref()) != Some(progress.epoch) || due.is_some());
-    if restart {
-        progress.cursor.clear();
-        progress.rekeyed = 0;
-    }
-    let done = !more && !restart;
-    let effect = match done {
-        true => StorageEffect::BatchDelete {
-            deletes: vec![(ABE_REKEY_KEYSPACE.to_string(), id)],
-            txn_id: Some(txn_id),
-        },
-        false => StorageEffect::BatchWrite {
-            writes: vec![(
-                ABE_REKEY_KEYSPACE.to_string(),
-                id,
-                postcard::to_allocvec(progress)
-                    .map_err(|_| KeyError::Storage)?
-                    .into(),
-            )],
-            txn_id: Some(txn_id),
-        },
-    };
-    match storage.send_storage_effect(effect).await {
-        Event::Storage(
-            StorageEvent::BatchDeleteResult { .. } | StorageEvent::BatchWriteResult { .. },
-        ) => Ok(Some(done)),
-        _ => Err(KeyError::Storage),
-    }
-}
-
-/// Realm quota and origin that new envelope charges must fit.
-type Quota = Option<(QuotaConfig, RealmId, NodeId)>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Step {
@@ -611,5 +414,131 @@ impl Operation for RekeyOperation {
         self.txn.take().map_or_else(Effects::new, |txn_id| {
             smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::storage::format::Compression;
+    use ulid::Ulid;
+
+    fn row(key: &str) -> (Key, Value) {
+        let version = VersionKey::new("bucket", key, Ulid::from_bytes([2; 16]));
+        (version.to_bytes().unwrap().into(), Vec::new().into())
+    }
+
+    /// A page of `page` versions under foo/ that has read its rows and waits for the scan.
+    fn scanning(page: usize) -> RekeyOperation {
+        let mut operation = RekeyOperation::new("bucket", "foo/", page, None, UNIX_EPOCH);
+        operation.id = vec![1; 16].into();
+        operation.progress = Some(RekeyProgress {
+            prefix: "foo/".into(),
+            epoch: 2,
+            cursor: Vec::new(),
+            rekeyed: 0,
+        });
+        let target = TransitionTarget {
+            compression: Compression::Off,
+            plan: None,
+        };
+        let unit = EncryptionTransition::new(TransitionKind::Rotate, None, target, 3, 0);
+        operation.unit = Some(unit);
+        operation.step = Step::Scan;
+        operation
+    }
+
+    fn scanned(operation: &mut RekeyOperation, keys: &[&str]) -> Effects {
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: keys.iter().map(|key| row(key)).collect(),
+            next_start_after: None,
+        }))
+    }
+
+    fn ended(operation: &mut RekeyOperation, outcome: RekeyOutcome) -> Effects {
+        operation.step(Event::SubOperation(SubOperationEvent::VersionRekeyed {
+            outcome,
+        }))
+    }
+
+    /// Answers the save transaction with the progress row `seen`, epoch 2 and no due marker.
+    fn saved(operation: &mut RekeyOperation, seen: Option<Value>) -> Effects {
+        let txn_id = TxnId::generate();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let values = vec![
+            (Key::from(Vec::new()), seen),
+            (
+                Key::from(Vec::new()),
+                Some(2u64.to_be_bytes().to_vec().into()),
+            ),
+            (Key::from(Vec::new()), None),
+        ];
+        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+    }
+
+    /// The progress a save writes.
+    fn written(effects: &Effects) -> RekeyProgress {
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("one progress write: {effects:?}");
+        };
+        postcard::from_bytes(&writes[0].2).unwrap()
+    }
+
+    #[test]
+    fn pages_then_saves() {
+        // One version per page: the cursor stops after the first re-keyed version.
+        let mut operation = scanning(1);
+        let effects = scanned(&mut operation, &["foo/a", "bar/x", "foo/b"]);
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let effects = ended(&mut operation, RekeyOutcome::Moved);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+        let progress = written(&saved(&mut operation, None));
+        assert_eq!(
+            (progress.cursor, progress.rekeyed),
+            (row("foo/a").0.to_vec(), 1)
+        );
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        let txn_id = TxnId::generate();
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        let (progress, done) = operation.finalize().unwrap();
+        assert_eq!((progress.rekeyed, done), (1, false));
+    }
+
+    #[test]
+    fn locked_version_keeps() {
+        // The cursor stays before a version the locked key could not re-key.
+        let mut operation = scanning(4);
+        scanned(&mut operation, &["foo/a", "foo/b"]);
+        ended(&mut operation, RekeyOutcome::Moved);
+        ended(&mut operation, RekeyOutcome::Locked);
+        let progress = written(&saved(&mut operation, None));
+        assert_eq!(progress.cursor, row("foo/a").0.to_vec());
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        let txn_id = TxnId::generate();
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert_eq!(operation.finalize(), Err(KeyError::Locked));
+    }
+
+    #[test]
+    fn last_page_finishes() {
+        let mut operation = scanning(4);
+        scanned(&mut operation, &["bar/x", "foo/a"]);
+        ended(&mut operation, RekeyOutcome::Skipped);
+        let effects = saved(&mut operation, None);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchDelete { .. })]
+        ));
     }
 }
