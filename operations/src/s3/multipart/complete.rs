@@ -106,6 +106,7 @@ pub enum CompleteUploadState {
     ResetUploadTransaction,
     ReadUploadReset,
     WriteUploadReset,
+    RecheckPending,
     DeletePending,
     CommitResetTransaction,
     CleanupFailedCompose,
@@ -284,6 +285,8 @@ pub struct CompleteUploadOperation {
     envelope_bytes: u64,
     /// A stale encrypted upload loses its pending envelope when its record is reset.
     reclaim_pending: bool,
+    /// A refused publication rechecks its pending envelope in the reset.
+    recheck_pending: bool,
 }
 
 impl CompleteUploadOperation {
@@ -326,6 +329,7 @@ impl CompleteUploadOperation {
             envelope: None,
             envelope_bytes: 0,
             reclaim_pending: false,
+            recheck_pending: false,
         }
     }
 
@@ -1928,6 +1932,7 @@ impl CompleteUploadOperation {
         };
         if matches!(error, StorageError::TransactionConflict) {
             self.txn_id = None;
+            self.recheck_pending = self.envelope_bytes > 0;
         }
         if !error.proves_no_commit() {
             self.txn_id = None;
@@ -2045,15 +2050,68 @@ impl CompleteUploadOperation {
             return self.reset_failed(Some(CompleteUploadError::NoTransactionFound));
         };
         if std::mem::take(&mut self.reclaim_pending) {
-            self.state = CompleteUploadState::DeletePending;
-            return smallvec![Effect::Storage(StorageEffect::Delete {
-                key_space: ABE_PENDING_KEYSPACE.to_string(),
-                key: self.input.upload_id.to_bytes().to_vec().into(),
+            return self.delete_pending(txn_id);
+        }
+        let plan = self
+            .upload_record
+            .as_ref()
+            .and_then(|upload| upload.encryption)
+            .map(|encryption| encryption.plan);
+        if let Some(plan) = plan.filter(|_| std::mem::take(&mut self.recheck_pending)) {
+            let mut reads = vec![
+                (
+                    BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                    self.input.bucket.as_bytes().to_vec().into(),
+                ),
+                (
+                    ABE_PENDING_KEYSPACE.to_string(),
+                    self.input.upload_id.to_bytes().to_vec().into(),
+                ),
+            ];
+            reads.extend(abe_reads(plan.key));
+            self.state = CompleteUploadState::RecheckPending;
+            return smallvec![Effect::Storage(StorageEffect::BatchRead {
+                reads,
                 txn_id: Some(txn_id),
             })];
         }
         self.state = CompleteUploadState::CommitResetTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    /// Only a moved generation, parameters or epoch drop the envelope; other conflicts retry.
+    fn pending_rechecked(&mut self, event: Event) -> Effects {
+        let values = match event {
+            Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+            Event::Storage(StorageEvent::Error { .. }) => return self.reset_failed(None),
+            _ => return self.reset_failed(Some(CompleteUploadError::InvalidOperationState)),
+        };
+        let (Some(((_, settings), pending)), Some(txn_id)) = (values.split_first(), self.txn_id)
+        else {
+            return self.reset_failed(Some(CompleteUploadError::InvalidOperationState));
+        };
+        let plan = self
+            .upload_record
+            .as_ref()
+            .and_then(|upload| upload.encryption)
+            .map(|encryption| encryption.plan);
+        let moved = BucketEncryption::from_row(settings.as_deref())
+            .is_ok_and(|settings| storage_current(plan.as_ref(), &settings).is_err());
+        let fence = self.pending_fence(pending);
+        if moved || matches!(fence, Err(AbeError::Parameters | AbeError::Epoch)) {
+            return self.delete_pending(txn_id);
+        }
+        self.state = CompleteUploadState::CommitResetTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    fn delete_pending(&mut self, txn_id: TxnId) -> Effects {
+        self.state = CompleteUploadState::DeletePending;
+        smallvec![Effect::Storage(StorageEffect::Delete {
+            key_space: ABE_PENDING_KEYSPACE.to_string(),
+            key: self.input.upload_id.to_bytes().to_vec().into(),
+            txn_id: Some(txn_id),
+        })]
     }
 
     fn pending_deleted(&mut self, event: Event) -> Effects {
@@ -2181,6 +2239,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::ResetUploadTransaction => self.reset_started(event),
             CompleteUploadState::ReadUploadReset => self.reset_upload_read(event),
             CompleteUploadState::WriteUploadReset => self.upload_reset(event),
+            CompleteUploadState::RecheckPending => self.pending_rechecked(event),
             CompleteUploadState::DeletePending => self.pending_deleted(event),
             CompleteUploadState::CommitResetTransaction => self.handle_reset_committed(event),
             CompleteUploadState::CleanupFailedCompose => self.compose_cleanup(event),

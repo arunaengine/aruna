@@ -1809,6 +1809,94 @@ fn stale_epoch_reclaims() {
     ));
 }
 
+/// Refuses the commit of a published envelope and answers the reset's recheck with `epoch`.
+fn conflict_recheck(epoch: u64) -> (CompleteUploadOperation, Effects) {
+    use aruna_core::structs::storage::abe::create_parameters;
+    use aruna_core::structs::storage::encryption::EncryptionMode;
+    let mut operation = abe_fenced(true, 1);
+    let envelope = operation.envelope.take().unwrap();
+    operation.envelope_bytes = 10;
+    operation.state = CompleteUploadState::CommitFinalizeTransaction;
+    operation.step(Event::Storage(StorageEvent::Error {
+        error: StorageError::TransactionConflict,
+    }));
+    let txn_id = Ulid::from_parts(4, 5);
+    operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    let mut record = operation.upload_record.clone().unwrap();
+    record.status = MultipartUploadStatus::Completing;
+    record.completing_since_ms = Some(TEST_NOW_MS);
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"upload".to_vec().into(),
+        value: Some(record.to_bytes().unwrap().into()),
+    }));
+    let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: b"upload".to_vec().into(),
+    }));
+    let [
+        Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: read,
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("expected the pending recheck, got {effects:?}")
+    };
+    assert_eq!((reads.len(), *read), (4, Some(txn_id)));
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(Ulid::from_parts(8, 8)),
+        key_generation: 1,
+        storage_generation: 2,
+        ..Default::default()
+    };
+    let input = &operation.input;
+    let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
+    let key = sealed_plan().key;
+    let parameters = create_parameters(&secret, input.realm_id, input.node_id, key).unwrap();
+    let values = vec![
+        (
+            reads[0].1.clone(),
+            Some(settings.to_bytes().unwrap().into()),
+        ),
+        (
+            reads[1].1.clone(),
+            Some(envelope.to_bytes().unwrap().into()),
+        ),
+        (
+            reads[2].1.clone(),
+            Some(parameters.to_bytes().unwrap().into()),
+        ),
+        (
+            reads[3].1.clone(),
+            Some(epoch.to_be_bytes().to_vec().into()),
+        ),
+    ];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    (operation, effects)
+}
+
+#[test]
+fn conflict_reclaims_stale() {
+    // An epoch raised between the fence read and the commit drops the pending envelope.
+    let (_, effects) = conflict_recheck(2);
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Delete { key_space, .. })] if key_space == ABE_PENDING_KEYSPACE
+        ),
+        "{effects:?}"
+    );
+    // An unrelated conflict keeps it, so the upload stays retryable.
+    let (_, effects) = conflict_recheck(1);
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        ),
+        "{effects:?}"
+    );
+}
+
 #[test]
 fn bucket_only_publishes() {
     // A generation without admitted parameters completes without an envelope.
