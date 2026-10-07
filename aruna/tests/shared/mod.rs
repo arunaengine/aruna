@@ -317,6 +317,32 @@ pub(crate) async fn create_bearer_token(
     .await?)
 }
 
+/// Stores the user row registration writes; grants wait while a recipient has none.
+pub(crate) async fn add_user(context: &DriverContext, user_id: UserId) -> TestResult<()> {
+    let user = aruna_core::structs::identity::user::User {
+        user_id,
+        name: "user".to_string(),
+        subject_ids: Vec::new(),
+        alias_user_ids: Default::default(),
+        attributes: Default::default(),
+    };
+    let row = (
+        aruna_core::keyspaces::USER_KEYSPACE.to_string(),
+        user_id.to_bytes().into(),
+        postcard::to_allocvec(&user)?.into(),
+    );
+    let write = aruna_core::effects::StorageEffect::BatchWrite {
+        writes: vec![row],
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(write).await {
+        aruna_core::events::Event::Storage(
+            aruna_core::events::StorageEvent::BatchWriteResult { .. },
+        ) => Ok(()),
+        other => Err(format!("user row not written: {other:?}").into()),
+    }
+}
+
 pub(crate) fn sign_scoped_token(
     seed: &SeedNode,
     user_id: UserId,

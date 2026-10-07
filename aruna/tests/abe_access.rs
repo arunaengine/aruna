@@ -28,13 +28,23 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use shared::{
-    S3Credentials, SeedNode, TestResult, create_bearer_token, create_group_http,
-    create_s3_credentials, s3_client, sign_scoped_token, sign_token, spawn_complete_seed,
-    spawn_fixed_seed,
+    S3Credentials, SeedNode, TestResult, create_group_http, create_s3_credentials, s3_client,
+    sign_scoped_token, sign_token, spawn_complete_seed, spawn_fixed_seed,
 };
 use ulid::Ulid;
 
 const BUCKET: &str = "abe-access";
+
+async fn create_bearer_token(
+    context: &aruna_operations::driver::DriverContext,
+    user_id: UserId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
+    capabilities: aruna_core::structs::identity::auth::NodeCapabilities,
+) -> TestResult<String> {
+    shared::add_user(context, user_id).await?;
+    shared::create_bearer_token(context, user_id, realm_id, capabilities).await
+}
+
 fn bytes(value: &Value) -> Vec<u8> {
     STANDARD.decode(value.as_str().unwrap()).unwrap()
 }
@@ -628,6 +638,7 @@ async fn add_key(base: &str, token: &str, key_id: &str, public: [u8; 32]) -> Tes
 
 async fn add_member(seed: &SeedNode, token: &str, group: &str, roles: Value) -> TestResult<String> {
     let user = UserId::local(Ulid::generate(), seed.realm_id);
+    shared::add_user(seed.context.as_ref(), user).await?;
     let response = reqwest::Client::new()
         .post(format!(
             "{}/api/v1/access/groups/{group}/members",
@@ -990,6 +1001,7 @@ async fn abe_queued_grants() -> TestResult<()> {
         .await?;
         let group = create_group_http(&base, &owner, "ABE queued").await?;
         let user = UserId::local(Ulid::generate(), seed.realm_id);
+        shared::add_user(seed.context.as_ref(), user).await?;
         let (status, _) = send(
             http.post(format!(
                 "{base}/api/v1/access/groups/{}/members",
@@ -1102,6 +1114,7 @@ async fn abe_restricted_keeps() -> TestResult<()> {
         .await?;
         let group = create_group_http(&base, &owner, "ABE restricted").await?;
         let user = UserId::local(Ulid::generate(), seed.realm_id);
+        shared::add_user(seed.context.as_ref(), user).await?;
         grant_roles(&base, &owner, &group.group_id, user, Value::Null).await?;
         let reader = sign_token(&seed, user, None, 600)?;
         let root =
@@ -1166,6 +1179,7 @@ async fn abe_issuance_reissues() -> TestResult<()> {
         let mut readers = Vec::new();
         for seed_byte in [11, 12] {
             let user = UserId::local(Ulid::generate(), seed.realm_id);
+            shared::add_user(seed.context.as_ref(), user).await?;
             grant_roles(&base, &owner, &group.group_id, user, Value::Null).await?;
             let token = sign_token(&seed, user, None, 600)?;
             let public = public_key_of(&SecretBytes::new(vec![seed_byte; 32])).unwrap();

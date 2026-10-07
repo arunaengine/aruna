@@ -14,10 +14,19 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use base64::engine::general_purpose::STANDARD;
 use reqwest::StatusCode;
 use shared::{
-    TestResult, create_bearer_token, create_group_http, create_s3_credentials, get_user_access,
-    request_credentials, s3_client, sign_scoped_token, spawn_complete_seed, spawn_seed_node,
-    wait_group_http,
+    TestResult, create_group_http, create_s3_credentials, get_user_access, request_credentials,
+    s3_client, sign_scoped_token, spawn_complete_seed, spawn_seed_node, wait_group_http,
 };
+
+async fn create_bearer_token(
+    context: &aruna_operations::driver::DriverContext,
+    user_id: aruna_core::UserId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
+    capabilities: aruna_core::structs::identity::auth::NodeCapabilities,
+) -> TestResult<String> {
+    shared::add_user(context, user_id).await?;
+    shared::create_bearer_token(context, user_id, realm_id, capabilities).await
+}
 
 fn create_request_restriction(pattern: String, permission: Permission) -> CreatePathRestriction {
     CreatePathRestriction {
