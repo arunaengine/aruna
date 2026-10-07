@@ -473,6 +473,57 @@ async fn pending_charge_replaced() {
 }
 
 #[tokio::test]
+async fn completion_quota_gated() {
+    // A completion that outgrows its pending row must fit the quota, exactly at the ceiling.
+    use aruna_core::structs::identity::realm::QuotaConfig;
+    let (_temp, context) = context();
+    let storage = &context.storage_handle;
+    let (sealed, source_id, _) = sealed(storage).await;
+    // Many prefixes make the copy's envelope larger than its pending row.
+    let dest = "a/".repeat(59);
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let copy = copy_input(&sealed, (SOURCE, source_id), &dest);
+        let copied = run(SealedCopyOperation::new(copy), storage, None, Race::Off).await;
+        ids.push(copied.unwrap().version_id);
+    }
+    // The first, unlimited completion measures the replacement delta of the same-sized second.
+    let before = group_bytes(storage, &sealed).await;
+    let outcome = complete(storage, &dest, ids[0], Some(&sealed), Race::Off).await;
+    assert_eq!(outcome, Ok(CopyOutcome::Completed));
+    let used = group_bytes(storage, &sealed).await;
+    let added = used - before;
+    assert!(added > 0);
+    let base = input(&sealed.location, Ulid::nil());
+    for ceiling in [used + added - 1, used + added] {
+        let row = pending_row(storage, &dest, ids[1]).await.unwrap();
+        let pending = PendingCopy::from_bytes(&row).unwrap();
+        let quota = QuotaConfig {
+            default_quota_bytes: Some(ceiling),
+            grace_factor_percent: 100,
+            ..QuotaConfig::default()
+        };
+        let version = VersionKey::new("bucket", &dest, ids[1]);
+        let operation = CopyEnvelopeOperation::new(version, row, pending).with_quota(
+            quota,
+            base.realm_id,
+            base.node_id,
+        );
+        let outcome = run(operation, storage, Some(&sealed), Race::Off).await;
+        let fits = ceiling == used + added;
+        let expected = if fits {
+            Ok(CopyOutcome::Completed)
+        } else {
+            Err(AbeError::Limit)
+        };
+        assert_eq!(outcome, expected);
+        assert_eq!(pending_row(storage, &dest, ids[1]).await.is_none(), fits);
+        let charged = if fits { ceiling } else { used };
+        assert_eq!(group_bytes(storage, &sealed).await, charged);
+    }
+}
+
+#[tokio::test]
 async fn quota_counts_envelope() {
     // The quota gate sees the pending charge too, at the boundary and for an empty object.
     let (_temp, context) = context();
