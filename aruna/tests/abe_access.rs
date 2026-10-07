@@ -135,12 +135,23 @@ async fn abe_read() -> TestResult<()> {
         let version = upload.version_id().unwrap().to_string();
         let other = s3.put_object().bucket(BUCKET).key("foobar/data").body(b"other bytes".to_vec().into()).send().await?;
         let other_version = other.version_id().unwrap().to_string();
+        let source = format!("{BUCKET}/foo/data?versionId={version}");
+        let copied = s3.copy_object().bucket(BUCKET).key("bar/copy").copy_source(&source).send().await?;
+        let bar_version = copied.version_id().unwrap().to_string();
         let multi = s3.create_multipart_upload().bucket(BUCKET).key("foo/multi").send().await?;
         let upload_id = multi.upload_id().unwrap();
         let part = s3.upload_part().bucket(BUCKET).key("foo/multi").upload_id(upload_id).part_number(1)
             .body(b"multipart bytes".to_vec().into()).send().await?;
         let response = client.post(format!("{encryption}/lock")).bearer_auth(&token).send().await?;
         assert!(response.status().is_success());
+        // Copies made while locked wait for their envelope; foo/c copies the pending foo/b.
+        let copied = s3.copy_object().bucket(BUCKET).key("foo/copy").copy_source(&source).send().await?;
+        let copy_version = copied.version_id().unwrap().to_string();
+        let copied = s3.copy_object().bucket(BUCKET).key("foo/b").copy_source(&source).send().await?;
+        let b_version = copied.version_id().unwrap().to_string();
+        let copied = s3.copy_object().bucket(BUCKET).key("foo/c")
+            .copy_source(format!("{BUCKET}/foo/b?versionId={b_version}")).send().await?;
+        let c_version = copied.version_id().unwrap().to_string();
         // The upload's envelope was made at create, so it completes without any private key.
         let parts = CompletedMultipartUpload::builder().parts(CompletedPart::builder().part_number(1)
             .e_tag(part.e_tag().unwrap()).build()).build();
@@ -223,6 +234,35 @@ async fn abe_read() -> TestResult<()> {
         let status: Value = response.json().await?;
         assert_eq!(status["unlock"]["state"],"locked");
         assert_eq!(status["bucket_id"],bucket_id.to_string());
+        // The unlocked copy has its own envelope for bar/copy, which the foo/ key does not open.
+        let bar_query = [("bucket",BUCKET),("key","bar/copy"),("version_id",&bar_version)];
+        let response = client.get(query_url(&envelope_route,&bar_query)?).bearer_auth(&token).send().await?;
+        assert_eq!(response.status(),StatusCode::OK);
+        let env: Value = response.json().await?;
+        let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
+        assert!(aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"])).is_err());
+        let copy_query = [("bucket",BUCKET),("key","foo/copy"),("version_id",&copy_version)];
+        let response = client.get(query_url(&envelope_route,&copy_query)?).bearer_auth(&token).send().await?;
+        assert_eq!(response.status(),StatusCode::CONFLICT);
+        s3.delete_object().bucket(BUCKET).key("foo/b").version_id(&b_version).send().await?;
+        s3.delete_object().bucket(BUCKET).key("foo/data").version_id(&version).send().await?;
+        let response = client.post(format!("{encryption}/unlock?bucket_id={bucket_id}&generation={generation}"))
+            .bearer_auth(&token).header("content-type","application/octet-stream")
+            .body(bucket_private.expose().to_vec()).send().await?;
+        assert!(response.status().is_success());
+        // The unlock wrote both pending envelopes, so the foo/ key reads them.
+        for (copy_key,copy_version) in [("foo/copy",&copy_version),("foo/c",&c_version)] {
+            let query = [("bucket",BUCKET),("key",copy_key),("version_id",copy_version)];
+            let response = client.get(query_url(&envelope_route,&query)?).bearer_auth(&token).send().await?;
+            let status = response.status(); let env: Value = response.json().await?;
+            assert_eq!(status,StatusCode::OK,"{env}");
+            let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
+            let object = aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
+            let response = client.get(query_url(&content_route,&query)?).bearer_auth(&token)
+                .header("x-aruna-object-key",STANDARD.encode(object.as_bytes())).send().await?;
+            assert_eq!(response.status(),StatusCode::OK);
+            assert_eq!(response.bytes().await?.as_ref(),b"scoped bytes");
+        }
         let _ = group;
         Ok::<(),Box<dyn std::error::Error>>(())
     }.await;
