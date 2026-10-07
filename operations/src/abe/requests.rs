@@ -264,6 +264,10 @@ impl KeyOperation {
         else {
             return self.fail(KeyError::Missing);
         };
+        // A continuation stops at the grant limit and keeps the batches it already wrote.
+        if self.result.is_some() && values.len() >= MAX_REQUESTS {
+            return self.flush();
+        }
         let current = snapshot.epoch;
         let revisions = snapshot.revisions.clone();
         let mut covered = std::collections::BTreeSet::new();
@@ -295,21 +299,27 @@ impl KeyOperation {
         let mut epochs: Vec<u64> = (1..=current)
             .rev()
             .filter(|e| !covered.contains(e))
-            .take(MAX_EPOCHS)
+            .take(MAX_EPOCHS + 1)
             .collect();
         if let (true, Some(grant)) = (epochs.is_empty(), held_grant) {
-            self.result = Some(KeyResult::Grant(grant));
+            self.result.get_or_insert(KeyResult::Grant(grant));
             return self.flush();
         }
         if epochs.first() != Some(&current) {
-            epochs.truncate(MAX_EPOCHS - 1);
             epochs.insert(0, current);
         }
+        self.more = epochs.len() > MAX_EPOCHS;
+        epochs.truncate(MAX_EPOCHS);
         epochs.sort_unstable();
         request.epochs = epochs;
         // A full open-request queue refuses only after no reusable grant is found.
         if self.queue_full {
             return self.fail(AbeError::Limit);
+        }
+        // After a holder's grant the next batch waits as one open request for a holder.
+        if matches!(self.action, KeyAction::Publish(_)) {
+            self.more = false;
+            return self.write_request(request);
         }
         self.issue(request)
     }
@@ -361,7 +371,24 @@ impl KeyOperation {
             .push((ABE_GRANT_KEYSPACE.to_string(), key, bytes.into()));
         self.index_token(&grant.context.request);
         self.result = Some(KeyResult::Grant(grant));
+        // A holder's batch may leave older epochs, which a follow-up request covers.
+        self.more |= matches!(self.action, KeyAction::Publish(_));
         self.flush()
+    }
+    /// Scans the recipient's grants again for the next batch of `request`'s scope.
+    pub(super) fn next_batch(&mut self, mut request: KeyRequest) -> Effects {
+        request.request_id = Ulid::generate();
+        request.created_at_ms = self.now;
+        let prefix = request.prefix();
+        self.request = Some(request);
+        self.state = State::Reuse;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: ABE_GRANT_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: None,
+            limit: MAX_REQUESTS + 1,
+            txn_id: self.txn
+        })]
     }
     pub(super) fn write_request(&mut self, request: KeyRequest) -> Effects {
         let bytes = match request.to_bytes() {

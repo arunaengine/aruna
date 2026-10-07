@@ -2006,6 +2006,41 @@ async fn abe_epochs() -> TestResult<()> {
                 (epoch, true)
             );
         }
+
+        // A member who joins after more than 16 raises gets the oldest epochs in a second batch.
+        for epoch in 5..=18 {
+            let (status, body) = send(http.post(&raise).bearer_auth(&owner)).await?;
+            assert_eq!(
+                (status, body["epoch"].as_u64()),
+                (StatusCode::OK, Some(epoch))
+            );
+        }
+        let fourth = put("foo/d").await?;
+        let late = add_member(&seed, &owner, &group.group_id, Value::Null).await?;
+        let late_private = SecretBytes::new(vec![14; 32]);
+        add_key(
+            &base,
+            &late,
+            "late-1",
+            public_key_of(&late_private).unwrap(),
+        )
+        .await?;
+        let (status, body) = send(http.post(&requests).bearer_auth(&late).json(&subtree)).await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(
+            body["fields"]["epochs"],
+            json!((3..=18).collect::<Vec<u64>>())
+        );
+        issue_open(&base, &owner, &bucket_private).await?;
+        issue_open(&base, &owner, &bucket_private).await?;
+        let keys = user_keys(&base, &late, &late_private).await?;
+        assert_eq!(keys.len(), 2);
+        for (key, version, epoch) in [("foo/a", &first, 1), ("foo/d", &fourth, 18)] {
+            assert_eq!(
+                opens(&base, &late, &keys, key, version).await?,
+                (epoch, true)
+            );
+        }
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;

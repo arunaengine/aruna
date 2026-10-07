@@ -461,6 +461,104 @@ async fn token_reads_locked() -> TestResult<()> {
     result
 }
 
+#[tokio::test]
+async fn token_reads_old() -> TestResult<()> {
+    const BUCKET: &str = "token-old-epochs";
+    let seed = spawn_complete_seed().await?;
+
+    let result = async {
+        let admin = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&seed.base_url, &admin, "token-old-group").await?;
+        let plain = create_s3_credentials(&seed.base_url, &admin, &group.group_id).await?;
+        let endpoint = seed
+            .s3
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
+        let client = s3_client(endpoint, &plain);
+        client.create_bucket().bucket(BUCKET).send().await?;
+        let http = reqwest::Client::new();
+        let bucket_url = format!("{}/api/v1/data/buckets/{BUCKET}", seed.base_url);
+        let encryption = format!("{bucket_url}/storage/encryption");
+        let enabled = http
+            .put(&encryption)
+            .bearer_auth(&admin)
+            .json(&serde_json::json!({ "mode": "node_managed", "expected_generation": 0 }))
+            .send()
+            .await?;
+        assert_eq!(enabled.status(), StatusCode::OK);
+        let put = |key: &'static str| {
+            client
+                .put_object()
+                .bucket(BUCKET)
+                .key(key)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(
+                    key.as_bytes(),
+                ))
+                .send()
+        };
+        put("old.txt").await?;
+        // More raises than one token key admits epochs.
+        for _ in 0..17 {
+            let raised = http
+                .post(format!("{bucket_url}/abe/epoch"))
+                .bearer_auth(&admin)
+                .send()
+                .await?;
+            assert_eq!(raised.status(), StatusCode::OK);
+        }
+        put("new.txt").await?;
+
+        let (public, private) = aruna_core::structs::storage::encryption::generate_key()?;
+        let token = hex::encode(private.bytes().expose());
+        let created = http
+            .post(format!("{}/api/v1/access/credentials", seed.base_url))
+            .bearer_auth(&admin)
+            .json(&aruna_api::routes::credentials::CreateS3Request {
+                group_id: group.group_id.clone(),
+                expires_in_seconds: Some(600),
+                path_restrictions: None,
+                encrypted_buckets: Some(vec![BUCKET.to_string()]),
+                token_public_key: Some(base64::Engine::encode(&STANDARD, public)),
+            })
+            .send()
+            .await?;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: aruna_api::routes::credentials::CreateS3Response = created.json().await?;
+        assert_eq!(token_grants(&seed, &created.access_key_id).await?.len(), 2);
+        let credentials = shared::S3Credentials {
+            access_key_id: created.access_key_id,
+            access_secret: created.access_secret,
+        };
+        let locked = http
+            .post(format!("{encryption}/lock"))
+            .bearer_auth(&admin)
+            .send()
+            .await?;
+        assert_eq!(locked.status(), StatusCode::OK);
+
+        // The token opens data from the first epoch and from the newest one.
+        let reader = token_client(endpoint, &credentials, Some(token));
+        for key in ["old.txt", "new.txt"] {
+            let object = reader.get_object().bucket(BUCKET).key(key).send().await?;
+            assert_eq!(
+                &object.body.collect().await?.into_bytes()[..],
+                key.as_bytes()
+            );
+        }
+        Ok(())
+    }
+    .await;
+
+    seed.shutdown().await;
+    result
+}
+
 /// The grants of credential `access_key`, read from the node's storage.
 async fn token_grants(
     seed: &shared::SeedNode,

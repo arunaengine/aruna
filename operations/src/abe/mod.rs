@@ -116,6 +116,7 @@ pub struct KeyOperation {
     scopes: Vec<KeyScope>,
     opened: Vec<Ulid>,
     reused: bool,
+    more: bool,
     fresh: bool,
     notify: bool,
     quiet: bool,
@@ -150,6 +151,7 @@ impl KeyOperation {
             scopes: Vec::new(),
             opened: Vec::new(),
             reused: false,
+            more: false,
             fresh: false,
             notify: false,
             quiet: false,
@@ -329,6 +331,13 @@ impl KeyOperation {
                 writes: std::mem::take(&mut self.writes),
                 txn_id: self.txn
             })];
+        }
+        // Older epochs left uncovered get the next bounded batch for the same scope.
+        if self.more
+            && let Some(KeyResult::Grant(grant)) = &self.result
+        {
+            self.more = false;
+            return self.next_batch(grant.context.request.clone());
         }
         // A member's own new request notifies holders once; reused requests send nothing.
         if matches!(self.action, KeyAction::Request(_))
