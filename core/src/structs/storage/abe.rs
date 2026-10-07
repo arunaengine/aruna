@@ -6,7 +6,7 @@ use super::blob::ArchiveKey;
 use super::encryption::{BucketKeyRef, generate_key, public_key_of};
 use crate::NodeId;
 use crate::compute::{SecretBytes, SharedSecret};
-use crate::key_seal::seal_to;
+use crate::key_seal::{SealedSecret, open_sealed, seal_to};
 use crate::structs::identity::realm::RealmId;
 use aruna_kpabe::{Attribute, MasterSecret, PublicParameters, frame_context, setup_from_seed};
 use serde::{Deserialize, Serialize};
@@ -246,6 +246,32 @@ pub struct EnvelopePlan {
 
 pub fn create_envelope(plan: EnvelopePlan) -> Result<(ObjectEnvelope, SharedSecret), AbeError> {
     let (public_key, private) = generate_key().map_err(|_| AbeError::Crypto)?;
+    Ok((seal_envelope(plan, public_key, &private)?, private))
+}
+
+/// A new envelope for `plan` around the object key that `source`'s recovery wrap opens.
+pub fn copy_envelope(
+    source: &ObjectEnvelope,
+    bucket: &SecretBytes,
+    plan: EnvelopePlan,
+) -> Result<ObjectEnvelope, AbeError> {
+    let bucket: &[u8; 32] = bucket.expose().try_into().map_err(|_| AbeError::Crypto)?;
+    let sealed = SealedSecret {
+        enc: source.recovery_enc,
+        ciphertext: source.recovery_ciphertext.clone(),
+    };
+    let opened = open_sealed(bucket, &sealed, RECOVERY_PURPOSE, &source.context.bytes()?)
+        .map_err(|_| AbeError::WrongKey)?;
+    let private = SharedSecret::new(SecretBytes::new(opened.to_vec()));
+    check_object(private.bytes(), source)?;
+    seal_envelope(plan, source.context.public_key, &private)
+}
+
+fn seal_envelope(
+    plan: EnvelopePlan,
+    public_key: [u8; 32],
+    private: &SharedSecret,
+) -> Result<ObjectEnvelope, AbeError> {
     let context = EnvelopeContext {
         parameters: plan.parameters,
         epoch: plan.epoch,
@@ -276,7 +302,7 @@ pub fn create_envelope(plan: EnvelopePlan) -> Result<(ObjectEnvelope, SharedSecr
         recovery_ciphertext: recovery.ciphertext,
     };
     envelope.to_bytes()?;
-    Ok((envelope, private))
+    Ok(envelope)
 }
 
 pub fn check_object(private: &SecretBytes, envelope: &ObjectEnvelope) -> Result<(), AbeError> {
@@ -290,6 +316,29 @@ pub fn check_object(private: &SecretBytes, envelope: &ObjectEnvelope) -> Result<
 pub struct EnvelopeArchive {
     pub archive: ArchiveKey,
     pub location_key: Vec<u8>,
+}
+
+/// A same-bucket copy published while locked; its own envelope is written at the next unlock.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCopy {
+    /// A complete envelope of the shared archive; its recovery wrap opens the object key.
+    pub source: ObjectEnvelope,
+    pub archive: ArchiveKey,
+}
+
+impl PendingCopy {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, AbeError> {
+        postcard::to_allocvec(self).map_err(|_| AbeError::Context)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, AbeError> {
+        if bytes.len() > 2 * MAX_ENVELOPE_BYTES {
+            return Err(AbeError::Limit);
+        }
+        let value: Self = postcard::from_bytes(bytes).map_err(|_| AbeError::Context)?;
+        ObjectEnvelope::from_bytes(&value.source.to_bytes()?)?;
+        Ok(value)
+    }
 }
 
 /// Usage bytes charged for one version's stored envelope and archive mapping rows.
@@ -324,6 +373,14 @@ pub enum AbeEffect {
     },
     /// Creates an object key and its envelope without writing bytes.
     Envelope(EnvelopePlan),
+    /// Envelopes `source`'s object key under its parameters for another write with the unlocked
+    /// bucket key; a locked key fails with `AbeError::Required`.
+    Copy {
+        source: ObjectEnvelope,
+        epoch: u64,
+        write_id: Ulid,
+        object_key: String,
+    },
 }
 
 #[derive(Debug, PartialEq)]

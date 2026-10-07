@@ -6,7 +6,8 @@ use super::BlobHandler;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::structs::storage::abe::{
-    AbeEffect, AbeEvent, check_object, create_envelope, create_parameters,
+    AbeEffect, AbeError, AbeEvent, EnvelopePlan, check_object, copy_envelope, create_envelope,
+    create_parameters,
 };
 
 impl BlobHandler {
@@ -104,6 +105,32 @@ impl BlobHandler {
                 Ok((envelope, _)) => BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope))),
                 Err(error) => BlobEvent::Error(error.into()),
             },
+            AbeEffect::Copy {
+                source,
+                epoch,
+                write_id,
+                object_key,
+            } => {
+                let unlocked = match self.unlocks.lock() {
+                    Ok(mut registry) => registry
+                        .unlocked_key(source.context.parameters.key, std::time::Instant::now()),
+                    Err(_) => return BlobEvent::Error(BlobError::HandleMissing),
+                };
+                let Ok((secret, bucket_public)) = unlocked else {
+                    return BlobEvent::Error(AbeError::Required.into());
+                };
+                let plan = EnvelopePlan {
+                    parameters: source.context.parameters.clone(),
+                    epoch,
+                    write_id,
+                    object_key,
+                    bucket_public,
+                };
+                match copy_envelope(&source, secret.bytes(), plan) {
+                    Ok(envelope) => BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope))),
+                    Err(error) => BlobEvent::Error(error.into()),
+                }
+            }
             AbeEffect::Admit {
                 envelope,
                 archive,

@@ -125,18 +125,28 @@ pub(crate) fn envelope_write(
     envelope: &ObjectEnvelope,
     version: &VersionKey,
     location: &BackendLocation,
-    (metadata, limit, txn_id): (&HashMap<String, String>, u64, Option<TxnId>),
+    rows: (&HashMap<String, String>, u64, Option<TxnId>),
 ) -> Result<(Effect, u64), AbeError> {
-    let version = version.to_bytes().map_err(|_| AbeError::Context)?;
-    let id = envelope.context.write_id.to_bytes().to_vec();
     // A pending multipart archive has no location key until it is hashed.
     let location_key = location.location_key().map(|key| key.to_bytes());
     let archive = EnvelopeArchive {
         archive: ArchiveKey::of(location),
         location_key: location_key.unwrap_or_default(),
     };
+    envelope_rows(envelope, version, &archive, rows)
+}
+
+/// The write publishing `envelope` for `version` with its archive mapping, and its usage charge.
+pub(crate) fn envelope_rows(
+    envelope: &ObjectEnvelope,
+    version: &VersionKey,
+    archive: &EnvelopeArchive,
+    (metadata, limit, txn_id): (&HashMap<String, String>, u64, Option<TxnId>),
+) -> Result<(Effect, u64), AbeError> {
+    let version = version.to_bytes().map_err(|_| AbeError::Context)?;
+    let id = envelope.context.write_id.to_bytes().to_vec();
     let bytes = envelope.to_bytes()?;
-    let archive_bytes = postcard::to_allocvec(&archive).map_err(|_| AbeError::Context)?;
+    let archive_bytes = postcard::to_allocvec(archive).map_err(|_| AbeError::Context)?;
     let metadata = postcard::to_allocvec(metadata).map_err(|_| AbeError::Context)?;
     let total = bytes.len() + archive_bytes.len() + id.len() + metadata.len();
     if total as u64 > limit {
