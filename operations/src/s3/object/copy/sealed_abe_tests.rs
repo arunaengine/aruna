@@ -509,3 +509,20 @@ async fn quota_counts_envelope() {
     run(fits, storage, None, Race::Off).await.unwrap();
     assert_eq!(group_bytes(storage, &sealed).await, 2 * used);
 }
+
+#[tokio::test]
+async fn locked_unrepresentable_refused() {
+    // A locked copy to a path with too many prefixes for an envelope is refused, not left pending.
+    let (_temp, context) = context();
+    let storage = &context.storage_handle;
+    let (sealed, source_id, _) = sealed(storage).await;
+    let dest = "a/".repeat(60);
+    let copy = copy_input(&sealed, (SOURCE, source_id), &dest);
+    let refused = run(SealedCopyOperation::new(copy), storage, None, Race::Off).await;
+    assert_eq!(
+        refused,
+        Err(SealedCopyError::Blob(BlobError::Abe(AbeError::Limit)))
+    );
+    let head = BlobHeadKey::new("bucket", &dest).to_bytes().unwrap();
+    assert!(get(storage, BLOB_HEAD_KEYSPACE, head).await.is_none());
+}
