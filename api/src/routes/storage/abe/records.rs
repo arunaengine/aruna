@@ -6,6 +6,7 @@ use super::*;
 use aruna_core::structs::storage::abe_access::{
     GrantContext, KeyGrant, KeyIssuer, KeyRequest, KeyScope, MAX_REQUESTS,
 };
+use aruna_operations::abe::rekey::rekey_page;
 use aruna_operations::abe::{
     EpochDueOperation, KeyAction, KeyOperation, KeyResult, MemberKeysOperation, ReissueOperation,
 };
@@ -42,6 +43,17 @@ pub struct RecordList {
 pub struct EpochView {
     pub epoch: u64,
 }
+#[derive(Deserialize, ToSchema)]
+pub struct RekeyBody {
+    pub prefix: String,
+}
+#[derive(Serialize, ToSchema)]
+pub struct RekeyView {
+    pub prefix: String,
+    pub epoch: u64,
+    pub rekeyed: u64,
+    pub done: bool,
+}
 #[derive(Deserialize)]
 pub struct PageQuery {
     pub cursor: Option<String>,
@@ -62,6 +74,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(publish_grant))
         .routes(routes!(own_grants))
         .routes(routes!(raise_epoch))
+        .routes(routes!(rekey_subtree))
 }
 fn request_fields(r: &KeyRequest) -> ServerResult<Value> {
     let scope = match &r.scope {
@@ -142,7 +155,15 @@ pub(crate) async fn epoch_run(
     bucket: &str,
     instant: bool,
 ) -> ServerResult<u64> {
-    let action = KeyAction::Epoch { instant };
+    raise_run(state, auth, bucket, KeyAction::Epoch { instant }).await
+}
+/// Runs a raise action, then reopens requests page by page until done.
+async fn raise_run(
+    state: &ServerState,
+    auth: &AuthContext,
+    bucket: &str,
+    action: KeyAction,
+) -> ServerResult<u64> {
     let KeyResult::Epoch(epoch) = execute(state, auth.clone(), bucket.into(), action).await? else {
         return Err(unexpected());
     };
@@ -381,4 +402,46 @@ pub async fn raise_epoch(
     let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     let epoch = epoch_run(&state, &auth, &bucket, true).await?;
     Ok(Json(EpochView { epoch }))
+}
+
+#[utoipa::path(post, path = "/data/buckets/{bucket}/abe/rekey", tag = "data/blobs",
+    summary = "Re-key a subtree",
+    description = r#"Gives every object version under a prefix a new object key and envelope.
+
+**Authentication**: An unrestricted realm bearer token of a current key holder.
+
+**Behavior**
+- A due epoch raise happens first; new envelopes carry the resulting epoch.
+- Each call re-keys at most 64 versions and saves its place; repeat the call until `done`.
+- Archive grants and envelopes are rewritten; payload blocks are not.
+- Versions outside the prefix and copies that still need the old key stay unchanged.
+- A raise or removal during the walk starts it again, so `done` covers it.
+- The node needs the bucket key: `node_managed`, or unlocked on this node."#,
+    params(("bucket" = String, Path, description = "Node-local S3 bucket name")),
+    request_body(content = RekeyBody, example = json!({"prefix":"foo/"})),
+    responses((status = 200, body = RekeyView, description = "Pass progress", example = json!({"prefix":"foo/","epoch":3,"rekeyed":64,"done":false})),
+        (status = 400, body = ErrorResponse, description = "Prefix is not empty and does not end in a slash"),
+        (status = 401, body = ErrorResponse, description = "Bearer token required"), (status = 403, body = ErrorResponse, description = "Caller is no current key holder"),
+        (status = 404, body = ErrorResponse, description = "Bucket missing or not encrypted"),
+        (status = 409, body = ErrorResponse, description = "Another prefix is being re-keyed, or the bucket key is locked here"),
+        (status = 503, body = ErrorResponse, description = "A concurrent change or busy storage; retry")),
+    security(("bearer_auth" = [])))]
+pub async fn rekey_subtree(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+    Json(body): Json<RekeyBody>,
+) -> ServerResult<Json<RekeyView>> {
+    let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
+    let scope = KeyScope::Subtree(body.prefix.clone());
+    scope.validate().map_err(|_| ServerError::BadRequest)?;
+    raise_run(&state, &auth, &bucket, KeyAction::Rekey).await?;
+    let page = rekey_page(&state.get_ctx(), &bucket, &body.prefix, MAX_REQUESTS).await;
+    let (progress, done) = page.map_err(key_error)?;
+    Ok(Json(RekeyView {
+        prefix: progress.prefix,
+        epoch: progress.epoch,
+        rekeyed: progress.rekeyed,
+        done,
+    }))
 }

@@ -237,6 +237,7 @@ pub(crate) mod tests {
         ),
         ("GET", "/data/buckets/{bucket}/abe/grants"),
         ("POST", "/data/buckets/{bucket}/abe/epoch"),
+        ("POST", "/data/buckets/{bucket}/abe/rekey"),
         ("GET", "/data/blobs/envelope"),
         ("GET", "/data/blobs/content"),
         ("GET", "/data/blobs/locations"),
