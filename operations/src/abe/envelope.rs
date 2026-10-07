@@ -7,7 +7,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::*;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::abe::{AbeError, AbeParameters, EnvelopeArchive, ObjectEnvelope};
-use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
+use aruna_core::structs::storage::blob::{ArchiveKey, BlobVersion, VersionKey};
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use ulid::Ulid;
@@ -29,6 +29,8 @@ pub struct EnvelopeOperation {
     state: State,
     id: Option<Ulid>,
     location: Option<Vec<u8>>,
+    /// The archive a version without a content hash waits on.
+    pending: Option<ArchiveKey>,
     result: Option<(ObjectEnvelope, EnvelopeArchive)>,
     output: Option<Result<(ObjectEnvelope, EnvelopeArchive), AbeError>>,
 }
@@ -40,6 +42,7 @@ impl EnvelopeOperation {
             state: State::Init,
             id: None,
             location: None,
+            pending: None,
             result: None,
             output: None,
         }
@@ -87,6 +90,7 @@ impl Operation for EnvelopeOperation {
                     return self.fail(AbeError::Missing);
                 };
                 self.location = version.location_key().map(|k| k.to_bytes());
+                self.pending = version.state.pending_archive().cloned();
                 let Some(id) = values[1]
                     .1
                     .as_ref()
@@ -123,6 +127,8 @@ impl Operation for EnvelopeOperation {
                             .map_err(|_| AbeError::Context)?;
                     if self.id != Some(envelope.context.write_id)
                         || self.location.as_deref().unwrap_or_default() != archive.location_key
+                        || (self.location.is_none()
+                            && self.pending.as_ref() != Some(&archive.archive))
                         || envelope.context.object_key != self.version.key
                     {
                         return Err(AbeError::Context);
