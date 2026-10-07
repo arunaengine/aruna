@@ -15,6 +15,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::storage::abe::envelope_charge;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
@@ -851,8 +852,13 @@ impl RebuildStatsOperation {
                 }
             }
             RebuildStatsState::ScanEnvelopes | RebuildStatsState::ScanArchives => {
+                let archives = self.state == RebuildStatsState::ScanArchives;
                 for (key, value) in values {
-                    *self.envelope_sizes.entry(key.to_vec()).or_default() += value.len() as u64;
+                    let bytes = match archives {
+                        true => envelope_charge(&[], value),
+                        false => value.len() as u64,
+                    };
+                    *self.envelope_sizes.entry(key.to_vec()).or_default() += bytes;
                 }
             }
             RebuildStatsState::ScanEnvelopeVersions | RebuildStatsState::ScanCopies => {

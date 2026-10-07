@@ -343,7 +343,26 @@ impl PendingCopy {
 
 /// Usage bytes charged for one version's stored envelope and archive mapping rows.
 pub fn envelope_charge(envelope: &[u8], archive: &[u8]) -> u64 {
-    (envelope.len() + archive.len()) as u64
+    // A pending mapping is charged its final size, so promotion adds no usage.
+    let pending = postcard::from_bytes::<EnvelopeArchive>(archive)
+        .ok()
+        .filter(|mapping| mapping.location_key.is_empty());
+    let archive = pending.map_or(archive.len(), |mapping| mapping.final_len());
+    (envelope.len() + archive) as u64
+}
+
+impl EnvelopeArchive {
+    /// Encoded size once a pending Pithos archive's location key is known.
+    fn final_len(&self) -> usize {
+        let digest = [0; 32];
+        let class = super::format::EncodingClass::Pithos { digest };
+        let key = super::blob::BlobLocationKey::new(digest, class, self.archive.backend.clone());
+        let filled = Self {
+            archive: self.archive.clone(),
+            location_key: key.to_bytes(),
+        };
+        postcard::to_allocvec(&filled).map_or(0, |bytes| bytes.len())
+    }
 }
 
 pub use getrandom::SysRng;

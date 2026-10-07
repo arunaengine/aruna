@@ -1971,6 +1971,93 @@ fn envelope_publishes_charged() {
     ));
 }
 
+/// Publishes the fenced pending envelope under a metadata limit, returning the step's effects.
+fn publish_envelope(metadata_bytes: u64) -> (CompleteUploadOperation, Effects) {
+    let limits = RoCrateLimits {
+        metadata_bytes,
+        ..Default::default()
+    };
+    let mut operation = abe_fenced(true, 1).with_rocrate_limits(limits);
+    operation.final_location = operation.composed_location.clone();
+    operation.version_id = Some(Ulid::from_parts(5, 1));
+    operation.state = CompleteUploadState::WriteVersionRecord;
+    let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: b"version".to_vec().into(),
+    }));
+    (operation, effects)
+}
+
+#[test]
+fn envelope_limit_boundary() {
+    // The metadata limit and the charge count a pending mapping at its promoted size.
+    use aruna_core::structs::storage::abe::{EnvelopeArchive, envelope_charge};
+    let (operation, effects) = publish_envelope(u64::MAX);
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("expected the envelope rows, got {effects:?}")
+    };
+    let (envelope, id, mapping) = (&writes[0].2, &writes[0].1, &writes[2].2);
+    let location = operation.final_location.as_ref().unwrap();
+    let mut archive: EnvelopeArchive = postcard::from_bytes(mapping).unwrap();
+    assert!(archive.location_key.is_empty());
+    let key = BlobLocationKey::new([1; 32], location.format.encoding(), location.backend.clone());
+    archive.location_key = key.to_bytes();
+    let promoted = postcard::to_allocvec(&archive).unwrap();
+    assert!(promoted.len() > mapping.len() + 1);
+    assert_eq!(operation.envelope_bytes, envelope_charge(envelope, &promoted));
+    assert_eq!(operation.envelope_bytes, envelope_charge(envelope, mapping));
+    let metadata = &operation.upload_record.as_ref().unwrap().metadata;
+    let metadata = postcard::to_allocvec(metadata).unwrap();
+    let limit = operation.envelope_bytes + (id.len() + metadata.len()) as u64;
+    let (_, effects) = publish_envelope(limit);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchWrite { .. })]
+    ));
+    let (mut operation, _) = publish_envelope(limit - 1);
+    assert!(matches!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::BlobError(BlobError::Abe(
+            AbeError::Limit
+        )))
+    ));
+}
+
+#[test]
+fn ceiling_covers_promotion() {
+    // A completion exactly at the ceiling has paid for the mapping its keyed read promotes.
+    use aruna_core::structs::storage::usage::UsageCounters;
+    for (slack, exceeded) in [(0, false), (1, true)] {
+        let (mut operation, _) = publish_envelope(u64::MAX);
+        let size = operation.final_location.as_ref().unwrap().blob_size;
+        let used = 7;
+        operation.input.quota_ceiling = Some(used + size + operation.envelope_bytes - slack);
+        operation.state = CompleteUploadState::WriteReplicationObligation;
+        operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"obligation".to_vec().into(),
+        }));
+        assert!(matches!(operation.state, CompleteUploadState::EnforceQuota));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"realm".to_vec().into(),
+            value: None,
+        }));
+        let counters = UsageCounters {
+            logical_bytes: used,
+            ..Default::default()
+        };
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"group".to_vec().into(),
+            value: Some(counters.to_bytes().unwrap().into()),
+        }));
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        let error = operation.cleanup.take_error();
+        let refused = matches!(error, Some(CompleteUploadError::QuotaExceeded { .. }));
+        assert_eq!(refused, exceeded, "slack {slack}: {error:?}");
+    }
+}
+
 #[test]
 fn plain_completion_refused() {
     // A plain upload never publishes once its bucket encrypts, even if its record predates it.

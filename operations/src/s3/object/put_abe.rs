@@ -148,11 +148,10 @@ pub(crate) fn envelope_rows(
     let bytes = envelope.to_bytes()?;
     let archive_bytes = postcard::to_allocvec(archive).map_err(|_| AbeError::Context)?;
     let metadata = postcard::to_allocvec(metadata).map_err(|_| AbeError::Context)?;
-    let total = bytes.len() + archive_bytes.len() + id.len() + metadata.len();
-    if total as u64 > limit {
+    let charge = envelope_charge(&bytes, &archive_bytes);
+    if charge + (id.len() + metadata.len()) as u64 > limit {
         return Err(AbeError::Limit);
     }
-    let charge = envelope_charge(&bytes, &archive_bytes);
     let writes = vec![
         (
             ABE_ENVELOPE_KEYSPACE.to_string(),

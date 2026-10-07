@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::structs::storage::abe::envelope_charge;
 use aruna_core::structs::storage::blob::{BackendRef, VersionKey};
 use aruna_core::structs::storage::encryption::ReadLease;
 use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
@@ -514,7 +515,7 @@ fn no_registrations() -> Event {
 
 #[test]
 fn envelope_mapping_rebound() {
-    // A promoted version's envelope mapping names the location key; the larger row is charged.
+    // A promoted version's envelope mapping names the location key; completion charged its size.
     let mut operation = hashed_operation();
     reread(&mut operation);
     operation.step(Event::Storage(StorageEvent::WriteResult {
@@ -564,17 +565,16 @@ fn envelope_mapping_rebound() {
     assert_eq!(archive.archive, ArchiveKey::of(&sealed()));
     assert_eq!(archive.location_key, location_key.to_bytes());
     archive.location_key.clear();
-    let growth = value.len() - postcard::to_allocvec(&archive).unwrap().len();
+    let pending = postcard::to_allocvec(&archive).unwrap();
+    assert_eq!(envelope_charge(&[], &pending), envelope_charge(&[], value));
     let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: Vec::new(),
     }));
-    let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
-        panic!("the group is charged in the same transaction, got {effects:?}")
-    };
     assert!(
-        deltas
+        !effects
             .iter()
-            .all(|(_, delta)| delta.logical_bytes == growth as i128)
+            .any(|effect| matches!(effect, Effect::Storage(StorageEffect::AddUsage { .. }))),
+        "promotion adds no usage, got {effects:?}"
     );
 }
 

@@ -26,14 +26,12 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::encryption::{
     BucketKeyError, BucketKeyRecord, BucketKeyRef, KeyState, ReadLease,
 };
-use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::blob::records::{HeadAliasContext, add_index_effect};
-use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use crate::replication::dht_registration::dht_registration_effect;
 
 /// Owner rows promoted per transaction.
@@ -90,7 +88,6 @@ enum State {
     ReadBuckets,
     ReadManaged,
     WriteVersions,
-    UpdateUsage,
     DeletePending,
     Commit,
     Abort,
@@ -118,8 +115,6 @@ pub struct PromotePendingOperation {
     pending: Vec<(Key, BlobVersion)>,
     groups: HashMap<String, Ulid>,
     promoted: usize,
-    /// Group charges for envelope mappings that gained their location key in this page.
-    usage: Vec<UsageCounterUpdate>,
     output: Option<Result<Promotion, PromoteError>>,
     /// A read admitted outside the unlock registry, such as with a token credential.
     lease: Option<ReadLease>,
@@ -149,7 +144,6 @@ impl PromotePendingOperation {
             pending: Vec::new(),
             groups: HashMap::new(),
             promoted: 0,
-            usage: Vec::new(),
             output: None,
             lease: None,
         }
@@ -519,20 +513,14 @@ impl PromotePendingOperation {
             return Err(PromoteError::BadHashes);
         }
         let envelopes = managed.split_off(self.pending.len());
-        // An envelope mapping now names the location key; its larger row is charged to the group.
+        // An envelope mapping now names the location key; completion already charged its size.
         let location_key =
             BlobLocationKey::new(blake3, location.format.encoding(), location.backend.clone());
-        let mut archive = EnvelopeArchive {
+        let archive = EnvelopeArchive {
             archive: self.archive.clone(),
-            location_key: Vec::new(),
+            location_key: location_key.to_bytes(),
         };
-        let pending_len = postcard::to_allocvec(&archive)
-            .map_err(ConversionError::from)?
-            .len();
-        archive.location_key = location_key.to_bytes();
         let mapping = postcard::to_allocvec(&archive).map_err(ConversionError::from)?;
-        let growth = (mapping.len() - pending_len) as i128;
-        let mut charges: HashMap<Ulid, i128> = HashMap::new();
         let mut writes = Vec::new();
         // A governed version's registration names the copy by its hashes, so it gains them too.
         for (key, value) in managed {
@@ -556,9 +544,6 @@ impl PromotePendingOperation {
             let version_key = aruna_core::structs::storage::blob::VersionKey::from_bytes(&key)?;
             if let Some(id) = envelope {
                 writes.push((ABE_ARCHIVE_KEYSPACE.to_string(), id, mapping.clone().into()));
-                if let Some(group_id) = groups.get(&version_key.bucket) {
-                    *charges.entry(*group_id).or_default() += growth;
-                }
             }
             version.state = BlobVersionState::Materialized {
                 blob_hash: blake3,
@@ -593,53 +578,10 @@ impl PromotePendingOperation {
             }
             self.promoted += 1;
         }
-        self.usage = charges
-            .into_iter()
-            .map(|(group_id, logical_bytes)| {
-                let delta = UsageDelta {
-                    logical_bytes,
-                    ..Default::default()
-                };
-                UsageCounterUpdate::for_group(group_id, delta)
-            })
-            .collect();
         Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: self.txn_id,
         })])
-    }
-
-    /// Stages the page's group charges in its transaction, one group at a time.
-    fn next_usage(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.next_page();
-        };
-        match self.usage.last_mut() {
-            Some(update) => {
-                self.state = State::UpdateUsage;
-                update.start(txn_id)
-            }
-            None => self.next_page(),
-        }
-    }
-
-    fn handle_usage(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.unexpected("UpdateUsage", "an open transaction", event);
-        };
-        let Some(update) = self.usage.last_mut() else {
-            return self.unexpected("UpdateUsage", "a usage update", event);
-        };
-        match update.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
-            Ok(None) => {
-                self.usage.pop();
-                self.next_usage()
-            }
-            Err(UsageUpdateError::UnexpectedEvent(event)) => {
-                self.unexpected("UpdateUsage", "BatchWriteResult", event)
-            }
-        }
     }
 
     fn next_page(&mut self) -> Effects {
@@ -736,10 +678,9 @@ impl Operation for PromotePendingOperation {
             State::ReadBuckets => self.handle_buckets(event),
             State::ReadManaged => self.handle_managed(event),
             State::WriteVersions => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.next_usage(),
+                Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.next_page(),
                 event => self.unexpected("WriteVersions", "BatchWriteResult", event),
             },
-            State::UpdateUsage => self.handle_usage(event),
             State::DeletePending => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.last_page = true;
