@@ -71,13 +71,13 @@ impl AsyncSliceReader for RegrantReader {
 }
 
 impl BlobHandler {
-    /// A reader over `source` granted only to the key of `plan`, and the location it is sent
-    /// with. The key of `lease` opens the old grants; the sent location carries no hashes.
+    /// A reader over `source` granted only to the key of `plan` and `object`, and the location it
+    /// is sent with. The key of `lease` opens the old grants; the sent location carries no hashes.
     pub(in crate::blob) async fn regrant_reader(
         &self,
         source: &BackendLocation,
         lease: ReadLease,
-        plan: &SealPlan,
+        (plan, object): (&SealPlan, Option<[u8; 32]>),
     ) -> Result<(RegrantReader, BackendLocation), BlobError> {
         let StoredLayout::Pithos(layout) = &source.format.layout else {
             return Err(BlobError::ReadError("not a Pithos copy".to_string()));
@@ -105,7 +105,14 @@ impl BlobHandler {
         let recipient = PublicKey::from_raw(plan.public_key).map_err(|error| {
             BlobError::WriteError(format!("invalid bucket public key: {error}"))
         })?;
-        let replacement = view.replace_grants(&directory, vec![recipient]);
+        let mut recipients = vec![recipient];
+        if let Some(object) = object {
+            let object = PublicKey::from_raw(object).map_err(|error| {
+                BlobError::WriteError(format!("invalid object public key: {error}"))
+            })?;
+            recipients.push(object);
+        }
+        let replacement = view.replace_grants(&directory, recipients);
         let replacement =
             replacement.map_err(|error| BlobError::IntegrityCheckFailed(error.to_string()))?;
         let header = Bytes::copy_from_slice(&replacement.header());
@@ -267,7 +274,7 @@ mod tests {
         let capacity = budget.available_permits();
         let charged = working_set(location.blob_size).div_ceil(1 << 20) as usize;
         let (mut reader, sent) = handler
-            .regrant_reader(&location, lease, &plan)
+            .regrant_reader(&location, lease, (&plan, None))
             .await
             .unwrap();
         assert_eq!(budget.available_permits(), capacity - charged);

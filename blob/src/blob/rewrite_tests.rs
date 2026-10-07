@@ -355,7 +355,7 @@ fn receiving(
 ) -> tokio::task::JoinHandle<BlobEvent> {
     let handler = handler.clone();
     tokio::spawn(async move {
-        let received = handler.handle_incoming_replication(None, inbound, target, true);
+        let received = handler.handle_incoming_replication(None, inbound, (target, None), true);
         Box::pin(received).await
     })
 }
@@ -390,7 +390,7 @@ async fn granted_copy_transfers() {
     let received = receiving(&handler, inbound, target);
     let ids = (Ulid::generate(), sending);
     let sent = handler
-        .replicate_leased(ids, sealed, lease, Some(plan))
+        .replicate_leased(ids, sealed, lease, Some((plan, None)))
         .await;
     assert!(
         matches!(sent, BlobEvent::ReplicationFinished { .. }),
@@ -412,6 +412,84 @@ async fn granted_copy_transfers() {
 }
 
 #[tokio::test]
+async fn object_key_transfers() {
+    // The target archive opens with the target's bucket and object keys, never the source's.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let data = b"granted to the target object key".repeat(2000);
+    let (key, private, public) = bucket_key(Ulid::generate(), 1, 5);
+    let (_, source_object, source_public) = bucket_key(Ulid::generate(), 1, 8);
+    let source = plain(&handler, &data).await;
+    let target = sealing(key, public);
+    let grants = (false, Some(source_public));
+    let rewrite = handler.rewrite_copy("bucket", "object", source, None, target, grants);
+    let event = Box::pin(rewrite).await;
+    let BlobEvent::CopyRewritten { location: sealed } = event else {
+        panic!("sealing failed: {event:?}")
+    };
+    assert_eq!(
+        opened(&handler, &sealed, source_object).await.unwrap(),
+        data
+    );
+    let lease = admitted(&handler, key, private, public, &sealed).await;
+    let (target_key, target_private, target_public) = bucket_key(Ulid::generate(), 1, 6);
+    let (_, target_object, object_public) = bucket_key(Ulid::generate(), 1, 9);
+    let target = sealing(target_key, target_public);
+    let plan = target.encryption.unwrap();
+    let (sending, inbound) = loopback(&handler).await;
+
+    let received = receiving(&handler, inbound, target);
+    let ids = (Ulid::generate(), sending);
+    let regrant = Some((plan, Some(object_public)));
+    let sent = handler.replicate_leased(ids, sealed, lease, regrant).await;
+    assert!(
+        matches!(sent, BlobEvent::ReplicationFinished { .. }),
+        "{sent:?}"
+    );
+    let received = received.await.unwrap();
+    let BlobEvent::ReplicationFinished { location } = received else {
+        panic!("receive failed: {received:?}")
+    };
+    for allowed in [target_private, target_object] {
+        assert_eq!(opened(&handler, &location, allowed).await.unwrap(), data);
+    }
+    for refused in [private, source_object] {
+        assert!(opened(&handler, &location, refused).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn plaintext_object_sealed() {
+    // Plaintext received for a target object key is sealed to it as well.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let data = b"plain source, target object key".repeat(2000);
+    let source = plain(&handler, &data).await;
+    let (key, private, public) = bucket_key(Ulid::generate(), 1, 7);
+    let (_, object, object_public) = bucket_key(Ulid::generate(), 1, 10);
+    let (sending, inbound) = loopback(&handler).await;
+
+    let target = (sealing(key, public), Some(object_public));
+    let receiver = handler.clone();
+    let received = tokio::spawn(async move {
+        Box::pin(receiver.handle_incoming_replication(None, inbound, target, true)).await
+    });
+    let sent = handler
+        .replicate_blob(Ulid::generate(), sending, source, true)
+        .await;
+    assert!(
+        matches!(sent, BlobEvent::ReplicationFinished { .. }),
+        "{sent:?}"
+    );
+    let BlobEvent::ReplicationFinished { location } = received.await.unwrap() else {
+        panic!("receive failed")
+    };
+    for allowed in [private, object] {
+        assert_eq!(opened(&handler, &location, allowed).await.unwrap(), data);
+    }
+}
+
+#[tokio::test]
 async fn tampered_transfer_fails() {
     // Archive bytes changed in transit do not match the announced tree and are not kept.
     use crate::bao_tree::SendStreamWrapper;
@@ -430,7 +508,10 @@ async fn tampered_transfer_fails() {
     let (target_key, _, target_public) = bucket_key(Ulid::generate(), 1, 6);
     let target = sealing(target_key, target_public);
     let plan = target.encryption.unwrap();
-    let (mut reader, sent) = handler.regrant_reader(&sealed, lease, &plan).await.unwrap();
+    let (mut reader, sent) = handler
+        .regrant_reader(&sealed, lease, (&plan, None))
+        .await
+        .unwrap();
     let size = sent.stored_size();
     let genuine = reader.read_exact_at(0, size as usize).await.unwrap();
     let block = crate::blob::BAO_BLOCK_SIZE;

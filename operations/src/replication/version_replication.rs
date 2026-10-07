@@ -2644,7 +2644,8 @@ impl ReplicateObjectOperation {
                 self.read_source_encryption()
             }
             ReplicationNegotiationResult::NeedBlobVersion
-            | ReplicationNegotiationResult::NeedSealedBlob(_) => {
+            | ReplicationNegotiationResult::NeedSealedBlob(_)
+            | ReplicationNegotiationResult::NeedAbeBlob(..) => {
                 let Some(blob) = self.manifest_blob() else {
                     return self.fail(ReplicateObjectError::MissingBlobHash);
                 };
@@ -2725,7 +2726,11 @@ impl ReplicateObjectOperation {
                 _ => self.replicate_plain(location),
             };
         };
-        let sealed_target = matches!(negotiated, ReplicationNegotiationResult::NeedSealedBlob(_));
+        let sealed_target = matches!(
+            negotiated,
+            ReplicationNegotiationResult::NeedSealedBlob(_)
+                | ReplicationNegotiationResult::NeedAbeBlob(..)
+        );
         if !sealed_target && !self.plaintext {
             return self.fail(ReplicateObjectError::PlaintextRefused);
         }
@@ -2784,11 +2789,15 @@ impl ReplicateObjectOperation {
         ) else {
             return self.fail(ReplicateObjectError::MissingBlobHash);
         };
-        let regrant = match (&self.negotiated, location.format.bucket_key()) {
+        // Never the source object key: only the target's bucket key and its own object key.
+        let (regrant, object) = match (&self.negotiated, location.format.bucket_key()) {
             (Some(ReplicationNegotiationResult::NeedSealedBlob(plan)), Some(_)) => {
-                Some(Box::new(*plan))
+                (Some(Box::new(*plan)), None)
             }
-            _ => None,
+            (Some(ReplicationNegotiationResult::NeedAbeBlob(plan, object)), Some(_)) => {
+                (Some(Box::new(*plan)), Some(*object))
+            }
+            _ => (None, None),
         };
         self.state = ReplicateObjectState::TransferBlob;
         smallvec![Effect::Blob(BlobEffect::ReplicateLeased {
@@ -2797,6 +2806,7 @@ impl ReplicateObjectOperation {
             location,
             lease: Box::new(lease),
             regrant,
+            object,
         })]
     }
 
@@ -4860,8 +4870,27 @@ mod tests {
             let effects = op.step(admitted(source_key(), &location));
             assert!(matches!(
                 effects.as_slice(),
-                [Effect::Blob(BlobEffect::ReplicateLeased { regrant: Some(plan), .. })]
+                [Effect::Blob(BlobEffect::ReplicateLeased { regrant: Some(plan), object: None, .. })]
                     if **plan == target_plan()
+            ));
+        }
+
+        #[test]
+        fn object_key_regrants() {
+            // The target's own object key is the only object recipient; the source key is not sent.
+            let location = sealed_location();
+            let mut op = negotiating(location.clone(), false);
+            let result = ReplicationNegotiationResult::NeedAbeBlob(target_plan(), [8; 32]);
+            answer(&mut op, result);
+            op.step(encrypting());
+            let effects = op.step(admitted(source_key(), &location));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::ReplicateLeased {
+                    regrant: Some(plan),
+                    object: Some([8, ..]),
+                    ..
+                })] if **plan == target_plan()
             ));
         }
 

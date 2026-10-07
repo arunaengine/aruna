@@ -354,6 +354,8 @@ pub enum ReplicationNegotiationResult {
     /// An encrypting target needs the bytes sealed to its key: a sealed source grants its
     /// archive to this plan, a plain source sends plaintext the target seals.
     NeedSealedBlob(SealPlan),
+    /// Like `NeedSealedBlob`, and the archive is also granted to this target object key.
+    NeedAbeBlob(SealPlan, [u8; 32]),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

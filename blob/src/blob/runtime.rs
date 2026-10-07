@@ -890,11 +890,12 @@ impl BlobHandler {
                 stream_id,
                 resolved,
                 keep_alive,
+                object,
             } => {
                 Box::pin(self.handle_incoming_replication(
                     replication_id,
                     stream_id,
-                    resolved,
+                    (resolved, object),
                     keep_alive,
                 ))
                 .await
@@ -931,9 +932,10 @@ impl BlobHandler {
                 location,
                 lease,
                 regrant,
+                object,
             } => {
                 let ids = (replication_id, stream_id);
-                let regrant = regrant.map(|plan| *plan);
+                let regrant = regrant.map(|plan| (*plan, object));
                 Box::pin(self.replicate_leased(ids, location, *lease, regrant)).await
             }
             BlobEffect::SealToken {

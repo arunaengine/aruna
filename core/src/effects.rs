@@ -159,6 +159,8 @@ pub enum BlobEffect {
         /// Each node routes its own replica; the sender's backend is ignored.
         resolved: ResolvedBackend,
         keep_alive: bool,
+        /// A plaintext replica is also sealed to this object key.
+        object: Option<[u8; 32]>,
     },
     ServeRead {
         stream_id: Ulid,
@@ -325,14 +327,15 @@ pub enum BlobEffect {
         node_id: NodeId,
     },
     /// Sends the copy at `location` of an encrypting bucket under `lease`, which covers the
-    /// transfer. A sealed copy with `regrant` is granted to that key and sent as stored bytes;
-    /// otherwise the plaintext is sent. Answers `ReplicationFinished`.
+    /// transfer. A sealed copy with `regrant` is granted to that key and `object`, and sent as
+    /// stored bytes; otherwise the plaintext is sent. Answers `ReplicationFinished`.
     ReplicateLeased {
         replication_id: Ulid,
         stream_id: Ulid,
         location: BackendLocation,
         lease: Box<ReadLease>,
         regrant: Option<Box<crate::structs::storage::encryption::SealPlan>>,
+        object: Option<[u8; 32]>,
     },
     Abe(Box<crate::structs::storage::abe::AbeEffect>),
 }

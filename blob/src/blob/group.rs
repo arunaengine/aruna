@@ -466,6 +466,7 @@ mod tests {
             stream_id: Ulid::from_bytes([8u8; 16]),
             resolved: ResolvedBackend::new(BackendRef::Group(backend_id), None),
             keep_alive: false,
+            object: None,
         };
 
         assert_eq!(group_ids(&effect), vec![backend_id]);

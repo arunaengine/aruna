@@ -284,24 +284,26 @@ impl BlobHandler {
     }
 
     /// Sends a copy of an encrypting bucket under `lease`. With `regrant` a sealed copy is granted
-    /// to that key and its stored bytes are sent; otherwise its plaintext is sent.
+    /// to that key and object key, and its stored bytes are sent; otherwise its plaintext is sent.
     pub async fn replicate_leased(
         &self,
         (replication_id, stream_id): (Ulid, Ulid),
         location: BackendLocation,
         lease: ReadLease,
-        regrant: Option<SealPlan>,
+        regrant: Option<(SealPlan, Option<[u8; 32]>)>,
     ) -> BlobEvent {
         let ids = (replication_id, stream_id);
         let sealed = matches!(location.format.layout, StoredLayout::Pithos(_));
         let sent = match (regrant, sealed) {
-            (Some(plan), true) => match self.regrant_reader(&location, lease, &plan).await {
-                Ok((reader, sent)) => {
-                    let size = sent.stored_size();
-                    self.send_replica(ids, sent, reader, size, true).await
+            (Some((plan, object)), true) => {
+                match self.regrant_reader(&location, lease, (&plan, object)).await {
+                    Ok((reader, sent)) => {
+                        let size = sent.stored_size();
+                        self.send_replica(ids, sent, reader, size, true).await
+                    }
+                    Err(error) => Err(BlobEvent::Error(error)),
                 }
-                Err(error) => Err(BlobEvent::Error(error)),
-            },
+            }
             (Some(_), false) => {
                 let message = "only a sealed copy is granted to another key";
                 Err(BlobEvent::Error(BlobError::ReadError(message.to_string())))
@@ -402,7 +404,7 @@ impl BlobHandler {
         &self,
         replication_id: Option<Ulid>,
         stream_id: Ulid,
-        resolved: ResolvedBackend,
+        (resolved, object): (ResolvedBackend, Option<[u8; 32]>),
         keep_alive: bool,
     ) -> BlobEvent {
         let (_replication_id, root, mut location) = {
@@ -498,7 +500,7 @@ impl BlobHandler {
         // Plaintext for an encrypting bucket is sealed with its plan, like any new write.
         if let (false, Some(plan)) = (sealed, resolved.encryption) {
             let received = (stream, root);
-            let sealing = (plan, resolved.compression);
+            let sealing = (plan, resolved.compression, object);
             let written = self.receive_sealing(received, location, operator, sealing);
             let event = Box::pin(written).await;
             if matches!(&event, BlobEvent::ReplicationFinished { .. })
@@ -626,14 +628,14 @@ impl BlobHandler {
         event
     }
 
-    /// Decodes plaintext checked against `root` and writes it sealed with `plan`, reusing the
-    /// write path of new objects. The written content hash must equal `root`.
+    /// Decodes plaintext checked against `root` and writes it sealed with `plan` and `object`,
+    /// reusing the write path of new objects. The written content hash must equal `root`.
     async fn receive_sealing(
         &self,
         (stream, root): (super::SharedBiStream, blake3::Hash),
         location: BackendLocation,
         operator: opendal::Operator,
-        (plan, compression): (SealPlan, Compression),
+        (plan, compression, object): (SealPlan, Compression, Option<[u8; 32]>),
     ) -> BlobEvent {
         let size = location.blob_size;
         let (writer, reader) = tokio::io::duplex(64 * 1024);
@@ -668,7 +670,7 @@ impl BlobHandler {
                     .map_err(|error| StreamError(Box::new(error)))
             },
         );
-        let seal = (Some(plan), None, None);
+        let seal = (Some(plan), None, object);
         let written = self.write_encoded(
             location.clone(),
             operator,

@@ -27,6 +27,7 @@ use crate::replication::queue::{
 };
 use crate::s3::bucket::create::CreateBucketOperation;
 use crate::s3::bucket::key::rows::settings_read;
+use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -43,6 +44,7 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
+use aruna_core::structs::storage::abe::{AbeEffect, AbeEvent, EnvelopePlan, ObjectEnvelope};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend,
@@ -90,6 +92,9 @@ enum IncomingVersionState {
     EnforceQuota,
     FinishQuotaCheck,
     ReadExistingBlob,
+    /// Reads the admitted ABE parameters and epoch of an encrypting destination.
+    ReadAbe,
+    CreateEnvelope,
     PolicyGate,
     SendNegotiation,
     AwaitApproval,
@@ -216,6 +221,8 @@ pub enum IncomingVersionError {
     /// The destination's key or stored format changed since the negotiation; retryable.
     #[error("the destination seal plan is stale")]
     StalePlan,
+    #[error(transparent)]
+    Blob(#[from] BlobError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -366,6 +373,9 @@ pub struct IncomingVersionOperation {
     /// How an encrypting destination seals the replica, captured at negotiation.
     seal_plan: Option<SealPlan>,
     destination_settings: Option<BucketEncryption>,
+    /// The replica's own envelope, created before the transfer and published with its version.
+    envelope: Option<ObjectEnvelope>,
+    envelope_bytes: u64,
 }
 
 impl IncomingVersionOperation {
@@ -421,6 +431,8 @@ impl IncomingVersionOperation {
             pending_negotiation: None,
             seal_plan: None,
             destination_settings: None,
+            envelope: None,
+            envelope_bytes: 0,
         }
     }
 
@@ -534,6 +546,8 @@ impl Operation for IncomingVersionOperation {
             IncomingVersionState::EnforceQuota => self.accept_quota_step(event),
             IncomingVersionState::FinishQuotaCheck => self.accept_quota_abort(event),
             IncomingVersionState::ReadExistingBlob => self.accept_existing_blob(event),
+            IncomingVersionState::ReadAbe => self.accept_abe(event),
+            IncomingVersionState::CreateEnvelope => self.accept_envelope(event),
             IncomingVersionState::PolicyGate => self.accept_policy_gate(event),
             IncomingVersionState::SendNegotiation => self.accept_reply_sent(event),
             IncomingVersionState::AwaitApproval => self.accept_source_approval(event),
@@ -651,6 +665,8 @@ impl IncomingVersionOperation {
             IncomingVersionState::EnforceQuota => "EnforceQuota",
             IncomingVersionState::FinishQuotaCheck => "FinishQuotaCheck",
             IncomingVersionState::ReadExistingBlob => "ReadExistingBlob",
+            IncomingVersionState::ReadAbe => "ReadAbe",
+            IncomingVersionState::CreateEnvelope => "CreateEnvelope",
             IncomingVersionState::PolicyGate => "PolicyGate",
             IncomingVersionState::SendNegotiation => "SendNegotiation",
             IncomingVersionState::AwaitApproval => "AwaitApproval",
@@ -727,6 +743,7 @@ impl IncomingVersionOperation {
                 ReplicationNegotiationResult::NeedVersionOnly
                     | ReplicationNegotiationResult::NeedBlobVersion
                     | ReplicationNegotiationResult::NeedSealedBlob(_)
+                    | ReplicationNegotiationResult::NeedAbeBlob(..)
             )
         ) && !self.apply_committed
             && !matches!(
@@ -1123,11 +1140,79 @@ impl IncomingVersionOperation {
             Some(error) => self.reject_negotiation(IncomingVersionError::RoutingFailed(error)),
             None => match self.seal_plan {
                 Some(plan) => {
-                    self.send_negotiation(ReplicationNegotiationResult::NeedSealedBlob(plan))
+                    self.state = IncomingVersionState::ReadAbe;
+                    smallvec![Effect::Storage(StorageEffect::BatchRead {
+                        reads: abe_reads(plan.key),
+                        txn_id: None,
+                    })]
                 }
                 None => self.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion),
             },
         }
+    }
+
+    /// Admitted ABE parameters give the replica its own object key and envelope before the
+    /// transfer; a generation without them keeps bucket-only grants.
+    fn accept_abe(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.fail(IncomingVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                received: event,
+            });
+        };
+        let Some(plan) = self.seal_plan else {
+            return self.fail(IncomingVersionError::StalePlan);
+        };
+        if values
+            .first()
+            .is_some_and(|(_, parameters)| parameters.is_none())
+        {
+            return self.send_negotiation(ReplicationNegotiationResult::NeedSealedBlob(plan));
+        }
+        let (parameters, epoch) = match parse_abe(&values, plan.key) {
+            Ok(parsed) => parsed,
+            Err(error) => return self.reject_negotiation(BlobError::from(error).into()),
+        };
+        self.state = IncomingVersionState::CreateEnvelope;
+        smallvec![Effect::Blob(BlobEffect::Abe(Box::new(
+            AbeEffect::Envelope(EnvelopePlan {
+                parameters,
+                epoch,
+                write_id: Ulid::generate(),
+                object_key: self.manifest.key.clone(),
+                bucket_public: plan.public_key,
+            })
+        )))]
+    }
+
+    fn accept_envelope(&mut self, event: Event) -> Effects {
+        let envelope = match event {
+            Event::Blob(BlobEvent::Abe(event)) => match *event {
+                AbeEvent::Envelope(envelope) => envelope,
+                event => {
+                    return self.fail(IncomingVersionError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "AbeEvent::Envelope",
+                        received: Event::Blob(BlobEvent::Abe(Box::new(event))),
+                    });
+                }
+            },
+            Event::Blob(BlobEvent::Error(error)) => return self.reject_negotiation(error.into()),
+            event => {
+                return self.fail(IncomingVersionError::InvalidStateEvent {
+                    state: self.state_name(),
+                    expected: "Event::Blob(BlobEvent::Abe)",
+                    received: event,
+                });
+            }
+        };
+        let Some(plan) = self.seal_plan else {
+            return self.fail(IncomingVersionError::StalePlan);
+        };
+        let object = envelope.context.public_key;
+        self.envelope = Some(envelope);
+        self.send_negotiation(ReplicationNegotiationResult::NeedAbeBlob(plan, object))
     }
 
     fn resolve_destination(&self) -> Result<ResolvedBackend, IncomingVersionError> {
@@ -1245,6 +1330,7 @@ impl IncomingVersionOperation {
             stream_id: self.stream_id,
             resolved,
             keep_alive: true,
+            object: self.envelope.as_ref().map(|e| e.context.public_key),
         })]
     }
 
@@ -1287,6 +1373,10 @@ impl IncomingVersionOperation {
         if let Effect::Storage(StorageEffect::BatchRead { reads, .. }) = &mut effect {
             let key = self.manifest.bucket.as_bytes().to_vec().into();
             reads.push((BUCKET_ENCRYPTION_KEYSPACE.to_string(), key));
+            // The envelope is published only under the parameters and epoch read here.
+            if let (Some(plan), Some(_)) = (self.seal_plan, &self.envelope) {
+                reads.extend(abe_reads(plan.key));
+            }
         }
         smallvec![effect]
     }
@@ -1819,6 +1909,21 @@ impl IncomingVersionOperation {
             Ok(effect) => effect,
             Err(err) => return self.fail(err.into()),
         };
+        // The envelope, its mappings and usage are published with the version they name.
+        if let (Some(envelope), Some(received)) = (&self.envelope, &self.received_blob) {
+            let rows = (
+                &self.manifest.metadata,
+                self.rocrate_limits.metadata_bytes,
+                self.txn_id,
+            );
+            match envelope_write(envelope, &version_key, &received.location, rows) {
+                Ok((write, charge)) => {
+                    self.envelope_bytes = charge;
+                    self.pending_version_effects.push_back(write);
+                }
+                Err(error) => return self.fail(BlobError::from(error).into()),
+            }
+        }
         if let Some(hash) = materialized_hash {
             let context = match self.alias_context() {
                 Ok(context) => context,
@@ -2003,10 +2108,14 @@ impl IncomingVersionOperation {
             ReplicationItemKind::Materialized => i128::from(self.incoming_logical_bytes()?),
             ReplicationItemKind::DeleteMarker => 0,
         };
+        let envelope = i128::from(self.envelope_bytes);
         Ok(UsageDelta {
             objects: self.object_delta,
-            logical_bytes: if self.is_reference_item() { 0 } else { bytes }
-                - i128::from(self.replaced_logical_bytes),
+            logical_bytes: if self.is_reference_item() {
+                0
+            } else {
+                bytes + envelope
+            } - i128::from(self.replaced_logical_bytes),
             referenced_bytes: if self.is_reference_item() { bytes } else { 0 }
                 - i128::from(self.replaced_reference_bytes),
             ..Default::default()
@@ -2052,7 +2161,8 @@ impl IncomingVersionOperation {
                 StorageError::TransactionNotFound,
             ));
         };
-        let quota_bytes = blob.size.saturating_sub(self.replaced_logical_bytes);
+        let quota_bytes = (blob.size.saturating_add(self.envelope_bytes))
+            .saturating_sub(self.replaced_logical_bytes);
         if let Some(ceiling) = self.quota_ceiling
             && quota_bytes > 0
         {
@@ -2732,7 +2842,8 @@ impl IncomingVersionOperation {
             }
             Some(
                 ReplicationNegotiationResult::NeedBlobVersion
-                | ReplicationNegotiationResult::NeedSealedBlob(_),
+                | ReplicationNegotiationResult::NeedSealedBlob(_)
+                | ReplicationNegotiationResult::NeedAbeBlob(..),
             ) => {
                 debug!(
                     bucket = %self.manifest.bucket,
@@ -2846,6 +2957,14 @@ impl IncomingVersionOperation {
                 received: event,
             });
         };
+        if let (Some(plan), Some(envelope)) = (self.seal_plan, &self.envelope) {
+            let abe = values.split_off(values.len().saturating_sub(2));
+            let anchored = parse_abe(&abe, plan.key)
+                .and_then(|(parameters, epoch)| envelope.anchored(&parameters, epoch));
+            if anchored.is_err() {
+                return self.fail(IncomingVersionError::StalePlan);
+            }
+        }
         let Some((_, settings)) = values.pop().filter(|_| values.len() == 2) else {
             return self.fail(PolicyGateError::InvalidEvent.into());
         };
@@ -3084,7 +3203,9 @@ impl IncomingVersionOperation {
     }
 
     fn accept_blob_version(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+        let (Event::Storage(StorageEvent::WriteResult { .. })
+        | Event::Storage(StorageEvent::BatchWriteResult { .. })) = event
+        else {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::WriteResult)",
