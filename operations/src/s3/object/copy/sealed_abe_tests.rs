@@ -512,17 +512,36 @@ async fn quota_counts_envelope() {
 
 #[tokio::test]
 async fn locked_unrepresentable_refused() {
-    // A locked copy to a path with too many prefixes for an envelope is refused, not left pending.
+    // A locked copy to a path no envelope can describe is refused, not left pending.
     let (_temp, context) = context();
     let storage = &context.storage_handle;
     let (sealed, source_id, _) = sealed(storage).await;
-    let dest = "a/".repeat(60);
-    let copy = copy_input(&sealed, (SOURCE, source_id), &dest);
-    let refused = run(SealedCopyOperation::new(copy), storage, None, Race::Off).await;
-    assert_eq!(
-        refused,
-        Err(SealedCopyError::Blob(BlobError::Abe(AbeError::Limit)))
-    );
-    let head = BlobHeadKey::new("bucket", &dest).to_bytes().unwrap();
-    assert!(get(storage, BLOB_HEAD_KEYSPACE, head).await.is_none());
+    // Too many prefixes, then 64 attributes whose ciphertext exceeds the byte limit.
+    let long = "a".repeat(906) + &"/a".repeat(59);
+    for (dest, error) in [("a/".repeat(60), AbeError::Limit), (long, AbeError::Crypto)] {
+        let copy = copy_input(&sealed, (SOURCE, source_id), &dest);
+        let refused = run(SealedCopyOperation::new(copy), storage, None, Race::Off).await;
+        assert_eq!(refused, Err(SealedCopyError::Blob(BlobError::Abe(error))));
+        let head = BlobHeadKey::new("bucket", &dest).to_bytes().unwrap();
+        assert!(get(storage, BLOB_HEAD_KEYSPACE, head).await.is_none());
+    }
+    for key_space in [ABE_COPY_KEYSPACE, BLOB_VERSIONS_KEYSPACE] {
+        let event = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: key_space.to_string(),
+                prefix: None,
+                start: None,
+                limit: 100,
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+            panic!("unexpected storage event: {event:?}");
+        };
+        // Only the source version remains.
+        assert_eq!(
+            values.len(),
+            usize::from(key_space == BLOB_VERSIONS_KEYSPACE)
+        );
+    }
 }
