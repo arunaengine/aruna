@@ -7,6 +7,7 @@ use crate::auth::permission_rules::{CollectedRole, PermissionRules};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
+use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::encryption::{BucketHolder, HolderOrigin, KeyState};
 use aruna_core::structs::storage::holders::admin_users;
@@ -27,7 +28,7 @@ impl KeyOperation {
         &mut self,
         values: Vec<(Key, Option<Value>)>,
     ) -> Result<(), KeyError> {
-        if !matches!(values.len(), 7 | 8) {
+        if !matches!(values.len(), 8 | 9) {
             return Err(AbeError::Context.into());
         }
         let bytes = |index: usize| values[index].1.as_deref().ok_or(KeyError::Missing);
@@ -62,6 +63,27 @@ impl KeyOperation {
             .map_err(|_| AbeError::Context)?
             .is_some_and(|h| h.user_id == self.auth.user_id && h.origin == HolderOrigin::Explicit);
         let recipient = self.recipient();
+        let user = values[7].1.as_deref().map(User::from_bytes).transpose();
+        let deactivated = user
+            .map_err(|_| AbeError::Context)?
+            .is_some_and(|u| u.is_deactivated());
+        let cut_off = self.token_credential().is_some_and(|key| {
+            let issued = Ulid::from_string(&key).map_or(0, |id| id.timestamp_ms() / 1000);
+            config
+                .user_cutoff(&recipient, self.now / 1000)
+                .is_some_and(|cutoff| issued < cutoff)
+        });
+        // A deactivated recipient or a credential issued before its user cutoff gets no new grant.
+        let issues = matches!(
+            self.action,
+            KeyAction::Request(_)
+                | KeyAction::Member(_)
+                | KeyAction::Token { .. }
+                | KeyAction::Publish(_)
+        );
+        if issues && (deactivated || cut_off) {
+            return Err(KeyError::Denied);
+        }
         let mut roles = realm.roles;
         roles.extend(group.roles.clone());
         let roles = roles
@@ -101,7 +123,7 @@ impl KeyOperation {
             holder: info.created_by == self.auth.user_id || admin || explicit,
             holders,
             policies,
-            due: values.get(7).is_some_and(|(_, v)| v.is_some()),
+            due: values.get(8).is_some_and(|(_, v)| v.is_some()),
         });
         Ok(())
     }
