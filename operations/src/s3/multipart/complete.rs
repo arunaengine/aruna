@@ -55,7 +55,7 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, TxnId};
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -1195,33 +1195,12 @@ impl CompleteUploadOperation {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
-        let (Some(plan), Some(location)) = (
-            self.upload_record
-                .as_ref()
-                .and_then(|upload| upload.encryption)
-                .map(|encryption| encryption.plan),
-            self.composed_location.clone(),
-        ) else {
+        let Some(location) = self.composed_location.clone() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
-        let Some(((_, pending), current)) = values.split_first() else {
-            return self.schedule_error(CompleteUploadError::InvalidOperationState);
-        };
-        let fenced = (|| {
-            let envelope = ObjectEnvelope::from_bytes(pending.as_deref().ok_or(AbeError::Stale)?)?;
-            let (parameters, epoch) = parse_abe(current, plan.key)?;
-            if parameters.realm_id != self.input.realm_id
-                || parameters.node_id != self.input.node_id
-                || envelope.context.object_key != self.input.key
-            {
-                return Err(AbeError::Context);
-            }
-            envelope.anchored(&parameters, epoch)?;
-            Ok(envelope)
-        })();
-        match fenced {
+        match self.pending_fence(&values) {
             Ok(envelope) => {
-                self.envelope = Some(envelope);
+                self.envelope = envelope;
                 self.fence_composed(&location)
             }
             Err(error) => {
@@ -1229,6 +1208,36 @@ impl CompleteUploadOperation {
                 self.schedule_error(BlobError::from(error).into())
             }
         }
+    }
+
+    /// Checks the pending envelope, then the parameters and epoch, as read in that order.
+    /// A generation without admitted parameters and envelope publishes bucket-only.
+    fn pending_fence(
+        &self,
+        values: &[(Key, Option<Value>)],
+    ) -> Result<Option<ObjectEnvelope>, AbeError> {
+        let plan = self
+            .upload_record
+            .as_ref()
+            .and_then(|upload| upload.encryption)
+            .ok_or(AbeError::Context)?
+            .plan;
+        let [(_, pending), current @ ..] = values else {
+            return Err(AbeError::Context);
+        };
+        if pending.is_none() && current.first().is_some_and(|(_, value)| value.is_none()) {
+            return Ok(None);
+        }
+        let envelope = ObjectEnvelope::from_bytes(pending.as_deref().ok_or(AbeError::Stale)?)?;
+        let (parameters, epoch) = parse_abe(current, plan.key)?;
+        if parameters.realm_id != self.input.realm_id
+            || parameters.node_id != self.input.node_id
+            || envelope.context.object_key != self.input.key
+        {
+            return Err(AbeError::Context);
+        }
+        envelope.anchored(&parameters, epoch)?;
+        Ok(Some(envelope))
     }
 
     fn fence_composed(&mut self, location: &BackendLocation) -> Effects {

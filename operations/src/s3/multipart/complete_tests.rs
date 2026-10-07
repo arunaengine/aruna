@@ -1810,8 +1810,33 @@ fn stale_epoch_reclaims() {
 }
 
 #[test]
+fn bucket_only_publishes() {
+    // A generation without admitted parameters completes without an envelope.
+    let (mut operation, location) = sealed_operation(&[b"first"]);
+    operation.txn_id = Some(Ulid::from_parts(4, 4));
+    operation.composed_location = Some(location);
+    operation.state = CompleteUploadState::FenceAbe;
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (b"pending".to_vec().into(), None),
+            (b"p".to_vec().into(), None),
+            (b"e".to_vec().into(), None),
+        ],
+    }));
+    assert!(
+        !matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ),
+        "{effects:?}"
+    );
+    assert!(operation.envelope.is_none());
+    assert!(operation.cleanup.take_error().is_none());
+}
+
+#[test]
 fn missing_envelope_refused() {
-    // An encrypted upload without its pending envelope never publishes.
+    // An upload of a generation with admitted parameters never publishes without its envelope.
     let mut operation = abe_fenced(false, 1);
     assert!(!operation.reclaim_pending);
     assert!(matches!(

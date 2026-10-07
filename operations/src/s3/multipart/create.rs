@@ -258,6 +258,13 @@ impl CreateMultipartOperation {
         let Some(plan) = self.encryption.map(|encryption| encryption.plan) else {
             return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
+        // A generation without admitted parameters keeps bucket-only pieces.
+        if values
+            .first()
+            .is_some_and(|(_, parameters)| parameters.is_none())
+        {
+            return self.start_transaction();
+        }
         let (parameters, epoch) = match parse_abe(&values, plan.key) {
             Ok(parsed) => parsed,
             Err(error) => return self.emit_error(BlobError::from(error).into()),
@@ -954,6 +961,38 @@ mod pure_tests {
         assert_eq!(envelope.context.epoch, 1);
         let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
             key: key.clone(),
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        );
+    }
+
+    #[test]
+    fn bucket_only_upload() {
+        // A generation without admitted parameters commits its record without an envelope.
+        let (settings, _) = sealed_settings();
+        let (mut operation, _) = sealed_create(None);
+        let effects = operation.step(fence_clear());
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+            panic!("expected the ABE read, got {effects:?}")
+        };
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: reads.iter().map(|(_, key)| (key.clone(), None)).collect(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+        let txn_id = TxnId::from_bytes([3u8; 16]);
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(fence_clear());
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(settings.to_bytes().unwrap().into()),
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"upload".to_vec().into(),
         }));
         assert_eq!(
             effects.as_slice(),

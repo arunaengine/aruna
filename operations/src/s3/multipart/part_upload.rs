@@ -270,7 +270,7 @@ impl UploadPartOperation {
             return self.emit_error(UploadPartError::MissingBody);
         };
         if let Some(encryption) = record.encryption {
-            // Without a pending envelope the piece goes to the bucket key only; completion refuses.
+            // Without a pending envelope the piece goes to the bucket key only.
             match pending.map(|value| ObjectEnvelope::from_bytes(value.as_ref())) {
                 Some(Ok(envelope)) => self.object = Some(envelope.context.public_key),
                 Some(Err(error)) => {
