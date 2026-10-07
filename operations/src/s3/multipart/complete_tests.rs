@@ -1184,7 +1184,7 @@ fn omitted_parts_deleted() {
     let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice() else {
         panic!("expected batch delete effect");
     };
-    assert_eq!(deletes.len(), 3);
+    assert_eq!(deletes.len(), 4);
     let omitted_key = MultipartPartKey::new(op.input.upload_id, 2)
         .to_bytes()
         .unwrap();
@@ -1729,6 +1729,132 @@ fn sealed_rotation_refused() {
     assert!(matches!(
         operation.cleanup.take_error(),
         Some(CompleteUploadError::BucketKey(_))
+    ));
+    assert!(operation.reclaim_pending);
+}
+
+/// Answers the envelope fence of a sealed completion; `pending` stores an epoch 1 envelope.
+fn abe_fenced(pending: bool, epoch: u64) -> CompleteUploadOperation {
+    use aruna_core::structs::storage::abe::{EnvelopePlan, create_envelope, create_parameters};
+    let (mut operation, location) = sealed_operation(&[b"first"]);
+    operation.txn_id = Some(Ulid::from_parts(4, 4));
+    operation.composed_location = Some(location);
+    let input = &operation.input;
+    let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
+    let key = sealed_plan().key;
+    let parameters = create_parameters(&secret, input.realm_id, input.node_id, key).unwrap();
+    let (envelope, _) = create_envelope(EnvelopePlan {
+        parameters: parameters.clone(),
+        epoch: 1,
+        write_id: Ulid::from_parts(6, 6),
+        object_key: input.key.clone(),
+        bucket_public: [3; 32],
+    })
+    .unwrap();
+    let row = pending.then(|| envelope.to_bytes().unwrap().into());
+    operation.state = CompleteUploadState::FenceAbe;
+    operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (b"pending".to_vec().into(), row),
+            (
+                b"p".to_vec().into(),
+                Some(parameters.to_bytes().unwrap().into()),
+            ),
+            (
+                b"e".to_vec().into(),
+                Some(epoch.to_be_bytes().to_vec().into()),
+            ),
+        ],
+    }));
+    operation
+}
+
+#[test]
+fn stale_epoch_reclaims() {
+    // A raised epoch refuses the completion; the record reset also deletes the pending envelope.
+    let mut operation = abe_fenced(true, 2);
+    assert!(operation.reclaim_pending);
+    operation.step(Event::Storage(StorageEvent::TransactionAborted {
+        txn_id: Ulid::from_parts(4, 4),
+    }));
+    let txn_id = Ulid::from_parts(4, 5);
+    operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    let mut record = operation.upload_record.clone().unwrap();
+    record.status = MultipartUploadStatus::Completing;
+    record.completing_since_ms = Some(TEST_NOW_MS);
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"upload".to_vec().into(),
+        value: Some(record.to_bytes().unwrap().into()),
+    }));
+    let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: b"upload".to_vec().into(),
+    }));
+    let [Effect::Storage(StorageEffect::Delete { key_space, key, .. })] = effects.as_slice() else {
+        panic!("expected the pending envelope delete, got {effects:?}")
+    };
+    assert_eq!(key_space, ABE_PENDING_KEYSPACE);
+    assert_eq!(key.as_ref(), operation.input.upload_id.to_bytes());
+    let effects = operation.step(Event::Storage(StorageEvent::DeleteResult {
+        key: key.clone(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit })] if *commit == txn_id
+    ));
+    assert!(matches!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::BlobError(BlobError::Abe(
+            AbeError::Epoch
+        )))
+    ));
+}
+
+#[test]
+fn missing_envelope_refused() {
+    // An encrypted upload without its pending envelope never publishes.
+    let mut operation = abe_fenced(false, 1);
+    assert!(!operation.reclaim_pending);
+    assert!(matches!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::BlobError(BlobError::Abe(
+            AbeError::Stale
+        )))
+    ));
+}
+
+#[test]
+fn envelope_publishes_charged() {
+    // A current envelope is published with the version and charged to the group.
+    let mut operation = abe_fenced(true, 1);
+    assert!(operation.envelope.is_some());
+    let location = operation.composed_location.clone().unwrap();
+    operation.final_location = Some(location);
+    operation.version_id = Some(Ulid::from_parts(5, 1));
+    operation.state = CompleteUploadState::WriteVersionRecord;
+    let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: b"version".to_vec().into(),
+    }));
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice() else {
+        panic!("expected the envelope rows, got {effects:?}")
+    };
+    assert_eq!(*txn_id, operation.txn_id);
+    let spaces: Vec<_> = writes.iter().map(|(space, ..)| space.as_str()).collect();
+    assert_eq!(
+        spaces,
+        [
+            aruna_core::keyspaces::ABE_ENVELOPE_KEYSPACE,
+            aruna_core::keyspaces::ABE_VERSION_KEYSPACE,
+            aruna_core::keyspaces::ABE_ARCHIVE_KEYSPACE,
+        ]
+    );
+    assert!(operation.envelope_bytes > 0);
+    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Write { key_space, .. })]
+            if key_space == aruna_core::keyspaces::COPY_OWNER_KEYSPACE
     ));
 }
 

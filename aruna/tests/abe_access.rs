@@ -19,6 +19,7 @@ use aruna_core::structs::storage::blob::{bucket_permission_path, group_permissio
 use aruna_core::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
 use aruna_kpabe::{Attribute, Envelope, Policy, UserKey};
 use aruna_operations::abe::{KeyAction, KeyError, KeyOperation, MemberKeysOperation};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -134,8 +135,18 @@ async fn abe_read() -> TestResult<()> {
         let version = upload.version_id().unwrap().to_string();
         let other = s3.put_object().bucket(BUCKET).key("foobar/data").body(b"other bytes".to_vec().into()).send().await?;
         let other_version = other.version_id().unwrap().to_string();
+        let multi = s3.create_multipart_upload().bucket(BUCKET).key("foo/multi").send().await?;
+        let upload_id = multi.upload_id().unwrap();
+        let part = s3.upload_part().bucket(BUCKET).key("foo/multi").upload_id(upload_id).part_number(1)
+            .body(b"multipart bytes".to_vec().into()).send().await?;
         let response = client.post(format!("{encryption}/lock")).bearer_auth(&token).send().await?;
         assert!(response.status().is_success());
+        // The upload's envelope was made at create, so it completes without any private key.
+        let parts = CompletedMultipartUpload::builder().parts(CompletedPart::builder().part_number(1)
+            .e_tag(part.e_tag().unwrap()).build()).build();
+        let completed = s3.complete_multipart_upload().bucket(BUCKET).key("foo/multi").upload_id(upload_id)
+            .multipart_upload(parts).send().await?;
+        let multi_version = completed.version_id().unwrap().to_string();
         let request_route = format!("{}/api/v1/data/buckets/{BUCKET}/abe/requests",seed.base_url);
         let response = client.post(&request_route).bearer_auth(&token)
             .json(&json!({"scope":{"kind":"subtree","value":"foo/"}})).send().await?;
@@ -190,6 +201,16 @@ async fn abe_read() -> TestResult<()> {
         assert_eq!(response.status(),StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.headers()["content-range"],"bytes 1-5/12");
         assert_eq!(response.bytes().await?.as_ref(),b"coped");
+        let multi_query = [("bucket",BUCKET),("key","foo/multi"),("version_id",&multi_version)];
+        let response = client.get(query_url(&envelope_route,&multi_query)?).bearer_auth(&token).send().await?;
+        let status = response.status(); let env: Value = response.json().await?;
+        assert_eq!(status,StatusCode::OK,"{env}");
+        let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
+        let multi_key = aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
+        let response = client.get(query_url(&content_route,&multi_query)?).bearer_auth(&token)
+            .header("x-aruna-object-key",STANDARD.encode(multi_key.as_bytes())).send().await?;
+        assert_eq!(response.status(),StatusCode::OK);
+        assert_eq!(response.bytes().await?.as_ref(),b"multipart bytes");
         let wrong_query = [("bucket",BUCKET),("key","foobar/data"),("version_id",&other_version)];
         let response = client.get(query_url(&content_route,&wrong_query)?).bearer_auth(&token)
             .header("x-aruna-object-key",&object_header).send().await?;
