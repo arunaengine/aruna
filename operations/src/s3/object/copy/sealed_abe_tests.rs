@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE};
 use aruna_core::structs::storage::abe::{
     EnvelopeArchive, EnvelopePlan, copy_envelope, create_envelope, create_parameters,
 };
-use aruna_core::structs::storage::encryption::public_key_of;
+use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode, public_key_of};
 
 struct Sealed {
     secret: SecretBytes,
@@ -31,6 +31,32 @@ async fn set_epoch(storage: &StorageHandle, location: &BackendLocation, epoch: u
     .await;
 }
 
+/// Makes `generation` the bucket's active key generation.
+async fn set_generation(storage: &StorageHandle, location: &BackendLocation, generation: u64) {
+    let settings = BucketEncryption {
+        mode: EncryptionMode::VaultLocked,
+        bucket_id: Some(location.format.bucket_key().unwrap().bucket_id),
+        key_generation: generation,
+        ..Default::default()
+    };
+    let value = settings.to_bytes().unwrap();
+    put(
+        storage,
+        BUCKET_ENCRYPTION_KEYSPACE,
+        b"bucket".to_vec(),
+        value,
+    )
+    .await;
+}
+
+/// What changes while an envelope is made, before the publishing transaction.
+#[derive(Clone, Copy, PartialEq)]
+enum Race {
+    Off,
+    Epoch,
+    Generation,
+}
+
 /// Admits parameters at epoch 1 and seeds the source version with its complete envelope.
 async fn sealed(storage: &StorageHandle) -> (Sealed, Ulid, ObjectEnvelope) {
     let location = sealed_location();
@@ -47,6 +73,7 @@ async fn sealed(storage: &StorageHandle) -> (Sealed, Ulid, ObjectEnvelope) {
     )
     .await;
     set_epoch(storage, &location, 1).await;
+    set_generation(storage, &location, 1).await;
     let info = BucketInfo {
         group_id: base.group_id,
         created_at: SystemTime::UNIX_EPOCH,
@@ -96,12 +123,11 @@ async fn sealed(storage: &StorageHandle) -> (Sealed, Ulid, ObjectEnvelope) {
 }
 
 /// Runs storage effects on `storage` and answers copy envelopes as an unlocked or locked node.
-/// `raise` raises the epoch while the envelope is made, before the publishing transaction.
 async fn run<O: Operation>(
     mut operation: O,
     storage: &StorageHandle,
     unlocked: Option<&Sealed>,
-    raise: bool,
+    race: Race,
 ) -> Result<O::Output, O::Error> {
     let mut effects: Vec<Effect> = operation.start().into_iter().collect();
     while !operation.is_complete() {
@@ -118,8 +144,14 @@ async fn run<O: Operation>(
                 else {
                     panic!("unexpected ABE effect")
                 };
-                if raise && let Some(sealed) = unlocked {
-                    set_epoch(storage, &sealed.location, epoch + 1).await;
+                match (race, unlocked) {
+                    (Race::Epoch, Some(sealed)) => {
+                        set_epoch(storage, &sealed.location, epoch + 1).await
+                    }
+                    (Race::Generation, Some(sealed)) => {
+                        set_generation(storage, &sealed.location, 2).await
+                    }
+                    _ => {}
                 }
                 Event::Blob(match unlocked {
                     Some(sealed) => {
@@ -158,7 +190,7 @@ async fn envelope_of(
     version_id: Ulid,
 ) -> Result<(ObjectEnvelope, EnvelopeArchive), AbeError> {
     let operation = EnvelopeOperation::new("bucket".to_string(), key.to_string(), version_id);
-    run(operation, storage, None, false).await
+    run(operation, storage, None, Race::Off).await
 }
 
 async fn pending_row(storage: &StorageHandle, key: &str, version_id: Ulid) -> Option<Vec<u8>> {
@@ -171,13 +203,13 @@ async fn complete(
     key: &str,
     version_id: Ulid,
     unlocked: Option<&Sealed>,
-    raise: bool,
+    race: Race,
 ) -> Result<CopyOutcome, AbeError> {
     let row = pending_row(storage, key, version_id).await.unwrap();
     let pending = PendingCopy::from_bytes(&row).unwrap();
     let version = VersionKey::new("bucket", key, version_id);
     let operation = CopyEnvelopeOperation::new(version, row, pending);
-    run(operation, storage, unlocked, raise).await
+    run(operation, storage, unlocked, race).await
 }
 
 #[tokio::test]
@@ -191,7 +223,7 @@ async fn unlocked_copy_envelope() {
         SealedCopyOperation::new(copy),
         storage,
         Some(&sealed),
-        false,
+        Race::Off,
     )
     .await
     .unwrap();
@@ -217,7 +249,7 @@ async fn locked_copy_pending() {
     let storage = &context.storage_handle;
     let (sealed, source_id, source) = sealed(storage).await;
     let copy = copy_input(&sealed, (SOURCE, source_id), "copy");
-    let result = run(SealedCopyOperation::new(copy), storage, None, false)
+    let result = run(SealedCopyOperation::new(copy), storage, None, Race::Off)
         .await
         .unwrap();
     let version_id = result.version_id;
@@ -225,9 +257,9 @@ async fn locked_copy_pending() {
         envelope_of(storage, "copy", version_id).await,
         Err(AbeError::Pending)
     );
-    let outcome = complete(storage, "copy", version_id, None, false).await;
+    let outcome = complete(storage, "copy", version_id, None, Race::Off).await;
     assert_eq!(outcome, Ok(CopyOutcome::Locked));
-    let outcome = complete(storage, "copy", version_id, Some(&sealed), false).await;
+    let outcome = complete(storage, "copy", version_id, Some(&sealed), Race::Off).await;
     assert_eq!(outcome, Ok(CopyOutcome::Completed));
     let (envelope, _) = envelope_of(storage, "copy", version_id).await.unwrap();
     assert_eq!(envelope.context.object_key, "copy");
@@ -242,12 +274,12 @@ async fn pending_chain_completes() {
     let storage = &context.storage_handle;
     let (sealed, a, source) = sealed(storage).await;
     let copy = copy_input(&sealed, (SOURCE, a), "b");
-    let b = run(SealedCopyOperation::new(copy), storage, None, false)
+    let b = run(SealedCopyOperation::new(copy), storage, None, Race::Off)
         .await
         .unwrap()
         .version_id;
     let copy = copy_input(&sealed, ("b", b), "c");
-    let c = run(SealedCopyOperation::new(copy), storage, None, false)
+    let c = run(SealedCopyOperation::new(copy), storage, None, Race::Off)
         .await
         .unwrap()
         .version_id;
@@ -272,7 +304,7 @@ async fn pending_chain_completes() {
         txn_id: None,
     };
     storage.send_storage_effect(effect).await;
-    let outcome = complete(storage, "c", c, Some(&sealed), false).await;
+    let outcome = complete(storage, "c", c, Some(&sealed), Race::Off).await;
     assert_eq!(outcome, Ok(CopyOutcome::Completed));
     let (envelope, _) = envelope_of(storage, "c", c).await.unwrap();
     assert_eq!(envelope.context.object_key, "c");
@@ -285,7 +317,13 @@ async fn stale_epoch_refused() {
     let storage = &context.storage_handle;
     let (sealed, source_id, _) = sealed(storage).await;
     let copy = copy_input(&sealed, (SOURCE, source_id), "copy");
-    let refused = run(SealedCopyOperation::new(copy), storage, Some(&sealed), true).await;
+    let refused = run(
+        SealedCopyOperation::new(copy),
+        storage,
+        Some(&sealed),
+        Race::Epoch,
+    )
+    .await;
     assert_eq!(
         refused,
         Err(SealedCopyError::Blob(BlobError::Abe(AbeError::Epoch)))
@@ -293,11 +331,37 @@ async fn stale_epoch_refused() {
     let head = BlobHeadKey::new("bucket", "copy").to_bytes().unwrap();
     assert!(get(storage, BLOB_HEAD_KEYSPACE, head).await.is_none());
     let copy = copy_input(&sealed, (SOURCE, source_id), "copy");
-    let version_id = run(SealedCopyOperation::new(copy), storage, None, false)
+    let version_id = run(SealedCopyOperation::new(copy), storage, None, Race::Off)
         .await
         .unwrap()
         .version_id;
-    let outcome = complete(storage, "copy", version_id, Some(&sealed), true).await;
+    let outcome = complete(storage, "copy", version_id, Some(&sealed), Race::Epoch).await;
     assert_eq!(outcome, Err(AbeError::Epoch));
+    assert!(pending_row(storage, "copy", version_id).await.is_some());
+}
+
+#[tokio::test]
+async fn stale_generation_refused() {
+    // A rotation between making the envelope and publishing it refuses copy and completion.
+    let (_temp, context) = context();
+    let storage = &context.storage_handle;
+    let (sealed, source_id, _) = sealed(storage).await;
+    let copy = copy_input(&sealed, (SOURCE, source_id), "copy");
+    let race = Race::Generation;
+    let refused = run(SealedCopyOperation::new(copy), storage, Some(&sealed), race).await;
+    assert_eq!(
+        refused,
+        Err(SealedCopyError::Blob(BlobError::Abe(AbeError::Parameters)))
+    );
+    let head = BlobHeadKey::new("bucket", "copy").to_bytes().unwrap();
+    assert!(get(storage, BLOB_HEAD_KEYSPACE, head).await.is_none());
+    set_generation(storage, &sealed.location, 1).await;
+    let copy = copy_input(&sealed, (SOURCE, source_id), "copy");
+    let version_id = run(SealedCopyOperation::new(copy), storage, None, Race::Off)
+        .await
+        .unwrap()
+        .version_id;
+    let outcome = complete(storage, "copy", version_id, Some(&sealed), race).await;
+    assert_eq!(outcome, Err(AbeError::Parameters));
     assert!(pending_row(storage, "copy", version_id).await.is_some());
 }

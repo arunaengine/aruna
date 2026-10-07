@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::abe::copies::still_active;
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, owner_write_effect, write_head_effect, write_version_effect,
@@ -21,7 +22,7 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -540,9 +541,12 @@ impl SealedCopyOperation {
         let Some(envelope) = &self.envelope else {
             return self.register();
         };
+        let bucket = self.input.bucket.as_bytes().to_vec();
+        let mut reads = vec![(BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.into())];
+        reads.extend(abe_reads(envelope.context.parameters.key));
         self.step = Step::FenceAbe;
         Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: abe_reads(envelope.context.parameters.key),
+            reads,
             txn_id: self.txn_id,
         })])
     }
@@ -552,12 +556,16 @@ impl SealedCopyOperation {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return Err(SealedCopyError::InvalidState);
         };
+        let [(_, settings), anchors @ ..] = values.as_slice() else {
+            return Err(SealedCopyError::InvalidState);
+        };
         let envelope = self
             .envelope
             .as_ref()
             .ok_or(SealedCopyError::InvalidState)?;
-        let (parameters, epoch) =
-            parse_abe(&values, envelope.context.parameters.key).map_err(abe)?;
+        let key = envelope.context.parameters.key;
+        still_active(settings.as_deref(), key).map_err(abe)?;
+        let (parameters, epoch) = parse_abe(anchors, key).map_err(abe)?;
         envelope.anchored(&parameters, epoch).map_err(abe)?;
         let version = self.version.as_ref().ok_or(SealedCopyError::InvalidState)?;
         let limit = RoCrateLimits::default().metadata_bytes;

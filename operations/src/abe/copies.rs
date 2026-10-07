@@ -9,14 +9,16 @@ use crate::s3::object::put::abe::{abe_reads, envelope_rows, parse_abe};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{ABE_COPY_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    ABE_COPY_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::storage::abe::{
     AbeEffect, AbeError, AbeEvent, EnvelopeArchive, ObjectEnvelope, PendingCopy,
 };
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, BucketInfo, VersionKey};
-use aruna_core::structs::storage::encryption::BucketKeyRef;
+use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRef};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -107,7 +109,14 @@ impl CopyEnvelopeOperation {
     }
 
     fn checked(&mut self, values: &[(Key, Option<Value>)]) -> Effects {
-        let [(_, row), (_, version), (_, bucket), anchors @ ..] = values else {
+        let [
+            (_, row),
+            (_, version),
+            (_, bucket),
+            (_, settings),
+            anchors @ ..,
+        ] = values
+        else {
             return self.finish(Err(AbeError::Context));
         };
         let version = version.as_deref().map(BlobVersion::from_bytes).transpose();
@@ -120,6 +129,7 @@ impl CopyEnvelopeOperation {
         let result = (|| {
             let bucket = bucket.as_deref().ok_or(AbeError::Missing)?;
             let bucket = BucketInfo::from_bytes(bucket).map_err(|_| AbeError::Context)?;
+            still_active(settings.as_deref(), self.key())?;
             let (parameters, epoch) = parse_abe(anchors, self.key())?;
             let envelope = self.envelope.as_ref().ok_or(AbeError::Context)?;
             envelope.anchored(&parameters, epoch)?;
@@ -196,7 +206,8 @@ impl Operation for CopyEnvelopeOperation {
                 let mut reads = vec![
                     (ABE_COPY_KEYSPACE.to_string(), version.clone().into()),
                     (BLOB_VERSIONS_KEYSPACE.to_string(), version.into()),
-                    (S3_BUCKET_KEYSPACE.to_string(), bucket.into()),
+                    (S3_BUCKET_KEYSPACE.to_string(), bucket.clone().into()),
+                    (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.into()),
                 ];
                 reads.extend(abe_reads(self.key()));
                 self.state = State::Check;
@@ -263,6 +274,15 @@ impl Operation for CopyEnvelopeOperation {
         self.txn.take().map_or_else(Effects::new, |txn_id| {
             smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         })
+    }
+}
+
+/// Fails unless the bucket settings `row` still seal new writes to `key`.
+pub(crate) fn still_active(row: Option<&[u8]>, key: BucketKeyRef) -> Result<(), AbeError> {
+    let settings = BucketEncryption::from_row(row).map_err(|_| AbeError::Context)?;
+    match settings.active_key() == Some(key) {
+        true => Ok(()),
+        false => Err(AbeError::Parameters),
     }
 }
 
