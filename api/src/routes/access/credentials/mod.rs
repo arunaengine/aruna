@@ -532,8 +532,8 @@ WRITE on the group the credential is bound to is deliberately not enough.
 
 **Behavior**
 - Only credentials held by the node that serves the request can be revoked here.
-- The record is not deleted: it keeps appearing in the owner's listing with a revocation timestamp
-  and the `revoked` status, and the node stops accepting the key for new S3 requests."#,
+- Revoking deletes the credential record, its owner index entry and its token key requests and
+  grants. It no longer appears in the owner's listing, and the node refuses the key for new S3 requests."#,
     params(("access_key_id" = String, Path, description = "Access key id of the credential to revoke, as returned when it was created or listed")),
     responses(
         (status = 204, description = "Credential revoked"),
