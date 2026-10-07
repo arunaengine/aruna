@@ -248,6 +248,8 @@ pub enum BlobEffect {
         lease: Option<Box<ReadLease>>,
         target: Box<ResolvedBackend>,
         grants_only: bool,
+        /// A new object public key, a second recipient of the sealed copy.
+        object: Option<Box<[u8; 32]>>,
     },
     /// Seals one part of an encrypted upload as a Pithos piece with the plan in `resolved`.
     /// The piece records a content tree at `content_offset` when one is given.

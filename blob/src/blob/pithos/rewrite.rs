@@ -79,7 +79,7 @@ impl AsyncArchiveSource for StoredBytes {
 impl BlobHandler {
     /// Writes `source` again in the format of `target` and answers the new copy, whose
     /// reservation stays held. `grants_only` keeps the sealed blocks and grants them to the
-    /// target key; otherwise the copy is decoded and encoded again.
+    /// target key; otherwise the copy is decoded and encoded again. `object` also gets grants.
     pub(in crate::blob) async fn rewrite_copy(
         &self,
         bucket: &str,
@@ -87,13 +87,18 @@ impl BlobHandler {
         source: BackendLocation,
         lease: Option<ReadLease>,
         target: ResolvedBackend,
-        grants_only: bool,
+        (grants_only, object): (bool, Option<[u8; 32]>),
     ) -> BlobEvent {
+        let lease_ref = lease.as_ref();
         let result = match grants_only {
             true => {
-                Box::pin(self.replace_grants(bucket, key, &source, lease.as_ref(), target)).await
+                let replace =
+                    self.replace_grants(bucket, key, &source, lease_ref, (target, object));
+                Box::pin(replace).await
             }
-            false => Box::pin(self.reencode(bucket, key, source, lease.as_ref(), target)).await,
+            false => {
+                Box::pin(self.reencode(bucket, key, source, lease_ref, (target, object))).await
+            }
         };
         // The lease keeps the source key and archive until the new copy is written.
         drop(lease);
@@ -106,7 +111,7 @@ impl BlobHandler {
         key: &str,
         source: BackendLocation,
         lease: Option<&ReadLease>,
-        target: ResolvedBackend,
+        (target, object): (ResolvedBackend, Option<[u8; 32]>),
     ) -> Result<BlobEvent, BlobError> {
         // One reservation covers the read and the write, so two rewrites never wait half-held.
         // Work above the node budget is refused, never clipped to fit.
@@ -147,8 +152,9 @@ impl BlobHandler {
         let reserved = target.encryption.and_then(|_| permit.take());
         let size = Some(source.blob_size);
         let created_by = source.created_by;
+        let grants = (reserved, object);
         let written =
-            self.write_reserved_blob((bucket, key), target, created_by, plain, size, reserved);
+            self.write_granted_blob((bucket, key), target, created_by, plain, size, grants);
         let event = Box::pin(written).await;
         drop(permit);
         Ok(match event {
@@ -198,7 +204,7 @@ impl BlobHandler {
         key: &str,
         source: &BackendLocation,
         lease: Option<&ReadLease>,
-        target: ResolvedBackend,
+        (target, object): (ResolvedBackend, Option<[u8; 32]>),
     ) -> Result<BlobEvent, BlobError> {
         let (StoredLayout::Pithos(layout), Some(plan)) = (&source.format.layout, target.encryption)
         else {
@@ -227,7 +233,14 @@ impl BlobHandler {
         let recipient = PublicKey::from_raw(plan.public_key).map_err(|error| {
             BlobError::WriteError(format!("invalid bucket public key: {error}"))
         })?;
-        let replacement = view.replace_grants(&directory, vec![recipient]);
+        let mut recipients = vec![recipient];
+        if let Some(object) = object {
+            let object = PublicKey::from_raw(object).map_err(|error| {
+                BlobError::WriteError(format!("invalid object public key: {error}"))
+            })?;
+            recipients.push(object);
+        }
+        let replacement = view.replace_grants(&directory, recipients);
         let replacement = replacement.map_err(integrity)?;
         let new_layout = PithosLayout {
             stored_size: replacement.archive_len(),

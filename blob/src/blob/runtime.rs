@@ -813,9 +813,17 @@ impl BlobHandler {
                 lease,
                 target,
                 grants_only,
+                object,
             } => {
                 let (lease, target) = (lease.map(|lease| *lease), *target);
-                let rewrite = self.rewrite_copy(&bucket, &key, source, lease, target, grants_only);
+                let rewrite = self.rewrite_copy(
+                    &bucket,
+                    &key,
+                    source,
+                    lease,
+                    target,
+                    (grants_only, object.map(|key| *key)),
+                );
                 Box::pin(rewrite).await
             }
             BlobEffect::ReadUnlockedKey { key } => self.read_unlocked(key),

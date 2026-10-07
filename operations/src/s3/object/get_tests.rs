@@ -2542,6 +2542,7 @@ mod token_read {
             lease: None,
             target: Box::new(ResolvedBackend::node_default().with_encryption(Some(plan))),
             grants_only: false,
+            object: None,
         };
         let Event::Blob(BlobEvent::CopyRewritten {
             location: mut sealed,

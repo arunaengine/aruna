@@ -32,6 +32,7 @@ impl RewriteVersionOperation {
         };
         let new = self.new.clone().ok_or(RewriteError::NotFinished)?;
         let old_key = old.location_key()?;
+        let (version, mut stored) = (version.clone(), None);
         let mut writes = Vec::new();
         let published = match existing {
             Some(value) => {
@@ -46,9 +47,8 @@ impl RewriteVersionOperation {
                     new.to_bytes()?.into(),
                 ));
                 self.owns_row = true;
-                let delta =
-                    StoredDelta::for_location(&new, true).ok_or(RewriteError::NotFinished)?;
-                self.usage = Some(UsageCounterUpdate::for_stored(delta));
+                stored =
+                    Some(StoredDelta::for_location(&new, true).ok_or(RewriteError::NotFinished)?);
                 new
             }
         };
@@ -60,7 +60,10 @@ impl RewriteVersionOperation {
                 Vec::new().into(),
             ));
         }
-        let mut moved = version.clone();
+        let (envelope, added) = self.envelope_writes(&published, &version.metadata)?;
+        writes.extend(envelope);
+        self.usage = self.usage_with(stored, added);
+        let mut moved = version;
         if let BlobVersionState::Materialized { encoding, .. } = &mut moved.state {
             *encoding = published.format.encoding();
         }
@@ -109,7 +112,7 @@ impl RewriteVersionOperation {
             .as_ref()
             .filter(|old| old.format.bucket_key().is_some());
         let Some(old) = sealed else {
-            return self.update_usage();
+            return self.drop_envelope();
         };
         let owner = CopyOwner::new(ArchiveKey::of(old), self.version_key.clone());
         match owner_delete_effect(&owner, self.txn_id) {

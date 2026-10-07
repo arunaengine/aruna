@@ -16,14 +16,17 @@ use aruna_core::keyspaces::{
     TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::storage::abe::ObjectEnvelope;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobVersion, BlobVersionState, CopyOwner, ManagedCopyKey,
     ManagedCopyRecord, ResolvedBackend, VersionKey,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
-use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, ReadLease};
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
+};
 use aruna_core::structs::storage::transition::{EncryptionTransition, TransitionKind, cleanup_key};
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -33,6 +36,8 @@ pub enum RewriteState {
     Init,
     ReadVersion,
     ReadLocation,
+    ReadEnvelope,
+    CreateEnvelope,
     Admit,
     Rewrite,
     StartTransaction,
@@ -42,6 +47,7 @@ pub enum RewriteState {
     ReadTarget,
     WriteRows,
     DropOwner,
+    DropEnvelope,
     UpdateUsage,
     Commit,
     Abort,
@@ -99,6 +105,13 @@ pub struct RewriteVersionOperation {
     copy: Option<ManagedCopyRecord>,
     owns_row: bool,
     usage: Option<UsageCounterUpdate>,
+    /// The version's envelope rows read before the rewrite, when the transition moves them.
+    envelope_rows: Option<abe::EnvelopeRows>,
+    /// The new envelope around the new object key of a new generation.
+    envelope: Option<ObjectEnvelope>,
+    /// The bucket's group and the usage charge of the replaced envelope rows.
+    charge: Option<(GroupId, u64)>,
+    deletes: Vec<(String, Key)>,
     output: Option<Result<RewriteOutcome, RewriteError>>,
 }
 
@@ -117,6 +130,10 @@ impl RewriteVersionOperation {
             copy: None,
             owns_row: false,
             usage: None,
+            envelope_rows: None,
+            envelope: None,
+            charge: None,
+            deletes: Vec::new(),
             output: None,
         }
     }
@@ -216,10 +233,18 @@ impl RewriteVersionOperation {
         }
         let source = old.format.bucket_key();
         let archive = ArchiveKey::of(&old);
+        let moves = source.is_some() && self.transition.target.plan.map(|p| p.key) != source;
         self.old = Some(old);
         let Some(key) = source else {
             return self.rewrite();
         };
+        if moves {
+            return self.read_envelope();
+        }
+        self.admit(key, archive)
+    }
+
+    fn admit(&mut self, key: BucketKeyRef, archive: ArchiveKey) -> Effects {
         self.state = RewriteState::Admit;
         smallvec![Effect::Blob(BlobEffect::AdmitRead { key, archive })]
     }
@@ -256,6 +281,10 @@ impl RewriteVersionOperation {
             lease: self.lease.take().map(Box::new),
             target: Box::new(resolved),
             grants_only: sealed && self.transition.kind == TransitionKind::Rotate,
+            object: self
+                .envelope
+                .as_ref()
+                .map(|envelope| Box::new(envelope.context.public_key)),
         })]
     }
 
@@ -288,11 +317,16 @@ impl RewriteVersionOperation {
         self.txn_id = Some(txn_id);
         self.state = RewriteState::ReadSettings;
         let bucket: Key = self.version_key.bucket.as_bytes().to_vec().into();
+        let mut reads = vec![
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.clone()),
+            (TRANSITION_KEYSPACE.to_string(), bucket),
+        ];
+        match self.envelope_reads() {
+            Ok(envelope) => reads.extend(envelope),
+            Err(error) => return self.fail(error),
+        }
         smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.clone()),
-                (TRANSITION_KEYSPACE.to_string(), bucket),
-            ],
+            reads,
             txn_id: Some(txn_id),
         })]
     }
@@ -303,8 +337,7 @@ impl RewriteVersionOperation {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected(event);
         };
-        let rows: Vec<Option<Value>> = values.into_iter().map(|(_, value)| value).collect();
-        let [settings, transition] = rows.as_slice() else {
+        let Some(([(_, settings), (_, transition)], envelope)) = values.split_first_chunk() else {
             return self.fail(RewriteError::NotFinished);
         };
         let settings = BucketEncryption::from_row(settings.as_ref().map(|row| row.as_ref()));
@@ -322,6 +355,11 @@ impl RewriteVersionOperation {
         };
         if !current {
             return self.end(RewriteOutcome::Skipped);
+        }
+        match self.check_envelope(envelope) {
+            Ok(true) => {}
+            Ok(false) => return self.end(RewriteOutcome::Skipped),
+            Err(error) => return self.fail(error),
         }
         match read_version_effect(&self.version_key, self.txn_id) {
             Ok(effect) => {
@@ -407,6 +445,8 @@ impl Operation for RewriteVersionOperation {
             RewriteState::Init => self.start(),
             RewriteState::ReadVersion => self.handle_version(event),
             RewriteState::ReadLocation => self.handle_location(event),
+            RewriteState::ReadEnvelope => self.handle_envelope(event),
+            RewriteState::CreateEnvelope => self.handle_created(event),
             RewriteState::Admit => self.handle_admit(event),
             RewriteState::Rewrite => self.handle_rewritten(event),
             RewriteState::StartTransaction => self.handle_started(event),
@@ -416,7 +456,11 @@ impl Operation for RewriteVersionOperation {
             RewriteState::ReadTarget => self.handle_target(event),
             RewriteState::WriteRows => self.handle_rows(event),
             RewriteState::DropOwner => match event {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => self.update_usage(),
+                Event::Storage(StorageEvent::DeleteResult { .. }) => self.drop_envelope(),
+                other => self.unexpected(other),
+            },
+            RewriteState::DropEnvelope => match event {
+                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.update_usage(),
                 other => self.unexpected(other),
             },
             RewriteState::UpdateUsage => self.handle_usage(event),
@@ -456,6 +500,9 @@ impl Operation for RewriteVersionOperation {
 }
 #[path = "../rewrite_rows.rs"]
 mod rows;
+
+#[path = "../rewrite_abe.rs"]
+mod abe;
 
 #[cfg(test)]
 #[path = "../rewrite_tests.rs"]
