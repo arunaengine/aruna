@@ -416,6 +416,9 @@ pub async fn raise_epoch(
 - Archive grants and envelopes are rewritten; payload blocks are not.
 - Versions outside the prefix and copies that still need the old key stay unchanged.
 - A raise or removal during the walk starts it again, so `done` covers it.
+- A copy into the prefix during the walk starts it again too.
+- A version whose content or format is still pending keeps `done` false until it is re-keyed.
+- One prefix per bucket: the first call claims it before changing any version.
 - The node needs the bucket key: `node_managed`, or unlocked on this node."#,
     params(("bucket" = String, Path, description = "Node-local S3 bucket name")),
     request_body(content = RekeyBody, example = json!({"prefix":"foo/"})),
