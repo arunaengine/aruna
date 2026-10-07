@@ -71,6 +71,7 @@ enum State {
     Settings,
     Snapshot,
     Keys,
+    Credential,
     Records,
     Existing,
     Reuse,
@@ -208,6 +209,19 @@ impl KeyOperation {
             ],
             txn_id: self.txn
         })]
+    }
+    /// Reads the recipient's user keys from their vault.
+    fn read_keys(&mut self) -> Effects {
+        let mut keys = ReadVaultOperation::new(ReadVaultConfig {
+            node_id: self.node,
+            user_id: self.recipient(),
+            query: VaultQuery::Keys,
+            deadline: std::time::Duration::from_secs(10),
+        });
+        self.state = State::Keys;
+        let effects = self.fenced(keys.start());
+        self.keys = Some(keys);
+        effects
     }
     fn keys_read(&mut self, event: Event) -> Effects {
         let Some(keys) = self.keys.as_mut() else {
@@ -359,22 +373,16 @@ impl Operation for KeyOperation {
                         Err(error) => return self.fail(error),
                     }
                 }
-                // A token is its own recipient key, so the vault is not read.
-                if matches!(self.action, KeyAction::Token { .. }) {
-                    return self.records();
+                if let Some(access_key) = self.token_credential() {
+                    self.state = State::Credential;
+                    return self.read(USER_ACCESS_KEYSPACE, access_key.into_bytes());
                 }
-                let mut keys = ReadVaultOperation::new(ReadVaultConfig {
-                    node_id: self.node,
-                    user_id: self.recipient(),
-                    query: VaultQuery::Keys,
-                    deadline: std::time::Duration::from_secs(10),
-                });
-                self.state = State::Keys;
-                let effects = self.fenced(keys.start());
-                self.keys = Some(keys);
-                effects
+                self.read_keys()
             }
             (State::Keys, event) => self.keys_read(event),
+            (State::Credential, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.credential_read(value)
+            }
             (State::Records, event) => self.records_read(event),
             (State::Existing, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
                 self.existing_read(value)

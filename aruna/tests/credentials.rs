@@ -671,6 +671,160 @@ async fn token_opens_scope() -> TestResult<()> {
     result
 }
 
+/// The open key requests of credential `access_key`, read from the node's storage.
+async fn token_requests(
+    seed: &shared::SeedNode,
+    access_key: &str,
+) -> TestResult<Vec<aruna_core::structs::storage::abe_access::KeyRequest>> {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    let scan = StorageEffect::Iter {
+        key_space: aruna_core::keyspaces::ABE_REQUEST_KEYSPACE.to_string(),
+        prefix: None,
+        start: None,
+        limit: usize::MAX,
+        txn_id: None,
+    };
+    let Event::Storage(StorageEvent::IterResult { values, .. }) =
+        seed.context.storage_handle.send_storage_effect(scan).await
+    else {
+        return Err(std::io::Error::other("request scan failed").into());
+    };
+    let mut requests = Vec::new();
+    for (_, value) in values {
+        let request = aruna_core::structs::storage::abe_access::KeyRequest::from_bytes(&value)?;
+        if request.credential_id.as_deref() == Some(access_key) {
+            requests.push(request);
+        }
+    }
+    Ok(requests)
+}
+
+#[tokio::test]
+async fn token_needs_credential() -> TestResult<()> {
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::storage::abe::AbeError;
+    use aruna_core::structs::storage::abe_access::{GrantContext, KeyGrant, KeyIssuer};
+    use aruna_operations::abe::{KeyAction, KeyError, KeyOperation};
+    use aruna_operations::driver::drive;
+    const BUCKET: &str = "token-live";
+    let seed = spawn_complete_seed().await?;
+
+    let result = async {
+        let admin = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&seed.base_url, &admin, "token-live-group").await?;
+        let plain = create_s3_credentials(&seed.base_url, &admin, &group.group_id).await?;
+        let endpoint = seed
+            .s3
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
+        s3_client(endpoint, &plain)
+            .create_bucket()
+            .bucket(BUCKET)
+            .send()
+            .await?;
+        let http = reqwest::Client::new();
+        let encryption = format!(
+            "{}/api/v1/data/buckets/{BUCKET}/storage/encryption",
+            seed.base_url
+        );
+        let enabled = http
+            .put(&encryption)
+            .bearer_auth(&admin)
+            .json(&serde_json::json!({ "mode": "node_managed", "expected_generation": 0 }))
+            .send()
+            .await?;
+        assert_eq!(enabled.status(), StatusCode::OK);
+        let locked = http
+            .post(format!("{encryption}/lock"))
+            .bearer_auth(&admin)
+            .send()
+            .await?;
+        assert_eq!(locked.status(), StatusCode::OK);
+
+        // A token of the locked bucket keeps an open request for a holder to publish.
+        let (public, _) = aruna_core::structs::storage::encryption::generate_key()?;
+        let created = http
+            .post(format!("{}/api/v1/access/credentials", seed.base_url))
+            .bearer_auth(&admin)
+            .json(&aruna_api::routes::credentials::CreateS3Request {
+                group_id: group.group_id.clone(),
+                expires_in_seconds: Some(600),
+                path_restrictions: None,
+                encrypted_buckets: Some(vec![BUCKET.to_string()]),
+                token_public_key: Some(base64::Engine::encode(&STANDARD, public)),
+            })
+            .send()
+            .await?;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: aruna_api::routes::credentials::CreateS3Response = created.json().await?;
+        assert_eq!(created.key_requests.len(), 1);
+        let access_key = created.access_key_id;
+        let mut requests = token_requests(&seed, &access_key).await?;
+        let request = requests
+            .pop()
+            .ok_or_else(|| std::io::Error::other("no open token request"))?;
+        let grant = KeyGrant {
+            context: GrantContext {
+                request,
+                issuer: KeyIssuer::User(seed.user_id),
+            },
+            enc: [1; 32],
+            ciphertext: vec![1; 16],
+        };
+        let auth = AuthContext {
+            user_id: seed.user_id,
+            realm_id: seed.realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let node = seed.net.node_id();
+        let now = aruna_core::time::unix_timestamp_millis();
+
+        // Once the credential expires, a holder can no longer publish its request.
+        let action = KeyAction::Publish(grant.clone());
+        let late = KeyOperation::new(BUCKET.into(), auth.clone(), node, action, now + 601_000);
+        assert_eq!(
+            drive(late, &seed.context).await,
+            Err(KeyError::Abe(AbeError::Stale))
+        );
+
+        // A request after revocation recreates no request or grant for the credential.
+        let revoked = http
+            .delete(format!(
+                "{}/api/v1/access/credentials/{access_key}",
+                seed.base_url
+            ))
+            .bearer_auth(&admin)
+            .send()
+            .await?;
+        assert!(revoked.status().is_success(), "{}", revoked.status());
+        let action = KeyAction::Token {
+            access_key: access_key.clone(),
+            public_key: public,
+            restrictions: None,
+        };
+        let request = KeyOperation::new(BUCKET.into(), auth, node, action, now);
+        assert_eq!(
+            drive(request, &seed.context).await,
+            Err(KeyError::Abe(AbeError::Stale))
+        );
+        assert!(token_requests(&seed, &access_key).await?.is_empty());
+        assert!(token_grants(&seed, &access_key).await?.is_empty());
+        Ok(())
+    }
+    .await;
+
+    seed.shutdown().await;
+    result
+}
+
 /// Changes a signed request: lists `listed` among its signed headers and sets the object key.
 #[derive(Debug)]
 struct Tamper {

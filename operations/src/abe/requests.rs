@@ -8,7 +8,9 @@ use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
+use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::encryption::{BucketHolder, HolderOrigin};
+use std::time::{Duration, SystemTime};
 
 impl KeyOperation {
     /// Checks the bucket-wide request bindings that do not depend on the recipient.
@@ -65,6 +67,36 @@ impl KeyOperation {
         request.recipient_record == key.map(|k| k.0)
             && request.recipient_public == key.map(|k| k.1)
             && request.recipient_fingerprint == key.map(|k| k.2)
+    }
+    /// The credential of a token action or of a published token request.
+    pub(super) fn token_credential(&self) -> Option<String> {
+        match &self.action {
+            KeyAction::Token { access_key, .. } => Some(access_key.clone()),
+            KeyAction::Publish(grant) => grant.context.request.credential_id.clone(),
+            _ => None,
+        }
+    }
+    /// Continues only while the token's credential is live, the recipient's, in the bucket's
+    /// group and issued by this node; reading it here makes a revocation conflict.
+    pub(super) fn credential_read(&mut self, value: Option<Value>) -> Effects {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now);
+        let live = value
+            .and_then(|v| UserAccess::from_bytes(&v).ok())
+            .is_some_and(|access| {
+                !access.is_expired(now)
+                    && !access.is_revoked()
+                    && access.user_identity == self.recipient()
+                    && self.info.as_ref().map(|i| i.group_id) == Some(access.group_id)
+                    && access.issued_by == *self.node.as_bytes()
+            });
+        if !live {
+            return self.fail(AbeError::Stale);
+        }
+        // A token is its own recipient key, so the vault is not read.
+        if matches!(self.action, KeyAction::Token { .. }) {
+            return self.records();
+        }
+        self.read_keys()
     }
     /// The access key whose requests this action handles; user requests have none.
     fn credential(&self) -> Option<&str> {
