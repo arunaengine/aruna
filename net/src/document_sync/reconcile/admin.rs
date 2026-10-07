@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::admin_documents::roles_narrowed;
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
 };
@@ -35,14 +36,15 @@ pub(crate) async fn apply_admin_operation(
 }
 
 /// Epoch due rows for this node's encrypted buckets of a group, or of all groups without one,
-/// when `event` can narrow a READ scope; epochs stay node-local.
+/// when `event` or the `narrowed` materialization can narrow a READ scope; epochs stay node-local.
 async fn due_writes(
     storage: &StorageHandle,
     event: &AdminDocumentEvent,
+    narrowed: bool,
     group_id: Option<GroupId>,
     txn_id: Option<TxnId>,
 ) -> Result<Vec<(String, ByteView, Value)>> {
-    if !event.op.narrows_reads() {
+    if !narrowed && !event.op.narrows_reads() {
         return Ok(Vec::new());
     }
     let rows = match storage
@@ -519,7 +521,9 @@ async fn group_transaction(
         roles: Default::default(),
         policies: Default::default(),
     });
+    let before = auth_doc.roles.clone();
     materialize_group_authorization(&mut auth_doc, &reducer_state, &event);
+    let narrowed = roles_narrowed(&before, &auth_doc.roles);
     let group_writes = group_reducer_entries(storage, group_id, &reducer_state, txn_id).await?;
 
     let mut writes = vec![
@@ -535,7 +539,8 @@ async fn group_transaction(
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     ];
     writes.extend(group_writes);
-    writes.extend(due_writes(storage, &event, Some(group_id), Some(txn_id)).await?);
+    let due = due_writes(storage, &event, narrowed, Some(group_id), Some(txn_id)).await?;
+    writes.extend(due);
     writes.extend(
         conflict_write_entries(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -615,7 +620,9 @@ pub(in crate::document_sync) async fn apply_realm_authorization(
         roles: Default::default(),
         operation_restrictions: Default::default(),
     });
+    let before = auth_doc.roles.clone();
     materialize_realm_authorization(&mut auth_doc, &reducer_state, &event);
+    let narrowed = roles_narrowed(&before, &auth_doc.roles);
 
     let mut writes = vec![
         (
@@ -629,7 +636,7 @@ pub(in crate::document_sync) async fn apply_realm_authorization(
         reducer_state_entry(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     ];
-    writes.extend(due_writes(storage, &event, None, None).await?);
+    writes.extend(due_writes(storage, &event, narrowed, None, None).await?);
     writes.extend(
         conflict_write_entries(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -1419,7 +1426,7 @@ async fn apply_realm_config(
             }
         };
         writes.push(reducer_write);
-        match due_writes(storage, &event, None, Some(txn_id)).await {
+        match due_writes(storage, &event, false, None, Some(txn_id)).await {
             Ok(due) => writes.extend(due),
             Err(error) => return Err(abort_error(storage, txn_id, error).await),
         }

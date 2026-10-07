@@ -376,6 +376,27 @@ impl AdminDocumentOperation {
     }
 }
 
+/// Whether `after` drops a role, permission change or assignment of `before`, or assigns a DENY
+/// role to a new user: each can narrow a READ scope.
+pub fn roles_narrowed(
+    before: &std::collections::HashMap<RoleId, Role>,
+    after: &std::collections::HashMap<RoleId, Role>,
+) -> bool {
+    let lost = before.iter().any(|(id, old)| {
+        after.get(id).is_none_or(|new| {
+            new.permissions != old.permissions || !old.assigned_users.is_subset(&new.assigned_users)
+        })
+    });
+    lost || after.iter().any(|(id, new)| {
+        let old = before.get(id).map(|r| &r.assigned_users);
+        new.permissions.values().any(|p| *p == Permission::DENY)
+            && new
+                .assigned_users
+                .iter()
+                .any(|u| old.is_none_or(|o| !o.contains(u)))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition};

@@ -841,3 +841,71 @@ async fn new_realm_materializes() {
         BTreeMap::from([(role_id, BTreeSet::from([assigned_user_id]))])
     );
 }
+
+#[tokio::test]
+async fn deny_assignment_marks() {
+    use aruna_core::keyspaces::{
+        ABE_DUE_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+    };
+    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([13; 32]);
+    let group_id = Ulid::from_parts(41, 1);
+    let role_id = Ulid::from_parts(42, 2);
+    let member = UserId::local(Ulid::from_parts(43, 3), realm_id);
+    let actor = test_actor(
+        9,
+        UserId::local(Ulid::from_parts(44, 4), realm_id),
+        realm_id,
+    );
+    let target = AdminDocumentTarget::Group { group_id };
+    let document_target = DocumentTarget::GroupAuthorization { group_id };
+    let bucket_id = Ulid::from_parts(45, 5);
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(bucket_id),
+        key_generation: 1,
+        ..Default::default()
+    };
+    let index = [&group_id.to_bytes()[..], b"bucket-a"].concat();
+    let rows = vec![
+        (
+            BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            b"bucket-a".to_vec().into(),
+            settings.to_bytes().unwrap().into(),
+        ),
+        (
+            GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            index.into(),
+            Vec::new().into(),
+        ),
+    ];
+    crate::document_sync::storage::batch_write_to(&storage, rows)
+        .await
+        .unwrap();
+    let role = admin_role(role_id, "Blocked", "/datasets/**", Permission::DENY);
+    let ops = [
+        AdminDocumentOperation::GroupRoleCreated { role },
+        AdminDocumentOperation::GroupAssignmentAdded {
+            role_id,
+            user_id: member,
+        },
+    ];
+    let due: ByteView = bucket_id.to_bytes().to_vec().into();
+    for (seq, op) in (1..).zip(ops) {
+        // The role's own marker was consumed by a raise before the assignment arrives.
+        batch_delete_to(&storage, vec![(ABE_DUE_KEYSPACE.to_string(), due.clone())])
+            .await
+            .unwrap();
+        let id = Ulid::from_parts(46, u128::from(seq));
+        let event = test_admin_event(id, target.clone(), &actor, seq, op);
+        apply_admin_operation(&storage, document_target.clone(), event)
+            .await
+            .expect("admin operation applies");
+    }
+    assert!(
+        read_storage_value(&storage, ABE_DUE_KEYSPACE, due)
+            .await
+            .is_some()
+    );
+}
