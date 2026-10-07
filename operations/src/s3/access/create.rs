@@ -668,6 +668,8 @@ mod pure_tests {
     use super::*;
     use crate::s3::access::index::owner_key;
     use aruna_core::effects::IterStart;
+    use aruna_core::keyspaces::{ABE_GRANT_KEYSPACE, ABE_REQUEST_KEYSPACE, TOKEN_GRANT_KEYSPACE};
+    use aruna_core::structs::storage::abe_access::token_prefix;
 
     fn owner_read(op: &CreateUserOperation, value: Option<aruna_core::types::Value>) -> Event {
         Event::Storage(StorageEvent::BatchReadResult {
@@ -826,7 +828,7 @@ mod pure_tests {
         let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
             entries: Vec::new(),
         }));
-        // The stale credential's token copies go in the same transaction: one full page, then
+        // The stale credential's token grants go in the same transaction: one full page, then
         // the rest after its cursor.
         let [
             Effect::Storage(StorageEffect::Iter {
@@ -840,22 +842,13 @@ mod pure_tests {
         else {
             panic!("expected the token index scan, got {effects:?}");
         };
-        assert_eq!((key_space.as_str(), *id), (TOKEN_INDEX_KEYSPACE, txn_id));
+        assert_eq!((key_space.as_str(), *id), (TOKEN_GRANT_KEYSPACE, txn_id));
         let prefix = prefix.clone().unwrap();
-        assert_eq!(
-            prefix.as_ref(),
-            TokenCopy::index_prefix(&stale_key).as_slice()
-        );
-        let copy = |bucket: u8| TokenCopy {
-            key: BucketKeyRef::new(Ulid::from_bytes([bucket; 16]), 1),
-            access_key: stale_key.clone(),
-            created_by: user_identity,
-            nonce: [0; 12],
-            ciphertext: vec![0; 48],
-            created_at_ms: 1,
-        };
+        assert_eq!(prefix.as_ref(), token_prefix(&stale_key).as_slice());
+        let request = |bucket: u8| vec![bucket; 80];
+        let row = |bucket: u8| [token_prefix(&stale_key), request(bucket)].concat();
         let page = |bucket: u8, next: bool| {
-            let key = Key::from(copy(bucket).index_key());
+            let key = Key::from(row(bucket));
             Event::Storage(StorageEvent::IterResult {
                 values: vec![(key.clone(), Value::from(Vec::new()))],
                 next_start_after: next.then_some(key),
@@ -873,8 +866,9 @@ mod pure_tests {
         assert_eq!(
             deleted,
             [
-                (KEY_COPY_KEYSPACE, copy(1).key()),
-                (TOKEN_INDEX_KEYSPACE, copy(1).index_key()),
+                (ABE_REQUEST_KEYSPACE, request(1)),
+                (ABE_GRANT_KEYSPACE, request(1)),
+                (TOKEN_GRANT_KEYSPACE, row(1)),
             ]
         );
         let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
@@ -883,7 +877,7 @@ mod pure_tests {
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Iter { start: Some(IterStart::After(after)), .. })]
-                if after.as_ref() == copy(1).index_key().as_slice()
+                if after.as_ref() == row(1).as_slice()
         ));
         op.step(page(2, false));
         let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
@@ -1050,9 +1044,8 @@ mod pure_tests {
 
     mod tokens {
         use super::*;
-        use crate::s3::bucket::key::rows::authority_rows;
-        use aruna_core::compute::SecretBytes;
         use aruna_core::structs::identity::realm::RealmId;
+        use aruna_core::structs::storage::blob::BucketInfo;
         use aruna_core::structs::storage::encryption::EncryptionMode;
         use aruna_core::structs::storage::format::Compression;
 
@@ -1093,18 +1086,20 @@ mod pure_tests {
         }
 
         /// Runs a token credential of `caller` for bucket `sealed` up to its bucket read.
-        fn started(caller: UserId) -> CreateTokenOperation {
+        fn started(caller: UserId) -> CreateUserOperation {
             let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
             let config = make_config(caller, Ulid::from_bytes([3; 16]));
-            let user_op = CreateUserOperation::new(config, test_key());
             let buckets = vec!["sealed".to_string()];
-            let mut operation =
-                CreateTokenOperation::new(user_op, buckets, (caller.realm_id, node), 9);
+            let mut operation = CreateUserOperation::new(config, test_key()).with_tokens(
+                buckets,
+                (caller.realm_id, node),
+                9,
+            );
             operation.start();
             let txn_id = Ulid::from_bytes([9; 16]);
             operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-            operation.step(owner_read(&operation.0, None));
-            let access_key = operation.0.access.as_ref().unwrap().access_key.clone();
+            operation.step(owner_read(&operation, None));
+            let access_key = operation.access.as_ref().unwrap().access_key.clone();
             let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
                 values: vec![(access_key.into(), None)],
             }));
@@ -1117,29 +1112,7 @@ mod pure_tests {
             operation
         }
 
-        /// Answers the bucket and authority reads; `grant` is the caller's stored grant.
-        fn checked(
-            caller: UserId,
-            admins: &[UserId],
-            grant: Option<Vec<u8>>,
-        ) -> (CreateTokenOperation, Effects) {
-            let mut operation = started(caller);
-            let row = |value: Vec<u8>| Some(value);
-            operation.step(rows(vec![
-                row(info().to_bytes().unwrap()),
-                row(sealed().to_bytes().unwrap()),
-            ]));
-            let authority = authority_rows(&info(), Some(&sealed()), admins);
-            let documents = authority[2..]
-                .iter()
-                .map(|(_, value)| value.as_ref().map(|value| value.to_vec()));
-            let mut values: Vec<_> = documents.collect();
-            values.push(grant);
-            let effects = operation.step(rows(values));
-            (operation, effects)
-        }
-
-        fn failed(operation: CreateTokenOperation) -> CreateUserError {
+        fn failed(operation: CreateUserOperation) -> CreateUserError {
             match operation.finalize() {
                 Err(error) => error,
                 Ok(_) => panic!("the credential was created"),
@@ -1147,30 +1120,13 @@ mod pure_tests {
         }
 
         #[test]
-        fn creator_gets_token() {
-            let (mut operation, effects) = checked(user(1), &[], None);
-            let key = BucketKeyRef::new(BUCKET_ID, 2);
-            let access_key = operation.0.access.as_ref().unwrap().access_key.clone();
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Blob(BlobEffect::SealToken { keys, access_key: named, created_by, .. })]
-                    if *keys == [key] && *named == access_key && *created_by == user(1)
-            ));
-            let copy = TokenCopy {
-                key,
-                access_key: access_key.clone(),
-                created_by: user(1),
-                nonce: [0; 12],
-                ciphertext: vec![0; 48],
-                created_at_ms: 9,
-            };
-            let token = SharedSecret::new(SecretBytes::new(vec![7; 32]));
-            let sealed = BlobEvent::TokenSealed {
-                copies: vec![copy.clone()],
-                token: token.clone(),
-            };
-            let effects = operation.step(Event::Blob(sealed));
-            // Credential, owner index, copy, its index and one audit entry commit together.
+        fn token_bucket_audited() {
+            // Any caller may name an encrypted bucket, locked or not; key holders issue later.
+            let mut operation = started(user(2));
+            let effects = operation.step(rows(vec![
+                Some(info().to_bytes().unwrap()),
+                Some(sealed().to_bytes().unwrap()),
+            ]));
             let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
             else {
                 panic!("expected the credential writes, got {effects:?}");
@@ -1181,61 +1137,14 @@ mod pure_tests {
                 [
                     USER_ACCESS_KEYSPACE,
                     ACCESS_OWNER_KEYSPACE,
-                    KEY_COPY_KEYSPACE,
-                    TOKEN_INDEX_KEYSPACE,
                     aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE,
                 ]
             );
-            assert_eq!(writes[2].1.as_ref(), copy.key().as_slice());
-            assert_eq!(TokenCopy::from_bytes(&writes[2].2).unwrap(), copy);
-            assert_eq!(writes[3].1.as_ref(), copy.index_key().as_slice());
-            let audit = BucketAuditRecord::from_bytes(&writes[4].2).unwrap();
+            let audit = BucketAuditRecord::from_bytes(&writes[2].2).unwrap();
             assert_eq!(
                 (audit.action, audit.actor, audit.bucket_id, audit.generation),
-                (AuditAction::TokenCreated, Some(user(1)), BUCKET_ID, Some(2))
+                (AuditAction::TokenCreated, Some(user(2)), BUCKET_ID, Some(2))
             );
-            operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-                entries: Vec::new(),
-            }));
-            let txn_id = Ulid::from_bytes([9; 16]);
-            operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id,
-            }));
-            let (created, _, _, returned) = operation.finalize().unwrap();
-            assert_eq!((created, returned), (access_key, token));
-        }
-
-        #[test]
-        fn holders_only() {
-            // A former admin without a grant gets no token; an explicit grant or a current
-            // admin role is enough.
-            let (operation, effects) = checked(user(2), &[], None);
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-            ));
-            assert_eq!(
-                failed(operation),
-                CreateUserError::NotHolder("sealed".to_string())
-            );
-            let (_, effects) = checked(user(2), &[user(2)], None);
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Blob(BlobEffect::SealToken { .. })]
-            ));
-            let grant = BucketHolder {
-                bucket_id: BUCKET_ID,
-                user_id: user(2),
-                origin: HolderOrigin::Explicit,
-                state: aruna_core::structs::storage::encryption::GrantState::Ready,
-                granted_by: user(1),
-                granted_at_ms: 1,
-            };
-            let (_, effects) = checked(user(2), &[], Some(grant.to_bytes().unwrap()));
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Blob(BlobEffect::SealToken { .. })]
-            ));
         }
 
         #[test]
@@ -1252,19 +1161,6 @@ mod pure_tests {
             assert_eq!(
                 failed(operation),
                 CreateUserError::NotEncrypted("sealed".to_string())
-            );
-
-            // A locked bucket fails the whole credential; nothing is written.
-            let (mut operation, _) = checked(user(1), &[], None);
-            let locked = BlobError::BucketKey(BucketKeyError::Locked(BUCKET_ID));
-            let effects = operation.step(Event::Blob(BlobEvent::Error(locked)));
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-            ));
-            assert_eq!(
-                failed(operation),
-                CreateUserError::BucketLocked("sealed".to_string())
             );
         }
     }

@@ -11,6 +11,7 @@ use aruna_api::routes::credentials::CreatePathRestriction;
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::storage::blob::group_permission_path;
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use base64::engine::general_purpose::STANDARD;
 use reqwest::StatusCode;
 use shared::{
     TestResult, create_bearer_token, create_group_http, create_s3_credentials, get_user_access,
@@ -39,6 +40,7 @@ async fn post_credentials(
             expires_in_seconds: Some(600),
             path_restrictions,
             encrypted_buckets: None,
+            token_public_key: None,
         })
         .send()
         .await?)
@@ -392,7 +394,9 @@ async fn token_reads_locked() -> TestResult<()> {
             .send()
             .await?;
 
-        // The bucket creator takes a token credential while the bucket is unlocked.
+        // The client keeps the token key; the node issues its grant at once in node managed mode.
+        let (public, private) = aruna_core::structs::storage::encryption::generate_key()?;
+        let token = hex::encode(private.bytes().expose());
         let created = http
             .post(format!("{}/api/v1/access/credentials", seed.base_url))
             .bearer_auth(&admin)
@@ -401,14 +405,13 @@ async fn token_reads_locked() -> TestResult<()> {
                 expires_in_seconds: Some(600),
                 path_restrictions: None,
                 encrypted_buckets: Some(vec![BUCKET.to_string()]),
+                token_public_key: Some(base64::Engine::encode(&STANDARD, public)),
             })
             .send()
             .await?;
         assert_eq!(created.status(), StatusCode::CREATED);
         let created: aruna_api::routes::credentials::CreateS3Response = created.json().await?;
-        let token = created
-            .session_token
-            .ok_or_else(|| std::io::Error::other("no session token returned"))?;
+        assert!(created.key_requests.is_empty(), "the node issues at once");
         let credentials = shared::S3Credentials {
             access_key_id: created.access_key_id,
             access_secret: created.access_secret,
