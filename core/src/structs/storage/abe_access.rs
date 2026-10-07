@@ -149,6 +149,16 @@ impl KeyRequest {
             KeyScope::Subtree(prefix) => key.starts_with(prefix.as_str()),
         }
     }
+    /// Whether both bind everything but the epoch set alike, so their keys may be merged.
+    pub fn same_context(&self, other: &Self) -> bool {
+        let rebound = Self {
+            request_id: other.request_id,
+            epochs: other.epochs.clone(),
+            created_at_ms: other.created_at_ms,
+            ..self.clone()
+        };
+        rebound == *other
+    }
 }
 
 /// Scan prefix of one credential's `token_grants` rows; access keys are alphanumeric.

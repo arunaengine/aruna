@@ -10,6 +10,7 @@ use aruna_core::structs::execution::notification::{
 };
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::encryption::{BucketHolder, HolderOrigin};
+use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
 impl KeyOperation {
@@ -270,8 +271,8 @@ impl KeyOperation {
             return self.flush();
         }
         let current = snapshot.epoch;
-        let revisions = snapshot.revisions.clone();
-        let mut covered = std::collections::BTreeSet::new();
+        let mut covered = BTreeSet::new();
+        let mut parts = Vec::new();
         let mut held_grant = None;
         for (key, value) in values.into_iter().take(MAX_REQUESTS) {
             let grant = match KeyGrant::from_bytes(&value) {
@@ -292,11 +293,9 @@ impl KeyOperation {
                 }
                 continue;
             }
-            if held.scope == request.scope
-                && held.restrictions == request.restrictions
-                && held.revisions == revisions
-            {
+            if held.same_context(&request) {
                 covered.extend(held.epochs.iter().copied());
+                parts.push(held.epochs.iter().copied().collect::<BTreeSet<u64>>());
                 if held.epochs.contains(&current) {
                     held_grant = Some(grant);
                 }
@@ -308,17 +307,28 @@ impl KeyOperation {
             .filter(|e| !covered.contains(e))
             .take(MAX_EPOCHS + 1)
             .collect();
-        if let (true, Some(grant)) = (epochs.is_empty(), held_grant) {
-            self.result.get_or_insert(KeyResult::Grant(grant));
-            return self.flush();
-        }
+        let missing = !epochs.is_empty();
         if epochs.first() != Some(&current) {
             epochs.insert(0, current);
         }
         self.more = epochs.len() > MAX_EPOCHS;
         epochs.truncate(MAX_EPOCHS);
-        epochs.sort_unstable();
-        request.epochs = epochs;
+        // Whole same-context grants join while the key stays bounded; publication deletes them.
+        let mut merged: BTreeSet<u64> = epochs.into_iter().collect();
+        let mut joined = 0;
+        parts.sort_by_key(|part| !part.contains(&current));
+        for part in parts {
+            let union: BTreeSet<u64> = merged.union(&part).copied().collect();
+            if union.len() <= MAX_EPOCHS {
+                merged = union;
+                joined += 1;
+            }
+        }
+        if let (false, true, Some(grant)) = (missing, joined < 2, held_grant) {
+            self.result.get_or_insert(KeyResult::Grant(grant));
+            return self.flush();
+        }
+        request.epochs = merged.into_iter().collect();
         // A full open-request queue refuses only a first batch without a reusable grant.
         if self.queue_full && self.result.is_none() {
             return self.fail(AbeError::Limit);
@@ -363,8 +373,26 @@ impl KeyOperation {
         let Some(KeyResult::Grant(grant)) = self.result.take() else {
             return self.fail(AbeError::Context);
         };
-        // Stored grants are only counted: this request's restrictions cannot judge other grants.
-        if values.len() >= MAX_REQUESTS {
+        // Same-context grants whose epochs the new key covers are merged into it: deleted here.
+        let request = &grant.context.request;
+        let mut merged = 0;
+        for (key, value) in &values {
+            let Ok(held) = KeyGrant::from_bytes(value).map(|g| g.context.request) else {
+                continue;
+            };
+            if held.same_context(request) && held.epochs.iter().all(|e| request.epochs.contains(e))
+            {
+                self.deletes
+                    .push((ABE_GRANT_KEYSPACE.to_string(), key.clone()));
+                if let Some(row) = held.token_key() {
+                    self.deletes
+                        .push((TOKEN_GRANT_KEYSPACE.to_string(), row.into()));
+                }
+                merged += 1;
+            }
+        }
+        // Other stored grants are only counted: this request's restrictions cannot judge them.
+        if values.len() - merged >= MAX_REQUESTS {
             return self.fail(AbeError::Limit);
         }
         let key: Key = grant.context.request.key().into();

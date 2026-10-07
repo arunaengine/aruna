@@ -622,6 +622,183 @@ mod tests {
         assert_eq!(operation.finalize(), Err(KeyError::Storage));
     }
 
+    /// A token run at epoch 3 whose snapshot admits READ on `pattern`, and its foo/ request.
+    fn merge_fixture(pattern: &str) -> (KeyOperation, KeyRequest) {
+        let realm_id = RealmId([1; 32]);
+        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let group_id = Ulid::from_bytes([8; 16]);
+        let key = BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1);
+        let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
+        let parameters =
+            aruna_core::structs::storage::abe::create_parameters(&secret, realm_id, node, key)
+                .unwrap();
+        let access_key = Ulid::from_bytes([3; 16]).to_string();
+        let (record, public, fingerprint) = token_recipient(&access_key, [1; 32]).unwrap();
+        let request = KeyRequest {
+            request_id: Ulid::from_bytes([1; 16]),
+            requesting_user: user,
+            recipient_user: user,
+            recipient_record: Some(record),
+            recipient_public: Some(public),
+            recipient_fingerprint: Some(fingerprint),
+            bucket: "bucket".into(),
+            parameters: parameters.clone(),
+            scope: KeyScope::Subtree("foo/".into()),
+            epochs: vec![3],
+            credential_id: Some(access_key.clone()),
+            restrictions: None,
+            revisions: Vec::new(),
+            created_at_ms: 1,
+        };
+        let auth = AuthContext {
+            user_id: user,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let action = KeyAction::Token {
+            access_key,
+            public_key: [1; 32],
+            restrictions: None,
+        };
+        let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
+        let root = aruna_core::structs::storage::blob::bucket_permission_path(
+            realm_id, group_id, node, "bucket",
+        );
+        let role = CollectedRole {
+            role: Role {
+                role_id: Ulid::from_bytes([2; 16]),
+                name: "reader".into(),
+                permissions: [(format!("{root}/{pattern}"), Permission::READ)].into(),
+                assigned_users: [user].into(),
+            },
+            direct: true,
+            public: false,
+        };
+        operation.info = Some(BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+        });
+        operation.txn = Some(TxnId::generate());
+        operation.snapshot = Some(Snapshot {
+            parameters,
+            epoch: 3,
+            revisions: Vec::new(),
+            rules: PermissionRules::from_roles(vec![role], None).unwrap(),
+            holder: false,
+            holders: Default::default(),
+            policies: false,
+            due: false,
+        });
+        (operation, request)
+    }
+
+    /// The stored grant row of `request` under request id `id` with `epochs`.
+    fn held(request: &KeyRequest, id: u8, epochs: &[u64]) -> (Key, Value) {
+        let mut request = request.clone();
+        request.request_id = Ulid::from_bytes([id; 16]);
+        request.epochs = epochs.to_vec();
+        let grant = KeyGrant {
+            context: GrantContext {
+                issuer: KeyIssuer::Node(request.parameters.node_id),
+                request,
+            },
+            enc: [0; 32],
+            ciphertext: vec![0; 16],
+        };
+        let key = grant.context.request.key().into();
+        (key, grant.to_bytes().unwrap().into())
+    }
+
+    fn issued(request: &KeyRequest, epochs: &[u64]) -> Event {
+        let mut request = request.clone();
+        request.request_id = Ulid::from_bytes([20; 16]);
+        request.epochs = epochs.to_vec();
+        let grant = KeyGrant {
+            context: GrantContext {
+                issuer: KeyIssuer::Node(request.parameters.node_id),
+                request,
+            },
+            enc: [0; 32],
+            ciphertext: vec![0; 16],
+        };
+        Event::Blob(BlobEvent::Abe(Box::new(AbeEvent::Grant(grant))))
+    }
+
+    #[test]
+    fn merges_same_context() {
+        let (mut operation, request) = merge_fixture("**");
+        let mut other = request.clone();
+        other.scope = KeyScope::Subtree("bar/".into());
+        let mut narrowed = request.clone();
+        narrowed.restrictions = Some(vec![PathRestriction {
+            pattern: "foo/**".into(),
+            permission: Permission::READ,
+        }]);
+        let mut revised = request.clone();
+        revised.revisions = vec![[1; 32]];
+        let values = vec![
+            held(&request, 11, &[1]),
+            held(&request, 12, &[2]),
+            held(&other, 13, &[1]),
+            held(&narrowed, 14, &[1, 2]),
+            held(&revised, 15, &[1]),
+        ];
+        operation.request = Some(request.clone());
+        // Both foo/ grants join the new epoch; other scopes, restrictions and revisions stay apart.
+        let effects = operation.reuse_read(values.clone());
+        let [Effect::Blob(BlobEffect::Abe(effect))] = effects.as_slice() else {
+            panic!("one issuance: {effects:?}");
+        };
+        let AbeEffect::Issue(context) = effect.as_ref() else {
+            panic!("an issue effect");
+        };
+        assert_eq!(context.request.epochs, vec![1, 2, 3]);
+
+        // Publication deletes exactly the merged parts and their token rows in its transaction.
+        assert!(matches!(
+            operation.step(issued(&request, &[1, 2, 3])).as_slice(),
+            [Effect::Storage(StorageEffect::Iter { .. })]
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: values.clone(),
+            next_start_after: None,
+        }));
+        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice()
+        else {
+            panic!("one delete batch: {effects:?}");
+        };
+        let grants: Vec<&Key> = deletes
+            .iter()
+            .filter(|(space, _)| space == ABE_GRANT_KEYSPACE)
+            .map(|(_, key)| key)
+            .collect();
+        assert_eq!(grants, vec![&values[0].0, &values[1].0]);
+        let rows = deletes.iter().filter(|(s, _)| s == TOKEN_GRANT_KEYSPACE);
+        assert_eq!(rows.count(), 2);
+    }
+
+    #[test]
+    fn refused_merge_keeps() {
+        // READ moved off foo/ before publication: the merge is refused and no grant is deleted.
+        let (mut operation, request) = merge_fixture("bar/**");
+        operation.state = State::Issue;
+        let effects = operation.step(issued(&request, &[1, 2, 3]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert!(operation.deletes.is_empty() && operation.writes.is_empty());
+        assert_eq!(operation.finalize(), Err(KeyError::Denied));
+    }
+
     #[test]
     fn fences_inactive_recipients() {
         // A deactivated user or a credential issued before the user cutoff gets no new grant.
