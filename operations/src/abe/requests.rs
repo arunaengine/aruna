@@ -289,9 +289,9 @@ impl KeyOperation {
         }
         self.flush()
     }
-    /// Reads the bucket holders unless the caller already holds the bucket key.
+    /// Reads the bucket holders, including a caller who holds the bucket key.
     pub(super) fn holders(&mut self) -> Option<Effects> {
-        let snapshot = self.snapshot.as_ref().filter(|s| !s.holder)?;
+        let snapshot = self.snapshot.as_ref()?;
         let prefix = snapshot.parameters.key.bucket_id.to_bytes().to_vec();
         self.state = State::Holders;
         Some(smallvec![Effect::Storage(StorageEffect::Iter {

@@ -1225,7 +1225,7 @@ async fn abe_members() -> TestResult<()> {
         assert_eq!(decided[0].as_array().unwrap().len(), 1, "{decided:?}");
         assert_eq!(decided[0], decided[1]);
 
-        // A grant by a non-holder notifies each holder once per member and bucket.
+        // Every new request notifies each holder once per member and bucket, a granting one too.
         let body = grant_roles(&base, &manager_token, &group.group_id, second, Value::Null).await?;
         assert_eq!(body["key_requests"].as_array().unwrap().len(), 1, "{body}");
         let inbox = format!("{base}/api/v1/system/notifications");
@@ -1255,9 +1255,9 @@ async fn abe_members() -> TestResult<()> {
         .await?;
         // The outbox drains in order, so a notice from the repeated approval would be here.
         let notices = pending().await;
-        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert_eq!(notices.len(), 3, "{notices:?}");
         assert!(notices.iter().all(|n| n["bucket"] == vault));
-        for member in [third, second] {
+        for member in [first, third, second] {
             assert!(
                 notices
                     .iter()
