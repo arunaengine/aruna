@@ -154,7 +154,6 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         BlobEffect::ServeSealedRead { location, .. } => push(&mut ids, &location.backend),
         BlobEffect::ReserveCompose { .. } => {}
         BlobEffect::ReplicateLeased { location, .. } => push(&mut ids, &location.backend),
-        BlobEffect::SealToken { .. } | BlobEffect::AdmitToken { .. } => {}
     }
     ids
 }

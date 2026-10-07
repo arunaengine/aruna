@@ -139,8 +139,6 @@ pub const KEY_WAIT_KEYSPACE: &str = "job_key_waits";
 pub const PENDING_RECLAIM_KEYSPACE: &str = "pending_reclaims";
 /// The weakened recovery each encrypted bucket's holders were last told about, by bucket id.
 pub const BUCKET_RECOVERY_KEYSPACE: &str = "bucket_recovery";
-/// The token copies of each S3 credential, keyed by access key and key reference. Values are empty.
-pub const TOKEN_INDEX_KEYSPACE: &str = "bucket_key_tokens";
 /// Key requests and grants of each S3 credential's token, keyed by access key, a zero byte and
 /// the request key. Values are empty.
 pub const TOKEN_GRANT_KEYSPACE: &str = "token_grants";
@@ -524,7 +522,6 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     KEY_WAIT_KEYSPACE,
     PENDING_RECLAIM_KEYSPACE,
     BUCKET_RECOVERY_KEYSPACE,
-    TOKEN_INDEX_KEYSPACE,
     PENDING_CLAIM_KEYSPACE,
     COPY_WAIT_KEYSPACE,
     PLAINTEXT_COPY_KEYSPACE,

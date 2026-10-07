@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::NodeId;
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;
@@ -10,11 +11,10 @@ use aruna_core::events::BlobEvent;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::ArchiveKey;
 use aruna_core::structs::storage::encryption::{
-    BucketKeyError, BucketKeyRef, CopyTarget, KeyTicket, ReadLease, TokenCopy, UnlockStatus,
-    deadline_after, generate_token, key_matches, open_token, seal_copies, seal_token,
+    BucketKeyError, BucketKeyRef, CopyTarget, KeyTicket, ReadLease, UnlockStatus, deadline_after,
+    key_matches, seal_copies,
 };
 use aruna_core::structs::storage::key_audit::next_event_id;
-use aruna_core::{NodeId, UserId};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -407,36 +407,6 @@ impl UnlockRegistry {
         Ok((session.secret.clone(), session.public_key))
     }
 
-    /// Seals the unlocked key of each of `keys` with one fresh token key; any locked generation
-    /// fails them all. Only the caller of the credential receives the token.
-    pub(super) fn seal_tokens(
-        &mut self,
-        keys: &[BucketKeyRef],
-        origin: (RealmId, NodeId),
-        holder: (&str, UserId),
-        now: Instant,
-    ) -> Result<(Vec<TokenCopy>, SharedSecret), BucketKeyError> {
-        let token = generate_token()?;
-        let now_ms = aruna_core::time::unix_timestamp_millis();
-        let copies = keys
-            .iter()
-            .map(|key| {
-                let (secret, public_key) = self.unlocked_key(*key, now)?;
-                let private = secret.bytes();
-                seal_token(
-                    *key,
-                    &public_key,
-                    private,
-                    origin,
-                    holder,
-                    token.bytes(),
-                    now_ms,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((copies, token))
-    }
-
     /// A lease of `archive` with a key a token opened. It pins the archive and holds `slot` like
     /// a registry lease, but belongs to no unlock session.
     pub(super) fn token_lease(
@@ -661,61 +631,6 @@ impl super::BlobHandler {
             .lock()
             .map_err(|_| poisoned())?
             .claim_delete(archive)
-    }
-
-    /// Seals the unlocked key of each of `keys` with one fresh token key. Any locked generation
-    /// fails the whole credential, so no token covers only part of its buckets.
-    pub(super) fn seal_token(
-        &self,
-        keys: &[BucketKeyRef],
-        origin: (RealmId, NodeId),
-        holder: (&str, UserId),
-    ) -> BlobEvent {
-        let sealed = match self.unlocks.lock() {
-            Ok(mut registry) => registry.seal_tokens(keys, origin, holder, Instant::now()),
-            Err(_) => Err(BucketKeyError::Seal),
-        };
-        match sealed {
-            Ok((copies, token)) => BlobEvent::TokenSealed { copies, token },
-            Err(error) => BlobEvent::Error(error.into()),
-        }
-    }
-
-    /// Admits a read with the key a token opens, once a lease slot is free. The lease holds the
-    /// key, the archive pin and the slot like a registry lease, but no unlock session.
-    pub(super) async fn admit_token(
-        &self,
-        key: BucketKeyRef,
-        archive: ArchiveKey,
-        copy: (TokenCopy, [u8; 32]),
-        origin: (RealmId, NodeId),
-        token: SharedSecret,
-    ) -> BlobEvent {
-        let slots = match self.unlocks.lock() {
-            Ok(registry) => registry.lease_slots(),
-            Err(_) => return BlobEvent::Error(poisoned()),
-        };
-        let Ok(slot) = slots.acquire_owned().await else {
-            return BlobEvent::Error(poisoned());
-        };
-        let (copy, public_key) = copy;
-        let opened = match copy.key == key {
-            true => open_token(&copy, &public_key, origin, token.bytes()),
-            false => Err(BucketKeyError::InvalidToken),
-        };
-        drop(token);
-        let secret = match opened {
-            Ok(secret) => SharedSecret::new(secret),
-            Err(error) => return BlobEvent::Error(error.into()),
-        };
-        let lease = match self.unlocks.lock() {
-            Ok(registry) => registry.token_lease(key, archive, secret, slot),
-            Err(_) => Err(poisoned()),
-        };
-        match lease {
-            Ok(lease) => BlobEvent::ReadAdmitted { lease },
-            Err(error) => BlobEvent::Error(error),
-        }
     }
 
     /// Seals copies with an unlocked key; the registry lock is not held while sealing.

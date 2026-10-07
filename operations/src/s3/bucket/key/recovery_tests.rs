@@ -9,7 +9,7 @@ use aruna_core::structs::execution::notification::NotificationOutboxRecord;
 use aruna_core::structs::identity::user::vault::UserKeyRecord;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::encryption::{BucketEncryption, TokenCopy};
+use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::vault_format::key_fingerprint;
 use std::time::SystemTime;
@@ -46,12 +46,6 @@ fn copy(user_id: UserId) -> (Key, Value) {
         created_at_ms: 1,
     };
     (copy.key().into(), copy.to_bytes().unwrap().into())
-}
-
-/// A token copy row of user(2)'s credential, which never counts as a holder copy.
-fn token_row() -> (Key, Value) {
-    let key = TokenCopy::copy_key(BucketKeyRef::new(BUCKET_ID, 1), "TOKENKEY");
-    (key.into(), b"not a user copy".to_vec().into())
 }
 
 fn rows(values: Vec<Vec<u8>>) -> Event {
@@ -99,7 +93,7 @@ fn checked(admins: &[UserId], marker: Option<Vec<u8>>) -> (RecoveryNoticeOperati
     operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
     operation.step(rows(Vec::new()));
     operation.step(Event::Storage(StorageEvent::IterResult {
-        values: vec![copy(user(1)), token_row(), copy(user(2))],
+        values: vec![copy(user(1)), copy(user(2))],
         next_start_after: None,
     }));
     let effects = operation.step(Event::Storage(StorageEvent::ReadResult {

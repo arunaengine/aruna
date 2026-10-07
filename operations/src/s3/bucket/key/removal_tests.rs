@@ -8,9 +8,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::vault::UserKeyRecord;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::encryption::{
-    BucketKeyRef, EncryptionMode, GrantState, TokenCopy,
-};
+use aruna_core::structs::storage::encryption::{BucketKeyRef, EncryptionMode, GrantState};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::vault_format::key_fingerprint;
 use std::time::SystemTime;
@@ -53,17 +51,6 @@ fn copy(user_id: UserId, generation: u64) -> SealedCopy {
         key_record: Ulid::from_bytes([user_id.user_ulid.to_bytes()[0]; 16]),
         key_id: "slot".to_string(),
         enc: [0; 32],
-        ciphertext: vec![0; 48],
-        created_at_ms: 1,
-    }
-}
-
-fn token_copy(created_by: UserId) -> TokenCopy {
-    TokenCopy {
-        key: BucketKeyRef::new(BUCKET_ID, 2),
-        access_key: "TOKENKEY".to_string(),
-        created_by,
-        nonce: [0; 12],
         ciphertext: vec![0; 48],
         created_at_ms: 1,
     }
@@ -159,14 +146,11 @@ fn run_by(case: Case, admin: bool) -> (RemoveHolderOperation, Effects) {
         .map(|grant| grant.to_bytes().unwrap())
         .collect();
     operation.step(rows(grants));
-    // Every run also scans a token copy of the target, which is no holder copy and stays.
-    let mut copies: Vec<_> = case
+    let copies: Vec<_> = case
         .copies
         .iter()
         .map(|copy| (Key::from(copy.key()), Value::from(copy.to_bytes().unwrap())))
         .collect();
-    let token = token_copy(case.target);
-    copies.push((token.key().into(), b"not a user copy".to_vec().into()));
     operation.step(Event::Storage(StorageEvent::IterResult {
         values: copies,
         next_start_after: None,

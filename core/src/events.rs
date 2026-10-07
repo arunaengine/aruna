@@ -21,7 +21,7 @@ use crate::structs::placement::policy::document::{PlacementPolicyDocument, Polic
 use crate::structs::placement::policy::{MAX_REF_INPUT, PlacementDecision};
 use crate::structs::storage::blob::{BackendLocation, HiddenBlobEntry};
 use crate::structs::storage::encryption::{
-    BucketKeyRef, KeyTicket, ReadLease, SealedCopy, TokenCopy, UnlockStatus,
+    BucketKeyRef, KeyTicket, ReadLease, SealedCopy, UnlockStatus,
 };
 use crate::structs::storage::multipart::{BackendUpload, PartPiece, WorkingShare};
 use crate::structs::storage::replication::{ReplicationItemError, ReplicationSuboperationResult};
@@ -215,11 +215,6 @@ pub enum BlobEvent {
     /// The working set of one composition; the completion keeps it until composition ends.
     ComposeReserved {
         share: WorkingShare,
-    },
-    /// The token copies of one credential and its token, which only the creator receives.
-    TokenSealed {
-        copies: Vec<TokenCopy>,
-        token: SharedSecret,
     },
     Abe(Box<crate::structs::storage::abe::AbeEvent>),
 }

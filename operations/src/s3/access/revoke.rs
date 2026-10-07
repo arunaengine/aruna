@@ -376,7 +376,7 @@ mod tests {
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Iter { key_space, .. })]
-                if key_space == TOKEN_INDEX_KEYSPACE
+                if key_space == TOKEN_GRANT_KEYSPACE
         ));
         let effects = op.step(no_tokens());
         assert!(matches!(
