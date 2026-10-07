@@ -31,6 +31,17 @@ impl KeyOperation {
         if !matches!(values.len(), 8 | 9) {
             return Err(AbeError::Context.into());
         }
+        let issues = matches!(
+            self.action,
+            KeyAction::Request(_)
+                | KeyAction::Member(_)
+                | KeyAction::Token { .. }
+                | KeyAction::Publish(_)
+        );
+        // Without the user row the account status is unknown, so the grant waits and retries.
+        if issues && values[7].1.is_none() {
+            return Err(KeyError::Storage);
+        }
         let bytes = |index: usize| values[index].1.as_deref().ok_or(KeyError::Missing);
         let realm =
             RealmAuthorizationDocument::from_bytes(bytes(0)?).map_err(|_| AbeError::Context)?;
@@ -74,13 +85,6 @@ impl KeyOperation {
                 .is_some_and(|cutoff| issued < cutoff)
         });
         // A deactivated recipient or a credential issued before its user cutoff gets no new grant.
-        let issues = matches!(
-            self.action,
-            KeyAction::Request(_)
-                | KeyAction::Member(_)
-                | KeyAction::Token { .. }
-                | KeyAction::Publish(_)
-        );
         if issues && (deactivated || cut_off) {
             return Err(KeyError::Denied);
         }

@@ -433,4 +433,31 @@ mod tests {
         assert!(operation.step(failed).is_empty());
         assert_eq!(operation.finalize(), Err(KeyError::Storage));
     }
+
+    #[test]
+    fn missing_user_retries() {
+        // An absent recipient user row is unknown status: the run fails and the cursor stays.
+        let realm_id = aruna_core::structs::identity::realm::RealmId([1; 32]);
+        let auth = AuthContext::anonymous(realm_id);
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let mut operation = ReissueOperation::new("bucket".into(), auth.clone(), node, 1, 1);
+        operation.step = Step::Run;
+        operation.next = Some(progress(2, false, b"next"));
+        let action = KeyAction::Request(KeyScope::Subtree("foo/".into()));
+        let mut run = KeyOperation::new("bucket".into(), auth, node, action, 1).quiet();
+        run.state = State::Snapshot;
+        operation.runs.push(run);
+        let Some(Effect::SubOperation(mut sub)) = operation.run_next().pop() else {
+            panic!("one run starts");
+        };
+        let values = vec![(Key::from(Vec::new()), None); 8];
+        assert!(
+            sub.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+                .is_empty()
+        );
+        assert!(sub.is_complete());
+        // No progress write follows: a later run resumes from the saved cursor.
+        assert!(operation.step(sub.finalize()).is_empty());
+        assert_eq!(operation.finalize(), Err(KeyError::Storage));
+    }
 }
