@@ -1206,7 +1206,12 @@ async fn abe_issuance_reissues() -> TestResult<()> {
             send(http.post(&requests).bearer_auth(&readers[1]).json(&subtree)).await?;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["fields"]["request"]["epochs"], json!([1, 2]));
+        // One page reissued the grants; the request rows stay saved for the next issuance.
         let progress = aruna_core::keyspaces::ABE_REISSUE_KEYSPACE;
+        assert!(stored(&seed, progress, id.clone()).await.is_some());
+        let (status, body) =
+            send(http.post(&requests).bearer_auth(&readers[0]).json(&subtree)).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
         assert!(stored(&seed, progress, id).await.is_none());
         let grants = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/grants");
         let (_, own) = send(http.get(&grants).bearer_auth(&readers[0])).await?;

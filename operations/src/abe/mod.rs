@@ -493,10 +493,8 @@ impl Operation for KeyOperation {
             }
             // Delivery is retried from the stored outbox, so a lost drain timer only delays it.
             (State::Drain, Event::Task(_)) => self.walk(),
-            (State::Reissue, Event::SubOperation(SubOperationEvent::ReissuePaged { more })) => {
-                if more {
-                    return self.walk();
-                }
+            // One page per run bounds the request; saved progress resumes on the next issuance.
+            (State::Reissue, Event::SubOperation(SubOperationEvent::ReissuePaged { .. })) => {
                 self.state = State::Done;
                 self.output = self.result.take().map(Ok);
                 smallvec![]
