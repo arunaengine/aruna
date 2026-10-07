@@ -468,7 +468,7 @@ async fn pending_charge_replaced() {
         .unwrap();
     let archive_keyspace = aruna_core::keyspaces::ABE_ARCHIVE_KEYSPACE;
     let archive = get(storage, archive_keyspace, id).await.unwrap();
-    let charge = (bytes.len() + archive.len()) as u64;
+    let charge = aruna_core::structs::storage::abe::envelope_charge(&bytes, &archive);
     assert_eq!(group_bytes(storage, &sealed).await, 50 + charge);
 }
 
