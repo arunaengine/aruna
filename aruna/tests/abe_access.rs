@@ -849,6 +849,16 @@ async fn abe_holders() -> TestResult<()> {
         let (status, _) = send(http.post(&route).bearer_auth(&owner).json(&submission(&record, [1; 32], &[1; 16]))).await?;
         assert_eq!(status, StatusCode::CONFLICT);
 
+        // The listing removes the stale request; the member's repeat opens a new one and notifies.
+        // The holder's member addition above notified for the new member's request too.
+        notified(4).await?;
+        let (_, owned) = send(http.get(&requests).bearer_auth(&owner)).await?;
+        assert!(owned["records"].as_array().unwrap().is_empty(), "{owned}");
+        let (status, pending) = send(http.post(&requests).bearer_auth(&reader).json(&exact)).await?;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_ne!(pending["fields"]["request_id"], json!(context.request.request_id.to_string()));
+        notified(5).await?;
+
         // A group CEL policy that can apply to reads refuses continuing keys.
         let policies = format!("{base}/api/v1/access/policies/group/{}", group.group_id);
         let policy = json!({"policies":[{"name":"no-tmp","kind":"deny","expression":"path.startsWith('/tmp')","enabled":true}]});

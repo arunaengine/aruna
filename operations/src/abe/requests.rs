@@ -11,19 +11,27 @@ use aruna_core::structs::execution::notification::{
 use aruna_core::structs::storage::encryption::{BucketHolder, HolderOrigin};
 
 impl KeyOperation {
-    fn current_request(&self, request: &KeyRequest) -> Result<(), KeyError> {
+    /// Checks the bucket-wide request bindings that do not depend on the recipient.
+    fn current_bucket(&self, request: &KeyRequest) -> Result<(), KeyError> {
         let snapshot = self.snapshot.as_ref().ok_or(KeyError::Missing)?;
-        let key = self.newest();
         if request.expired(self.now)
             || request.parameters != snapshot.parameters
             || request.epochs != [snapshot.epoch]
             || request.revisions != snapshot.revisions
-            || request.recipient_user != self.recipient()
+            || request.bucket != self.bucket
+        {
+            return Err(AbeError::Stale.into());
+        }
+        Ok(())
+    }
+    fn current_request(&self, request: &KeyRequest) -> Result<(), KeyError> {
+        self.current_bucket(request)?;
+        let key = self.newest();
+        if request.recipient_user != self.recipient()
             || request.requesting_user != request.recipient_user
             || request.recipient_record != key.map(|k| k.record_id)
             || request.recipient_public != key.map(|k| k.public_key)
             || request.recipient_fingerprint != key.map(|k| k.fingerprint)
-            || request.bucket != self.bucket
         {
             return Err(AbeError::Stale.into());
         }
@@ -80,11 +88,13 @@ impl KeyOperation {
             (KeyAction::Open(_), Event::Storage(StorageEvent::IterResult { values, .. })) => {
                 let next = page_end(&values);
                 let mut requests = Vec::new();
-                for (_, value) in values.into_iter().take(MAX_REQUESTS) {
+                for (key, value) in values.into_iter().take(MAX_REQUESTS) {
                     match KeyRequest::from_bytes(&value) {
-                        Ok(r) if r.recipient_public.is_some() && !r.expired(self.now) => {
-                            requests.push(r)
+                        // Stale requests would fail publication, so they are removed here.
+                        Ok(r) if self.current_bucket(&r).is_err() => {
+                            self.deletes.push((ABE_REQUEST_KEYSPACE.to_string(), key))
                         }
+                        Ok(r) if r.recipient_public.is_some() => requests.push(r),
                         Ok(_) => {}
                         Err(error) => return self.fail(error),
                     }
