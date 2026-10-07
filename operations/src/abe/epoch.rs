@@ -57,10 +57,18 @@ impl KeyOperation {
 /// Marks a raise due in every encrypted bucket of a group, or of the node without a group.
 /// Returns the node managed buckets, which the node raises at once. A group without encrypted
 /// buckets costs one index scan and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DueState {
+    Scan,
+    Read,
+    Write,
+    Done,
+}
 #[derive(Debug, PartialEq)]
 pub struct EpochDueOperation {
     group_id: Option<GroupId>,
     now: u64,
+    state: DueState,
     buckets: Vec<String>,
     managed: Vec<String>,
     output: Option<Result<Vec<String>, KeyError>>,
@@ -70,12 +78,14 @@ impl EpochDueOperation {
         Self {
             group_id,
             now,
+            state: DueState::Scan,
             buckets: Vec::new(),
             managed: Vec::new(),
             output: None,
         }
     }
     fn done(&mut self) -> Effects {
+        self.state = DueState::Done;
         self.output = Some(Ok(std::mem::take(&mut self.managed)));
         smallvec![]
     }
@@ -93,8 +103,8 @@ impl Operation for EpochDueOperation {
         })]
     }
     fn step(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::IterResult { values, .. }) if self.buckets.is_empty() => {
+        match (self.state, event) {
+            (DueState::Scan, Event::Storage(StorageEvent::IterResult { values, .. })) => {
                 self.buckets = values
                     .iter()
                     .filter_map(|(key, _)| std::str::from_utf8(key.get(16..)?).ok())
@@ -113,12 +123,13 @@ impl Operation for EpochDueOperation {
                         )
                     })
                     .collect();
+                self.state = DueState::Read;
                 smallvec![Effect::Storage(StorageEffect::BatchRead {
                     reads,
                     txn_id: None
                 })]
             }
-            Event::Storage(StorageEvent::BatchReadResult { values }) => {
+            (DueState::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 let mut writes = Vec::new();
                 for (bucket, (_, value)) in self.buckets.iter().zip(values) {
                     let Ok(settings) = BucketEncryption::from_row(value.as_deref()) else {
@@ -138,13 +149,15 @@ impl Operation for EpochDueOperation {
                 if writes.is_empty() {
                     return self.done();
                 }
+                self.state = DueState::Write;
                 smallvec![Effect::Storage(StorageEffect::BatchWrite {
                     writes,
                     txn_id: None
                 })]
             }
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.done(),
+            (DueState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => self.done(),
             _ => {
+                self.state = DueState::Done;
                 self.output = Some(Err(KeyError::Storage));
                 smallvec![]
             }
@@ -158,5 +171,21 @@ impl Operation for EpochDueOperation {
     }
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_early_write() {
+        let mut operation = EpochDueOperation::new(None, 1);
+        operation.start();
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(operation.finalize(), Err(KeyError::Storage));
     }
 }
