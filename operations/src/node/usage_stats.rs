@@ -2607,8 +2607,7 @@ mod tests {
         // A pending copy row is charged its stored length, as the copy and its delete charge it.
         let group_id = Ulid::generate();
         let version = VersionKey::new("b", "copy", Ulid::generate());
-        let key = aruna_core::structs::storage::encryption::BucketKeyRef::new(Ulid::generate(), 1);
-        let row = crate::abe::copies::copy_row(key, &version).unwrap();
+        let row = crate::abe::copies::copy_row(Ulid::generate(), &version).unwrap();
         let mut operation = RebuildStatsOperation::new();
         operation.bucket_groups.insert("b".to_string(), group_id);
         operation.state = RebuildStatsState::ScanCopies;

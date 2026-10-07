@@ -335,7 +335,7 @@ async fn pending_chain_completes() {
     assert_eq!(row.source, source);
     let a_key = VersionKey::new("bucket", SOURCE, a).to_bytes().unwrap();
     let b_key = VersionKey::new("bucket", "b", b);
-    let b_row = copy_row(source.context.parameters.key, &b_key).unwrap();
+    let b_row = copy_row(source.context.parameters.key.bucket_id, &b_key).unwrap();
     let b_key = b_key.to_bytes().unwrap();
     let id = source.context.write_id.to_bytes().to_vec();
     let deletes = vec![

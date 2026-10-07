@@ -1292,56 +1292,76 @@ async fn removes_envelope_rows() {
 
 #[tokio::test]
 async fn removes_pending_copy() {
-    // Deleting a copy that waits for its envelope deletes its pending row and its charge.
+    // Deleting a copy that waits for its envelope deletes its pending row and its charge, also
+    // after a key rotation or with encryption off.
     use crate::node::usage_stats::StoredDelta;
-    use aruna_core::keyspaces::ABE_COPY_KEYSPACE;
+    use aruna_core::keyspaces::{ABE_COPY_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE};
+    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
     use aruna_core::structs::storage::usage::usage_group_key;
 
-    let temp_handle = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-    let context = DriverContext {
-        storage_handle: storage_handle.clone(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    };
-    let version_id = Ulid::generate();
-    let location = seed_pending(&storage_handle, &[version_id]).await;
-    let version = VersionKey::new("bucket", "sealed", version_id);
-    let key = location.format.bucket_key().unwrap();
-    let version = crate::abe::copies::copy_row(key, &version).unwrap();
-    storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: ABE_COPY_KEYSPACE.to_string(),
-            key: version.clone().into(),
-            value: vec![1; 8].into(),
-            txn_id: None,
-        })
+    for mode in [EncryptionMode::VaultLocked, EncryptionMode::Off] {
+        let temp_handle = tempdir().unwrap();
+        let path = temp_handle.path().to_str().unwrap();
+        let storage_handle = storage::FjallStorage::open(path).unwrap();
+        let context = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let version_id = Ulid::generate();
+        let location = seed_pending(&storage_handle, &[version_id]).await;
+        let version = VersionKey::new("bucket", "sealed", version_id);
+        let bucket_id = location.format.bucket_key().unwrap().bucket_id;
+        let version = crate::abe::copies::copy_row(bucket_id, &version).unwrap();
+        let settings = BucketEncryption {
+            mode,
+            bucket_id: Some(bucket_id),
+            key_generation: 2,
+            ..Default::default()
+        };
+        for (key_space, key, value) in [
+            (ABE_COPY_KEYSPACE, version.clone(), vec![1; 8]),
+            (
+                BUCKET_ENCRYPTION_KEYSPACE,
+                b"bucket".to_vec(),
+                settings.to_bytes().unwrap(),
+            ),
+        ] {
+            storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await;
+        }
+        let group_id = Ulid::generate();
+        let published = UsageDelta {
+            objects: 1,
+            logical_bytes: 50 + 8,
+            ..Default::default()
+        };
+        let stored = StoredDelta::of_copy(&location, 1, 80).unwrap();
+        apply_usage(
+            &storage_handle,
+            UsageCounterUpdate::with_stored(group_id, published, stored),
+        )
         .await;
-    let group_id = Ulid::generate();
-    let published = UsageDelta {
-        objects: 1,
-        logical_bytes: 50 + 8,
-        ..Default::default()
-    };
-    let stored = StoredDelta::of_copy(&location, 1, 80).unwrap();
-    apply_usage(
-        &storage_handle,
-        UsageCounterUpdate::with_stored(group_id, published, stored),
-    )
-    .await;
 
-    drive(delete_pending(group_id, version_id), &context)
-        .await
-        .unwrap();
-
-    assert!(
-        read_value(&context, ABE_COPY_KEYSPACE, version)
+        drive(delete_pending(group_id, version_id), &context)
             .await
-            .is_none()
-    );
-    let group = read_counters(&context, usage_group_key(group_id)).await;
-    assert_eq!((group.objects, group.logical_bytes), (0, 0));
+            .unwrap();
+
+        assert!(
+            read_value(&context, ABE_COPY_KEYSPACE, version)
+                .await
+                .is_none()
+        );
+        let group = read_counters(&context, usage_group_key(group_id)).await;
+        assert_eq!((group.objects, group.logical_bytes), (0, 0));
+    }
 }

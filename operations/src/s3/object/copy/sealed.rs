@@ -255,7 +255,7 @@ impl SealedCopyOperation {
             (ABE_VERSION_KEYSPACE.to_string(), source.to_bytes()?.into()),
             (
                 ABE_COPY_KEYSPACE.to_string(),
-                copy_row(key, &source)?.into(),
+                copy_row(key.bucket_id, &source)?.into(),
             ),
         ];
         reads.extend(abe_reads(key));
@@ -540,7 +540,10 @@ impl SealedCopyOperation {
     /// Fences the copy's own envelope or writes its pending row; a source without either skips.
     fn publish_envelope(&mut self) -> Result<Effects, SealedCopyError> {
         if let Some(pending) = &self.pending {
-            let key = copy_row(pending.source.context.parameters.key, &self.dest_version())?;
+            let key = copy_row(
+                pending.source.context.parameters.key.bucket_id,
+                &self.dest_version(),
+            )?;
             let value = pending.to_bytes().map_err(abe)?;
             self.envelope_bytes = value.len() as u64;
             self.step = Step::WriteEnvelope;

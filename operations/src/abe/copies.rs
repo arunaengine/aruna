@@ -34,8 +34,8 @@ use ulid::Ulid;
 
 /// Pending copies read per page while an unlock completes them.
 const COPY_PAGE: usize = 64;
-/// Length of the bucket key that prefixes each pending copy row.
-const ROW_PREFIX: usize = 24;
+/// Length of the bucket id that prefixes each pending copy row.
+const ROW_PREFIX: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CopyOutcome {
@@ -299,9 +299,10 @@ impl Operation for CopyEnvelopeOperation {
             (State::Create, Event::Blob(event)) => self.created(event),
             (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
                 self.txn = Some(txn_id);
-                let (Ok(row), Ok(version)) =
-                    (copy_row(self.key(), &self.version), self.version.to_bytes())
-                else {
+                let (Ok(row), Ok(version)) = (
+                    copy_row(self.key().bucket_id, &self.version),
+                    self.version.to_bytes(),
+                ) else {
                     return self.finish(Err(AbeError::Context));
                 };
                 let bucket = self.version.bucket.as_bytes().to_vec();
@@ -328,7 +329,7 @@ impl Operation for CopyEnvelopeOperation {
                 self.quota_step(event)
             }
             (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                let Ok(row) = copy_row(self.key(), &self.version) else {
+                let Ok(row) = copy_row(self.key().bucket_id, &self.version) else {
                     return self.finish(Err(AbeError::Context));
                 };
                 self.state = State::Delete;
@@ -385,20 +386,16 @@ impl Operation for CopyEnvelopeOperation {
     }
 }
 
-/// Key of the pending copy row of `version`, prefixed by the bucket key its source names.
-pub(crate) fn copy_row(
-    key: BucketKeyRef,
-    version: &VersionKey,
-) -> Result<Vec<u8>, ConversionError> {
-    Ok([key.key(), version.to_bytes()?].concat())
+/// Key of the pending copy row of `version`, prefixed by its stable bucket id.
+pub(crate) fn copy_row(bucket_id: Ulid, version: &VersionKey) -> Result<Vec<u8>, ConversionError> {
+    Ok([&bucket_id.to_bytes()[..], &version.to_bytes()?].concat())
 }
 
-/// The version of a pending copy row, after its bucket key prefix.
+/// The version of a pending copy row, after its bucket id prefix.
 pub(crate) fn copy_version(row: &[u8]) -> Result<VersionKey, ConversionError> {
-    let (key, version) = row
+    let (_, version) = row
         .split_at_checked(ROW_PREFIX)
         .ok_or_else(|| ConversionError::InvalidLength("pending copy row".to_string()))?;
-    BucketKeyRef::from_key(key)?;
     VersionKey::from_bytes(version)
 }
 
@@ -424,7 +421,7 @@ pub async fn complete_copies(
         let (rows, next) = iter_prefix_page(
             &context.storage_handle,
             ABE_COPY_KEYSPACE,
-            Some(key.key().into()),
+            Some(key.bucket_id.to_bytes().to_vec().into()),
             start_after,
             COPY_PAGE,
             None,
@@ -436,6 +433,10 @@ pub async fn complete_copies(
         }
         for (row, value) in &rows {
             let pending = PendingCopy::from_bytes(value).map_err(|error| error.to_string())?;
+            // Rows of another generation wait for that key.
+            if pending.source.context.parameters.key != key {
+                continue;
+            }
             let version = copy_version(row).map_err(|error| error.to_string())?;
             let mut operation = CopyEnvelopeOperation::new(version, value.to_vec(), pending);
             if let Some(quota) = &quota {

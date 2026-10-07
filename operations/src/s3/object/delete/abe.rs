@@ -6,8 +6,10 @@ use super::*;
 use crate::abe::copies::copy_row;
 use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE,
 };
 use aruna_core::structs::storage::abe::envelope_charge;
+use aruna_core::structs::storage::encryption::BucketEncryption;
 
 impl DeleteObjectOperation {
     fn target_key(&self) -> Result<VersionKey, DeleteObjectError> {
@@ -29,26 +31,35 @@ impl DeleteObjectOperation {
             Ok(key) => key,
             Err(err) => return self.emit_error(err),
         };
+        let bucket = self.input.bucket.as_bytes().to_vec();
         self.state = DeleteObjectState::ReadEnvelopeVersion;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: ABE_VERSION_KEYSPACE.to_string(),
-            key: key.into(),
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (ABE_VERSION_KEYSPACE.to_string(), key.into()),
+                (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.into()),
+            ],
             txn_id: self.txn_id,
         })]
     }
     pub(super) fn envelope_version_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
-        let Some(id) = value else {
-            // A pending copy has no envelope yet, only its pending row under its bucket key.
-            let location = self.target_archive.as_ref().and_then(|(_, l)| l.as_ref());
-            let Some(bucket_key) = location.and_then(|l| l.format.bucket_key()) else {
+        let [(_, value), (_, settings)] = values.as_slice() else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let Some(id) = value.clone() else {
+            // A pending copy has no envelope yet, only its pending row under the stable bucket id.
+            let settings = match BucketEncryption::from_row(settings.as_deref()) {
+                Ok(settings) => settings,
+                Err(err) => return self.emit_error(err.into()),
+            };
+            let Some(bucket_id) = settings.bucket_id else {
                 return self.remove_managed_copies();
             };
             let key = match self
                 .target_key()
-                .and_then(|version| Ok(copy_row(bucket_key, &version)?))
+                .and_then(|version| Ok(copy_row(bucket_id, &version)?))
             {
                 Ok(key) => key,
                 Err(err) => return self.emit_error(err),
