@@ -1389,6 +1389,15 @@ async fn apply_realm_config(
             index.compact(&mut reducer_state);
         }
 
+        let cutoff_owner = match &event.op {
+            AdminDocumentOperation::ConfigTokenRevoked { token_owner, .. } => Some(*token_owner),
+            _ => None,
+        };
+        let cutoff_before = cutoff_owner.and_then(|owner| {
+            previous_config
+                .as_ref()
+                .and_then(|config| config.user_cutoff(&owner, effective_now))
+        });
         let (config, config_changed) = match plan_realm_change(
             previous_config,
             realm_id,
@@ -1409,6 +1418,13 @@ async fn apply_realm_config(
             return Ok(());
         }
 
+        // A new or later user cutoff ends READ for a deactivated account; a replay leaves it equal.
+        let cutoff_raised = cutoff_owner.is_some_and(|owner| {
+            config
+                .as_ref()
+                .and_then(|config| config.user_cutoff(&owner, effective_now))
+                > cutoff_before
+        });
         let mut writes = Vec::new();
         if config_changed && let Some(config) = config {
             let bytes = match config.to_bytes(&event.actor) {
@@ -1438,8 +1454,8 @@ async fn apply_realm_config(
         };
         writes.push(reducer_write);
         // A replayed policy event is a duplicate and writes no new due marker.
-        if applied {
-            match due_writes(storage, &event, false, None, Some(txn_id)).await {
+        if applied || cutoff_raised {
+            match due_writes(storage, &event, cutoff_raised, None, Some(txn_id)).await {
                 Ok(due) => writes.extend(due),
                 Err(error) => return Err(abort_error(storage, txn_id, error).await),
             }

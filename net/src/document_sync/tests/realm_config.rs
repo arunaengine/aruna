@@ -696,6 +696,106 @@ async fn policy_replay_unmarked() {
 }
 
 #[tokio::test]
+async fn cutoff_marks_due() {
+    // A replicated user cutoff marks encrypted buckets due; its replay writes no new marker.
+    use aruna_core::keyspaces::{
+        ABE_DUE_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+    };
+    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([68; 32]);
+    let actor = test_actor(
+        11,
+        UserId::local(Ulid::from_parts(1_640, 1), realm_id),
+        realm_id,
+    );
+    let target = AdminDocumentTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
+    let bucket_id = Ulid::from_parts(1_641, 1);
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(bucket_id),
+        key_generation: 1,
+        ..Default::default()
+    };
+    let index = [&Ulid::from_parts(1_642, 1).to_bytes()[..], b"bucket-a"].concat();
+    let rows = vec![
+        (
+            BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            b"bucket-a".to_vec().into(),
+            settings.to_bytes().unwrap().into(),
+        ),
+        (
+            GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            index.into(),
+            Vec::new().into(),
+        ),
+    ];
+    batch_write_to(&storage, rows).await.unwrap();
+    let bootstrap = [
+        AdminDocumentOperation::ConfigSettingsSet {
+            metadata_replication: MetadataReplicationConfig::new(3),
+            discovery: test_discovery(25, "https://cutoff.example:443"),
+        },
+        AdminDocumentOperation::ConfigNodeEnsured {
+            node_id: actor.node_id,
+            kind: RealmNodeKind::Server,
+        },
+    ];
+    for (seq, op) in (1u64..).zip(bootstrap) {
+        let event = test_admin_event(
+            Ulid::from_parts(1_643, seq.into()),
+            target.clone(),
+            &actor,
+            seq,
+            op,
+        );
+        apply_admin_operation(&storage, document_target.clone(), event)
+            .await
+            .expect("bootstrap event applies");
+    }
+    let due: ByteView = bucket_id.to_bytes().to_vec().into();
+    assert!(
+        read_storage_value(&storage, ABE_DUE_KEYSPACE, due.clone())
+            .await
+            .is_none()
+    );
+
+    let owner = UserId::local(Ulid::from_parts(1_644, 1), realm_id);
+    let cutoff = test_admin_event(
+        Ulid::from_parts(1_645, 1),
+        target,
+        &actor,
+        3,
+        AdminDocumentOperation::ConfigTokenRevoked {
+            token_hash: aruna_core::auth::user_cutoff_hash(&owner),
+            expires_at: aruna_core::auth::user_cutoff_expiry(unix_timestamp_secs()),
+            token_owner: owner,
+        },
+    );
+    apply_admin_operation(&storage, document_target.clone(), cutoff.clone())
+        .await
+        .expect("user cutoff applies");
+    assert!(
+        read_storage_value(&storage, ABE_DUE_KEYSPACE, due.clone())
+            .await
+            .is_some()
+    );
+
+    batch_delete_to(&storage, vec![(ABE_DUE_KEYSPACE.to_string(), due.clone())])
+        .await
+        .unwrap();
+    apply_admin_operation(&storage, document_target, cutoff)
+        .await
+        .expect("replayed user cutoff applies");
+    assert!(
+        read_storage_value(&storage, ABE_DUE_KEYSPACE, due)
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn replicated_revocation_applies() {
     // A revocation replicated from another node must pass the realm-config
     // storage-apply whitelist and deny the token on this node.
