@@ -69,7 +69,7 @@ pub enum RewriteOutcome {
     Skipped,
     /// The source copy needs a key generation that is locked on this node.
     AwaitingKey,
-    /// A re-key must come back: the version's content or format is still pending.
+    /// A re-key must come back: the version is still pending or changed before publication.
     Unfinished,
 }
 
@@ -399,12 +399,13 @@ impl RewriteVersionOperation {
             (Ok(_), Ok(None)) => false,
             (Err(error), _) | (_, Err(error)) => return self.fail(error.into()),
         };
+        // A re-key comes back for a version that changed before publication.
         if !current {
-            return self.end(RewriteOutcome::Skipped);
+            return self.end(self.waits(true));
         }
         match self.check_envelope(envelope) {
             Ok(true) => {}
-            Ok(false) => return self.end(RewriteOutcome::Skipped),
+            Ok(false) => return self.end(self.waits(true)),
             Err(error) => return self.fail(error),
         }
         match read_version_effect(&self.version_key, self.txn_id) {
@@ -422,7 +423,7 @@ impl RewriteVersionOperation {
             Err(effects) => return effects,
         };
         if current != self.version {
-            return self.end(RewriteOutcome::Skipped);
+            return self.end(self.waits(true));
         }
         let governed = (self.version.as_ref()).is_some_and(|v| !v.placement_policies.is_empty());
         let Some(old) = self.old.as_ref().filter(|_| governed) else {

@@ -538,6 +538,39 @@ mod envelopes {
     }
 
     #[test]
+    fn rekey_retries_completion() {
+        // Delayed copy completion publishes an envelope after the re-key read the pending row.
+        let target = TransitionTarget {
+            compression: Compression::Off,
+            plan: Some(plan(2)),
+        };
+        let unit = EncryptionTransition::new(TransitionKind::Rotate, None, target, 0, 100);
+        let mut operation = operation(unit).rekey();
+        let (pending, completed) = (rows(false, true, 2), rows(true, false, 2));
+        let reads = std::cell::Cell::new(0);
+        let answer = |space: &str| {
+            reads.set(reads.get() + usize::from(space == ABE_VERSION_KEYSPACE));
+            match reads.get() {
+                0 | 1 => pending(space),
+                _ => completed(space),
+            }
+        };
+        let (old, new) = (location(Some(2)), location(Some(2)));
+        let effects = fenced(&mut operation, (&old, answer), (settings(2, 0), new, 1));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: TxnId::default(),
+        }));
+        let id = operation.new.as_ref().unwrap().ulid;
+        operation.step(Event::Blob(BlobEvent::ReservationReleased { id }));
+        // The walk comes back for it instead of passing it with the old object key.
+        assert_eq!(operation.finalize(), Ok(RewriteOutcome::Unfinished));
+    }
+
+    #[test]
     fn decrypt_drops_envelope() {
         let mut operation = operation(transition(TransitionKind::Decrypt, Some(1), None));
         let new = location(None);
