@@ -1999,11 +1999,18 @@ fn envelope_limit_boundary() {
     let location = operation.final_location.as_ref().unwrap();
     let mut archive: EnvelopeArchive = postcard::from_bytes(mapping).unwrap();
     assert!(archive.location_key.is_empty());
-    let key = BlobLocationKey::new([1; 32], location.format.encoding(), location.backend.clone());
+    let key = BlobLocationKey::new(
+        [1; 32],
+        location.format.encoding(),
+        location.backend.clone(),
+    );
     archive.location_key = key.to_bytes();
     let promoted = postcard::to_allocvec(&archive).unwrap();
     assert!(promoted.len() > mapping.len() + 1);
-    assert_eq!(operation.envelope_bytes, envelope_charge(envelope, &promoted));
+    assert_eq!(
+        operation.envelope_bytes,
+        envelope_charge(envelope, &promoted)
+    );
     assert_eq!(operation.envelope_bytes, envelope_charge(envelope, mapping));
     let metadata = &operation.upload_record.as_ref().unwrap().metadata;
     let metadata = postcard::to_allocvec(metadata).unwrap();
