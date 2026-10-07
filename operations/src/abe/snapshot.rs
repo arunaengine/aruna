@@ -78,6 +78,7 @@ impl KeyOperation {
         let restrictions = match &self.action {
             KeyAction::Publish(grant) => grant.context.request.restrictions.as_deref(),
             KeyAction::Member(_) => None,
+            KeyAction::Token { restrictions, .. } => restrictions.as_deref(),
             _ => self.auth.path_restrictions.as_deref(),
         };
         let rules =
@@ -112,7 +113,8 @@ impl KeyOperation {
         }
         Ok(())
     }
-    /// Literal scopes of the recipient's direct READ or WRITE rules; the whole bucket wins.
+    /// Literal scopes of the recipient's direct READ or WRITE rules and a token's restrictions;
+    /// the whole bucket wins.
     pub(super) fn member_scopes(&self) -> Result<Vec<KeyScope>, KeyError> {
         let snapshot = self.snapshot.as_ref().ok_or(KeyError::Missing)?;
         if snapshot.policies {
@@ -122,7 +124,19 @@ impl KeyOperation {
         let inner = format!("{root}/");
         let glob = |v: &str| v.contains(['*', '?', '[', ']', '{', '}', '\\']);
         let mut scopes = Vec::new();
-        for (pattern, permission) in snapshot.rules.direct_patterns() {
+        let mut patterns = snapshot.rules.direct_patterns();
+        if let KeyAction::Token {
+            restrictions: Some(restrictions),
+            ..
+        } = &self.action
+        {
+            patterns.extend(
+                restrictions
+                    .iter()
+                    .map(|r| (r.pattern.clone(), r.permission.clone())),
+            );
+        }
+        for (pattern, permission) in patterns {
             let scope = match pattern.strip_suffix("**") {
                 _ if permission == Permission::DENY => continue,
                 Some(base) if !glob(base) && inner.starts_with(base) => {

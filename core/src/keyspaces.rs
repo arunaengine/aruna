@@ -141,6 +141,9 @@ pub const PENDING_RECLAIM_KEYSPACE: &str = "pending_reclaims";
 pub const BUCKET_RECOVERY_KEYSPACE: &str = "bucket_recovery";
 /// The token copies of each S3 credential, keyed by access key and key reference. Values are empty.
 pub const TOKEN_INDEX_KEYSPACE: &str = "bucket_key_tokens";
+/// Key requests and grants of each S3 credential's token, keyed by access key, a zero byte and
+/// the request key. Values are empty.
+pub const TOKEN_GRANT_KEYSPACE: &str = "token_grants";
 /// The content hash a sender claimed for a received pending archive, keyed by archive.
 pub const PENDING_CLAIM_KEYSPACE: &str = "pending_claims";
 /// Replication jobs waiting for a locked source key, keyed by key reference and job key.
@@ -526,6 +529,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     COPY_WAIT_KEYSPACE,
     PLAINTEXT_COPY_KEYSPACE,
     GROUP_ENCRYPTED_KEYSPACE,
+    TOKEN_GRANT_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

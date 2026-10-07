@@ -26,12 +26,9 @@ impl KeyOperation {
     }
     fn current_request(&self, request: &KeyRequest) -> Result<(), KeyError> {
         self.current_bucket(request)?;
-        let key = self.newest();
         if request.recipient_user != self.recipient()
             || request.requesting_user != request.recipient_user
-            || request.recipient_record != key.map(|k| k.record_id)
-            || request.recipient_public != key.map(|k| k.public_key)
-            || request.recipient_fingerprint != key.map(|k| k.fingerprint)
+            || !self.recipient_current(request)
         {
             return Err(AbeError::Stale.into());
         }
@@ -39,16 +36,42 @@ impl KeyOperation {
     }
     pub(super) fn grant_allowed(&self, request: &KeyRequest) -> Result<(), KeyError> {
         let snapshot = self.snapshot.as_ref().ok_or(KeyError::Missing)?;
-        let key = self.newest();
         if request.parameters != snapshot.parameters
             || request.bucket != self.bucket
-            || request.recipient_record != key.map(|k| k.record_id)
-            || request.recipient_public != key.map(|k| k.public_key)
-            || request.recipient_fingerprint != key.map(|k| k.fingerprint)
+            || !self.recipient_current(request)
         {
             return Err(AbeError::Stale.into());
         }
         self.scope_allowed(&request.scope)
+    }
+    /// Whether `request` names the current recipient key: the newest user key, or a token key.
+    fn recipient_current(&self, request: &KeyRequest) -> bool {
+        let key = match (&self.action, &request.credential_id) {
+            (_, None) => self
+                .newest()
+                .map(|k| (k.record_id, k.public_key, k.fingerprint)),
+            (KeyAction::Token { access_key, .. }, Some(id)) if id != access_key => return false,
+            (
+                KeyAction::Token {
+                    access_key,
+                    public_key,
+                    ..
+                },
+                _,
+            ) => token_recipient(access_key, *public_key),
+            // A stored token request keeps its key; revoking the credential deletes it.
+            (_, Some(_)) => return request.recipient_public.is_some(),
+        };
+        request.recipient_record == key.map(|k| k.0)
+            && request.recipient_public == key.map(|k| k.1)
+            && request.recipient_fingerprint == key.map(|k| k.2)
+    }
+    /// The access key whose requests this action handles; user requests have none.
+    fn credential(&self) -> Option<&str> {
+        match &self.action {
+            KeyAction::Token { access_key, .. } => Some(access_key),
+            _ => None,
+        }
     }
     pub(super) fn records_read(&mut self, event: Event) -> Effects {
         let action = self.action.clone();
@@ -79,12 +102,13 @@ impl KeyOperation {
                 KeyAction::Request(scope),
                 Event::Storage(StorageEvent::IterResult { values, .. }),
             ) => self.request_read(scope, values),
-            (KeyAction::Member(_), Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                match self.scopes.pop() {
-                    Some(scope) => self.request_read(scope, values),
-                    None => self.fail(AbeError::Context),
-                }
-            }
+            (
+                KeyAction::Member(_) | KeyAction::Token { .. },
+                Event::Storage(StorageEvent::IterResult { values, .. }),
+            ) => match self.scopes.pop() {
+                Some(scope) => self.request_read(scope, values),
+                None => self.fail(AbeError::Context),
+            },
             (KeyAction::Open(_), Event::Storage(StorageEvent::IterResult { values, .. })) => {
                 let next = page_end(&values);
                 let mut requests = Vec::new();
@@ -111,6 +135,10 @@ impl KeyOperation {
                         Ok(_) => return self.fail(KeyError::Denied),
                         Err(error) => return self.fail(error),
                     };
+                    // Token grants are the credential's, listed with the bucket's tokens.
+                    if grant.context.request.credential_id.is_some() {
+                        continue;
+                    }
                     if self.grant_allowed(&grant.context.request).is_err() {
                         self.deletes.push((ABE_GRANT_KEYSPACE.to_string(), key));
                     } else {
@@ -134,14 +162,18 @@ impl KeyOperation {
                 Ok(r) => r,
                 Err(error) => return self.fail(error),
             };
+            if request.credential_id.as_deref() != self.credential() {
+                continue;
+            }
             if self.current_request(&request).is_err() {
                 self.deletes.push((ABE_REQUEST_KEYSPACE.to_string(), key));
             } else {
                 open.push(request);
             }
         }
+        // A token's restrictions narrow its scopes instead.
         let restrictions = match self.action {
-            KeyAction::Member(_) => None,
+            KeyAction::Member(_) | KeyAction::Token { .. } => None,
             _ => self.auth.path_restrictions.clone(),
         };
         let same = open
@@ -153,19 +185,31 @@ impl KeyOperation {
             (Some(index), _) => open.swap_remove(index),
             (None, None) => return self.fail(KeyError::Missing),
             (None, Some(s)) => {
-                let key = self.newest();
+                let key = match &self.action {
+                    KeyAction::Token {
+                        access_key,
+                        public_key,
+                        ..
+                    } => match token_recipient(access_key, *public_key) {
+                        Some(key) => Some(key),
+                        None => return self.fail(AbeError::Context),
+                    },
+                    _ => self
+                        .newest()
+                        .map(|k| (k.record_id, k.public_key, k.fingerprint)),
+                };
                 KeyRequest {
                     request_id: Ulid::generate(),
                     requesting_user: self.recipient(),
                     recipient_user: self.recipient(),
-                    recipient_record: key.map(|k| k.record_id),
-                    recipient_public: key.map(|k| k.public_key),
-                    recipient_fingerprint: key.map(|k| k.fingerprint),
+                    recipient_record: key.map(|k| k.0),
+                    recipient_public: key.map(|k| k.1),
+                    recipient_fingerprint: key.map(|k| k.2),
                     bucket: self.bucket.clone(),
                     parameters: s.parameters.clone(),
                     scope,
                     epochs: vec![s.epoch],
-                    credential_id: None,
+                    credential_id: self.credential().map(str::to_string),
                     restrictions,
                     revisions: s.revisions.clone(),
                     created_at_ms: self.now,
@@ -198,6 +242,9 @@ impl KeyOperation {
                 Err(error) => return self.fail(error),
             };
             let held = &grant.context.request;
+            if held.credential_id != request.credential_id {
+                continue;
+            }
             if self.grant_allowed(held).is_err() {
                 self.deletes.push((ABE_GRANT_KEYSPACE.to_string(), key));
                 continue;
@@ -263,6 +310,7 @@ impl KeyOperation {
             .push((ABE_REQUEST_KEYSPACE.to_string(), key.clone()));
         self.writes
             .push((ABE_GRANT_KEYSPACE.to_string(), key, bytes.into()));
+        self.index_token(&grant.context.request);
         self.result = Some(KeyResult::Grant(grant));
         self.flush()
     }
@@ -276,7 +324,19 @@ impl KeyOperation {
             request.key().into(),
             bytes.into(),
         ));
+        self.index_token(&request);
         self.flush()
+    }
+    /// Lists a token's request or grant under its credential, so revocation finds it.
+    fn index_token(&mut self, request: &KeyRequest) {
+        if let Some(key) = request.token_key() {
+            let row = (
+                TOKEN_GRANT_KEYSPACE.to_string(),
+                key.into(),
+                Vec::new().into(),
+            );
+            self.writes.push(row);
+        }
     }
 }
 

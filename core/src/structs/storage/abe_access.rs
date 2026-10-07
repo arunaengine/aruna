@@ -2,10 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::abe::{AbeError, AbeParameters};
+use super::abe::{AbeError, AbeParameters, GRANT_PURPOSE, ObjectEnvelope, check_object};
+use crate::compute::{SecretBytes, SharedSecret};
+use crate::key_seal::{SealedSecret, open_sealed};
 use crate::structs::identity::auth::PathRestriction;
 use crate::{NodeId, UserId};
-use aruna_kpabe::{Attribute, Policy, frame_context};
+use aruna_kpabe::{Attribute, Envelope, Policy, UserKey, frame_context};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -96,6 +98,33 @@ impl KeyRequest {
     pub fn expired(&self, now: u64) -> bool {
         now.saturating_sub(self.created_at_ms) >= REQUEST_TTL
     }
+    /// The `token_grants` row of a credential's request: the access key prefix, then its key.
+    pub fn token_key(&self) -> Option<Vec<u8>> {
+        let access_key = self.credential_id.as_deref()?;
+        Some([token_prefix(access_key), self.key()].concat())
+    }
+    /// Whether this scope's key may open the envelope of `key`.
+    pub fn covers(&self, key: &str) -> bool {
+        match &self.scope {
+            KeyScope::Exact(exact) => exact == key,
+            KeyScope::Subtree(prefix) => key.starts_with(prefix.as_str()),
+        }
+    }
+}
+
+/// Scan prefix of one credential's `token_grants` rows; access keys are alphanumeric.
+pub fn token_prefix(access_key: &str) -> Vec<u8> {
+    [access_key.as_bytes(), &[0]].concat()
+}
+
+/// The recipient record, public key and fingerprint of the token key of `access_key`.
+pub fn token_recipient(access_key: &str, public: [u8; 32]) -> Option<(Ulid, [u8; 32], [u8; 32])> {
+    let record = Ulid::from_string(access_key).ok()?;
+    Some((
+        record,
+        public,
+        crate::vault_format::key_fingerprint(&public),
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +200,30 @@ impl KeyGrant {
         let value: Self = postcard::from_bytes(bytes).map_err(|_| AbeError::Context)?;
         value.to_bytes()?;
         Ok(value)
+    }
+    /// Opens the scoped key with `token`, then the object key of `envelope`.
+    /// A token that does not open this grant fails as `WrongKey`.
+    pub fn open_object(
+        &self,
+        token: &SecretBytes,
+        envelope: &ObjectEnvelope,
+    ) -> Result<SharedSecret, AbeError> {
+        let token: &[u8; 32] = token.expose().try_into().map_err(|_| AbeError::WrongKey)?;
+        let parameters = self.context.request.parameters.public()?;
+        let aad = self.context.bytes()?;
+        let sealed = SealedSecret {
+            enc: self.enc,
+            ciphertext: self.ciphertext.clone(),
+        };
+        let opened = open_sealed(token, &sealed, GRANT_PURPOSE, &aad);
+        let opened = opened.map_err(|_| AbeError::WrongKey)?;
+        let transport = [&self.enc[..], &self.ciphertext].concat();
+        let key = UserKey::open(&parameters, &transport, |_| Ok(opened))?;
+        let cipher = Envelope::from_bytes(&parameters, &envelope.abe)?;
+        let object = aruna_kpabe::open(&parameters, &key, &cipher, &envelope.context.bytes()?)?;
+        let private = SharedSecret::new(SecretBytes::new(object.as_bytes().to_vec()));
+        check_object(private.bytes(), envelope)?;
+        Ok(private)
     }
 }
 

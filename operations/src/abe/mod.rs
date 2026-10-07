@@ -15,7 +15,7 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::*;
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::user::vault::{UserKeyRecord, VaultRecords};
 use aruna_core::structs::storage::abe::{AbeEffect, AbeError, AbeEvent, AbeParameters};
 use aruna_core::structs::storage::abe_access::*;
@@ -36,6 +36,13 @@ pub enum KeyAction {
     Publish(KeyGrant),
     /// Opens requests for a member's direct read scopes after a role grant by the caller.
     Member(aruna_core::UserId),
+    /// Opens requests of the caller's new credential, sealed to its token key and narrowed by
+    /// its path restrictions.
+    Token {
+        access_key: String,
+        public_key: [u8; 32],
+        restrictions: Option<Vec<PathRestriction>>,
+    },
 }
 #[derive(Debug, PartialEq)]
 pub enum KeyResult {
@@ -236,7 +243,9 @@ impl KeyOperation {
             }
             KeyAction::Open(_) if !snapshot.holder => return self.fail(KeyError::Denied),
             KeyAction::Open(cursor) => (ABE_REQUEST_KEYSPACE, bucket, cursor.clone()),
-            KeyAction::Request(_) | KeyAction::Member(_) => (ABE_REQUEST_KEYSPACE, own, None),
+            KeyAction::Request(_) | KeyAction::Member(_) | KeyAction::Token { .. } => {
+                (ABE_REQUEST_KEYSPACE, own, None)
+            }
             KeyAction::Grants(cursor) => (ABE_GRANT_KEYSPACE, own, cursor.clone()),
         };
         self.state = State::Records;
@@ -288,7 +297,7 @@ impl KeyOperation {
         {
             return effects;
         }
-        if matches!(self.action, KeyAction::Member(_))
+        if matches!(self.action, KeyAction::Member(_) | KeyAction::Token { .. })
             && !matches!(self.result, Some(KeyResult::Opened(_)))
         {
             return self.next_scope();
@@ -340,7 +349,7 @@ impl Operation for KeyOperation {
                 if matches!(self.action, KeyAction::Open(_)) {
                     return self.records();
                 }
-                if matches!(self.action, KeyAction::Member(_)) {
+                if matches!(self.action, KeyAction::Member(_) | KeyAction::Token { .. }) {
                     match self.member_scopes() {
                         Ok(scopes) if scopes.is_empty() => {
                             self.result = Some(KeyResult::Opened(Vec::new()));
@@ -349,6 +358,10 @@ impl Operation for KeyOperation {
                         Ok(scopes) => self.scopes = scopes,
                         Err(error) => return self.fail(error),
                     }
+                }
+                // A token is its own recipient key, so the vault is not read.
+                if matches!(self.action, KeyAction::Token { .. }) {
+                    return self.records();
                 }
                 let mut keys = ReadVaultOperation::new(ReadVaultConfig {
                     node_id: self.node,
