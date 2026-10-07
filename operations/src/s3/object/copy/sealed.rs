@@ -604,17 +604,18 @@ impl SealedCopyOperation {
     /// The copy adds a logical object but no physical bytes: the archive is already credited.
     fn start_quota(&mut self) -> Result<Effects, SealedCopyError> {
         let txn_id = self.txn()?;
+        let added = self.input.size.saturating_add(self.envelope_bytes);
         let delta = UsageDelta {
             objects: i128::from(!self.was_live),
-            logical_bytes: i128::from(self.input.size) + i128::from(self.envelope_bytes),
+            logical_bytes: i128::from(added),
             ..Default::default()
         };
         self.usage = Some(UsageCounterUpdate::for_group(self.input.group_id, delta));
-        match self.input.quota_ceiling.filter(|_| self.input.size > 0) {
+        match self.input.quota_ceiling.filter(|_| added > 0) {
             Some(ceiling) => {
                 let mut gate = QuotaGate::new_for_realm(
                     ceiling,
-                    self.input.size,
+                    added,
                     self.input.group_id,
                     self.input.node_id,
                     self.input.realm_id,

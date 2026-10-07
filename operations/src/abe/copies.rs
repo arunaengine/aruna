@@ -4,8 +4,10 @@
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::store::iter_prefix_page;
-use crate::node::usage_stats::UsageCounterUpdate;
+use crate::node::usage_stats::{QuotaGate, UsageCounterUpdate};
+use crate::realm::get_config::GetConfigOperation;
 use crate::s3::object::put::abe::{abe_reads, envelope_rows, parse_abe};
+use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -15,6 +17,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::storage::abe::{
     AbeEffect, AbeError, AbeEvent, EnvelopeArchive, ObjectEnvelope, PendingCopy,
 };
@@ -51,6 +54,7 @@ enum State {
     Start,
     Check,
     Locate,
+    Quota,
     Write,
     Delete,
     Usage,
@@ -70,6 +74,11 @@ pub struct CopyEnvelopeOperation {
     /// Metadata, group and location key of the checked version, kept until it is published.
     stored: Option<(HashMap<String, String>, GroupId, Vec<u8>)>,
     usage: Option<UsageCounterUpdate>,
+    /// Realm quota and origin; none leaves the group unlimited.
+    quota: Option<(QuotaConfig, RealmId, NodeId)>,
+    gate: Option<QuotaGate>,
+    /// The envelope write, held while the quota gate runs.
+    write: Option<Effect>,
     output: Option<Result<CopyOutcome, AbeError>>,
 }
 
@@ -84,8 +93,16 @@ impl CopyEnvelopeOperation {
             envelope: None,
             stored: None,
             usage: None,
+            quota: None,
+            gate: None,
+            write: None,
             output: None,
         }
+    }
+
+    pub fn with_quota(mut self, quota: QuotaConfig, realm: RealmId, node: NodeId) -> Self {
+        self.quota = Some((quota, realm, node));
+        self
     }
 
     fn key(&self) -> BucketKeyRef {
@@ -202,15 +219,49 @@ impl CopyEnvelopeOperation {
         match envelope_rows(envelope, &self.version, &archive, rows) {
             Ok((effect, charge)) => {
                 // The envelope replaces the pending row and its charge.
+                let added = i128::from(charge) - self.row.len() as i128;
                 let delta = UsageDelta {
-                    logical_bytes: i128::from(charge) - self.row.len() as i128,
+                    logical_bytes: added,
                     ..Default::default()
                 };
                 self.usage = Some(UsageCounterUpdate::for_group(group, delta));
+                let ceiling = self.quota.as_ref().and_then(|(quota, realm, node)| {
+                    let ceiling = quota.effective_group_ceiling(&group)?;
+                    Some((ceiling, *realm, *node))
+                });
+                let (Some(txn_id), Some((ceiling, realm, node)), true) =
+                    (self.txn, ceiling, added > 0)
+                else {
+                    self.state = State::Write;
+                    return smallvec![effect];
+                };
+                let mut gate = QuotaGate::new_for_realm(ceiling, added as u64, group, node, realm);
+                let effects = gate.start(txn_id);
+                self.gate = Some(gate);
+                self.write = Some(effect);
+                self.state = State::Quota;
+                effects
+            }
+            Err(error) => self.finish(Err(error)),
+        }
+    }
+
+    /// A positive replacement charge must fit the group quota.
+    fn quota_step(&mut self, event: Event) -> Effects {
+        let (Some(txn_id), Some(gate)) = (self.txn, self.gate.as_mut()) else {
+            return self.finish(Err(AbeError::Context));
+        };
+        match gate.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) if gate.is_exceeded() => self.finish(Err(AbeError::Limit)),
+            Ok(None) => {
+                let Some(effect) = self.write.take() else {
+                    return self.finish(Err(AbeError::Context));
+                };
                 self.state = State::Write;
                 smallvec![effect]
             }
-            Err(error) => self.finish(Err(error)),
+            Err(_) => self.finish(Err(AbeError::Unavailable)),
         }
     }
 }
@@ -272,6 +323,9 @@ impl Operation for CopyEnvelopeOperation {
             }
             (State::Locate, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
                 self.located(value)
+            }
+            (State::Quota, event @ Event::Storage(_)) if self.gate.is_some() => {
+                self.quota_step(event)
             }
             (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
                 let Ok(row) = copy_row(self.key(), &self.version) else {
@@ -358,7 +412,12 @@ pub(crate) fn still_active(row: Option<&[u8]>, key: BucketKeyRef) -> Result<(), 
 }
 
 /// Pages through pending copies and envelopes those of `key`; a lock in between stops the walk.
-pub async fn complete_copies(context: &DriverContext, key: BucketKeyRef) -> Result<usize, String> {
+pub async fn complete_copies(
+    context: &DriverContext,
+    key: BucketKeyRef,
+    (realm, node): (RealmId, NodeId),
+) -> Result<usize, String> {
+    let mut quota = None;
     let mut start_after = None;
     let mut completed = 0;
     loop {
@@ -371,10 +430,17 @@ pub async fn complete_copies(context: &DriverContext, key: BucketKeyRef) -> Resu
             None,
         )
         .await?;
+        if quota.is_none() && !rows.is_empty() {
+            let config = drive(GetConfigOperation::new(realm), context).await;
+            quota = Some(config.map_err(|error| error.to_string())?.quota);
+        }
         for (row, value) in &rows {
             let pending = PendingCopy::from_bytes(value).map_err(|error| error.to_string())?;
             let version = copy_version(row).map_err(|error| error.to_string())?;
-            let operation = CopyEnvelopeOperation::new(version, value.to_vec(), pending);
+            let mut operation = CopyEnvelopeOperation::new(version, value.to_vec(), pending);
+            if let Some(quota) = &quota {
+                operation = operation.with_quota(quota.clone(), realm, node);
+            }
             match drive(operation, context).await {
                 Ok(CopyOutcome::Completed) => completed += 1,
                 Ok(CopyOutcome::Gone) => {}

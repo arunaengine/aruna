@@ -471,3 +471,41 @@ async fn pending_charge_replaced() {
     let charge = (bytes.len() + archive.len()) as u64;
     assert_eq!(group_bytes(storage, &sealed).await, 50 + charge);
 }
+
+#[tokio::test]
+async fn quota_counts_envelope() {
+    // The quota gate sees the pending charge too, at the boundary and for an empty object.
+    let (_temp, context) = context();
+    let storage = &context.storage_handle;
+    let (sealed, source_id, _) = sealed(storage).await;
+    let copy = copy_input(&sealed, (SOURCE, source_id), "a");
+    run(SealedCopyOperation::new(copy), storage, None, Race::Off)
+        .await
+        .unwrap();
+    let used = group_bytes(storage, &sealed).await;
+    let limited = |dest: &str, size: u64, ceiling: u64| SealedCopyInput {
+        size,
+        quota_ceiling: Some(ceiling),
+        ..copy_input(&sealed, (SOURCE, source_id), dest)
+    };
+    let refused = run(
+        SealedCopyOperation::new(limited("b", 50, 2 * used - 1)),
+        storage,
+        None,
+        Race::Off,
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        Err(SealedCopyError::QuotaExceeded { .. })
+    ));
+    let empty = SealedCopyOperation::new(limited("b", 0, used));
+    let refused = run(empty, storage, None, Race::Off).await;
+    assert!(matches!(
+        refused,
+        Err(SealedCopyError::QuotaExceeded { .. })
+    ));
+    let fits = SealedCopyOperation::new(limited("b", 50, 2 * used));
+    run(fits, storage, None, Race::Off).await.unwrap();
+    assert_eq!(group_bytes(storage, &sealed).await, 2 * used);
+}
