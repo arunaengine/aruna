@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod copies;
+mod enumerate;
 pub mod envelope;
 mod epoch;
 mod member;
@@ -57,6 +58,8 @@ pub enum KeyAction {
     },
     /// Refuses all but unrestricted key holders, then raises a due epoch, before a re-key.
     Rekey,
+    /// Opens enumerated grants for the current writes under a prefix that the caller may read.
+    Writes(String),
 }
 #[derive(Debug, PartialEq)]
 pub enum KeyResult {
@@ -81,6 +84,8 @@ pub enum KeyError {
     Busy,
     #[error("the bucket key is locked on this node")]
     Locked,
+    #[error("the prefix holds at least {0} more readable files than one enumerated grant names")]
+    Bound(usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum State {
@@ -104,6 +109,9 @@ enum State {
     Drain,
     Done,
     Reissue,
+    Heads,
+    Writes,
+    Envelopes,
 }
 #[derive(Debug, PartialEq)]
 pub struct KeyOperation {
@@ -123,6 +131,10 @@ pub struct KeyOperation {
     request: Option<KeyRequest>,
     queue_full: bool,
     scopes: Vec<KeyScope>,
+    /// The epoch of each enumerated scope in `scopes`, and of the one being requested.
+    groups: Vec<u64>,
+    group_epoch: Option<u64>,
+    listed: Vec<(String, Ulid)>,
     opened: Vec<Ulid>,
     reused: bool,
     more: bool,
@@ -158,6 +170,9 @@ impl KeyOperation {
             request: None,
             queue_full: false,
             scopes: Vec::new(),
+            groups: Vec::new(),
+            group_epoch: None,
+            listed: Vec::new(),
             opened: Vec::new(),
             reused: false,
             more: false,
@@ -267,6 +282,10 @@ impl KeyOperation {
                 Err(error) => return self.fail(error),
             }
         }
+        if let KeyAction::Writes(prefix) = &self.action {
+            let prefix = prefix.clone();
+            return self.list_heads(&prefix);
+        }
         if let Some(access_key) = self.token_credential() {
             self.state = State::Credential;
             return self.read(USER_ACCESS_KEYSPACE, access_key.into_bytes());
@@ -320,9 +339,10 @@ impl KeyOperation {
             }
             KeyAction::Open(_) if !snapshot.holder => return self.fail(KeyError::Denied),
             KeyAction::Open(cursor) => (ABE_REQUEST_KEYSPACE, bucket, cursor.clone()),
-            KeyAction::Request(_) | KeyAction::Member(_) | KeyAction::Token { .. } => {
-                (ABE_REQUEST_KEYSPACE, own, None)
-            }
+            KeyAction::Request(_)
+            | KeyAction::Member(_)
+            | KeyAction::Token { .. }
+            | KeyAction::Writes(_) => (ABE_REQUEST_KEYSPACE, own, None),
             KeyAction::Grants(cursor) => (ABE_GRANT_KEYSPACE, own, cursor.clone()),
             KeyAction::Epoch { .. } | KeyAction::Rekey => return self.fail(AbeError::Context),
         };
@@ -383,8 +403,10 @@ impl KeyOperation {
         {
             return effects;
         }
-        if matches!(self.action, KeyAction::Member(_) | KeyAction::Token { .. })
-            && !matches!(self.result, Some(KeyResult::Opened(_)))
+        if matches!(
+            self.action,
+            KeyAction::Member(_) | KeyAction::Token { .. } | KeyAction::Writes(_)
+        ) && !matches!(self.result, Some(KeyResult::Opened(_)))
         {
             return self.next_scope();
         }
@@ -512,6 +534,15 @@ impl Operation for KeyOperation {
                 self.output = self.result.take().map(Ok);
                 smallvec![]
             }
+            (State::Heads, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                self.heads_read(values)
+            }
+            (State::Writes, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                self.writes_read(values)
+            }
+            (State::Envelopes, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                self.envelopes_read(values)
+            }
             (_, Event::Storage(StorageEvent::Error { .. })) => self.fail(KeyError::Storage),
             _ => self.fail(AbeError::Context),
         }
@@ -615,6 +646,7 @@ mod tests {
             holders: Default::default(),
             policies: false,
             due: true,
+            checks: Default::default(),
         });
         let issuer = KeyIssuer::Node(node);
         let grant = KeyGrant {
@@ -705,6 +737,7 @@ mod tests {
             holders: Default::default(),
             policies: false,
             due: false,
+            checks: Default::default(),
         });
         (operation, request)
     }

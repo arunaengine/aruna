@@ -73,6 +73,9 @@ pub(crate) fn key_error(error: KeyError) -> ServerError {
         KeyError::Storage => ServerError::ServiceUnavailable,
         KeyError::Busy => ServerError::Refused(StatusCode::CONFLICT, "rekey_running", message),
         KeyError::Locked => ServerError::Refused(StatusCode::CONFLICT, "bucket_locked", message),
+        KeyError::Bound(_) => {
+            ServerError::Refused(StatusCode::PAYLOAD_TOO_LARGE, "enumeration_limit", message)
+        }
     }
 }
 fn parameter_view(p: &AbeParameters, epoch: u64) -> ServerResult<Value> {

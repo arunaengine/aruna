@@ -17,9 +17,14 @@ impl KeyOperation {
     /// Checks the bucket-wide request bindings that do not depend on the recipient.
     fn current_bucket(&self, request: &KeyRequest) -> Result<(), KeyError> {
         let snapshot = self.snapshot.as_ref().ok_or(KeyError::Missing)?;
+        // An enumerated grant keeps the epoch of its writes; others end at the current one.
+        let epoch = match request.scope {
+            KeyScope::Writes(_) => request.epochs.iter().all(|e| *e <= snapshot.epoch),
+            _ => request.epochs.iter().max() == Some(&snapshot.epoch),
+        };
         if request.expired(self.now)
             || request.parameters != snapshot.parameters
-            || request.epochs.iter().max() != Some(&snapshot.epoch)
+            || !epoch
             || request.revisions != snapshot.revisions
             || request.bucket != self.bucket
         {
@@ -133,10 +138,13 @@ impl KeyOperation {
                 Event::Storage(StorageEvent::IterResult { values, .. }),
             ) => self.request_read(scope, values),
             (
-                KeyAction::Member(_) | KeyAction::Token { .. },
+                KeyAction::Member(_) | KeyAction::Token { .. } | KeyAction::Writes(_),
                 Event::Storage(StorageEvent::IterResult { values, .. }),
             ) => match self.scopes.pop() {
-                Some(scope) => self.request_read(scope, values),
+                Some(scope) => {
+                    self.group_epoch = self.groups.pop();
+                    self.request_read(scope, values)
+                }
                 None => self.fail(AbeError::Context),
             },
             (KeyAction::Open(_), Event::Storage(StorageEvent::IterResult { values, .. })) => {
@@ -239,7 +247,7 @@ impl KeyOperation {
                     bucket: self.bucket.clone(),
                     parameters: s.parameters.clone(),
                     scope,
-                    epochs: vec![s.epoch],
+                    epochs: vec![self.group_epoch.unwrap_or(s.epoch)],
                     credential_id: self.credential().map(str::to_string),
                     restrictions,
                     revisions: s.revisions.clone(),
@@ -274,6 +282,7 @@ impl KeyOperation {
         let mut covered = BTreeSet::new();
         let mut parts = Vec::new();
         let mut held_grant = None;
+        let mut identical = None;
         for (key, value) in values.into_iter().take(MAX_REQUESTS) {
             let grant = match KeyGrant::from_bytes(&value) {
                 Ok(g) => g,
@@ -294,12 +303,26 @@ impl KeyOperation {
                 continue;
             }
             if held.same_context(&request) {
+                if held.epochs == request.epochs {
+                    identical = Some(grant.clone());
+                }
                 covered.extend(held.epochs.iter().copied());
                 parts.push(held.epochs.iter().copied().collect::<BTreeSet<u64>>());
                 if held.epochs.contains(&current) {
                     held_grant = Some(grant);
                 }
             }
+        }
+        // An enumerated grant is never widened by epochs or merged with others: only reused.
+        if matches!(request.scope, KeyScope::Writes(_)) {
+            if let Some(grant) = identical {
+                self.result.get_or_insert(KeyResult::Grant(grant));
+                return self.flush();
+            }
+            if self.queue_full && self.result.is_none() {
+                return self.fail(AbeError::Limit);
+            }
+            return self.issue(request);
         }
         // Every epoch may hold data in scope: ask for the newest uncovered ones and the current one.
         let mut epochs: Vec<u64> = (1..=current)
@@ -405,9 +428,10 @@ impl KeyOperation {
         self.writes
             .push((ABE_GRANT_KEYSPACE.to_string(), key, bytes.into()));
         self.index_token(&grant.context.request);
-        self.result = Some(KeyResult::Grant(grant));
         // Any batch, even of a reused open request, may leave older epochs: rescan the coverage.
-        self.more = true;
+        // An enumerated grant has its one epoch only.
+        self.more = !matches!(grant.context.request.scope, KeyScope::Writes(_));
+        self.result = Some(KeyResult::Grant(grant));
         self.flush()
     }
     /// Scans the recipient's grants again for the next batch of `request`'s scope.

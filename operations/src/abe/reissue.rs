@@ -123,6 +123,10 @@ impl ReissueOperation {
             let Ok(request) = request else {
                 continue;
             };
+            // An enumerated grant never covers later writes, so it is not reopened.
+            if matches!(request.scope, KeyScope::Writes(_)) {
+                continue;
+            }
             match (request.credential_id, request.recipient_public) {
                 (Some(access_key), Some(public)) => {
                     if !self.tokens.iter().any(|(k, _)| *k == access_key) {

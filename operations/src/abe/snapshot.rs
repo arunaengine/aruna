@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::auth::permission_rules::{CollectedRole, PermissionRules};
+use aruna_core::request_policy::{CompiledPolicySet, PolicyRequest, RequestPolicy};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
@@ -22,6 +23,8 @@ pub(super) struct Snapshot {
     pub holders: std::collections::BTreeSet<aruna_core::UserId>,
     pub policies: bool,
     pub due: bool,
+    /// The realm and group CEL policies each enumerated write is checked against.
+    pub checks: [Vec<RequestPolicy>; 2],
 }
 impl KeyOperation {
     pub(super) fn snapshot_read(
@@ -37,6 +40,7 @@ impl KeyOperation {
                 | KeyAction::Member(_)
                 | KeyAction::Token { .. }
                 | KeyAction::Publish(_)
+                | KeyAction::Writes(_)
         );
         // Without the user row the account status is unknown, so the grant waits and retries.
         if issues && values[7].1.is_none() {
@@ -128,18 +132,64 @@ impl KeyOperation {
             holders,
             policies,
             due: values.get(8).is_some_and(|(_, v)| v.is_some()),
+            checks: [config.request_policies.clone(), group.policies.clone()],
         });
         Ok(())
     }
     pub(super) fn scope_allowed(&self, scope: &KeyScope) -> Result<(), KeyError> {
         let snapshot = self.snapshot.as_ref().ok_or(KeyError::Missing)?;
+        // Each listed write passes the full read check; CEL policies refuse only continuing keys.
+        if let KeyScope::Writes(writes) = scope {
+            let keys: Vec<&str> = writes.iter().map(|(key, _)| key.as_str()).collect();
+            if !self.readable(&keys)?.into_iter().all(|ok| ok) {
+                return Err(KeyError::Denied);
+            }
+            return Ok(());
+        }
         if snapshot.policies {
             return Err(AbeError::Scope.into());
         }
-        if !snapshot.rules.admits_scope(&self.root()?, scope) {
-            return Err(KeyError::Denied);
+        let root = self.root()?;
+        if !snapshot.rules.admits_scope(&root, scope) {
+            // A partly readable subtree, as with a DENY inside it, may get an enumerated grant.
+            let KeyScope::Subtree(prefix) = scope else {
+                return Err(KeyError::Denied);
+            };
+            let path = format!("{root}/{prefix}");
+            let glob = |c| ['*', '?', '[', ']', '{', '}', '\\'].contains(&c);
+            let partly = snapshot
+                .rules
+                .direct_patterns()
+                .iter()
+                .any(|(pattern, permission)| {
+                    let literal = pattern.split(glob).next().unwrap_or_default();
+                    *permission != Permission::DENY
+                        && (literal.starts_with(&path) || path.starts_with(literal))
+                });
+            return Err(match partly {
+                true => AbeError::Scope.into(),
+                false => KeyError::Denied,
+            });
         }
         Ok(())
+    }
+    /// Whether the recipient may read each object key now: RBAC, path restrictions, DENY and the
+    /// realm and group CEL policies, each as for a plain read.
+    pub(super) fn readable(&self, keys: &[&str]) -> Result<Vec<bool>, KeyError> {
+        let snapshot = self.snapshot.as_ref().ok_or(KeyError::Missing)?;
+        let root = self.root()?;
+        let compile = |policies| CompiledPolicySet::compile(policies).map_err(|_| KeyError::Denied);
+        let [realm, group] = &snapshot.checks;
+        let (realm, group) = (compile(realm)?, compile(group)?);
+        let user = self.recipient().to_string();
+        let allowed = |key: &&str| {
+            let path = format!("{root}/{key}");
+            let request = PolicyRequest::basic(path.clone(), "read".into(), user.clone());
+            snapshot.rules.allows(&path, &Permission::READ)
+                && !realm.evaluate(&request).is_denied()
+                && !group.evaluate(&request).is_denied()
+        };
+        Ok(keys.iter().map(allowed).collect())
     }
     /// Literal scopes of the recipient's direct READ or WRITE rules and a token's restrictions;
     /// the whole bucket wins.
