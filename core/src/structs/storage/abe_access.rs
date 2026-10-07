@@ -308,6 +308,9 @@ mod tests {
         wide.created_at_ms = 1_760_000_000_000;
         let mut root = request.clone();
         root.scope = KeyScope::Subtree(String::new());
+        let mut token = request.clone();
+        token.request_id = ulid("01K6YQ8ZQ9V3X2N4M5P6R7S8TH");
+        token.credential_id = Some("01K6YQ8ZQ9V3X2N4M5P6R7S8TJ".into());
         json!([
             view(&GrantContext {
                 request,
@@ -320,6 +323,10 @@ mod tests {
             view(&GrantContext {
                 request: root,
                 issuer: KeyIssuer::User(user("01K6YQ8ZQ9V3X2N4M5P6R7S8TG", 3)),
+            }),
+            view(&GrantContext {
+                request: token,
+                issuer: KeyIssuer::Node(node),
             }),
         ])
     }
