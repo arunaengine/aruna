@@ -93,10 +93,7 @@ impl KeyOperation {
             return self.fail(AbeError::Stale);
         }
         // A token is its own recipient key, so the vault is not read.
-        if matches!(self.action, KeyAction::Token { .. }) {
-            return self.records();
-        }
-        self.read_keys()
+        self.records()
     }
     /// The access key whose requests this action handles; user requests have none.
     fn credential(&self) -> Option<&str> {

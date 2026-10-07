@@ -702,6 +702,7 @@ async fn token_requests(
 
 #[tokio::test]
 async fn token_needs_credential() -> TestResult<()> {
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::storage::abe::AbeError;
     use aruna_core::structs::storage::abe_access::{GrantContext, KeyGrant, KeyIssuer};
@@ -794,6 +795,29 @@ async fn token_needs_credential() -> TestResult<()> {
             drive(late, &seed.context).await,
             Err(KeyError::Abe(AbeError::Stale))
         );
+
+        // A holder publishes the live token's request without reading the creator's vault.
+        let action = KeyAction::Publish(grant.clone());
+        let mut operation = KeyOperation::new(BUCKET.into(), auth.clone(), node, action, now);
+        let mut effects: std::collections::VecDeque<_> = operation.start().into_iter().collect();
+        while let Some(effect) = effects.pop_front() {
+            let aruna_core::effects::Effect::Storage(effect) = effect else {
+                panic!("unexpected effect {effect:?}");
+            };
+            if let aruna_core::effects::StorageEffect::Iter { key_space, .. } = &effect {
+                assert_ne!(key_space, aruna_core::keyspaces::USER_KEY_KEYSPACE);
+            }
+            let event = seed
+                .context
+                .storage_handle
+                .send_storage_effect(effect)
+                .await;
+            if !operation.is_complete() {
+                effects.extend(operation.step(event));
+            }
+        }
+        assert!(operation.finalize().is_ok());
+        assert_eq!(token_grants(&seed, &access_key).await?.len(), 1);
 
         // A request after revocation recreates no request or grant for the credential.
         let revoked = http
