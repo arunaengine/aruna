@@ -185,6 +185,11 @@ impl KeyOperation {
             return self.fail(error);
         }
         let overflow = values.len() > MAX_REQUESTS;
+        // A token's restrictions narrow its scopes instead.
+        let restrictions = match self.action {
+            KeyAction::Member(_) | KeyAction::Token { .. } => None,
+            _ => self.auth.path_restrictions.clone(),
+        };
         let mut open = Vec::new();
         for (key, value) in values {
             let request = match KeyRequest::from_bytes(&value) {
@@ -194,17 +199,13 @@ impl KeyOperation {
             if request.credential_id.as_deref() != self.credential() {
                 continue;
             }
-            if self.current_request(&request).is_err() {
+            // Other restrictions are judged only under their own rules, so they stay.
+            if request.restrictions == restrictions && self.current_request(&request).is_err() {
                 self.deletes.push((ABE_REQUEST_KEYSPACE.to_string(), key));
             } else {
                 open.push(request);
             }
         }
-        // A token's restrictions narrow its scopes instead.
-        let restrictions = match self.action {
-            KeyAction::Member(_) | KeyAction::Token { .. } => None,
-            _ => self.auth.path_restrictions.clone(),
-        };
         let same = open
             .iter()
             .position(|r| r.scope == scope && r.restrictions == restrictions);
@@ -278,7 +279,10 @@ impl KeyOperation {
                 Err(error) => return self.fail(error),
             };
             let held = &grant.context.request;
-            if held.credential_id != request.credential_id {
+            // Other restrictions are judged only under their own rules, so they stay.
+            if held.credential_id != request.credential_id
+                || held.restrictions != request.restrictions
+            {
                 continue;
             }
             if self.grant_allowed(held).is_err() {

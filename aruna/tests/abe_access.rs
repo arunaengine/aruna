@@ -1087,6 +1087,68 @@ async fn abe_queued_grants() -> TestResult<()> {
     result
 }
 
+#[tokio::test]
+async fn abe_restricted_keeps() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let http = reqwest::Client::new();
+        let base = seed.base_url.clone();
+        let owner = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&base, &owner, "ABE restricted").await?;
+        let user = UserId::local(Ulid::generate(), seed.realm_id);
+        grant_roles(&base, &owner, &group.group_id, user, Value::Null).await?;
+        let reader = sign_token(&seed, user, None, 600)?;
+        let root =
+            group_permission_path(seed.realm_id, group.group_id.parse()?, seed.net.node_id());
+        let restricted = sign_scoped_token(
+            &seed,
+            user,
+            vec![PathRestriction {
+                pattern: format!("{root}/{BUCKET}/foo/**"),
+                permission: Permission::READ,
+            }],
+        )?;
+        let reader_public = public_key_of(&SecretBytes::new(vec![11; 32])).unwrap();
+        add_key(&base, &reader, "reader-1", reader_public).await?;
+        let credentials = create_s3_credentials(&base, &owner, &group.group_id).await?;
+        s3_client(seed.s3.as_ref().unwrap(), &credentials)
+            .create_bucket()
+            .bucket(BUCKET)
+            .send()
+            .await?;
+        let encryption = format!("{base}/api/v1/data/buckets/{BUCKET}/storage/encryption");
+        let (status, settings) = send(
+            http.put(&encryption)
+                .bearer_auth(&owner)
+                .json(&json!({"mode":"node_managed","expected_generation":0})),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{settings}");
+
+        // The restricted `foo/` issuance scans the unrestricted `bar/` grant and keeps it.
+        let requests = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/requests");
+        let subtree = |value: &str| json!({"scope":{"kind":"subtree","value":value}});
+        for (token, prefix) in [(&reader, "bar/"), (&restricted, "foo/")] {
+            let request = http.post(&requests).bearer_auth(token);
+            let (status, body) = send(request.json(&subtree(prefix))).await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let grants = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/grants");
+        let (_, own) = send(http.get(&grants).bearer_auth(&reader)).await?;
+        assert_eq!(own["records"].as_array().unwrap().len(), 2, "{own}");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
 async fn grant_roles(
     base: &str,
     actor: &str,
