@@ -599,7 +599,7 @@ async fn token_opens_scope() -> TestResult<()> {
             let opened = grants[0].open_object(private.bytes(), &envelope);
             assert_eq!(opened.is_ok(), key == "allowed/a.txt", "{key}");
             if let Ok(object) = opened {
-                header = base64::Engine::encode(&STANDARD, object.as_bytes());
+                header = base64::Engine::encode(&STANDARD, object.bytes().expose());
             }
         }
 
@@ -851,9 +851,7 @@ async fn token_needs_credential() -> TestResult<()> {
 
 #[tokio::test]
 async fn token_limit_revokes() -> TestResult<()> {
-    use aruna_api::routes::credentials::{
-        CreateS3Request, CredentialStatusResponse, ListS3Response,
-    };
+    use aruna_api::routes::credentials::{CreateS3Request, ListS3Response};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     const BUCKET: &str = "token-limit";
@@ -946,13 +944,15 @@ async fn token_limit_revokes() -> TestResult<()> {
             .await?
             .json()
             .await?;
-        let revoked: Vec<_> = listed
+        let mut keys: Vec<_> = listed
             .credentials
             .iter()
-            .filter(|c| c.status == CredentialStatusResponse::Revoked)
+            .map(|c| &c.access_key_id)
             .collect();
-        assert_eq!(revoked.len(), 1);
-        assert_ne!(revoked[0].access_key_id, created.access_key_id);
+        keys.sort();
+        let mut expected = vec![&plain.access_key_id, &created.access_key_id];
+        expected.sort();
+        assert_eq!(keys, expected, "only the earlier credentials remain");
         Ok(())
     }
     .await;
