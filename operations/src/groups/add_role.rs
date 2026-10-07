@@ -59,6 +59,7 @@ pub struct AddRoleOperation {
     fence: crate::placement::fence::WriteFence,
     state: AddRoleState,
     output: Option<Result<(Group, GroupAuthorizationDocument), AddRoleError>>,
+    narrowed: bool,
 }
 
 impl std::fmt::Debug for AddRoleOperation {
@@ -191,6 +192,7 @@ impl AddRoleOperation {
             fence: Default::default(),
             state: AddRoleState::Init,
             output: None,
+            narrowed: false,
         }
     }
 
@@ -403,7 +405,9 @@ impl AddRoleOperation {
             .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
         let members_before = group_members(&auth_doc);
+        let roles_before = auth_doc.roles.clone();
         materialize_group_role(&mut group, &mut auth_doc, &self.input.role, &reducer_state);
+        self.narrowed = aruna_core::admin_documents::roles_narrowed(&roles_before, &auth_doc.roles);
         let new_members = newly_materialized_members(&members_before, &auth_doc, &self.input.role);
 
         let conflict_delete_keys: Vec<_> =
@@ -598,13 +602,14 @@ impl AddRoleOperation {
             admin_outbox_written,
             new_members,
         };
-        // A DENY rule can narrow existing READ scopes.
-        if self
-            .input
-            .role
-            .permissions
-            .values()
-            .any(|p| *p == Permission::DENY)
+        // A DENY rule or a replaced role can narrow existing READ scopes.
+        if self.narrowed
+            || self
+                .input
+                .role
+                .permissions
+                .values()
+                .any(|p| *p == Permission::DENY)
         {
             return smallvec![crate::abe::mark_due(Some(self.input.group_id), txn_id)];
         }
@@ -1858,6 +1863,32 @@ pub mod test {
             effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { .. })]
         ));
+    }
+
+    #[test]
+    fn replaced_role_marks() {
+        // Replacing an existing READ role with a narrower path marks epochs due before commit.
+        let (actor, group, mut auth_doc) = fixture();
+        let mut old = role(&actor, group.group_id);
+        old.permissions = HashMap::from([(
+            format!("/{}/g/{}/**", actor.realm_id, group.group_id),
+            Permission::READ,
+        )]);
+        auth_doc.roles.insert(old.role_id, old);
+        let txn_id = TxnId::generate();
+        let mut operation = AddRoleOperation::new(AddRoleConfig {
+            auth_context: auth_context(&actor),
+            actor: actor.clone(),
+            realm_id: actor.realm_id,
+            group_id: group.group_id,
+            role: role(&actor, group.group_id),
+        });
+
+        let effects = step_to_fence(&mut operation, &actor, &group, &auth_doc, txn_id, None);
+        assert!(
+            matches!(effects.as_slice(), [Effect::SubOperation(_)]),
+            "a narrowing replacement marks epochs due first, got {effects:?}"
+        );
     }
 
     #[test]
