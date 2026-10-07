@@ -162,6 +162,73 @@ fn published(
     operation.step(read_result(None))
 }
 
+/// Asserts a direct rewrite of a plain source and returns its row writes.
+fn rewritten(
+    operation: &mut RewriteVersionOperation,
+    (target, settings): (Option<SealPlan>, Vec<u8>),
+) -> Vec<(String, Key, Value)> {
+    let old = location(None);
+    let effects = located(operation, &old);
+    let [
+        Effect::Blob(BlobEffect::RewriteCopy {
+            lease,
+            target: format,
+            grants_only,
+            ..
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("expected a rewrite, got {effects:?}")
+    };
+    assert!(lease.is_none() && !grants_only);
+    assert_eq!(format.encryption, target);
+
+    let new = location(target.map(|plan| plan.key.generation));
+    let effects = published(operation, &old, new, settings);
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("expected the row writes, got {effects:?}")
+    };
+    let mut spaces: Vec<&str> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
+    // Only a sealed copy has an owner row.
+    assert_eq!(spaces.contains(&COPY_OWNER_KEYSPACE), target.is_some());
+    spaces.retain(|space| *space != COPY_OWNER_KEYSPACE);
+    assert_eq!(
+        spaces,
+        [
+            BLOB_LOCATIONS_KEYSPACE,
+            BLOB_VERSIONS_KEYSPACE,
+            TRANSITION_CLEANUP_KEYSPACE,
+            BLOB_RECLAIM_KEYSPACE,
+        ]
+    );
+    writes.clone()
+}
+
+#[test]
+fn bucket_only_copy() {
+    // Without ABE parameters a plain source becomes a bucket-only copy, with no envelope.
+    let mut operation = operation(transition(TransitionKind::Encrypt, None, Some(1)));
+    let writes = rewritten(&mut operation, (Some(plan(1)), settings(1, 3)));
+    let stored = BlobVersion::from_bytes(&writes[2].2).unwrap();
+    let encoding = stored.location_key().unwrap().encoding;
+    assert_eq!(encoding, EncodingClass::Pithos { digest: [1; 32] });
+}
+
+#[test]
+fn compresses_plain_copy() {
+    let target = TransitionTarget {
+        compression: Compression::Zstd { level: 3 },
+        plan: None,
+    };
+    let transition = EncryptionTransition::new(TransitionKind::Reencode, None, target, 3, 100);
+    let mut operation = operation(transition);
+    let plain = BucketEncryption {
+        storage_generation: 3,
+        ..BucketEncryption::default()
+    };
+    rewritten(&mut operation, (None, plain.to_bytes().unwrap()));
+}
+
 #[test]
 fn locked_source_waits() {
     let mut operation = operation(transition(TransitionKind::Decrypt, Some(1), None));

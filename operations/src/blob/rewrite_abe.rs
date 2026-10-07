@@ -40,6 +40,10 @@ impl RewriteVersionOperation {
     }
 
     pub(super) fn read_envelope(&mut self) -> Effects {
+        // A plain-to-plain rewrite has no envelope rows.
+        if self.transition.target.plan.is_none() && self.plain() {
+            return self.proceed();
+        }
         let (Ok(version), Ok(row)) = (self.version_key.to_bytes(), self.copy_key()) else {
             return self.fail(RewriteError::NotFinished);
         };
@@ -55,6 +59,10 @@ impl RewriteVersionOperation {
             reads,
             txn_id: None,
         })]
+    }
+
+    fn plain(&self) -> bool {
+        (self.old.as_ref()).is_some_and(|old| old.format.bucket_key().is_none())
     }
 
     fn same_generation(&self) -> bool {
@@ -76,8 +84,8 @@ impl RewriteVersionOperation {
         }
     }
 
-    /// A version with envelope rows, or a plain version, gets its new envelope before the
-    /// rewrite grants to it.
+    /// A version with envelope rows, or a plain version moving into a bucket with ABE
+    /// parameters, gets its new envelope before the rewrite grants to it.
     pub(super) fn handle_envelope(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected(event);
@@ -85,8 +93,9 @@ impl RewriteVersionOperation {
         let Some(([(_, id), (_, copy)], anchors)) = values.split_first_chunk() else {
             return self.fail(RewriteError::NotFinished);
         };
-        let plain = (self.old.as_ref()).is_some_and(|old| old.format.bucket_key().is_none());
-        if id.is_none() && copy.is_none() && !plain {
+        // Without target parameters a plain version gets a bucket-only copy.
+        let admitted = anchors.first().is_some_and(|(_, row)| row.is_some());
+        if id.is_none() && copy.is_none() && !(self.plain() && admitted) {
             return self.proceed();
         }
         self.envelope_rows = Some(EnvelopeRows {
