@@ -492,6 +492,8 @@ async fn token_reads_old() -> TestResult<()> {
             .send()
             .await?;
         assert_eq!(enabled.status(), StatusCode::OK);
+        let settings: serde_json::Value = enabled.json().await?;
+        let bucket_id = ulid::Ulid::from_string(settings["bucket_id"].as_str().unwrap())?;
         let put = |key: &'static str| {
             client
                 .put_object()
@@ -513,6 +515,14 @@ async fn token_reads_old() -> TestResult<()> {
             assert_eq!(raised.status(), StatusCode::OK);
         }
         put("new.txt").await?;
+        // A removal synced from another node left this bucket due; issuing the token raises first.
+        let due = aruna_core::effects::StorageEffect::Write {
+            key_space: aruna_core::keyspaces::ABE_DUE_KEYSPACE.to_string(),
+            key: bucket_id.to_bytes().to_vec().into(),
+            value: vec![1].into(),
+            txn_id: None,
+        };
+        seed.context.storage_handle.send_storage_effect(due).await;
 
         let (public, private) = aruna_core::structs::storage::encryption::generate_key()?;
         let token = hex::encode(private.bytes().expose());
@@ -530,7 +540,10 @@ async fn token_reads_old() -> TestResult<()> {
             .await?;
         assert_eq!(created.status(), StatusCode::CREATED);
         let created: aruna_api::routes::credentials::CreateS3Response = created.json().await?;
-        assert_eq!(token_grants(&seed, &created.access_key_id).await?.len(), 2);
+        let grants = token_grants(&seed, &created.access_key_id).await?;
+        assert_eq!(grants.len(), 2);
+        let epochs = grants.iter().flat_map(|g| g.context.request.epochs.clone());
+        assert_eq!(epochs.max(), Some(19));
         let credentials = shared::S3Credentials {
             access_key_id: created.access_key_id,
             access_secret: created.access_secret,

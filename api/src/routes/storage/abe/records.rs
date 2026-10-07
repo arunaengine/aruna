@@ -189,7 +189,7 @@ fn unexpected() -> ServerError {
 **Authentication**: A realm bearer token; the scope must be covered by current READ authority.
 
 **Behavior**
-- An unlocked or node-managed bucket issues the grant at once (`200`).
+- An unlocked or node-managed bucket issues the grant at once (`200`), after a due epoch raise.
 - Otherwise the deduplicated open request is returned (`202`); repeating it returns its state.
 - Repeating an issued request returns its current grant (`200`).
 - A recipient holds at most 64 current grants per bucket; a new grant past that returns `413`.
@@ -201,7 +201,8 @@ fn unexpected() -> ServerError {
         (status = 400, body = ErrorResponse, description = "Invalid scope"), (status = 401, body = ErrorResponse, description = "Bearer token required"),
         (status = 403, body = ErrorResponse, description = "READ refused"), (status = 404, body = ErrorResponse, description = "Bucket missing"),
         (status = 409, body = ErrorResponse, description = "Stale request"), (status = 413, body = ErrorResponse, description = "Request limit"),
-        (status = 422, body = ErrorResponse, description = "Scope or CEL policy cannot be compiled")), security(("bearer_auth" = [])))]
+        (status = 422, body = ErrorResponse, description = "Scope or CEL policy cannot be compiled"),
+        (status = 503, body = ErrorResponse, description = "A due epoch raise or storage failed; retry")), security(("bearer_auth" = [])))]
 pub async fn request_key(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
@@ -235,12 +236,14 @@ pub async fn request_key(
 **Authentication**: An unrestricted realm bearer token of a current key holder.
 
 **Behavior**
+- The first page raises a due epoch first.
 - Each `record` is the grant context to echo in the grant submission; `aad` is its associated data.
 - At most 64 records per page; pass `next_cursor` as `cursor` for the next page."#,
     params(("bucket" = String, Path, description = "Node-local S3 bucket name"),("cursor" = Option<String>, Query, description = "Opaque next_cursor from the previous page")),
     responses((status = 200, body = RecordList, description = "Bounded open requests", example = json!({"records":[],"next_cursor":null})),
         (status = 401, body = ErrorResponse, description = "Bearer token required"), (status = 403, body = ErrorResponse, description = "Caller is no current key holder"),
-        (status = 404, body = ErrorResponse, description = "Bucket missing")), security(("bearer_auth" = [])))]
+        (status = 404, body = ErrorResponse, description = "Bucket missing"),
+        (status = 503, body = ErrorResponse, description = "A due epoch raise or storage failed; retry")), security(("bearer_auth" = [])))]
 pub async fn open_requests(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
@@ -249,10 +252,8 @@ pub async fn open_requests(
 ) -> ServerResult<Json<RecordList>> {
     let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     // A holder opening the list is an issuance run: a due raise happens before listing.
-    if page.cursor.is_none()
-        && let Err(error) = epoch_run(&state, &auth, &bucket, false).await
-    {
-        tracing::debug!(event = "abe.epoch_raise.skipped", error = %error);
+    if page.cursor.is_none() {
+        epoch_run(&state, &auth, &bucket, false).await?;
     }
     let issuer = KeyIssuer::User(auth.user_id);
     let KeyResult::Requests(requests, next) =
@@ -277,6 +278,7 @@ pub async fn open_requests(
 **Authentication**: An unrestricted realm bearer token of a current key holder.
 
 **Behavior**
+- A due epoch raise happens first; a grant for the older epoch then returns `409`.
 - `context` echoes the listed `record`; issuer, recipient, scope, parameters and epoch are rechecked.
 - Repeating an admitted submission returns the stored grant.
 - A recipient holds at most 64 current grants per bucket; a new grant past that returns `413`."#,
@@ -286,7 +288,8 @@ pub async fn open_requests(
         (status = 400, body = ErrorResponse, description = "Invalid encoding"), (status = 401, body = ErrorResponse, description = "Bearer token required"),
         (status = 403, body = ErrorResponse, description = "Caller is no current issuer"), (status = 404, body = ErrorResponse, description = "Request missing"),
         (status = 409, body = ErrorResponse, description = "Stale binding"), (status = 413, body = ErrorResponse, description = "Grant too large or grant limit"),
-        (status = 422, body = ErrorResponse, description = "Scope or CEL policy cannot be compiled")), security(("bearer_auth" = [])))]
+        (status = 422, body = ErrorResponse, description = "Scope or CEL policy cannot be compiled"),
+        (status = 503, body = ErrorResponse, description = "A due epoch raise or storage failed; retry")), security(("bearer_auth" = [])))]
 pub async fn publish_grant(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
@@ -311,6 +314,8 @@ pub async fn publish_grant(
         ciphertext: decode(&body.ciphertext)?,
     };
     grant.to_bytes().map_err(abe_error)?;
+    // A holder's grant is an issuance run: a due raise happens first and makes older grants stale.
+    epoch_run(&state, &auth, &bucket, false).await?;
     match execute(&state, auth, bucket, KeyAction::Publish(grant)).await? {
         KeyResult::Grant(g) => Ok(Json(grant_view(g)?)),
         _ => Err(unexpected()),

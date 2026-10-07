@@ -82,6 +82,7 @@ enum State {
     Bucket,
     Settings,
     Snapshot,
+    Unlock,
     Keys,
     Credential,
     Records,
@@ -214,9 +215,12 @@ impl KeyOperation {
         ];
         self.state = State::Snapshot;
         let bucket_id = key.bucket_id.to_bytes().to_vec();
-        // Only a raise reads the due row, so other runs never conflict with a new marker.
-        let due = matches!(self.action, KeyAction::Epoch { .. })
-            .then(|| (ABE_DUE_KEYSPACE.to_string(), bucket_id.into()));
+        // Raises and node issuance read the due row; listing and grant reads never conflict.
+        let reads_due = !matches!(
+            self.action,
+            KeyAction::Open(_) | KeyAction::Grants(_) | KeyAction::Publish(_)
+        );
+        let due = reads_due.then(|| (ABE_DUE_KEYSPACE.to_string(), bucket_id.into()));
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![
                 (AUTH_KEYSPACE.to_string(), realm.clone().into()),
@@ -238,6 +242,24 @@ impl KeyOperation {
             .collect(),
             txn_id: self.txn
         })]
+    }
+    /// Opens or issues the requests of a request, member or token action under the snapshot epoch.
+    fn prepare(&mut self) -> Effects {
+        if matches!(self.action, KeyAction::Member(_) | KeyAction::Token { .. }) {
+            match self.member_scopes() {
+                Ok(scopes) if scopes.is_empty() => {
+                    self.result = Some(KeyResult::Opened(Vec::new()));
+                    return self.flush();
+                }
+                Ok(scopes) => self.scopes = scopes,
+                Err(error) => return self.fail(error),
+            }
+        }
+        if let Some(access_key) = self.token_credential() {
+            self.state = State::Credential;
+            return self.read(USER_ACCESS_KEYSPACE, access_key.into_bytes());
+        }
+        self.read_keys()
     }
     /// Reads the recipient's user keys from their vault.
     fn read_keys(&mut self) -> Effects {
@@ -404,21 +426,17 @@ impl Operation for KeyOperation {
                 if let KeyAction::Epoch { instant } = self.action {
                     return self.raise(instant);
                 }
-                if matches!(self.action, KeyAction::Member(_) | KeyAction::Token { .. }) {
-                    match self.member_scopes() {
-                        Ok(scopes) if scopes.is_empty() => {
-                            self.result = Some(KeyResult::Opened(Vec::new()));
-                            return self.flush();
-                        }
-                        Ok(scopes) => self.scopes = scopes,
-                        Err(error) => return self.fail(error),
-                    }
+                if self.snapshot.as_ref().is_some_and(|s| s.due) {
+                    return self.due_check();
                 }
-                if let Some(access_key) = self.token_credential() {
-                    self.state = State::Credential;
-                    return self.read(USER_ACCESS_KEYSPACE, access_key.into_bytes());
+                self.prepare()
+            }
+            (State::Unlock, Event::Blob(BlobEvent::KeyStatus { generations })) => {
+                let key = self.snapshot.as_ref().map(|s| s.parameters.key);
+                if generations.iter().any(|g| g.active && Some(g.key) == key) {
+                    return self.raise_first();
                 }
-                self.read_keys()
+                self.prepare()
             }
             (State::Keys, event) => self.keys_read(event),
             (State::Credential, Event::Storage(StorageEvent::ReadResult { value, .. })) => {

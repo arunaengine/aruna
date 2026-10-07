@@ -33,15 +33,25 @@ impl KeyOperation {
         if instant && !holder {
             return self.fail(KeyError::Denied);
         }
-        let epoch = snapshot.epoch;
-        let bucket: Key = snapshot.parameters.key.bucket_id.to_bytes().to_vec().into();
         if !instant && !(snapshot.due && (holder || self.managed)) {
-            self.result = Some(KeyResult::Epoch(epoch));
+            self.result = Some(KeyResult::Epoch(snapshot.epoch));
             return self.flush();
         }
-        let Some(next) = epoch.checked_add(1) else {
-            return self.fail(AbeError::Limit);
-        };
+        match self.raised() {
+            Ok(next) => {
+                self.result = Some(KeyResult::Epoch(next));
+                self.flush()
+            }
+            Err(error) => self.fail(error),
+        }
+    }
+    /// Queues a raise by one in this transaction and moves the snapshot to the new epoch.
+    fn raised(&mut self) -> Result<u64, KeyError> {
+        let snapshot = self.snapshot.as_mut().ok_or(KeyError::Missing)?;
+        let next = snapshot.epoch.checked_add(1).ok_or(AbeError::Limit)?;
+        snapshot.epoch = next;
+        snapshot.due = false;
+        let bucket: Key = snapshot.parameters.key.bucket_id.to_bytes().to_vec().into();
         let row = progress(next, false, &[]);
         self.deletes
             .push((ABE_DUE_KEYSPACE.to_string(), bucket.clone()));
@@ -52,8 +62,26 @@ impl KeyOperation {
         ));
         self.writes
             .push((ABE_REISSUE_KEYSPACE.to_string(), bucket, row.into()));
-        self.result = Some(KeyResult::Epoch(next));
-        self.flush()
+        Ok(next)
+    }
+    /// Node issuance consumes a due raise first while the node can issue: its key is node managed
+    /// or unlocked. Otherwise requests wait for a holder, whose run raises first.
+    pub(super) fn due_check(&mut self) -> Effects {
+        if self.managed {
+            return self.raise_first();
+        }
+        let Some(snapshot) = &self.snapshot else {
+            return self.fail(KeyError::Missing);
+        };
+        let bucket_id = snapshot.parameters.key.bucket_id;
+        self.state = State::Unlock;
+        smallvec![Effect::Blob(BlobEffect::ReadKeyStatus { bucket_id })]
+    }
+    pub(super) fn raise_first(&mut self) -> Effects {
+        if let Err(error) = self.raised() {
+            return self.fail(error);
+        }
+        self.prepare()
     }
 }
 
