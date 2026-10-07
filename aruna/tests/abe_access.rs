@@ -6,7 +6,7 @@
 mod shared;
 
 use aruna_core::UserId;
-use aruna_core::compute::SecretBytes;
+use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::key_seal::{SealedSecret, open_sealed, seal_to};
@@ -19,10 +19,13 @@ use aruna_core::structs::storage::abe_access::{GrantContext, KeyGrant, KeyScope,
 use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
 use aruna_kpabe::{Attribute, Envelope, Policy, UserKey};
+use aruna_operations::abe::copies::complete_copies;
+use aruna_operations::abe::rekey::rekey_page;
 use aruna_operations::abe::{
     KeyAction, KeyError, KeyOperation, KeyResult, MemberKeysOperation, ReissueOperation,
 };
 use aruna_operations::driver::drive;
+use aruna_operations::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::StatusCode;
@@ -1881,6 +1884,53 @@ async fn opens(
     Ok((epoch, opened))
 }
 
+/// Turns on `vault_locked` for `BUCKET`; returns its bucket id, generation and opened key.
+async fn locked_key(
+    seed: &SeedNode,
+    owner: &str,
+    owner_key: &Value,
+    owner_private: &SecretBytes,
+) -> TestResult<(Ulid, u64, SecretBytes)> {
+    let http = reqwest::Client::new();
+    let base = &seed.base_url;
+    let encryption = format!("{base}/api/v1/data/buckets/{BUCKET}/storage/encryption");
+    let (status, settings) = send(
+        http.put(&encryption)
+            .bearer_auth(owner)
+            .json(&json!({"mode":"vault_locked","expected_generation":0})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{settings}");
+    let generation = settings["key_generation"].as_u64().unwrap();
+    let bucket_id = Ulid::from_string(settings["bucket_id"].as_str().unwrap())?;
+    let (_, copies) = send(
+        http.get(format!("{encryption}/copies/me?generation={generation}"))
+            .bearer_auth(owner),
+    )
+    .await?;
+    let copy = &copies["copies"][0];
+    let record_id = Ulid::from_string(owner_key["record_id"].as_str().unwrap())?;
+    let info = copy_info(
+        seed.realm_id,
+        seed.net.node_id(),
+        BucketKeyRef::new(bucket_id, generation),
+        seed.user_id,
+        record_id,
+    );
+    let owner_secret: &[u8; 32] = owner_private.expose().try_into()?;
+    let opened = open_sealed(
+        owner_secret,
+        &SealedSecret {
+            enc: bytes(&copy["enc"]).try_into().unwrap(),
+            ciphertext: bytes(&copy["ciphertext"]),
+        },
+        &info,
+        &[],
+    )?;
+    let bucket_private = SecretBytes::new(opened.to_vec());
+    Ok((bucket_id, generation, bucket_private))
+}
+
 #[tokio::test]
 async fn abe_epochs() -> TestResult<()> {
     let seed = spawn_complete_seed().await?;
@@ -1940,40 +1990,8 @@ async fn abe_epochs() -> TestResult<()> {
         let s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
         s3.create_bucket().bucket(BUCKET).send().await?;
         let encryption = format!("{base}/api/v1/data/buckets/{BUCKET}/storage/encryption");
-        let (status, settings) = send(
-            http.put(&encryption)
-                .bearer_auth(&owner)
-                .json(&json!({"mode":"vault_locked","expected_generation":0})),
-        )
-        .await?;
-        assert_eq!(status, StatusCode::OK, "{settings}");
-        let generation = settings["key_generation"].as_u64().unwrap();
-        let bucket_id = Ulid::from_string(settings["bucket_id"].as_str().unwrap())?;
-        let (_, copies) = send(
-            http.get(format!("{encryption}/copies/me?generation={generation}"))
-                .bearer_auth(&owner),
-        )
-        .await?;
-        let copy = &copies["copies"][0];
-        let record_id = Ulid::from_string(owner_key["record_id"].as_str().unwrap())?;
-        let info = copy_info(
-            seed.realm_id,
-            seed.net.node_id(),
-            BucketKeyRef::new(bucket_id, generation),
-            seed.user_id,
-            record_id,
-        );
-        let owner_secret: &[u8; 32] = owner_private.expose().try_into()?;
-        let opened = open_sealed(
-            owner_secret,
-            &SealedSecret {
-                enc: bytes(&copy["enc"]).try_into().unwrap(),
-                ciphertext: bytes(&copy["ciphertext"]),
-            },
-            &info,
-            &[],
-        )?;
-        let bucket_private = SecretBytes::new(opened.to_vec());
+        let (bucket_id, generation, bucket_private) =
+            locked_key(&seed, &owner, &owner_key, &owner_private).await?;
         let put = |key: &'static str| {
             let request = s3
                 .put_object()
@@ -2036,6 +2054,18 @@ async fn abe_epochs() -> TestResult<()> {
         assert_eq!(
             opens(&base, &reader, &new_keys, "foo/b", &second).await?,
             (2, true)
+        );
+        // The old grant merged into the new one: one key opens what both opened, no more.
+        assert_eq!(new_keys.len(), 1);
+        assert_eq!(new_keys[0].0, vec![1, 2]);
+        assert_eq!(
+            opens(&base, &reader, &new_keys, "foo/a", &first).await?,
+            (1, true)
+        );
+        let outside = put("bar/x").await?;
+        assert_eq!(
+            opens(&base, &owner, &new_keys, "bar/x", &outside).await?,
+            (2, false)
         );
 
         // A removal marks the locked bucket due without raising it.
@@ -2226,6 +2256,183 @@ async fn abe_epochs() -> TestResult<()> {
         let epochs: std::collections::BTreeSet<u64> =
             keys.iter().flat_map(|(e, _, _)| e.clone()).collect();
         assert_eq!(epochs, (1..=18).collect());
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+/// The status and body of the envelope route for one version.
+async fn envelope(
+    base: &str,
+    token: &str,
+    key: &str,
+    version: &str,
+) -> TestResult<(StatusCode, Value)> {
+    let route = format!("{base}/api/v1/data/blobs/envelope");
+    let query = [("bucket", BUCKET), ("key", key), ("version_id", version)];
+    send(
+        reqwest::Client::new()
+            .get(query_url(&route, &query)?)
+            .bearer_auth(token),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn abe_rekey() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let http = reqwest::Client::new();
+        let base = seed.base_url.clone();
+        let owner = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&base, &owner, "ABE rekey").await?;
+        let owner_private = SecretBytes::new(vec![7; 32]);
+        let owner_public = public_key_of(&owner_private).unwrap();
+        let owner_key = add_key(&base, &owner, "owner-1", owner_public).await?;
+        let mut members = Vec::new();
+        for (byte, name) in [(11u8, "reader-1"), (12, "leaver-1")] {
+            let id = UserId::local(Ulid::generate(), seed.realm_id);
+            grant_roles(&base, &owner, &group.group_id, id, Value::Null).await?;
+            let context = seed.context.as_ref();
+            let token =
+                create_bearer_token(context, id, seed.realm_id, seed.capabilities.clone()).await?;
+            let private = SecretBytes::new(vec![byte; 32]);
+            add_key(&base, &token, name, public_key_of(&private).unwrap()).await?;
+            members.push((id, token, private));
+        }
+        let [
+            (_, reader, reader_private),
+            (leaver_id, leaver, leaver_private),
+        ] = <[_; 2]>::try_from(members).unwrap();
+        let credentials = create_s3_credentials(&base, &owner, &group.group_id).await?;
+        let s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
+        s3.create_bucket().bucket(BUCKET).send().await?;
+        let encryption = format!("{base}/api/v1/data/buckets/{BUCKET}/storage/encryption");
+        let (bucket_id, generation, bucket_private) =
+            locked_key(&seed, &owner, &owner_key, &owner_private).await?;
+        let key = BucketKeyRef::new(bucket_id, generation);
+        let put = |key: &'static str| {
+            let request = s3
+                .put_object()
+                .bucket(BUCKET)
+                .key(key)
+                .body(key.as_bytes().to_vec().into());
+            async move {
+                Ok::<_, Box<dyn std::error::Error>>(
+                    request.send().await?.version_id().unwrap().to_string(),
+                )
+            }
+        };
+        let (a, b, other) = (
+            put("foo/a").await?,
+            put("foo/b").await?,
+            put("bar/b").await?,
+        );
+        let lock = http.post(format!("{encryption}/lock")).bearer_auth(&owner);
+        assert!(lock.send().await?.status().is_success());
+        // A copy made while locked stays pending: outside the subtree, its source inside.
+        let copied = s3
+            .copy_object()
+            .bucket(BUCKET)
+            .key("bar/copy")
+            .copy_source(format!("{BUCKET}/foo/a?versionId={a}"))
+            .send()
+            .await?;
+        let copied = copied.version_id().unwrap().to_string();
+        let pending = envelope(&base, &owner, "bar/copy", &copied).await?;
+        assert_eq!(pending.0, StatusCode::CONFLICT, "{}", pending.1);
+        let requests = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/requests");
+        let subtree = json!({"scope":{"kind":"subtree","value":"foo/"}});
+        for token in [&reader, &leaver] {
+            let (status, body) =
+                send(http.post(&requests).bearer_auth(token).json(&subtree)).await?;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        }
+        issue_open(&base, &owner, &bucket_private).await?;
+        let leaver_keys = user_keys(&base, &leaver, &leaver_private).await?;
+        let (_, kept) = envelope(&base, &owner, "bar/b", &other).await?;
+        let leave = format!(
+            "{base}/api/v1/access/groups/{}/members/{leaver_id}",
+            group.group_id
+        );
+        let left = http.delete(&leave).bearer_auth(&owner).send().await?;
+        assert_eq!(left.status(), StatusCode::NO_CONTENT);
+
+        // Unlocking without the wake keeps the copy pending while its source is re-keyed.
+        let input = UnlockInput {
+            bucket: BUCKET.into(),
+            group_id: Ulid::from_string(&group.group_id)?,
+            realm_id: seed.realm_id,
+            node_id: seed.net.node_id(),
+            caller: seed.user_id,
+            key,
+            duration: None,
+            now_ms: aruna_core::time::unix_timestamp_millis(),
+        };
+        let secret = SharedSecret::new(SecretBytes::new(bucket_private.expose().to_vec()));
+        drive(UnlockBucketOperation::new(input, secret), &seed.context).await?;
+        // A page before the due raise covers no removal: the route raises and walks again.
+        let (progress, done) = rekey_page(&seed.context, BUCKET, "foo/", 1).await?;
+        assert_eq!((progress.epoch, progress.rekeyed, done), (1, 1, false));
+        let rekey = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/rekey");
+        let prefix = json!({"prefix":"foo/"});
+        let (status, _) = send(http.post(&rekey).bearer_auth(&reader).json(&prefix)).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, view) = send(http.post(&rekey).bearer_auth(&owner).json(&prefix)).await?;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        let expected = json!({"prefix":"foo/","epoch":2,"rekeyed":2,"done":true});
+        assert_eq!(view, expected);
+
+        // A removed reader's old key opens no re-keyed envelope; a remaining reader's new one does.
+        let reader_keys = user_keys(&base, &reader, &reader_private).await?;
+        for (name, version) in [("foo/a", &a), ("foo/b", &b)] {
+            let opened = opens(&base, &owner, &leaver_keys, name, version).await?;
+            assert_eq!(opened, (2, false));
+            let opened = opens(&base, &owner, &reader_keys, name, version).await?;
+            assert_eq!(opened, (2, true));
+        }
+        assert_eq!(envelope(&base, &owner, "bar/b", &other).await?.1, kept);
+        // The pending copy outside the subtree still reads the archive of its re-keyed source.
+        let read_copy = || async {
+            let read = s3
+                .get_object()
+                .bucket(BUCKET)
+                .key("bar/copy")
+                .send()
+                .await?;
+            Ok::<_, Box<dyn std::error::Error>>(read.body.collect().await?.into_bytes())
+        };
+        assert_eq!(read_copy().await?.as_ref(), b"foo/a");
+        let origin = (seed.realm_id, seed.net.node_id());
+        complete_copies(&seed.context, key, origin).await?;
+        let completed = envelope(&base, &owner, "bar/copy", &copied).await?;
+        assert_eq!(completed.0, StatusCode::OK, "{}", completed.1);
+        assert_eq!(read_copy().await?.as_ref(), b"foo/a");
+
+        // An interrupted pass resumes after its cursor; versions before it are not re-keyed again.
+        let c = put("foo/c").await?;
+        let (_, old_a) = envelope(&base, &owner, "foo/a", &a).await?;
+        let (_, old_c) = envelope(&base, &owner, "foo/c", &c).await?;
+        let (progress, done) = rekey_page(&seed.context, BUCKET, "foo/", 1).await?;
+        assert_eq!((progress.rekeyed, done), (1, false));
+        let (_, new_a) = envelope(&base, &owner, "foo/a", &a).await?;
+        assert_ne!(new_a, old_a);
+        let (status, view) = send(http.post(&rekey).bearer_auth(&owner).json(&prefix)).await?;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(
+            (view["rekeyed"].as_u64(), view["done"].as_bool()),
+            (Some(3), Some(true))
+        );
+        assert_eq!(envelope(&base, &owner, "foo/a", &a).await?.1, new_a);
+        assert_ne!(envelope(&base, &owner, "foo/c", &c).await?.1, old_c);
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
