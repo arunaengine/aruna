@@ -1464,6 +1464,34 @@ async fn group_policies_replicate() {
     )
     .await
     .expect("group creation bootstraps the auth doc");
+    // An encrypted bucket of the group on this node becomes due for an epoch raise.
+    use aruna_core::keyspaces::{
+        ABE_DUE_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+    };
+    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+    let bucket_id = Ulid::from_parts(1_624, 1);
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(bucket_id),
+        key_generation: 1,
+        ..Default::default()
+    };
+    let index = [&group_id.to_bytes()[..], b"bucket-a"].concat();
+    let rows = vec![
+        (
+            BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            b"bucket-a".to_vec().into(),
+            settings.to_bytes().unwrap().into(),
+        ),
+        (
+            GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            index.into(),
+            Vec::new().into(),
+        ),
+    ];
+    crate::document_sync::storage::batch_write_to(&storage, rows)
+        .await
+        .unwrap();
 
     let policies = vec![aruna_core::request_policy::RequestPolicy {
         policy_id: Ulid::from_bytes([3; 16]),
@@ -1491,6 +1519,12 @@ async fn group_policies_replicate() {
 
     let auth_doc = read_group_auth(&storage, group_id).await;
     assert_eq!(auth_doc.policies, policies);
+    let due = bucket_id.to_bytes().to_vec().into();
+    assert!(
+        read_storage_value(&storage, ABE_DUE_KEYSPACE, due)
+            .await
+            .is_some()
+    );
 }
 
 #[tokio::test]

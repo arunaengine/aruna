@@ -3,9 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::keyspaces::GROUP_DELETE_KEYSPACE;
+use aruna_core::keyspaces::{
+    BUCKET_ENCRYPTION_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+};
 use aruna_core::storage_entries::group_deletion_entries;
 use aruna_core::structs::identity::group_delete::{GroupDeleteRecord, MembershipFence};
+use aruna_core::structs::storage::abe_access::{due_rows, indexed_buckets};
 
 pub(crate) async fn apply_admin_operation(
     storage: &StorageHandle,
@@ -29,6 +32,58 @@ pub(crate) async fn apply_admin_operation(
             "admin document operation target does not match document sync target".to_string(),
         )),
     }
+}
+
+/// Epoch due rows for this node's encrypted buckets of a group, or of all groups without one,
+/// when `event` can narrow a READ scope; epochs stay node-local.
+async fn due_writes(
+    storage: &StorageHandle,
+    event: &AdminDocumentEvent,
+    group_id: Option<GroupId>,
+    txn_id: Option<TxnId>,
+) -> Result<Vec<(String, ByteView, Value)>> {
+    if !event.op.narrows_reads() {
+        return Ok(Vec::new());
+    }
+    let rows = match storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            prefix: group_id.map(|g| g.to_bytes().to_vec().into()),
+            start: None,
+            limit: usize::MAX,
+            txn_id,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => {
+            return Err(NetError::Dht(format!(
+                "unexpected index scan event: {other:?}"
+            )));
+        }
+    };
+    let buckets = indexed_buckets(&rows);
+    if buckets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reads = buckets
+        .iter()
+        .map(|b| (BUCKET_ENCRYPTION_KEYSPACE.to_string(), b.as_bytes().into()))
+        .collect();
+    let settings = match storage
+        .send_storage_effect(StorageEffect::BatchRead { reads, txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => {
+            return Err(NetError::Dht(format!(
+                "unexpected settings event: {other:?}"
+            )));
+        }
+    };
+    Ok(due_rows(&buckets, settings, unix_timestamp_millis()).0)
 }
 
 pub(in crate::document_sync) async fn persist_stale_event(
@@ -480,6 +535,7 @@ async fn group_transaction(
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     ];
     writes.extend(group_writes);
+    writes.extend(due_writes(storage, &event, Some(group_id), Some(txn_id)).await?);
     writes.extend(
         conflict_write_entries(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -573,6 +629,7 @@ pub(in crate::document_sync) async fn apply_realm_authorization(
         reducer_state_entry(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     ];
+    writes.extend(due_writes(storage, &event, None, None).await?);
     writes.extend(
         conflict_write_entries(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -1362,6 +1419,10 @@ async fn apply_realm_config(
             }
         };
         writes.push(reducer_write);
+        match due_writes(storage, &event, None, Some(txn_id)).await {
+            Ok(due) => writes.extend(due),
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        }
         if previous_state
             .as_ref()
             .is_none_or(|previous| previous.conflicts != reducer_state.conflicts)

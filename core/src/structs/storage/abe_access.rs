@@ -3,9 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::abe::{AbeError, AbeParameters, GRANT_PURPOSE, ObjectEnvelope, check_object};
+use super::encryption::{BucketEncryption, EncryptionMode};
 use crate::compute::{SecretBytes, SharedSecret};
 use crate::key_seal::{SealedSecret, open_sealed};
+use crate::keyspaces::ABE_DUE_KEYSPACE;
 use crate::structs::identity::auth::PathRestriction;
+use crate::types::{Key, Value};
 use crate::{NodeId, UserId};
 use aruna_kpabe::{Attribute, Envelope, Policy, UserKey, frame_context};
 use serde::{Deserialize, Serialize};
@@ -15,6 +18,40 @@ pub const REQUEST_TTL: u64 = 30 * 24 * 60 * 60 * 1000;
 pub const MAX_REQUESTS: usize = 64;
 /// Epochs one scoped key may admit.
 pub const MAX_EPOCHS: usize = aruna_kpabe::MAX_EPOCHS;
+
+/// Bucket names in rows of the group's encrypted bucket index.
+pub fn indexed_buckets(rows: &[(Key, Value)]) -> Vec<String> {
+    rows.iter()
+        .filter_map(|(key, _)| std::str::from_utf8(key.get(16..)?).ok())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Due rows, keyed by bucket id, for the buckets whose settings hold an active key, and the names
+/// of the node managed ones. A blind write, so a raise that read the old marker conflicts.
+pub fn due_rows(
+    buckets: &[String],
+    settings: Vec<(Key, Option<Value>)>,
+    now: u64,
+) -> (Vec<(String, Key, Value)>, Vec<String>) {
+    let mut writes = Vec::new();
+    let mut managed = Vec::new();
+    for (bucket, (_, value)) in buckets.iter().zip(settings) {
+        let Ok(settings) = BucketEncryption::from_row(value.as_deref()) else {
+            continue;
+        };
+        let Some(key) = settings.active_key() else {
+            continue;
+        };
+        let id = key.bucket_id.to_bytes().to_vec().into();
+        let at = now.to_be_bytes().to_vec().into();
+        writes.push((ABE_DUE_KEYSPACE.to_string(), id, at));
+        if settings.mode == EncryptionMode::NodeManaged {
+            managed.push(bucket.clone());
+        }
+    }
+    (writes, managed)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

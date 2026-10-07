@@ -359,6 +359,23 @@ pub enum AdminDocumentOperation {
     },
 }
 
+impl AdminDocumentOperation {
+    /// Whether applying this operation can remove or narrow a READ scope.
+    pub fn narrows_reads(&self) -> bool {
+        match self {
+            Self::GroupAssignmentRemoved { .. }
+            | Self::RealmAssignmentRemoved { .. }
+            | Self::GroupRoleRemoved { .. }
+            | Self::ConfigPoliciesSet { .. }
+            | Self::GroupPoliciesSet { .. } => true,
+            Self::GroupRoleCreated { role } | Self::RealmRoleCreated { role } => {
+                role.permissions.values().any(|p| *p == Permission::DENY)
+            }
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition};

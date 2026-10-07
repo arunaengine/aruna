@@ -110,11 +110,7 @@ impl Operation for EpochDueOperation {
     fn step(&mut self, event: Event) -> Effects {
         match (self.state, event) {
             (DueState::Scan, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.buckets = values
-                    .iter()
-                    .filter_map(|(key, _)| std::str::from_utf8(key.get(16..)?).ok())
-                    .map(str::to_string)
-                    .collect();
+                self.buckets = indexed_buckets(&values);
                 if self.buckets.is_empty() {
                     return self.done();
                 }
@@ -135,22 +131,8 @@ impl Operation for EpochDueOperation {
                 })]
             }
             (DueState::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let mut writes = Vec::new();
-                for (bucket, (_, value)) in self.buckets.iter().zip(values) {
-                    let Ok(settings) = BucketEncryption::from_row(value.as_deref()) else {
-                        continue;
-                    };
-                    let Some(key) = settings.active_key() else {
-                        continue;
-                    };
-                    // A blind write, so a raise that read the old marker conflicts and stays due.
-                    let id = key.bucket_id.to_bytes().to_vec().into();
-                    let at = self.now.to_be_bytes().to_vec().into();
-                    writes.push((ABE_DUE_KEYSPACE.to_string(), id, at));
-                    if settings.mode == EncryptionMode::NodeManaged {
-                        self.managed.push(bucket.clone());
-                    }
-                }
+                let (writes, managed) = due_rows(&self.buckets, values, self.now);
+                self.managed = managed;
                 if writes.is_empty() || self.txn.is_none() {
                     return self.done();
                 }
