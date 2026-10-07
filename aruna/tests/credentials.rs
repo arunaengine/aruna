@@ -460,3 +460,160 @@ async fn token_reads_locked() -> TestResult<()> {
     seed.shutdown().await;
     result
 }
+
+/// The grants of credential `access_key`, read from the node's storage.
+async fn token_grants(
+    seed: &shared::SeedNode,
+    access_key: &str,
+) -> TestResult<Vec<aruna_core::structs::storage::abe_access::KeyGrant>> {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    let scan = StorageEffect::Iter {
+        key_space: aruna_core::keyspaces::ABE_GRANT_KEYSPACE.to_string(),
+        prefix: None,
+        start: None,
+        limit: usize::MAX,
+        txn_id: None,
+    };
+    let Event::Storage(StorageEvent::IterResult { values, .. }) =
+        seed.context.storage_handle.send_storage_effect(scan).await
+    else {
+        return Err(std::io::Error::other("grant scan failed").into());
+    };
+    let mut grants = Vec::new();
+    for (_, value) in values {
+        let grant = aruna_core::structs::storage::abe_access::KeyGrant::from_bytes(&value)?;
+        if grant.context.request.credential_id.as_deref() == Some(access_key) {
+            grants.push(grant);
+        }
+    }
+    Ok(grants)
+}
+
+#[tokio::test]
+async fn token_opens_scope() -> TestResult<()> {
+    use aruna_core::structs::storage::abe_access::KeyScope;
+    const BUCKET: &str = "token-scope";
+    let seed = spawn_complete_seed().await?;
+
+    let result = async {
+        let admin = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&seed.base_url, &admin, "token-scope-group").await?;
+        let plain = create_s3_credentials(&seed.base_url, &admin, &group.group_id).await?;
+        let endpoint = seed
+            .s3
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
+        let client = s3_client(endpoint, &plain);
+        client.create_bucket().bucket(BUCKET).send().await?;
+        let http = reqwest::Client::new();
+        let encryption = format!(
+            "{}/api/v1/data/buckets/{BUCKET}/storage/encryption",
+            seed.base_url
+        );
+        let enabled = http
+            .put(&encryption)
+            .bearer_auth(&admin)
+            .json(&serde_json::json!({ "mode": "node_managed", "expected_generation": 0 }))
+            .send()
+            .await?;
+        assert_eq!(enabled.status(), StatusCode::OK);
+        let mut versions = Vec::new();
+        for key in ["allowed/a.txt", "other/b.txt"] {
+            let put = client
+                .put_object()
+                .bucket(BUCKET)
+                .key(key)
+                .body(aws_sdk_s3::primitives::ByteStream::from(
+                    key.as_bytes().to_vec(),
+                ))
+                .send()
+                .await?;
+            let version = put
+                .version_id()
+                .ok_or_else(|| std::io::Error::other("no version id"))?;
+            versions.push(ulid::Ulid::from_string(version)?);
+        }
+
+        // A token restricted to `allowed/` gets one grant of that subtree, issued at once.
+        let (public, private) = aruna_core::structs::storage::encryption::generate_key()?;
+        let created = http
+            .post(format!("{}/api/v1/access/credentials", seed.base_url))
+            .bearer_auth(&admin)
+            .json(&aruna_api::routes::credentials::CreateS3Request {
+                group_id: group.group_id.clone(),
+                expires_in_seconds: Some(600),
+                path_restrictions: Some(vec![create_request_restriction(
+                    format!("{BUCKET}/allowed/**"),
+                    Permission::READ,
+                )]),
+                encrypted_buckets: Some(vec![BUCKET.to_string()]),
+                token_public_key: Some(base64::Engine::encode(&STANDARD, public)),
+            })
+            .send()
+            .await?;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: aruna_api::routes::credentials::CreateS3Response = created.json().await?;
+        let access_key = created.access_key_id.clone();
+        let grants = token_grants(&seed, &access_key).await?;
+        let scopes: Vec<_> = grants.iter().map(|g| &g.context.request.scope).collect();
+        assert_eq!(scopes, [&KeyScope::Subtree("allowed/".to_string())]);
+        let locked = http
+            .post(format!("{encryption}/lock"))
+            .bearer_auth(&admin)
+            .send()
+            .await?;
+        assert_eq!(locked.status(), StatusCode::OK);
+
+        // While locked the token reads its scope; a leaked token and grant open nothing else.
+        let credentials = shared::S3Credentials {
+            access_key_id: created.access_key_id,
+            access_secret: created.access_secret,
+        };
+        let token = hex::encode(private.bytes().expose());
+        let reader = token_client(endpoint, &credentials, Some(token));
+        let object = reader
+            .get_object()
+            .bucket(BUCKET)
+            .key("allowed/a.txt")
+            .send()
+            .await?;
+        assert_eq!(
+            &object.body.collect().await?.into_bytes()[..],
+            b"allowed/a.txt"
+        );
+        for (key, version) in ["allowed/a.txt", "other/b.txt"].into_iter().zip(&versions) {
+            let read = aruna_operations::abe::envelope::EnvelopeOperation::new(
+                BUCKET.to_string(),
+                key.to_string(),
+                *version,
+            );
+            let (envelope, _) = aruna_operations::driver::drive(read, &seed.context).await?;
+            let opened = grants[0].open_object(private.bytes(), &envelope);
+            assert_eq!(opened.is_ok(), key == "allowed/a.txt", "{key}");
+        }
+
+        // Revoking the credential deletes its grants.
+        let revoked = http
+            .delete(format!(
+                "{}/api/v1/access/credentials/{access_key}",
+                seed.base_url
+            ))
+            .bearer_auth(&admin)
+            .send()
+            .await?;
+        assert!(revoked.status().is_success(), "{}", revoked.status());
+        assert!(token_grants(&seed, &access_key).await?.is_empty());
+        Ok(())
+    }
+    .await;
+
+    seed.shutdown().await;
+    result
+}
