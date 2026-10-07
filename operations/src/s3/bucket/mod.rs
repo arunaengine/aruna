@@ -18,7 +18,6 @@ pub mod rotate;
 pub mod routing;
 pub mod seal_missing;
 pub mod search;
-pub mod token_admit;
 pub mod token_list;
 pub mod usage;
 
