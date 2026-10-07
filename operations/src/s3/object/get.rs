@@ -1725,29 +1725,50 @@ pub(crate) async fn read_local(
     read_object(context, input, restrictions, private, &token.limits).await
 }
 
+/// Reads a version with the object key of a request header; without a version id, the
+/// current version is pinned first.
+pub async fn get_object_keyed(
+    context: &DriverContext,
+    mut input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+    private: SharedSecret,
+    limits: &RoCrateLimits,
+) -> Result<GetObjectResult, GetObjectError> {
+    pin_version(context, &mut input).await?;
+    read_object(context, input, restrictions, private, limits).await
+}
+
+/// Sets the version id of `input` to the current version when none was named.
+async fn pin_version(
+    context: &DriverContext,
+    input: &mut GetObjectInput,
+) -> Result<Ulid, GetObjectError> {
+    if let Some(version) = input.version_id {
+        return Ok(version);
+    }
+    let head = HeadObjectOperation::new(HeadObjectInput {
+        bucket: input.bucket.clone(),
+        key: input.key.clone(),
+        version_id: None,
+    });
+    let head = drive(head, context)
+        .await
+        .map_err(|_| GetObjectError::GetObjectFailed)?;
+    let version = head
+        .resolved_version_id
+        .or(head.version_id)
+        .ok_or(GetObjectError::NoSuchKey)?;
+    input.version_id = Some(version);
+    Ok(version)
+}
+
 /// Pins the version and opens its object key with a grant of `credential` that covers it.
 async fn token_object(
     context: &DriverContext,
     mut input: GetObjectInput,
     credential: &TokenCredential,
 ) -> Result<(GetObjectInput, SharedSecret), GetObjectError> {
-    let version = match input.version_id {
-        Some(version) => version,
-        None => {
-            let head = HeadObjectOperation::new(HeadObjectInput {
-                bucket: input.bucket.clone(),
-                key: input.key.clone(),
-                version_id: None,
-            });
-            let head = drive(head, context)
-                .await
-                .map_err(|_| GetObjectError::GetObjectFailed)?;
-            head.resolved_version_id
-                .or(head.version_id)
-                .ok_or(GetObjectError::NoSuchKey)?
-        }
-    };
-    input.version_id = Some(version);
+    let version = pin_version(context, &mut input).await?;
     let read = EnvelopeOperation::new(input.bucket.clone(), input.key.clone(), version);
     let (envelope, _) = drive(read, context).await?;
     let key = envelope.context.parameters.key;

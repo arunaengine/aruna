@@ -5,7 +5,9 @@
 use super::scope::resolve_scope;
 use super::server::S3OpLabel;
 use super::util::{anonymous_read_allowed, operation_permission};
+use crate::object_key::ObjectKey;
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
+use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
 use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -29,6 +31,7 @@ use aruna_operations::s3::session::{
     GetS3Operation, S3SessionError, TouchS3Config, TouchS3Operation,
 };
 use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{HeaderMap, Uri};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
@@ -39,6 +42,7 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::debug;
+use zeroize::Zeroizing;
 
 tokio::task_local! {
     /// The session token hash of the request being verified, which selects its signing secret.
@@ -136,6 +140,9 @@ impl S3Access for AuthProvider {
         // Evaluate action from S3 operation name
         let action = operation_permission(&operation_name)
             .ok_or_else(|| s3_error!(InvalidRequest, "Unknown Operation"))?;
+
+        // An object key is accepted only on GetObject, in a signed header.
+        let object_key = request_object_key(cx.headers(), cx.uri(), &operation_name)?;
 
         // Unsigned requests are checked as the Everyone principal, but only for
         // the public object-byte read surface.
@@ -246,6 +253,9 @@ impl S3Access for AuthProvider {
 
         cx.extensions_mut().insert(extras);
         cx.extensions_mut().insert(user_access);
+        if let Some(key) = object_key {
+            cx.extensions_mut().insert(ObjectKey(Ok(Some(key))));
+        }
         Ok(())
     }
 }
@@ -337,13 +347,52 @@ fn request_token_hash(headers: &HeaderMap, uri: &Uri) -> S3Result<String> {
 
 const TOKEN_HEADER: &str = "x-amz-security-token";
 const TOKEN_QUERY: &str = "X-Amz-Security-Token";
+const OBJECT_KEY_HEADER: &str = "x-aruna-object-key";
 
-/// Hides every token header value from formatting, so a logged request shows no token.
+/// Hides every token and object key header value from formatting, so a logged request shows
+/// neither.
 pub(crate) fn hide_tokens(headers: &mut HeaderMap) {
-    if let http::header::Entry::Occupied(mut entry) = headers.entry(TOKEN_HEADER) {
-        for value in entry.iter_mut() {
-            value.set_sensitive(true);
+    for name in [TOKEN_HEADER, OBJECT_KEY_HEADER] {
+        if let http::header::Entry::Occupied(mut entry) = headers.entry(name) {
+            for value in entry.iter_mut() {
+                value.set_sensitive(true);
+            }
         }
+    }
+}
+
+/// The object key of a GetObject request. It must be one SigV4 signed header and never come
+/// with a presigned URL, so the request signature covers it.
+fn request_object_key(
+    headers: &HeaderMap,
+    uri: &Uri,
+    operation: &str,
+) -> S3Result<Option<SharedSecret>> {
+    let mut values = headers.get_all(OBJECT_KEY_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    let presigned = url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+        .any(|(name, _)| name == "X-Amz-Signature");
+    if values.next().is_some()
+        || presigned
+        || operation != "GetObject"
+        || !signs_header(headers, OBJECT_KEY_HEADER)
+    {
+        return Err(s3_error!(
+            AccessDenied,
+            "The object key must be a signed header of a GetObject request"
+        ));
+    }
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    match STANDARD.decode_slice(value.as_bytes(), &mut bytes[..]) {
+        Ok(32) if value.len() == 44 => {
+            Ok(Some(SharedSecret::new(SecretBytes::new(bytes.to_vec()))))
+        }
+        _ => Err(s3_error!(
+            InvalidArgument,
+            "The object key header is malformed"
+        )),
     }
 }
 
@@ -1338,5 +1387,40 @@ mod token_tests {
         ] {
             assert!(!formatted.contains(CANARY), "{formatted}");
         }
+    }
+
+    /// Padded base64 of `canary-object-key-5e1b-0000-0000`.
+    const OBJECT_KEY: &str = "Y2FuYXJ5LW9iamVjdC1rZXktNWUxYi0wMDAwLTAwMDA=";
+
+    fn keyed(authorization: &str, uri: &'static str, operation: &str) -> S3Result<bool> {
+        let mut headers = headers(authorization, &[]);
+        headers.insert(OBJECT_KEY_HEADER, OBJECT_KEY.parse().unwrap());
+        request_object_key(&headers, &Uri::from_static(uri), operation).map(|key| key.is_some())
+    }
+
+    #[test]
+    fn object_key_signed() {
+        let signed = "AWS4-HMAC-SHA256 Credential=KEY/20261005/us-east-1/s3/aws4_request, \
+            SignedHeaders=host;x-amz-date;x-aruna-object-key, Signature=00";
+        assert!(keyed(signed, "/bucket/key", "GetObject").unwrap());
+        // Unsigned, presigned or on another operation, the header is refused.
+        let denied = |result: S3Result<bool>| {
+            result.is_err_and(|error| error.code() == &s3s::S3ErrorCode::AccessDenied)
+        };
+        assert!(denied(keyed(UNSIGNED, "/bucket/key", "GetObject")));
+        assert!(denied(keyed(
+            signed,
+            "/bucket/key?X-Amz-Signature=00",
+            "GetObject"
+        )));
+        assert!(denied(keyed(signed, "/bucket/key", "HeadObject")));
+        let mut headers = headers(signed, &[]);
+        headers.insert(OBJECT_KEY_HEADER, "c2hvcnQ=".parse().unwrap());
+        let uri = Uri::from_static("/bucket/key");
+        assert!(request_object_key(&headers, &uri, "GetObject").is_err());
+        // Formatting a request shows no object key once hidden.
+        headers.insert(OBJECT_KEY_HEADER, OBJECT_KEY.parse().unwrap());
+        hide_tokens(&mut headers);
+        assert!(!format!("{headers:?}").contains(OBJECT_KEY));
     }
 }

@@ -28,6 +28,7 @@ use self::listing::{
 use self::multipart::parse_upload_marker;
 use self::object::object_range_request;
 
+use crate::object_key::ObjectKey;
 use crate::s3::auth::map_authorize_error;
 use crate::s3::browse::{IndexEntry, render_index, wants_index};
 use crate::s3::checksum::{
@@ -99,7 +100,7 @@ use aruna_operations::s3::object::delete::bulk::{
 };
 use aruna_operations::s3::object::delete::{DeleteObjectInput as DOI, DeleteObjectOperation};
 use aruna_operations::s3::object::get::{
-    GetObjectInput as GOI, TokenRead, get_object_info, get_object_token,
+    GetObjectInput as GOI, TokenRead, get_object_info, get_object_keyed, get_object_token,
 };
 use aruna_operations::s3::object::head::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::object::list::{ListBucketInput as LOV2I, ListBucketOperation};
@@ -1558,9 +1559,14 @@ impl S3 for ArunaS3Service {
         // continues against the realm's holders instead of failing here.
         let restrictions = user_access.path_restrictions.clone();
         let token = self.token_read(&req.extensions);
-        let result = get_object_token(&self.state, input, restrictions, token)
-            .await
-            .map_err(IntoS3Error::into_s3_error)?;
+        let result = match req.extensions.get::<ObjectKey>() {
+            Some(ObjectKey(Ok(Some(private)))) => {
+                let (private, limits) = (private.clone(), &self.rocrate_limits);
+                get_object_keyed(&self.state, input, restrictions, private, limits).await
+            }
+            _ => get_object_token(&self.state, input, restrictions, token).await,
+        }
+        .map_err(IntoS3Error::into_s3_error)?;
         self.record_touch(
             &user_access.access_key,
             &response_bucket,

@@ -4,6 +4,7 @@
 
 use crate::s3::checksum::checksum_mismatch_error;
 use aruna_core::errors::{BlobError, ConversionError, SourceResolutionError, StagingSourceError};
+use aruna_core::structs::storage::abe::AbeError;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::routing::RoutingError;
 use aruna_operations::blob::managed_copy::ManagedCopyError;
@@ -487,6 +488,11 @@ impl IntoS3Error for GetObjectError {
                 "The security token does not open the bucket key"
             ),
             GetObjectError::NoSuchVersion => missing_version_error(),
+            GetObjectError::Abe(AbeError::Pending | AbeError::Required) => bucket_locked_error(),
+            GetObjectError::Abe(AbeError::WrongKey) => {
+                s3_error!(AccessDenied, "The object key does not match this version")
+            }
+            GetObjectError::Abe(AbeError::Missing) => missing_version_error(),
             GetObjectError::HistoricalReferenceUnavailable => {
                 s3_error!(
                     NoSuchVersion,
