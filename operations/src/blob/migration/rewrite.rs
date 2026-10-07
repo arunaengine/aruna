@@ -121,6 +121,8 @@ pub struct RewriteVersionOperation {
     quota: Option<(QuotaConfig, RealmId, NodeId)>,
     gate: Option<QuotaGate>,
     deletes: Vec<(String, Key)>,
+    /// A scoped re-key of the current generation, outside any transition.
+    rekey: bool,
     output: Option<Result<RewriteOutcome, RewriteError>>,
 }
 
@@ -146,7 +148,29 @@ impl RewriteVersionOperation {
             quota: None,
             gate: None,
             deletes: Vec::new(),
+            rekey: false,
             output: None,
+        }
+    }
+
+    /// Gives a version of the target generation a new object key and envelope; `transition`
+    /// names that generation and is not stored.
+    pub fn rekey(mut self) -> Self {
+        self.rekey = true;
+        self
+    }
+
+    /// A re-key moves only archives already in the target format; a transition the others.
+    fn moves(&self, old: &BackendLocation) -> bool {
+        let target = self.transition.target.plan.map(|plan| plan.key);
+        match self.rekey {
+            true => {
+                old.format
+                    .bucket_key()
+                    .is_some_and(|key| Some(key) == target)
+                    && !self.transition.needs(old)
+            }
+            false => self.transition.needs(old),
         }
     }
 
@@ -245,7 +269,7 @@ impl RewriteVersionOperation {
             Ok(None) => return self.end(RewriteOutcome::Skipped),
             Err(effects) => return effects,
         };
-        if old.staging || old.partial || !self.transition.needs(&old) {
+        if old.staging || old.partial || !self.moves(&old) {
             return self.end(RewriteOutcome::Skipped);
         }
         self.old = Some(old);
@@ -352,6 +376,7 @@ impl RewriteVersionOperation {
             .as_ref()
             .map(|row| EncryptionTransition::from_bytes(row));
         let current = match (settings, stored.transpose()) {
+            (Ok(settings), _) if self.rekey => self.transition.still_current(&settings),
             (Ok(settings), Ok(Some(stored))) => {
                 stored.started_at_ms == self.transition.started_at_ms
                     && stored.kind == self.transition.kind

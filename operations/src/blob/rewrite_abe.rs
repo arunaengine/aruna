@@ -67,7 +67,9 @@ impl RewriteVersionOperation {
 
     fn same_generation(&self) -> bool {
         let source = self.old.as_ref().and_then(|old| old.format.bucket_key());
-        source.is_some() && self.transition.target.plan.map(|plan| plan.key) == source
+        source.is_some()
+            && !self.rekey
+            && self.transition.target.plan.map(|plan| plan.key) == source
     }
 
     /// Admits a sealed source for reading; a plain source is rewritten directly.
@@ -96,6 +98,10 @@ impl RewriteVersionOperation {
         // Without target parameters a plain version gets a bucket-only copy.
         let admitted = anchors.first().is_some_and(|(_, row)| row.is_some());
         if id.is_none() && copy.is_none() && !(self.plain() && admitted) {
+            // Without an envelope there is no object key to replace.
+            if self.rekey {
+                return self.end(RewriteOutcome::Skipped);
+            }
             return self.proceed();
         }
         self.envelope_rows = Some(EnvelopeRows {

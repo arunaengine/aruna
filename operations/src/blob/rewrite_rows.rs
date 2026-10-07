@@ -84,12 +84,15 @@ impl RewriteVersionOperation {
             self.version_key.to_bytes()?.into(),
             moved.to_bytes()?.into(),
         ));
-        let cleanup = cleanup_key(&self.version_key.bucket, &old_key.to_bytes());
-        writes.push((
-            TRANSITION_CLEANUP_KEYSPACE.to_string(),
-            cleanup.into(),
-            Vec::new().into(),
-        ));
+        // Only a transition waits for its old copies to go.
+        if !self.rekey {
+            let cleanup = cleanup_key(&self.version_key.bucket, &old_key.to_bytes());
+            writes.push((
+                TRANSITION_CLEANUP_KEYSPACE.to_string(),
+                cleanup.into(),
+                Vec::new().into(),
+            ));
+        }
         let candidate =
             ReclaimCandidateKey::new(old_key.backend, old_key.encoding, old_key.blake3_hash);
         let enqueued = ReclaimCandidate {
