@@ -455,6 +455,12 @@ impl Operation for KeyOperation {
             (State::Holders, Event::Storage(StorageEvent::IterResult { values, .. })) => {
                 self.notify_holders(values)
             }
+            // A key unlocked after the locked status read cannot issue before the due raise: retry.
+            (State::Issue, Event::Blob(BlobEvent::Abe(_)))
+                if self.snapshot.as_ref().is_some_and(|s| s.due) =>
+            {
+                self.fail(KeyError::Storage)
+            }
             (State::Issue, Event::Blob(BlobEvent::Abe(event))) => match *event {
                 AbeEvent::Grant(grant) => self.publish_grant(grant),
                 _ => self.fail(AbeError::Context),
@@ -506,5 +512,108 @@ impl Operation for KeyOperation {
         self.txn.take().map_or_else(Effects::new, |txn_id| {
             smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::permission_rules::{CollectedRole, PermissionRules};
+    use aruna_core::structs::identity::auth::{Permission, Role};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::encryption::BucketKeyRef;
+
+    #[test]
+    fn due_refuses_grant() {
+        let realm_id = RealmId([1; 32]);
+        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([8; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+        };
+        let parameters = AbeParameters {
+            realm_id,
+            node_id: node,
+            key: BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1),
+            fingerprint: [7; 32],
+            parameters: vec![9; 3],
+        };
+        let scope = KeyScope::Subtree("foo/".into());
+        let request = KeyRequest {
+            request_id: Ulid::from_bytes([1; 16]),
+            requesting_user: user,
+            recipient_user: user,
+            recipient_record: None,
+            recipient_public: None,
+            recipient_fingerprint: None,
+            bucket: "bucket".into(),
+            parameters: parameters.clone(),
+            scope: scope.clone(),
+            epochs: vec![1],
+            credential_id: None,
+            restrictions: None,
+            revisions: Vec::new(),
+            created_at_ms: 1,
+        };
+        let auth = AuthContext {
+            user_id: user,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let action = KeyAction::Request(scope);
+        let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
+        let root = aruna_core::structs::storage::blob::bucket_permission_path(
+            realm_id,
+            info.group_id,
+            node,
+            "bucket",
+        );
+        let role = CollectedRole {
+            role: Role {
+                role_id: Ulid::from_bytes([2; 16]),
+                name: "reader".into(),
+                permissions: [(format!("{root}/**"), Permission::READ)].into(),
+                assigned_users: [user].into(),
+            },
+            direct: true,
+            public: false,
+        };
+        let txn_id = TxnId::generate();
+        operation.info = Some(info);
+        operation.txn = Some(txn_id);
+        operation.state = State::Issue;
+        operation.request = Some(request.clone());
+        // The status read saw a locked key and left the raise due; an unlock then let Issue succeed.
+        operation.snapshot = Some(Snapshot {
+            parameters,
+            epoch: 1,
+            revisions: Vec::new(),
+            rules: PermissionRules::from_roles(vec![role], None).unwrap(),
+            holder: false,
+            holders: Default::default(),
+            policies: false,
+            due: true,
+        });
+        let issuer = KeyIssuer::Node(node);
+        let grant = KeyGrant {
+            context: GrantContext { request, issuer },
+            enc: [0; 32],
+            ciphertext: Vec::new(),
+        };
+        let event = Event::Blob(BlobEvent::Abe(Box::new(AbeEvent::Grant(grant))));
+        let effects = operation.step(event);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: id })] if *id == txn_id
+        ));
+        assert_eq!(operation.finalize(), Err(KeyError::Storage));
     }
 }
