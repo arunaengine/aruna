@@ -588,6 +588,7 @@ async fn token_opens_scope() -> TestResult<()> {
             &object.body.collect().await?.into_bytes()[..],
             b"allowed/a.txt"
         );
+        let mut header = String::new();
         for (key, version) in ["allowed/a.txt", "other/b.txt"].into_iter().zip(&versions) {
             let read = aruna_operations::abe::envelope::EnvelopeOperation::new(
                 BUCKET.to_string(),
@@ -597,7 +598,59 @@ async fn token_opens_scope() -> TestResult<()> {
             let (envelope, _) = aruna_operations::driver::drive(read, &seed.context).await?;
             let opened = grants[0].open_object(private.bytes(), &envelope);
             assert_eq!(opened.is_ok(), key == "allowed/a.txt", "{key}");
+            if let Ok(object) = opened {
+                header = base64::Engine::encode(&STANDARD, object.as_bytes());
+            }
         }
+
+        // The object key header opens the locked object only when the signature covers it.
+        let keyed = token_client(endpoint, &plain, None);
+        let get = || keyed.get_object().bucket(BUCKET).key("allowed/a.txt");
+        let value = header.clone();
+        let object = get()
+            .customize()
+            .mutate_request(move |request| {
+                request
+                    .headers_mut()
+                    .insert("x-aruna-object-key", value.clone());
+            })
+            .send()
+            .await?;
+        assert_eq!(
+            &object.body.collect().await?.into_bytes()[..],
+            b"allowed/a.txt"
+        );
+        for listed in ["X-Aruna-Object-Key", " x-aruna-object-key"] {
+            let tamper = Tamper {
+                listed: Some(listed),
+                key: header.clone(),
+            };
+            let read = get().customize().interceptor(tamper).send().await;
+            assert_eq!(
+                service_error_code(&read).as_deref(),
+                Some("AccessDenied"),
+                "{listed:?}"
+            );
+        }
+        let value = header.clone();
+        let tamper = Tamper {
+            listed: None,
+            key: base64::Engine::encode(&STANDARD, [7u8; 32]),
+        };
+        let read = get()
+            .customize()
+            .mutate_request(move |request| {
+                request
+                    .headers_mut()
+                    .insert("x-aruna-object-key", value.clone());
+            })
+            .interceptor(tamper)
+            .send()
+            .await;
+        assert_eq!(
+            service_error_code(&read).as_deref(),
+            Some("SignatureDoesNotMatch")
+        );
 
         // Revoking the credential deletes its grants.
         let revoked = http
@@ -616,4 +669,34 @@ async fn token_opens_scope() -> TestResult<()> {
 
     seed.shutdown().await;
     result
+}
+
+/// Changes a signed request: lists `listed` among its signed headers and sets the object key.
+#[derive(Debug)]
+struct Tamper {
+    listed: Option<&'static str>,
+    key: String,
+}
+
+impl aws_sdk_s3::config::Intercept for Tamper {
+    fn name(&self) -> &'static str {
+        "Tamper"
+    }
+
+    fn modify_before_transmit(
+        &self,
+        context: &mut aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &aws_sdk_s3::config::RuntimeComponents,
+        _cfg: &mut aws_sdk_s3::config::ConfigBag,
+    ) -> Result<(), aws_sdk_s3::error::BoxError> {
+        let headers = context.request_mut().headers_mut();
+        headers.insert("x-aruna-object-key", self.key.clone());
+        if let Some(listed) = self.listed {
+            let authorization = headers.get("authorization").unwrap_or_default();
+            let authorization =
+                authorization.replace("SignedHeaders=", &format!("SignedHeaders={listed};"));
+            headers.insert("authorization", authorization);
+        }
+        Ok(())
+    }
 }

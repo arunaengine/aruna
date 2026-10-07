@@ -512,18 +512,16 @@ pub(crate) fn header_token_refused(headers: &HeaderMap, uri: &Uri) -> bool {
             })
 }
 
-/// Whether the SigV4 `Authorization` header lists `name` among its signed headers.
+/// Whether the SigV4 `Authorization` header lists `name` among its signed headers. The list
+/// is read as s3s reads it, which signs only names that exactly match a lowercase header.
 pub(crate) fn signs_header(headers: &HeaderMap, name: &str) -> bool {
     headers
         .get(http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split_once("SignedHeaders="))
-        .and_then(|(_, rest)| rest.split(',').next())
-        .is_some_and(|names| {
-            names
-                .split(';')
-                .any(|signed| signed.trim().eq_ignore_ascii_case(name))
-        })
+        .and_then(|value| value.split_once(','))
+        .and_then(|(_, rest)| rest.trim_start().strip_prefix("SignedHeaders="))
+        .and_then(|rest| rest.split_once(','))
+        .is_some_and(|(names, _)| names.split(';').any(|signed| signed == name))
 }
 
 /// The token credential a long-lived key sends in a signed `x-amz-security-token` header.
@@ -1414,6 +1412,18 @@ mod token_tests {
             "GetObject"
         )));
         assert!(denied(keyed(signed, "/bucket/key", "HeadObject")));
+        // s3s signs no header for a name in another case or with whitespace.
+        for listed in [
+            "X-Aruna-Object-Key",
+            " x-aruna-object-key",
+            "x-aruna-object-key ",
+        ] {
+            let unsigned = signed.replace("x-aruna-object-key", listed);
+            assert!(
+                denied(keyed(&unsigned, "/bucket/key", "GetObject")),
+                "{listed}"
+            );
+        }
         let mut headers = headers(signed, &[]);
         headers.insert(OBJECT_KEY_HEADER, "c2hvcnQ=".parse().unwrap());
         let uri = Uri::from_static("/bucket/key");
