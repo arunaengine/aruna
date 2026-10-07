@@ -7,7 +7,9 @@ use crate::download::{self, AdmissionError};
 use crate::object_key::ObjectKey;
 use crate::rate_limit::LocalKey;
 use crate::routes::execution::jobs::range_request;
-use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use aruna_operations::s3::object::get::{
+    GetObjectError, GetObjectInput, GetObjectOperation, read_object,
+};
 use axum::response::Response;
 use http::{HeaderMap, header};
 
@@ -55,8 +57,9 @@ pub async fn content(
     let auth = crate::auth::require_realm_auth(&state, auth)?;
     let (version, info) = authorize_version(&state, &auth, &query).await?;
     let private = object.0.map_err(|_| ServerError::BadRequest)?;
+    let keyed = private.is_some();
     let range = range_request(&headers).map_err(|_| ServerError::BadRequest)?;
-    let mut operation = GetObjectOperation::new(GetObjectInput {
+    let input = GetObjectInput {
         bucket: query.bucket.clone(),
         key: query.key.clone(),
         version_id: Some(version),
@@ -64,13 +67,8 @@ pub async fn content(
         group_id: info.group_id,
         user_identity: auth.user_id,
         node_id: state.get_node_id(),
-    })
-    .with_restrictions(auth.path_restrictions.clone());
-    let keyed = private.is_some();
-    if let Some(private) = private {
-        let (envelope, archive) = read_envelope(&state, &query, version).await?;
-        operation = operation.with_object(envelope, archive, private);
-    }
+    };
+    let restrictions = auth.path_restrictions.clone();
     let permit = download::admit(&state, LocalKey::User(auth.user_id)).map_err(|e| match e {
         AdmissionError::Total => ServerError::ServiceUnavailable,
         AdmissionError::User => ServerError::Refused(
@@ -79,7 +77,18 @@ pub async fn content(
             "download capacity exhausted".into(),
         ),
     })?;
-    let result = match drive(operation, &state.get_ctx()).await {
+    // A keyed read of a pending version promotes it under the object key first.
+    let result = match private {
+        Some(private) => {
+            let limits = state.rocrate_limits();
+            read_object(&state.get_ctx(), input, restrictions, private, limits).await
+        }
+        None => {
+            let operation = GetObjectOperation::new(input).with_restrictions(restrictions);
+            drive(operation, &state.get_ctx()).await
+        }
+    };
+    let result = match result {
         Err(GetObjectError::ConversionError(aruna_core::errors::ConversionError::BucketKey(
             aruna_core::structs::storage::encryption::BucketKeyError::Locked(_),
         ))) if !keyed => {

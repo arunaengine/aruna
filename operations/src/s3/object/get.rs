@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::abe::envelope::EnvelopeOperation;
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::managed_copy::ManagedCopyError;
 use crate::blob::promote::{
@@ -23,6 +24,7 @@ use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
     multipart_summary_read, summary_from_read,
 };
+use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
     BlobError, ConversionError, SourceResolutionError, StagingSourceError, StorageError,
@@ -40,6 +42,7 @@ use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, Source
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
+use aruna_core::structs::storage::abe::AbeEffect;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, CurrentVersionPointer, ManagedCopyKey, VersionKey,
@@ -183,7 +186,7 @@ pub enum GetObjectError {
     GetObjectFailed,
     #[error("operation did not finish")]
     NotFinished,
-    /// The version waits for its content hash; a token credential promotes it first.
+    /// The version waits for its content hash; a token credential or object key promotes it first.
     #[error("The object content waits for its bucket key.")]
     PendingContent(ArchiveKey),
     #[error(transparent)]
@@ -683,7 +686,9 @@ impl GetObjectOperation {
                 self.state = GetObjectState::ResolveReferenceAccess;
                 smallvec![resolve_binding_effect(ResolveBindingInput { source },)]
             }
-            BlobVersionState::PendingContent { archive, .. } if self.token.is_some() => {
+            BlobVersionState::PendingContent { archive, .. }
+                if self.token.is_some() || self.object.is_some() =>
+            {
                 self.abort_with_error(GetObjectError::PendingContent(archive))
             }
             BlobVersionState::PendingContent { .. } => {
@@ -1835,8 +1840,68 @@ async fn promote_token(
         TokenAdmitError::Conversion(error) => error.into(),
         _ => GetObjectError::GetObjectFailed,
     })?;
-    let promote =
-        PromotePendingOperation::new(archive.clone(), realm_id, node_id, token.limits.clone());
+    promote_leased(context, input, archive, lease, &token.limits).await
+}
+
+/// Reads a pinned version with an object key; a pending version is promoted under that key once.
+pub async fn read_object(
+    context: &DriverContext,
+    input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+    private: SharedSecret,
+    limits: &RoCrateLimits,
+) -> Result<GetObjectResult, GetObjectError> {
+    let version = input.version_id.ok_or(GetObjectError::NoSuchVersion)?;
+    let mut promoted = false;
+    loop {
+        let read = EnvelopeOperation::new(input.bucket.clone(), input.key.clone(), version);
+        let (envelope, mapping) = drive(read, context).await?;
+        let operation = GetObjectOperation::new(input.clone())
+            .with_restrictions(restrictions.clone())
+            .with_object(envelope.clone(), mapping.clone(), private.clone());
+        let archive = match drive(operation, context).await {
+            Err(GetObjectError::PendingContent(archive))
+                if !promoted && archive == mapping.archive =>
+            {
+                archive
+            }
+            result => return result,
+        };
+        promoted = true;
+        let blob = context
+            .blob_handle
+            .as_ref()
+            .ok_or(GetObjectError::GetObjectFailed)?;
+        let admit = AbeEffect::Admit {
+            envelope,
+            archive: archive.clone(),
+            private: private.clone(),
+        };
+        let lease = match blob
+            .send_blob_effect(BlobEffect::Abe(Box::new(admit)))
+            .await
+        {
+            Event::Blob(BlobEvent::ReadAdmitted { lease }) => lease,
+            Event::Blob(BlobEvent::Error(BlobError::Abe(error))) => return Err(error.into()),
+            Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
+                return Err(locked(error));
+            }
+            _ => return Err(GetObjectError::GetObjectFailed),
+        };
+        promote_leased(context, &input, archive, lease, limits).await?;
+    }
+}
+
+/// Promotes the pending `archive` under `lease`, as an unlock would.
+async fn promote_leased(
+    context: &DriverContext,
+    input: &GetObjectInput,
+    archive: ArchiveKey,
+    lease: ReadLease,
+    limits: &RoCrateLimits,
+) -> Result<(), GetObjectError> {
+    let (realm_id, node_id) = (input.user_identity.realm_id, input.node_id);
+    let promote = PromotePendingOperation::new(archive.clone(), realm_id, node_id, limits.clone());
     let outcome = match drive(promote.with_lease(lease), context).await {
         Err(PromoteError::Blob(BlobError::IntegrityCheckFailed(reason))) => {
             reject_archive(context, &archive, (realm_id, node_id), reason)
