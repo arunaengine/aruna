@@ -127,6 +127,7 @@ fn sealed_error(error: SealedCopyError) -> CopyObjectError {
         }
         SealedCopyError::PolicyGate(error) => put(PutObjectError::PolicyGate(error)),
         SealedCopyError::NoSuchVersion => CopyObjectError::Get(GetObjectError::NoSuchVersion),
+        SealedCopyError::Blob(error) => put(PutObjectError::BlobWriteFailed(error)),
         error => put(PutObjectError::WriteFailed(error.to_string())),
     }
 }
