@@ -1810,28 +1810,38 @@ async fn issue_open(
     assert_eq!(status, StatusCode::OK, "{list}");
     let mut issued = Vec::new();
     for record in list["records"].as_array().unwrap() {
-        let context: GrantContext = postcard::from_bytes(&bytes(&record["record"]))?;
-        let r = &context.request;
-        let parameters = r.parameters.public()?;
-        let master = r.parameters.recompute(bucket_private)?;
-        let policy = r.scope.policy(&r.parameters, &r.epochs)?;
-        let key = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
-        let recipient = r.recipient_public.unwrap();
-        let sealed = key.seal(|plain| {
-            seal_to(&recipient, GRANT_PURPOSE, &context.bytes().unwrap(), plain)
-                .map_err(|_| aruna_kpabe::Error)
-        })?;
-        let route = format!("{requests}/{}/grant", r.request_id);
+        let grant = sealed_grant(&record["record"], bucket_private)?;
+        let route = format!("{requests}/{}/grant", grant.context.request.request_id);
         let (status, body) = send(http.post(&route).bearer_auth(token).json(&submission(
             &record["record"],
-            sealed.enc,
-            &sealed.ciphertext,
+            grant.enc,
+            &grant.ciphertext,
         )))
         .await?;
         assert_eq!(status, StatusCode::OK, "{body}");
-        issued.push(context);
+        issued.push(grant.context);
     }
     Ok(issued)
+}
+
+/// The grant a holder issues for a listed request record with the bucket key.
+fn sealed_grant(record: &Value, bucket_private: &SecretBytes) -> TestResult<KeyGrant> {
+    let context: GrantContext = postcard::from_bytes(&bytes(record))?;
+    let r = &context.request;
+    let parameters = r.parameters.public()?;
+    let master = r.parameters.recompute(bucket_private)?;
+    let policy = r.scope.policy(&r.parameters, &r.epochs)?;
+    let key = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
+    let recipient = r.recipient_public.unwrap();
+    let sealed = key.seal(|plain| {
+        seal_to(&recipient, GRANT_PURPOSE, &context.bytes().unwrap(), plain)
+            .map_err(|_| aruna_kpabe::Error)
+    })?;
+    Ok(KeyGrant {
+        context,
+        enc: sealed.enc,
+        ciphertext: sealed.ciphertext,
+    })
 }
 
 type HeldKey = (Vec<u64>, aruna_kpabe::PublicParameters, UserKey);
@@ -2444,6 +2454,206 @@ async fn abe_rekey() -> TestResult<()> {
         );
         assert_eq!(envelope(&base, &owner, "foo/a", &a).await?.1, new_a);
         assert_ne!(envelope(&base, &owner, "foo/c", &c).await?.1, old_c);
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+/// Publishes `grant` as the seed owner by hand; `race` commits just before its transaction does.
+async fn publish_racing(
+    seed: &SeedNode,
+    grant: KeyGrant,
+    race: impl std::future::Future<Output = TestResult<()>>,
+) -> TestResult<Result<KeyResult, KeyError>> {
+    let auth = AuthContext {
+        user_id: seed.user_id,
+        realm_id: seed.realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let now = aruna_core::time::unix_timestamp_millis();
+    let action = KeyAction::Publish(grant);
+    let mut operation = KeyOperation::new(BUCKET.into(), auth, seed.net.node_id(), action, now);
+    let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
+    let mut race = Some(race);
+    while let Some(effect) = effects.pop_front() {
+        let Effect::Storage(effect) = effect else {
+            panic!("unexpected effect {effect:?}")
+        };
+        if matches!(effect, StorageEffect::CommitTransaction { .. })
+            && let Some(race) = race.take()
+        {
+            race.await?;
+        }
+        let event = seed
+            .context
+            .storage_handle
+            .send_storage_effect(effect)
+            .await;
+        if !operation.is_complete() {
+            effects.extend(operation.step(event));
+        }
+    }
+    Ok(operation.finalize())
+}
+
+/// The epoch sets of the stored grants of `user` in the bucket `bucket_id`.
+async fn grant_epochs(seed: &SeedNode, bucket_id: Ulid, user: UserId) -> Vec<Vec<u64>> {
+    let iter = StorageEffect::Iter {
+        key_space: aruna_core::keyspaces::ABE_GRANT_KEYSPACE.to_string(),
+        prefix: Some(bucket_id.to_bytes().to_vec().into()),
+        start: None,
+        limit: MAX_REQUESTS,
+        txn_id: None,
+    };
+    let event = seed.context.storage_handle.send_storage_effect(iter).await;
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+        panic!("unexpected storage event {event:?}")
+    };
+    let grants = values.iter().map(|(_, v)| KeyGrant::from_bytes(v).unwrap());
+    let own = grants.filter(|g| g.context.request.recipient_user == user);
+    own.map(|g| g.context.request.epochs).collect()
+}
+
+#[tokio::test]
+async fn abe_merge_races() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let http = reqwest::Client::new();
+        let base = seed.base_url.clone();
+        let owner = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&base, &owner, "ABE merge races").await?;
+        let owner_private = SecretBytes::new(vec![7; 32]);
+        let owner_key = add_key(
+            &base,
+            &owner,
+            "owner-1",
+            public_key_of(&owner_private).unwrap(),
+        )
+        .await?;
+        let mut readers = Vec::new();
+        for (byte, name) in [(11u8, "leaver-1"), (12, "reader-1")] {
+            let id = UserId::local(Ulid::generate(), seed.realm_id);
+            grant_roles(&base, &owner, &group.group_id, id, Value::Null).await?;
+            let context = seed.context.as_ref();
+            let token =
+                create_bearer_token(context, id, seed.realm_id, seed.capabilities.clone()).await?;
+            let private = SecretBytes::new(vec![byte; 32]);
+            add_key(&base, &token, name, public_key_of(&private).unwrap()).await?;
+            readers.push((id, token, private));
+        }
+        let [(leaver_id, leaver, _), (reader_id, reader, reader_private)] =
+            <[_; 2]>::try_from(readers).unwrap();
+        let credentials = create_s3_credentials(&base, &owner, &group.group_id).await?;
+        let s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
+        s3.create_bucket().bucket(BUCKET).send().await?;
+        let encryption = format!("{base}/api/v1/data/buckets/{BUCKET}/storage/encryption");
+        let (bucket_id, _, bucket_private) =
+            locked_key(&seed, &owner, &owner_key, &owner_private).await?;
+        let put = |key: &'static str| {
+            let request = s3
+                .put_object()
+                .bucket(BUCKET)
+                .key(key)
+                .body(key.as_bytes().to_vec().into());
+            async move {
+                Ok::<_, Box<dyn std::error::Error>>(
+                    request.send().await?.version_id().unwrap().to_string(),
+                )
+            }
+        };
+        let first = put("foo/a").await?;
+        let lock = http.post(format!("{encryption}/lock")).bearer_auth(&owner);
+        assert!(lock.send().await?.status().is_success());
+        let requests = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/requests");
+        let subtree = json!({"scope":{"kind":"subtree","value":"foo/"}});
+        for token in [&leaver, &reader] {
+            let (status, body) =
+                send(http.post(&requests).bearer_auth(token).json(&subtree)).await?;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        }
+        issue_open(&base, &owner, &bucket_private).await?;
+        let raise = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/epoch");
+        let (status, body) = send(http.post(&raise).bearer_auth(&owner)).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The reopened requests merge the epoch 1 grants when they are published.
+        let listed = || async {
+            let (status, list) = send(http.get(&requests).bearer_auth(&owner)).await?;
+            assert_eq!(status, StatusCode::OK, "{list}");
+            Ok::<_, Box<dyn std::error::Error>>(list)
+        };
+        let grant_of = |list: &Value, user: UserId| {
+            let records = list["records"].as_array().unwrap().iter();
+            let mut grants = records.map(|r| sealed_grant(&r["record"], &bucket_private).unwrap());
+            grants
+                .find(|g| g.context.request.recipient_user == user)
+                .unwrap()
+        };
+
+        // A removal commits while the leaver's merge is in flight: the merge commits nothing.
+        let leave = format!(
+            "{base}/api/v1/access/groups/{}/members/{leaver_id}",
+            group.group_id
+        );
+        let removal = async {
+            let left = http.delete(&leave).bearer_auth(&owner).send().await?;
+            assert_eq!(left.status(), StatusCode::NO_CONTENT);
+            Ok(())
+        };
+        let grant = grant_of(&listed().await?, leaver_id);
+        let published = publish_racing(&seed, grant, removal).await?;
+        assert_eq!(published, Err(KeyError::Storage));
+        assert_eq!(
+            grant_epochs(&seed, bucket_id, leaver_id).await,
+            vec![vec![1]]
+        );
+
+        // A raise consumes the due removal; the reader's reopened request merges epoch 1 too.
+        let (status, body) = send(http.post(&raise).bearer_auth(&owner)).await?;
+        assert_eq!((status, body["epoch"].as_u64()), (StatusCode::OK, Some(3)));
+        let grant = grant_of(&listed().await?, reader_id);
+        assert_eq!(grant.context.request.epochs, vec![1, 2, 3]);
+        // A raise and its reissue commit while the reader's merge is in flight: the same holds.
+        let reissue = async {
+            let (status, body) = send(http.post(&raise).bearer_auth(&owner)).await?;
+            assert_eq!((status, body["epoch"].as_u64()), (StatusCode::OK, Some(4)));
+            Ok(())
+        };
+        let published = publish_racing(&seed, grant, reissue).await?;
+        assert_eq!(published, Err(KeyError::Storage));
+        assert_eq!(
+            grant_epochs(&seed, bucket_id, reader_id).await,
+            vec![vec![1]]
+        );
+
+        // The next issuance gives the reader one key over exactly the admitted epochs. The epoch 1
+        // grant stays: it was issued under the group document before the removal.
+        issue_open(&base, &owner, &bucket_private).await?;
+        assert_eq!(
+            grant_epochs(&seed, bucket_id, leaver_id).await,
+            vec![vec![1]]
+        );
+        let held = grant_epochs(&seed, bucket_id, reader_id).await;
+        assert_eq!(held, vec![vec![1], vec![1, 2, 3, 4]]);
+        let mut keys = user_keys(&base, &reader, &reader_private).await?;
+        keys.retain(|(epochs, _, _)| epochs.len() == 4);
+        let third = put("foo/c").await?;
+        let outside = put("bar/x").await?;
+        for (key, version, expected) in [
+            ("foo/a", &first, (1, true)),
+            ("foo/c", &third, (4, true)),
+            ("bar/x", &outside, (4, false)),
+        ] {
+            assert_eq!(opens(&base, &owner, &keys, key, version).await?, expected);
+        }
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
