@@ -123,12 +123,12 @@ impl AccountStatusOperation {
         let [(_, target), (_, caller), (_, realm_auth)] = values.as_slice() else {
             return self.fail(AccountStatusError::NotFound);
         };
-        let Some(target) = target.as_deref() else {
-            return self.fail(AccountStatusError::NotFound);
-        };
-        let target = match User::from_bytes(target) {
-            Ok(target) => target,
-            Err(error) => return self.fail(error.into()),
+        // A federated user has no record here; only its credentials can be cut off.
+        let target = match target.as_deref().map(User::from_bytes) {
+            Some(Ok(target)) => Some(target),
+            Some(Err(error)) => return self.fail(error.into()),
+            None if self.foreign() => None,
+            None => return self.fail(AccountStatusError::NotFound),
         };
         // Service accounts never manage other accounts, whatever roles they hold.
         let caller = caller.as_deref().map(User::from_bytes).transpose();
@@ -148,7 +148,7 @@ impl AccountStatusOperation {
             Err(error) => return self.fail(error.into()),
         };
         let realm_id = self.config.actor.realm_id;
-        let path = match target.service_group() {
+        let path = match target.as_ref().and_then(User::service_group) {
             Some(group_id) => format!("/{realm_id}/g/{group_id}/admin"),
             None => format!("/{realm_id}/admin/config"),
         };
@@ -184,7 +184,11 @@ impl AccountStatusOperation {
     /// two leaves an active account without old credentials, and a retry completes it.
     fn next_write(&mut self) -> Effects {
         if self.config.active {
-            return self.update_user();
+            return if self.foreign() {
+                self.finish()
+            } else {
+                self.update_user()
+            };
         }
         // The grace also cuts off tokens another node mints before the status reaches it.
         let cutoff = self.config.now.saturating_add(REVOCATION_GRACE_SECS);
@@ -244,13 +248,21 @@ impl AccountStatusOperation {
     fn handle_cutoff(&mut self, event: Event) -> Effects {
         match event {
             Event::SubOperation(SubOperationEvent::TokenRevoked { result: Ok(()) }) => {
-                self.update_user()
+                if self.foreign() {
+                    self.finish()
+                } else {
+                    self.update_user()
+                }
             }
             Event::SubOperation(SubOperationEvent::TokenRevoked { result: Err(error) }) => {
                 self.fail(AccountStatusError::Cutoff(error))
             }
             other => self.unexpected("token revocation result", other),
         }
+    }
+
+    fn foreign(&self) -> bool {
+        self.config.target.realm_id != self.config.actor.realm_id
     }
 
     fn finish(&mut self) -> Effects {
@@ -509,6 +521,30 @@ mod tests {
             SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
         ));
         assert_eq!(failure(operation), AccountStatusError::Unauthorized);
+    }
+
+    #[test]
+    fn cuts_off_federated_user() {
+        // A federated user has no record here; deactivation writes only the cutoff.
+        let mut fixture = fixture();
+        fixture.target = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId::from_bytes([6u8; 32]));
+        let mut operation = operation(&fixture, false);
+        operation.start();
+        let key = ByteView::from(Vec::new());
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (key.clone(), None),
+                (key, None),
+                (ByteView::from(Vec::new()), Some(realm_auth(&fixture, &[]))),
+            ],
+        }));
+        let effects = operation.step(allowed());
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
+            result: Ok(()),
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(operation.finalize(), Ok(()));
     }
 
     #[test]
