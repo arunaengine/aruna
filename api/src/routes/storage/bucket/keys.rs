@@ -284,7 +284,7 @@ fn status_view(status: &UnlockStatus) -> UnlockView {
         (status = 200, description = "The unlock state", body = UnlockView, example = json!({ "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": 1790003600000_u64, "max_deadline_ms": 1790007200000_u64 })),
         (status = 400, description = "`wrong_key` or `invalid_duration`", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller holds no key of this bucket", body = ErrorResponse),
+        (status = 403, description = "The caller holds no key of this bucket, or is a federated user (code `foreign_encryption_keys_unsupported`)", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "`stale_generation`, `not_encrypted`, or `no_copy` when the caller has no sealed copy of the generation", body = ErrorResponse),
         (status = 503, description = "`unlock_capacity`: no room for another unlocked key", body = ErrorResponse)
@@ -300,6 +300,7 @@ pub async fn unlock_bucket(
 ) -> ServerResult<Json<UnlockView>> {
     let private_key = unlock_key(body)?;
     let auth = require_unrestricted_auth(&state, auth)?;
+    crate::routes::storage::abe::refuse_foreign_keys(&auth)?;
     let bucket_id = parse_ulid(&query.bucket_id, "bucket_id")?;
     let group_id = bucket_group(&state, &bucket).await?;
     let input = UnlockInput {
