@@ -24,7 +24,7 @@ use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::transfer::intent_digest;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::federation::import::bound_upload;
+use aruna_operations::federation::import::{bound_upload, read_import};
 use aruna_operations::jobs::import::{load_rocrate_upload, write_rocrate_upload};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_storage::FjallStorage;
@@ -301,6 +301,13 @@ async fn push_binds_principal() {
     assert_eq!(bound, Ok(Some(upload_id)));
     let again = push(&fixture, &intent, &grant).await.unwrap();
     assert_eq!(again.upload_id, first.upload_id);
+    // A push with fresh consent to the same transfer rebinds the upload, so a paused job resumes.
+    let fresh = self::intent(&fixture, fixture.user);
+    let renewed = self::grant(&fresh, BODY);
+    let resumed = push(&fixture, &fresh, &renewed).await.unwrap();
+    assert_eq!(resumed.upload_id, first.upload_id);
+    let stored = read_import(&context, upload_id).await.unwrap().unwrap();
+    assert_eq!(stored.intent, fresh);
     // Another artifact under the same import key is never handed the bound upload.
     let other = self::grant(&intent, b"another export body");
     let error = push(&fixture, &intent, &other).await.unwrap_err();
@@ -405,8 +412,9 @@ async fn import(
 }
 
 #[tokio::test]
-async fn retry_reuses_job() {
-    // A retry finds the bound upload and its job; a later upload never replaces the binding.
+async fn bound_upload_confirmed() {
+    // A bound upload is used only after the source confirms its grant; a later upload never
+    // replaces the binding.
     let fixture = fixture(false).await;
     let intent = intent(&fixture, fixture.user);
     let grant = grant(&intent, BODY);
@@ -417,26 +425,14 @@ async fn retry_reuses_job() {
     };
     let (first, second) = (Ulid::generate(), Ulid::generate());
     seed_upload(&fixture, first).await;
-    write_import(&fixture.state.get_ctx(), &key, first, &binding)
-        .await
-        .unwrap();
+    let context = fixture.state.get_ctx();
+    write_import(&context, &key, first, &binding).await.unwrap();
     let user = fixture.user;
-    let created = import(&fixture, user, &intent, &grant, SECRET)
-        .await
-        .unwrap();
-    assert!(created.created);
-    let retried = import(&fixture, user, &intent, &grant, SECRET)
-        .await
-        .unwrap();
-    assert!(!retried.created);
-    assert_eq!(retried.job_id, created.job_id);
+    let error = import(&fixture, user, &intent, &grant, SECRET).await;
+    assert!(matches!(error, Err(ServerError::ServiceUnavailable)));
     seed_upload(&fixture, second).await;
-    let bound = write_import(&fixture.state.get_ctx(), &key, second, &binding).await;
+    let bound = write_import(&context, &key, second, &binding).await;
     assert_eq!(bound, Ok(first));
-    let replayed = import(&fixture, user, &intent, &grant, SECRET)
-        .await
-        .unwrap();
-    assert_eq!(replayed.job_id, created.job_id);
 }
 
 #[tokio::test]
