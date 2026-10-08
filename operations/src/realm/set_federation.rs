@@ -20,7 +20,7 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::task::TaskEvent;
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -28,6 +28,7 @@ use tracing::warn;
 use url::Url;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::federation::publish::PUBLISH_SOON;
 use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::document_outbox::{
@@ -79,6 +80,7 @@ enum SetFederationState {
     ScheduleSyncDrain {
         document: RealmConfigDocument,
     },
+    SchedulePublication,
     Finish,
     Error,
 }
@@ -265,6 +267,23 @@ impl SetFederationOperation {
         Ok(settings)
     }
 
+    /// With a registry URL, publishes soon instead of at the next 6 hour renewal.
+    fn schedule_publication(&mut self, document: &RealmConfigDocument) -> Effects {
+        let has_registry = document
+            .federation
+            .as_ref()
+            .is_some_and(|settings| settings.registry_url.is_some());
+        if !has_registry {
+            self.state = SetFederationState::Finish;
+            return smallvec![];
+        }
+        self.state = SetFederationState::SchedulePublication;
+        smallvec![Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::PublishRegistration,
+            after: PUBLISH_SOON,
+        })]
+    }
+
     fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.fail(SetFederationError::MissingTransaction);
@@ -398,20 +417,31 @@ impl Operation for SetFederationOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            SetFederationState::ScheduleSyncDrain { .. } => match event {
+            SetFederationState::ScheduleSyncDrain { document } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = SetFederationState::Finish;
-                    smallvec![]
+                    self.schedule_publication(&document)
                 }
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
-                    self.state = SetFederationState::Finish;
-                    smallvec![]
+                    self.schedule_publication(&document)
                 }
                 other => self.unexpected_event(
                     "document sync outbox drain timer schedule",
                     format!("{other:?}"),
                 ),
+            },
+            SetFederationState::SchedulePublication => match event {
+                Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                    self.state = SetFederationState::Finish;
+                    smallvec![]
+                }
+                Event::Task(TaskEvent::Error { message, .. }) => {
+                    warn!(error = %message, "Failed to shorten the registry publication timer");
+                    self.state = SetFederationState::Finish;
+                    smallvec![]
+                }
+                other => self
+                    .unexpected_event("registry publication timer schedule", format!("{other:?}")),
             },
             SetFederationState::Finish | SetFederationState::Error | SetFederationState::Init => {
                 smallvec![]

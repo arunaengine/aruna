@@ -19,9 +19,10 @@ use aruna_core::keyspaces::FEDERATION_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::task::TaskKey;
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::Effects;
+use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
@@ -31,9 +32,12 @@ use url::Url;
 
 use crate::driver::{DriverContext, drive};
 use crate::metadata::stats::{count_realm_documents, count_realm_groups};
+use crate::tasks::task_persistence::persist_task_effect;
 
 /// How often the reporting node renews its registration.
 pub const PUBLISH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+/// Delay of the first publication after a settings change on this node.
+pub const PUBLISH_SOON: Duration = Duration::from_secs(60);
 /// Withdrawals sent while registration is disabled and the registry URL is kept.
 pub const MAX_WITHDRAWALS: u8 = 3;
 const STATE_KEY: &[u8] = b"publication";
@@ -341,14 +345,18 @@ fn realm_url(registry_url: &Url, realm_id: &RealmId) -> Result<Url, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Arms the registration timer at startup without postponing a restored due time.
-pub async fn restore_publish_timer(task_handle: &TaskHandle) {
-    if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = task_handle
-        .send_effect(Effect::Task(aruna_core::task::TaskEffect::ShortenTimer {
-            key: TaskKey::PublishRegistration,
-            after: PUBLISH_INTERVAL,
-        }))
-        .await
+/// Arms the registration timer at startup without postponing a restored due time. The due
+/// time is persisted, so repeated restarts do not keep moving the first publication.
+pub async fn restore_publish_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+    let effect = TaskEffect::ShortenTimer {
+        key: TaskKey::PublishRegistration,
+        after: PUBLISH_INTERVAL,
+    };
+    if let Err(message) = persist_task_effect(storage, &effect).await {
+        warn!(message = %message, "Failed to persist registry publication timer");
+    }
+    if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) =
+        task_handle.send_effect(Effect::Task(effect)).await
     {
         warn!(message = %message, "Failed to arm registry publication timer");
     }
