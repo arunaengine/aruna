@@ -708,6 +708,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-registry"
+version = "3.0.0-alpha.106"
+dependencies = [
+ "aruna-blob",
+ "aruna-core",
+ "axum",
+ "ed25519-dalek 3.0.0",
+ "fjall",
+ "postcard",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "aruna-storage"
 version = "3.0.0-alpha.106"
 dependencies = [

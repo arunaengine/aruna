@@ -16,6 +16,7 @@ members = [
     "tasks",
     "operations",
     "aruna-doctor",
+    "registry",
     "scripts/compute-helper",
 ]
 # default-members = ["aruna"]

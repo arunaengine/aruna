@@ -1,0 +1,29 @@
+# Manifest of aruna-registry, the optional public listing service for federated realms.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aruna-blob = { workspace = true }
+aruna-core = { workspace = true }
+axum = { workspace = true }
+fjall = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+tempfile = { workspace = true }
