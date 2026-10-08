@@ -1262,6 +1262,7 @@ fn map_put_error(error: PutObjectError) -> CallToolResult {
         PutObjectError::WriteFailed(error) => internal_error(error),
         PutObjectError::BlobWriteFailed(error) => internal_error(error),
         PutObjectError::InvalidPreassignedVersion => internal_error("invalid object version"),
+        PutObjectError::ObjectExists => internal_error("object already exists"),
         PutObjectError::ConversionError(error) => internal_error(error),
         PutObjectError::UsageUpdateError(error) => internal_error(error),
         PutObjectError::QuotaGateError(error) => internal_error(error),
