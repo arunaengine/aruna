@@ -32,6 +32,7 @@ use url::Url;
 
 use crate::driver::{DriverContext, drive};
 use crate::metadata::stats::{count_realm_documents, count_realm_groups};
+use crate::realm::get_config::GetConfigOperation;
 use crate::tasks::task_persistence::persist_task_effect;
 
 /// How often the reporting node renews its registration.
@@ -58,6 +59,8 @@ pub enum Publication {
     },
     Withdraw {
         registry_url: Url,
+        /// Issue time of the disabled settings' descriptor.
+        issued_at: u64,
     },
 }
 
@@ -97,13 +100,44 @@ fn decide(
             PublicationState::default(),
         ),
         RegistrationMode::Disabled if state.withdrawals < MAX_WITHDRAWALS => (
-            Publication::Withdraw { registry_url },
+            Publication::Withdraw {
+                registry_url,
+                issued_at: settings.descriptor.payload.issued_at,
+            },
             PublicationState {
                 withdrawals: state.withdrawals + 1,
             },
         ),
         RegistrationMode::Disabled => (Publication::Nothing, state),
     }
+}
+
+/// Whether a captured publication still matches the current settings: this node still
+/// reports, and the mode, registry URL and descriptor issue time are unchanged.
+fn still_due(config: &RealmConfigDocument, node_id: NodeId, publication: &Publication) -> bool {
+    let Some(settings) = config.federation.as_ref() else {
+        return false;
+    };
+    let (registry_url, issued_at, mode) = match publication {
+        Publication::Nothing => return false,
+        Publication::Register {
+            registry_url,
+            descriptor,
+            ..
+        } => (
+            registry_url,
+            descriptor.payload.issued_at,
+            RegistrationMode::Enabled,
+        ),
+        Publication::Withdraw {
+            registry_url,
+            issued_at,
+        } => (registry_url, *issued_at, RegistrationMode::Disabled),
+    };
+    is_reporting(config, node_id)
+        && settings.registration == mode
+        && settings.registry_url.as_ref() == Some(registry_url)
+        && settings.descriptor.payload.issued_at == issued_at
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -276,6 +310,7 @@ pub async fn publish_registration(
         .map_err(|error| error.to_string())?;
     let now = unix_timestamp_secs();
     let sign_error = |error: FederationError| error.to_string();
+    let captured = publication.clone();
     let (method, registry_url, body) = match publication {
         Publication::Nothing => return Ok(()),
         Publication::Register {
@@ -305,7 +340,7 @@ pub async fn publish_registration(
             let body = serde_json::to_vec(&signed).map_err(|error| error.to_string())?;
             (reqwest::Method::PUT, registry_url, body)
         }
-        Publication::Withdraw { registry_url } => {
+        Publication::Withdraw { registry_url, .. } => {
             let withdrawal = Withdrawal {
                 realm_id,
                 issued_at: now,
@@ -320,6 +355,13 @@ pub async fn publish_registration(
         .as_ref()
         .ok_or("no blob handle for registry egress")?;
     let url = realm_url(&registry_url, &realm_id)?;
+    // The KPI counts take time; settings may have changed since the decision.
+    let current = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !still_due(&current, node_id, &captured) {
+        return Ok(());
+    }
     let response = blob
         .repository_request(method, url)
         .map_err(|error| error.to_string())?
@@ -457,6 +499,29 @@ mod tests {
         let (publication, next) = decide(&config, reporter(), state);
         assert_eq!(publication, Publication::Nothing);
         assert_eq!(next, state);
+    }
+
+    #[test]
+    fn stale_capture_discarded() {
+        let enabled = config(RegistrationMode::Enabled, true);
+        let (captured, _) = decide(&enabled, reporter(), PublicationState::default());
+        assert!(still_due(&enabled, reporter(), &captured));
+        assert!(!still_due(&enabled, lower(node(1), node(2)).1, &captured));
+        let disabled = config(RegistrationMode::Disabled, true);
+        assert!(!still_due(&disabled, reporter(), &captured));
+        assert!(!still_due(
+            &config(RegistrationMode::Enabled, false),
+            reporter(),
+            &captured
+        ));
+        let mut moved = enabled.clone();
+        let settings = moved.federation.as_mut().unwrap();
+        settings.registry_url = Some(Url::parse("https://other.example.org").unwrap());
+        assert!(!still_due(&moved, reporter(), &captured));
+        let mut resigned = enabled;
+        let settings = resigned.federation.as_mut().unwrap();
+        settings.descriptor.payload.issued_at = 2;
+        assert!(!still_due(&resigned, reporter(), &captured));
     }
 
     #[test]
