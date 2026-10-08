@@ -18,6 +18,7 @@ pub mod device;
 pub mod drs;
 pub mod execution;
 pub mod federation;
+pub mod federation_export;
 pub mod federation_login;
 pub mod git;
 pub mod info;
@@ -52,6 +53,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(assistant::router())
         .merge(info::router())
         .merge(federation::router())
+        .merge(federation_export::router())
         .merge(federation_login::router())
         .merge(onboarding::router())
         .merge(storage::blobs::router())
@@ -496,6 +498,10 @@ pub(crate) mod tests {
         ("POST", "/access/sessions"),
         ("POST", "/federation/login-handoffs"),
         ("POST", "/federation/sessions"),
+        ("POST", "/federation/exports"),
+        ("POST", "/federation/exports/{job_id}/grant"),
+        ("DELETE", "/federation/exports/{job_id}/grant"),
+        ("POST", "/federation/exports/{job_id}/push"),
         ("POST", "/access/users/resolve"),
         ("POST", "/access/s3/sessions"),
         ("POST", "/access/s3/sessions/{access_key_id}/refresh"),
