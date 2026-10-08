@@ -442,7 +442,6 @@ pub fn validate_page(
             || request
                 .document_id
                 .is_some_and(|document_id| entry.record.document_id != document_id)
-            || entry.record.user_id.realm_id != request.realm_id
             || key_document(&entry.key) != Some(entry.record.document_id)
             || invalid_iri(&entry.record)
         {
@@ -551,6 +550,35 @@ mod tests {
             start_after: None,
             limit: MAX_AUDIT_RECORDS,
         }
+    }
+
+    #[test]
+    fn foreign_principal_accepted() {
+        // A federated user of realm 9 acted in realm 1; the record keeps the full id.
+        let realm_id = RealmId([1u8; 32]);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let document_id = Ulid::from_bytes([3u8; 16]);
+        let node = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let mut foreign = entry(
+            group_id,
+            document_id,
+            Ulid::from_bytes([1u8; 16]),
+            realm_id,
+            node,
+        );
+        foreign.record.user_id = UserId::new(Ulid::from_bytes([1u8; 16]), RealmId([9u8; 32]));
+        let page = |entry: AuditPageEntry| AuditPageResponse {
+            records: vec![entry],
+            next_start_after: None,
+        };
+        let request = request(realm_id, group_id, document_id);
+        assert_eq!(validate_page(&request, &page(foreign.clone())), Ok(()));
+        // A record of another realm stays refused whoever acted.
+        foreign.record.realm_id = RealmId([9u8; 32]);
+        assert_eq!(
+            validate_page(&request, &page(foreign)),
+            Err(AuditPageError::InvalidRecord)
+        );
     }
 
     #[test]
