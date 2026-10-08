@@ -233,6 +233,7 @@ pub async fn create_session(
             node_capabilities: state.node_capabilities().clone(),
             kind,
             label: request.label,
+            name: None,
             restrictions,
         }),
         &state.get_ctx(),
@@ -430,6 +431,7 @@ mod tests {
         auth.session = Some(SessionRef {
             sid: Ulid::generate().to_string(),
             kind: SessionKind::Assistant,
+            name: None,
         });
         let error = create_session(
             State(state.clone()),
@@ -629,6 +631,7 @@ mod tests {
         auth.session = Some(SessionRef {
             sid: Ulid::generate().to_string(),
             kind: SessionKind::Portal,
+            name: None,
         });
         let (_, Json(created)) = create_session(
             State(state.clone()),

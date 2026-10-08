@@ -34,6 +34,8 @@ pub struct CreateSessionConfig {
     pub node_capabilities: NodeCapabilities,
     pub kind: SessionKind,
     pub label: Option<String>,
+    /// Display name a federated session carries in its token.
+    pub name: Option<String>,
     pub restrictions: Option<Vec<PathRestriction>>,
 }
 
@@ -149,6 +151,7 @@ impl CreateSessionOperation {
         let session_ref = SessionRef {
             sid: self.sid.clone(),
             kind: self.config.kind,
+            name: self.config.name.clone(),
         };
         let token = mint_token(&CreateTokenConfig {
             time: self.config.time,
@@ -411,6 +414,7 @@ mod pure_tests {
             node_capabilities: NodeCapabilities::management_node(signing_key).unwrap(),
             kind: SessionKind::Portal,
             label: None,
+            name: None,
             restrictions: None,
         }
     }

@@ -5,6 +5,7 @@
 use crate::NodeId;
 use crate::UserId;
 use crate::errors::ConversionError;
+use crate::federation::MAX_NAME_LEN;
 use crate::structs::identity::realm::RealmId;
 use crate::types::RoleId;
 use core::fmt;
@@ -87,6 +88,9 @@ pub struct TokenClaims {
     /// Delegation signature: Realm signature over issuer_pubkey
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegation_signature: Option<String>,
+    /// Bounded display name of a federated session's user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +99,8 @@ pub enum SessionKind {
     Portal,
     Assistant,
     Api,
+    /// A session this realm issued for a user of another realm after a login handoff.
+    Federated,
 }
 
 impl fmt::Display for SessionKind {
@@ -103,6 +109,7 @@ impl fmt::Display for SessionKind {
             Self::Portal => "portal",
             Self::Assistant => "assistant",
             Self::Api => "api",
+            Self::Federated => "federated",
         })
     }
 }
@@ -111,6 +118,8 @@ impl fmt::Display for SessionKind {
 pub struct SessionRef {
     pub sid: String,
     pub kind: SessionKind,
+    /// Display-only name of a federated user; never used for authorization.
+    pub name: Option<String>,
 }
 
 /// Path restriction for token scope.
@@ -220,14 +229,22 @@ impl TryFrom<TokenClaims> for AuthContext {
     fn try_from(value: TokenClaims) -> Result<Self, Self::Error> {
         let user_id = UserId::from_string(&value.sub)?;
         let realm_id = RealmId::from_base64(&value.iss)?;
-        if user_id.realm_id != realm_id {
+        // Only a federated session names a user of another realm than its issuer.
+        let federated = value.session_kind == Some(SessionKind::Federated);
+        if user_id.realm_id != realm_id && !federated {
             return Err(ConversionError::InvalidUserId);
         }
+        let name = match value.name {
+            Some(name) if !federated || name.chars().count() > MAX_NAME_LEN => {
+                return Err(ConversionError::InvalidSessionClaim);
+            }
+            name => name,
+        };
         let path_restrictions = value.restrictions;
         let session = match (value.sid, value.session_kind) {
             (Some(sid), Some(kind)) => {
                 Ulid::from_string(&sid)?;
-                Some(SessionRef { sid, kind })
+                Some(SessionRef { sid, kind, name })
             }
             (None, None) => None,
             _ => return Err(ConversionError::InvalidSessionClaim),
@@ -314,6 +331,7 @@ mod tests {
             restrictions: Some(restrictions.clone()),
             issuer_pubkey: None,
             delegation_signature: None,
+            name: None,
         })
         .unwrap();
 
@@ -338,10 +356,43 @@ mod tests {
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,
+            name: None,
         })
         .unwrap();
 
         assert_eq!(auth.session.unwrap().sid, sid);
+    }
+
+    fn foreign_claims(kind: SessionKind, name: Option<String>) -> TokenClaims {
+        let user_id = UserId::new(Ulid::from_bytes([9u8; 16]), RealmId::from_bytes([1u8; 32]));
+        TokenClaims {
+            sub: user_id.to_string(),
+            iss: RealmId::from_bytes([7u8; 32]).to_base64(),
+            iat: 1,
+            exp: 2,
+            jti: "token-id".to_string(),
+            sid: Some(Ulid::from_bytes([8u8; 16]).to_string()),
+            session_kind: Some(kind),
+            restrictions: None,
+            issuer_pubkey: None,
+            delegation_signature: None,
+            name,
+        }
+    }
+
+    #[test]
+    fn foreign_only_federated() {
+        // A foreign subject is accepted only in a federated session, with a bounded name.
+        let auth =
+            AuthContext::try_from(foreign_claims(SessionKind::Federated, Some("Ada".into())))
+                .unwrap();
+        assert_ne!(auth.user_id.realm_id, auth.realm_id);
+        assert_eq!(auth.session.unwrap().name.as_deref(), Some("Ada"));
+        for kind in [SessionKind::Portal, SessionKind::Api] {
+            assert!(AuthContext::try_from(foreign_claims(kind, None)).is_err());
+        }
+        let long = "a".repeat(crate::federation::MAX_NAME_LEN + 1);
+        assert!(AuthContext::try_from(foreign_claims(SessionKind::Federated, Some(long))).is_err());
     }
 }
 

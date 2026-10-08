@@ -3999,6 +3999,7 @@ fn test_token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenCla
         restrictions: None,
         issuer_pubkey: None,
         delegation_signature: None,
+        name: None,
     }
 }
 
