@@ -5,7 +5,9 @@
 
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::federation_export::{GRANT_HEADER, encode_header, transfer_refused};
+use crate::routes::federation_export::{
+    GRANT_HEADER, INTENT_HEADER, decode_header, encode_header, grant_header, transfer_refused,
+};
 use crate::routes::rocrate_import::{
     ImportMetadataRequest, ImportSourceRequest, ImportTargetRequest, SubmitImportRequest,
     SubmitImportResponse, map_upload_error, parse_import_metadata, parse_import_target,
@@ -29,7 +31,7 @@ use aruna_operations::federation::import::{
 use aruna_operations::jobs::import::{CreateRoCrateConfig, CreateRoCrateOperation};
 use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
 use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
@@ -74,6 +76,13 @@ pub struct FederatedImportRequest {
     pub grant: Signed<ExportGrant>,
     /// Hex of the 32 byte secret whose SHA-256 is the intent nonce.
     pub secret: String,
+}
+
+/// An admitted push of another realm's artifact into the upload route.
+pub(crate) struct Push {
+    pub intent: Signed<ImportIntent>,
+    pub grant: Signed<ExportGrant>,
+    pub key: String,
 }
 
 fn import_refused(error: ImportError) -> ServerError {
@@ -147,6 +156,39 @@ async fn admit(
     .map_err(import_refused)?;
     import_key(&grant.payload, &payload.destination)
         .map_err(|error| transfer_refused(TransferError::Signature(error)))
+}
+
+/// Admits a push from the source realm; `None` without intent and grant headers.
+pub(crate) async fn admit_push(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> ServerResult<Option<Push>> {
+    let intent = decode_header::<Signed<ImportIntent>>(headers, INTENT_HEADER)?;
+    let grant = grant_header(headers)?;
+    let (intent, grant) = match (intent, grant) {
+        (Some(intent), Some(grant)) => (intent, grant),
+        (None, None) => return Ok(None),
+        _ => return Err(ServerError::Unauthorized),
+    };
+    let key = admit(state, &intent, &grant, None).await?;
+    Ok(Some(Push { intent, grant, key }))
+}
+
+/// The upload an earlier transfer of the same import key left on this node.
+pub(crate) async fn pushed_upload(
+    state: &ServerState,
+    push: &Push,
+) -> ServerResult<Option<RoCrateUploadRecord>> {
+    let context = state.get_ctx();
+    let Some(upload_id) = bound_upload(&context, &push.key)
+        .await
+        .map_err(import_refused)?
+    else {
+        return Ok(None);
+    };
+    aruna_operations::jobs::import::load_rocrate_upload(&context, upload_id)
+        .await
+        .map_err(ServerError::InternalError)
 }
 
 /// Checks a transferred upload against the grant and binds it to the intent and import key.
