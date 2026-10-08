@@ -144,7 +144,7 @@ jobs:
           docker logs minio >&2 || true
           exit 1
 
-      # Shows whether the coverage export stays within memory at four threads.
+      # Shows whether the coverage export stays within memory at two threads.
       - name: Sample memory use
         run: nohup sh -c 'while sleep 5; do printf "%s " "$(date +%T)"; free -m | sed -n 2p; done' > memory.log 2>&1 &
 
@@ -179,7 +179,7 @@ jobs:
           RAYON_NUM_THREADS: 1
         run: |
           grcov . \
-            --threads 4 \
+            --threads 2 \
             --binary-path ./target/debug/deps/ \
             --source-dir . \
             --output-type lcov \
