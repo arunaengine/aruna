@@ -1192,11 +1192,8 @@ async fn abe_issuance_reissues() -> TestResult<()> {
             readers.push(token);
         }
         let credentials = create_s3_credentials(&base, &owner, &group.group_id).await?;
-        s3_client(seed.s3.as_ref().unwrap(), &credentials)
-            .create_bucket()
-            .bucket(BUCKET)
-            .send()
-            .await?;
+        let s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
+        s3.create_bucket().bucket(BUCKET).send().await?;
         let encryption = format!("{base}/api/v1/data/buckets/{BUCKET}/storage/encryption");
         let (status, settings) = send(
             http.put(&encryption)
@@ -1214,13 +1211,13 @@ async fn abe_issuance_reissues() -> TestResult<()> {
 
         // A synced removal left the bucket due; the next node issuance raises and reissues.
         let id = bucket_id.to_bytes().to_vec();
-        let due = StorageEffect::Write {
+        let due = || StorageEffect::Write {
             key_space: aruna_core::keyspaces::ABE_DUE_KEYSPACE.to_string(),
             key: id.clone().into(),
             value: vec![1].into(),
             txn_id: None,
         };
-        seed.context.storage_handle.send_storage_effect(due).await;
+        seed.context.storage_handle.send_storage_effect(due()).await;
         let (status, body) =
             send(http.post(&requests).bearer_auth(&readers[1]).json(&subtree)).await?;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1231,7 +1228,7 @@ async fn abe_issuance_reissues() -> TestResult<()> {
         let (status, body) =
             send(http.post(&requests).bearer_auth(&readers[0]).json(&subtree)).await?;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(stored(&seed, progress, id).await.is_none());
+        assert!(stored(&seed, progress, id.clone()).await.is_none());
         let grants = format!("{base}/api/v1/data/buckets/{BUCKET}/abe/grants");
         let (_, own) = send(http.get(&grants).bearer_auth(&readers[0])).await?;
         let epochs: Vec<u64> = own["records"]
@@ -1247,6 +1244,29 @@ async fn abe_issuance_reissues() -> TestResult<()> {
             })
             .collect();
         assert!(epochs.contains(&2), "{own}");
+
+        // A due raise by an enumerated request also pages the reissue for continuing readers.
+        let body = b"x".to_vec().into();
+        s3.put_object()
+            .bucket(BUCKET)
+            .key("foo/x")
+            .body(body)
+            .send()
+            .await?;
+        seed.context.storage_handle.send_storage_effect(due()).await;
+        let writes = json!({"scope":{"kind":"writes","value":"foo/"}});
+        for _ in 0..2 {
+            let (status, body) =
+                send(http.post(&requests).bearer_auth(&readers[1]).json(&writes)).await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        assert!(stored(&seed, progress, id).await.is_none());
+        let (_, own) = send(http.get(&grants).bearer_auth(&readers[0])).await?;
+        let continuing = own["records"].as_array().unwrap().iter().any(|r| {
+            let grant = KeyGrant::from_bytes(&bytes(&r["record"])).unwrap();
+            grant.context.request.epochs.contains(&3)
+        });
+        assert!(continuing, "{own}");
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;

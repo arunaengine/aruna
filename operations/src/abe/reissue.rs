@@ -249,7 +249,10 @@ impl KeyOperation {
     pub(super) fn walk(&mut self) -> Effects {
         let issuing = matches!(
             self.action,
-            KeyAction::Request(_) | KeyAction::Member(_) | KeyAction::Token { .. }
+            KeyAction::Request(_)
+                | KeyAction::Member(_)
+                | KeyAction::Token { .. }
+                | KeyAction::Writes(_)
         );
         if self.quiet || !issuing {
             self.state = State::Done;
