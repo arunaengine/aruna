@@ -862,6 +862,7 @@ async fn write_next(
     checkpoint: &mut ImportCheckpoint,
     plan: &ImportPlan,
 ) -> Result<(), ImportFailure> {
+    ensure_federated(ctx, spec).await?;
     if checkpoint.next_entry >= plan.entries.len() {
         checkpoint.phase = ImportPhase::Rewrite;
         return Ok(());
@@ -1132,6 +1133,7 @@ async fn create_document(
     checkpoint: &mut ImportCheckpoint,
 ) -> Result<(), ImportFailure> {
     ensure_metadata_permission(ctx, spec).await?;
+    ensure_federated(ctx, spec).await?;
     ensure_valid_path(spec)?;
     let jsonld = checkpoint
         .rewritten_json
@@ -1461,7 +1463,19 @@ async fn ensure_targets(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<()
         Permission::WRITE,
     )
     .await?;
-    ensure_metadata_permission(ctx, spec).await
+    ensure_metadata_permission(ctx, spec).await?;
+    ensure_federated(ctx, spec).await
+}
+
+/// An import of another realm's artifact keeps its intent binding and import policies.
+async fn ensure_federated(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<(), ImportFailure> {
+    use crate::federation::import::{ImportError, recheck_import};
+    recheck_import(&ctx.driver, spec, ctx.owner_node_id)
+        .await
+        .map_err(|error| match error {
+            ImportError::Storage(error) => ImportFailure::Retryable(error),
+            error => ImportFailure::Permanent(error.to_string()),
+        })
 }
 
 async fn ensure_metadata_permission(
