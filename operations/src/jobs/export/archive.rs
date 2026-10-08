@@ -24,6 +24,7 @@ pub(super) fn plan_export(
         let entity = &mut checkpoint.entities[entry.entity_index];
         entity.report_source = Some(entry.report_source);
         entity.resolved_version = entry.resolved_version;
+        entity.content = Some((entry.hash, entry.size));
         let reserved = |path: &String| path == METADATA_PATH || path == REPORT_PATH;
         let explicit = entity
             .local_path
@@ -73,6 +74,9 @@ pub(super) fn plan_export(
         .collect::<BTreeMap<_, _>>();
     let unrewritten = scan_unrewritten(&document, &replacements);
     rewrite_ids(&mut document, &replacements);
+    if spec.selection.is_some() {
+        add_references(&mut document, &checkpoint.entities);
+    }
     checkpoint.report = build_rows(&checkpoint.entities, &unrewritten);
     let has_omissions = if spec.destination.is_some() {
         blocking_omissions(&checkpoint.report) > 0
@@ -184,7 +188,6 @@ pub(super) fn recognize_entities(
                     key: location.key.clone(),
                 })
             });
-        let external = !identity.is_aruna();
         let hash_realm = identity.hash_realm;
         let supported_exact = identity
             .exact
@@ -193,7 +196,10 @@ pub(super) fn recognize_entities(
         let supported_hash =
             identity.hash.is_some() && hash_realm.is_none_or(|hash_realm| hash_realm == realm_id);
         let located = identity.location.is_some();
-        let unsupported_realm = !external && !supported_exact && !supported_hash && !located;
+        let foreign = identity.is_aruna() && !supported_exact && !supported_hash && !located;
+        // A web identifier of another realm is a reference, as an export into a realm leaves it.
+        let external = !identity.is_aruna() || (foreign && web_entity(&entity_id));
+        let unsupported_realm = foreign && !external;
         let paths = local_paths.remove(&subject).unwrap_or_default();
         let local_path = raw_path
             .filter(|raw_path| paths.contains(raw_path))
@@ -224,6 +230,7 @@ pub(super) fn recognize_entities(
             report_source: None,
             resolved_version: None,
             path_synthesized: false,
+            content: None,
         });
     }
     if let Some(subject) = files.into_iter().next() {
@@ -1165,6 +1172,56 @@ pub(crate) fn blocking_omissions(rows: &[ExportReportRow]) -> usize {
             _ => false,
         })
         .count()
+}
+
+/// Leaves every File entity outside `files` as a reference to this realm.
+pub(super) fn keep_references(entities: &mut [ExportEntity], files: &[String]) {
+    for entity in entities.iter_mut() {
+        if entity.omission.is_none() && !files.contains(&entity.entity_id) {
+            entity.omission = Some(ReasonCode::External);
+            entity.message = Some("left as a reference to the source realm".to_string());
+        }
+    }
+}
+
+/// The web identifier and the original identifier of an entity left as a reference.
+fn reference_ids(entity: &ExportEntity) -> Option<(String, String)> {
+    let id = match (&entity.exact, entity.hash) {
+        (Some(exact), _) => (exact.to_w3id(), exact.to_string()),
+        (None, Some(hash)) => (content_id(hash), entity.entity_id.clone()),
+        (None, None) => return None,
+    };
+    Some(id)
+}
+
+/// Names each Aruna entity left as a reference by its web identifier, keeping the original
+/// identifier as `identifier`, so the receiving realm keeps it as an external reference.
+pub(super) fn add_references(document: &mut JsonValue, entities: &[ExportEntity]) {
+    let references = entities
+        .iter()
+        .filter(|entity| entity.omission == Some(ReasonCode::External))
+        .filter_map(|entity| Some((entity.entity_id.clone(), reference_ids(entity)?)))
+        .collect::<BTreeMap<_, _>>();
+    let replacements = references
+        .iter()
+        .map(|(id, (web, _))| (id.clone(), web.clone()))
+        .collect();
+    rewrite_ids(document, &replacements);
+    let keywords = JsonLdKeywords::new(document);
+    let Some(graph) = document.get_mut("@graph").and_then(JsonValue::as_array_mut) else {
+        return;
+    };
+    let identifiers = references
+        .into_values()
+        .collect::<BTreeMap<String, String>>();
+    for object in graph.iter_mut().filter_map(JsonValue::as_object_mut) {
+        let id = keywords.object_id(object).map(|(_, id)| id.to_string());
+        if let Some(original) = id.and_then(|id| identifiers.get(&id)) {
+            object
+                .entry("identifier")
+                .or_insert_with(|| JsonValue::String(original.clone()));
+        }
+    }
 }
 
 /// A data entity on the web, which a crate may name without carrying its bytes.

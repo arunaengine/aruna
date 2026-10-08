@@ -28,7 +28,7 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobVersion, BucketInfo, HashIndex, ManagedCopyKey, VersionKey,
     ensure_confined_path, object_permission_path,
 };
-use aruna_core::structs::storage::data_identity::DataIdentity;
+use aruna_core::structs::storage::data_identity::{DataIdentity, content_id};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };
@@ -230,6 +230,8 @@ struct ExportEntity {
     report_source: Option<ExportReportSource>,
     resolved_version: Option<Ulid>,
     path_synthesized: bool,
+    /// Plaintext hash and size of the included version.
+    content: Option<([u8; 32], u64)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -745,7 +747,11 @@ async fn snapshot_export(
     let canonical = craqle::validate_rocrate_jsonld(&jsonld).map_err(map_crate_error)?;
     let document: JsonValue = serde_json::from_str(&jsonld)
         .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
-    let entities = recognize_entities(&document, &canonical.nquads, spec.auth_context.realm_id)?;
+    let mut entities =
+        recognize_entities(&document, &canonical.nquads, spec.auth_context.realm_id)?;
+    if let Some(selection) = &spec.selection {
+        keep_references(&mut entities, &selection.files);
+    }
     if entities.len() as u64 > spec.limits.max_entries {
         return Err(ExportFailure::Permanent(format!(
             "RO-Crate has more than {} File entities",
@@ -1935,6 +1941,15 @@ async fn open_local_txn(
             }));
         }
     };
+    // An export into another realm reads encrypted files only for a current key holder.
+    if lease.is_some()
+        && spec.selection.is_some()
+        && !crate::replication::plaintext::is_holder(driver, bucket, spec.auth_context.user_id)
+            .await
+            .map_err(ExportFailure::Retryable)?
+    {
+        return Ok(CandidateOpen::Status(OpenStatus::Denied));
+    }
     let (effect, held) = match (lease, location.format.bucket_key()) {
         (Some(lease), Some(_)) => {
             let location = location.clone();

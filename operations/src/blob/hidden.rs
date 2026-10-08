@@ -913,6 +913,7 @@ mod tests {
         let mut record = JobRecord::new(
             job_id,
             JobPayload::ExportRoCrate(ExportRoCrateSpec {
+                selection: None,
                 destination: None,
                 auth_context: AuthContext {
                     user_id: UserId::nil(realm),

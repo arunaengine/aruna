@@ -586,6 +586,7 @@ async fn queued_push_recovers() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("revision missing")?
         .winning_event_id;
     let spec = ExportRoCrateSpec {
+        selection: None,
         destination: Some(link.destination(false)),
         auth_context: AuthContext {
             user_id: link.created_by,
@@ -638,6 +639,7 @@ async fn full_slots_wait() -> Result<(), Box<dyn std::error::Error>> {
     let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
     // Other exports of the creator take every active job slot.
     let spec = ExportRoCrateSpec {
+        selection: None,
         destination: None,
         auth_context: AuthContext {
             user_id: link.created_by,
