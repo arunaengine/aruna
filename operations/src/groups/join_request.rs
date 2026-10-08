@@ -339,6 +339,7 @@ impl GroupJoinOperation {
                 RoutingContext {
                     group_auth: Some(&auth),
                     realm_auth: None,
+                    realm_id: self.input.actor.realm_id,
                 },
                 self.input.now_ms,
             )

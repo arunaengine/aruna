@@ -565,7 +565,8 @@ fn join_payload_validates() {
         actor_user_id,
     };
     assert!(validate_inbound_kind(&valid, realm_id).is_ok());
-    assert!(validate_inbound_kind(&valid, RealmId::from_bytes([8; 32])).is_err());
+    // A federated requester of another realm may be named on an admin-bound record.
+    assert!(validate_inbound_kind(&valid, RealmId::from_bytes([8; 32])).is_ok());
     let invalid = NotificationKind::GroupJoinRequested {
         group_id,
         request_id: Ulid::nil(),
