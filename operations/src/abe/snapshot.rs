@@ -4,7 +4,8 @@
 
 use super::*;
 use crate::auth::permission_rules::{CollectedRole, PermissionRules};
-use aruna_core::request_policy::{CompiledPolicySet, PolicyRequest, RequestPolicy};
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request, policy_request_with};
+use aruna_core::request_policy::{CompiledPolicySet, RequestPolicy};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
@@ -181,10 +182,23 @@ impl KeyOperation {
         let compile = |policies| CompiledPolicySet::compile(policies).map_err(|_| KeyError::Denied);
         let [realm, group] = &snapshot.checks;
         let (realm, group) = (compile(realm)?, compile(group)?);
-        let user = self.recipient().to_string();
+        let recipient = self.recipient();
+        // A holder publishes later, without the recipient's session, so a session policy refuses.
+        let own = !matches!(self.action, KeyAction::Publish(_)) && recipient == self.auth.user_id;
+        if !own && (realm.needs_session || group.needs_session) {
+            return Err(KeyError::Session);
+        }
         let allowed = |key: &&str| {
             let path = format!("{root}/{key}");
-            let request = PolicyRequest::basic(path.clone(), "read".into(), user.clone());
+            let request = match own {
+                true => policy_request_with(
+                    &path,
+                    &Permission::READ,
+                    Some(&self.auth),
+                    PolicyRequestExtras::rest(),
+                ),
+                false => policy_request(&path, &Permission::READ, Some(&recipient)),
+            };
             snapshot.rules.allows(&path, &Permission::READ)
                 && !realm.evaluate(&request).is_denied()
                 && !group.evaluate(&request).is_denied()

@@ -294,4 +294,55 @@ mod tests {
         let scope = KeyScope::Subtree("bar/".into());
         assert_eq!(continuing.scope_allowed(&scope), Err(KeyError::Denied));
     }
+
+    #[test]
+    fn session_policy_checked() {
+        // The caller's own session is evaluated; a holder publishing later cannot evaluate it.
+        use aruna_core::structs::identity::auth::{SessionKind, SessionRef};
+        let session = RequestPolicy {
+            policy_id: Ulid::from_bytes([10; 16]),
+            name: "no-assistant".into(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: "permission == 'read' && request.session.kind == 'assistant'".into(),
+            enabled: true,
+        };
+        let id = Ulid::from_bytes([1; 16]);
+        let scope = KeyScope::Writes(vec![("foo/a".into(), id)]);
+        let mut operation = listing();
+        operation.snapshot.as_mut().unwrap().checks[1].push(session);
+        assert_eq!(operation.scope_allowed(&scope), Ok(()));
+        operation.auth.session = Some(SessionRef {
+            sid: Ulid::from_bytes([12; 16]).to_string(),
+            kind: SessionKind::Assistant,
+        });
+        assert_eq!(operation.scope_allowed(&scope), Err(KeyError::Denied));
+        let recipient = operation.auth.user_id;
+        let parameters = operation.snapshot.as_ref().unwrap().parameters.clone();
+        let request = KeyRequest {
+            request_id: id,
+            requesting_user: recipient,
+            recipient_user: recipient,
+            recipient_record: Some(id),
+            recipient_public: Some([1; 32]),
+            recipient_fingerprint: Some([2; 32]),
+            bucket: "bucket".into(),
+            parameters,
+            scope: scope.clone(),
+            epochs: vec![3],
+            credential_id: None,
+            restrictions: None,
+            revisions: Vec::new(),
+            created_at_ms: 0,
+        };
+        let issuer = KeyIssuer::User(recipient);
+        let grant = KeyGrant {
+            context: GrantContext { request, issuer },
+            enc: [0; 32],
+            ciphertext: vec![0; 16],
+        };
+        operation.action = KeyAction::Publish(grant);
+        operation.auth.session = None;
+        assert_eq!(operation.scope_allowed(&scope), Err(KeyError::Session));
+    }
 }

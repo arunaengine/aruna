@@ -192,6 +192,8 @@ pub struct CompiledPolicySet {
     policies: Vec<CompiledPolicy>,
     pub needs_body: bool,
     pub needs_params: bool,
+    /// Whether an enabled policy reads `request`, the session of the caller.
+    pub needs_session: bool,
 }
 
 /// The offending policy when a set fails to compile.
@@ -295,6 +297,7 @@ impl CompiledPolicySet {
         let mut compiled = Vec::with_capacity(policies.len());
         let mut needs_body = false;
         let mut needs_params = false;
+        let mut needs_session = false;
         for policy in policies {
             let program = compile_program(policy, &policy.expression)?;
             let when = match &policy.when {
@@ -307,6 +310,7 @@ impl CompiledPolicySet {
                     needs_body |= references.has_variable("body");
                     needs_params |=
                         references.has_variable("params") || references.has_variable("headers");
+                    needs_session |= references.has_variable("request");
                 }
             }
             compiled.push(CompiledPolicy {
@@ -322,6 +326,7 @@ impl CompiledPolicySet {
             policies: compiled,
             needs_body,
             needs_params,
+            needs_session,
         })
     }
 

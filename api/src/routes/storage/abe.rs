@@ -76,6 +76,7 @@ pub(crate) fn key_error(error: KeyError) -> ServerError {
         KeyError::Bound(_) => {
             ServerError::Refused(StatusCode::PAYLOAD_TOO_LARGE, "enumeration_limit", message)
         }
+        KeyError::Session => ServerError::Refused(StatusCode::CONFLICT, "session_policy", message),
     }
 }
 fn parameter_view(p: &AbeParameters, epoch: u64) -> ServerResult<Value> {
