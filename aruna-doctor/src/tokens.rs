@@ -954,6 +954,7 @@ mod tests {
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,
+            name: None,
         }
     }
 

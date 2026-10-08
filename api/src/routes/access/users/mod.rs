@@ -337,6 +337,7 @@ async fn issue_user_session(
             node_capabilities: state.node_capabilities().clone(),
             kind,
             label: None,
+            name: None,
             restrictions,
         }),
         &state.get_ctx(),

@@ -243,6 +243,7 @@ fn mint_token_at(
         restrictions: None,
         issuer_pubkey: None,
         delegation_signature: None,
+        name: None,
     };
     let key_pem = signing_key
         .to_pkcs8_pem(LineEnding::LF)
