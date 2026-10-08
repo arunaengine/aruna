@@ -26,7 +26,7 @@ use aruna_core::transfer::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::federation::import::{
-    ImportError, ImportRecord, authorize_import, reusable_upload, write_import,
+    ImportError, ImportRecord, authorize_import, check_cutoff, reusable_upload, write_import,
 };
 use aruna_operations::jobs::import::{
     CreateRoCrateConfig, CreateRoCrateOperation, load_rocrate_upload, write_rocrate_upload,
@@ -151,6 +151,9 @@ async fn admit(
     let (payload, source) = (&intent.payload, Some(grant.payload.source));
     let auth = principal(state, payload);
     let context = state.get_ctx();
+    check_cutoff(&context, local, payload)
+        .await
+        .map_err(import_refused)?;
     authorize_import(
         &context,
         &auth,
@@ -428,7 +431,8 @@ binds the call to the portal that requested the intent.
 **Behavior**
 - The intent must name this realm's current descriptor and the secret; the grant must be signed
   by its source realm for this intent. WRITE and the `federation.import` policies are checked
-  again, and on every step of the import job.
+  again, and on every step of the import job. An intent issued before a credential cutoff of its
+  principal is refused.
 - When an earlier push or pull of the same import key left an upload on this node, it is used
   once the source answers a HEAD of the artifact with the grant. Otherwise this node pulls the
   artifact from the grant's artifact URL through its egress guard. If either fails, the answer is

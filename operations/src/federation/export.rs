@@ -23,6 +23,7 @@ use thiserror::Error;
 use ulid::Ulid;
 use url::Url;
 
+use crate::auth::bearer_token::realm_user_cutoff;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
@@ -153,6 +154,13 @@ async fn recheck(
     auth: &AuthContext,
     record: &GrantRecord,
 ) -> Result<(), GrantError> {
+    let cutoff = realm_user_cutoff(&context.storage_handle, auth.realm_id, &record.principal)
+        .await
+        .map_err(|error| GrantError::Storage(error.to_string()))?;
+    // A credential cutoff of the consenting user also ends grants issued before it.
+    if cutoff.is_some_and(|cutoff| record.grant.payload.issued_at < cutoff) {
+        return Err(GrantError::Denied);
+    }
     let audience = record.grant.payload.audience;
     let path = &record.document_path;
     authorize_export(context, auth, path, audience, record.with_files).await?;
@@ -470,7 +478,7 @@ mod tests {
         put(
             &context,
             config_space,
-            config_key,
+            config_key.clone(),
             config.to_bytes(&actor).unwrap(),
         )
         .await;
@@ -519,6 +527,21 @@ mod tests {
         assert!(admitted.is_ok());
         record.sources[0].key_ref = Some(BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1));
         write_record(&context, job(), &record).await.unwrap();
+        let admitted = admit_grant(&context, local(), job(), &record.grant, NOW).await;
+        assert_eq!(admitted, Err(GrantError::Denied));
+        // A credential cutoff of the consenting user after issuance ends the grant.
+        use aruna_core::time::unix_timestamp_secs;
+        record.sources[0].key_ref = None;
+        write_record(&context, job(), &record).await.unwrap();
+        let mut config = config;
+        config
+            .revoked_tokens
+            .push(aruna_core::structs::identity::realm::TokenRevocation {
+                token_hash: aruna_core::auth::user_cutoff_hash(&record.principal),
+                expires_at: aruna_core::auth::user_cutoff_expiry(unix_timestamp_secs()),
+            });
+        let config_bytes = config.to_bytes(&actor).unwrap();
+        put(&context, config_space, config_key, config_bytes).await;
         let admitted = admit_grant(&context, local(), job(), &record.grant, NOW).await;
         assert_eq!(admitted, Err(GrantError::Denied));
     }

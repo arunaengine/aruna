@@ -260,7 +260,8 @@ that owns the job.
 **Behavior**
 - The export must have succeeded with every selected file included.
 - READ, the `federation.export` policies and, for encrypted files, an unlocked key the caller
-  holds are checked again now and on every artifact read with the grant.
+  holds are checked again now and on every artifact read with the grant. A credential cutoff of
+  the caller ends every grant issued before it.
 - The grant names the artifact's BLAKE3 and size, the dataset and selection digests and the
   artifact URL; it lives 24 hours and is not renewable. Repeating the call returns the stored
   grant while it is valid and not revoked. An expired grant is refused with code
