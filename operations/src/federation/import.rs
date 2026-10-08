@@ -22,7 +22,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::auth::bearer_token::realm_user_cutoff;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
@@ -223,21 +222,6 @@ fn bound(spec: &ImportRoCrateSpec, intent: &ImportIntent) -> bool {
         && normalized(&spec.metadata.path) == normalized(&destination.metadata_path)
 }
 
-/// Refuses an intent issued before a credential cutoff of its principal in realm `local`.
-pub async fn check_cutoff(
-    context: &DriverContext,
-    local: RealmId,
-    intent: &ImportIntent,
-) -> Result<(), ImportError> {
-    let cutoff = realm_user_cutoff(&context.storage_handle, local, &intent.principal)
-        .await
-        .map_err(|error| ImportError::Storage(error.to_string()))?;
-    if cutoff.is_some_and(|cutoff| intent.issued_at < cutoff) {
-        return Err(ImportError::Denied);
-    }
-    Ok(())
-}
-
 /// Rechecks an import of another realm's artifact at every step; other imports pass. An expired
 /// intent or grant, or a superseded descriptor, pauses the job until a fresh consent rebinds it.
 pub async fn recheck_import(
@@ -286,7 +270,7 @@ pub async fn recheck_import(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use aruna_core::effects::StorageEffect;
     use aruna_core::federation::RealmDescriptor;
@@ -302,7 +286,7 @@ mod tests {
     use tempfile::{TempDir, tempdir};
     use url::Url;
 
-    fn context() -> (TempDir, DriverContext) {
+    pub(crate) fn context() -> (TempDir, DriverContext) {
         let dir = tempdir().unwrap();
         let context = DriverContext {
             storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
@@ -316,7 +300,7 @@ mod tests {
         (dir, context)
     }
 
-    fn realm(seed: u8) -> RealmId {
+    pub(crate) fn realm(seed: u8) -> RealmId {
         RealmId::from_bytes(
             SigningKey::from_bytes(&[seed; 32])
                 .verifying_key()
@@ -324,15 +308,15 @@ mod tests {
         )
     }
 
-    fn signer(seed: u8) -> NodeCapabilities {
+    pub(crate) fn signer(seed: u8) -> NodeCapabilities {
         NodeCapabilities::management_node(SigningKey::from_bytes(&[seed; 32])).unwrap()
     }
 
-    fn principal() -> UserId {
+    pub(crate) fn principal() -> UserId {
         UserId::new(Ulid::from_bytes([3; 16]), realm(1))
     }
 
-    fn descriptor() -> Signed<RealmDescriptor> {
+    pub(crate) fn descriptor() -> Signed<RealmDescriptor> {
         let descriptor = RealmDescriptor {
             realm_id: realm(2),
             name: "B".to_string(),
@@ -349,7 +333,7 @@ mod tests {
         seed_cutoff(context, descriptor, None).await;
     }
 
-    async fn seed_cutoff(
+    pub(crate) async fn seed_cutoff(
         context: &DriverContext,
         descriptor: Signed<RealmDescriptor>,
         cutoff: Option<aruna_core::structs::identity::realm::TokenRevocation>,
@@ -384,7 +368,7 @@ mod tests {
         context.storage_handle.send_storage_effect(effect).await;
     }
 
-    fn record() -> ImportRecord {
+    pub(crate) fn record() -> ImportRecord {
         let intent = ImportIntent {
             realm_id: realm(2),
             descriptor_digest: aruna_core::handoff::descriptor_digest(&descriptor()).unwrap(),
@@ -575,7 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn cutoff_ends_intent() {
-        // A credential cutoff of the principal after issuance refuses and pauses the import.
+        // A credential cutoff of the principal after issuance pauses the import.
         let (_dir, context) = context();
         let upload_id = Ulid::from_bytes([9; 16]);
         let record = record();
@@ -589,9 +573,6 @@ mod tests {
             ),
         };
         seed_cutoff(&context, descriptor(), Some(cutoff)).await;
-        let intent = &record.intent.payload;
-        let admitted = check_cutoff(&context, realm(2), intent).await;
-        assert_eq!(admitted, Err(ImportError::Denied));
         let checked = recheck_import(&context, &spec(upload_id), node(), NOW).await;
         assert_eq!(checked, Err(ImportError::Expired));
     }
