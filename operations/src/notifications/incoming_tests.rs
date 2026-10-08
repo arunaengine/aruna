@@ -1475,6 +1475,10 @@ fn metadata_path_accepted() {
     };
 
     assert!(validate_watch_event(&event, realm_id, 1_000).is_ok());
+    // A federated actor is accepted; the event itself must still belong to this realm.
+    event.actor = UserId::new(Ulid::generate(), RealmId::from_bytes([78u8; 32]));
+    assert!(validate_watch_event(&event, realm_id, 1_000).is_ok());
+    assert!(validate_watch_event(&event, RealmId::from_bytes([78u8; 32]), 1_000).is_err());
 
     event.path = format!("meta/{group_id}/datasets/project/");
     assert_eq!(
