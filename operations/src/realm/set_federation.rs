@@ -187,7 +187,7 @@ impl SetFederationOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let settings = self.signed_settings(&document)?;
+        let settings = self.signed_settings(&document, &reducer_state)?;
         let admin_event = reducer_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::ConfigFederationSet {
@@ -236,12 +236,10 @@ impl SetFederationOperation {
     fn signed_settings(
         &self,
         document: &RealmConfigDocument,
+        reducer_state: &AdminDocumentState,
     ) -> Result<FederationSettings, SetFederationError> {
         let config = &self.config;
-        let previous = document
-            .federation
-            .as_ref()
-            .map_or(0, |settings| settings.descriptor.payload.issued_at);
+        let previous = latest_issued(document, reducer_state);
         let descriptor = RealmDescriptor {
             realm_id: config.actor.realm_id,
             name: config.name.clone(),
@@ -440,6 +438,29 @@ impl Operation for SetFederationOperation {
     }
 }
 
+/// The highest descriptor issue time among the stored settings and every reducer candidate,
+/// so a newly signed descriptor supersedes all sides of a conflict.
+fn latest_issued(document: &RealmConfigDocument, reducer_state: &AdminDocumentState) -> u64 {
+    let materialized = reducer_state
+        .user_subject_ids
+        .get(CONFIG_FEDERATION_PATH)
+        .and_then(|version| version.value.as_deref());
+    let conflicting = reducer_state
+        .conflicts
+        .get(CONFIG_FEDERATION_PATH)
+        .into_iter()
+        .flat_map(|conflict| &conflict.values)
+        .filter_map(|candidate| candidate.value.as_deref());
+    materialized
+        .into_iter()
+        .chain(conflicting)
+        .filter_map(|value| serde_json::from_str::<FederationSettings>(value).ok())
+        .chain(document.federation.clone())
+        .map(|settings| settings.descriptor.payload.issued_at)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Overlays the reducer's materialized federation settings onto the document,
 /// mirroring the replicated materialization in `net::irokle`.
 fn apply_reducer_federation(
@@ -459,8 +480,10 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::realm::get_config::GetConfigOperation;
     use aruna_core::UserId;
+    use aruna_core::admin_documents::AdminDocumentDot;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::reducer::{AdminConflict, AdminConflictValue};
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
@@ -586,6 +609,43 @@ mod tests {
             .expect("settings store again");
         let second = stored(&ctx, &actor).await.expect("settings stored");
         assert_eq!(second.descriptor.payload.issued_at, 101);
+    }
+
+    #[test]
+    fn issued_above_conflicts() {
+        // A conflict candidate newer than the stored descriptor raises the next issue time.
+        let actor = actor();
+        let config = request(&actor, "https://api.example.org");
+        let operation = SetFederationOperation::new(config.clone());
+        let empty = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        let settings_at = |issued_at: u64| {
+            let mut config = config.clone();
+            config.now = issued_at;
+            SetFederationOperation::new(config)
+                .signed_settings(&empty, &AdminDocumentState::new(operation.admin_target()))
+                .unwrap()
+        };
+        let stored = settings_at(200);
+        let candidate = |issued_at| AdminConflictValue {
+            value: Some(serde_json::to_string(&settings_at(issued_at)).unwrap()),
+            dot: AdminDocumentDot {
+                event_id: Ulid::from_bytes([issued_at as u8; 16]),
+                origin_node_id: actor.node_id,
+                origin_seq: issued_at,
+            },
+        };
+        let mut state = AdminDocumentState::new(operation.admin_target());
+        state.conflicts.insert(
+            CONFIG_FEDERATION_PATH.to_string(),
+            AdminConflict {
+                path: CONFIG_FEDERATION_PATH.to_string(),
+                values: vec![candidate(500), candidate(300)],
+            },
+        );
+        let mut document = empty.clone();
+        document.federation = Some(stored);
+        let signed = operation.signed_settings(&document, &state).unwrap();
+        assert_eq!(signed.descriptor.payload.issued_at, 501);
     }
 
     #[tokio::test]
