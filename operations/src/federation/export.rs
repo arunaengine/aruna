@@ -361,6 +361,108 @@ mod tests {
         assert_eq!(admitted, Err(GrantError::Denied));
     }
 
+    async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
+        let effect = StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(effect).await;
+    }
+
+    #[tokio::test]
+    async fn encrypted_needs_holder() {
+        // A reader who holds no key of an encrypting bucket is refused for its files only.
+        use aruna_core::document::DocumentTarget;
+        use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
+        use aruna_core::structs::identity::auth::Actor;
+        use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+        use aruna_core::structs::identity::realm::{
+            RealmAuthorizationDocument, RealmConfigDocument,
+        };
+        use aruna_core::structs::storage::blob::BucketInfo;
+        let (_dir, context) = context();
+        let (realm, group) = (local(), Ulid::from_bytes([2; 16]));
+        let owner = UserId::new(Ulid::from_bytes([9; 16]), realm);
+        let mut record = record();
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            user_id: owner,
+            realm_id: realm,
+        };
+        let mut group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm, group);
+        let viewer = group_auth
+            .roles
+            .values_mut()
+            .find(|role| role.name == "viewer");
+        viewer.unwrap().assigned_users.insert(record.principal);
+        let group_doc = Group {
+            display_name: "group".to_string(),
+            group_id: group,
+            realm_id: realm,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm);
+        let config = RealmConfigDocument::default_for_realm(realm, Vec::new());
+        let config_target = DocumentTarget::RealmConfig { realm_id: realm };
+        let info = BucketInfo {
+            group_id: group,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: owner,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+        };
+        let realm_key = realm.as_bytes().to_vec();
+        put(
+            &context,
+            AUTH_KEYSPACE,
+            realm_key,
+            realm_auth.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        let group_key = group.to_bytes().to_vec();
+        let auth_doc = group_auth.to_bytes(&actor).unwrap();
+        put(&context, AUTH_KEYSPACE, group_key.clone(), auth_doc).await;
+        put(
+            &context,
+            GROUP_KEYSPACE,
+            group_key,
+            group_doc.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        let config_key = config_target.storage_key().to_vec();
+        let config_space = config_target.storage_keyspace();
+        put(
+            &context,
+            config_space,
+            config_key,
+            config.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        put(
+            &context,
+            S3_BUCKET_KEYSPACE,
+            b"sealed".to_vec(),
+            info.to_bytes().unwrap(),
+        )
+        .await;
+        let path = format!("/{realm}/g/{group}/meta/doc");
+        record.document_path = path.clone();
+        record.sources = vec![("sealed".to_string(), path, false)];
+        write_record(&context, job(), &record).await.unwrap();
+        let admitted = admit_grant(&context, local(), job(), &record.grant, NOW).await;
+        assert!(admitted.is_ok());
+        record.sources[0].2 = true;
+        write_record(&context, job(), &record).await.unwrap();
+        let admitted = admit_grant(&context, local(), job(), &record.grant, NOW).await;
+        assert_eq!(admitted, Err(GrantError::Denied));
+    }
+
     #[tokio::test]
     async fn grant_needs_record() {
         let (_dir, context) = context();
