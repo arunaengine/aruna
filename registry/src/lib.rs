@@ -6,6 +6,7 @@
 pub mod store;
 pub mod verify;
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use aruna_blob::egress::EgressGuard;
@@ -17,22 +18,52 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use serde::Serialize;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tracing::warn;
 
 use crate::store::{Entry, Store, StoreError, is_stale};
 use crate::verify::verify_routes;
 
+/// Writes accepted per minute across all clients, and their burst.
+const WRITES_PER_MINUTE: u32 = 60;
+const WRITE_BURST: u32 = 20;
+/// Registrations whose descriptor routes are fetched at the same time.
+const VERIFY_SLOTS: usize = 4;
+
 pub struct RegistryState {
     pub store: Store,
     pub egress: EgressGuard,
+    writes: DefaultDirectRateLimiter,
+    verifications: Semaphore,
+}
+
+impl RegistryState {
+    pub fn new(store: Store, egress: EgressGuard) -> Self {
+        let quota = Quota::per_minute(NonZeroU32::new(WRITES_PER_MINUTE).expect("nonzero rate"))
+            .allow_burst(NonZeroU32::new(WRITE_BURST).expect("nonzero burst"));
+        Self {
+            store,
+            egress,
+            writes: RateLimiter::direct(quota),
+            verifications: Semaphore::new(VERIFY_SLOTS),
+        }
+    }
+
+    /// Counts one write; runs before any signature check or fetch.
+    fn admit_write(&self) -> Result<(), RegistryError> {
+        self.writes.check().map_err(|_| RegistryError::RateLimited)
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error("path is not a realm id")]
     BadRealm,
+    #[error("too many registry writes, retry later")]
+    RateLimited,
     #[error(transparent)]
     Signature(#[from] FederationError),
     #[error(transparent)]
@@ -43,6 +74,8 @@ impl IntoResponse for RegistryError {
     fn into_response(self) -> Response {
         let status = match &self {
             Self::BadRealm => StatusCode::BAD_REQUEST,
+            Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Self::Store(StoreError::NotFound) => StatusCode::NOT_FOUND,
             Self::Signature(_) => StatusCode::FORBIDDEN,
             Self::Store(StoreError::Replayed | StoreError::FutureIssued) => StatusCode::CONFLICT,
             Self::Store(error) => {
@@ -145,6 +178,7 @@ async fn put_realm(
     Path(realm_id): Path<String>,
     Json(signed): Json<Signed<Registration>>,
 ) -> Result<Json<Listing>, RegistryError> {
+    state.admit_write()?;
     let realm_id = parse_realm(&realm_id)?;
     check_registration(&realm_id, &signed)?;
     let now = unix_timestamp_secs();
@@ -152,7 +186,14 @@ async fn put_realm(
     state
         .store
         .check_issued(&realm_id, signed.payload.issued_at, now)?;
-    let verified = verify_routes(&state.egress, &signed.payload.descriptor).await;
+    let verified = {
+        let _slot = state
+            .verifications
+            .acquire()
+            .await
+            .map_err(|_| RegistryError::Store(StoreError::Poisoned))?;
+        verify_routes(&state.egress, &signed.payload.descriptor).await
+    };
     let entry = Entry {
         registration: signed,
         received_at: now,
@@ -167,6 +208,7 @@ async fn delete_realm(
     Path(realm_id): Path<String>,
     Json(signed): Json<Signed<Withdrawal>>,
 ) -> Result<StatusCode, RegistryError> {
+    state.admit_write()?;
     let realm_id = parse_realm(&realm_id)?;
     signed.verify(&realm_id)?;
     let now = unix_timestamp_secs();
@@ -182,6 +224,37 @@ mod tests {
     use crate::store::tests::{capabilities, realm_id, registration};
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use ed25519_dalek::SigningKey;
+
+    #[tokio::test]
+    async fn writes_rate_limited() {
+        // The limit applies before the signature check, so forged writes use it up too.
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(RegistryState::new(
+            Store::open(dir.path()).unwrap(),
+            EgressGuard::new(aruna_core::egress::EgressPolicy::strict()).unwrap(),
+        ));
+        let other = NodeCapabilities::management_node(SigningKey::from_bytes(&[8; 32])).unwrap();
+        let forged = Signed::sign(
+            Withdrawal {
+                realm_id: realm_id(),
+                issued_at: 10,
+            },
+            &other,
+        )
+        .unwrap();
+        let path = realm_id().to_string();
+        for _ in 0..WRITE_BURST {
+            let result = delete_realm(
+                State(state.clone()),
+                Path(path.clone()),
+                Json(forged.clone()),
+            )
+            .await;
+            assert!(matches!(result, Err(RegistryError::Signature(_))));
+        }
+        let result = delete_realm(State(state), Path(path), Json(forged)).await;
+        assert!(matches!(result, Err(RegistryError::RateLimited)));
+    }
 
     #[test]
     fn accepts_signed_registration() {
