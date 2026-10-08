@@ -808,6 +808,14 @@ async fn resolve_entries(
         }
         let entity = &checkpoint.entities[index];
         if entity.omission.is_some() {
+            // An export into a realm names a location it leaves out by its current version here.
+            if spec.selection.is_some()
+                && entity.exact.is_none()
+                && entity.hash.is_none()
+                && let Some(location) = entity.storage_key.clone()
+            {
+                checkpoint.entities[index].exact = current_version(ctx, spec, &location).await;
+            }
             ctx.progress.advance(1);
             continue;
         }

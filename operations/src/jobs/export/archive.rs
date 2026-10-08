@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::structs::storage::data_identity::ObjectLocation;
 
 pub(super) fn plan_export(
     spec: &ExportRoCrateSpec,
@@ -75,7 +76,7 @@ pub(super) fn plan_export(
     let unrewritten = scan_unrewritten(&document, &replacements);
     rewrite_ids(&mut document, &replacements);
     if spec.selection.is_some() {
-        add_references(&mut document, &checkpoint.entities);
+        add_references(&mut document, &checkpoint.entities)?;
     }
     checkpoint.report = build_rows(&checkpoint.entities, &unrewritten);
     let has_omissions = if spec.destination.is_some() {
@@ -1256,14 +1257,26 @@ fn reference_ids(entity: &ExportEntity) -> Option<(String, String)> {
     Some(id)
 }
 
-/// Names each Aruna entity left as a reference by its web identifier, keeping the original
-/// identifier as `identifier`, so the receiving realm keeps it as an external reference.
-pub(super) fn add_references(document: &mut JsonValue, entities: &[ExportEntity]) {
-    let references = entities
-        .iter()
-        .filter(|entity| entity.omission == Some(ReasonCode::External))
-        .filter_map(|entity| Some((entity.entity_id.clone(), reference_ids(entity)?)))
-        .collect::<BTreeMap<_, _>>();
+/// Names each Aruna entity left out of an export into a realm by its web identifier, keeps the
+/// original identifier as `identifier` and drops its source-local locations, so the receiving
+/// realm keeps it as an external reference. A source location without a version fails.
+pub(super) fn add_references(
+    document: &mut JsonValue,
+    entities: &[ExportEntity],
+) -> Result<(), ExportFailure> {
+    let mut references = BTreeMap::new();
+    for entity in entities.iter().filter(|entity| entity.omission.is_some()) {
+        match reference_ids(entity) {
+            Some(ids) => references.insert(entity.entity_id.clone(), ids),
+            None if entity.storage_key.is_some() => {
+                return Err(ExportFailure::Permanent(format!(
+                    "File entity `{}` names a source location without a current version",
+                    entity.entity_id
+                )));
+            }
+            None => continue,
+        };
+    }
     let replacements = references
         .iter()
         .map(|(id, (web, _))| (id.clone(), web.clone()))
@@ -1271,19 +1284,37 @@ pub(super) fn add_references(document: &mut JsonValue, entities: &[ExportEntity]
     rewrite_ids(document, &replacements);
     let keywords = JsonLdKeywords::new(document);
     let Some(graph) = document.get_mut("@graph").and_then(JsonValue::as_array_mut) else {
-        return;
+        return Ok(());
     };
     let identifiers = references
         .into_values()
         .collect::<BTreeMap<String, String>>();
+    let local_path = ["localPath", LOCAL_PATH_IRI, PATH_HTTP_IRI];
+    let content_url = ["contentUrl", SCHEMA_CONTENT_IRI, CONTENT_HTTPS_IRI];
+    let source_local = |value: &JsonValue| value.as_str().and_then(ObjectLocation::parse).is_some();
     for object in graph.iter_mut().filter_map(JsonValue::as_object_mut) {
         let id = keywords.object_id(object).map(|(_, id)| id.to_string());
-        if let Some(original) = id.and_then(|id| identifiers.get(&id)) {
-            object
-                .entry("identifier")
-                .or_insert_with(|| JsonValue::String(original.clone()));
-        }
+        let Some(original) = id.and_then(|id| identifiers.get(&id)) else {
+            continue;
+        };
+        object
+            .entry("identifier")
+            .or_insert_with(|| JsonValue::String(original.clone()));
+        object.retain(|key, value| {
+            if keywords.expands_to(key, &local_path) {
+                return false;
+            }
+            if !keywords.expands_to(key, &content_url) {
+                return true;
+            }
+            if let JsonValue::Array(values) = value {
+                values.retain(|value| !source_local(value));
+                return !values.is_empty();
+            }
+            !source_local(value)
+        });
     }
+    Ok(())
 }
 
 /// A data entity on the web, which a crate may name without carrying its bytes.
