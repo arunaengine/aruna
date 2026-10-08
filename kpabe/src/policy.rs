@@ -1,3 +1,7 @@
+//! Typed attributes and canonical policies with their row labels and limits.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use alloc::vec::Vec;
 
 use crate::{Error, MAX_ATTRIBUTE_BYTES, MAX_ATTRIBUTES, MAX_BYTES, MAX_EPOCHS, MAX_ROWS};

@@ -1,3 +1,7 @@
+//! Object envelopes: a KEM ciphertext plus an authenticated, sealed object private key.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use alloc::vec::Vec;
 
 use aes_gcm_core::{Aes256Gcm, KeyInit, aead::AeadInOut};

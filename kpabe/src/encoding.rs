@@ -1,3 +1,7 @@
+//! Canonical, bounded byte encodings of parameters, ciphertexts and sealed user keys.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use alloc::vec::Vec;
 
 use bls12_381_plus::{G1Projective, G2Projective, Gt};

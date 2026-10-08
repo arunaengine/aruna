@@ -1,3 +1,7 @@
+//! Checks the fixed test vectors and prints them on request.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use alloc::{vec, vec::Vec};
 
 use rand::{SeedableRng, rngs::StdRng};

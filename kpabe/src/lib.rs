@@ -1,6 +1,7 @@
 //! FAME KP KEM from Agrawal and Chase (2017), Appendix B, Figure B.1.
-//! Callers admit parameter fingerprints and supply canonical contexts and cryptographic entropy.
-//! Production use requires external review of this crate, its protocol and its pairing dependency.
+//! Callers admit fingerprints and give canonical contexts and entropy. Needs review for production.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 #![no_std]
 #![forbid(unsafe_code)]

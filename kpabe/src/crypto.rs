@@ -1,3 +1,7 @@
+//! Hashing, HKDF expansion, key derivation and checked scalar and group helpers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use alloc::vec::Vec;
 
 use bls12_381_plus::{G1Projective, Gt, Scalar, elliptic_curve_013::hash2curve::ExpandMsgXmd};

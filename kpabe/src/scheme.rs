@@ -1,3 +1,7 @@
+//! Setup, key issuance, encapsulation and decapsulation of the KP KEM.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use alloc::vec::Vec;
 
 use bls12_381_plus::{G1Affine, G1Projective, G2Affine, G2Projective, Gt, Scalar, pairing};

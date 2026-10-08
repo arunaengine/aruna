@@ -1,3 +1,7 @@
+//! Tests the browser binding against crate vectors, issued scopes and refused policies.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_kpabe::{Attribute, frame_context, seal};
 use rand::{SeedableRng, rngs::StdRng};
 use serde_json::{Value, json};

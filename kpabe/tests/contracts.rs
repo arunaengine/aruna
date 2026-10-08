@@ -1,3 +1,7 @@
+//! Tests the public policy shapes and the sealed key boundary.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_kpabe::{
     Attribute, Envelope, Policy, PublicParameters, issue, open, seal, setup_from_seed,
 };

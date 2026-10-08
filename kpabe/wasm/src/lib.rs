@@ -1,6 +1,7 @@
-//! Browser binding of `aruna-kpabe` for the portal's key worker.
-//! Imports opened grants, opens object envelopes and issues scoped keys from a bucket key.
+//! Browser binding of `aruna-kpabe` for the portal's key worker: grants, envelopes, scoped keys.
 //! Secret inputs are taken as mutable slices and cleared, which also clears the caller's buffer.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_kpabe::{
     Attribute, Envelope, MasterSecret, Policy, PublicParameters, SecretKey, UserKey,

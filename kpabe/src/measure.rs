@@ -1,3 +1,7 @@
+//! Prints local timings and encoded sizes of parameters, ciphertexts and keys on request.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use alloc::vec::Vec;
 
 use rand::{SeedableRng, rngs::StdRng};
