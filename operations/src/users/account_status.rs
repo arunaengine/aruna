@@ -286,6 +286,10 @@ impl Operation for AccountStatusOperation {
     type Error = AccountStatusError;
 
     fn start(&mut self) -> Effects {
+        // Federated callers never change account status; local admins may cut them off.
+        if self.config.auth_context.user_id.realm_id != self.config.actor.realm_id {
+            return self.fail(AccountStatusError::Unauthorized);
+        }
         let realm_id = self.config.actor.realm_id;
         let realm_auth = DocumentTarget::RealmAuthorization { realm_id };
         self.state = AccountStatusState::ReadRecords;
@@ -545,6 +549,17 @@ mod tests {
         }));
         assert!(effects.is_empty());
         assert_eq!(operation.finalize(), Ok(()));
+    }
+
+    #[test]
+    fn federated_caller_refused() {
+        // Group admin roles of a federated user never reach service-account status changes.
+        let mut fixture = fixture();
+        fixture.actor.user_id =
+            UserId::new(Ulid::from_bytes([1u8; 16]), RealmId::from_bytes([6u8; 32]));
+        let mut operation = operation(&fixture, false);
+        assert!(operation.start().is_empty());
+        assert_eq!(failure(operation), AccountStatusError::Unauthorized);
     }
 
     #[test]
