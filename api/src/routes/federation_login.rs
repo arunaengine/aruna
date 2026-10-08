@@ -305,3 +305,237 @@ pub async fn create_federated_session(
         }),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::handle_token;
+    use crate::routes::access::sessions::{CreateSessionRequest, create_session};
+    use crate::tests::routes::{test_context, test_state, test_storage};
+    use aruna_core::UserId;
+    use aruna_core::document::DocumentTarget;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMode};
+    use aruna_core::handoff::secret_nonce;
+    use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionRef};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use axum::response::IntoResponse;
+    use ed25519_dalek::SigningKey;
+    use tempfile::TempDir;
+    use ulid::Ulid;
+    use url::Url;
+
+    const SECRET: [u8; SECRET_LEN] = [4; SECRET_LEN];
+
+    fn home_key() -> SigningKey {
+        SigningKey::from_bytes(&[11; 32])
+    }
+
+    fn home_user() -> UserId {
+        UserId::new(
+            Ulid::from_bytes([3; 16]),
+            RealmId::from_bytes(home_key().verifying_key().to_bytes()),
+        )
+    }
+
+    /// A serving realm that admits the home realm, with its federation settings.
+    async fn serving() -> (TempDir, Arc<ServerState>, FederationSettings) {
+        let (dir, storage) = test_storage();
+        let context = Arc::new(test_context(storage));
+        let key = SigningKey::from_bytes(&[12; 32]);
+        let realm_id = RealmId::from_bytes(key.verifying_key().to_bytes());
+        let node_id = iroh::SecretKey::generate().public();
+        let actor = Actor {
+            node_id,
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: actor.clone(),
+                realm_description: "Realm".to_string(),
+                oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let capabilities = NodeCapabilities::management_node(key).unwrap();
+        let descriptor = RealmDescriptor {
+            realm_id,
+            name: "Serving".to_string(),
+            description: String::new(),
+            api_url: Url::parse("https://b.example.org/api/v1").unwrap(),
+            portal_url: Url::parse("https://b.example.org").unwrap(),
+            issued_at: 10,
+        };
+        let settings = FederationSettings {
+            name: descriptor.name.clone(),
+            api_url: descriptor.api_url.clone(),
+            portal_url: descriptor.portal_url.clone(),
+            registry_url: None,
+            registration: RegistrationMode::Enabled,
+            accepted_realms: AcceptedRealms::Only(vec![home_user().realm_id]),
+            descriptor: Signed::sign(descriptor, &capabilities).unwrap(),
+        };
+        let mut config = drive(GetConfigOperation::new(realm_id), &context)
+            .await
+            .unwrap();
+        config.federation = Some(settings.clone());
+        let target = DocumentTarget::RealmConfig { realm_id };
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let state = Arc::new(test_state(context, realm_id, node_id, capabilities).await);
+        (dir, state, settings)
+    }
+
+    fn handoff(settings: &FederationSettings) -> Signed<LoginHandoff> {
+        let home = NodeCapabilities::management_node(home_key()).unwrap();
+        let payload = LoginHandoff::new(
+            home_user().realm_id,
+            home_user(),
+            &settings.descriptor,
+            secret_nonce(&SECRET),
+            Some("Ada".to_string()),
+            unix_timestamp_secs(),
+        )
+        .unwrap();
+        Signed::sign(payload, &home).unwrap()
+    }
+
+    async fn login(
+        state: &Arc<ServerState>,
+        handoff: Signed<LoginHandoff>,
+        secret: [u8; SECRET_LEN],
+    ) -> ServerResult<(StatusCode, Json<CreateSessionResponse>)> {
+        create_federated_session(
+            State(state.clone()),
+            None,
+            HeaderMap::new(),
+            Json(FederatedSessionRequest {
+                handoff,
+                secret: hex::encode(secret),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn opens_federated_session() {
+        // The session names the foreign user, carries the name and cannot create children.
+        let (_dir, state, settings) = serving().await;
+        let (status, Json(created)) = login(&state, handoff(&settings), SECRET).await.unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.kind, "federated");
+        let claims = handle_token(&state, &created.token).await.unwrap();
+        let auth = AuthContext::try_from(claims).unwrap();
+        assert_eq!(auth.user_id, home_user());
+        assert_eq!(auth.realm_id, state.get_realm_id());
+        let session = auth.session.clone().unwrap();
+        assert_eq!(session.kind, SessionKind::Federated);
+        assert_eq!(session.name.as_deref(), Some("Ada"));
+
+        let child = create_session(
+            State(state.clone()),
+            Extension(Some(auth)),
+            Extension(Some(crate::auth::ValidatedBearer::new_for_test(
+                created.token,
+            ))),
+            Json(CreateSessionRequest {
+                kind: "portal".to_string(),
+                label: None,
+                expires_in_seconds: None,
+                path_restrictions: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(child.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn refuses_wrong_secret() {
+        let (_dir, state, settings) = serving().await;
+        let error = login(&state, handoff(&settings), [5; SECRET_LEN])
+            .await
+            .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn refuses_chained_handoff() {
+        // A federated session cannot sign a handoff for a third realm; a local portal can.
+        let (_dir, state, _settings) = serving().await;
+        let home = NodeCapabilities::management_node(home_key()).unwrap();
+        let audience = RealmDescriptor {
+            realm_id: home_user().realm_id,
+            name: "Home".to_string(),
+            description: String::new(),
+            api_url: Url::parse("https://a.example.org/api/v1").unwrap(),
+            portal_url: Url::parse("https://a.example.org").unwrap(),
+            issued_at: 1,
+        };
+        let request = || LoginHandoffRequest {
+            descriptor: Signed::sign(audience.clone(), &home).unwrap(),
+            nonce: secret_nonce(&SECRET),
+        };
+        let session = |kind| {
+            Some(SessionRef {
+                sid: Ulid::generate().to_string(),
+                kind,
+                name: None,
+            })
+        };
+        let federated = AuthContext {
+            user_id: home_user(),
+            realm_id: state.get_realm_id(),
+            path_restrictions: None,
+            session: session(SessionKind::Federated),
+        };
+        let error = create_login_handoff(
+            State(state.clone()),
+            Extension(Some(federated)),
+            Json(request()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+        let local = AuthContext {
+            user_id: UserId::local(Ulid::generate(), state.get_realm_id()),
+            realm_id: state.get_realm_id(),
+            path_restrictions: None,
+            session: session(SessionKind::Portal),
+        };
+        let Json(signed) = create_login_handoff(
+            State(state.clone()),
+            Extension(Some(local)),
+            Json(request()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(signed.verify(&state.get_realm_id()), Ok(()));
+        assert_eq!(signed.payload.audience, home_user().realm_id);
+    }
+
+    #[test]
+    fn login_attempts_limited() {
+        let limiter = login_limiter();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        for _ in 0..LOGINS_PER_MINUTE {
+            admit_login(&limiter, ip).unwrap();
+        }
+        assert!(admit_login(&limiter, ip).is_err());
+        admit_login(&limiter, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))).unwrap();
+    }
+}
