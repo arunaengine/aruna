@@ -502,11 +502,6 @@ pub async fn create_import(
         },
         idempotency_key: Some(key),
     };
-    // Without the session, a retry from a later session keeps the same plan digest.
-    let auth = AuthContext {
-        session: None,
-        ..auth
-    };
     submit_import(State(state), Extension(Some(auth)), Json(submit)).await
 }
 

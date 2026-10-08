@@ -482,3 +482,58 @@ async fn losing_spool_discarded() {
         .unwrap();
     assert_eq!(discarded.expires_at_ms, 0);
 }
+
+#[tokio::test]
+async fn retry_keeps_plan() {
+    // A federation-bound import retried from another session is the same job, not a conflict.
+    let fixture = fixture(false).await;
+    let intent = intent(&fixture, fixture.user);
+    let grant = grant(&intent, BODY);
+    let key = import_key(&grant.payload, &intent.payload.destination).unwrap();
+    let binding = ImportRecord {
+        intent: intent.clone(),
+        grant: grant.clone(),
+    };
+    let upload_id = Ulid::generate();
+    seed_upload(&fixture, upload_id).await;
+    let context = fixture.state.get_ctx();
+    write_import(&context, &key, upload_id, &binding)
+        .await
+        .unwrap();
+    let submit = |sid: &str| {
+        let auth = AuthContext {
+            user_id: fixture.user,
+            realm_id: fixture.state.get_realm_id(),
+            path_restrictions: None,
+            session: Some(aruna_core::structs::identity::auth::SessionRef {
+                sid: sid.to_string(),
+                kind: aruna_core::structs::identity::auth::SessionKind::Portal,
+                name: None,
+            }),
+        };
+        let request = SubmitImportRequest {
+            source: ImportSourceRequest::Upload {
+                upload_id: upload_id.to_string(),
+            },
+            target: ImportTargetRequest {
+                bucket: "lab".to_string(),
+                prefix: "imports".to_string(),
+            },
+            metadata: ImportMetadataRequest {
+                group_id: fixture.group.to_string(),
+                path: "datasets/run".to_string(),
+                public: false,
+            },
+            idempotency_key: Some(key.clone()),
+        };
+        submit_import(
+            State(fixture.state.clone()),
+            Extension(Some(auth)),
+            Json(request),
+        )
+    };
+    let (_, Json(first)) = submit("first").await.unwrap();
+    let (_, Json(second)) = submit("second").await.unwrap();
+    assert!(first.created && !second.created);
+    assert_eq!(first.job_id, second.job_id);
+}

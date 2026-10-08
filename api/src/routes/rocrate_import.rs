@@ -17,6 +17,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_operations::driver::{drive, drive_until};
+use aruna_operations::federation::import::read_import;
 use aruna_operations::jobs::import::{
     CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation, load_rocrate_upload,
 };
@@ -391,6 +392,21 @@ pub async fn submit_import(
     }
     let target = parse_import_target(request.target, state.rocrate_limits().key_bytes)?;
     let metadata = parse_import_metadata(request.metadata, state.rocrate_limits().key_bytes)?;
+    // An import of another realm's export keeps one plan across the sessions that retry it.
+    let auth = match &source {
+        ImportRoCrateSource::Upload { upload_id }
+            if read_import(&state.get_ctx(), *upload_id)
+                .await
+                .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?
+                .is_some() =>
+        {
+            AuthContext {
+                session: None,
+                ..auth
+            }
+        }
+        _ => auth,
+    };
     let mut spec = ImportRoCrateSpec {
         auth_context: auth,
         source,

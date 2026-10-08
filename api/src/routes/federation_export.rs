@@ -192,9 +192,13 @@ pub async fn create_export(
     let digest = intent_digest(&request.intent)
         .map_err(|error| transfer_refused(TransferError::Signature(error)))?;
     let key = format!("federation-{digest}");
+    // Without the session, a retry from a later session keeps the same plan digest.
     let spec = ExportRoCrateSpec {
         destination: None,
-        auth_context: auth,
+        auth_context: AuthContext {
+            session: None,
+            ..auth
+        },
         document_id,
         limits: state.rocrate_limits().clone(),
         selection: Some(ExportSelection {
