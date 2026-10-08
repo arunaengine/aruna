@@ -59,7 +59,7 @@ impl AdminDocumentState {
                     || request.request_id.is_nil()
                     || request.user_id != event.actor.user_id
                     || request.user_id.is_nil()
-                    || request.user_id.realm_id != event.actor.realm_id
+                    || !self.admits_requester(event, &request.user_id)
                     || !crate::join_request::valid_message(&request.message)
                 {
                     return Err(AdminDocumentError::InvalidJoinRequest);
@@ -76,7 +76,7 @@ impl AdminDocumentState {
                 use crate::join_request::JoinDecisionKind;
                 if decision.request_id.is_nil()
                     || decision.user_id.is_nil()
-                    || decision.user_id.realm_id != event.actor.realm_id
+                    || !self.admits_requester(event, &decision.user_id)
                     || decision.decided_by != event.actor.user_id
                     || !crate::join_request::valid_message(&decision.reason)
                     || decision.role_ids.iter().any(Ulid::is_nil)
@@ -124,5 +124,13 @@ impl AdminDocumentState {
             _ => return Err(AdminDocumentError::UnsupportedTarget),
         }
         Ok(AdminApplyStatus::Applied)
+    }
+}
+
+impl AdminDocumentState {
+    /// A requester of the actor's realm, or a foreign one when the group belongs to that realm.
+    fn admits_requester(&self, event: &AdminDocumentEvent, user_id: &UserId) -> bool {
+        user_id.realm_id == event.actor.realm_id
+            || self.materialized_group_realm() == Some(event.actor.realm_id)
     }
 }

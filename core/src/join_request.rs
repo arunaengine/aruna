@@ -119,6 +119,7 @@ impl AdminDocumentState {
 mod tests {
     use super::*;
     use crate::admin_documents::{AdminDocumentOperation, AdminRoleDefinition};
+    use crate::reducer::AdminDocumentError;
     use crate::structs::identity::auth::Actor;
     use crate::structs::identity::realm::RealmId;
     use std::collections::BTreeMap;
@@ -216,6 +217,88 @@ mod tests {
         let before = approved.clone();
         approved.apply(&approval).unwrap();
         assert_eq!(approved, before);
+    }
+
+    /// A group of realm 7 owned by actor 1, with a user role.
+    fn realm_group(realm_seed: u8) -> (AdminDocumentState, Ulid) {
+        let admin = actor(1);
+        let (mut state, _, role_id) = pending();
+        state
+            .apply_operation(
+                &admin,
+                AdminDocumentOperation::GroupCreated {
+                    realm_id: RealmId::from_bytes([realm_seed; 32]),
+                    display_name: "Group".into(),
+                    owner: admin.user_id,
+                },
+            )
+            .unwrap();
+        (state, role_id)
+    }
+
+    fn foreign_actor() -> Actor {
+        // Same ULID as actor 2, but a user of realm 9 acting through realm 7.
+        Actor {
+            node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+            user_id: UserId::new(Ulid::from_bytes([2; 16]), RealmId::from_bytes([9; 32])),
+            realm_id: RealmId::from_bytes([7; 32]),
+        }
+    }
+
+    fn join(state: &mut AdminDocumentState, by: &Actor) -> Result<JoinRequest, AdminDocumentError> {
+        let request = JoinRequest {
+            request_id: Ulid::from_bytes([15; 16]),
+            group_id: Ulid::from_bytes([3; 16]),
+            user_id: by.user_id,
+            message: None,
+            created_at: 1,
+        };
+        state.apply_operation(
+            by,
+            AdminDocumentOperation::GroupJoinRequested {
+                request: request.clone(),
+            },
+        )?;
+        Ok(request)
+    }
+
+    #[test]
+    fn admits_foreign_requester() {
+        // A foreign user joins a group of the serving realm and stays distinct from a local
+        // user with the same ULID.
+        let (mut state, role_id) = realm_group(7);
+        let foreign = foreign_actor();
+        let request = join(&mut state, &foreign).unwrap();
+        state
+            .apply_operation(
+                &actor(1),
+                AdminDocumentOperation::GroupJoinDecided {
+                    decision: JoinDecision {
+                        request_id: request.request_id,
+                        user_id: foreign.user_id,
+                        kind: JoinDecisionKind::Approved,
+                        decided_by: actor(1).user_id,
+                        reason: None,
+                        decided_at: 2,
+                        role_ids: BTreeSet::from([role_id]),
+                    },
+                },
+            )
+            .unwrap();
+        let members = &state.materialized_group_assignments()[&role_id];
+        assert!(members.contains(&foreign.user_id));
+        assert!(!members.contains(&actor(2).user_id));
+    }
+
+    #[test]
+    fn rejects_other_realm_group() {
+        let (mut state, _) = realm_group(8);
+        let before = state.clone();
+        assert_eq!(
+            join(&mut state, &foreign_actor()),
+            Err(AdminDocumentError::InvalidJoinRequest)
+        );
+        assert_eq!(state, before);
     }
 
     #[test]
