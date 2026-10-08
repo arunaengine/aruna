@@ -44,8 +44,11 @@ pub const MAX_WITHDRAWALS: u8 = 3;
 const STATE_KEY: &[u8] = b"publication";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Local withdrawal count of one disable cycle, named by the disabled descriptor's issue time
+/// and the registry URL, so each cycle gets its own budget.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicationState {
+    pub cycle: Option<(u64, Url)>,
     pub withdrawals: u8,
 }
 
@@ -90,6 +93,13 @@ fn decide(
     if !is_reporting(config, node_id) {
         return (Publication::Nothing, state);
     }
+    let issued_at = settings.descriptor.payload.issued_at;
+    let cycle = Some((issued_at, registry_url.clone()));
+    let used = if state.cycle == cycle {
+        state.withdrawals
+    } else {
+        0
+    };
     match settings.registration {
         RegistrationMode::Enabled => (
             Publication::Register {
@@ -99,13 +109,14 @@ fn decide(
             },
             PublicationState::default(),
         ),
-        RegistrationMode::Disabled if state.withdrawals < MAX_WITHDRAWALS => (
+        RegistrationMode::Disabled if used < MAX_WITHDRAWALS => (
             Publication::Withdraw {
                 registry_url,
-                issued_at: settings.descriptor.payload.issued_at,
+                issued_at,
             },
             PublicationState {
-                withdrawals: state.withdrawals + 1,
+                cycle,
+                withdrawals: used + 1,
             },
         ),
         RegistrationMode::Disabled => (Publication::Nothing, state),
@@ -206,12 +217,12 @@ impl PublishOperation {
             return Ok(self.finish(Publication::Nothing));
         };
         let config = RealmConfigDocument::from_bytes(config)?;
-        let previous = stored
+        let previous: PublicationState = stored
             .map(postcard::from_bytes)
             .transpose()
             .map_err(ConversionError::from)?
             .unwrap_or_default();
-        let (publication, next) = decide(&config, self.node_id, previous);
+        let (publication, next) = decide(&config, self.node_id, previous.clone());
         if next == previous {
             return Ok(self.finish(publication));
         }
@@ -462,7 +473,10 @@ mod tests {
 
     #[test]
     fn registers_when_enabled() {
-        let state = PublicationState { withdrawals: 2 };
+        let state = PublicationState {
+            cycle: None,
+            withdrawals: 2,
+        };
         let (publication, next) =
             decide(&config(RegistrationMode::Enabled, true), reporter(), state);
         assert!(matches!(
@@ -491,14 +505,39 @@ mod tests {
         let config = config(RegistrationMode::Disabled, true);
         let mut state = PublicationState::default();
         for attempt in 1..=MAX_WITHDRAWALS {
-            let (publication, next) = decide(&config, reporter(), state);
+            let (publication, next) = decide(&config, reporter(), state.clone());
             assert!(matches!(publication, Publication::Withdraw { .. }));
             assert_eq!(next.withdrawals, attempt);
             state = next;
         }
-        let (publication, next) = decide(&config, reporter(), state);
+        let (publication, next) = decide(&config, reporter(), state.clone());
         assert_eq!(publication, Publication::Nothing);
         assert_eq!(next, state);
+    }
+
+    #[test]
+    fn new_cycle_budget() {
+        // A later disable cycle or another registry starts a fresh count.
+        let mut config = config(RegistrationMode::Disabled, true);
+        let used = PublicationState {
+            cycle: Some((1, Url::parse("https://registry.example.org").unwrap())),
+            withdrawals: MAX_WITHDRAWALS,
+        };
+        let (publication, _) = decide(&config, reporter(), used.clone());
+        assert_eq!(publication, Publication::Nothing);
+        let settings = config.federation.as_mut().unwrap();
+        settings.descriptor.payload.issued_at = 2;
+        let (publication, next) = decide(&config, reporter(), used.clone());
+        assert!(matches!(
+            publication,
+            Publication::Withdraw { issued_at: 2, .. }
+        ));
+        assert_eq!(next.withdrawals, 1);
+        let settings = config.federation.as_mut().unwrap();
+        settings.descriptor.payload.issued_at = 1;
+        settings.registry_url = Some(Url::parse("https://other.example.org").unwrap());
+        let (publication, _) = decide(&config, reporter(), used);
+        assert!(matches!(publication, Publication::Withdraw { .. }));
     }
 
     #[test]
