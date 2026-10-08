@@ -603,9 +603,20 @@ mod tests {
             assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
             assert_eq!(
                 headers.get("cross-origin-opener-policy").unwrap(),
-                "same-origin"
+                "same-origin-allow-popups"
             );
         }
+        let response = router
+            .oneshot(request(Method::GET, "/federation/login"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get("cross-origin-opener-policy")
+                .unwrap(),
+            "unsafe-none"
+        );
     }
 
     #[tokio::test]
