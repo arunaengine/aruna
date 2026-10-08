@@ -47,6 +47,7 @@ pub mod task;
 pub mod telemetry;
 pub mod time;
 pub mod trace_context;
+pub mod transfer;
 pub mod types;
 pub mod user;
 pub mod vault_format;
