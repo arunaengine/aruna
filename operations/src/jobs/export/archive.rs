@@ -1174,6 +1174,62 @@ pub(crate) fn blocking_omissions(rows: &[ExportReportRow]) -> usize {
         .count()
 }
 
+/// What a grant for a finished export into another realm pins.
+#[derive(Debug)]
+pub(crate) struct ExportFacts {
+    pub(crate) revision: Ulid,
+    pub(crate) dataset_digest: [u8; 32],
+    pub(crate) versions: Vec<aruna_core::transfer::SelectedVersion>,
+    /// Bucket, permission path and encryption of each version read on this node.
+    pub(crate) sources: Vec<(String, String, bool)>,
+    pub(crate) artifact: ArtifactRef,
+}
+
+impl ExportCheckpoint {
+    /// The facts of a finished export, unless one of the selected `files` was left out.
+    pub(crate) fn export_facts(&self, files: &[String]) -> Option<ExportFacts> {
+        let mut versions = Vec::new();
+        let mut sources = Vec::new();
+        for file in files {
+            let entity = self
+                .entities
+                .iter()
+                .find(|entity| &entity.entity_id == file)?;
+            let (blake3, size) = entity.content.filter(|_| entity.omission.is_none())?;
+            let version_id = entity.resolved_version?;
+            versions.push(aruna_core::transfer::SelectedVersion {
+                version_id,
+                blake3,
+                size,
+            });
+            let used = entity
+                .candidates
+                .iter()
+                .find_map(|candidate| match &candidate.source {
+                    CandidateSource::Local {
+                        location,
+                        permission_path,
+                        bucket,
+                        ..
+                    } if candidate.resolved_version == Some(version_id) => Some((
+                        bucket.clone(),
+                        permission_path.clone(),
+                        location.format.bucket_key().is_some(),
+                    )),
+                    _ => None,
+                });
+            sources.extend(used);
+        }
+        Some(ExportFacts {
+            revision: self.winning_event_id?,
+            dataset_digest: self.dataset_digest?,
+            versions,
+            sources,
+            artifact: self.artifact.clone()?,
+        })
+    }
+}
+
 /// Leaves every File entity outside `files` as a reference to this realm.
 pub(super) fn keep_references(entities: &mut [ExportEntity], files: &[String]) {
     for entity in entities.iter_mut() {
