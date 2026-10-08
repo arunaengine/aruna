@@ -19,6 +19,7 @@ pub mod events;
 pub mod federation;
 pub mod git;
 pub mod handle;
+pub mod handoff;
 pub mod id;
 pub mod jobs;
 pub mod join_request;
