@@ -10,7 +10,9 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use aruna_blob::egress::EgressGuard;
-use aruna_core::federation::{FederationError, Registration, Signed, Withdrawal};
+use aruna_core::federation::{
+    FederationError, Registration, Signed, Withdrawal, valid_federation_url,
+};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_secs;
 use axum::extract::{Path, State};
@@ -62,6 +64,8 @@ impl RegistryState {
 pub enum RegistryError {
     #[error("path is not a realm id")]
     BadRealm,
+    #[error("descriptor URLs must be HTTPS, or HTTP to a loopback host")]
+    BadUrl,
     #[error("too many registry writes, retry later")]
     RateLimited,
     #[error(transparent)]
@@ -73,7 +77,7 @@ pub enum RegistryError {
 impl IntoResponse for RegistryError {
     fn into_response(self) -> Response {
         let status = match &self {
-            Self::BadRealm => StatusCode::BAD_REQUEST,
+            Self::BadRealm | Self::BadUrl => StatusCode::BAD_REQUEST,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Store(StoreError::NotFound) => StatusCode::NOT_FOUND,
             Self::Signature(_) => StatusCode::FORBIDDEN,
@@ -141,13 +145,20 @@ fn public(body: impl Serialize) -> Response {
     response
 }
 
-/// The registration and its descriptor must both be signed for the path realm.
+/// The registration and its descriptor must both be signed for the path realm and the
+/// descriptor URLs must follow the federation URL rule.
 fn check_registration(
     realm_id: &RealmId,
     signed: &Signed<Registration>,
 ) -> Result<(), RegistryError> {
     signed.verify(realm_id)?;
-    signed.payload.descriptor.verify(realm_id)?;
+    let descriptor = &signed.payload.descriptor;
+    descriptor.verify(realm_id)?;
+    if !valid_federation_url(&descriptor.payload.api_url)
+        || !valid_federation_url(&descriptor.payload.portal_url)
+    {
+        return Err(RegistryError::BadUrl);
+    }
     Ok(())
 }
 
@@ -260,6 +271,20 @@ mod tests {
     fn accepts_signed_registration() {
         let signed = registration("https://realm.example.org", 10);
         assert!(check_registration(&realm_id(), &signed).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_urls() {
+        // Checked before any fetch or write; a private HTTPS URL still passes admission.
+        for base in ["http://realm.example.org", "ftp://realm.example.org"] {
+            let signed = registration(base, 10);
+            assert!(matches!(
+                check_registration(&realm_id(), &signed),
+                Err(RegistryError::BadUrl)
+            ));
+        }
+        let private = registration("https://10.0.0.5", 10);
+        assert!(check_registration(&realm_id(), &private).is_ok());
     }
 
     #[test]
