@@ -453,3 +453,189 @@ fn apply_reducer_federation(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::{DriverContext, drive};
+    use crate::realm::get_config::GetConfigOperation;
+    use aruna_core::UserId;
+    use aruna_core::events::StorageEvent;
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmId, RealmNodeKind,
+    };
+    use ed25519_dalek::SigningKey;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    fn context(root: &str) -> DriverContext {
+        DriverContext {
+            storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        }
+    }
+
+    fn realm_key() -> SigningKey {
+        SigningKey::from_bytes(&[9u8; 32])
+    }
+
+    fn actor() -> Actor {
+        let realm_id = RealmId::from_bytes(realm_key().verifying_key().to_bytes());
+        Actor {
+            node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([1u8; 16]), realm_id),
+            realm_id,
+        }
+    }
+
+    fn request(actor: &Actor, api_url: &str) -> SetFederationConfig {
+        SetFederationConfig {
+            actor: actor.clone(),
+            auth_context: AuthContext {
+                user_id: actor.user_id,
+                realm_id: actor.realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            node_capabilities: NodeCapabilities::management_node(realm_key()).unwrap(),
+            name: "Realm".to_string(),
+            api_url: Url::parse(api_url).unwrap(),
+            portal_url: Url::parse("https://portal.example.org").unwrap(),
+            registry_url: None,
+            registration: RegistrationMode::Enabled,
+            accepted_realms: AcceptedRealms::None,
+            now: 100,
+        }
+    }
+
+    async fn write(ctx: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
+        match ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    async fn seed(ctx: &DriverContext, actor: &Actor, kind: RealmNodeKind, admin: bool) {
+        let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        document.ensure_node(actor.node_id, kind);
+        let target = DocumentTarget::RealmConfig {
+            realm_id: actor.realm_id,
+        };
+        let value = document.to_bytes(actor).unwrap();
+        write(
+            ctx,
+            target.storage_keyspace(),
+            target.storage_key().to_vec(),
+            value,
+        )
+        .await;
+        let mut authorization = RealmAuthorizationDocument::default_realm_doc(actor.realm_id);
+        for role in authorization.roles.values_mut() {
+            if admin {
+                role.assigned_users.insert(actor.user_id);
+            }
+        }
+        let value = authorization.to_bytes(actor).unwrap();
+        write(
+            ctx,
+            AUTH_KEYSPACE,
+            actor.realm_id.as_bytes().to_vec(),
+            value,
+        )
+        .await;
+    }
+
+    async fn stored(ctx: &DriverContext, actor: &Actor) -> Option<FederationSettings> {
+        drive(GetConfigOperation::new(actor.realm_id), ctx)
+            .await
+            .expect("config reads")
+            .federation
+    }
+
+    #[tokio::test]
+    async fn stores_signed_descriptor() {
+        // The stored descriptor verifies for the realm and its issue time only grows.
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        let actor = actor();
+        seed(&ctx, &actor, RealmNodeKind::Management, true).await;
+
+        let config = request(&actor, "https://api.example.org");
+        drive(SetFederationOperation::new(config.clone()), &ctx)
+            .await
+            .expect("settings store");
+        let first = stored(&ctx, &actor).await.expect("settings stored");
+        assert_eq!(first.descriptor.verify(&actor.realm_id), Ok(()));
+        assert_eq!(first.descriptor.payload.issued_at, 100);
+
+        drive(SetFederationOperation::new(config), &ctx)
+            .await
+            .expect("settings store again");
+        let second = stored(&ctx, &actor).await.expect("settings stored");
+        assert_eq!(second.descriptor.payload.issued_at, 101);
+    }
+
+    #[tokio::test]
+    async fn refuses_non_admin() {
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        let actor = actor();
+        seed(&ctx, &actor, RealmNodeKind::Management, false).await;
+
+        let error = drive(
+            SetFederationOperation::new(request(&actor, "https://api.example.org")),
+            &ctx,
+        )
+        .await
+        .expect_err("a non-admin is refused");
+        assert_eq!(error, SetFederationError::Unauthorized);
+        assert_eq!(stored(&ctx, &actor).await, None);
+    }
+
+    #[tokio::test]
+    async fn refuses_server_node() {
+        // Peers reject realm-config events from a server node, so it never writes them.
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        let actor = actor();
+        seed(&ctx, &actor, RealmNodeKind::Server, true).await;
+
+        let error = drive(
+            SetFederationOperation::new(request(&actor, "https://api.example.org")),
+            &ctx,
+        )
+        .await
+        .expect_err("a server node is refused");
+        assert_eq!(error, SetFederationError::NotManagementNode);
+    }
+
+    #[tokio::test]
+    async fn refuses_plain_http() {
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        let actor = actor();
+        seed(&ctx, &actor, RealmNodeKind::Management, true).await;
+
+        let error = drive(
+            SetFederationOperation::new(request(&actor, "http://api.example.org")),
+            &ctx,
+        )
+        .await
+        .expect_err("plain http is refused");
+        assert!(matches!(error, SetFederationError::InvalidSettings { .. }));
+        assert_eq!(stored(&ctx, &actor).await, None);
+    }
+}
