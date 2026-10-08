@@ -2408,7 +2408,8 @@ async fn plaintext_export_parks() {
 
 #[test]
 fn selection_keeps_references() {
-    // Unselected files stay references by web id with their ARN; the selected one travels.
+    // Every left-out source form becomes a web id with its original identifier; the selected
+    // file travels and source-local locations are dropped.
     let realm_id = RealmId::from_bytes([2; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
     let version = Ulid::from_bytes([4; 16]);
@@ -2416,27 +2417,45 @@ fn selection_keeps_references() {
     let (kept, left) = (arn("kept").unwrap(), arn("left").unwrap());
     let other_realm = RealmId::from_bytes([9; 32]);
     let foreign = VersionedObjectArn::new(other_realm, node_id, "bucket", "f", version).unwrap();
+    let other = VersionedObjectArn::new(other_realm, node_id, "bucket", "g", version).unwrap();
+    let located = arn("located").unwrap();
     let mut document = json!({
         "@graph": [
             {"@id": kept.to_string(), "@type": "File"},
-            {"@id": left.to_string(), "@type": "File"},
+            {"@id": left.to_string(), "@type": "File", "localPath": "data/left.csv"},
             {"@id": foreign.to_w3id(), "@type": "File"},
+            {"@id": other.to_string(), "@type": "File"},
+            {"@id": "s3://bucket/located", "@type": "File",
+                "contentUrl": ["s3://bucket/located", "https://example.org/located"]},
         ]
     });
     let mut entities = recognized_entities(&document, realm_id).unwrap();
     // A web identifier of another realm is an external reference, not unsupported.
     assert_eq!(entities[2].omission, Some(ReasonCode::External));
+    assert_eq!(entities[3].omission, Some(ReasonCode::Unsupported));
 
     keep_references(&mut entities, &[kept.to_string()]);
     assert_eq!(entities[0].omission, None);
     assert_eq!(entities[1].omission, Some(ReasonCode::External));
-    add_references(&mut document, &entities);
+    // A location without a current version cannot be named in another realm.
+    let failed = add_references(&mut document.clone(), &entities);
+    assert!(matches!(failed, Err(ExportFailure::Permanent(_))));
+    entities[4].exact = Some(located.clone());
+    add_references(&mut document, &entities).unwrap();
 
     let graph = document["@graph"].as_array().unwrap();
     assert_eq!(graph[0]["@id"], kept.to_string());
     assert_eq!(graph[1]["@id"], left.to_w3id());
     assert_eq!(graph[1]["identifier"], left.to_string());
+    assert!(graph[1].get("localPath").is_none());
     assert_eq!(graph[2]["@id"], foreign.to_w3id());
+    assert_eq!(graph[3]["@id"], other.to_w3id());
+    assert_eq!(graph[3]["identifier"], other.to_string());
+    assert_eq!(graph[4]["@id"], located.to_w3id());
+    assert_eq!(
+        graph[4]["contentUrl"],
+        json!(["https://example.org/located"])
+    );
 }
 
 #[test]
