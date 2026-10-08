@@ -357,6 +357,11 @@ pub enum AdminDocumentOperation {
     GroupLocationSet {
         location: Option<crate::structs::storage::dataset_location::DatasetLocation>,
     },
+    /// Replaces the realm federation settings with their newly signed descriptor.
+    #[serde(rename = "RealmConfigFederationSet")]
+    ConfigFederationSet {
+        settings: Box<crate::federation::FederationSettings>,
+    },
 }
 
 impl AdminDocumentOperation {

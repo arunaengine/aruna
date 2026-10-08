@@ -1422,6 +1422,14 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 return Err("realm compute configuration is malformed".to_string());
             }
         }
+        AdminDocumentOperation::ConfigFederationSet { settings } => {
+            // Only a holder of the realm key or its delegate can publish a descriptor.
+            if let AdminDocumentTarget::RealmConfig { realm_id } = &event.target
+                && let Err(error) = settings.validate(realm_id)
+            {
+                return Err(format!("realm federation settings rejected: {error}"));
+            }
+        }
         AdminDocumentOperation::CandidateMapPublished { map } => {
             let mut seen = std::collections::BTreeSet::new();
             if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
@@ -1634,6 +1642,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::TransitionStallReported { .. }
         | AdminDocumentOperation::TransitionDrainReported { .. }
         | AdminDocumentOperation::ConfigComputeSet { .. }
+        | AdminDocumentOperation::ConfigFederationSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
     };
 
