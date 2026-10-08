@@ -116,8 +116,9 @@ impl ListJoinOperation {
             if key != reducer_state_key(&state.target) {
                 return Err(ListJoinError::UnexpectedEvent);
             }
+            let local_group = state.materialized_group_realm() == Some(self.input.auth.realm_id);
             for entry in state.join_requests() {
-                if entry.request.user_id.realm_id != self.input.auth.realm_id
+                if (entry.request.user_id.realm_id != self.input.auth.realm_id && !local_group)
                     || (self.input.group_id.is_none()
                         && entry.request.user_id != self.input.auth.user_id)
                     || (self.input.pending_only && entry.decision.is_some())
@@ -166,10 +167,7 @@ impl Operation for ListJoinOperation {
         if self.state != State::Init {
             return self.fail(ListJoinError::UnexpectedEvent);
         }
-        if self.input.auth.path_restrictions.is_some()
-            || self.input.auth.user_id.is_nil()
-            || self.input.auth.user_id.realm_id != self.input.auth.realm_id
-        {
+        if self.input.auth.path_restrictions.is_some() || self.input.auth.user_id.is_nil() {
             return self.fail(ListJoinError::Unauthorized);
         }
         if let Some(group_id) = self.input.group_id {
@@ -217,5 +215,103 @@ impl Operation for ListJoinOperation {
     }
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::UserId;
+    use aruna_core::admin_documents::AdminDocumentOperation;
+    use aruna_core::join_request::JoinRequest;
+    use aruna_core::reducer::AdminDocumentState;
+    use aruna_core::storage_entries::reducer_state_entry;
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::RealmId;
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([7; 32])
+    }
+
+    fn foreign_user() -> UserId {
+        UserId::new(Ulid::from_bytes([2; 16]), RealmId::from_bytes([9; 32]))
+    }
+
+    /// A group of the serving realm with one join request of a federated user.
+    fn group_entry() -> (Key, Value) {
+        let group_id = Ulid::from_bytes([3; 16]);
+        let admin = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([1; 16]), realm()),
+            realm_id: realm(),
+        };
+        let mut state = AdminDocumentState::new(AdminDocumentTarget::Group { group_id });
+        state
+            .apply_operation(
+                &admin,
+                AdminDocumentOperation::GroupCreated {
+                    realm_id: realm(),
+                    display_name: "Group".into(),
+                    owner: admin.user_id,
+                },
+            )
+            .unwrap();
+        let requester = Actor {
+            user_id: foreign_user(),
+            ..admin
+        };
+        state
+            .apply_operation(
+                &requester,
+                AdminDocumentOperation::GroupJoinRequested {
+                    request: JoinRequest {
+                        request_id: Ulid::from_bytes([5; 16]),
+                        group_id,
+                        user_id: foreign_user(),
+                        message: None,
+                        created_at: 1,
+                    },
+                },
+            )
+            .unwrap();
+        let (_, key, value) = reducer_state_entry(&state).unwrap();
+        (key, value)
+    }
+
+    fn listed(user_id: UserId, group_id: Option<Ulid>) -> Vec<JoinRequestState> {
+        let mut operation = ListJoinOperation::new(ListJoinInput {
+            auth: AuthContext {
+                user_id,
+                realm_id: realm(),
+                path_restrictions: None,
+                session: None,
+            },
+            group_id,
+            pending_only: false,
+            start_after: None,
+            limit: 10,
+        });
+        operation.start();
+        if group_id.is_some() {
+            operation.step(Event::SubOperation(
+                SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+            ));
+        }
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![group_entry()],
+            next_start_after: None,
+        }));
+        operation.finalize().unwrap().requests
+    }
+
+    #[test]
+    fn lists_foreign_requests() {
+        // The federated requester sees its own request and a group admin sees it too.
+        assert_eq!(listed(foreign_user(), None).len(), 1);
+        let admin = UserId::local(Ulid::from_bytes([1; 16]), realm());
+        assert_eq!(listed(admin, Some(Ulid::from_bytes([3; 16]))).len(), 1);
+        // A local user with the same ULID is someone else.
+        let twin = UserId::local(foreign_user().user_ulid, realm());
+        assert!(listed(twin, None).is_empty());
     }
 }
