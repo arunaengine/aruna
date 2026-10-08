@@ -462,7 +462,20 @@ async fn build_user_response(
     if auth.realm_id != state.get_realm_id() || auth.path_restrictions.is_some() {
         return Err(ServerError::Forbidden);
     }
-    let user = read_current_user(state, auth.user_id).await?;
+    let user = match auth.session.as_ref() {
+        // A federated user has no record here; the token's display name stands in for it.
+        Some(session) if session.kind == SessionKind::Federated => User {
+            user_id: auth.user_id,
+            name: session
+                .name
+                .clone()
+                .unwrap_or_else(|| auth.user_id.to_string()),
+            subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
+            attributes: Default::default(),
+        },
+        _ => read_current_user(state, auth.user_id).await?,
+    };
     let preferences = preferences_from_attributes(&user.attributes);
     let realm_roles = collect_realm_roles(read_realm_authorization(state).await?, auth.user_id);
     let groups = collect_group_memberships(state, auth.user_id).await?;
@@ -774,7 +787,9 @@ takes no user id.
   `ui.favourite_metadata_ids` (a comma separated list) and `ui.dashboard_scope` (`personal` or
   `realm`, absent when unset or unknown) attributes.
 - Group membership is collected from the groups this node holds, so a group that has not arrived
-  here yet is missing."#,
+  here yet is missing.
+- A federated session gets a record built from its token: the full user id, the display name
+  (or the user id when none is known), no attributes and the roles this realm assigned."#,
     responses(
         (
             status = 200,

@@ -1619,3 +1619,67 @@ async fn deactivation_cuts_tokens() {
     node.net.shutdown().await;
     oidc_task.abort();
 }
+
+#[tokio::test]
+async fn federated_profile_synthesized() {
+    // A federated session sees its full id and token name, and cannot renew its token.
+    use aruna_core::structs::identity::auth::{AuthContext, SessionRef};
+    use axum::Extension;
+    use axum::response::IntoResponse;
+    let (_dir, storage) = crate::tests::routes::test_storage();
+    let context = Arc::new(crate::tests::routes::test_context(storage));
+    let signing_key = generate_signing_key();
+    let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+    let node_id = iroh::SecretKey::generate().public();
+    drive(
+        CreateRealmOperation::new(CreateRealmConfig {
+            actor: Actor {
+                node_id,
+                user_id: UserId::nil(realm_id),
+                realm_id,
+            },
+            realm_description: "Realm".to_string(),
+            oidc_providers: Vec::new(),
+            node_location: None,
+            node_weight: None,
+            node_labels: Default::default(),
+        }),
+        &context,
+    )
+    .await
+    .unwrap();
+    let state = Arc::new(
+        crate::tests::routes::test_state(
+            context,
+            realm_id,
+            node_id,
+            NodeCapabilities::management_node(signing_key).unwrap(),
+        )
+        .await,
+    );
+    let foreign = UserId::new(Ulid::generate(), RealmId::from_bytes([9; 32]));
+    let auth = AuthContext {
+        user_id: foreign,
+        realm_id,
+        path_restrictions: None,
+        session: Some(SessionRef {
+            sid: Ulid::generate().to_string(),
+            kind: SessionKind::Federated,
+            name: Some("Ada".to_string()),
+        }),
+    };
+    let info = super::build_user_response(&state, auth.clone())
+        .await
+        .unwrap();
+    assert_eq!(info.user.user_id, foreign.to_string());
+    assert_eq!(info.user.name, "Ada");
+    assert!(info.user.attributes.is_empty());
+    let error = super::get_token(
+        State(state),
+        axum::http::HeaderMap::new(),
+        Extension(Some(auth)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+}
