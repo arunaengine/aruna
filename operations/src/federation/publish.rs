@@ -354,3 +354,164 @@ pub async fn restore_publish_timer(task_handle: &TaskHandle) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::UserId;
+    use aruna_core::federation::{AcceptedRealms, FederationSettings};
+    use aruna_core::structs::identity::auth::Actor;
+    use ed25519_dalek::SigningKey;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn lower(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
+        if a.as_bytes() < b.as_bytes() {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
+    fn config(registration: RegistrationMode, registry: bool) -> RealmConfigDocument {
+        let key = SigningKey::from_bytes(&[4; 32]);
+        let realm_id = RealmId::from_bytes(key.verifying_key().to_bytes());
+        let capabilities = NodeCapabilities::management_node(key).unwrap();
+        let url = |value: &str| Url::parse(value).unwrap();
+        let descriptor = RealmDescriptor {
+            realm_id,
+            name: "Realm".to_string(),
+            description: String::new(),
+            api_url: url("https://api.example.org"),
+            portal_url: url("https://portal.example.org"),
+            issued_at: 1,
+        };
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let (first, second) = lower(node(1), node(2));
+        config.ensure_node(first, RealmNodeKind::Management);
+        config.ensure_node(second, RealmNodeKind::Management);
+        config.ensure_node(node(3), RealmNodeKind::Server);
+        config.federation = Some(FederationSettings {
+            name: descriptor.name.clone(),
+            api_url: descriptor.api_url.clone(),
+            portal_url: descriptor.portal_url.clone(),
+            registry_url: registry.then(|| url("https://registry.example.org")),
+            registration,
+            accepted_realms: AcceptedRealms::None,
+            descriptor: Signed::sign(descriptor, &capabilities).unwrap(),
+        });
+        config
+    }
+
+    fn reporter() -> NodeId {
+        lower(node(1), node(2)).0
+    }
+
+    #[test]
+    fn registers_when_enabled() {
+        let state = PublicationState { withdrawals: 2 };
+        let (publication, next) =
+            decide(&config(RegistrationMode::Enabled, true), reporter(), state);
+        assert!(matches!(
+            publication,
+            Publication::Register {
+                nodes_configured: Some(3),
+                ..
+            }
+        ));
+        assert_eq!(next, PublicationState::default());
+    }
+
+    #[test]
+    fn lowest_management_reports() {
+        // The higher management node and a server node stay silent.
+        let config = config(RegistrationMode::Enabled, true);
+        let higher = lower(node(1), node(2)).1;
+        for node_id in [higher, node(3)] {
+            let (publication, _) = decide(&config, node_id, PublicationState::default());
+            assert_eq!(publication, Publication::Nothing);
+        }
+    }
+
+    #[test]
+    fn withdrawals_bounded() {
+        let config = config(RegistrationMode::Disabled, true);
+        let mut state = PublicationState::default();
+        for attempt in 1..=MAX_WITHDRAWALS {
+            let (publication, next) = decide(&config, reporter(), state);
+            assert!(matches!(publication, Publication::Withdraw { .. }));
+            assert_eq!(next.withdrawals, attempt);
+            state = next;
+        }
+        let (publication, next) = decide(&config, reporter(), state);
+        assert_eq!(publication, Publication::Nothing);
+        assert_eq!(next, state);
+    }
+
+    #[test]
+    fn cleared_url_silent() {
+        // Without a registry URL nothing is sent, not even a withdrawal.
+        let config = config(RegistrationMode::Disabled, false);
+        let (publication, _) = decide(&config, reporter(), PublicationState::default());
+        assert_eq!(publication, Publication::Nothing);
+    }
+
+    #[test]
+    fn realm_url_joins() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let url = realm_url(
+            &Url::parse("https://r.example.org/base").unwrap(),
+            &realm_id,
+        );
+        assert_eq!(
+            url.unwrap().as_str(),
+            format!("https://r.example.org/base/v1/realms/{realm_id}")
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_survives_restart() {
+        // The attempt count is stored, so a restarted node does not withdraw again.
+        let dir = tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let config = config(RegistrationMode::Disabled, true);
+        let target = DocumentTarget::RealmConfig {
+            realm_id: config.realm_id,
+        };
+        let actor = Actor {
+            node_id: reporter(),
+            user_id: UserId::local(Ulid::from_bytes([1; 16]), config.realm_id),
+            realm_id: config.realm_id,
+        };
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let mut sent = 0;
+        for _ in 0..MAX_WITHDRAWALS + 2 {
+            let publication = drive(PublishOperation::new(config.realm_id, reporter()), &context)
+                .await
+                .unwrap();
+            if matches!(publication, Publication::Withdraw { .. }) {
+                sent += 1;
+            }
+        }
+        assert_eq!(sent, MAX_WITHDRAWALS);
+    }
+}
