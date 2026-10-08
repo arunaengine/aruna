@@ -169,7 +169,7 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
   must already be allowed to the caller, and deny rules are kept.
 - A path-restricted caller creates a session with its own restrictions, or narrower ones.
 - A bound assistant or API session can create only its own kind; a portal session and an unbound
-  token may create any kind.
+  token may create any kind. A federated session creates none.
 - The token is returned in this response only; the session itself stays listable and revocable by
   its id.
 - Sessions live on the node that issued them and are not replicated to the realm's other nodes.
@@ -198,7 +198,7 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
             })),
         (status = 400, description = "Unknown session kind, a lifetime outside the allowed range, or restrictions without a read or write scope", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "A requested scope exceeds the caller's access, the user is deactivated, or the token belongs to another realm", body = ErrorResponse),
+        (status = 403, description = "A requested scope exceeds the caller's access, the user is deactivated, the caller holds a federated session, or the token belongs to another realm", body = ErrorResponse),
         (status = 409, description = "The caller already holds 256 active sessions", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -212,11 +212,11 @@ pub async fn create_session(
     let auth = require_realm_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let kind = parse_session_kind(&request.kind)?;
-    if auth
-        .session
-        .as_ref()
-        .is_some_and(|parent| parent.kind != SessionKind::Portal && parent.kind != kind)
-    {
+    // A federated session can neither renew itself nor create children of any kind.
+    if auth.session.as_ref().is_some_and(|parent| {
+        parent.kind == SessionKind::Federated
+            || (parent.kind != SessionKind::Portal && parent.kind != kind)
+    }) {
         return Err(ServerError::Forbidden);
     }
     let now = unix_timestamp_secs();

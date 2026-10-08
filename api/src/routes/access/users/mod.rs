@@ -692,6 +692,7 @@ somebody else.
 
 **Behavior**
 - The token preserves a bound session's kind; an OIDC or unbound caller receives a `portal` session.
+- A federated session is refused; it ends with its lifetime and cannot be renewed.
 - The token keeps the path restrictions of the presented token, so renewal never widens access.
 - The token is returned in this response only, so a lost one has to be reissued here.
 
@@ -707,7 +708,7 @@ somebody else.
             })
         ),
         (status = 401, description = "Missing or invalid bearer token, or this node knows no user for the presented OIDC subject", body = ErrorResponse),
-        (status = 403, description = "The user is deactivated, or an alias of the canonical user of that OIDC subject", body = ErrorResponse),
+        (status = 403, description = "The user is deactivated, an alias of the canonical user of that OIDC subject, or the caller holds a federated session", body = ErrorResponse),
         (status = 409, description = "The caller already holds 256 active sessions", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -719,6 +720,13 @@ async fn get_token(
 ) -> ServerResult<(StatusCode, Json<GetTokenResponse>)> {
     let (user_id, kind, restrictions) = match auth {
         Some(aruna_ctx) => {
+            if aruna_ctx
+                .session
+                .as_ref()
+                .is_some_and(|session| session.kind == SessionKind::Federated)
+            {
+                return Err(ServerError::Forbidden);
+            }
             ensure_token_subject(&state, aruna_ctx.user_id).await?;
             let kind = aruna_ctx
                 .session
