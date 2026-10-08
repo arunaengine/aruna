@@ -232,7 +232,8 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::federation::publish::restore_publish_timer(&task_handle).await;
+        crate::federation::publish::restore_publish_timer(&context.storage_handle, &task_handle)
+            .await;
         if stopped() {
             return;
         }
