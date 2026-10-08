@@ -2742,7 +2742,7 @@ async fn abe_enumerated() -> TestResult<()> {
         let credentials = create_s3_credentials(&base, &owner, &group.group_id).await?;
         let s3 = s3_client(seed.s3.as_ref().unwrap(), &credentials);
         s3.create_bucket().bucket(BUCKET).send().await?;
-        let (bucket_id, _, bucket_private) = locked_key(&seed, &owner, &owner_key, &owner_private).await?;
+        let (bucket_id, generation, bucket_private) = locked_key(&seed, &owner, &owner_key, &owner_private).await?;
         let put = |key: String| {
             let request = s3
                 .put_object()
@@ -2824,6 +2824,27 @@ async fn abe_enumerated() -> TestResult<()> {
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
         assert_eq!(body["code"], json!("enumeration_limit"));
         assert!(body["error"].as_str().unwrap().contains("at least 1 more"), "{body}");
+
+        // Long keys below the count bound that no grant context fits are refused, never stored.
+        let long = vec!["x".repeat(200); 3].join("/");
+        for index in 0..12 {
+            put(format!("foo/long/{index:02}/{long}")).await?;
+        }
+        let (status, body) = request("writes", "foo/long/").await?;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert_eq!(body["code"], json!("encryption_limit"));
+        let unlock = format!("{encryption}/unlock?bucket_id={bucket_id}&generation={generation}");
+        let response = http
+            .post(unlock)
+            .bearer_auth(&owner)
+            .header("content-type", "application/octet-stream")
+            .body(bucket_private.expose().to_vec())
+            .send()
+            .await?;
+        assert!(response.status().is_success());
+        let (status, body) = request("writes", "foo/long/").await?;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert_eq!(body["code"], json!("encryption_limit"));
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;

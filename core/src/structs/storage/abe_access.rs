@@ -132,6 +132,17 @@ impl KeyRequest {
     }
     pub fn to_bytes(&self) -> Result<Vec<u8>, AbeError> {
         self.scope.policy(&self.parameters, &self.epochs)?;
+        // A user issuer frames longer than a node, so every issuer can sign what is stored.
+        let request = Self {
+            recipient_record: Some(self.recipient_record.unwrap_or_default()),
+            recipient_public: Some(self.recipient_public.unwrap_or_default()),
+            recipient_fingerprint: Some(self.recipient_fingerprint.unwrap_or_default()),
+            ..self.clone()
+        };
+        let issuer = KeyIssuer::User(self.recipient_user);
+        if (GrantContext { request, issuer }).bytes().is_err() {
+            return Err(AbeError::Limit);
+        }
         let bytes = postcard::to_allocvec(self).map_err(|_| AbeError::Context)?;
         if bytes.len() > aruna_kpabe::MAX_BYTES {
             return Err(AbeError::Limit);

@@ -364,6 +364,9 @@ impl KeyOperation {
         self.issue(request)
     }
     fn issue(&mut self, request: KeyRequest) -> Effects {
+        if let Err(error) = request.to_bytes() {
+            return self.fail(error);
+        }
         if request.recipient_public.is_none() {
             self.result = Some(KeyResult::Request(request.clone()));
             return self.write_request(request);
