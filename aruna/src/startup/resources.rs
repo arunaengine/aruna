@@ -503,6 +503,7 @@ async fn fill(
         acquired.task_handle.clone(),
         acquired.jobs_runtime.clone(),
         config.rocrate_limits.clone(),
+        Some(config.node_capabilities.clone()),
     )
     .await;
     acquired.task_queues = Some(task_queues);

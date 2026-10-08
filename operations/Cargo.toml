@@ -56,12 +56,12 @@ ed25519-dalek = { workspace = true }
 oxrdf = { workspace = true }
 oxttl = { workspace = true }
 percent-encoding = { workspace = true }
+reqwest = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
 proptest = { workspace = true }
-reqwest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
