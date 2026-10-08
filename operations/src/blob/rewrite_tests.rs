@@ -469,7 +469,7 @@ mod envelopes {
         new: BackendLocation,
     ) -> Vec<(String, Key, Value)> {
         fenced(operation, (old, answer), (settings, new, 1));
-        operation.step(read_result(Some(version(&old).to_bytes().unwrap())));
+        operation.step(read_result(Some(version(old).to_bytes().unwrap())));
         let effects = operation.step(read_result(None));
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected the row writes, got {effects:?}")

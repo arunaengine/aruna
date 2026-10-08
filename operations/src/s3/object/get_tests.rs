@@ -1913,10 +1913,8 @@ async fn historical_drift_fails() {
 
 mod sealed {
     use super::test_node_id;
-    use crate::s3::bucket::key::rows::authority_rows;
     use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
     use aruna_core::UserId;
-    use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
     use aruna_core::errors::{BlobError, ConversionError};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -1924,12 +1922,11 @@ mod sealed {
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::BlobVersion;
     use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation, BackendRef};
-    use aruna_core::structs::storage::blob::{BlobVersion, BucketInfo};
     use aruna_core::structs::storage::encryption::{
-        BucketEncryption, BucketKeyError, BucketKeyRecord, BucketKeyRef, EncryptionMode, ReadLease,
+        BucketEncryption, BucketKeyError, BucketKeyRef, EncryptionMode, ReadLease,
     };
-    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
     use std::collections::HashMap;
     use std::sync::Arc;
