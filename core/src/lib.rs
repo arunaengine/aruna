@@ -16,6 +16,7 @@ pub mod effects;
 pub mod egress;
 pub mod errors;
 pub mod events;
+pub mod federation;
 pub mod git;
 pub mod handle;
 pub mod id;
