@@ -219,7 +219,8 @@ pub struct GrantRequest<'a> {
 }
 
 /// Signs the grant of a finished export after the current checks and stores its record. A
-/// repeated request returns the stored grant while it is valid and not revoked.
+/// repeated request returns the stored grant while it is valid; an expired grant needs a new
+/// intent and export.
 pub async fn issue_grant(
     context: &DriverContext,
     request: GrantRequest<'_>,
@@ -229,12 +230,10 @@ pub async fn issue_grant(
         if record.revoked {
             return Err(GrantError::Revoked);
         }
-        let local = auth.realm_id;
         let job = request.job_id.as_ulid();
-        if check_issued(&record.grant, &local, job, request.now).is_ok() {
-            recheck(context, auth, &record).await?;
-            return Ok(record.grant);
-        }
+        check_issued(&record.grant, &auth.realm_id, job, request.now)?;
+        recheck(context, auth, &record).await?;
+        return Ok(record.grant);
     }
     let checkpoint = stored_checkpoint(&context.storage_handle, request.job_id)
         .await
@@ -535,5 +534,34 @@ mod tests {
             admitted,
             Err(GrantError::Transfer(TransferError::BadLifetime))
         );
+    }
+
+    #[tokio::test]
+    async fn expired_grant_kept() {
+        // A stored grant past its lifetime is never signed again for the same export.
+        let (_dir, context) = context();
+        let record = record();
+        write_record(&context, job(), &record).await.unwrap();
+        let auth = principal(record.principal, local());
+        let selection = ExportSelection {
+            files: Vec::new(),
+            audience: record.grant.payload.audience,
+            intent_digest: record.grant.payload.intent_digest.clone(),
+        };
+        let request = GrantRequest {
+            auth: &auth,
+            job_id: job(),
+            document_id: record.grant.payload.document_id,
+            document_path: record.document_path.clone(),
+            selection: &selection,
+            artifact_url: record.grant.payload.artifact_url.clone(),
+            capabilities: &capabilities(),
+            now: NOW + MAX_TRANSFER_SECS,
+        };
+        let issued = issue_grant(&context, request).await;
+        let expired = GrantError::Transfer(TransferError::BadLifetime);
+        assert_eq!(issued, Err(expired));
+        let stored = read_record(&context, job()).await.unwrap();
+        assert_eq!(stored, Some(record));
     }
 }

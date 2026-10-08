@@ -259,13 +259,14 @@ that owns the job.
   holds are checked again now and on every artifact read with the grant.
 - The grant names the artifact's BLAKE3 and size, the dataset and selection digests and the
   artifact URL; it lives 24 hours and is not renewable. Repeating the call returns the stored
-  grant while it is valid and not revoked."#,
+  grant while it is valid and not revoked. An expired grant is refused with code
+  `transfer_rejected`; a new grant needs a new intent and export."#,
     params(("job_id" = String, Path, description = "Export job id")),
     responses(
         (status = 200, description = "The signed export grant", body = serde_json::Value,
             example = json!({ "payload": { "source": "<source realm id>", "audience": "<destination realm id>", "intent_digest": "<hex>", "export_job_id": "<ulid>", "document_id": "<ulid>", "source_revision": "<ulid>", "dataset_digest": "<hex>", "selection_digest": "<hex>", "artifact_url": "https://a.example.org/api/v1/compute/jobs/<job id>/artifacts/rocrate", "artifact_blake3": "<hex>", "artifact_size": 2048, "issued_at": 1791000000, "expires_at": 1791086400 }, "signer": "Realm", "signature": "<hex>" })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The export is no longer allowed (code `export_denied`)", body = ErrorResponse),
+        (status = 403, description = "The export is no longer allowed (code `export_denied`) or its grant expired (code `transfer_rejected`)", body = ErrorResponse),
         (status = 404, description = "No such export into another realm of the caller on this node", body = ErrorResponse),
         (status = 409, description = "The export has not succeeded or left out a selected file (code `export_unfinished`)", body = ErrorResponse),
         (status = 410, description = "The grant was revoked (code `grant_revoked`)", body = ErrorResponse)
