@@ -441,3 +441,7 @@ pub async fn create_import(
     };
     submit_import(State(state), Extension(Some(auth)), Json(submit)).await
 }
+
+#[cfg(test)]
+#[path = "federation_import_tests.rs"]
+mod tests;
