@@ -149,7 +149,8 @@ a path-restricted delegated token are both refused.
 - Instead of a bearer token, another realm may push an export with this realm's signed intent in
   header `x-aruna-import-intent` and its own grant in `x-aruna-export-grant` (base64url JSON).
   Intent, grant, size and BLAKE3 are checked, and the upload belongs to the intent's principal.
-  A repeated push of the same export returns the earlier upload.
+  A repeated push of the same export returns the earlier upload; a push of another artifact for
+  the same import is refused with 409 and code `import_conflict`.
 - Bytes are hashed and spooled as they arrive, so the archive never has to fit in memory.
 - The upload is private to the caller and to this node, whose base URL is returned as
   `owner_node_url`.
@@ -188,6 +189,7 @@ a path-restricted delegated token are both refused.
         (status = 400, description = "Content-Type is neither application/zip nor application/vnd.eln+zip", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm or is a path-restricted delegated token", body = ErrorResponse),
+        (status = 409, description = "A pushed export conflicts with the upload bound to its import (code `import_conflict`)", body = ErrorResponse),
         (status = 413, description = "The archive exceeds the node's direct-upload cap; the partial spool is discarded", body = ErrorResponse),
         (status = 503, description = "Upload capacity exhausted or blob storage unavailable; retryable", body = ErrorResponse)
     ),

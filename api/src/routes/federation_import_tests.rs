@@ -24,6 +24,7 @@ use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::transfer::intent_digest;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
+use aruna_operations::federation::import::bound_upload;
 use aruna_operations::jobs::import::{load_rocrate_upload, write_rocrate_upload};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_storage::FjallStorage;
@@ -296,9 +297,17 @@ async fn push_binds_principal() {
         .unwrap();
     assert_eq!(record.owner, fixture.user);
     let key = import_key(&grant.payload, &intent.payload.destination).unwrap();
-    assert_eq!(bound_upload(&context, &key).await, Ok(Some(upload_id)));
+    let bound = bound_upload(&context, fixture.user, &key).await;
+    assert_eq!(bound, Ok(Some(upload_id)));
     let again = push(&fixture, &intent, &grant).await.unwrap();
     assert_eq!(again.upload_id, first.upload_id);
+    // Another artifact under the same import key is never handed the bound upload.
+    let other = self::grant(&intent, b"another export body");
+    let error = push(&fixture, &intent, &other).await.unwrap_err();
+    assert!(matches!(
+        error,
+        ServerError::Refused(_, "import_conflict", _)
+    ));
 }
 
 #[tokio::test]
@@ -313,7 +322,8 @@ async fn push_checks_artifact() {
         ServerError::Refused(_, "artifact_mismatch", _)
     ));
     let key = import_key(&mismatch.payload, &intent.payload.destination).unwrap();
-    assert_eq!(bound_upload(&fixture.state.get_ctx(), &key).await, Ok(None));
+    let bound = bound_upload(&fixture.state.get_ctx(), fixture.user, &key).await;
+    assert_eq!(bound, Ok(None));
     // A body above the granted size is cut off as too large.
     let small = grant(&intent, &BODY[..4]);
     let error = push(&fixture, &intent, &small).await.unwrap_err();
@@ -361,8 +371,8 @@ async fn seed_upload(fixture: &Fixture, upload_id: Ulid) {
             blob_size: 1,
             hashes: HashMap::new(),
         },
-        blake3: [5; 32],
-        size: 1,
+        blake3: *blake3::hash(BODY).as_bytes(),
+        size: BODY.len() as u64,
         media_type: RoCrateMediaType::Zip,
         expires_at_ms: unix_timestamp_millis() + 60_000,
         claimed_by: None,
@@ -451,15 +461,12 @@ async fn losing_spool_discarded() {
     // A transfer that loses the binding race gets the winner and its own spool expires.
     let fixture = fixture(false).await;
     let intent = intent(&fixture, fixture.user);
-    let grant = grant(&intent, &[5]);
+    let grant = grant(&intent, BODY);
     let key = import_key(&grant.payload, &intent.payload.destination).unwrap();
     let (first, second) = (Ulid::generate(), Ulid::generate());
     seed_upload(&fixture, first).await;
     seed_upload(&fixture, second).await;
     let context = fixture.state.get_ctx();
-    let mut grant = grant;
-    grant.payload.artifact_blake3 = hex::encode([5; 32]);
-    grant.payload.artifact_size = 1;
     let binding = ImportRecord {
         intent: intent.clone(),
         grant: grant.clone(),

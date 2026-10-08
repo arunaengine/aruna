@@ -5,15 +5,17 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::federation::Signed;
 use aruna_core::keyspaces::FEDERATION_KEYSPACE;
-use aruna_core::structs::execution::job::{ImportRoCrateSource, ImportRoCrateSpec};
+use aruna_core::structs::execution::job::{
+    ImportRoCrateSource, ImportRoCrateSpec, RoCrateUploadRecord,
+};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::transfer::{ExportGrant, ImportDestination, ImportIntent};
+use aruna_core::{NodeId, UserId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -22,6 +24,7 @@ use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome};
+use crate::jobs::import::load_rocrate_upload;
 use crate::jobs::key_wake::read_row;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
@@ -42,6 +45,8 @@ pub enum ImportError {
     Unbound,
     #[error("the destination bucket does not exist")]
     NoBucket,
+    #[error("the import key is bound to another transfer")]
+    Conflict,
     #[error("import storage failed: {0}")]
     Storage(String),
 }
@@ -85,8 +90,13 @@ pub async fn authorize_import(
     Ok(())
 }
 
-fn upload_key(import_key: &str) -> Vec<u8> {
-    [&b"upload/"[..], import_key.as_bytes()].concat()
+fn upload_key(principal: UserId, import_key: &str) -> Vec<u8> {
+    [
+        &b"upload/"[..],
+        &principal.to_bytes(),
+        import_key.as_bytes(),
+    ]
+    .concat()
 }
 
 /// Binds a verified upload to its intent and grant, and the import key to that upload, so a
@@ -98,7 +108,7 @@ pub async fn write_import(
     record: &ImportRecord,
 ) -> Result<Ulid, ImportError> {
     let change = RecordChange::BindImport {
-        key: upload_key(import_key),
+        key: upload_key(record.intent.payload.principal, import_key),
         record_key: record_key(upload_id),
         upload_id,
         record: record.clone(),
@@ -112,15 +122,16 @@ pub async fn write_import(
     }
 }
 
-/// The upload an import key was bound to by an earlier transfer.
+/// The upload `principal`'s import key was bound to by an earlier transfer.
 pub async fn bound_upload(
     context: &DriverContext,
+    principal: UserId,
     import_key: &str,
 ) -> Result<Option<Ulid>, ImportError> {
     let row = read_row(
         &context.storage_handle,
         FEDERATION_KEYSPACE,
-        upload_key(import_key),
+        upload_key(principal, import_key),
     )
     .await
     .map_err(ImportError::Storage)?;
@@ -130,6 +141,54 @@ pub async fn bound_upload(
         Ok(Ulid::from_bytes(bytes))
     })
     .transpose()
+}
+
+/// Whether a stored binding and its upload belong to the same transfer as `grant` for `intent`:
+/// source, document, digests, artifact, destination and owner.
+fn same_transfer(
+    stored: &ImportRecord,
+    upload: Option<&RoCrateUploadRecord>,
+    intent: &ImportIntent,
+    grant: &ExportGrant,
+) -> bool {
+    let old = &stored.grant.payload;
+    let artifact = |blake3: &[u8; 32], size: u64| {
+        hex::encode(blake3) == grant.artifact_blake3 && size == grant.artifact_size
+    };
+    old.source == grant.source
+        && old.document_id == grant.document_id
+        && old.dataset_digest == grant.dataset_digest
+        && old.selection_digest == grant.selection_digest
+        && old.artifact_blake3 == grant.artifact_blake3
+        && old.artifact_size == grant.artifact_size
+        && stored.intent.payload.principal == intent.principal
+        && stored.intent.payload.destination == intent.destination
+        && upload.is_none_or(|upload| {
+            upload.owner == intent.principal && artifact(&upload.blake3, upload.size)
+        })
+}
+
+/// The upload an earlier transfer of the same principal and import key left on this node; a
+/// binding of another transfer is a conflict.
+pub async fn reusable_upload(
+    context: &DriverContext,
+    intent: &ImportIntent,
+    grant: &ExportGrant,
+    import_key: &str,
+) -> Result<Option<Ulid>, ImportError> {
+    let Some(upload_id) = bound_upload(context, intent.principal, import_key).await? else {
+        return Ok(None);
+    };
+    let stored = read_import(context, upload_id)
+        .await?
+        .ok_or_else(|| ImportError::Storage("upload binding without record".to_string()))?;
+    let upload = load_rocrate_upload(context, upload_id)
+        .await
+        .map_err(ImportError::Storage)?;
+    if !same_transfer(&stored, upload.as_ref(), intent, grant) {
+        return Err(ImportError::Conflict);
+    }
+    Ok(Some(upload_id))
 }
 
 pub async fn read_import(
@@ -189,7 +248,6 @@ pub async fn recheck_import(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::execution::job::{
@@ -310,7 +368,11 @@ mod tests {
         write_import(&context, "key", upload_id, &record())
             .await
             .unwrap();
-        assert_eq!(bound_upload(&context, "key").await, Ok(Some(upload_id)));
+        let bound = bound_upload(&context, principal(), "key").await;
+        assert_eq!(bound, Ok(Some(upload_id)));
+        // Another principal's binding of the same import key is separate.
+        let other = UserId::new(Ulid::from_bytes([4; 16]), realm(2));
+        assert_eq!(bound_upload(&context, other, "key").await, Ok(None));
         let mut moved = spec(upload_id);
         moved.target.prefix = "elsewhere".to_string();
         let checked = recheck_import(&context, &moved, node()).await;
@@ -319,6 +381,51 @@ mod tests {
         other.auth_context.user_id = UserId::new(Ulid::from_bytes([4; 16]), realm(2));
         let checked = recheck_import(&context, &other, node()).await;
         assert_eq!(checked, Err(ImportError::Unbound));
+    }
+
+    #[test]
+    fn conflicting_reuse_refused() {
+        // A binding is reused only for the same transfer, owner and artifact.
+        let stored = record();
+        let (intent, grant) = (&stored.intent.payload, &stored.grant.payload);
+        assert!(same_transfer(&stored, None, intent, grant));
+        let mut other = grant.clone();
+        other.artifact_blake3 = "ee".repeat(32);
+        assert!(!same_transfer(&stored, None, intent, &other));
+        let mut moved = intent.clone();
+        moved.destination.prefix = "elsewhere".to_string();
+        assert!(!same_transfer(&stored, None, &moved, grant));
+        let mut upload = RoCrateUploadRecord {
+            upload_id: Ulid::from_bytes([9; 16]),
+            owner: principal(),
+            location: aruna_core::structs::storage::blob::BackendLocation {
+                backend: aruna_core::structs::storage::blob::BackendRef::node_default(),
+                storage_class: None,
+                root: "/data".to_string(),
+                storage_bucket: "storage".to_string(),
+                backend_path: "input".to_string(),
+                ulid: Ulid::nil(),
+                format: Default::default(),
+                created_by: principal(),
+                created_at: SystemTime::UNIX_EPOCH,
+                staging: false,
+                partial: false,
+                blob_size: 1,
+                hashes: Default::default(),
+            },
+            blake3: [0; 32],
+            size: grant.artifact_size,
+            media_type: aruna_core::structs::execution::job::RoCrateMediaType::Zip,
+            expires_at_ms: 0,
+            claimed_by: None,
+        };
+        let mut matching = grant.clone();
+        matching.artifact_blake3 = hex::encode([0; 32]);
+        let mut bound = stored.clone();
+        bound.grant.payload = matching.clone();
+        assert!(same_transfer(&bound, Some(&upload), intent, &matching));
+        upload.owner = UserId::new(Ulid::from_bytes([4; 16]), realm(2));
+        assert!(!same_transfer(&bound, Some(&upload), intent, &matching));
     }
 
     #[tokio::test]

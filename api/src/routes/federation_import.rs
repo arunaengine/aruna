@@ -26,7 +26,7 @@ use aruna_core::transfer::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::federation::import::{
-    ImportError, ImportRecord, authorize_import, bound_upload, write_import,
+    ImportError, ImportRecord, authorize_import, reusable_upload, write_import,
 };
 use aruna_operations::jobs::import::{
     CreateRoCrateConfig, CreateRoCrateOperation, load_rocrate_upload, write_rocrate_upload,
@@ -97,6 +97,9 @@ fn import_refused(error: ImportError) -> ServerError {
             ServerError::Refused(StatusCode::FORBIDDEN, "import_denied", message)
         }
         ImportError::NoBucket => ServerError::NotFound,
+        ImportError::Conflict => {
+            ServerError::Refused(StatusCode::CONFLICT, "import_conflict", message)
+        }
         ImportError::Storage(_) => ServerError::ServiceUnavailableReason(message),
     }
 }
@@ -182,7 +185,8 @@ pub(crate) async fn pushed_upload(
     push: &Push,
 ) -> ServerResult<Option<RoCrateUploadRecord>> {
     let context = state.get_ctx();
-    let Some(upload_id) = bound_upload(&context, &push.key)
+    let (intent, grant) = (&push.intent.payload, &push.grant.payload);
+    let Some(upload_id) = reusable_upload(&context, intent, grant, &push.key)
         .await
         .map_err(import_refused)?
     else {
@@ -406,7 +410,7 @@ binds the call to the portal that requested the intent.
         (status = 400, description = "A malformed secret", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the intent's principal, the intent or grant was refused (code `transfer_rejected`), WRITE or a policy denied the import (code `import_denied`), or the source refused the pull (code `source_refused`)", body = ErrorResponse),
-        (status = 409, description = "The import key is bound to a different plan", body = ErrorResponse),
+        (status = 409, description = "The import key is bound to a different plan, or to another transfer, owner or artifact (code `import_conflict`)", body = ErrorResponse),
         (status = 502, description = "The source realm could not be reached (code `pull_unreachable`) or sent another artifact (code `artifact_mismatch`)", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -426,7 +430,8 @@ pub async fn create_import(
         .filter(|secret| secret.len() == SECRET_LEN)
         .ok_or_else(|| ServerError::BadRequestReason("secret must be 32 hex bytes".into()))?;
     let key = admit(&state, &intent, &grant, Some(&secret)).await?;
-    let bound = bound_upload(&state.get_ctx(), &key)
+    let (payload, granted) = (&intent.payload, &grant.payload);
+    let bound = reusable_upload(&state.get_ctx(), payload, granted, &key)
         .await
         .map_err(import_refused)?;
     let upload_id = match bound {
