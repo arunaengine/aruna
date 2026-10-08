@@ -52,12 +52,12 @@ fn record_key(upload_id: Ulid) -> Vec<u8> {
 }
 
 /// WRITE on the destination bucket and metadata path, and the deny-only `federation.import`
-/// policies for an import from `source`.
+/// policies, which see `source_realm` once the source is known.
 pub async fn authorize_import(
     context: &DriverContext,
     auth: &AuthContext,
     destination: &ImportDestination,
-    source: RealmId,
+    source: Option<RealmId>,
     node_id: NodeId,
 ) -> Result<(), ImportError> {
     let bucket = match drive(GetBucketOperation::new(destination.bucket.clone()), context).await {
@@ -74,7 +74,9 @@ pub async fn authorize_import(
     for path in paths {
         let extras = PolicyRequestExtras {
             operation: IMPORT_OPERATION.to_string(),
-            params: BTreeMap::from([("source_realm".to_string(), source.to_string())]),
+            params: source
+                .map(|source| BTreeMap::from([("source_realm".to_string(), source.to_string())]))
+                .unwrap_or_default(),
             ..Default::default()
         };
         authorize(context, realm_id, auth, &path, &Permission::WRITE, extras)
@@ -175,7 +177,7 @@ pub async fn recheck_import(
     if !bound(spec, intent) {
         return Err(ImportError::Unbound);
     }
-    let source = record.grant.payload.source;
+    let source = Some(record.grant.payload.source);
     authorize_import(
         context,
         &spec.auth_context,

@@ -513,7 +513,7 @@ fn parse_import_source(source: ImportSourceRequest) -> ServerResult<ImportRoCrat
     }
 }
 
-fn parse_import_target(
+pub(crate) fn parse_import_target(
     target: ImportTargetRequest,
     key_limit: u64,
 ) -> ServerResult<ImportRoCrateTarget> {
@@ -535,7 +535,7 @@ fn parse_import_target(
     })
 }
 
-fn parse_import_metadata(
+pub(crate) fn parse_import_metadata(
     metadata: ImportMetadataRequest,
     key_limit: u64,
 ) -> ServerResult<ImportMetadataTarget> {
@@ -774,7 +774,7 @@ pub(crate) fn upload_body_stream(
     }))
 }
 
-fn map_upload_error(error: CreateRoCrateError) -> ServerError {
+pub(crate) fn map_upload_error(error: CreateRoCrateError) -> ServerError {
     match error {
         CreateRoCrateError::Blob(BlobError::SizeLimitExceeded { limit }) => {
             ServerError::PayloadTooLarge(format!("upload exceeds limit {limit}"))
@@ -854,7 +854,7 @@ fn source_permission_path(
     )
 }
 
-async fn owner_node_url(state: &ServerState) -> ServerResult<String> {
+pub(crate) async fn owner_node_url(state: &ServerState) -> ServerResult<String> {
     state
         .interface_state()
         .await
