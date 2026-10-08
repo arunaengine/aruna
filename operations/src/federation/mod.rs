@@ -3,5 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod export;
+pub mod import;
 pub mod login;
 pub mod publish;
