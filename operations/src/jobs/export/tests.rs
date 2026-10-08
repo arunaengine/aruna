@@ -2503,9 +2503,53 @@ fn facts_need_selected_files() {
     let facts = checkpoint.export_facts(&files).unwrap();
     assert_eq!(facts.versions.len(), 1);
     assert_eq!(facts.versions[0].size, 5);
-    let source = ("bucket".to_string(), "/object".to_string(), false);
-    assert_eq!(facts.sources, vec![source]);
+    let source = &facts.sources[0];
+    assert_eq!(
+        (source.bucket.as_str(), source.key.as_str()),
+        ("bucket", "key")
+    );
+    assert_eq!(
+        (source.version_id, source.blake3, source.size),
+        (version, [7; 32], 5)
+    );
     assert!(checkpoint.export_facts(&["other".to_string()]).is_none());
+    // A selected file without a version read on this node pins nothing.
+    let local = checkpoint.entities[0].candidates[0].source.clone();
+    checkpoint.entities[0].candidates[0].source = CandidateSource::RemoteHash {
+        node_id,
+        hash: [7; 32],
+    };
+    assert!(checkpoint.export_facts(&files).is_none());
+    checkpoint.entities[0].candidates[0].source = local;
     checkpoint.entities[0].omission = Some(ReasonCode::Denied);
     assert!(checkpoint.export_facts(&files).is_none());
+}
+
+#[tokio::test]
+async fn selection_reads_locally() {
+    // An export into another realm never reads a selected file through another node.
+    let realm_id = RealmId::from_bytes([64; 32]);
+    let node = bao_node(realm_id).await;
+    let hash = [65; 32];
+    let candidate = ExportCandidate {
+        source: CandidateSource::RemoteHash {
+            node_id: iroh::SecretKey::from_bytes(&[66; 32]).public(),
+            hash,
+        },
+        report_source: ExportReportSource::Hash,
+        resolved_version: None,
+        expected_blake3: Some(hash),
+    };
+    let mut spec = remote_spec(realm_id, UserId::nil(realm_id));
+    spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
+        files: vec!["data.csv".to_string()],
+        audience: RealmId::from_bytes([67; 32]),
+        intent_digest: String::new(),
+    });
+    let opened = open_candidate(node.driver.as_ref(), &spec, &candidate, true).await;
+    assert!(matches!(
+        opened.unwrap(),
+        CandidateOpen::Status(OpenStatus::Denied)
+    ));
+    node.net.shutdown().await;
 }

@@ -1774,6 +1774,10 @@ async fn open_candidate_checked(
     candidate: &ExportCandidate,
     metadata_only: bool,
 ) -> Result<CandidateOpen, ExportFailure> {
+    // Another node cannot enforce the export consent, so an export into a realm reads locally.
+    if spec.selection.is_some() && !matches!(candidate.source, CandidateSource::Local { .. }) {
+        return Ok(CandidateOpen::Status(OpenStatus::Denied));
+    }
     match &candidate.source {
         CandidateSource::Local {
             location,
