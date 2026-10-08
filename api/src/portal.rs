@@ -45,6 +45,7 @@ pub fn router(state: Arc<ServerState>, config: PortalConfig) -> Router {
     let security = PortalSecurity::new(state.clone(), config.csp.with_api_url(&api_base_url));
     Router::new()
         .route("/portal-config.json", get(portal_config))
+        .route("/.well-known/aruna-realm", get(realm_descriptor))
         .fallback(serve_portal)
         .layer(CompressionLayer::new())
         .layer(from_fn_with_state(security, portal_security_headers))
@@ -87,6 +88,10 @@ async fn portal_config(State(state): State<PortalState>) -> Response {
         .into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+async fn realm_descriptor(State(state): State<PortalState>) -> Response {
+    crate::routes::federation::descriptor_response(&state.server).await
 }
 
 async fn serve_portal(State(state): State<PortalState>, request: Request) -> Response {
