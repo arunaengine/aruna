@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, StorageEffect};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::effects::BlobEffect;
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::federation::{FederationError, Signed};
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, FEDERATION_KEYSPACE};
 use aruna_core::structs::execution::job::{ExportSelection, JobId};
@@ -25,7 +25,8 @@ use url::Url;
 
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome};
 use crate::jobs::export::stored_checkpoint;
 use crate::jobs::key_wake::read_row;
 use crate::replication::plaintext::is_holder;
@@ -74,7 +75,7 @@ pub enum GrantError {
     Storage(String),
 }
 
-fn record_key(job_id: JobId) -> Vec<u8> {
+pub(crate) fn record_key(job_id: JobId) -> Vec<u8> {
     [&b"grant/"[..], &job_id.to_bytes()].concat()
 }
 
@@ -172,22 +173,14 @@ async fn recheck(
     Ok(())
 }
 
-async fn write_record(
+/// Runs one transactional change of a grant record.
+async fn change_record(
     context: &DriverContext,
-    job_id: JobId,
-    record: &GrantRecord,
-) -> Result<(), GrantError> {
-    let value = postcard::to_allocvec(record).map_err(|e| GrantError::Storage(e.to_string()))?;
-    let effect = StorageEffect::Write {
-        key_space: FEDERATION_KEYSPACE.to_string(),
-        key: record_key(job_id).into(),
-        value: value.into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        other => Err(GrantError::Storage(format!("{other:?}"))),
-    }
+    change: RecordChange,
+) -> Result<RecordOutcome, GrantError> {
+    drive(RecordOperation::new(change), context)
+        .await
+        .map_err(|error| GrantError::Storage(error.to_string()))
 }
 
 /// The grant record of `job_id`, if one was issued.
@@ -267,8 +260,13 @@ pub async fn issue_grant(
         revoked: false,
     };
     recheck(context, auth, &record).await?;
-    write_record(context, request.job_id, &record).await?;
-    Ok(record.grant)
+    let key = record_key(request.job_id);
+    // A racing request may have stored its grant or a revocation first; that one wins.
+    match change_record(context, RecordChange::StoreGrant { key, record }).await? {
+        RecordOutcome::Grant(stored) if stored.revoked => Err(GrantError::Revoked),
+        RecordOutcome::Grant(stored) => Ok(stored.grant),
+        other => Err(GrantError::Storage(format!("unexpected outcome {other:?}"))),
+    }
 }
 
 /// Admits one artifact read by a grant: its signature, binding and lifetime, the stored record
@@ -294,21 +292,31 @@ pub async fn admit_grant(
 
 /// Revokes the grant of `job_id` for every later read; false when none was issued.
 pub async fn revoke_grant(context: &DriverContext, job_id: JobId) -> Result<bool, GrantError> {
-    let Some(mut record) = read_record(context, job_id).await? else {
-        return Ok(false);
-    };
-    record.revoked = true;
-    write_record(context, job_id, &record).await?;
-    Ok(true)
+    let key = record_key(job_id);
+    match change_record(context, RecordChange::RevokeGrant { key }).await? {
+        RecordOutcome::Revoked(existed) => Ok(existed),
+        other => Err(GrantError::Storage(format!("unexpected outcome {other:?}"))),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::effects::StorageEffect;
     use ed25519_dalek::SigningKey;
     use tempfile::{TempDir, tempdir};
 
     const NOW: u64 = 10_000;
+
+    async fn write_record(
+        context: &DriverContext,
+        job_id: JobId,
+        record: &GrantRecord,
+    ) -> Result<(), GrantError> {
+        let value = postcard::to_allocvec(record).unwrap();
+        put(context, FEDERATION_KEYSPACE, record_key(job_id), value).await;
+        Ok(())
+    }
 
     fn context() -> (TempDir, DriverContext) {
         let dir = tempdir().unwrap();

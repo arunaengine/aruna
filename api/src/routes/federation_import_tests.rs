@@ -31,7 +31,6 @@ use aruna_tasks::TaskHandle;
 use axum::body::Body;
 use axum::http::HeaderValue;
 use axum::http::header::CONTENT_TYPE;
-use axum::response::IntoResponse;
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -397,7 +396,7 @@ async fn import(
 
 #[tokio::test]
 async fn retry_reuses_job() {
-    // A retry finds the bound upload and its job; another upload for the key is a conflict.
+    // A retry finds the bound upload and its job; a later upload never replaces the binding.
     let fixture = fixture(false).await;
     let intent = intent(&fixture, fixture.user);
     let grant = grant(&intent, BODY);
@@ -422,13 +421,12 @@ async fn retry_reuses_job() {
     assert!(!retried.created);
     assert_eq!(retried.job_id, created.job_id);
     seed_upload(&fixture, second).await;
-    write_import(&fixture.state.get_ctx(), &key, second, &binding)
+    let bound = write_import(&fixture.state.get_ctx(), &key, second, &binding).await;
+    assert_eq!(bound, Ok(first));
+    let replayed = import(&fixture, user, &intent, &grant, SECRET)
         .await
         .unwrap();
-    let error = import(&fixture, user, &intent, &grant, SECRET)
-        .await
-        .unwrap_err();
-    assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+    assert_eq!(replayed.job_id, created.job_id);
 }
 
 #[tokio::test]
@@ -446,4 +444,38 @@ async fn import_needs_principal() {
         wrong,
         Err(ServerError::Refused(_, "transfer_rejected", _))
     ));
+}
+
+#[tokio::test]
+async fn losing_spool_discarded() {
+    // A transfer that loses the binding race gets the winner and its own spool expires.
+    let fixture = fixture(false).await;
+    let intent = intent(&fixture, fixture.user);
+    let grant = grant(&intent, &[5]);
+    let key = import_key(&grant.payload, &intent.payload.destination).unwrap();
+    let (first, second) = (Ulid::generate(), Ulid::generate());
+    seed_upload(&fixture, first).await;
+    seed_upload(&fixture, second).await;
+    let context = fixture.state.get_ctx();
+    let mut grant = grant;
+    grant.payload.artifact_blake3 = hex::encode([5; 32]);
+    grant.payload.artifact_size = 1;
+    let binding = ImportRecord {
+        intent: intent.clone(),
+        grant: grant.clone(),
+    };
+    write_import(&context, &key, first, &binding).await.unwrap();
+    let losing = load_rocrate_upload(&context, second)
+        .await
+        .unwrap()
+        .unwrap();
+    let bound = bind_upload(&fixture.state, &intent, &grant, &key, &losing)
+        .await
+        .unwrap();
+    assert_eq!(bound.upload_id, first);
+    let discarded = load_rocrate_upload(&context, second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(discarded.expires_at_ms, 0);
 }

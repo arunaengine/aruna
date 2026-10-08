@@ -6,3 +6,4 @@ pub mod export;
 pub mod import;
 pub mod login;
 pub mod publish;
+pub mod records;

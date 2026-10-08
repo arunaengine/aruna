@@ -258,10 +258,13 @@ pub async fn upload_rocrate(
     .await
     .map_err(map_upload_error)?;
     drop(upload_slot);
-    if let Some(push) = &push {
-        let bind = crate::routes::federation_import::bind_upload;
-        bind(&state, &push.intent, &push.grant, &push.key, &record).await?;
-    }
+    let record = match &push {
+        Some(push) => {
+            let bind = crate::routes::federation_import::bind_upload;
+            bind(&state, &push.intent, &push.grant, &push.key, &record).await?
+        }
+        None => record,
+    };
     Ok((
         StatusCode::CREATED,
         Json(upload_response(&record, owner_node_url)?),

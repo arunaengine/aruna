@@ -28,7 +28,9 @@ use aruna_operations::driver::drive;
 use aruna_operations::federation::import::{
     ImportError, ImportRecord, authorize_import, bound_upload, write_import,
 };
-use aruna_operations::jobs::import::{CreateRoCrateConfig, CreateRoCrateOperation};
+use aruna_operations::jobs::import::{
+    CreateRoCrateConfig, CreateRoCrateOperation, load_rocrate_upload, write_rocrate_upload,
+};
 use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -186,19 +188,20 @@ pub(crate) async fn pushed_upload(
     else {
         return Ok(None);
     };
-    aruna_operations::jobs::import::load_rocrate_upload(&context, upload_id)
+    load_rocrate_upload(&context, upload_id)
         .await
         .map_err(ServerError::InternalError)
 }
 
 /// Checks a transferred upload against the grant and binds it to the intent and import key.
+/// When a racing transfer bound its upload first, that one is kept and this spool discarded.
 pub(crate) async fn bind_upload(
     state: &ServerState,
     intent: &Signed<ImportIntent>,
     grant: &Signed<ExportGrant>,
     key: &str,
     record: &RoCrateUploadRecord,
-) -> ServerResult<()> {
+) -> ServerResult<RoCrateUploadRecord> {
     let expected = &grant.payload;
     if hex::encode(record.blake3) != expected.artifact_blake3
         || record.size != expected.artifact_size
@@ -212,9 +215,25 @@ pub(crate) async fn bind_upload(
         intent: intent.clone(),
         grant: grant.clone(),
     };
-    write_import(&state.get_ctx(), key, record.upload_id, &binding)
+    let context = state.get_ctx();
+    let bound = write_import(&context, key, record.upload_id, &binding)
         .await
-        .map_err(import_refused)
+        .map_err(import_refused)?;
+    if bound == record.upload_id {
+        return Ok(record.clone());
+    }
+    // An expired upload is removed by the next hidden sweep.
+    let losing = RoCrateUploadRecord {
+        expires_at_ms: 0,
+        ..record.clone()
+    };
+    write_rocrate_upload(&context.storage_handle, &losing)
+        .await
+        .map_err(ServerError::ServiceUnavailableReason)?;
+    load_rocrate_upload(&context, bound)
+        .await
+        .map_err(ServerError::InternalError)?
+        .ok_or(ServerError::NotFound)
 }
 
 /// A `Sync` byte stream over a response body, as the upload writer needs.
@@ -414,8 +433,9 @@ pub async fn create_import(
         Some(upload_id) => upload_id,
         None => {
             let record = pull_artifact(&state, &intent, &grant).await?;
-            bind_upload(&state, &intent, &grant, &key, &record).await?;
-            record.upload_id
+            bind_upload(&state, &intent, &grant, &key, &record)
+                .await?
+                .upload_id
         }
     };
     let destination = intent.payload.destination;
