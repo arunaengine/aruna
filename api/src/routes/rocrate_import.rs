@@ -11,7 +11,7 @@ use aruna_core::repository::RepositoryPull;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{
     ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload,
-    RoCrateMediaType, user_dedup_key,
+    RoCrateMediaType, RoCrateUploadRecord, user_dedup_key,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
@@ -146,6 +146,10 @@ pub struct SubmitImportResponse {
 a path-restricted delegated token are both refused.
 
 **Behavior**
+- Instead of a bearer token, another realm may push an export with this realm's signed intent in
+  header `x-aruna-import-intent` and its own grant in `x-aruna-export-grant` (base64url JSON).
+  Intent, grant, size and BLAKE3 are checked, and the upload belongs to the intent's principal.
+  A repeated push of the same export returns the earlier upload.
 - Bytes are hashed and spooled as they arrive, so the archive never has to fit in memory.
 - The upload is private to the caller and to this node, whose base URL is returned as
   `owner_node_url`.
@@ -196,9 +200,24 @@ pub async fn upload_rocrate(
     body: Body,
 ) -> ServerResult<(StatusCode, Json<UploadRoCrateResponse>)> {
     let deadline = Instant::now() + UPLOAD_DEADLINE;
-    let auth = require_unrestricted_auth(&state, auth)?;
+    // Another realm pushes an export with this realm's intent and its grant instead of a bearer.
+    let push = match auth {
+        None => crate::routes::federation_import::admit_push(&state, &headers).await?,
+        Some(_) => None,
+    };
+    let owner = match &push {
+        Some(push) => push.intent.payload.principal,
+        None => require_unrestricted_auth(&state, auth)?.user_id,
+    };
     let media_type = parse_media_type(&headers)?;
-    let limit = state.rocrate_limits().direct_upload_bytes;
+    let mut limit = state.rocrate_limits().direct_upload_bytes;
+    if let Some(push) = &push {
+        limit = limit.min(push.grant.payload.artifact_size);
+        if let Some(record) = crate::routes::federation_import::pushed_upload(&state, push).await? {
+            let response = upload_response(&record, owner_node_url(&state).await?)?;
+            return Ok((StatusCode::CREATED, Json(response)));
+        }
+    }
     if headers
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -217,10 +236,6 @@ pub async fn upload_rocrate(
     let expires_at_ms = aruna_core::time::unix_timestamp_millis()
         .checked_add(state.rocrate_limits().upload_retention_ms)
         .ok_or_else(|| ServerError::InternalError("upload expiry overflow".to_string()))?;
-    let timestamp = i64::try_from(expires_at_ms)
-        .ok()
-        .and_then(DateTime::<Utc>::from_timestamp_millis)
-        .ok_or_else(|| ServerError::InternalError("upload expiry is invalid".to_string()))?;
     let owner_node_url = timeout_at(deadline, owner_node_url(&state))
         .await
         .map_err(|_| {
@@ -230,7 +245,7 @@ pub async fn upload_rocrate(
     let record = drive_until(
         CreateRoCrateOperation::new(CreateRoCrateConfig {
             upload_id,
-            owner: auth.user_id,
+            owner,
             media_type,
             expires_at_ms,
             max_bytes: limit,
@@ -243,16 +258,31 @@ pub async fn upload_rocrate(
     .await
     .map_err(map_upload_error)?;
     drop(upload_slot);
+    if let Some(push) = &push {
+        let bind = crate::routes::federation_import::bind_upload;
+        bind(&state, &push.intent, &push.grant, &push.key, &record).await?;
+    }
     Ok((
         StatusCode::CREATED,
-        Json(UploadRoCrateResponse {
-            upload_id: upload_id.to_string(),
-            blake3: hex::encode(record.blake3),
-            size: record.size,
-            expires_at: timestamp.to_rfc3339(),
-            owner_node_url,
-        }),
+        Json(upload_response(&record, owner_node_url)?),
     ))
+}
+
+fn upload_response(
+    record: &RoCrateUploadRecord,
+    owner_node_url: String,
+) -> ServerResult<UploadRoCrateResponse> {
+    let timestamp = i64::try_from(record.expires_at_ms)
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .ok_or_else(|| ServerError::InternalError("upload expiry is invalid".to_string()))?;
+    Ok(UploadRoCrateResponse {
+        upload_id: record.upload_id.to_string(),
+        blake3: hex::encode(record.blake3),
+        size: record.size,
+        expires_at: timestamp.to_rfc3339(),
+        owner_node_url,
+    })
 }
 
 #[utoipa::path(
