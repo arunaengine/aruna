@@ -423,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_run_keeps_cursor() {
+    fn failure_keeps_cursor() {
         let realm_id = aruna_core::structs::identity::realm::RealmId([1; 32]);
         let auth = AuthContext {
             user_id: UserId::nil(realm_id),

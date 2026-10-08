@@ -3669,7 +3669,7 @@ fn abe_target_negotiates() {
 }
 
 #[test]
-fn encrypting_target_refuses_references() {
+fn target_refuses_references() {
     // A reference would serve bytes the destination never sealed.
     let (settings, _, _) = encrypting_target();
     let group_id = test_group_id();
@@ -4062,7 +4062,7 @@ fn replacement_drops_envelope() {
 }
 
 #[test]
-fn encrypted_replacement_defers_quota() {
+fn encrypted_replacement_quota() {
     // One payload byte more replaces a larger old envelope at the exact ceiling.
     let (_, _, plan) = encrypting_target();
     let mut op = IncomingVersionOperation::new(

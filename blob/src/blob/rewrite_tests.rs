@@ -565,7 +565,7 @@ async fn tampered_transfer_fails() {
 }
 
 #[tokio::test]
-async fn plaintext_sealed_on_receipt() {
+async fn sealed_on_receipt() {
     // A plain source sends plaintext; an encrypting target seals it with its own plan.
     let context = setup_two_backends().await;
     let handler = context.blob_handle.handler.clone();

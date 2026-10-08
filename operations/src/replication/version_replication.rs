@@ -4919,7 +4919,7 @@ mod tests {
         }
 
         #[test]
-        fn plain_source_sealed_remotely() {
+        fn sealed_by_target() {
             // A plain bucket sends plaintext to an encrypting target, which seals it itself.
             let mut op = negotiating(materialized_location(), false);
             answer(
