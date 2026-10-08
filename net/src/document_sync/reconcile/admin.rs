@@ -1266,9 +1266,15 @@ fn validate_config_target(
 /// Whether a realm-config event's origin node and actor belong to the target
 /// realm.
 fn validate_config_actor(realm_id: RealmId, event: &AdminDocumentEvent) -> Result<()> {
+    // A federated user may only revoke its own token, which this realm issued.
+    let own_revocation = matches!(
+        &event.op,
+        AdminDocumentOperation::ConfigTokenRevoked { token_owner, .. }
+            if *token_owner == event.actor.user_id && !token_owner.is_nil()
+    );
     if event.origin_node_id != event.actor.node_id
         || event.actor.realm_id != realm_id
-        || event.actor.user_id.realm_id != realm_id
+        || (event.actor.user_id.realm_id != realm_id && !own_revocation)
     {
         return Err(NetError::Bootstrap(
             "realm config event actor and origin do not match the target realm".to_string(),
@@ -1300,8 +1306,7 @@ fn validate_revocation_snapshot(
     } = &event.op
         && (!aruna_core::auth::valid_token_hash(token_hash)
             || !valid_revocation_expiry(*expires_at, raw_now)
-            || token_owner.is_nil()
-            || token_owner.realm_id != realm_id)
+            || token_owner.is_nil())
     {
         return Err(NetError::Bootstrap(
             "replicated revocation has invalid hash, expiry, or owner".to_string(),
