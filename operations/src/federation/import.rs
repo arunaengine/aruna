@@ -84,22 +84,52 @@ pub async fn authorize_import(
     Ok(())
 }
 
+fn upload_key(import_key: &str) -> Vec<u8> {
+    [&b"upload/"[..], import_key.as_bytes()].concat()
+}
+
+/// Binds a verified upload to its intent and grant, and the import key to that upload, so a
+/// retried transfer reuses it.
 pub async fn write_import(
     context: &DriverContext,
+    import_key: &str,
     upload_id: Ulid,
     record: &ImportRecord,
 ) -> Result<(), ImportError> {
     let value = postcard::to_allocvec(record).map_err(|e| ImportError::Storage(e.to_string()))?;
-    let effect = StorageEffect::Write {
-        key_space: FEDERATION_KEYSPACE.to_string(),
-        key: record_key(upload_id).into(),
-        value: value.into(),
+    let entry =
+        |key: Vec<u8>, value: Vec<u8>| (FEDERATION_KEYSPACE.to_string(), key.into(), value.into());
+    let effect = StorageEffect::BatchWrite {
+        writes: vec![
+            entry(record_key(upload_id), value),
+            entry(upload_key(import_key), upload_id.to_bytes().to_vec()),
+        ],
         txn_id: None,
     };
     match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         other => Err(ImportError::Storage(format!("{other:?}"))),
     }
+}
+
+/// The upload an import key was bound to by an earlier transfer.
+pub async fn bound_upload(
+    context: &DriverContext,
+    import_key: &str,
+) -> Result<Option<Ulid>, ImportError> {
+    let row = read_row(
+        &context.storage_handle,
+        FEDERATION_KEYSPACE,
+        upload_key(import_key),
+    )
+    .await
+    .map_err(ImportError::Storage)?;
+    row.map(|row| {
+        let bytes = <[u8; 16]>::try_from(row.as_slice())
+            .map_err(|_| ImportError::Storage("invalid upload binding".to_string()))?;
+        Ok(Ulid::from_bytes(bytes))
+    })
+    .transpose()
 }
 
 pub async fn read_import(
@@ -276,7 +306,10 @@ mod tests {
             recheck_import(&context, &spec(upload_id), node()).await,
             Ok(())
         );
-        write_import(&context, upload_id, &record()).await.unwrap();
+        write_import(&context, "key", upload_id, &record())
+            .await
+            .unwrap();
+        assert_eq!(bound_upload(&context, "key").await, Ok(Some(upload_id)));
         let mut moved = spec(upload_id);
         moved.target.prefix = "elsewhere".to_string();
         let checked = recheck_import(&context, &moved, node()).await;
@@ -292,7 +325,9 @@ mod tests {
         // A principal without WRITE on the destination is refused when the job resumes.
         let (_dir, context) = context();
         let upload_id = Ulid::from_bytes([9; 16]);
-        write_import(&context, upload_id, &record()).await.unwrap();
+        write_import(&context, "key", upload_id, &record())
+            .await
+            .unwrap();
         let info = BucketInfo {
             group_id: Ulid::from_bytes([1; 16]),
             created_at: SystemTime::UNIX_EPOCH,

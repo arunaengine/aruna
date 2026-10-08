@@ -194,19 +194,17 @@ fn grant_binding_enforced() {
 
 #[test]
 fn import_key_identity() {
-    // Retries map to one key and upload; another selection or destination does not.
+    // Retries map to one key; another selection or destination does not.
     let intent = valid_intent();
     let granted = grant(&intent, 10).payload;
     let key = import_key(&granted, &destination()).unwrap();
     assert_eq!(key, import_key(&granted, &destination()).unwrap());
-    assert_eq!(import_upload(&key), import_upload(&key));
     let mut moved = destination();
     moved.prefix = "elsewhere".to_string();
     assert_ne!(key, import_key(&granted, &moved).unwrap());
     let mut reselected = granted.clone();
     reselected.selection_digest = "dd".repeat(32);
     assert_ne!(key, import_key(&reselected, &destination()).unwrap());
-    assert_ne!(import_upload(&key), import_upload("federation-other"));
 }
 
 #[test]
