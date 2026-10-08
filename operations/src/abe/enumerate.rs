@@ -345,4 +345,130 @@ mod tests {
         operation.auth.session = None;
         assert_eq!(operation.scope_allowed(&scope), Err(KeyError::Session));
     }
+
+    /// A listing run whose assistant session may not read foo/a, and a human request for foo/a.
+    fn assistant(action: KeyAction) -> (KeyOperation, KeyRequest) {
+        use aruna_core::structs::identity::auth::{SessionKind, SessionRef};
+        let policy = RequestPolicy {
+            policy_id: Ulid::from_bytes([10; 16]),
+            name: "no-assistant".into(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: "request.session.kind == 'assistant' && path.endsWith('/foo/a')".into(),
+            enabled: true,
+        };
+        let mut operation = listing();
+        operation.action = action;
+        operation.state = State::Records;
+        operation.snapshot.as_mut().unwrap().checks[1].push(policy);
+        operation.auth.session = Some(SessionRef {
+            sid: Ulid::from_bytes([12; 16]).to_string(),
+            kind: SessionKind::Assistant,
+        });
+        let user = operation.auth.user_id;
+        let record = UserKeyRecord {
+            user_id: user,
+            record_id: Ulid::from_bytes([14; 16]),
+            key_id: "slot".into(),
+            public_key: [1; 32],
+            fingerprint: [2; 32],
+            has_recovery: false,
+            node_id: operation.node,
+            placement: aruna_core::structs::placement::record::PlacementRef::NIL,
+            created_at_ms: 1,
+        };
+        let request = KeyRequest {
+            request_id: Ulid::from_bytes([1; 16]),
+            requesting_user: user,
+            recipient_user: user,
+            recipient_record: Some(record.record_id),
+            recipient_public: Some(record.public_key),
+            recipient_fingerprint: Some(record.fingerprint),
+            bucket: "bucket".into(),
+            parameters: operation.snapshot.as_ref().unwrap().parameters.clone(),
+            scope: KeyScope::Writes(vec![("foo/a".into(), Ulid::from_bytes([11; 16]))]),
+            epochs: vec![2],
+            credential_id: None,
+            restrictions: None,
+            revisions: Vec::new(),
+            created_at_ms: 0,
+        };
+        operation.recipient_keys = vec![record];
+        (operation, request)
+    }
+
+    fn grant_row(request: &KeyRequest) -> (Key, Value) {
+        let grant = KeyGrant {
+            context: GrantContext {
+                request: request.clone(),
+                issuer: KeyIssuer::User(request.recipient_user),
+            },
+            enc: [0; 32],
+            ciphertext: vec![0; 16],
+        };
+        (request.key().into(), grant.to_bytes().unwrap().into())
+    }
+
+    #[test]
+    fn listing_withholds_human() {
+        // The assistant does not see the human's foo/a grant, which stays; a stale grant goes.
+        let (mut operation, request) = assistant(KeyAction::Grants(None));
+        let mut stale = request.clone();
+        stale.request_id = Ulid::from_bytes([2; 16]);
+        stale.bucket = "other".into();
+        let values = vec![grant_row(&request), grant_row(&stale)];
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: values.clone(),
+            next_start_after: None,
+        }));
+        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice()
+        else {
+            panic!("one delete batch: {effects:?}");
+        };
+        assert_eq!(
+            deletes,
+            &vec![(ABE_GRANT_KEYSPACE.to_string(), values[1].0.clone())]
+        );
+        assert_eq!(operation.result, Some(KeyResult::Grants(Vec::new(), None)));
+        // The human session still lists it.
+        let (mut operation, _) = assistant(KeyAction::Grants(None));
+        operation.auth.session = None;
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: values[..1].to_vec(),
+            next_start_after: None,
+        }));
+        let Some(KeyResult::Grants(grants, None)) = &operation.result else {
+            panic!("a grant page");
+        };
+        assert_eq!(grants.len(), 1);
+    }
+
+    #[test]
+    fn sibling_issuance_keeps() {
+        // An assistant grant for foo/c keeps the human's open request and grant for foo/a.
+        let (mut operation, request) = assistant(KeyAction::Writes("foo/".into()));
+        let scope = KeyScope::Writes(vec![("foo/c".into(), Ulid::from_bytes([13; 16]))]);
+        operation.scopes = vec![scope];
+        operation.groups = vec![2];
+        let open = (request.key().into(), request.to_bytes().unwrap().into());
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![open],
+            next_start_after: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { .. })]
+        ));
+        assert!(operation.deletes.is_empty());
+        assert_eq!(operation.state, State::Reuse);
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![grant_row(&request)],
+            next_start_after: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Abe(_))]
+        ));
+        assert!(operation.deletes.is_empty());
+    }
 }

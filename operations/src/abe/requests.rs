@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::notifications::outbox::new_outbox_record;
+use aruna_core::request_policy::CompiledPolicySet;
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -51,6 +52,18 @@ impl KeyOperation {
             return Err(AbeError::Stale.into());
         }
         self.scope_allowed(&request.scope)
+    }
+    /// Whether a failed check deletes the row; a refusal that may depend on the session keeps it.
+    fn durable(&self, error: &KeyError) -> bool {
+        let session = self.snapshot.as_ref().is_some_and(|s| {
+            (s.checks.iter())
+                .any(|p| CompiledPolicySet::compile(p).map_or(true, |c| c.needs_session))
+        });
+        match error {
+            KeyError::Session => false,
+            KeyError::Denied => !session,
+            _ => true,
+        }
     }
     /// Whether `request` names the current recipient key: the newest user key, or a token key.
     fn recipient_current(&self, request: &KeyRequest) -> bool {
@@ -177,10 +190,12 @@ impl KeyOperation {
                     if grant.context.request.credential_id.is_some() {
                         continue;
                     }
-                    if self.grant_allowed(&grant.context.request).is_err() {
-                        self.deletes.push((ABE_GRANT_KEYSPACE.to_string(), key));
-                    } else {
-                        grants.push(grant);
+                    match self.grant_allowed(&grant.context.request) {
+                        Ok(()) => grants.push(grant),
+                        Err(error) if self.durable(&error) => {
+                            self.deletes.push((ABE_GRANT_KEYSPACE.to_string(), key))
+                        }
+                        Err(_) => {}
                     }
                 }
                 self.result = Some(KeyResult::Grants(grants, next));
@@ -200,6 +215,7 @@ impl KeyOperation {
             _ => self.auth.path_restrictions.clone(),
         };
         let mut open = Vec::new();
+        let mut withheld = 0;
         for (key, value) in values {
             let request = match KeyRequest::from_bytes(&value) {
                 Ok(r) => r,
@@ -209,16 +225,22 @@ impl KeyOperation {
                 continue;
             }
             // Other restrictions are judged only under their own rules, so they stay.
-            if request.restrictions == restrictions && self.current_request(&request).is_err() {
-                self.deletes.push((ABE_REQUEST_KEYSPACE.to_string(), key));
-            } else {
+            if request.restrictions != restrictions {
                 open.push(request);
+                continue;
+            }
+            match self.current_request(&request) {
+                Ok(()) => open.push(request),
+                Err(error) if self.durable(&error) => {
+                    self.deletes.push((ABE_REQUEST_KEYSPACE.to_string(), key))
+                }
+                Err(_) => withheld += 1,
             }
         }
         let same = open
             .iter()
             .position(|r| r.scope == scope && r.restrictions == restrictions);
-        self.queue_full = overflow || open.len() >= MAX_REQUESTS;
+        self.queue_full = overflow || open.len() + withheld >= MAX_REQUESTS;
         self.reused = same.is_some();
         let request = match (same, self.snapshot.as_ref()) {
             (Some(index), _) => open.swap_remove(index),
@@ -295,9 +317,9 @@ impl KeyOperation {
             {
                 continue;
             }
-            if self.grant_allowed(held).is_err() {
+            if let Err(error) = self.grant_allowed(held) {
                 // A holder's restrictions cannot judge the recipient's other grants.
-                if !matches!(self.action, KeyAction::Publish(_)) {
+                if !matches!(self.action, KeyAction::Publish(_)) && self.durable(&error) {
                     self.deletes.push((ABE_GRANT_KEYSPACE.to_string(), key));
                 }
                 continue;
