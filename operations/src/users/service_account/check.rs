@@ -176,6 +176,11 @@ impl Operation for ServiceCheckOperation {
     type Error = ServiceCheckError;
 
     fn start(&mut self) -> Effects {
+        // Federated users never administer service accounts, whatever group roles they hold.
+        let auth = &self.config.auth_context;
+        if auth.user_id.realm_id != auth.realm_id {
+            return self.fail(ServiceCheckError::Refused);
+        }
         let mut reads = vec![user_read(&self.config.auth_context.user_id)];
         reads.extend(self.config.target.as_ref().map(user_read));
         self.state = ServiceCheckState::ReadRecords;
@@ -210,5 +215,32 @@ impl Operation for ServiceCheckOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::realm::RealmId;
+    use ulid::Ulid;
+
+    #[test]
+    fn federated_caller_refused() {
+        // A federated group administrator reads nothing and is refused.
+        let realm_id = RealmId::from_bytes([5u8; 32]);
+        let caller = UserId::new(Ulid::from_bytes([1u8; 16]), RealmId::from_bytes([6u8; 32]));
+        let mut operation = ServiceCheckOperation::new(ServiceCheckConfig {
+            auth_context: AuthContext {
+                user_id: caller,
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            group_id: Ulid::from_bytes([2u8; 16]),
+            target: None,
+        });
+        assert!(operation.start().is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize(), Err(ServiceCheckError::Refused));
     }
 }
