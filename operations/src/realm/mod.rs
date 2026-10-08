@@ -16,5 +16,6 @@ pub mod peer_trust;
 pub mod read_authorization;
 pub mod recover_admin;
 pub mod set_compute;
+pub mod set_federation;
 pub mod set_policies;
 pub mod set_quota;
