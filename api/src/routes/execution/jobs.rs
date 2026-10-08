@@ -13,6 +13,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::device::compute::LocalExecutionError;
+use aruna_operations::federation::export::admit_grant;
 use aruna_operations::jobs::command::{
     CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
     ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
@@ -1830,13 +1831,28 @@ async fn artifact_response(
     headers: HeaderMap,
     download: bool,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
-    let auth_token = forwarded_job_auth(bearer)?;
     let now_ms = aruna_core::time::unix_timestamp_millis();
+    // A destination realm reads with an export grant, only here on the owner node.
+    let grant = crate::routes::federation_export::grant_header(&headers)?;
+    let (user_id, auth_token) = match (auth, grant) {
+        (None, Some(grant)) => {
+            let context = state.get_ctx();
+            let local = state.get_realm_id();
+            let now = now_ms / 1000;
+            let record = admit_grant(&context, local, job_id, &grant, now)
+                .await
+                .map_err(crate::routes::federation_export::grant_refused)?;
+            (record.principal, None)
+        }
+        (auth, _) => {
+            let auth = require_unrestricted_auth(&state, auth)?;
+            (auth.user_id, forwarded_job_auth(bearer)?)
+        }
+    };
     let owned = match read_artifact_routed(
         &state.get_ctx(),
-        auth.user_id,
+        user_id,
         job_id,
         now_ms,
         None,
@@ -1904,7 +1920,7 @@ async fn artifact_response(
         );
     }
     let body = if download && content_length > 0 {
-        let permit = match download::admit(state.as_ref(), LocalKey::User(auth.user_id)) {
+        let permit = match download::admit(state.as_ref(), LocalKey::User(user_id)) {
             Ok(permit) => permit,
             Err(AdmissionError::Total) => {
                 return Err(ServerError::ServiceUnavailableReason(
@@ -1921,7 +1937,7 @@ async fn artifact_response(
         };
         let (lookup, read) = read_artifact_routed(
             &state.get_ctx(),
-            auth.user_id,
+            user_id,
             job_id,
             now_ms,
             Some(range),
@@ -1989,6 +2005,9 @@ Self-scoped like the status read: a job submitted by somebody else answers 404, 
 kind that produces no crate.
 
 **Behavior**
+- Without a bearer token, another realm reads an export into it with its signed grant in header
+  `x-aruna-export-grant` (base64url JSON), only at the owning node. Every request rechecks the
+  grant, its revoked flag and the exporting user's current access.
 - A successful answer always carries `Content-Type: application/zip`, `Content-Length`,
   `Accept-Ranges: bytes`, an `ETag` that is the artifact's quoted hex BLAKE3 digest, and a
   `Content-Disposition: attachment` naming the crate file with both an ASCII fallback and a UTF-8
@@ -2034,7 +2053,8 @@ pub async fn get_job_artifact(
     description = r#"Answers exactly what the download would answer, with the headers but no body.
 
 **Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
-Self-scoped like the status read: a job submitted by somebody else answers 404.
+Self-scoped like the status read: a job submitted by somebody else answers 404. An export grant
+in header `x-aruna-export-grant` is accepted as for the download.
 
 **Behavior**
 - Lets a client learn a crate's size, digest and filename before fetching it.

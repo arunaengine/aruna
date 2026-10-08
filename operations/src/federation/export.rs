@@ -352,6 +352,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_denial_stops_reads() {
+        // A consenting user who lost READ on the document can no longer be read for.
+        let (_dir, context) = context();
+        let record = record();
+        write_record(&context, job(), &record).await.unwrap();
+        let admitted = admit_grant(&context, local(), job(), &record.grant, NOW).await;
+        assert_eq!(admitted, Err(GrantError::Denied));
+    }
+
+    #[tokio::test]
     async fn grant_needs_record() {
         let (_dir, context) = context();
         let record = record();
