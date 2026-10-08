@@ -6,16 +6,17 @@
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::sessions::{CreateSessionResponse, map_create_error, unix_rfc3339};
-use crate::routes::access::users::ensure_active;
 use crate::server::state::ServerState;
 use aruna_core::federation::{RealmDescriptor, Signed};
-use aruna_core::handoff::{FEDERATED_SESSION_SECS, HandoffError, LoginHandoff, check_handoff};
-use aruna_core::structs::identity::auth::{AuthContext, SessionKind};
+use aruna_core::handoff::{HandoffError, LoginHandoff};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::driver::drive;
-use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
-use aruna_operations::session::{CreateSessionConfig, CreateSessionOperation};
-use aruna_operations::users::read_document::ReadUserOperation;
+use aruna_operations::federation::login::{
+    FederatedLoginConfig, FederatedLoginError, FederatedLoginOperation, IssueHandoffConfig,
+    IssueHandoffError, IssueHandoffOperation,
+};
+use aruna_operations::realm::get_config::GetConfigError;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
@@ -153,34 +154,26 @@ pub async fn create_login_handoff(
     Json(request): Json<LoginHandoffRequest>,
 ) -> ServerResult<Json<Signed<LoginHandoff>>> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let local = state.get_realm_id();
-    let portal = auth.session.as_ref().map(|session| session.kind) == Some(SessionKind::Portal);
-    if auth.user_id.realm_id != local || !portal {
-        return Err(ServerError::Forbidden);
-    }
     let nonce_valid = hex::decode(&request.nonce).is_ok_and(|bytes| bytes.len() == SECRET_LEN);
     if !nonce_valid {
         return Err(ServerError::BadRequestReason(
             "nonce must be a hex SHA-256 digest".to_string(),
         ));
     }
-    ensure_active(&state, auth.user_id).await?;
-    let name = drive(ReadUserOperation::new(auth.user_id), &state.get_ctx())
+    let config = IssueHandoffConfig {
+        auth_context: auth,
+        descriptor: request.descriptor,
+        nonce: request.nonce.to_ascii_lowercase(),
+        node_capabilities: state.node_capabilities().clone(),
+        now: unix_timestamp_secs(),
+    };
+    let signed = drive(IssueHandoffOperation::new(config), &state.get_ctx())
         .await
-        .ok()
-        .map(|user| user.name)
-        .filter(|name| !name.is_empty());
-    let handoff = LoginHandoff::new(
-        local,
-        auth.user_id,
-        &request.descriptor,
-        request.nonce.to_ascii_lowercase(),
-        name,
-        unix_timestamp_secs(),
-    )
-    .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
-    let signed = Signed::sign(handoff, state.node_capabilities())
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| match error {
+            IssueHandoffError::Refused | IssueHandoffError::Deactivated => ServerError::Forbidden,
+            IssueHandoffError::Invalid(error) => ServerError::BadRequestReason(error.to_string()),
+            error => ServerError::InternalError(error.to_string()),
+        })?;
     Ok(Json(signed))
 }
 
@@ -256,44 +249,31 @@ pub async fn create_federated_session(
         .ok()
         .filter(|secret| secret.len() == SECRET_LEN)
         .ok_or_else(|| ServerError::BadRequestReason("secret must be 32 hex bytes".to_string()))?;
-    let local = state.get_realm_id();
-    let config = drive(GetConfigOperation::new(local), &state.get_ctx())
+    let (handoff_id, user_id) = (
+        request.handoff.payload.handoff_id,
+        request.handoff.payload.user,
+    );
+    let config = FederatedLoginConfig {
+        realm_id: state.get_realm_id(),
+        handoff: request.handoff,
+        secret,
+        node_capabilities: state.node_capabilities().clone(),
+        now: unix_timestamp_secs(),
+    };
+    let created = drive(FederatedLoginOperation::new(config), &state.get_ctx())
         .await
         .map_err(|error| match error {
-            GetConfigError::DocumentNotFound => ServerError::NotFound,
+            FederatedLoginError::Config(GetConfigError::DocumentNotFound) => ServerError::NotFound,
+            FederatedLoginError::Disabled => ServerError::Refused(
+                StatusCode::FORBIDDEN,
+                "federation_disabled",
+                error.to_string(),
+            ),
+            FederatedLoginError::Rejected(error) => rejected(error),
+            FederatedLoginError::Session(error) => map_create_error(error),
             error => ServerError::InternalError(error.to_string()),
         })?;
-    let settings = config.federation.ok_or_else(|| {
-        ServerError::Refused(
-            StatusCode::FORBIDDEN,
-            "federation_disabled",
-            "this realm has no federation settings".to_string(),
-        )
-    })?;
-    let now = unix_timestamp_secs();
-    check_handoff(&request.handoff, &local, &settings, &secret, now).map_err(rejected)?;
-    let handoff = request.handoff.payload;
-    info!(
-        handoff_id = %handoff.handoff_id,
-        user_id = %handoff.user,
-        "Federated login accepted"
-    );
-    let created = drive(
-        CreateSessionOperation::new(CreateSessionConfig {
-            time: now,
-            expiry: now.saturating_add(FEDERATED_SESSION_SECS),
-            user_id: handoff.user,
-            realm_id: local,
-            node_capabilities: state.node_capabilities().clone(),
-            kind: SessionKind::Federated,
-            label: None,
-            name: handoff.name,
-            restrictions: None,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(map_create_error)?;
+    info!(%handoff_id, %user_id, "Federated login accepted");
     Ok((
         StatusCode::CREATED,
         Json(CreateSessionResponse {
@@ -317,9 +297,10 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMode};
     use aruna_core::handoff::secret_nonce;
-    use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionRef};
+    use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::realm::get_config::GetConfigOperation;
     use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;
     use tempfile::TempDir;
