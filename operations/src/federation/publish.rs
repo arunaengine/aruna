@@ -401,13 +401,42 @@ fn realm_url(registry_url: &Url, realm_id: &RealmId) -> Result<Url, String> {
 /// Arms the registration timer at startup without postponing a restored due time. The due
 /// time is persisted, so repeated restarts do not keep moving the first publication.
 pub async fn restore_publish_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+    shorten_timer(storage, Some(task_handle), PUBLISH_INTERVAL).await;
+}
+
+/// Whether this node reports and the settings name a registry.
+fn publishes_soon(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+    let registry = config.federation.as_ref();
+    registry.is_some_and(|settings| settings.registry_url.is_some())
+        && is_reporting(config, node_id)
+}
+
+/// Publishes soon on the reporting node after replicated realm settings materialize here,
+/// also when another management node served the change.
+pub async fn publish_soon(context: &DriverContext, realm_id: RealmId, node_id: NodeId) {
+    match drive(GetConfigOperation::new(realm_id), context).await {
+        Ok(config) if publishes_soon(&config, node_id) => {}
+        Ok(_) => return,
+        Err(error) => {
+            warn!(error = %error, "Realm config unavailable for registry publication");
+            return;
+        }
+    }
+    let task_handle = context.task_handle.as_ref();
+    shorten_timer(&context.storage_handle, task_handle, PUBLISH_SOON).await;
+}
+
+async fn shorten_timer(storage: &StorageHandle, task_handle: Option<&TaskHandle>, after: Duration) {
     let effect = TaskEffect::ShortenTimer {
         key: TaskKey::PublishRegistration,
-        after: PUBLISH_INTERVAL,
+        after,
     };
     if let Err(message) = persist_task_effect(storage, &effect).await {
         warn!(message = %message, "Failed to persist registry publication timer");
     }
+    let Some(task_handle) = task_handle else {
+        return;
+    };
     if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) =
         task_handle.send_effect(Effect::Task(effect)).await
     {
@@ -418,6 +447,7 @@ pub async fn restore_publish_timer(storage: &StorageHandle, task_handle: &TaskHa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks::task_persistence::read_timer;
     use aruna_core::UserId;
     use aruna_core::federation::{AcceptedRealms, FederationSettings};
     use aruna_core::structs::identity::auth::Actor;
@@ -582,6 +612,57 @@ mod tests {
             url.unwrap().as_str(),
             format!("https://r.example.org/base/v1/realms/{realm_id}")
         );
+    }
+
+    #[test]
+    fn reporter_publishes_soon() {
+        // The management node that served the change may not report; the reporter acts.
+        let unset = config(RegistrationMode::Enabled, false);
+        let config = config(RegistrationMode::Enabled, true);
+        assert!(publishes_soon(&config, reporter()));
+        assert!(!publishes_soon(&config, lower(node(1), node(2)).1));
+        assert!(!publishes_soon(&unset, reporter()));
+    }
+
+    #[tokio::test]
+    async fn materialized_change_shortens() {
+        // Replicated settings arriving at the reporter persist a due time one minute away.
+        let dir = tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let config = config(RegistrationMode::Enabled, true);
+        let target = DocumentTarget::RealmConfig {
+            realm_id: config.realm_id,
+        };
+        let actor = Actor {
+            node_id: reporter(),
+            user_id: UserId::local(Ulid::from_bytes([1; 16]), config.realm_id),
+            realm_id: config.realm_id,
+        };
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let key = TaskKey::PublishRegistration;
+        let storage = &context.storage_handle;
+        publish_soon(&context, config.realm_id, lower(node(1), node(2)).1).await;
+        assert_eq!(read_timer(storage, &key).await.unwrap(), None);
+        publish_soon(&context, config.realm_id, reporter()).await;
+        let due = read_timer(storage, &key).await.unwrap().unwrap();
+        let limit = (unix_timestamp_secs() + 61) * 1000;
+        assert!(due.due_unix_millis <= limit);
     }
 
     #[tokio::test]
