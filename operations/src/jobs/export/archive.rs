@@ -1180,13 +1180,12 @@ pub(crate) struct ExportFacts {
     pub(crate) revision: Ulid,
     pub(crate) dataset_digest: [u8; 32],
     pub(crate) versions: Vec<aruna_core::transfer::SelectedVersion>,
-    /// Bucket, permission path and encryption of each version read on this node.
-    pub(crate) sources: Vec<(String, String, bool)>,
+    pub(crate) sources: Vec<crate::federation::export::PinnedSource>,
     pub(crate) artifact: ArtifactRef,
 }
 
 impl ExportCheckpoint {
-    /// The facts of a finished export, unless one of the selected `files` was left out.
+    /// The facts of a finished export, unless a selected file was left out or not read here.
     pub(crate) fn export_facts(&self, files: &[String]) -> Option<ExportFacts> {
         let mut versions = Vec::new();
         let mut sources = Vec::new();
@@ -1202,23 +1201,30 @@ impl ExportCheckpoint {
                 blake3,
                 size,
             });
-            let used = entity
-                .candidates
-                .iter()
-                .find_map(|candidate| match &candidate.source {
-                    CandidateSource::Local {
-                        location,
-                        permission_path,
-                        bucket,
-                        ..
-                    } if candidate.resolved_version == Some(version_id) => Some((
-                        bucket.clone(),
-                        permission_path.clone(),
-                        location.format.bucket_key().is_some(),
-                    )),
-                    _ => None,
-                });
-            sources.extend(used);
+            let source = entity.candidates.iter().find_map(|candidate| {
+                let CandidateSource::Local {
+                    location,
+                    permission_path,
+                    bucket,
+                    key,
+                    ..
+                } = &candidate.source
+                else {
+                    return None;
+                };
+                (candidate.resolved_version == Some(version_id)).then(|| {
+                    crate::federation::export::PinnedSource {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        path: permission_path.clone(),
+                        version_id,
+                        blake3,
+                        size,
+                        key_ref: location.format.bucket_key(),
+                    }
+                })
+            });
+            sources.push(source?);
         }
         Some(ExportFacts {
             revision: self.winning_event_id?,

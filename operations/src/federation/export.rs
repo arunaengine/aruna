@@ -9,11 +9,12 @@ use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::federation::{FederationError, Signed};
-use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, FEDERATION_KEYSPACE};
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, FEDERATION_KEYSPACE};
 use aruna_core::structs::execution::job::{ExportSelection, JobId};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::encryption::BucketEncryption;
+use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
+use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::transfer::{
     ExportGrant, MAX_TRANSFER_SECS, TransferError, check_issued, selection_digest,
 };
@@ -37,9 +38,22 @@ pub struct GrantRecord {
     pub grant: Signed<ExportGrant>,
     pub principal: UserId,
     pub document_path: String,
-    /// Bucket, permission path and encryption of each pinned version read on this node.
-    pub sources: Vec<(String, String, bool)>,
+    pub with_files: bool,
+    pub sources: Vec<PinnedSource>,
     pub revoked: bool,
+}
+
+/// A selected file version read on this node, rechecked on every artifact read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedSource {
+    pub bucket: String,
+    pub key: String,
+    pub path: String,
+    pub version_id: Ulid,
+    pub blake3: [u8; 32],
+    pub size: u64,
+    /// The bucket key generation of an encrypted version.
+    pub key_ref: Option<BucketKeyRef>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -101,20 +115,8 @@ pub async fn authorize_export(
     .map_err(|_| GrantError::Denied)
 }
 
-/// Whether the active key of an encrypting `bucket` is unlocked on this node.
-async fn unlocked(context: &DriverContext, bucket: &str) -> Result<bool, GrantError> {
-    let row = read_row(
-        &context.storage_handle,
-        BUCKET_ENCRYPTION_KEYSPACE,
-        bucket.as_bytes().to_vec(),
-    )
-    .await
-    .map_err(GrantError::Storage)?;
-    let settings = BucketEncryption::from_row(row.as_deref())
-        .map_err(|e| GrantError::Storage(e.to_string()))?;
-    let Some(key) = settings.active_key() else {
-        return Ok(true);
-    };
+/// Whether bucket key generation `key` is unlocked on this node.
+async fn unlocked(context: &DriverContext, key: BucketKeyRef) -> Result<bool, GrantError> {
     let blob = context.blob_handle.as_ref().ok_or(GrantError::Denied)?;
     let effect = BlobEffect::ReadKeyStatus {
         bucket_id: key.bucket_id,
@@ -127,23 +129,42 @@ async fn unlocked(context: &DriverContext, bucket: &str) -> Result<bool, GrantEr
     }
 }
 
-/// Current READ on the document and every pinned version, the export policies, and for
-/// encrypted versions an unlocked key the consenting user still holds.
+/// Whether the pinned version still exists with its hash.
+async fn pinned(context: &DriverContext, source: &PinnedSource) -> Result<bool, GrantError> {
+    let key = VersionKey::new(source.bucket.clone(), source.key.clone(), source.version_id);
+    let key = key
+        .to_bytes()
+        .map_err(|e| GrantError::Storage(e.to_string()))?;
+    let row = read_row(&context.storage_handle, BLOB_VERSIONS_KEYSPACE, key)
+        .await
+        .map_err(GrantError::Storage)?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let version = BlobVersion::from_bytes(&row).map_err(|e| GrantError::Storage(e.to_string()))?;
+    Ok(version.blob_hash() == Some(&source.blake3))
+}
+
+/// Current READ on the document and every pinned version, the export policies, the pinned
+/// versions themselves, and for encrypted versions their unlocked key the user still holds.
 async fn recheck(
     context: &DriverContext,
     auth: &AuthContext,
     record: &GrantRecord,
 ) -> Result<(), GrantError> {
     let audience = record.grant.payload.audience;
-    let with_files = !record.sources.is_empty();
-    authorize_export(context, auth, &record.document_path, audience, with_files).await?;
-    for (bucket, path, encrypted) in &record.sources {
-        authorize_export(context, auth, path, audience, true).await?;
-        if *encrypted {
-            let holder = is_holder(context, bucket, auth.user_id)
+    let path = &record.document_path;
+    authorize_export(context, auth, path, audience, record.with_files).await?;
+    for source in &record.sources {
+        authorize_export(context, auth, &source.path, audience, true).await?;
+        if !pinned(context, source).await? {
+            return Err(GrantError::Denied);
+        }
+        if let Some(key) = source.key_ref {
+            let holder = is_holder(context, &source.bucket, auth.user_id)
                 .await
                 .map_err(GrantError::Storage)?;
-            if !holder || !unlocked(context, bucket).await? {
+            if !holder || !unlocked(context, key).await? {
                 return Err(GrantError::Denied);
             }
         }
@@ -242,6 +263,7 @@ pub async fn issue_grant(
         grant: Signed::sign(grant, request.capabilities)?,
         principal: auth.user_id,
         document_path: request.document_path,
+        with_files: !selection.files.is_empty(),
         sources: facts.sources,
         revoked: false,
     };
@@ -335,6 +357,7 @@ mod tests {
             grant: Signed::sign(grant, &capabilities()).unwrap(),
             principal: UserId::new(Ulid::from_bytes([1; 16]), local()),
             document_path: "/doc".to_string(),
+            with_files: false,
             sources: Vec::new(),
             revoked: false,
         }
@@ -453,11 +476,41 @@ mod tests {
         .await;
         let path = format!("/{realm}/g/{group}/meta/doc");
         record.document_path = path.clone();
-        record.sources = vec![("sealed".to_string(), path, false)];
+        record.with_files = true;
+        let version_id = Ulid::from_bytes([3; 16]);
+        record.sources = vec![PinnedSource {
+            bucket: "sealed".to_string(),
+            key: "data.csv".to_string(),
+            path,
+            version_id,
+            blake3: [7; 32],
+            size: 5,
+            key_ref: None,
+        }];
         write_record(&context, job(), &record).await.unwrap();
+        // The pinned version must still exist with its hash.
+        let admitted = admit_grant(&context, local(), job(), &record.grant, NOW).await;
+        assert_eq!(admitted, Err(GrantError::Denied));
+        let version = BlobVersion::materialized(
+            [7; 32],
+            aruna_core::structs::storage::blob::BackendRef::node_default(),
+            aruna_core::structs::storage::format::EncodingClass::Raw,
+            std::time::SystemTime::UNIX_EPOCH,
+            owner,
+            None,
+        );
+        let key = VersionKey::new("sealed".to_string(), "data.csv".to_string(), version_id);
+        let row = version.to_bytes().unwrap();
+        put(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            key.to_bytes().unwrap(),
+            row,
+        )
+        .await;
         let admitted = admit_grant(&context, local(), job(), &record.grant, NOW).await;
         assert!(admitted.is_ok());
-        record.sources[0].2 = true;
+        record.sources[0].key_ref = Some(BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1));
         write_record(&context, job(), &record).await.unwrap();
         let admitted = admit_grant(&context, local(), job(), &record.grant, NOW).await;
         assert_eq!(admitted, Err(GrantError::Denied));

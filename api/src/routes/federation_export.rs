@@ -138,7 +138,7 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
   `federation.export` see `destination_realm` and `with_files`.
 - Only the File entities named in `files` travel; every other one stays a reference by its web
   identifier with the original ARN as `identifier`. Encrypted files need an unlocked bucket key
-  that the caller holds.
+  that the caller holds. Selected files must be stored on this node.
 - Repeating the call for the same intent returns the same job with `created` false."#,
     request_body(
         content = FederatedExportRequest,
