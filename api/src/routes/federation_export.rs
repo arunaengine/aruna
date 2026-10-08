@@ -446,3 +446,64 @@ pub async fn push_export(
         .map_err(|error| unreachable("push_refused", error.to_string()))?;
     Ok(Json(answer))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routes::execution::jobs::get_job_artifact;
+    use crate::tests::routes::{test_context, test_state, test_storage};
+    use aruna_core::structs::identity::auth::NodeCapabilities;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::transfer::MAX_TRANSFER_SECS;
+    use axum::http::HeaderValue;
+    use axum::response::IntoResponse;
+    use ed25519_dalek::SigningKey;
+    use ulid::Ulid;
+    use url::Url;
+
+    #[tokio::test]
+    async fn artifact_needs_record() {
+        // Without a bearer only a grant with its node-local record reads the artifact.
+        let (_dir, storage) = test_storage();
+        let key = SigningKey::from_bytes(&[31; 32]);
+        let realm_id = RealmId::from_bytes(key.verifying_key().to_bytes());
+        let capabilities = NodeCapabilities::management_node(key).unwrap();
+        let node_id = iroh::SecretKey::from_bytes(&[32; 32]).public();
+        let context = Arc::new(test_context(storage));
+        let state = Arc::new(test_state(context, realm_id, node_id, capabilities).await);
+        let job_id = JobId::from_bytes([5; 16]);
+        let now = unix_timestamp_secs();
+        let grant = ExportGrant {
+            source: realm_id,
+            audience: RealmId::from_bytes([9; 32]),
+            intent_digest: String::new(),
+            export_job_id: job_id.as_ulid(),
+            document_id: Ulid::from_bytes([6; 16]),
+            source_revision: Ulid::from_bytes([7; 16]),
+            dataset_digest: String::new(),
+            selection_digest: String::new(),
+            artifact_url: Url::parse("https://a.example.org/artifact").unwrap(),
+            artifact_blake3: String::new(),
+            artifact_size: 1,
+            issued_at: now,
+            expires_at: now + MAX_TRANSFER_SECS,
+        };
+        let grant = Signed::sign(grant, state.node_capabilities()).unwrap();
+        let read = |headers: HeaderMap| {
+            let state = State(state.clone());
+            let path = Path(job_id.as_ulid().to_string());
+            get_job_artifact(state, Extension(None), Extension(None), path, headers)
+        };
+        let error = read(HeaderMap::new()).await.unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::UNAUTHORIZED);
+        let mut headers = HeaderMap::new();
+        let value = HeaderValue::from_str(&encode_header(&grant).unwrap()).unwrap();
+        headers.insert(GRANT_HEADER, value);
+        let error = read(headers).await.unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::NOT_FOUND);
+        let mut headers = HeaderMap::new();
+        headers.insert(GRANT_HEADER, HeaderValue::from_static("not-a-grant"));
+        let error = read(headers).await.unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+}
