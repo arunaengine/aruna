@@ -353,11 +353,9 @@ fn validate_watch_event(event: &WatchEvent, realm_id: RealmId, now_ms: u64) -> R
             event.occurred_at_ms
         ));
     }
+    // A federated user of another realm may act on this realm's resources.
     if event.actor.is_nil() {
         return Err("watch event has empty actor".to_string());
-    }
-    if event.actor.realm_id != realm_id {
-        return Err("watch event actor realm must match event realm".to_string());
     }
     if event.path.is_empty() {
         return Err("watch event has empty path".to_string());
