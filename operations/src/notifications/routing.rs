@@ -10,7 +10,7 @@ use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchSubscription, watch_notification_id, watch_path_matches,
 };
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
-use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
 
 pub fn group_admin_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<UserId> {
     let mut ids: Vec<UserId> = auth_doc
@@ -41,6 +41,8 @@ pub fn realm_admin_ids(auth_doc: &RealmAuthorizationDocument) -> Vec<UserId> {
 pub struct RoutingContext<'a> {
     pub group_auth: Option<&'a GroupAuthorizationDocument>,
     pub realm_auth: Option<&'a RealmAuthorizationDocument>,
+    /// The serving realm; users of other realms have no inbox here and get no record.
+    pub realm_id: RealmId,
 }
 
 pub fn route_resource_event(
@@ -48,6 +50,7 @@ pub fn route_resource_event(
     ctx: RoutingContext<'_>,
     now_ms: u64,
 ) -> Vec<NotificationRecord> {
+    let realm_id = ctx.realm_id;
     let mut records = Vec::new();
     match event {
         ResourceEvent::GroupJoinRequested {
@@ -140,6 +143,7 @@ pub fn route_resource_event(
             }
         }
     }
+    records.retain(|record| record.recipient.realm_id == realm_id);
     records
 }
 
@@ -220,6 +224,7 @@ mod pure_tests {
             RoutingContext {
                 group_auth: Some(&doc),
                 realm_auth: None,
+                realm_id: REALM,
             },
             100,
         );
@@ -285,6 +290,7 @@ mod pure_tests {
             RoutingContext {
                 group_auth: Some(&group),
                 realm_auth: None,
+                realm_id: REALM,
             },
             1,
         );
@@ -306,10 +312,38 @@ mod pure_tests {
             RoutingContext {
                 group_auth: None,
                 realm_auth: Some(&realm),
+                realm_id: REALM,
             },
             1,
         );
         assert!(onboarded.is_empty());
+    }
+
+    #[test]
+    fn foreign_member_uninformed() {
+        // A federated member has no inbox here; the local admin still learns of the addition.
+        let admin = user(10);
+        let foreign = UserId::new(Ulid::from_bytes([20; 16]), RealmId([8u8; 32]));
+        let doc = group_with_admins(HashSet::from([admin, foreign]));
+        let records = route_resource_event(
+            &ResourceEvent::GroupMemberAdded {
+                group_id: doc.group_id,
+                affected_user: foreign,
+                actor_user_id: user(11),
+            },
+            RoutingContext {
+                group_auth: Some(&doc),
+                realm_auth: None,
+                realm_id: REALM,
+            },
+            1_000,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].recipient, admin);
+        assert!(matches!(
+            records[0].kind,
+            NotificationKind::GroupMemberAdded { member_user_id, .. } if member_user_id == foreign
+        ));
     }
 
     #[test]
@@ -325,6 +359,7 @@ mod pure_tests {
             RoutingContext {
                 group_auth: Some(&doc),
                 realm_auth: None,
+                realm_id: REALM,
             },
             1_000,
         );
@@ -358,6 +393,7 @@ mod pure_tests {
             RoutingContext {
                 group_auth: Some(&doc),
                 realm_auth: None,
+                realm_id: REALM,
             },
             1_000,
         );
@@ -383,6 +419,7 @@ mod pure_tests {
             RoutingContext {
                 group_auth: Some(&doc),
                 realm_auth: None,
+                realm_id: REALM,
             },
             1_000,
         );
@@ -408,6 +445,7 @@ mod pure_tests {
             RoutingContext {
                 group_auth: None,
                 realm_auth: None,
+                realm_id: REALM,
             },
             1_000,
         );
@@ -427,6 +465,7 @@ mod pure_tests {
             RoutingContext {
                 group_auth: None,
                 realm_auth: None,
+                realm_id: REALM,
             },
             1_000,
         );

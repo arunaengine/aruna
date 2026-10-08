@@ -575,6 +575,7 @@ impl RemoveFromOperation {
                 RoutingContext {
                     group_auth: Some(&auth_doc),
                     realm_auth: None,
+                    realm_id: self.input.actor.realm_id,
                 },
                 unix_timestamp_millis(),
             );
