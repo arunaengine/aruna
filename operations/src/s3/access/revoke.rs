@@ -2,14 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::index::{decode_index, encode_index, owner_key};
+use super::index::{decode_index, encode_index, owner_key, token_deletes, token_scan};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ACCESS_OWNER_KEYSPACE, USER_ACCESS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_core::types::Effects;
+use aruna_core::types::{Effects, Key, TxnId};
 use smallvec::smallvec;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -25,6 +25,8 @@ pub enum RevokeUserState {
     CommitTransaction,
     Finish,
     Error,
+    ScanTokens,
+    DeleteTokens,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -52,6 +54,8 @@ pub struct RevokeUserOperation {
     txn_id: Option<ulid::Ulid>,
     access: Option<UserAccess>,
     output: Option<Result<UserAccess, RevokeUserError>>,
+    /// Where the scan of this credential's token grants continues after the current page.
+    token_cursor: Option<Key>,
 }
 
 impl RevokeUserOperation {
@@ -62,6 +66,7 @@ impl RevokeUserOperation {
             txn_id: None,
             access: None,
             output: None,
+            token_cursor: None,
         }
     }
 
@@ -184,12 +189,62 @@ impl RevokeUserOperation {
         let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
             return self.emit_error(RevokeUserError::InvalidOperationState);
         };
+        self.scan_tokens(None)
+    }
+
+    /// The credential's token requests and grants go in the same transaction, one page at a time.
+    fn scan_tokens(&mut self, start: Option<Key>) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(RevokeUserError::NoTransactionFound);
         };
+        self.state = RevokeUserState::ScanTokens;
+        smallvec![token_scan(&self.access_key, start, txn_id)]
+    }
 
+    fn tokens_scanned(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return self.emit_error(RevokeUserError::InvalidOperationState);
+        };
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(RevokeUserError::NoTransactionFound);
+        };
+        if values.is_empty() {
+            return self.commit(txn_id);
+        }
+        let deletes = match token_deletes(&self.access_key, values) {
+            Ok(deletes) => deletes,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        self.token_cursor = next_start_after;
+        self.state = RevokeUserState::DeleteTokens;
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn tokens_deleted(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
+            return self.emit_error(RevokeUserError::InvalidOperationState);
+        };
+        if let Some(cursor) = self.token_cursor.take() {
+            return self.scan_tokens(Some(cursor));
+        }
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(RevokeUserError::NoTransactionFound);
+        };
+        self.commit(txn_id)
+    }
+
+    /// Marks the credential group's encrypted buckets due, then commits.
+    fn commit(&mut self, txn_id: TxnId) -> Effects {
         self.state = RevokeUserState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        let group = self.access.as_ref().map(|access| access.group_id);
+        smallvec![crate::abe::mark_due(group, txn_id)]
     }
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
@@ -219,6 +274,11 @@ impl Operation for RevokeUserOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let (RevokeUserState::CommitTransaction, Some(txn_id)) = (&self.state, self.txn_id)
+            && let Some(next) = crate::abe::marked(&event, txn_id)
+        {
+            return next.unwrap_or_else(|error| self.emit_error(error.into()));
+        }
         match self.state {
             RevokeUserState::Init => self.handle_init(),
             RevokeUserState::StartTransaction => self.handle_transaction_started(event),
@@ -229,6 +289,8 @@ impl Operation for RevokeUserOperation {
             RevokeUserState::CommitTransaction => self.handle_transaction_committed(event),
             RevokeUserState::Finish => smallvec![],
             RevokeUserState::Error => self.abort(),
+            RevokeUserState::ScanTokens => self.tokens_scanned(event),
+            RevokeUserState::DeleteTokens => self.tokens_deleted(event),
         }
     }
 
@@ -259,12 +321,41 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::s3::access::index::{decode_index, encode_index, owner_key};
     use aruna_core::UserId;
+    use aruna_core::keyspaces::{ABE_GRANT_KEYSPACE, ABE_REQUEST_KEYSPACE, TOKEN_GRANT_KEYSPACE};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::abe_access::token_prefix;
     use aruna_core::structs::storage::blob::UserAccess;
     use aruna_storage::storage;
     use std::time::Duration;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    fn no_tokens() -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        })
+    }
+
+    fn marked() -> Event {
+        Event::SubOperation(aruna_core::events::SubOperationEvent::EpochsMarked { result: Ok(()) })
+    }
+
+    #[test]
+    fn aborts_unmarked() {
+        let mut op = RevokeUserOperation::new("userkey".to_string());
+        let txn_id = Ulid::generate();
+        op.state = RevokeUserState::CommitTransaction;
+        op.txn_id = Some(txn_id);
+        let result = Err(StorageError::TransactionConflict);
+        let event = aruna_core::events::SubOperationEvent::EpochsMarked { result };
+        let effects = op.step(Event::SubOperation(event));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        );
+        assert!(op.finalize().is_err());
+    }
 
     #[test]
     fn revoke_stays_local() {
@@ -314,6 +405,15 @@ mod tests {
         }));
         assert!(matches!(
             effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
+                if key_space == TOKEN_GRANT_KEYSPACE
+        ));
+        // The due markers are written in the revocation's transaction before it commits.
+        let effects = op.step(no_tokens());
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let effects = op.step(marked());
+        assert!(matches!(
+            effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { .. })]
         ));
 
@@ -359,9 +459,11 @@ mod tests {
                 if key_space == USER_ACCESS_KEYSPACE
         ));
 
-        let effects = op.step(Event::Storage(StorageEvent::DeleteResult {
+        op.step(Event::Storage(StorageEvent::DeleteResult {
             key: access.access_key.as_bytes().into(),
         }));
+        op.step(no_tokens());
+        let effects = op.step(marked());
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { .. })]
@@ -450,5 +552,86 @@ mod tests {
             panic!("owner index read failed");
         };
         assert!(decode_index(value.as_ref()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoke_deletes_tokens() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let user_access = UserAccess {
+            access_key: "tokenkey".to_string(),
+            user_identity: Default::default(),
+            group_id: Ulid::generate(),
+            secret: aruna_core::credential_encryption::EncryptedS3Secret::empty(),
+            expiry: SystemTime::now() + Duration::from_secs(3600),
+            path_restrictions: None,
+            issued_by: [0u8; 32],
+            revoked_at: None,
+        };
+        let write = |key_space: &str, key: Vec<u8>, value: Vec<u8>| StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        };
+        storage_handle
+            .send_storage_effect(write(
+                USER_ACCESS_KEYSPACE,
+                b"tokenkey".to_vec(),
+                user_access.to_bytes().unwrap(),
+            ))
+            .await;
+        // An open request and a grant of this credential, and a grant of another credential
+        // whose key extends this one.
+        let rows = [
+            ("tokenkey", ABE_REQUEST_KEYSPACE, 1u8),
+            ("tokenkey", ABE_GRANT_KEYSPACE, 2),
+            ("tokenkeyx", ABE_GRANT_KEYSPACE, 3),
+        ];
+        let row = |access_key: &str, request: u8| [token_prefix(access_key), vec![request; 80]];
+        for (access_key, key_space, request) in rows {
+            let [prefix, key] = row(access_key, request);
+            storage_handle
+                .send_storage_effect(write(key_space, key.clone(), vec![1]))
+                .await;
+            let index = [prefix, key].concat();
+            storage_handle
+                .send_storage_effect(write(TOKEN_GRANT_KEYSPACE, index, Vec::new()))
+                .await;
+        }
+
+        drive(
+            RevokeUserOperation::new("tokenkey".to_string()),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+
+        for ((access_key, key_space, request), kept) in rows.into_iter().zip([false, false, true]) {
+            let [prefix, key] = row(access_key, request);
+            let index = [prefix, key.clone()].concat();
+            for (key_space, key) in [(key_space, key), (TOKEN_GRANT_KEYSPACE, index)] {
+                let read = StorageEffect::Read {
+                    key_space: key_space.to_string(),
+                    key: key.into(),
+                    txn_id: None,
+                };
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) =
+                    storage_handle.send_storage_effect(read).await
+                else {
+                    panic!("token row read failed");
+                };
+                assert_eq!(value.is_some(), kept, "{key_space} of {access_key}");
+            }
+        }
     }
 }

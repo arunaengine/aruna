@@ -2,8 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::abe::envelope::EnvelopeOperation;
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::managed_copy::ManagedCopyError;
+use crate::blob::promote::{
+    PromoteError, PromotePendingOperation, Promotion, drop_mismatch, reject_archive,
+};
 use crate::blob::records::blob_location_read;
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::driver::{DriverContext, drive};
@@ -15,32 +19,38 @@ use crate::replication::protocol::{
 use crate::replication::queue::{
     LiveObligationRecord, LiveVersionInput, LiveVersionOperation, live_obligation_entry,
 };
+use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
     multipart_summary_read, summary_from_read,
 };
+use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
     BlobError, ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+    ABE_GRANT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
+use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
+use aruna_core::structs::storage::abe::AbeEffect;
+use aruna_core::structs::storage::abe::AbeError;
+use aruna_core::structs::storage::abe_access::{KeyGrant, MAX_REQUESTS};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
 use aruna_core::structs::storage::encryption::{
-    BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
+    BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease, TokenCredential,
 };
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectKey, MultipartObjectSummary,
@@ -176,6 +186,11 @@ pub enum GetObjectError {
     GetObjectFailed,
     #[error("operation did not finish")]
     NotFinished,
+    /// The version waits for its content hash; a token credential or object key promotes it first.
+    #[error("The object content waits for its bucket key.")]
+    PendingContent(ArchiveKey),
+    #[error(transparent)]
+    Abe(#[from] aruna_core::structs::storage::abe::AbeError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -227,7 +242,7 @@ impl ObjectRangeRequest {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GetObjectInput {
     pub bucket: String,
     pub key: String,
@@ -323,6 +338,13 @@ pub struct GetObjectOperation {
     reference_key: Option<BucketKeyRef>,
     /// Admitted plaintext read of that bucket; the served stream keeps it until it ends.
     reference_lease: Option<ReadLease>,
+    /// The request has a token, so a pending version answers `PendingContent`.
+    token: bool,
+    object: Option<(
+        aruna_core::structs::storage::abe::ObjectEnvelope,
+        aruna_core::structs::storage::abe::EnvelopeArchive,
+        aruna_core::compute::SharedSecret,
+    )>,
 }
 
 impl GetObjectOperation {
@@ -362,11 +384,29 @@ impl GetObjectOperation {
             output: None,
             reference_key: None,
             reference_lease: None,
+            token: false,
+            object: None,
         }
     }
 
     pub fn with_restrictions(mut self, restrictions: Option<Vec<PathRestriction>>) -> Self {
         self.restrictions = restrictions;
+        self
+    }
+
+    /// Marks a request with a token, which can open the object key of a pending version.
+    pub fn with_token(mut self, token: bool) -> Self {
+        self.token = token;
+        self
+    }
+
+    pub fn with_object(
+        mut self,
+        envelope: aruna_core::structs::storage::abe::ObjectEnvelope,
+        archive: aruna_core::structs::storage::abe::EnvelopeArchive,
+        private: aruna_core::compute::SharedSecret,
+    ) -> Self {
+        self.object = Some((envelope, archive, private));
         self
     }
 
@@ -576,6 +616,11 @@ impl GetObjectOperation {
                 self.state = GetObjectState::ResolveReferenceAccess;
                 smallvec![resolve_binding_effect(ResolveBindingInput { source },)]
             }
+            BlobVersionState::PendingContent { archive, .. }
+                if self.token || self.object.is_some() =>
+            {
+                self.abort_with_error(GetObjectError::PendingContent(archive))
+            }
             BlobVersionState::PendingContent { .. } => {
                 self.emit_error(ConversionError::BucketKey(BucketKeyError::Unsupported).into())
             }
@@ -730,10 +775,31 @@ impl GetObjectOperation {
         // A sealed copy is read only under a lease of its key, admitted after the commit.
         if let Some(key) = location.format.bucket_key() {
             let archive = ArchiveKey::of(&location);
+            let admit = if let Some((envelope, mapping, private)) = self.object.take() {
+                if mapping.archive != archive
+                    || location.location_key().ok().map(|k| k.to_bytes())
+                        != Some(mapping.location_key)
+                    || envelope.context.parameters.key != key
+                    || envelope.context.object_key != self.input.key
+                {
+                    return self.emit_error(GetObjectError::Abe(
+                        aruna_core::structs::storage::abe::AbeError::Context,
+                    ));
+                }
+                BlobEffect::Abe(Box::new(
+                    aruna_core::structs::storage::abe::AbeEffect::Admit {
+                        envelope,
+                        archive,
+                        private,
+                    },
+                ))
+            } else {
+                BlobEffect::AdmitRead { key, archive }
+            };
             self.state = GetObjectState::CommitTransaction;
             return smallvec![
                 Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
-                Effect::Blob(BlobEffect::AdmitRead { key, archive })
+                Effect::Blob(admit)
             ];
         }
         // A plain copy of an encrypting bucket, not converted yet, needs the bucket unlocked too.
@@ -833,6 +899,9 @@ impl GetObjectOperation {
                 lease
             }
             // A locked key stays typed: `BucketKeyError::Locked` names the bucket.
+            Event::Blob(BlobEvent::Error(BlobError::Abe(error))) => {
+                return self.emit_error(GetObjectError::Abe(error));
+            }
             Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
                 return self.emit_error(locked(error));
             }
@@ -1584,10 +1653,27 @@ pub async fn get_object_routed(
     input: GetObjectInput,
     restrictions: Option<Vec<PathRestriction>>,
 ) -> Result<GetObjectResult, GetObjectError> {
+    get_object_token(context, input, restrictions, None).await
+}
+
+/// The token credential of one S3 request and the limits of a promotion it starts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenRead {
+    pub credential: TokenCredential,
+    pub limits: RoCrateLimits,
+}
+
+/// `get_object_routed` where `token` admits a read of a locked bucket key. A pending version
+/// is promoted with the token first, then read like any other.
+pub async fn get_object_token(
+    context: &DriverContext,
+    input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+    token: Option<TokenRead>,
+) -> Result<GetObjectResult, GetObjectError> {
     let ranged = input.range.is_some();
     let user_id = input.user_identity;
-    let operation = GetObjectOperation::new(input).with_restrictions(restrictions.clone());
-    let result = drive(operation, context).await;
+    let result = read_local(context, input, restrictions.clone(), token.as_ref()).await;
     let Err(GetObjectError::BlobNotLocal {
         blake3,
         version_id,
@@ -1611,6 +1697,197 @@ pub async fn get_object_routed(
         restrictions,
     };
     routed_blob(context, read).await
+}
+
+/// Reads the local copy; with a token, a locked or pending version is read with the object key
+/// that a grant of the credential opens.
+pub(crate) async fn read_local(
+    context: &DriverContext,
+    input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+    token: Option<&TokenRead>,
+) -> Result<GetObjectResult, GetObjectError> {
+    let operation = GetObjectOperation::new(input.clone())
+        .with_restrictions(restrictions.clone())
+        .with_token(token.is_some());
+    let result = drive(operation, context).await;
+    let Some(token) = token else {
+        return result;
+    };
+    match result {
+        Err(GetObjectError::PendingContent(_)) => {}
+        Err(GetObjectError::ConversionError(ConversionError::BucketKey(
+            BucketKeyError::Locked(_),
+        ))) => {}
+        result => return result,
+    }
+    let (input, private) = token_object(context, input, &token.credential).await?;
+    read_object(context, input, restrictions, private, &token.limits).await
+}
+
+/// Reads a version with the object key of a request header; without a version id, the
+/// current version is pinned first.
+pub async fn get_object_keyed(
+    context: &DriverContext,
+    mut input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+    private: SharedSecret,
+    limits: &RoCrateLimits,
+) -> Result<GetObjectResult, GetObjectError> {
+    pin_version(context, &mut input).await?;
+    read_object(context, input, restrictions, private, limits).await
+}
+
+/// Sets the version id of `input` to the current version when none was named.
+async fn pin_version(
+    context: &DriverContext,
+    input: &mut GetObjectInput,
+) -> Result<Ulid, GetObjectError> {
+    if let Some(version) = input.version_id {
+        return Ok(version);
+    }
+    let head = HeadObjectOperation::new(HeadObjectInput {
+        bucket: input.bucket.clone(),
+        key: input.key.clone(),
+        version_id: None,
+    });
+    let head = drive(head, context)
+        .await
+        .map_err(|_| GetObjectError::GetObjectFailed)?;
+    let version = head
+        .resolved_version_id
+        .or(head.version_id)
+        .ok_or(GetObjectError::NoSuchKey)?;
+    input.version_id = Some(version);
+    Ok(version)
+}
+
+/// Pins the version and opens its object key with a grant of `credential` that covers it.
+async fn token_object(
+    context: &DriverContext,
+    mut input: GetObjectInput,
+    credential: &TokenCredential,
+) -> Result<(GetObjectInput, SharedSecret), GetObjectError> {
+    let version = pin_version(context, &mut input).await?;
+    let read = EnvelopeOperation::new(input.bucket.clone(), input.key.clone(), version);
+    let (envelope, _) = drive(read, context).await?;
+    let key = envelope.context.parameters.key;
+    let user = input.user_identity.to_storage_key();
+    let scan = StorageEffect::Iter {
+        key_space: ABE_GRANT_KEYSPACE.to_string(),
+        prefix: Some([&key.bucket_id.to_bytes()[..], &user].concat().into()),
+        start: None,
+        limit: MAX_REQUESTS + 1,
+        txn_id: None,
+    };
+    let values = match context.storage_handle.send_storage_effect(scan).await {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        _ => return Err(GetObjectError::GetObjectFailed),
+    };
+    let mut error = locked(BucketKeyError::Locked(key.bucket_id));
+    for (_, value) in values {
+        let Ok(grant) = KeyGrant::from_bytes(&value) else {
+            continue;
+        };
+        let request = &grant.context.request;
+        if request.credential_id.as_deref() != Some(credential.access_key.as_str())
+            || request.parameters != envelope.context.parameters
+            || !request.epochs.contains(&envelope.context.epoch)
+            || !request.covers(&input.key)
+        {
+            continue;
+        }
+        match grant.open_object(credential.token.bytes(), &envelope) {
+            Ok(private) => return Ok((input, private)),
+            Err(AbeError::WrongKey) => error = locked(BucketKeyError::InvalidToken),
+            Err(other) => error = other.into(),
+        }
+    }
+    Err(error)
+}
+
+/// Reads a pinned version with an object key; a pending version is promoted under that key once.
+pub async fn read_object(
+    context: &DriverContext,
+    input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+    private: SharedSecret,
+    limits: &RoCrateLimits,
+) -> Result<GetObjectResult, GetObjectError> {
+    let version = input.version_id.ok_or(GetObjectError::NoSuchVersion)?;
+    let mut promoted = false;
+    loop {
+        let read = EnvelopeOperation::new(input.bucket.clone(), input.key.clone(), version);
+        let (envelope, mapping) = drive(read, context).await?;
+        let operation = GetObjectOperation::new(input.clone())
+            .with_restrictions(restrictions.clone())
+            .with_object(envelope.clone(), mapping.clone(), private.clone());
+        let archive = match drive(operation, context).await {
+            Err(GetObjectError::PendingContent(archive))
+                if !promoted && archive == mapping.archive =>
+            {
+                archive
+            }
+            result => return result,
+        };
+        promoted = true;
+        let blob = context
+            .blob_handle
+            .as_ref()
+            .ok_or(GetObjectError::GetObjectFailed)?;
+        let admit = AbeEffect::Admit {
+            envelope,
+            archive: archive.clone(),
+            private: private.clone(),
+        };
+        let lease = match blob
+            .send_blob_effect(BlobEffect::Abe(Box::new(admit)))
+            .await
+        {
+            Event::Blob(BlobEvent::ReadAdmitted { lease }) => lease,
+            Event::Blob(BlobEvent::Error(BlobError::Abe(error))) => return Err(error.into()),
+            Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
+                return Err(locked(error));
+            }
+            _ => return Err(GetObjectError::GetObjectFailed),
+        };
+        promote_leased(context, &input, archive, lease, limits).await?;
+    }
+}
+
+/// Promotes the pending `archive` under `lease`, as an unlock would.
+async fn promote_leased(
+    context: &DriverContext,
+    input: &GetObjectInput,
+    archive: ArchiveKey,
+    lease: ReadLease,
+    limits: &RoCrateLimits,
+) -> Result<(), GetObjectError> {
+    let (realm_id, node_id) = (input.user_identity.realm_id, input.node_id);
+    let promote = PromotePendingOperation::new(archive.clone(), realm_id, node_id, limits.clone());
+    let outcome = match drive(promote.with_lease(lease), context).await {
+        Err(PromoteError::Blob(BlobError::IntegrityCheckFailed(reason))) => {
+            reject_archive(context, &archive, (realm_id, node_id), reason)
+                .await
+                .map_err(|_| GetObjectError::GetObjectFailed)?;
+            return Err(GetObjectError::GetObjectFailed);
+        }
+        result => result.map_err(|error| {
+            warn!(error = %error, "Token promotion of a pending version failed");
+            GetObjectError::GetObjectFailed
+        })?,
+    };
+    match outcome {
+        Promotion::Promoted { .. } | Promotion::Gone => Ok(()),
+        Promotion::AwaitingKey(_) => Err(GetObjectError::GetObjectFailed),
+        Promotion::Mismatch { claimed } => {
+            drop_mismatch(context, &archive, claimed, (realm_id, node_id))
+                .await
+                .map_err(|_| GetObjectError::GetObjectFailed)?;
+            Err(GetObjectError::GetObjectFailed)
+        }
+    }
 }
 
 /// Resolves complete object facts without transferring holder bytes.

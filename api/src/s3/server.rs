@@ -7,6 +7,7 @@ mod activity;
 mod body;
 mod classification;
 mod keepalive;
+mod post;
 mod response;
 
 pub(crate) use body::DeleteObjectsBody;
@@ -18,8 +19,8 @@ use self::activity::{
 use self::classification::RequestClassification;
 use self::keepalive::{HandlerOutcome, await_handler, keepalive_response};
 use self::response::{
-    apply_response_cors, connection_error, invalid_bucket_response, oversized_delete_response,
-    preflight_response, slow_down_response, stream_timeout_response,
+    apply_response_cors, connection_error, invalid_bucket_response, invalid_token_response,
+    oversized_delete_response, preflight_response, slow_down_response, stream_timeout_response,
 };
 use super::auth::AuthProvider;
 use super::service::ArunaS3Service;
@@ -56,6 +57,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tracing::instrument::WithSubscriber;
 use tracing::{Instrument, error, info, trace};
 
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -382,15 +384,43 @@ impl PreparedRequest {
 
         let shared = self.service.shared.clone();
         let span = self.trace.span.clone();
-        let request = self
+        let mut request = self
             .request
             .take()
             .expect("request is present before the handler runs");
+        // Stage: refuse token forms that s3s would log before signature validation.
+        if super::auth::query_token_refused(request.headers(), request.uri())
+            || super::auth::header_token_refused(request.headers(), request.uri())
+        {
+            drop(request);
+            self.finish_request();
+            return self
+                .trace
+                .respond("invalid_token", invalid_token_response()?);
+        }
         let token = super::auth::request_token(request.headers(), request.uri());
-        let mut handler: BoxFuture<'static, Result<HttpResponse, HttpError>> = Box::pin(
-            super::auth::with_request_token(token, async move { shared.call(request).await })
-                .instrument(span),
-        );
+        let mut handler: BoxFuture<'static, Result<HttpResponse, HttpError>> =
+            Box::pin(async move {
+                let form_token = match post::prepare(&mut request).await {
+                    Ok(form_token) => form_token,
+                    Err(error) => {
+                        return error
+                            .to_http_response()
+                            .map_err(|error| HttpError::new(Box::new(error)));
+                    }
+                };
+                let handler =
+                    super::auth::with_request_token(
+                        token,
+                        async move { shared.call(request).await },
+                    )
+                    .instrument(span);
+                if form_token {
+                    handler.with_subscriber(post::safe_dispatch()).await
+                } else {
+                    handler.await
+                }
+            });
         let connection = self.connection.clone();
         let stream = self.stream.clone();
         let deadline = deadline_activity.clone();
@@ -892,17 +922,7 @@ fn restore_signed_expect(headers: &mut http::HeaderMap) {
     if headers.contains_key(header::EXPECT) {
         return;
     }
-    let signs_expect = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split_once("SignedHeaders="))
-        .and_then(|(_, rest)| rest.split(',').next())
-        .is_some_and(|names| {
-            names
-                .split(';')
-                .any(|name| name.trim().eq_ignore_ascii_case("expect"))
-        });
-    if signs_expect {
+    if super::auth::signs_header(headers, "expect") {
         headers.insert(
             header::EXPECT,
             http::HeaderValue::from_static("100-continue"),
@@ -919,6 +939,7 @@ impl Service<Request<Incoming>> for WrappingService {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let (mut parts, body) = req.into_parts();
+        super::auth::hide_tokens(&mut parts.headers);
         restore_signed_expect(&mut parts.headers);
         // Stage: classification. Route, bucket, CORS preconditions and body
         // shape are derived before anything is parsed or stored.
@@ -1015,6 +1036,331 @@ async fn load_bucket_cors(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TOKEN_CANARY: &str = "group-s-token-canary";
+    const TOKEN_AUTH: &str = "AWS4-HMAC-SHA256 Credential=TOKENKEY/20261005/us-east-1/s3/aws4_request, \
+        SignedHeaders=host;x-amz-date;x-amz-security-token, Signature=\
+        0000000000000000000000000000000000000000000000000000000000000000";
+
+    struct TestS3;
+
+    #[async_trait::async_trait]
+    impl s3s::S3 for TestS3 {
+        async fn put_object(
+            &self,
+            request: s3s::S3Request<s3s::dto::PutObjectInput>,
+        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::PutObjectOutput>> {
+            use futures_util::StreamExt;
+            assert_eq!(request.input.key, "key");
+            let mut body = request.input.body.unwrap();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next().await {
+                bytes.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(bytes, b"file-data");
+            Ok(s3s::S3Response::new(Default::default()))
+        }
+    }
+
+    struct FormChunks(std::collections::VecDeque<bytes::Bytes>);
+
+    impl futures_core::Stream for FormChunks {
+        type Item = Result<bytes::Bytes, s3s::StdError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(self.0.pop_front().map(Ok))
+        }
+    }
+
+    impl s3s::stream::ByteStream for FormChunks {}
+
+    fn form_request(fields: &[(&str, &str)], chunk: usize) -> s3s::HttpRequest {
+        let mut body = String::new();
+        for (name, value) in fields {
+            body.push_str(&format!(
+                "--boundary\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            ));
+        }
+        body.push_str(
+            "--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"file\"\r\n\r\n\
+             file-data\r\n--boundary--\r\n",
+        );
+        let stream: s3s::stream::DynByteStream = Box::pin(FormChunks(
+            body.as_bytes()
+                .chunks(chunk)
+                .map(bytes::Bytes::copy_from_slice)
+                .collect(),
+        ));
+        Request::builder()
+            .method(Method::POST)
+            .uri("/bucket")
+            .header(header::HOST, "localhost")
+            .header(
+                header::CONTENT_TYPE,
+                "Multipart/Form-Data; boundary=\"boundary\"",
+            )
+            .header(header::CONTENT_LENGTH, body.len())
+            .body(s3s::Body::from(stream))
+            .unwrap()
+    }
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn request_trace(mut request: s3s::HttpRequest) -> (http::StatusCode, String) {
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || LogWriter(writer.clone()))
+            .finish();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let mut builder = S3ServiceBuilder::new(TestS3);
+        let mut auth = s3s::auth::SimpleAuth::from_single("TOKENKEY", "signing-secret");
+        auth.register("ASIAKEY".to_string(), "signing-secret".into());
+        builder.set_auth(auth);
+        let service = WrappingService {
+            shared: builder.build(),
+            cors: CorsConfig::default(),
+            domain: "localhost".to_string(),
+            driver_ctx,
+            metrics: Arc::new(NodeMetrics::new()),
+            peer_ip: None,
+            rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
+            control_limit: Arc::new(Semaphore::new(1)),
+            bulk_limit: Arc::new(Semaphore::new(1)),
+            read_limit: Arc::new(Semaphore::new(1)),
+            mutation_limit: Arc::new(Semaphore::new(1)),
+            capture_limit: Arc::new(Semaphore::new(1)),
+            activity: None,
+            trusted_proxies: Arc::new(Vec::new()),
+            timeouts: S3ServerTimeouts::default(),
+        };
+        let status = async {
+            super::super::auth::hide_tokens(request.headers_mut());
+            let (parts, body) = request.into_parts();
+            let classification = RequestClassification::classify(&parts, &service.domain);
+            let trace =
+                RequestTrace::begin(&classification, &parts.headers, service.metrics.clone());
+            let prepared = PreparedRequest {
+                classification,
+                trace,
+                op_label: S3OpLabel::new(),
+                request: Some(s3s::HttpRequest::from_parts(parts, body)),
+                capture: None,
+                admission: None,
+                capture_permit: None,
+                lease: LocalLease::default(),
+                connection: Arc::new(ConnectionActivity::with_idle(
+                    service.timeouts.connection_idle,
+                )),
+                stream: Arc::new(ConnectionActivity::with_idle(
+                    service.timeouts.connection_idle,
+                )),
+                active: None,
+                body_end: true,
+                charged_ip: None,
+                admission_limit: service.bulk_limit.clone(),
+                egress_limit: service.read_limit.clone(),
+                capture_limit: service.capture_limit.clone(),
+                service,
+            };
+            prepared.run().await.unwrap().status()
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        (status, logs)
+    }
+
+    #[tokio::test]
+    async fn sigv2_token_hidden() {
+        let request = |token| {
+            let mut request = Request::builder()
+                .uri("/bucket/key")
+                .header(header::HOST, "localhost")
+                .header(header::DATE, "Mon, 05 Oct 2026 12:00:00 GMT")
+                .header(header::AUTHORIZATION, "AWS TOKENKEY:invalid")
+                .body(s3s::Body::empty())
+                .unwrap();
+            if token {
+                request
+                    .headers_mut()
+                    .insert("x-amz-security-token", TOKEN_CANARY.parse().unwrap());
+            }
+            request
+        };
+        let (_, control) = request_trace(request(false)).await;
+        assert!(control.contains("sig_v2 header_auth"), "{control}");
+        let (status, logs) = request_trace(request(true)).await;
+        assert_eq!(status, http::StatusCode::BAD_REQUEST);
+        assert!(logs.contains("request.received"), "{logs}");
+        assert!(!logs.contains(TOKEN_CANARY), "{logs}");
+        assert!(!logs.contains("sig_v2 header_auth"), "{logs}");
+        let request = Request::builder()
+            .uri("/bucket/key?AWSAccessKeyId=TOKENKEY&Expires=2000000000&Signature=invalid")
+            .header(header::HOST, "localhost")
+            .header(header::AUTHORIZATION, TOKEN_AUTH)
+            .header("x-amz-security-token", TOKEN_CANARY)
+            .body(s3s::Body::empty())
+            .unwrap();
+        let (status, logs) = request_trace(request).await;
+        assert_eq!(status, http::StatusCode::BAD_REQUEST);
+        assert!(!logs.contains(TOKEN_CANARY), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn mixed_tokens_hidden() {
+        for (query, authorization) in [
+            ("X-Amz-Credential=ASIAKEY%2Fscope", Some(TOKEN_AUTH)),
+            (
+                "X-Amz-Credential=TOKENKEY%2Fscope&X-Amz-Credential=ASIAKEY%2Fscope",
+                None,
+            ),
+            (
+                "X-Amz-Credential=ASIAKEY%2Fscope&X-Amz-Credential=TOKENKEY%2Fscope",
+                None,
+            ),
+            (
+                "X-Amz-Credential=ASIAKEY%2Fscope&X-Amz-Credential=ASIAKEY%2Fscope",
+                None,
+            ),
+        ] {
+            let query = query.replace("%2Fscope", "%2F20261005%2Fus-east-1%2Fs3%2Faws4_request");
+            let uri = format!("/bucket/key?{query}&X-Amz-Security-Token={TOKEN_CANARY}");
+            let mut request = Request::builder()
+                .uri(uri)
+                .header(header::HOST, "localhost")
+                .body(s3s::Body::empty())
+                .unwrap();
+            if let Some(authorization) = authorization {
+                request
+                    .headers_mut()
+                    .insert(header::AUTHORIZATION, authorization.parse().unwrap());
+            }
+            let (status, logs) = request_trace(request).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST);
+            assert!(logs.contains("request.received"), "{logs}");
+            assert!(!logs.contains(TOKEN_CANARY), "{logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_tokens_hidden() {
+        for chunk in [1, usize::MAX] {
+            for authentication in [
+                vec![],
+                vec![("AWSAccessKeyId", "TOKENKEY"), ("signature", "invalid")],
+                vec![
+                    ("x-amz-credential", "TOKENKEY/scope"),
+                    ("x-amz-signature", "invalid"),
+                ],
+                vec![
+                    ("x-amz-credential", "ASIAKEY/scope"),
+                    ("x-amz-credential", "TOKENKEY/scope"),
+                    ("x-amz-signature", "invalid"),
+                ],
+                vec![
+                    ("AWSAccessKeyId", "TOKENKEY"),
+                    ("signature", "invalid"),
+                    ("x-amz-credential", "ASIAKEY/scope"),
+                ],
+            ] {
+                let mut fields = vec![("X-Amz-Security-Token", TOKEN_CANARY), ("key", "key")];
+                fields.extend(authentication);
+                let (status, logs) = request_trace(form_request(&fields, chunk)).await;
+                assert_eq!(status, http::StatusCode::BAD_REQUEST);
+                assert!(logs.contains("request.received"), "{logs}");
+                assert!(!logs.contains(TOKEN_CANARY), "{logs}");
+                assert!(!logs.contains("multipart=Multipart"), "{logs}");
+                assert!(!logs.contains("checking post signature"), "{logs}");
+            }
+            let fields = [
+                ("key", "key"),
+                ("x-amz-credential", "ASIAKEY/scope"),
+                ("x-amz-signature", "invalid"),
+                ("x-amz-security-token", TOKEN_CANARY),
+            ];
+            let (_, logs) = request_trace(form_request(&fields, chunk)).await;
+            assert!(logs.contains("checking post signature v4"), "{logs}");
+            assert!(!logs.contains(TOKEN_CANARY), "{logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_forms_preserved() {
+        for (key, policy, signature) in [
+            (
+                "TOKENKEY",
+                concat!(
+                    "eyJleHBpcmF0aW9uIjoiMjA5OS0wMS0wMVQwMDowMDowMFoiLCJjb25kaXRpb25zIjpb",
+                    "eyJidWNrZXQiOiJidWNrZXQifSx7ImtleSI6ImtleSJ9LHsiQVdTQWNjZXNzS2V5SWQi",
+                    "OiJUT0tFTktFWSJ9XX0="
+                ),
+                "L7yNZXWFl14ABWx96cAKjT2/AIk=",
+            ),
+            (
+                "ASIAKEY",
+                concat!(
+                    "eyJleHBpcmF0aW9uIjoiMjA5OS0wMS0wMVQwMDowMDowMFoiLCJjb25kaXRpb25zIjpb",
+                    "eyJidWNrZXQiOiJidWNrZXQifSx7ImtleSI6ImtleSJ9LHsiQVdTQWNjZXNzS2V5SWQi",
+                    "OiJBU0lBS0VZIn0seyJ4LWFtei1zZWN1cml0eS10b2tlbiI6Imdyb3VwLXMtdG9rZW4t",
+                    "Y2FuYXJ5In1dfQ=="
+                ),
+                "+GIXoKtq0QhLb4CjVaFrr/MYczE=",
+            ),
+        ] {
+            for chunk in [1, usize::MAX] {
+                let mut fields = vec![
+                    ("key", "key"),
+                    ("AWSAccessKeyId", key),
+                    ("policy", policy),
+                    ("signature", signature),
+                ];
+                if key == "ASIAKEY" {
+                    fields.push(("x-amz-security-token", TOKEN_CANARY));
+                    if chunk == 1 {
+                        fields.insert(1, ("AWSAccessKeyId", "TOKENKEY"));
+                        fields.push(("X-Amz-Security-Token", TOKEN_CANARY));
+                    }
+                }
+                let (status, logs) = request_trace(form_request(&fields, chunk)).await;
+                assert_eq!(status, http::StatusCode::NO_CONTENT, "{logs}");
+                assert!(logs.contains("checking post signature v2"), "{logs}");
+                assert!(!logs.contains(TOKEN_CANARY), "{logs}");
+                assert_eq!(
+                    logs.contains("multipart=Multipart"),
+                    key == "TOKENKEY",
+                    "{logs}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn refuses_full_connection() {

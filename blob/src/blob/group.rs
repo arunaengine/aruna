@@ -84,6 +84,11 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
 
     let mut ids = Vec::new();
     match effect {
+        BlobEffect::Abe(effect) => {
+            if let aruna_core::structs::storage::abe::AbeEffect::Write { resolved, .. } = effect.as_ref() {
+                push(&mut ids, &resolved.backend);
+            }
+        }
         BlobEffect::Write { resolved, .. }
         | BlobEffect::WritePart { resolved, .. }
         | BlobEffect::OpenUpload { resolved, .. }
@@ -148,6 +153,7 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         BlobEffect::ReadSealed { location, .. } => push(&mut ids, &location.backend),
         BlobEffect::ServeSealedRead { location, .. } => push(&mut ids, &location.backend),
         BlobEffect::ReserveCompose { .. } => {}
+        BlobEffect::ReplicateLeased { location, .. } => push(&mut ids, &location.backend),
     }
     ids
 }
@@ -459,6 +465,7 @@ mod tests {
             stream_id: Ulid::from_bytes([8u8; 16]),
             resolved: ResolvedBackend::new(BackendRef::Group(backend_id), None),
             keep_alive: false,
+            object: None,
         };
 
         assert_eq!(group_ids(&effect), vec![backend_id]);

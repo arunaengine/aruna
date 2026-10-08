@@ -28,6 +28,7 @@ use self::listing::{
 use self::multipart::parse_upload_marker;
 use self::object::object_range_request;
 
+use crate::object_key::ObjectKey;
 use crate::s3::auth::map_authorize_error;
 use crate::s3::browse::{IndexEntry, render_index, wants_index};
 use crate::s3::checksum::{
@@ -58,6 +59,7 @@ use aruna_core::structs::execution::job::{RoCrateLimits, credential_job_id};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, object_permission_path};
+use aruna_core::structs::storage::encryption::TokenCredential;
 use aruna_core::structs::storage::multipart::COMPLETION_DEADLINE_MS;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot};
@@ -82,7 +84,7 @@ use aruna_operations::s3::multipart::create::{
     CreateMultipartInput as CMPI, CreateMultipartOperation,
 };
 use aruna_operations::s3::multipart::part_copy::{
-    PartCopyInput as UploadPartCopyData, upload_part_copy,
+    PartCopyInput as UploadPartCopyData, upload_part_token,
 };
 use aruna_operations::s3::multipart::part_upload::{UploadPartInput as UPI, UploadPartOperation};
 use aruna_operations::s3::multipart::parts::{ListPartsInput as LPI, ListPartsOperation};
@@ -91,14 +93,14 @@ use aruna_operations::s3::object::attributes::{
     GetAttributesInput as GOAI, GetAttributesOperation,
 };
 use aruna_operations::s3::object::copy::{
-    CopyObjectInput as CopyObjectData, CopyReferences, copy_object,
+    CopyObjectInput as CopyObjectData, CopyReferences, copy_object_token,
 };
 use aruna_operations::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput as DOSI, delete_objects,
 };
 use aruna_operations::s3::object::delete::{DeleteObjectInput as DOI, DeleteObjectOperation};
 use aruna_operations::s3::object::get::{
-    GetObjectInput as GOI, get_object_info, get_object_routed,
+    GetObjectInput as GOI, TokenRead, get_object_info, get_object_keyed, get_object_token,
 };
 use aruna_operations::s3::object::head::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::object::list::{ListBucketInput as LOV2I, ListBucketOperation};
@@ -195,6 +197,15 @@ impl ArunaS3Service {
     pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
         self.rocrate_limits = limits;
         self
+    }
+
+    /// The token credential the access check admitted for this request, if any.
+    fn token_read(&self, extensions: &http::Extensions) -> Option<TokenRead> {
+        let credential = extensions.get::<TokenCredential>()?.clone();
+        Some(TokenRead {
+            credential,
+            limits: self.rocrate_limits.clone(),
+        })
     }
 
     /// Attributes one authorized request made with a session's own credential
@@ -1036,7 +1047,8 @@ impl S3 for ArunaS3Service {
             req.input.copy_source_if_unmodified_since.as_ref(),
         )?;
 
-        let result = copy_object(
+        let token = self.token_read(&req.extensions);
+        let result = copy_object_token(
             &self.state,
             CopyObjectData {
                 source_bucket,
@@ -1061,6 +1073,7 @@ impl S3 for ArunaS3Service {
                 restrictions: replication_auth.path_restrictions.clone(),
                 references: CopyReferences::Preserve,
             },
+            token,
         )
         .await
         .map_err(IntoS3Error::into_s3_error)?;
@@ -1295,7 +1308,8 @@ impl S3 for ArunaS3Service {
             )
             .await?;
 
-        let result = upload_part_copy(
+        let token = self.token_read(&req.extensions);
+        let result = upload_part_token(
             &self.state,
             UploadPartCopyData {
                 source_bucket,
@@ -1312,6 +1326,7 @@ impl S3 for ArunaS3Service {
                 conditions,
                 source_auth_context,
             },
+            token,
         )
         .await
         .map_err(IntoS3Error::into_s3_error)?;
@@ -1542,9 +1557,16 @@ impl S3 for ArunaS3Service {
 
         // A device holds version records without their bytes, so a local miss
         // continues against the realm's holders instead of failing here.
-        let result = get_object_routed(&self.state, input, user_access.path_restrictions.clone())
-            .await
-            .map_err(IntoS3Error::into_s3_error)?;
+        let restrictions = user_access.path_restrictions.clone();
+        let token = self.token_read(&req.extensions);
+        let result = match req.extensions.get::<ObjectKey>() {
+            Some(ObjectKey(Ok(Some(private)))) => {
+                let (private, limits) = (private.clone(), &self.rocrate_limits);
+                get_object_keyed(&self.state, input, restrictions, private, limits).await
+            }
+            _ => get_object_token(&self.state, input, restrictions, token).await,
+        }
+        .map_err(IntoS3Error::into_s3_error)?;
         self.record_touch(
             &user_access.access_key,
             &response_bucket,

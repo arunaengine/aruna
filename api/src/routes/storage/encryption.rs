@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::abe::ScopeView;
 use super::routing::ensure_group_admin;
 use crate::auth::require_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -11,9 +12,10 @@ use aruna_core::errors::BlobError;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::abe_access::KeyScope;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::encryption::{
-    BlockCipher, BlockKeys, BucketKeyError, EncryptionMode, KeyState, UnlockStatus,
+    BlockCipher, BlockKeys, BucketKeyError, BucketKeyRef, EncryptionMode, KeyState, UnlockStatus,
 };
 use aruna_core::structs::storage::holders::{
     HolderReport, HolderState, Recovery, RecoveryState, resolve_holders,
@@ -35,7 +37,10 @@ use aruna_operations::s3::bucket::key_rows::SettingsError;
 use aruna_operations::s3::bucket::rotate::{
     ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
 };
-use aruna_operations::s3::key_status::{KeySnapshot, KeyStatusError, KeyStatusOperation};
+use aruna_operations::s3::bucket::token_list::{ListTokensOperation, TokenEntry};
+use aruna_operations::s3::key_status::{
+    AbeSnapshot, KeySnapshot, KeyStatusError, KeyStatusOperation,
+};
 use aruna_operations::s3::unlock_limit::{
     UnlockLimitError, UnlockLimitInput, UnlockLimitOperation,
 };
@@ -58,6 +63,7 @@ pub struct StorageEncryptionDoc;
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(StorageEncryptionDoc::openapi())
         .routes(routes!(get_bucket_encryption, put_bucket_encryption))
+        .routes(routes!(list_bucket_tokens))
 }
 
 /// Unlock state of one key generation on this node.
@@ -143,6 +149,33 @@ impl From<&EncryptionTransition> for TransitionView {
     }
 }
 
+/// The ABE epoch of a bucket, whether a raise is due and its unfinished re-key pass.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct AbeView {
+    pub epoch: u64,
+    pub raise_due: bool,
+    pub rekey: Option<RekeyView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct RekeyView {
+    pub prefix: String,
+    pub rekeyed: u64,
+}
+
+impl From<&AbeSnapshot> for AbeView {
+    fn from(abe: &AbeSnapshot) -> Self {
+        Self {
+            epoch: abe.epoch,
+            raise_due: abe.due,
+            rekey: abe.rekey.as_ref().map(|rekey| RekeyView {
+                prefix: rekey.prefix.clone(),
+                rekeyed: rekey.rekeyed,
+            }),
+        }
+    }
+}
+
 /// What the caller may do; display only, every route checks again.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct CallerView {
@@ -185,6 +218,8 @@ pub struct EncryptionStatus {
     pub holders: Option<HolderCounts>,
     pub recovery: Option<RecoveryView>,
     pub transition: Option<TransitionView>,
+    /// ABE epoch state; null for a bucket without ABE.
+    pub abe: Option<AbeView>,
     pub caller: CallerView,
 }
 
@@ -231,8 +266,127 @@ pub(crate) fn key_refusal(error: &BucketKeyError) -> ServerError {
         BucketKeyError::InvalidDuration => (StatusCode::BAD_REQUEST, "invalid_duration"),
         BucketKeyError::Seal => return ServerError::InternalError(message),
         BucketKeyError::Unsupported => (StatusCode::NOT_IMPLEMENTED, "not_supported"),
+        BucketKeyError::InvalidToken => (StatusCode::FORBIDDEN, "invalid_token"),
     };
     ServerError::Refused(status, code, message)
+}
+
+/// One scoped key grant of a token credential.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct TokenView {
+    /// The key request the grant answers; unique per listed grant.
+    pub request_id: String,
+    pub access_key_id: String,
+    /// The user who created the token credential.
+    pub user_id: String,
+    /// RFC 3339 time the key request of the grant was created.
+    pub created_at: String,
+    pub generation: u64,
+    /// The literal object key or prefix the grant opens.
+    pub scope: ScopeView,
+    pub epochs: Vec<u64>,
+    /// True when the grant is of another generation than the active one, or its credential no
+    /// longer authenticates; such a grant reads nothing any more.
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct TokenListView {
+    pub tokens: Vec<TokenView>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/buckets/{bucket}/storage/encryption/tokens",
+    tag = "data/storage",
+    summary = "List a bucket's token credentials",
+    description = r#"Lists the scoped key grants of the token credentials of a bucket on this node.
+
+**Authentication**: realm bearer token of a current key holder of the bucket, or WRITE on the
+owning group's admin path.
+
+**Behavior**
+- One entry per issued grant: a credential gets one grant per scope and key generation. Open
+  key requests of a token are not listed.
+- `stale` marks a grant of a generation that is no longer active, or of a credential that was
+  revoked, expired or deleted. A key rotation leaves every older grant stale; create a new
+  credential to read again while the bucket is locked.
+- Tokens themselves are never stored or shown; the node keeps only their public keys."#,
+    params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
+    responses(
+        (
+            status = 200,
+            description = "The bucket's token grants",
+            body = TokenListView,
+            example = json!({
+                "tokens": [{
+                    "request_id": "01JREQ00123456789ABCDEFGHJ",
+                    "access_key_id": "01JAKEY0123456789ABCDEFGHJ",
+                    "user_id": "01JUSER0123456789ABCDEFGHJ",
+                    "created_at": "2026-10-05T12:00:00Z",
+                    "generation": 1,
+                    "scope": {"kind": "subtree", "value": "raw/"},
+                    "epochs": [1],
+                    "stale": false
+                }]
+            })
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or neither key holder nor group admin", body = ErrorResponse),
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
+        (status = 503, description = "An authorization document of the bucket is missing", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_bucket_tokens(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+) -> ServerResult<Json<TokenListView>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = bucket_group(&state, &bucket).await?;
+    let snapshot = read_snapshot(&state, &bucket, group_id).await?;
+    if !is_holder(&snapshot, auth.user_id) {
+        ensure_group_admin(&state, &auth, group_id).await?;
+    }
+    let Some(bucket_id) = snapshot.settings.bucket_id else {
+        return Ok(Json(TokenListView { tokens: Vec::new() }));
+    };
+    let operation = ListTokensOperation::new(bucket_id, std::time::SystemTime::now());
+    let entries = drive(operation, &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let active = snapshot.settings.active_key();
+    let tokens = entries
+        .into_iter()
+        .map(|entry| token_view(entry, active))
+        .collect();
+    Ok(Json(TokenListView { tokens }))
+}
+
+/// A grant is stale unless it is of the `active` generation and its credential still works.
+fn token_view(entry: TokenEntry, active: Option<BucketKeyRef>) -> TokenView {
+    let request = entry.grant.context.request;
+    TokenView {
+        stale: Some(request.parameters.key) != active || !entry.credential_active,
+        request_id: request.request_id.to_string(),
+        access_key_id: request.credential_id.unwrap_or_default(),
+        user_id: request.recipient_user.to_string(),
+        created_at: rfc3339(request.created_at_ms),
+        generation: request.parameters.key.generation,
+        scope: match request.scope {
+            KeyScope::Exact(value) => ScopeView::Exact(value),
+            KeyScope::Subtree(value) => ScopeView::Subtree(value),
+            // Token credentials never get enumerated grants.
+            KeyScope::Writes(_) => ScopeView::Writes(String::new()),
+        },
+        epochs: request.epochs,
+    }
+}
+
+fn rfc3339(at_ms: u64) -> String {
+    let at = UNIX_EPOCH + Duration::from_millis(at_ms);
+    chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 pub(crate) fn blob_refusal(error: BlobError) -> ServerError {
@@ -473,6 +627,7 @@ pub(crate) fn build_status(
         }),
         recovery: report.map(|report| RecoveryView::from(&report.recovery)),
         transition: snapshot.transition.as_ref().map(TransitionView::from),
+        abe: snapshot.abe.as_ref().map(AbeView::from),
         caller: CallerView {
             holder: is_holder(snapshot, caller),
             ready_copy,
@@ -512,6 +667,8 @@ pub(crate) async fn current_status(
 - `generations` lists every key generation this node still needs; `unlock`, `public_key` and
   `fingerprint` describe the active one.
 - `holders` and `recovery` come from the key directory; a failed lookup reads as unknown.
+- `abe` reports the epoch, whether a raise is due after lost access, and the unfinished re-key
+  pass with its prefix and count; it is null for a bucket without ABE.
 - `caller` is for display only; every key route checks the caller again."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     responses(
@@ -539,6 +696,7 @@ pub(crate) async fn current_status(
                 "holders": { "ready": 2, "pending": 0, "missing_key": 0 },
                 "recovery": { "state": "met", "ready_holders": 2, "ready_with_recovery": 1 },
                 "transition": null,
+                "abe": { "epoch": 2, "raise_due": true, "rekey": { "prefix": "raw/", "rekeyed": 120 } },
                 "caller": { "holder": true, "ready_copy": true, "admin": true }
             })
         ),
@@ -588,7 +746,7 @@ pub async fn get_bucket_encryption(
         example = json!({ "mode": "vault_locked", "max_unlock_ms": 3600000, "expected_generation": 0 })
     ),
     responses(
-        (status = 200, description = "The status after the change", body = EncryptionStatus, example = json!({ "bucket": "research-raw", "mode": "node_managed", "bucket_id": "01JAMXQ7B1D7Q8E7Q2F3R8Z9KC", "storage_generation": 1, "key_generation": 1, "public_key": "qL3UuCZ0XkWbQZ2yZ8m1qL3UuCZ0XkWbQZ2yZ8m1qL0=", "fingerprint": "5d1c0a6f9e1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5", "cipher": "chacha20_poly1305", "block_keys": "content_derived", "max_unlock_ms": null, "unlock": { "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": null, "max_deadline_ms": null }, "generations": [], "holders": { "ready": 2, "pending": 0, "missing_key": 0 }, "recovery": { "state": "met", "ready_holders": 2, "ready_with_recovery": 1 }, "transition": null, "caller": { "holder": true, "ready_copy": true, "admin": true } })),
+        (status = 200, description = "The status after the change", body = EncryptionStatus, example = json!({ "bucket": "research-raw", "mode": "node_managed", "bucket_id": "01JAMXQ7B1D7Q8E7Q2F3R8Z9KC", "storage_generation": 1, "key_generation": 1, "public_key": "qL3UuCZ0XkWbQZ2yZ8m1qL3UuCZ0XkWbQZ2yZ8m1qL0=", "fingerprint": "5d1c0a6f9e1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5", "cipher": "chacha20_poly1305", "block_keys": "content_derived", "max_unlock_ms": null, "unlock": { "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": null, "max_deadline_ms": null }, "generations": [], "holders": { "ready": 2, "pending": 0, "missing_key": 0 }, "recovery": { "state": "met", "ready_holders": 2, "ready_with_recovery": 1 }, "transition": null, "abe": null, "caller": { "holder": true, "ready_copy": true, "admin": true } })),
         (status = 400, description = "An invalid mode, cipher or unlock maximum", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
@@ -902,6 +1060,69 @@ pub(crate) fn enable_refusal(error: EnableError) -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_tokens_marked() {
+        use aruna_core::structs::storage::abe::AbeParameters;
+        use aruna_core::structs::storage::abe_access::{
+            GrantContext, KeyGrant, KeyIssuer, KeyRequest,
+        };
+        let bucket_id = Ulid::from_bytes([4; 16]);
+        let realm = RealmId::from_bytes([1; 32]);
+        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm);
+        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let entry = |generation, credential_active| TokenEntry {
+            grant: KeyGrant {
+                context: GrantContext {
+                    request: KeyRequest {
+                        request_id: Ulid::from_bytes([1; 16]),
+                        requesting_user: user,
+                        recipient_user: user,
+                        recipient_record: Some(Ulid::from_bytes([7; 16])),
+                        recipient_public: Some([5; 32]),
+                        recipient_fingerprint: Some([6; 32]),
+                        bucket: "reef".to_string(),
+                        parameters: AbeParameters {
+                            realm_id: realm,
+                            node_id: node,
+                            key: BucketKeyRef::new(bucket_id, generation),
+                            fingerprint: [7; 32],
+                            parameters: vec![9; 3],
+                        },
+                        scope: KeyScope::Subtree("raw/".to_string()),
+                        epochs: vec![1],
+                        credential_id: Some("TOKENKEY".to_string()),
+                        restrictions: None,
+                        revisions: Vec::new(),
+                        created_at_ms: 1_791_000_000_000,
+                    },
+                    issuer: KeyIssuer::Node(node),
+                },
+                enc: [0; 32],
+                ciphertext: vec![0; 48],
+            },
+            credential_active,
+        };
+        let active = Some(BucketKeyRef::new(bucket_id, 2));
+        let view = token_view(entry(2, true), active);
+        assert_eq!(
+            view,
+            TokenView {
+                request_id: Ulid::from_bytes([1; 16]).to_string(),
+                access_key_id: "TOKENKEY".to_string(),
+                user_id: user.to_string(),
+                created_at: "2026-10-03T04:00:00Z".to_string(),
+                generation: 2,
+                scope: ScopeView::Subtree("raw/".to_string()),
+                epochs: vec![1],
+                stale: false,
+            }
+        );
+        // A rotation, a revoked credential or a bucket that stopped encrypting leaves it stale.
+        assert!(token_view(entry(1, true), active).stale);
+        assert!(token_view(entry(2, false), active).stale);
+        assert!(token_view(entry(2, true), None).stale);
+    }
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::encryption::{
         BucketEncryption, BucketKeyRecord, BucketKeyRef,
@@ -1036,6 +1257,33 @@ mod tests {
         assert_eq!(json["mode"], "off");
         assert!(json["unlock"].is_null() && json["public_key"].is_null());
         assert_eq!(json["generations"], serde_json::json!([]));
+        assert!(json["abe"].is_null());
+    }
+
+    #[test]
+    fn reports_abe_state() {
+        use aruna_operations::abe::rekey::RekeyProgress;
+        let mut abe = snapshot();
+        abe.abe = Some(AbeSnapshot {
+            epoch: 4,
+            due: true,
+            rekey: Some(RekeyProgress {
+                prefix: "raw/".to_string(),
+                epoch: 4,
+                cursor: b"raw/a".to_vec(),
+                rekeyed: 7,
+            }),
+        });
+        let status = build_status("bucket".to_string(), &abe, None, user(1), 100);
+        let json = serde_json::to_value(&status).unwrap();
+        let expected = serde_json::json!({
+            "epoch": 4, "raise_due": true, "rekey": { "prefix": "raw/", "rekeyed": 7 }
+        });
+        assert_eq!(json["abe"], expected);
+        abe.abe.as_mut().unwrap().rekey = None;
+        let status = build_status("bucket".to_string(), &abe, None, user(1), 100);
+        let json = serde_json::to_value(&status).unwrap();
+        assert!(json["abe"]["rekey"].is_null());
     }
 
     #[test]

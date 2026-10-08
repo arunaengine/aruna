@@ -41,6 +41,7 @@ pub struct RealmRoleOperation {
     input: RealmRoleConfig,
     state: RealmRoleState,
     output: Option<Result<RealmAuthorizationDocument, RealmRoleError>>,
+    narrowed: bool,
 }
 
 impl std::fmt::Debug for RealmRoleOperation {
@@ -133,6 +134,7 @@ impl RealmRoleOperation {
             input,
             state: RealmRoleState::Init,
             output: None,
+            narrowed: false,
         }
     }
 
@@ -290,7 +292,9 @@ impl RealmRoleOperation {
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
+        let roles_before = auth_doc.roles.clone();
         materialize_realm_role(&mut auth_doc, &self.input.role, &reducer_state);
+        self.narrowed = aruna_core::admin_documents::roles_narrowed(&roles_before, &auth_doc.roles);
 
         let conflict_delete_keys: Vec<_> =
             stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state))
@@ -404,6 +408,9 @@ impl RealmRoleOperation {
             auth_doc,
             admin_outbox_written,
         };
+        if self.narrowed {
+            return smallvec![crate::abe::mark_due(None, txn_id)];
+        }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -554,6 +561,11 @@ impl Operation for RealmRoleOperation {
             Ok(event) => event,
             Err(effects) => return effects,
         };
+        if let RealmRoleState::CommitTransaction { txn_id, .. } = self.state
+            && let Some(next) = crate::abe::marked(&event, txn_id)
+        {
+            return next.unwrap_or_else(|error| self.fail(error.into()));
+        }
 
         match self.state.clone() {
             RealmRoleState::Auth => self.handle_authorization(event),
@@ -787,6 +799,60 @@ pub mod test {
         assert_eq!(
             operation.finalize(),
             Err(RealmRoleError::InvalidAssignedUser)
+        );
+    }
+
+    #[test]
+    fn deny_role_marks() {
+        // An assigned DENY role narrows READ scopes, so epochs are marked due before commit.
+        let realm_id = aruna_core::structs::identity::realm::RealmId([1u8; 32]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([2u8; 16]), realm_id),
+            realm_id,
+        };
+        let mut operation = RealmRoleOperation::new(RealmRoleConfig {
+            actor: actor.clone(),
+            realm_id,
+            role: Role {
+                role_id: Ulid::from_bytes([4u8; 16]),
+                name: "blocked".to_string(),
+                permissions: HashMap::from([(format!("/{realm_id}/data/**"), Permission::DENY)]),
+                assigned_users: HashSet::from([UserId::local(
+                    Ulid::from_bytes([5u8; 16]),
+                    realm_id,
+                )]),
+            },
+        });
+        let auth_doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
+        let txn_id = TxnId::generate();
+        operation.start();
+        operation.step(Event::SubOperation(
+            aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    (*realm_id.as_bytes()).into(),
+                    Some(auth_doc.to_bytes(&actor).unwrap().into()),
+                ),
+                (realm_id.as_bytes().to_vec().into(), None),
+            ],
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert!(
+            matches!(effects.as_slice(), [Effect::SubOperation(_)]),
+            "got {effects:?}"
+        );
+        let effects = operation.step(Event::SubOperation(
+            aruna_core::events::SubOperationEvent::EpochsMarked { result: Ok(()) },
+        ));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
         );
     }
 

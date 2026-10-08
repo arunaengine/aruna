@@ -20,6 +20,7 @@ use crate::placement::policy::{
 use crate::replication::queue::build_live_obligation;
 use crate::s3::multipart::create::storage_current;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
+use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup, delete_records_effect};
 use aruna_blob::hash::{Hasher, combine_crcs};
@@ -29,9 +30,9 @@ use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE, PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
-    UPLOAD_PART_KEYSPACE,
+    ABE_PENDING_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, OBJECT_METADATA_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
@@ -39,6 +40,7 @@ use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
+use aruna_core::structs::storage::abe::{AbeError, ObjectEnvelope};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
     BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend, VersionKey,
@@ -53,7 +55,7 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, TxnId};
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -81,6 +83,7 @@ pub enum CompleteUploadState {
     CheckPurgeFinalize,
     ReadBucketDefault,
     CheckSealSettings,
+    FenceAbe,
     FenceBackend,
     CheckHashLookup,
     WriteBlobLocation,
@@ -89,6 +92,7 @@ pub enum CompleteUploadState {
     WriteBlobHead,
     WritePathIndex,
     WriteVersionRecord,
+    WriteEnvelope,
     WriteCopyOwner,
     RegisterManagedCopy,
     WriteObjectMetadata,
@@ -102,6 +106,8 @@ pub enum CompleteUploadState {
     ResetUploadTransaction,
     ReadUploadReset,
     WriteUploadReset,
+    RecheckPending,
+    DeletePending,
     CommitResetTransaction,
     CleanupFailedCompose,
     QueueCleanupRow,
@@ -274,6 +280,13 @@ pub struct CompleteUploadOperation {
     /// Selected parts with their piece records, gathered while the part rows are paged.
     selected_parts: HashMap<u16, MultipartPart>,
     selected_bytes: u64,
+    /// The pending envelope that passed the fence, published with the version.
+    envelope: Option<ObjectEnvelope>,
+    envelope_bytes: u64,
+    /// A stale encrypted upload loses its pending envelope when its record is reset.
+    reclaim_pending: bool,
+    /// A refused publication rechecks its pending envelope in the reset.
+    recheck_pending: bool,
 }
 
 impl CompleteUploadOperation {
@@ -313,6 +326,10 @@ impl CompleteUploadOperation {
             compose_share: None,
             selected_parts: HashMap::new(),
             selected_bytes: 0,
+            envelope: None,
+            envelope_bytes: 0,
+            reclaim_pending: false,
+            recheck_pending: false,
         }
     }
 
@@ -1155,10 +1172,76 @@ impl CompleteUploadOperation {
         let current = BucketEncryption::from_row(value.as_deref())
             .map_err(CompleteUploadError::from)
             .and_then(|settings| Ok(storage_current(plan.as_ref(), &settings)?));
-        match current {
-            Ok(()) => self.fence_composed(&location),
-            Err(error) => self.schedule_error(error),
+        match (current, plan) {
+            (Ok(()), Some(plan)) => {
+                let mut reads = vec![(
+                    ABE_PENDING_KEYSPACE.to_string(),
+                    self.input.upload_id.to_bytes().to_vec().into(),
+                )];
+                reads.extend(abe_reads(plan.key));
+                self.state = CompleteUploadState::FenceAbe;
+                smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads,
+                    txn_id: self.txn_id,
+                })]
+            }
+            (Ok(()), None) => self.fence_composed(&location),
+            (Err(error @ CompleteUploadError::BucketKey(_)), Some(_)) => {
+                self.reclaim_pending = true;
+                self.schedule_error(error)
+            }
+            (Err(error), _) => self.schedule_error(error),
         }
+    }
+
+    /// The pending envelope must match the parameters and epoch this transaction reads.
+    fn abe_fenced(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        let Some(location) = self.composed_location.clone() else {
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
+        };
+        match self.pending_fence(&values) {
+            Ok(envelope) => {
+                self.envelope = envelope;
+                self.fence_composed(&location)
+            }
+            Err(error) => {
+                self.reclaim_pending = matches!(error, AbeError::Parameters | AbeError::Epoch);
+                self.schedule_error(BlobError::from(error).into())
+            }
+        }
+    }
+
+    /// Checks the pending envelope, then the parameters and epoch, as read in that order.
+    /// A generation without admitted parameters and envelope publishes bucket-only.
+    fn pending_fence(
+        &self,
+        values: &[(Key, Option<Value>)],
+    ) -> Result<Option<ObjectEnvelope>, AbeError> {
+        let plan = self
+            .upload_record
+            .as_ref()
+            .and_then(|upload| upload.encryption)
+            .ok_or(AbeError::Context)?
+            .plan;
+        let [(_, pending), current @ ..] = values else {
+            return Err(AbeError::Context);
+        };
+        if pending.is_none() && current.first().is_some_and(|(_, value)| value.is_none()) {
+            return Ok(None);
+        }
+        let envelope = ObjectEnvelope::from_bytes(pending.as_deref().ok_or(AbeError::Stale)?)?;
+        let (parameters, epoch) = parse_abe(current, plan.key)?;
+        if parameters.realm_id != self.input.realm_id
+            || parameters.node_id != self.input.node_id
+            || envelope.context.object_key != self.input.key
+        {
+            return Err(AbeError::Context);
+        }
+        envelope.anchored(&parameters, epoch)?;
+        Ok(Some(envelope))
     }
 
     fn fence_composed(&mut self, location: &BackendLocation) -> Effects {
@@ -1461,6 +1544,37 @@ impl CompleteUploadOperation {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
+        let Some(envelope) = self.envelope.take() else {
+            return self.write_owner();
+        };
+        let (Some(version_id), Some(location), Some(upload)) = (
+            self.version_id,
+            self.final_location.as_ref(),
+            self.upload_record.as_ref(),
+        ) else {
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
+        };
+        let version = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
+        let limit = self.rocrate_limits.metadata_bytes;
+        let rows = (&upload.metadata, limit, self.txn_id);
+        match envelope_write(&envelope, &version, location, rows) {
+            Ok((effect, charge)) => {
+                self.envelope_bytes = charge;
+                self.state = CompleteUploadState::WriteEnvelope;
+                smallvec![effect]
+            }
+            Err(error) => self.schedule_error(BlobError::from(error).into()),
+        }
+    }
+
+    fn envelope_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        self.write_owner()
+    }
+
+    fn write_owner(&mut self) -> Effects {
         let (Some(version_id), Some(location)) = (self.version_id, self.final_location.as_ref())
         else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
@@ -1718,7 +1832,7 @@ impl CompleteUploadOperation {
 
         let group_delta = UsageDelta {
             objects: if self.was_live { 0 } else { 1 },
-            logical_bytes: size,
+            logical_bytes: size + i128::from(self.envelope_bytes),
             ..Default::default()
         };
         let stored = self
@@ -1739,7 +1853,7 @@ impl CompleteUploadOperation {
         let object_size = self
             .final_location
             .as_ref()
-            .map(|location| location.blob_size)
+            .map(|location| location.blob_size.saturating_add(self.envelope_bytes))
             .unwrap_or(0);
         if let Some(ceiling) = self.input.quota_ceiling
             && object_size > 0
@@ -1818,6 +1932,7 @@ impl CompleteUploadOperation {
         };
         if matches!(error, StorageError::TransactionConflict) {
             self.txn_id = None;
+            self.recheck_pending = self.envelope_bytes > 0;
         }
         if !error.proves_no_commit() {
             self.txn_id = None;
@@ -1934,8 +2049,83 @@ impl CompleteUploadOperation {
         let Some(txn_id) = self.txn_id else {
             return self.reset_failed(Some(CompleteUploadError::NoTransactionFound));
         };
+        if std::mem::take(&mut self.reclaim_pending) {
+            return self.delete_pending(txn_id);
+        }
+        let plan = self
+            .upload_record
+            .as_ref()
+            .and_then(|upload| upload.encryption)
+            .map(|encryption| encryption.plan);
+        if let Some(plan) = plan.filter(|_| std::mem::take(&mut self.recheck_pending)) {
+            let mut reads = vec![
+                (
+                    BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                    self.input.bucket.as_bytes().to_vec().into(),
+                ),
+                (
+                    ABE_PENDING_KEYSPACE.to_string(),
+                    self.input.upload_id.to_bytes().to_vec().into(),
+                ),
+            ];
+            reads.extend(abe_reads(plan.key));
+            self.state = CompleteUploadState::RecheckPending;
+            return smallvec![Effect::Storage(StorageEffect::BatchRead {
+                reads,
+                txn_id: Some(txn_id),
+            })];
+        }
         self.state = CompleteUploadState::CommitResetTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    /// Only a moved generation, parameters or epoch drop the envelope; other conflicts retry.
+    fn pending_rechecked(&mut self, event: Event) -> Effects {
+        let values = match event {
+            Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+            Event::Storage(StorageEvent::Error { .. }) => return self.reset_failed(None),
+            _ => return self.reset_failed(Some(CompleteUploadError::InvalidOperationState)),
+        };
+        let (Some(((_, settings), pending)), Some(txn_id)) = (values.split_first(), self.txn_id)
+        else {
+            return self.reset_failed(Some(CompleteUploadError::InvalidOperationState));
+        };
+        let plan = self
+            .upload_record
+            .as_ref()
+            .and_then(|upload| upload.encryption)
+            .map(|encryption| encryption.plan);
+        let moved = BucketEncryption::from_row(settings.as_deref())
+            .is_ok_and(|settings| storage_current(plan.as_ref(), &settings).is_err());
+        let fence = self.pending_fence(pending);
+        if moved || matches!(fence, Err(AbeError::Parameters | AbeError::Epoch)) {
+            return self.delete_pending(txn_id);
+        }
+        self.state = CompleteUploadState::CommitResetTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    fn delete_pending(&mut self, txn_id: TxnId) -> Effects {
+        self.state = CompleteUploadState::DeletePending;
+        smallvec![Effect::Storage(StorageEffect::Delete {
+            key_space: ABE_PENDING_KEYSPACE.to_string(),
+            key: self.input.upload_id.to_bytes().to_vec().into(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn pending_deleted(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::DeleteResult { .. }) => match self.txn_id {
+                Some(txn_id) => {
+                    self.state = CompleteUploadState::CommitResetTransaction;
+                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                }
+                None => self.reset_failed(Some(CompleteUploadError::NoTransactionFound)),
+            },
+            Event::Storage(StorageEvent::Error { .. }) => self.reset_failed(None),
+            _ => self.reset_failed(Some(CompleteUploadError::InvalidOperationState)),
+        }
     }
 
     fn handle_reset_committed(&mut self, event: Event) -> Effects {
@@ -2026,6 +2216,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::CheckPurgeFinalize => self.finalize_fence_checked(event),
             CompleteUploadState::ReadBucketDefault => self.handle_default_read(event),
             CompleteUploadState::CheckSealSettings => self.seal_settings_read(event),
+            CompleteUploadState::FenceAbe => self.abe_fenced(event),
             CompleteUploadState::FenceBackend => self.handle_backend_fenced(event),
             CompleteUploadState::CheckHashLookup => self.hash_checked(event),
             CompleteUploadState::WriteBlobLocation => self.location_written(event),
@@ -2034,6 +2225,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::WriteBlobHead => self.head_written(event),
             CompleteUploadState::WritePathIndex => self.path_index_written(event),
             CompleteUploadState::WriteVersionRecord => self.version_written(event),
+            CompleteUploadState::WriteEnvelope => self.envelope_written(event),
             CompleteUploadState::WriteCopyOwner => self.owner_written(event),
             CompleteUploadState::RegisterManagedCopy => self.handle_copy_registered(event),
             CompleteUploadState::WriteObjectMetadata => self.metadata_written(event),
@@ -2047,6 +2239,8 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::ResetUploadTransaction => self.reset_started(event),
             CompleteUploadState::ReadUploadReset => self.reset_upload_read(event),
             CompleteUploadState::WriteUploadReset => self.upload_reset(event),
+            CompleteUploadState::RecheckPending => self.pending_rechecked(event),
+            CompleteUploadState::DeletePending => self.pending_deleted(event),
             CompleteUploadState::CommitResetTransaction => self.handle_reset_committed(event),
             CompleteUploadState::CleanupFailedCompose => self.compose_cleanup(event),
             CompleteUploadState::QueueCleanupRow => self.handle_cleanup_queued(event),

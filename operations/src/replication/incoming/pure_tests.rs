@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{IncomingVersionError, IncomingVersionOperation, IncomingVersionState, ReceivedBlob};
+use aruna_core::structs::storage::abe::{
+    AbeEffect, AbeEvent, AbeParameters, EnvelopePlan, ObjectEnvelope, create_envelope,
+    create_parameters,
+};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
@@ -49,6 +53,213 @@ use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 use ulid::Ulid;
+
+#[tokio::test]
+async fn refused_copy_absent() {
+    use crate::replication::protocol::{ReplicationMode, VersionReplicationRequest};
+    use crate::replication::version_replication::{ReplicateObjectError, ReplicateObjectOperation};
+    use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
+    use aruna_core::structs::storage::blob::VersionKey;
+    use aruna_core::structs::storage::encryption::{
+        BucketEncryption, BucketKeyRef, EncryptionMode,
+    };
+    use aruna_core::structs::storage::format::PithosLayout;
+    let (_source_dir, source_storage) = crate::tests::s3::test_storage();
+    let (target_dir, target_storage) = crate::tests::s3::test_storage();
+    let target_node = iroh::SecretKey::from_bytes(&[42; 32]).public();
+    let stream_id = Ulid::from_parts(42, 42);
+    let data = [7u8; 42];
+    let hash = *blake3::hash(&data).as_bytes();
+    let mut target_location = make_location();
+    target_location.root = target_dir.path().to_str().unwrap().to_string();
+    target_location
+        .hashes
+        .insert("blake3".to_string(), hash.to_vec());
+    let path = std::path::PathBuf::from(target_location.get_full_path().unwrap());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, data).unwrap();
+    let mut location = target_location.clone();
+    let key = BucketKeyRef::new(Ulid::from_parts(43, 43), 1);
+    location.format = StoredFormat::pithos(
+        PithosLayout {
+            stored_size: 99,
+            metadata_digest: [2; 32],
+            storage_generation: 1,
+        },
+        key,
+    );
+    let version = BlobVersion::materialized(
+        hash,
+        location.backend.clone(),
+        location.format.encoding(),
+        fixed_created_at(),
+        test_user_id(),
+        None,
+    );
+    let settings = BucketEncryption {
+        mode: EncryptionMode::VaultLocked,
+        bucket_id: Some(key.bucket_id),
+        key_generation: key.generation,
+        ..Default::default()
+    };
+    let version_key = VersionKey::new("bucket", "dir/file.txt", trace_version_id())
+        .to_bytes()
+        .unwrap();
+    for (storage, space, row, value) in [
+        (
+            &source_storage,
+            BLOB_VERSIONS_KEYSPACE,
+            version_key.clone(),
+            version.to_bytes().unwrap(),
+        ),
+        (
+            &source_storage,
+            BLOB_HEAD_KEYSPACE,
+            aruna_core::structs::storage::blob::BlobHeadKey::new("bucket", "dir/file.txt")
+                .to_bytes()
+                .unwrap(),
+            CurrentVersionPointer::new(trace_version_id())
+                .to_bytes()
+                .unwrap(),
+        ),
+        (
+            &source_storage,
+            BLOB_LOCATIONS_KEYSPACE,
+            location.location_key().unwrap().to_bytes(),
+            location.to_bytes().unwrap(),
+        ),
+        (
+            &source_storage,
+            BUCKET_ENCRYPTION_KEYSPACE,
+            b"bucket".to_vec(),
+            settings.to_bytes().unwrap(),
+        ),
+        (
+            &target_storage,
+            S3_BUCKET_KEYSPACE,
+            b"bucket".to_vec(),
+            make_bucket_info(test_group_id()).to_bytes().unwrap(),
+        ),
+        (
+            &target_storage,
+            BLOB_LOCATIONS_KEYSPACE,
+            target_location.location_key().unwrap().to_bytes(),
+            target_location.to_bytes().unwrap(),
+        ),
+    ] {
+        assert!(matches!(
+            storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: space.to_string(),
+                    key: row.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+    let mut source = ReplicateObjectOperation::new(VersionReplicationRequest {
+        bucket: "bucket".to_string(),
+        key: "dir/file.txt".to_string(),
+        version_id: trace_version_id(),
+        source_group_id: test_group_id(),
+        target_node_id: target_node,
+        auth_context: make_manifest(ReplicationItemKind::Materialized).auth_context,
+        mode: ReplicationMode::OnDemand,
+    });
+    let mut effects = source.start();
+    while matches!(effects.as_slice(), [Effect::Storage(_)]) {
+        let Effect::Storage(effect) = effects.remove(0) else {
+            unreachable!()
+        };
+        effects = source.step(source_storage.send_storage_effect(effect).await);
+    }
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::OpenConnection { .. })]
+    ));
+    let effects = source.step(Event::Blob(BlobEvent::ConnectionEstablished { stream_id }));
+    let VersionReplicationMessage::VersionManifest(mut manifest) = message_from_effect(&effects[0])
+    else {
+        panic!("expected source manifest");
+    };
+    assert!(manifest.current_version);
+    manifest.writer_auth_context = Some(manifest.auth_context.clone());
+    source.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+    let mut target =
+        IncomingVersionOperation::new(stream_id, target_node, test_realm_id(), manifest);
+    target.manifest_policy = Some(target.target_authorization_path(test_group_id()));
+    target.writer_policy = Some(target.target_authorization_path(test_group_id()));
+    let mut effects = target.start();
+    loop {
+        match effects.as_slice() {
+            [Effect::Storage(_)] => {
+                let Effect::Storage(effect) = effects.remove(0) else {
+                    unreachable!()
+                };
+                effects = target.step(target_storage.send_storage_effect(effect).await)
+            }
+            [Effect::SubOperation(_)]
+                if target.state == IncomingVersionState::LoadDestinationRouting =>
+            {
+                effects = target.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
+                    result: Ok(GroupRoutingInputs::default()),
+                }));
+            }
+            _ => break,
+        }
+    }
+    let negotiation = message_from_effect(&effects[0]);
+    assert_eq!(
+        negotiation,
+        VersionReplicationMessage::VersionNegotiationResponse(
+            ReplicationNegotiationResult::NeedVersionOnly
+        )
+    );
+    let waiting = target.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+    assert!(matches!(
+        waiting.as_slice(),
+        [Effect::Blob(BlobEffect::ReadMessage { .. })]
+    ));
+    let mut effects = source.step(Event::Blob(BlobEvent::MessageReceived {
+        stream_id,
+        payload: negotiation.to_bytes().unwrap(),
+    }));
+    assert_eq!(effects.len(), 1);
+    let Effect::Storage(effect) = effects.remove(0) else {
+        panic!("source must check encryption");
+    };
+    let effects = source.step(source_storage.send_storage_effect(effect).await);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::CloseConnection { .. })]
+    ));
+    assert_eq!(
+        source.finalize(),
+        Err(ReplicateObjectError::PlaintextRefused)
+    );
+    target.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
+    for space in [
+        BLOB_VERSIONS_KEYSPACE,
+        BLOB_HEAD_KEYSPACE,
+        PATHS_INDEX_KEYSPACE,
+    ] {
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = target_storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: space.to_string(),
+                prefix: None,
+                start: None,
+                limit: 2,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("target index read failed");
+        };
+        assert!(values.is_empty(), "refused copy wrote {space}");
+    }
+}
 
 fn test_realm_id() -> RealmId {
     RealmId::from_bytes([7u8; 32])
@@ -2011,6 +2222,33 @@ fn group_backend_key(backend_id: Ulid) -> Vec<u8> {
     BlobLocationKey::new([1u8; 32], EncodingClass::Raw, BackendRef::Group(backend_id)).to_bytes()
 }
 
+#[test]
+fn metadata_waits_approval() {
+    let (mut op, _) = probe_backend(Vec::new(), GroupRoutingInputs::default());
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: make_location().location_key().unwrap().to_bytes().into(),
+        value: Some(make_location().to_bytes().unwrap().into()),
+    }));
+    let stream_id = op.stream_id;
+    let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::ReadMessage { .. })]
+    ));
+    let effects = op.step(Event::Blob(BlobEvent::MessageReceived {
+        stream_id,
+        payload: VersionReplicationMessage::VersionApplyApproved
+            .to_bytes()
+            .unwrap(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    ));
+}
+
 fn probed_key(effects: &aruna_core::types::Effects) -> Vec<u8> {
     let [Effect::Storage(StorageEffect::Read { key, .. })] = effects.as_slice() else {
         panic!("expected one location read, got {effects:?}")
@@ -3274,10 +3512,42 @@ fn stale_encoding_rejects() {
     ));
 }
 
-#[test]
-fn encrypted_destination_refused() {
-    // An encrypting bucket refuses a replica before any byte arrives.
-    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+/// An encrypting destination with its active key, and the plan it captures from both.
+fn encrypting_target() -> (
+    aruna_core::structs::storage::encryption::BucketEncryption,
+    aruna_core::structs::storage::encryption::BucketKeyRecord,
+    aruna_core::structs::storage::encryption::SealPlan,
+) {
+    use aruna_core::structs::storage::encryption::{
+        BucketEncryption, BucketKeyRecord, BucketKeyRef, EncryptionMode, SealPlan,
+    };
+    let key = BucketKeyRef::new(Ulid::from_parts(95, 95), 1);
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(key.bucket_id),
+        key_generation: 1,
+        storage_generation: 3,
+        ..Default::default()
+    };
+    let record = BucketKeyRecord::new(key, Ulid::from_parts(96, 96), [4; 32], 0);
+    let plan = SealPlan::capture(&settings, &record).unwrap().unwrap();
+    (settings, record, plan)
+}
+
+fn destination_rows(group_id: Ulid, settings: &[u8]) -> Event {
+    let bucket = make_bucket_info(group_id).to_bytes().unwrap();
+    Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (b"bucket".to_vec().into(), Some(bucket.into())),
+            (b"bucket".to_vec().into(), Some(settings.to_vec().into())),
+        ],
+    })
+}
+
+/// An encrypting target that has read its plan and now reads its ABE parameters.
+fn reading_abe() -> IncomingVersionOperation {
+    use aruna_core::keyspaces::{ABE_PARAMETERS_KEYSPACE, BUCKET_KEY_KEYSPACE};
+    let (settings, record, _) = encrypting_target();
     let group_id = test_group_id();
     let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(94, 94),
@@ -3288,22 +3558,132 @@ fn encrypted_destination_refused() {
     op.manifest_policy = Some(op.target_authorization_path(group_id));
     op.writer_policy = Some(op.target_authorization_path(group_id));
     op.start();
-    let settings = BucketEncryption {
-        mode: EncryptionMode::NodeManaged,
-        bucket_id: Some(Ulid::from_parts(95, 95)),
-        key_generation: 1,
-        ..Default::default()
-    };
-    let bucket = make_bucket_info(group_id).to_bytes().unwrap();
-    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (b"bucket".to_vec().into(), Some(bucket.into())),
-            (
-                b"bucket".to_vec().into(),
-                Some(settings.to_bytes().unwrap().into()),
-            ),
-        ],
+    let effects = op.step(destination_rows(group_id, &settings.to_bytes().unwrap()));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == BUCKET_KEY_KEYSPACE
+    ));
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: Vec::new().into(),
+        value: Some(record.to_bytes().unwrap().into()),
     }));
+    load_routing(&mut op, GroupRoutingInputs::default());
+    assert_eq!(op.state, IncomingVersionState::ReadExistingVersion);
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: Vec::new().into(),
+        value: None,
+    }));
+    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        key: Vec::new().into(),
+        value: None,
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { reads, txn_id: None })]
+            if reads[0].0 == ABE_PARAMETERS_KEYSPACE
+    ));
+    op
+}
+
+fn abe_rows(parameters: Option<&AbeParameters>, epoch: u64) -> Event {
+    Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (
+                vec![0u8].into(),
+                parameters.map(|p| p.to_bytes().unwrap().into()),
+            ),
+            (vec![1u8].into(), Some(epoch.to_be_bytes().to_vec().into())),
+        ],
+    })
+}
+
+fn target_parameters() -> AbeParameters {
+    let (_, _, plan) = encrypting_target();
+    let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
+    let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+    create_parameters(&secret, test_realm_id(), node, plan.key).unwrap()
+}
+
+#[test]
+fn encrypting_target_negotiates() {
+    // Without ABE parameters the plan alone rides on the reply, and no plain or foreign copy is
+    // probed or adopted.
+    let (_, _, plan) = encrypting_target();
+    let mut op = reading_abe();
+    let effects = op.step(abe_rows(None, 1));
+
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
+    assert_eq!(
+        message_from_effect(&effects[0]),
+        VersionReplicationMessage::VersionNegotiationResponse(
+            ReplicationNegotiationResult::NeedSealedBlob(plan)
+        )
+    );
+    let effects = op.step(Event::Blob(BlobEvent::MessageSent {
+        stream_id: Ulid::from_parts(94, 94),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::HandleReplication { resolved, object: None, .. })]
+            if resolved.encryption == Some(plan)
+    ));
+    assert_eq!(op.envelope, None);
+}
+
+#[test]
+fn abe_target_negotiates() {
+    // Admitted parameters give the replica its own object key and envelope before the transfer,
+    // and the reply carries that object key with the plan.
+    let (_, _, plan) = encrypting_target();
+    let parameters = target_parameters();
+    let mut op = reading_abe();
+    let effects = op.step(abe_rows(Some(&parameters), 2));
+    let [Effect::Blob(BlobEffect::Abe(effect))] = effects.as_slice() else {
+        panic!("expected the envelope effect, got {effects:?}")
+    };
+    let AbeEffect::Envelope(envelope_plan) = effect.as_ref() else {
+        panic!("expected an envelope plan, got {effect:?}")
+    };
+    assert_eq!(envelope_plan.epoch, 2);
+    assert_eq!(envelope_plan.bucket_public, plan.public_key);
+    assert_eq!(envelope_plan.object_key, op.manifest.key);
+    let (envelope, _) = create_envelope(envelope_plan.clone()).unwrap();
+    let object = envelope.context.public_key;
+    let event = Box::new(AbeEvent::Envelope(envelope));
+    let effects = op.step(Event::Blob(BlobEvent::Abe(event)));
+
+    assert_eq!(
+        message_from_effect(&effects[0]),
+        VersionReplicationMessage::VersionNegotiationResponse(
+            ReplicationNegotiationResult::NeedAbeBlob(plan, object)
+        )
+    );
+    let effects = op.step(Event::Blob(BlobEvent::MessageSent {
+        stream_id: Ulid::from_parts(94, 94),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::HandleReplication { object: Some(sent), .. })]
+            if *sent == object
+    ));
+}
+
+#[test]
+fn target_refuses_references() {
+    // A reference would serve bytes the destination never sealed.
+    let (settings, _, _) = encrypting_target();
+    let group_id = test_group_id();
+    let mut manifest = make_manifest(ReplicationItemKind::Materialized);
+    manifest.reference_intent = true;
+    manifest.blob = None;
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(94, 94),
+        iroh::SecretKey::from_bytes(&[94; 32]).public(),
+        test_realm_id(),
+        manifest,
+    );
+    op.state = IncomingVersionState::ReadDestinationBucket;
+    let effects = op.step(destination_rows(group_id, &settings.to_bytes().unwrap()));
 
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
     expect_rejected_negotiation(
@@ -3312,10 +3692,10 @@ fn encrypted_destination_refused() {
     );
 }
 
-#[test]
-fn encrypted_publication_refused() {
-    // Encryption enabled after the negotiation still refuses the replica at publication.
-    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+/// An operation inside its apply transaction, at the drift check of a sealed receipt.
+fn sealed_drift(
+    plan: Option<aruna_core::structs::storage::encryption::SealPlan>,
+) -> IncomingVersionOperation {
     let mut op = IncomingVersionOperation::new(
         Ulid::from_parts(96, 96),
         iroh::SecretKey::from_bytes(&[96; 32]).public(),
@@ -3324,30 +3704,412 @@ fn encrypted_publication_refused() {
     );
     op.state = IncomingVersionState::CheckDrift;
     op.txn_id = Some(Ulid::from_parts(97, 97));
+    op.seal_plan = plan;
     op.existing_blob_location = Some(make_location());
-    let settings = BucketEncryption {
-        mode: EncryptionMode::VaultLocked,
-        bucket_id: Some(Ulid::from_parts(98, 98)),
-        key_generation: 1,
-        ..Default::default()
-    };
+    op
+}
+
+fn drift_rows(settings: &[u8]) -> Event {
     let bucket = make_bucket_info(Ulid::from_parts(93, 93))
         .to_bytes()
         .unwrap();
-    op.step(Event::Storage(StorageEvent::BatchReadResult {
+    Event::Storage(StorageEvent::BatchReadResult {
         values: vec![
             (vec![0u8; 4].into(), Some(bucket.into())),
             (vec![1u8; 4].into(), None),
-            (
-                vec![2u8; 4].into(),
-                Some(settings.to_bytes().unwrap().into()),
-            ),
+            (vec![2u8; 4].into(), Some(settings.to_vec().into())),
+        ],
+    })
+}
+
+#[test]
+fn stale_plan_retries() {
+    // A plan captured at negotiation must still hold at publication; a stale one fails the item
+    // with a reason the sender retries, and plain bytes never land in a bucket that now encrypts.
+    use aruna_core::structs::storage::replication::{ReplicationFailure, ReplicationItemError};
+    let (mut settings, _, plan) = encrypting_target();
+    settings.storage_generation += 1;
+    for mut op in [sealed_drift(Some(plan)), sealed_drift(None)] {
+        op.step(drift_rows(&settings.to_bytes().unwrap()));
+        assert_eq!(op.state, IncomingVersionState::Error);
+        assert_eq!(op.output, Some(Err(IncomingVersionError::StalePlan)));
+    }
+    let reason = IncomingVersionError::StalePlan.to_string();
+    assert_eq!(
+        ReplicationItemError::from_peer_reason(&reason).failure,
+        ReplicationFailure::Other
+    );
+
+    // The unchanged plan passes on to the replaced-version check.
+    settings.storage_generation -= 1;
+    let mut op = sealed_drift(Some(plan));
+    let effects = op.step(drift_rows(&settings.to_bytes().unwrap()));
+    assert_eq!(op.state, IncomingVersionState::VerifyReplaced);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == BLOB_VERSIONS_KEYSPACE
+    ));
+}
+
+#[test]
+fn received_archive_pends() {
+    // An archive kept as the sender granted it is published pending with the claimed hash, and
+    // writes no hash alias: only promotion with the target key may register it.
+    use aruna_core::keyspaces::{
+        COPY_OWNER_KEYSPACE, PENDING_CLAIM_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    };
+    use aruna_core::structs::storage::format::PithosLayout;
+    let (_, _, plan) = encrypting_target();
+    let mut location = make_location();
+    location.hashes.clear();
+    let layout = PithosLayout {
+        stored_size: 300,
+        metadata_digest: [6; 32],
+        storage_generation: plan.storage_generation,
+    };
+    location.format = StoredFormat::pithos(layout, plan.key);
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(98, 98),
+        iroh::SecretKey::from_bytes(&[98; 32]).public(),
+        test_realm_id(),
+        make_manifest(ReplicationItemKind::Materialized),
+    );
+    op.seal_plan = Some(plan);
+    op.destination_group_id = Some(test_group_id());
+    op.txn_id = Some(Ulid::from_parts(99, 99));
+    op.received_blob = Some(ReceivedBlob::reserved(location));
+
+    let effects = op.write_hash_lookup();
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("the archive rows are written together: {effects:?}")
+    };
+    let spaces: Vec<_> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
+    assert_eq!(
+        spaces,
+        [
+            COPY_OWNER_KEYSPACE,
+            PENDING_LOCATION_KEYSPACE,
+            PENDING_CLAIM_KEYSPACE
+        ]
+    );
+    assert_eq!(writes[2].2.as_ref(), &[1u8; 32]);
+
+    let mut version = None;
+    let mut effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    }));
+    for _ in 0..8 {
+        let event = match effects.first() {
+            Some(Effect::Storage(StorageEffect::Read { key, .. })) => StorageEvent::ReadResult {
+                key: key.clone(),
+                value: None,
+            },
+            Some(Effect::Storage(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                ..
+            })) => {
+                assert_ne!(
+                    key_space, PATHS_INDEX_KEYSPACE,
+                    "no hash alias for a pending replica"
+                );
+                if key_space == BLOB_VERSIONS_KEYSPACE {
+                    version = Some(BlobVersion::from_bytes(value).unwrap());
+                }
+                StorageEvent::WriteResult { key: key.clone() }
+            }
+            _ => break,
+        };
+        effects = op.step(Event::Storage(event));
+    }
+    assert!(matches!(
+        version.map(|version| version.state),
+        Some(BlobVersionState::PendingContent { .. })
+    ));
+}
+
+fn target_envelope(epoch: u64) -> ObjectEnvelope {
+    let (_, _, plan) = encrypting_target();
+    let plan = EnvelopePlan {
+        parameters: target_parameters(),
+        epoch,
+        write_id: Ulid::from_parts(90, 90),
+        object_key: make_manifest(ReplicationItemKind::Materialized).key,
+        bucket_public: plan.public_key,
+    };
+    create_envelope(plan).unwrap().0
+}
+
+#[test]
+fn stale_epoch_refused() {
+    // An epoch raised since the negotiation refuses the envelope; nothing of it was stored.
+    let (settings, _, plan) = encrypting_target();
+    let settings = settings.to_bytes().unwrap();
+    let parameters = target_parameters();
+    let with_abe = |epoch: u64| {
+        let Event::Storage(StorageEvent::BatchReadResult { mut values }) = drift_rows(&settings)
+        else {
+            unreachable!()
+        };
+        let Event::Storage(StorageEvent::BatchReadResult { values: abe }) =
+            abe_rows(Some(&parameters), epoch)
+        else {
+            unreachable!()
+        };
+        values.extend(abe);
+        Event::Storage(StorageEvent::BatchReadResult { values })
+    };
+    let mut op = sealed_drift(Some(plan));
+    op.envelope = Some(target_envelope(1));
+    let effects = op.check_drift();
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 5
+    ));
+    let effects = op.step(with_abe(2));
+    assert_eq!(op.output, Some(Err(IncomingVersionError::StalePlan)));
+    assert!(effects.iter().all(|effect| !matches!(
+        effect,
+        Effect::Storage(StorageEffect::Write { .. } | StorageEffect::BatchWrite { .. })
+    )));
+
+    let mut op = sealed_drift(Some(plan));
+    op.envelope = Some(target_envelope(1));
+    op.step(with_abe(1));
+    assert_eq!(op.state, IncomingVersionState::VerifyReplaced);
+}
+
+#[test]
+fn replica_publishes_envelope() {
+    // The envelope, its mappings and its charge are written in the version's transaction.
+    use aruna_core::keyspaces::{
+        ABE_ARCHIVE_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
+    };
+    use aruna_core::structs::storage::abe::EnvelopeArchive;
+    use aruna_core::structs::storage::blob::ArchiveKey;
+    use aruna_core::structs::storage::format::PithosLayout;
+    let (_, _, plan) = encrypting_target();
+    let mut location = make_location();
+    location.hashes.clear();
+    let layout = PithosLayout {
+        stored_size: 300,
+        metadata_digest: [6; 32],
+        storage_generation: plan.storage_generation,
+    };
+    location.format = StoredFormat::pithos(layout, plan.key);
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(98, 98),
+        iroh::SecretKey::from_bytes(&[98; 32]).public(),
+        test_realm_id(),
+        make_manifest(ReplicationItemKind::Materialized),
+    );
+    let envelope = target_envelope(1);
+    op.seal_plan = Some(plan);
+    op.envelope = Some(envelope.clone());
+    op.destination_group_id = Some(test_group_id());
+    op.txn_id = Some(Ulid::from_parts(99, 99));
+    op.received_blob = Some(ReceivedBlob::reserved(location.clone()));
+
+    let mut effects = op.write_blob_version();
+    let mut writes = None;
+    while let Some(effect) = effects.first() {
+        if let Effect::Storage(StorageEffect::BatchWrite { writes: rows, .. }) = effect {
+            writes = Some(rows.clone());
+            break;
+        }
+        effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: Vec::new().into(),
+        }));
+    }
+    let writes = writes.expect("the envelope rows are written");
+    let spaces: Vec<_> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
+    assert_eq!(
+        spaces,
+        [
+            ABE_ENVELOPE_KEYSPACE,
+            ABE_VERSION_KEYSPACE,
+            ABE_ARCHIVE_KEYSPACE
+        ]
+    );
+    assert_eq!(ObjectEnvelope::from_bytes(&writes[0].2).unwrap(), envelope);
+    let archive: EnvelopeArchive = postcard::from_bytes(&writes[2].2).unwrap();
+    assert_eq!(archive.archive, ArchiveKey::of(&location));
+    assert!(archive.location_key.is_empty());
+    assert!(op.envelope_bytes > 0);
+    let delta = op.usage_delta().unwrap();
+    let size = op.manifest.blob.as_ref().unwrap().size;
+    assert_eq!(
+        delta.logical_bytes,
+        i128::from(size + op.envelope_bytes) - i128::from(op.replaced_logical_bytes)
+    );
+}
+
+#[test]
+fn replacement_drops_envelope() {
+    // Replacing an ABE version deletes its old envelope rows and returns their charge.
+    use aruna_core::keyspaces::{
+        ABE_ARCHIVE_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
+    };
+    use aruna_core::structs::storage::abe::envelope_charge;
+    use aruna_core::structs::storage::format::PithosLayout;
+    let (_, _, plan) = encrypting_target();
+    let mut location = make_location();
+    location.hashes.clear();
+    location.format = StoredFormat::pithos(
+        PithosLayout {
+            stored_size: 300,
+            metadata_digest: [6; 32],
+            storage_generation: plan.storage_generation,
+        },
+        plan.key,
+    );
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(97, 97),
+        iroh::SecretKey::from_bytes(&[97; 32]).public(),
+        test_realm_id(),
+        make_manifest(ReplicationItemKind::Materialized),
+    );
+    let txn_id = Ulid::from_parts(99, 99);
+    op.seal_plan = Some(plan);
+    op.envelope = Some(target_envelope(1));
+    op.destination_group_id = Some(test_group_id());
+    op.txn_id = Some(txn_id);
+    op.received_blob = Some(ReceivedBlob::reserved(location));
+    let replaced = BlobVersion::materialized(
+        [9u8; 32],
+        BackendRef::node_default(),
+        EncodingClass::Raw,
+        SystemTime::UNIX_EPOCH,
+        test_user_id(),
+        None,
+    );
+    op.replaced_version = Some(replaced.clone());
+    op.replaced_logical_bytes = 42;
+    op.state = IncomingVersionState::VerifyReplaced;
+
+    let version = op.version_key_bytes().unwrap();
+    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        key: version.clone().into(),
+        value: Some(replaced.to_bytes().unwrap().into()),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { reads, txn_id: Some(id) })]
+            if reads[0] == (ABE_VERSION_KEYSPACE.to_string(), version.clone().into())
+                && *id == txn_id
+    ));
+    let old_id = vec![7u8; 16];
+    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (version.clone().into(), Some(old_id.clone().into())),
+            (b"bucket".to_vec().into(), None),
         ],
     }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads == &vec![
+            (ABE_ENVELOPE_KEYSPACE.to_string(), old_id.clone().into()),
+            (ABE_ARCHIVE_KEYSPACE.to_string(), old_id.clone().into()),
+        ]
+    ));
+    op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (old_id.clone().into(), Some(vec![1; 40].into())),
+            (old_id.clone().into(), Some(vec![2; 9].into())),
+        ],
+    }));
+    assert_eq!(op.state, IncomingVersionState::ReadReplacedMetadata);
+    let effects = op.step(Event::Storage(StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: None,
+    }));
+    let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice() else {
+        panic!("the replaced rows are deleted together: {effects:?}")
+    };
+    for row in [
+        (ABE_VERSION_KEYSPACE.to_string(), version.clone().into()),
+        (ABE_ENVELOPE_KEYSPACE.to_string(), old_id.clone().into()),
+        (ABE_ARCHIVE_KEYSPACE.to_string(), old_id.into()),
+    ] {
+        assert!(deletes.contains(&row), "missing delete {row:?}");
+    }
 
-    assert_eq!(op.state, IncomingVersionState::Error);
+    // The new envelope maps the same version after the old rows are gone.
+    let mut effects = op.write_blob_version();
+    let writes = loop {
+        match effects.first() {
+            Some(Effect::Storage(StorageEffect::BatchWrite { writes, .. })) => {
+                break writes.clone();
+            }
+            Some(_) => {}
+            None => panic!("the envelope rows are written"),
+        }
+        effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: Vec::new().into(),
+        }));
+    };
+    let new_id = Ulid::from_parts(90, 90).to_bytes().to_vec();
+    assert_eq!(writes[1].0, ABE_VERSION_KEYSPACE);
+    assert_eq!(writes[1].1.as_ref(), version.as_slice());
+    assert_eq!(writes[1].2.as_ref(), new_id.as_slice());
+    let size = op.manifest.blob.as_ref().unwrap().size;
+    let old = 42 + envelope_charge(&[1; 40], &[2; 9]);
     assert_eq!(
-        op.output,
-        Some(Err(IncomingVersionError::EncryptedDestination))
+        op.usage_delta().unwrap().logical_bytes,
+        i128::from(size + op.envelope_bytes) - i128::from(old)
     );
+}
+
+#[test]
+fn encrypted_replacement_quota() {
+    // One payload byte more replaces a larger old envelope at the exact ceiling.
+    let (_, _, plan) = encrypting_target();
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(98, 98),
+        iroh::SecretKey::from_bytes(&[98; 32]).public(),
+        test_realm_id(),
+        make_manifest(ReplicationItemKind::Materialized),
+    );
+    op.seal_plan = Some(plan);
+    op.destination_group_id = Some(test_group_id());
+    op.state = IncomingVersionState::ReadReplacedBlob;
+    let mut old = make_location();
+    old.blob_size -= 1;
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0u8; 4].into(),
+        value: Some(old.to_bytes().unwrap().into()),
+    }));
+    assert_eq!(op.state, IncomingVersionState::ReadQuotaConfig);
+
+    let mut config = RealmConfigDocument::default_for_realm(test_realm_id(), Vec::new());
+    config.quota = QuotaConfig {
+        default_quota_bytes: Some(1),
+        grace_factor_percent: 100,
+        ..QuotaConfig::default()
+    };
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0u8; 4].into(),
+        value: Some(postcard::to_allocvec(&config).unwrap().into()),
+    }));
+    assert_eq!(op.state, IncomingVersionState::ReadAbe);
+    assert_eq!(op.quota_ceiling, Some(1));
+
+    // The transaction adds the old envelope charge, so the net charge needs no quota.
+    let mut location = make_location();
+    location.hashes.clear();
+    location.format = StoredFormat::pithos(
+        aruna_core::structs::storage::format::PithosLayout {
+            stored_size: 300,
+            metadata_digest: [6; 32],
+            storage_generation: plan.storage_generation,
+        },
+        plan.key,
+    );
+    op.received_blob = Some(ReceivedBlob::reserved(location));
+    op.txn_id = Some(Ulid::from_parts(99, 99));
+    op.envelope_bytes = 10;
+    op.replaced_logical_bytes += 11;
+    op.start_commit_quota();
+    assert_eq!(op.state, IncomingVersionState::UpdateUsage);
 }

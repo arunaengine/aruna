@@ -10,7 +10,7 @@ use crate::driver::{
 };
 use crate::s3::object::copy::sealed::{SealedCopyError, SealedCopyInput, SealedCopyOperation};
 use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectOperation, reference_archive,
+    GetObjectError, GetObjectInput, TokenRead, read_local, reference_archive,
 };
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
@@ -126,6 +126,7 @@ fn sealed_error(error: SealedCopyError) -> CopyObjectError {
         }
         SealedCopyError::PolicyGate(error) => put(PutObjectError::PolicyGate(error)),
         SealedCopyError::NoSuchVersion => CopyObjectError::Get(GetObjectError::NoSuchVersion),
+        SealedCopyError::Blob(error) => put(PutObjectError::BlobWriteFailed(error)),
         error => put(PutObjectError::WriteFailed(error.to_string())),
     }
 }
@@ -220,6 +221,24 @@ pub async fn copy_object_tracked(
     input: CopyObjectInput,
     progress: Option<Arc<AtomicU64>>,
 ) -> Result<CopyResultData, CopyObjectError> {
+    copy_inner(context, input, progress, None).await
+}
+
+/// `copy_object` where `token` admits the source read while its bucket key is locked.
+pub async fn copy_object_token(
+    context: &DriverContext,
+    input: CopyObjectInput,
+    token: Option<TokenRead>,
+) -> Result<CopyResultData, CopyObjectError> {
+    copy_inner(context, input, None, token.as_ref()).await
+}
+
+async fn copy_inner(
+    context: &DriverContext,
+    input: CopyObjectInput,
+    progress: Option<Arc<AtomicU64>>,
+    token: Option<&TokenRead>,
+) -> Result<CopyResultData, CopyObjectError> {
     ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
         .await
         .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
@@ -262,7 +281,7 @@ pub async fn copy_object_tracked(
     if head.location.is_none() && input.references == CopyReferences::Preserve {
         // Another bucket reads the reference without the source's lock, so admit it here.
         if input.source_bucket != input.dest_bucket {
-            admit_source(context, &input.source_bucket).await?;
+            admit_source(context, &input).await?;
         }
         return preserve_reference(context, input, head, source_last_modified).await;
     }
@@ -273,20 +292,17 @@ pub async fn copy_object_tracked(
         return sealed_copy(context, input, head, location, source_last_modified).await;
     }
 
-    let source = drive(
-        GetObjectOperation::new(GetObjectInput {
-            bucket: input.source_bucket,
-            key: input.source_key,
-            version_id: input.source_version_id,
-            range: None,
-            group_id: input.source_group_id,
-            user_identity: input.source_auth_context.user_id,
-            node_id: input.node_id,
-        })
-        .with_restrictions(input.source_auth_context.path_restrictions.clone()),
-        context,
-    )
-    .await?;
+    let source_input = GetObjectInput {
+        bucket: input.source_bucket,
+        key: input.source_key,
+        version_id: input.source_version_id,
+        range: None,
+        group_id: input.source_group_id,
+        user_identity: input.source_auth_context.user_id,
+        node_id: input.node_id,
+    };
+    let restrictions = input.source_auth_context.path_restrictions.clone();
+    let source = read_local(context, source_input, restrictions, token).await?;
 
     let source_version_id = source.version_id;
     let materialized = source.location.is_some();
@@ -342,6 +358,7 @@ pub async fn copy_object_tracked(
         quota_ceiling: input.quota_ceiling,
         routing,
     })
+    .without_envelope()
     .with_metadata(metadata)
     .with_inherited_policies(source.source_policies.clone())
     .with_restrictions(input.restrictions.clone());
@@ -412,13 +429,16 @@ async fn sealed_copy(
     })
 }
 
-/// Admits a plaintext read of `bucket` the way GET does: an encrypting bucket must be unlocked.
-/// No bytes move, so the lease ends at once.
-async fn admit_source(context: &DriverContext, bucket: &str) -> Result<(), CopyObjectError> {
+/// Admits a plaintext read of the source bucket the way GET does: an encrypting bucket must be
+/// unlocked, since a token opens single objects only. No bytes move, so the lease ends at once.
+async fn admit_source(
+    context: &DriverContext,
+    input: &CopyObjectInput,
+) -> Result<(), CopyObjectError> {
     let failed = || CopyObjectError::Get(GetObjectError::GetObjectFailed);
     let read = StorageEffect::Read {
         key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-        key: bucket.as_bytes().to_vec().into(),
+        key: input.source_bucket.as_bytes().to_vec().into(),
         txn_id: None,
     };
     let Event::Storage(StorageEvent::ReadResult { value, .. }) =
@@ -433,14 +453,18 @@ async fn admit_source(context: &DriverContext, bucket: &str) -> Result<(), CopyO
     };
     let blob_handle = context.blob_handle.as_ref().ok_or_else(failed)?;
     let archive = reference_archive(key);
-    match blob_handle
-        .send_blob_effect(BlobEffect::AdmitRead { key, archive })
-        .await
-    {
+    let locked = |error| {
+        CopyObjectError::Get(GetObjectError::ConversionError(ConversionError::BucketKey(
+            error,
+        )))
+    };
+    let admit = BlobEffect::AdmitRead {
+        key,
+        archive: archive.clone(),
+    };
+    match blob_handle.send_blob_effect(admit).await {
         Event::Blob(BlobEvent::ReadAdmitted { .. }) => Ok(()),
-        Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => Err(CopyObjectError::Get(
-            GetObjectError::ConversionError(ConversionError::BucketKey(error)),
-        )),
+        Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => Err(locked(error)),
         _ => Err(failed()),
     }
 }
@@ -1050,7 +1074,11 @@ pub(crate) mod test {
     async fn locked_reference_refused() {
         // A reference of a locked encrypting bucket is not preserved into another bucket, where
         // its external bytes would be readable without the source's key.
-        use aruna_core::structs::storage::encryption::EncryptionMode;
+        use aruna_core::compute::{SecretBytes, SharedSecret};
+        use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::storage::encryption::{
+            BucketKeyError, EncryptionMode, TokenCredential,
+        };
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([6u8; 32]);
         let group_id = Ulid::generate();
@@ -1145,6 +1173,64 @@ pub(crate) mod test {
         assert!(value.is_none(), "nothing is published in the plain bucket");
         // Within its own bucket the reference stays behind the same lock, so it is kept.
         copy_object(&context, request("locked")).await.unwrap();
+
+        // A token opens single objects only, so it admits no reference copy of a locked bucket.
+        let token = Some(TokenRead {
+            credential: TokenCredential {
+                access_key: "HOLDER".to_string(),
+                token: SharedSecret::new(SecretBytes::new(vec![9; 32])),
+            },
+            limits: RoCrateLimits::default(),
+        });
+        let refused = copy_object_token(&context, request("plain"), token).await;
+        assert!(matches!(
+            refused,
+            Err(CopyObjectError::Get(GetObjectError::ConversionError(
+                ConversionError::BucketKey(BucketKeyError::Locked(_))
+            )))
+        ));
+    }
+
+    /// Stores the realm and group documents, so `owner` holds the group's roles.
+    pub(crate) async fn seed_authority(
+        context: &DriverContext,
+        realm_id: RealmId,
+        group_id: GroupId,
+        owner: UserId,
+    ) {
+        use aruna_core::keyspaces::AUTH_KEYSPACE;
+        use aruna_core::structs::identity::auth::Actor;
+        use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+        use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+        let realm = RealmAuthorizationDocument {
+            realm_id,
+            roles: Default::default(),
+            operation_restrictions: Default::default(),
+        };
+        let group = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            user_id: owner,
+            realm_id,
+        };
+        for (key, value) in [
+            (
+                realm_id.as_bytes().to_vec(),
+                realm.to_bytes(&actor).unwrap(),
+            ),
+            (
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
+            ),
+        ] {
+            let write = StorageEffect::Write {
+                key_space: AUTH_KEYSPACE.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            };
+            context.storage_handle.send_storage_effect(write).await;
+        }
     }
 
     #[tokio::test]

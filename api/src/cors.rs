@@ -147,6 +147,8 @@ impl CorsConfig {
                 ])
                 .allow_headers([
                     header::AUTHORIZATION,
+                    header::RANGE,
+                    HeaderName::from_static("x-aruna-object-key"),
                     header::CONTENT_TYPE,
                     HeaderName::from_static("mcp-method"),
                     HeaderName::from_static("mcp-name"),
@@ -155,7 +157,12 @@ impl CorsConfig {
                 ])
                 // The portal is always cross-origin now, so its retry backoff
                 // and download filenames depend on these being readable.
-                .expose_headers([header::CONTENT_DISPOSITION, header::RETRY_AFTER])
+                .expose_headers([
+                    header::CONTENT_DISPOSITION,
+                    header::RETRY_AFTER,
+                    header::CONTENT_RANGE,
+                    header::ACCEPT_RANGES,
+                ])
                 .max_age(CORS_MAX_AGE),
         )
     }
@@ -281,7 +288,7 @@ mod tests {
                 .headers()
                 .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
                 .unwrap(),
-            "content-disposition,retry-after"
+            "content-disposition,retry-after,content-range,accept-ranges"
         );
     }
 

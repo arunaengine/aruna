@@ -15,6 +15,7 @@ use aruna_operations::replication::locations::{
     LocationSummaryError, LocationSummaryOperation, QueuedNodesOperation, QueuedReplicas,
     RelationshipNodesOperation, RemoteLocationOperation,
 };
+use aruna_operations::replication::plaintext::{consent_required, is_holder};
 use aruna_operations::replication::protocol::{
     CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest, ReplicationMode,
 };
@@ -72,6 +73,10 @@ pub struct ReplicateBlobRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
     pub node_id: String,
+    /// Copies objects of an encrypted source bucket as plaintext when the target bucket does
+    /// not encrypt. Only for a current key holder of the source bucket.
+    #[serde(default)]
+    pub plaintext: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -115,7 +120,12 @@ the whole bucket when it is not.
 - No `path` replicates the whole bucket, a `path` replicates that object, and a `path` with
   `version_id` replicates exactly that version.
 - Delete markers are included in the queued work.
-- Submitting the same scope again queues the work again, so the request is not idempotent."#,
+- Submitting the same scope again queues the work again, so the request is not idempotent.
+- An encrypting target receives each copy sealed to its own key; a locked source key leaves the
+  copy waiting until the next unlock of the source bucket, without retries or errors.
+- An encrypted source refuses a target bucket that does not encrypt unless `plaintext` is true and
+  the caller is a current key holder of the source bucket, checked here and before each run.
+- With encryption off and no retained encrypted archives, `plaintext` has no effect."#,
     request_body(
         content = ReplicateBlobRequest,
         description = "Replication scope and the hex id of the destination node",
@@ -123,7 +133,8 @@ the whole bucket when it is not.
             "bucket": "lab-raw",
             "path": "runs/2026-04-09/reads.fastq.gz",
             "version_id": "01JABCDEF0123456789ABCDEFG",
-            "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978"
+            "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+            "plaintext": false
         })
     ),
     responses(
@@ -140,7 +151,12 @@ the whole bucket when it is not.
         ),
         (status = 400, description = "Malformed destination node id or version id, or a version_id sent without a path", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the bucket or object", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token belongs to another realm, the caller lacks WRITE on the bucket or object, or `not_holder` when `plaintext` is set and the caller is no current key holder of the encrypted source bucket",
+            body = ErrorResponse,
+            example = json!({"error": "the caller holds no key of bucket lab-raw", "code": "not_holder"})
+        ),
         (status = 404, description = "Bucket unknown to this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -174,6 +190,10 @@ pub async fn replicate_blob(
     };
 
     crate::auth::ensure_permission(&state, &auth, permission_path, Permission::WRITE).await?;
+    let plaintext = match request.plaintext {
+        true => plaintext_holder(&state, &request.bucket, auth.user_id).await?,
+        false => false,
+    };
 
     let node_id = NodeId::from_str(&request.node_id).map_err(|_| ServerError::BadRequest)?;
     let target = match (request.path.as_deref(), request.version_id.as_deref()) {
@@ -213,7 +233,8 @@ pub async fn replicate_blob(
         version_id: version_id.clone(),
         target_node_id: input.target_node_id.to_string(),
     };
-    let queue_result = drive(QueueBlobOperation::new(input, None), &state.get_ctx())
+    let operation = QueueBlobOperation::new(input, None).with_plaintext(plaintext);
+    let queue_result = drive(operation, &state.get_ctx())
         .await
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
     if !queue_result.scheduled {
@@ -227,6 +248,30 @@ pub async fn replicate_blob(
     }
 
     Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+/// Encrypted sources, including retained archives, need a current holder, else `not_holder`.
+pub(crate) async fn plaintext_holder(
+    state: &ServerState,
+    bucket: &str,
+    user: aruna_core::UserId,
+) -> ServerResult<bool> {
+    let context = state.get_ctx();
+    let encrypted = consent_required(&context, bucket)
+        .await
+        .map_err(ServerError::InternalError)?;
+    if !encrypted {
+        return Ok(false);
+    }
+    match is_holder(&context, bucket, user).await {
+        Ok(true) => Ok(true),
+        Ok(false) => Err(ServerError::Refused(
+            StatusCode::FORBIDDEN,
+            "not_holder",
+            format!("the caller holds no key of bucket {bucket}"),
+        )),
+        Err(error) => Err(ServerError::InternalError(error)),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

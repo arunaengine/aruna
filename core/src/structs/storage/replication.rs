@@ -6,6 +6,7 @@
 use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::encryption::{BucketKeyRef, SealPlan};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
@@ -350,6 +351,11 @@ pub enum ReplicationNegotiationResult {
     #[serde(rename = "NeedBlobAndVersion")]
     NeedBlobVersion,
     Rejected(String),
+    /// An encrypting target needs the bytes sealed to its key: a sealed source grants its
+    /// archive to this plan, a plain source sends plaintext the target seals.
+    NeedSealedBlob(SealPlan),
+    /// Like `NeedSealedBlob`, and the archive is also granted to this target object key.
+    NeedAbeBlob(SealPlan, [u8; 32]),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -357,6 +363,8 @@ pub enum ReplicationSuboperationResult {
     Replicated,
     Skipped,
     ReplicatedBytes(u64),
+    /// The source key is locked here; the item runs again after its next unlock.
+    AwaitingKey(BucketKeyRef),
 }
 
 /// Stable failure category of one replication item. Retry and terminal policy
@@ -371,6 +379,8 @@ pub enum ReplicationFailure {
     WriterDenied,
     /// Anything else, which is retryable.
     Other,
+    /// An encrypted source refused a plain target without a permitted plaintext request.
+    PlaintextRefused,
 }
 
 impl ReplicationFailure {
@@ -383,7 +393,10 @@ impl ReplicationFailure {
     }
 
     pub fn is_denied(self) -> bool {
-        matches!(self, Self::AccessDenied | Self::WriterDenied)
+        matches!(
+            self,
+            Self::AccessDenied | Self::WriterDenied | Self::PlaintextRefused
+        )
     }
 }
 

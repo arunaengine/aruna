@@ -42,9 +42,14 @@ pub enum KeyWakeError {
     Promote(#[from] PromoteError),
     #[error("could not resume encryption transitions: {0}")]
     Transition(String),
+    #[error("could not wake copies waiting for the key: {0}")]
+    Copies(String),
+    #[error("could not write envelopes of pending copies: {0}")]
+    Envelopes(String),
 }
 
-/// Resumes jobs, remote wakes, transitions and pending promotion whenever a key becomes usable.
+/// Resumes jobs, remote wakes, transitions, pending promotion, waiting copies and pending copy
+/// envelopes whenever a key becomes usable.
 pub async fn wake_unlocked(
     context: &DriverContext,
     key: BucketKeyRef,
@@ -61,8 +66,13 @@ pub async fn wake_unlocked(
     if !matches!(promoted, Ok(0)) {
         resumed = resumed.and(resume_transitions(context, key).await);
     }
+    // Copies waiting for this source key run after promotion, so pending sources are hashed.
+    let copies = crate::replication::parking::wake_parked(context, key, now_ms).await;
+    let envelopes = crate::abe::copies::complete_copies(context, key, origin).await;
     queued.map_err(|error| KeyWakeError::Jobs(JobMutationError::Storage(error)))?;
     resumed.map_err(KeyWakeError::Transition)?;
+    copies.map_err(|error| KeyWakeError::Copies(error.to_string()))?;
+    envelopes.map_err(KeyWakeError::Envelopes)?;
     Ok((woken?, promoted?))
 }
 

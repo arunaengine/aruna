@@ -1847,12 +1847,16 @@ mod sealed {
     use super::{fence_clear, put_config, test_location};
     use crate::s3::object::put::{PutObjectError, PutObjectOperation, PutObjectState};
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::errors::BlobError;
     use aruna_core::errors::ConversionError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::abe::{
+        AbeError, AbeParameters, EnvelopeContext, ObjectEnvelope, create_parameters,
+    };
     use aruna_core::structs::storage::encryption::{
         BucketEncryption, BucketKeyError, BucketKeyRecord, BucketKeyRef, EncryptionMode, SealPlan,
     };
@@ -1912,11 +1916,37 @@ mod sealed {
         assert_eq!(key_space, BUCKET_KEY_KEYSPACE);
         assert_eq!(key.as_ref(), record().key.key().as_slice());
         let effects = op.step(row(Some(record().to_bytes().unwrap())));
-        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+            panic!("expected the ABE anchor read, got {effects:?}")
+        };
+        let (realm, node) = (op.config.realm_id, op.config.node_id);
+        let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
+        let parameters = aruna_core::structs::storage::abe::create_parameters(
+            &secret,
+            realm,
+            node,
+            record().key,
+        )
+        .unwrap();
+        let values = vec![
+            (
+                reads[0].1.clone(),
+                Some(parameters.to_bytes().unwrap().into()),
+            ),
+            (reads[1].1.clone(), Some(1u64.to_be_bytes().to_vec().into())),
+        ];
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        let [Effect::Blob(BlobEffect::Abe(effect))] = effects.as_slice() else {
             panic!("expected the write, got {effects:?}")
         };
-        let plan = SealPlan::capture(&settings(), &record()).unwrap();
-        assert_eq!(resolved.encryption, plan);
+        let aruna_core::structs::storage::abe::AbeEffect::Write { plan, resolved, .. } =
+            effect.as_ref()
+        else {
+            panic!("expected the envelope write")
+        };
+        assert_eq!((plan.epoch, &plan.parameters), (1, &parameters));
+        let seal = SealPlan::capture(&settings(), &record()).unwrap();
+        assert_eq!(resolved.encryption, seal);
     }
 
     #[test]
@@ -1937,9 +1967,18 @@ mod sealed {
 
     /// Runs the version transaction up to the seal fence with `settings` as the current row.
     fn fenced(plan: Option<SealPlan>, current: &BucketEncryption) -> PutObjectOperation {
+        fenced_with(plan, current, |_| {})
+    }
+
+    fn fenced_with(
+        plan: Option<SealPlan>,
+        current: &BucketEncryption,
+        prepare: impl FnOnce(&mut PutObjectOperation),
+    ) -> PutObjectOperation {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = iroh::SecretKey::generate().public();
         let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
+        prepare(&mut op);
         let mut location = test_location(op.config.user_id);
         if let Some(plan) = plan {
             let layout = PithosLayout {
@@ -2028,5 +2067,202 @@ mod sealed {
         };
         assert_eq!(key_space, COPY_OWNER_KEYSPACE);
         assert_eq!(*txn_id, op.txn_id);
+    }
+
+    fn parameters(op: &PutObjectOperation, secret: u8) -> AbeParameters {
+        let secret = aruna_core::compute::SecretBytes::new(vec![secret; 32]);
+        create_parameters(&secret, op.config.realm_id, op.config.node_id, record().key).unwrap()
+    }
+
+    fn envelope(parameters: AbeParameters) -> ObjectEnvelope {
+        ObjectEnvelope {
+            context: EnvelopeContext {
+                parameters,
+                epoch: 1,
+                object_key: "some-file.txt".to_string(),
+                write_id: Ulid::from_bytes([8; 16]),
+                public_key: [3; 32],
+            },
+            abe: vec![1; 16],
+            recovery_enc: [2; 32],
+            recovery_ciphertext: vec![4; 32],
+        }
+    }
+
+    /// Answers the publication fence with substituted parameters or another epoch.
+    fn abe_fence(substituted: bool, epoch: u64) -> PutObjectOperation {
+        let plan = SealPlan::capture(&settings(), &record()).unwrap();
+        let mut op = fenced_with(plan, &settings(), |op| {
+            op.envelope = Some(envelope(parameters(op, 9)));
+        });
+        assert_eq!(op.state, PutObjectState::FenceAbe);
+        let current = parameters(&op, if substituted { 10 } else { 9 });
+        op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    b"p".to_vec().into(),
+                    Some(current.to_bytes().unwrap().into()),
+                ),
+                (
+                    b"e".to_vec().into(),
+                    Some(epoch.to_be_bytes().to_vec().into()),
+                ),
+            ],
+        }));
+        op
+    }
+
+    #[test]
+    fn envelope_fence_refused() {
+        let refused = |op: PutObjectOperation| match op.finalize() {
+            Err(PutObjectError::BlobWriteFailed(BlobError::Abe(error))) => error,
+            other => panic!("expected an envelope refusal, got {other:?}"),
+        };
+        assert_eq!(refused(abe_fence(false, 2)), AbeError::Epoch);
+        assert_eq!(refused(abe_fence(true, 1)), AbeError::Parameters);
+        // The admitted parameters and epoch pass the fence and reach the hash step.
+        let outcome = abe_fence(false, 1).finalize();
+        assert!(
+            matches!(outcome, Err(PutObjectError::MissingHash(_))),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn envelope_write_rollback() {
+        let mut op = operation();
+        let txn_id = Ulid::generate();
+        op.txn_id = Some(txn_id);
+        op.state = PutObjectState::WriteEnvelope;
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: aruna_core::errors::StorageError::TransactionConflict,
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        );
+        assert!(op.finalize().is_err());
+    }
+
+    #[test]
+    fn plain_skips_envelope() {
+        let mut op = operation();
+        op.start();
+        op.step(row(None));
+        op.step(fence_clear());
+        let effects = op.step(row(None));
+        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
+            panic!("expected the plain write, got {effects:?}")
+        };
+        assert_eq!(resolved.encryption, None);
+    }
+
+    #[test]
+    fn disabled_skips_envelope() {
+        let mut op = operation().without_envelope();
+        op.start();
+        op.step(row(None));
+        op.step(fence_clear());
+        op.step(row(Some(settings().to_bytes().unwrap())));
+        let effects = op.step(row(Some(record().to_bytes().unwrap())));
+        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
+            panic!("expected the sealed write without envelope, got {effects:?}")
+        };
+        assert_eq!(
+            resolved.encryption,
+            SealPlan::capture(&settings(), &record()).unwrap()
+        );
+    }
+
+    #[test]
+    fn charges_envelope_bytes() {
+        let mut op = operation();
+        op.config.quota_ceiling = None;
+        let txn_id = Ulid::generate();
+        let mut location = test_location(op.config.user_id);
+        location.format = StoredFormat::pithos(
+            PithosLayout {
+                stored_size: 10,
+                metadata_digest: [1; 32],
+                storage_generation: 2,
+            },
+            record().key,
+        );
+        location.hashes.insert(
+            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+            vec![5; 32],
+        );
+        op.envelope = Some(envelope(parameters(&op, 9)));
+        op.version_id = Some(Ulid::generate());
+        op.txn_id = Some(txn_id);
+        op.output = Some(Ok(location));
+        let effects = op.store_envelope();
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the envelope rows, got {effects:?}")
+        };
+        let charge = writes[0].2.len() + writes[2].2.len();
+        assert_eq!(op.envelope_bytes, charge as u64);
+        op.state = PutObjectState::WriteReplicationObligation;
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"obligation".to_vec().into(),
+        }));
+        let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
+            panic!("expected the counter deltas, got {effects:?}")
+        };
+        assert!(
+            deltas
+                .iter()
+                .any(|(_, d)| d.logical_bytes == 1 + charge as i128)
+        );
+    }
+
+    /// Runs the quota gate for a write with a 2 byte ceiling and no prior usage.
+    fn quota_charge(payload: u64, envelope_bytes: u64) -> aruna_core::types::Effects {
+        let mut op = operation();
+        op.config.quota_ceiling = Some(2);
+        let txn_id = Ulid::generate();
+        let mut location = test_location(op.config.user_id);
+        location.blob_size = payload;
+        location.hashes.insert(
+            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+            vec![5; 32],
+        );
+        op.envelope_bytes = envelope_bytes;
+        op.txn_id = Some(txn_id);
+        op.output = Some(Ok(location));
+        op.state = PutObjectState::WriteReplicationObligation;
+        let mut effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"obligation".to_vec().into(),
+        }));
+        if op.state == PutObjectState::EnforceQuota {
+            let empty = || {
+                Event::Storage(StorageEvent::ReadResult {
+                    key: b"k".to_vec().into(),
+                    value: None,
+                })
+            };
+            op.step(empty());
+            op.step(empty());
+            effects = op.step(Event::Storage(StorageEvent::IterResult {
+                values: vec![],
+                next_start_after: None,
+            }));
+        }
+        effects
+    }
+
+    #[test]
+    fn quota_counts_envelope() {
+        let refused = |effects: aruna_core::types::Effects| {
+            matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+            )
+        };
+        // The payload alone fits, but the envelope pushes the charge over the ceiling.
+        assert!(refused(quota_charge(2, 1)));
+        assert!(refused(quota_charge(0, 3)));
+        assert!(!refused(quota_charge(0, 2)));
+        assert!(!refused(quota_charge(1, 1)));
     }
 }

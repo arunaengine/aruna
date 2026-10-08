@@ -1922,6 +1922,7 @@ mod sealed {
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::BlobVersion;
     use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation, BackendRef};
     use aruna_core::structs::storage::encryption::{
         BucketEncryption, BucketKeyError, BucketKeyRef, EncryptionMode, ReadLease,
@@ -2207,5 +2208,27 @@ mod sealed {
                 Effect::Blob(BlobEffect::Read { .. }),
             ]
         ));
+    }
+
+    #[test]
+    fn pending_token_promotes() {
+        // With a token, a pending version ends the read typed, so the caller promotes it.
+        let mut operation = operation().with_token(true);
+        let archive = ArchiveKey::new(Ulid::generate(), BackendRef::node_default());
+        let version = BlobVersion::pending(
+            archive.clone(),
+            SystemTime::UNIX_EPOCH,
+            operation.input.user_identity,
+            None,
+        );
+        let effects = operation.read_version(Ulid::generate(), version, false);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert_eq!(
+            operation.finalize().err(),
+            Some(GetObjectError::PendingContent(archive))
+        );
     }
 }

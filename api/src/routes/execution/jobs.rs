@@ -1745,7 +1745,7 @@ pub async fn get_job_report(
     }
 }
 
-fn range_request(headers: &HeaderMap) -> Result<Option<ObjectRangeRequest>, ()> {
+pub(crate) fn range_request(headers: &HeaderMap) -> Result<Option<ObjectRangeRequest>, ()> {
     let Some(value) = headers.get(RANGE) else {
         return Ok(None);
     };

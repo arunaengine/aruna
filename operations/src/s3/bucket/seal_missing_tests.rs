@@ -97,7 +97,11 @@ fn pending_holders_sealed() {
         granted_at_ms: 1,
     };
     operation.step(rows(vec![grant.to_bytes().unwrap()]));
-    let effects = operation.step(rows(vec![copy(user(1)).to_bytes().unwrap()]));
+    let created = copy(user(1));
+    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+        values: vec![(created.key().into(), created.to_bytes().unwrap().into())],
+        next_start_after: None,
+    }));
     let [Effect::Blob(BlobEffect::SealUnlocked { holders, .. })] = effects.as_slice() else {
         panic!("expected the seal step, got {effects:?}");
     };

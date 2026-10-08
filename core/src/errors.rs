@@ -93,6 +93,8 @@ pub enum BlobError {
     Closed,
     #[error(transparent)]
     BucketKey(#[from] crate::structs::storage::encryption::BucketKeyError),
+    #[error(transparent)]
+    Abe(#[from] crate::structs::storage::abe::AbeError),
 }
 
 #[derive(Debug, Error, PartialEq)]

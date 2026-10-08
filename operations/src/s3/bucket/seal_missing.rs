@@ -255,7 +255,7 @@ impl Operation for SealMissingOperation {
                 }
             }
             (SealStep::ReadCopies, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                match decode(&values, SealedCopy::from_bytes) {
+                match decode(&SealedCopy::user_rows(values), SealedCopy::from_bytes) {
                     Ok(copies) => self.seal(copies),
                     Err(error) => self.fail(error),
                 }

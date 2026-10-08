@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod abe;
+pub mod abe_access;
 pub mod backends;
 pub mod blob;
 pub mod cleanup;

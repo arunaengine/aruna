@@ -137,6 +137,14 @@ encrypted.
 - **While locked.** Uploads, listings and object info still work. Reading content, copying it to
   another bucket and jobs that need it wait or are refused. S3 answers `403 AccessDenied` with the
   header `x-aruna-bucket-locked: true`.
+- **Token credentials.** A key holder can create an S3 credential that reads chosen buckets while
+  they are locked: list them in `encrypted_buckets` of `POST /access/credentials`. Each bucket
+  must be unlocked at that moment. The answer contains a `session_token` once; the node does not
+  keep it. Set it as `aws_session_token` next to the access key and secret, for example in
+  `~/.aws/credentials`. The token only works in the signed request header, never in presigned
+  URLs. It stops working when the credential is revoked, when its creator stops being a key
+  holder, or after a key rotation. `GET /data/buckets/{bucket}/storage/encryption/tokens` lists
+  the token credentials of a bucket.
 - **S3 clients.** Encrypted buckets report `AES256` server-side encryption. `PutBucketEncryption`
   with `AES256` turns on `node_managed` mode; turning encryption off is only possible through the
   REST API. Other encryption headers, such as KMS or customer keys, are refused.
@@ -147,6 +155,13 @@ encrypted.
   to an encrypted bucket are encrypted.
 - **Content fingerprints.** For deduplication, the node keeps content hashes of encrypted
   objects. These hashes are extra plaintext fingerprints: they can show that two files are equal.
+- **Copies and sync to other nodes.** A target bucket that encrypts stores every copy sealed to
+  its own key. When both buckets encrypt, the source node grants each encrypted file to the key of
+  the target bucket, so the target never needs the source key. While the source bucket is locked,
+  its copies wait and run after the next unlock; the sync status shows how many wait. The target
+  checks the content of such a copy when its own bucket is next unlocked. A target bucket without
+  encryption gets copies of an encrypted bucket only when the request sets `plaintext: true` and
+  the requester holds the key of the source bucket.
 
 ## Avoiding Common Pitfalls
 

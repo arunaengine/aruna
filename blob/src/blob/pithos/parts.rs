@@ -48,7 +48,7 @@ impl BlobHandler {
         part: MultipartPartKey,
         resolved: ResolvedBackend,
         created_by: UserId,
-        content_offset: Option<u64>,
+        (content_offset, object): (Option<u64>, Option<[u8; 32]>),
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
         let Some(plan) = resolved.encryption else {
@@ -63,7 +63,7 @@ impl BlobHandler {
             Ok(share) => share,
             Err(error) => return BlobEvent::Error(error),
         };
-        let encoder = match piece_encoder(&upload, part.part_number, content_offset) {
+        let encoder = match piece_encoder(&upload, part.part_number, content_offset, object) {
             Ok(encoder) => encoder,
             Err(error) => return BlobEvent::Error(error),
         };
@@ -473,20 +473,26 @@ impl BlobHandler {
 }
 
 /// Fixed 4 MiB blocks with the cipher, key mode and compression of `upload`, keyed by the part
-/// number. Content hashing stays on in both key modes when an offset is known.
+/// number and granted to the bucket key and the object key if given. Content hashing stays on
+/// in both key modes when an offset is known.
 fn piece_encoder(
     upload: &UploadEncryption,
     part_number: u16,
     content_offset: Option<u64>,
+    object: Option<[u8; 32]>,
 ) -> Result<PieceEncoder, BlobError> {
     let plan = &upload.plan;
-    let bucket = PublicKey::from_raw(plan.public_key)
-        .map_err(|error| BlobError::WriteError(error.to_string()))?;
+    let recipients = std::iter::once(plan.public_key)
+        .chain(object)
+        .map(|key| {
+            PublicKey::from_raw(key).map_err(|error| BlobError::WriteError(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let processing = ProcessingOptions::new(true, pithos_level(upload.compression))
         .and_then(|options| options.with_cipher(cipher(plan.cipher)))
         .and_then(|options| options.with_key_mode(key_mode(plan.block_keys)))
         .map_err(write_error)?;
-    let encoder = PieceEncoder::new(u64::from(part_number), vec![bucket], processing)
+    let encoder = PieceEncoder::new(u64::from(part_number), recipients, processing)
         .and_then(|encoder| encoder.with_chunking(Chunking::Fixed(PART_BLOCK)))
         .and_then(|encoder| encoder.with_content_hash(content_offset.is_some()));
     match content_offset {

@@ -5,6 +5,7 @@
 
 mod hash;
 pub(in crate::blob) mod parts;
+mod regrant;
 mod rewrite;
 
 use super::BlobHandler;
@@ -277,6 +278,15 @@ async fn open(
         let mut entries = archive.entries();
         match (entries.next(), entries.next()) {
             (Some(entry), None) => {
+                if let EntryKind::File { size, .. } = entry.kind
+                    && opening.original != u64::MAX
+                    && size != opening.original
+                {
+                    return Err(BlobError::IntegrityCheckFailed(format!(
+                        "sealed copy holds {size} bytes, recorded {}",
+                        opening.original
+                    )));
+                }
                 entry.path == OBJECT_PATH
                     && matches!(entry.kind, EntryKind::File { .. })
                     && entry.references.is_empty()
@@ -344,7 +354,16 @@ pub(super) struct ArchiveEncoder {
 impl ArchiveEncoder {
     /// One piece of FastCDC blocks from 1 to 16 MiB, granted to the key of `plan` with its
     /// cipher and key mode. Content hashing stays on in both key modes.
+    #[cfg(test)]
     pub(super) fn new(plan: &SealPlan, compression: Compression) -> Result<Self, BlobError> {
+        Self::granted(plan, compression, None)
+    }
+
+    pub(super) fn granted(
+        plan: &SealPlan,
+        compression: Compression,
+        object: Option<[u8; 32]>,
+    ) -> Result<Self, BlobError> {
         let bucket = PublicKey::from_raw(plan.public_key)
             .map_err(|error| BlobError::WriteError(error.to_string()))?;
         let blocks = CdcConfig::new(MIB, 4 * MIB, 16 * MIB).map_err(write_error)?;
@@ -352,7 +371,14 @@ impl ArchiveEncoder {
             .and_then(|options| options.with_cipher(cipher(plan.cipher)))
             .and_then(|options| options.with_key_mode(key_mode(plan.block_keys)))
             .map_err(write_error)?;
-        let encoder = PieceEncoder::new(1, vec![bucket], processing)
+        let mut recipients = vec![bucket];
+        if let Some(object) = object {
+            recipients.push(
+                PublicKey::from_raw(object)
+                    .map_err(|error| BlobError::WriteError(error.to_string()))?,
+            );
+        }
+        let encoder = PieceEncoder::new(1, recipients, processing)
             .and_then(|encoder| encoder.with_chunking(Chunking::ContentDefined(blocks)))
             .and_then(|encoder| encoder.with_content_hash(true))
             .map_err(write_error)?;

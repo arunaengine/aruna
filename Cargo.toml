@@ -9,6 +9,8 @@ members = [
     "blob",
     "compute",
     "core",
+    "kpabe",
+    "kpabe/wasm",
     "storage",
     "net",
     "tasks",
@@ -21,13 +23,14 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.104"
+version = "3.0.0-alpha.105"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
 rust-version = "1.97.1"
 
 [workspace.dependencies]
+aruna-kpabe = { path = "kpabe" }
 # Workspace crates
 aruna = { path = "aruna" }
 aruna-api = { path = "api" }
@@ -41,6 +44,7 @@ aruna-tasks = { path = "tasks" }
 
 # Third-party crates
 aes-gcm = "0.11.1"
+aes-gcm-core = { package = "aes-gcm", version = "0.11.1", default-features = false, features = ["aes", "zeroize"] }
 ahash = "0.8.12"
 async-compression = { version = "0.4.46", default-features = false, features = [
     "tokio",
@@ -68,6 +72,7 @@ axum = "0.8.9"
 bao-tree = "0.16.1"
 base64 = "0.23.1"
 blake3 = { version = "=1.8.7", features = ["serde"] }
+bls12_381_plus = { version = "=0.9.0", default-features = false, features = ["groups", "pairings", "alloc"] }
 bollard = "0.21.1"
 byteview = "0.10.2"
 bytes = "1.12.1"
@@ -104,6 +109,7 @@ hpke = { version = "0.14.1", default-features = false, features = [
 ] }
 http = "1.5.0"
 http-body = "1.1.0"
+httparse = "1.10.1"
 hyper = { version = "1.11.1", features = ["full"] }
 hyper-util = { version = "0.1.20", features = [
     "server",
@@ -125,6 +131,7 @@ jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 json-patch = "4.2.0"
 lru = "0.18.4"
 md5 = "0.8.1"
+mime = "0.3.17"
 nix = { version = "0.31.3", features = ["time", "fs", "process", "signal"] }
 opendal = { version = "0.57.0", features = [
     "services-azblob",
@@ -158,6 +165,7 @@ prometheus-client = "0.25"
 proptest = "1.11.0"
 quick-xml = "0.42.0"
 rand = "0.10.2"
+rand_core = { version = "0.10.1", default-features = false }
 reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
     "rustls",
@@ -185,6 +193,7 @@ serde_json = { version = "1.0.151", features = ["raw_value"] }
 serde-saphyr = "0.0.29"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
+sha2_010 = { package = "sha2", version = "0.10.9", default-features = false }
 smallvec = "1.15.2"
 spargebra = "0.4.7"
 subtle = "2.6.1"
@@ -194,12 +203,14 @@ sysinfo = { version = "0.39.6", default-features = false, features = [
 tar = "0.4.46"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
+thiserror-core = { package = "thiserror", version = "2.0.20", default-features = false }
 tokio = { version = "1.53.1", features = ["full", "tracing"] }
 toml = "1.1.6"
 tokio-util = { version = "0.7.19", features = ["compat", "io-util", "rt"] }
 tower = { version = "0.5.3", features = ["limit"] }
 tower-http = { version = "0.7.1", features = ["compression-br", "compression-gzip", "cors", "fs", "timeout"] }
 tracing = "0.1.44"
+tracing-core = "0.1.36"
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", features = [
     "env-filter",
@@ -220,6 +231,8 @@ utoipa = { version = "5.5.0", features = [
 ] }
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+# Exact: the portal's wasm-bindgen-cli must match this version.
+wasm-bindgen = "=0.2.127"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
 zeroize = "1.9.0"

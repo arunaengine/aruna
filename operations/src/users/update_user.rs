@@ -67,6 +67,7 @@ pub struct UpdateUserOperation {
     fence: crate::placement::fence::WriteFence,
     state: UpdateUserState,
     output: Option<Result<User, UpdateUserError>>,
+    deactivating: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -164,6 +165,7 @@ impl UpdateUserOperation {
             fence: Default::default(),
             state: UpdateUserState::Init,
             output: None,
+            deactivating: false,
         }
     }
 
@@ -333,7 +335,10 @@ impl UpdateUserOperation {
             return Err(UpdateUserError::UserIdMismatch);
         }
 
+        let was_deactivated = user.is_deactivated();
         apply_updates(&mut user, &self.input)?;
+        // An active user turning inactive ends READ; a repeat leaves the status unchanged.
+        self.deactivating = !was_deactivated && user.is_deactivated();
         let admin_target = AdminDocumentTarget::User {
             user_id: user.user_id,
         };
@@ -509,6 +514,9 @@ impl UpdateUserOperation {
             user,
             admin_outbox_written,
         };
+        if self.deactivating {
+            return smallvec![crate::abe::mark_due(None, txn_id)];
+        }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -595,6 +603,11 @@ impl Operation for UpdateUserOperation {
             Ok(event) => event,
             Err(effects) => return effects,
         };
+        if let UpdateUserState::CommitTransaction { txn_id, .. } = self.state
+            && let Some(next) = crate::abe::marked(&event, txn_id)
+        {
+            return next.unwrap_or_else(|error| self.fail(error.into()));
+        }
 
         match self.state.clone() {
             UpdateUserState::Auth => self.handle_auth_result(event),
@@ -1222,6 +1235,57 @@ mod pure_tests {
             Err(UpdateUserError::InvalidAttributeKey(
                 "display name".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn deactivation_marks_due() {
+        // Turning inactive marks encrypted buckets due before the user commit; a repeat does not.
+        use aruna_core::user::validation::DEACTIVATED_ATTRIBUTE;
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        let run = |stored: User| {
+            let mut request = input(realm_id, user_id, user_id);
+            request.set_attributes =
+                HashMap::from([(DEACTIVATED_ATTRIBUTE.to_string(), "true".to_string())]);
+            request.remove_attributes.clear();
+            request.system = true;
+            let mut operation = UpdateUserOperation::new(request);
+            operation.start();
+            let txn_id = TxnId::generate();
+            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+            let bytes = stored.to_bytes(&actor(realm_id, user_id)).unwrap();
+            let key = ByteView::from(Vec::new());
+            operation.step(Event::Storage(StorageEvent::BatchReadResult {
+                values: vec![
+                    (key.clone(), Some(bytes.into())),
+                    (key.clone(), None),
+                    (key.clone(), None),
+                    (key, None),
+                ],
+            }));
+            let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
+            }));
+            (operation, effects, txn_id)
+        };
+
+        let (mut operation, effects, txn_id) = run(stored_user(user_id));
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let marked = Event::SubOperation(SubOperationEvent::EpochsMarked { result: Ok(()) });
+        assert_eq!(
+            operation.step(marked).as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        );
+
+        let mut inactive = stored_user(user_id);
+        inactive
+            .attributes
+            .insert(DEACTIVATED_ATTRIBUTE.to_string(), "true".to_string());
+        let (_, effects, txn_id) = run(inactive);
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
         );
     }
 

@@ -4,16 +4,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::bucket::key::rows::{
-    Row, SettingsError, authority_read, copy_targets, generation_rows, parse_authority,
-    uploads_open,
+    Row, SettingsError, authority_read, copy_targets, generation_rows, group_bucket_key,
+    parse_authority, uploads_open,
 };
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, TRANSITION_KEYSPACE, TRANSITION_QUEUE_KEYSPACE,
-    UPLOAD_KEYSPACE,
+    BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, TRANSITION_KEYSPACE,
+    TRANSITION_QUEUE_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
@@ -55,6 +55,8 @@ pub enum ChangeState {
     Commit,
     Finish,
     Error,
+    PrepareAbe,
+    DeleteIndex,
 }
 
 /// The change a holder or admin asked for.
@@ -134,6 +136,7 @@ pub struct ChangeResult {
 pub struct ChangeEncryptionOperation {
     input: ChangeInput,
     state: ChangeState,
+    abe: Option<crate::s3::bucket::key::abe::PrepareAbeOperation>,
     txn_id: Option<TxnId>,
     info: Option<BucketInfo>,
     admins: BTreeSet<UserId>,
@@ -152,6 +155,7 @@ impl ChangeEncryptionOperation {
         Self {
             input,
             state: ChangeState::Init,
+            abe: None,
             txn_id: None,
             info: None,
             admins: BTreeSet::new(),
@@ -319,7 +323,7 @@ impl ChangeEncryptionOperation {
     }
 
     fn seal(&mut self, public_key: [u8; 32], private_key: SharedSecret) -> Effects {
-        let (Some(active), Some(info)) = (self.active.as_ref(), self.info.as_ref()) else {
+        let (Some(active), Some(_info)) = (self.active.as_ref(), self.info.as_ref()) else {
             return self.fail(ChangeError::NotFinished);
         };
         let key = BucketKeyRef::new(active.key.bucket_id, active.key.generation + 1);
@@ -330,16 +334,46 @@ impl ChangeEncryptionOperation {
         if mode == EncryptionMode::NodeManaged {
             record.vault_entry = Some(record_id);
         }
-        let creator = info.created_by;
-        let report = resolve_holders(
-            creator,
-            &self.admins,
-            &self.grants,
-            &self.input.lookups,
-            &[],
-        );
-        let holders = copy_targets(&report, &self.input.lookups);
         self.new_key = Some((record, private_key.clone()));
+        let Some(txn) = self.txn_id else {
+            return self.fail(ChangeError::NotFinished);
+        };
+        let mut abe = crate::s3::bucket::key::abe::PrepareAbeOperation::new(
+            self.input.realm_id,
+            self.input.node_id,
+            key,
+            private_key,
+            txn,
+        );
+        self.state = ChangeState::PrepareAbe;
+        let effects = abe.start();
+        self.abe = Some(abe);
+        effects
+    }
+
+    fn prepare_abe(&mut self, event: Event) -> Effects {
+        let Some(abe) = self.abe.as_mut() else {
+            return self.fail(ChangeError::NotFinished);
+        };
+        let effects = abe.step(event);
+        if !abe.is_complete() {
+            return effects;
+        }
+        let Some(abe) = self.abe.take() else {
+            return self.fail(ChangeError::NotFinished);
+        };
+        if let Err(error) = abe.finalize() {
+            return self.fail(error);
+        }
+        let Some((key, public_key)) = self.new_key.as_ref().map(|(r, _)| (r.key, r.public_key))
+        else {
+            return self.fail(ChangeError::NotFinished);
+        };
+        let Some(private_key) = self.new_key.as_ref().map(|(_, s)| s.clone()) else {
+            return self.fail(ChangeError::NotFinished);
+        };
+        let report = self.report(&[]);
+        let holders = copy_targets(&report, &self.input.lookups);
         if holders.is_empty() {
             return self.write_rows(None, Vec::new());
         }
@@ -377,6 +411,19 @@ impl ChangeEncryptionOperation {
 }
 
 impl ChangeEncryptionOperation {
+    /// A bucket turned `off` leaves the group index, so member grants no longer visit it.
+    fn delete_index(&mut self) -> Effects {
+        if self.wanted().0 != EncryptionMode::Off {
+            return self.write_vault();
+        }
+        self.state = ChangeState::DeleteIndex;
+        smallvec![Effect::Storage(StorageEffect::Delete {
+            key_space: GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            key: group_bucket_key(self.input.group_id, &self.input.bucket),
+            txn_id: self.txn_id,
+        })]
+    }
+
     fn write_vault(&mut self) -> Effects {
         let Some((id, secret)) = self.vault.take() else {
             return self.commit();
@@ -432,6 +479,7 @@ impl Operation for ChangeEncryptionOperation {
             return self.fail(error.clone());
         }
         match (self.state, event) {
+            (ChangeState::PrepareAbe, event) => self.prepare_abe(event),
             (
                 ChangeState::StartTransaction,
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }),
@@ -490,6 +538,9 @@ impl Operation for ChangeEncryptionOperation {
                 self.write_rows(Some(private_key), Vec::new())
             }
             (ChangeState::WriteRows, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                self.delete_index()
+            }
+            (ChangeState::DeleteIndex, Event::Storage(StorageEvent::DeleteResult { .. })) => {
                 self.write_vault()
             }
             (ChangeState::WriteVault, Event::Storage(StorageEvent::WriteResult { .. })) => {

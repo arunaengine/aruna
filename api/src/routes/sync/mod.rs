@@ -6,6 +6,7 @@ use crate::auth::{
     ValidatedBearer, ensure_permission, ensure_permission_with, require_unrestricted_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::storage::blobs::plaintext_holder;
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
@@ -21,6 +22,11 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::AuthToken;
+use aruna_operations::replication::parking::awaiting_jobs;
+use aruna_operations::replication::plaintext::{
+    consent_delete, consent_write, read_consent, relationship_consent, source_encrypted,
+    store_consent,
+};
 use aruna_operations::replication::protocol::ReplicationMode;
 use aruna_operations::replication::queue::{QueueBlobOperation, relationship_job_stats};
 use aruna_operations::replication::version_replication::{
@@ -147,6 +153,10 @@ pub struct CreateSyncRequest {
     pub reference_handling: ApiReferenceHandling,
     #[serde(default)]
     pub replicate_deletes: bool,
+    /// Copies objects of an encrypted source bucket as plaintext when the target bucket does not
+    /// encrypt. Only for a current key holder of the source bucket.
+    #[serde(default)]
+    pub plaintext: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -163,6 +173,8 @@ pub struct SyncStatusResponse {
     pub last_synced_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Copy jobs of this relationship that wait for the source bucket key, counted when read.
+    pub awaiting_key: usize,
     pub counters: SyncCountersResponse,
 }
 
@@ -174,6 +186,8 @@ pub struct SyncRelationshipResponse {
     pub mode: ApiSyncMode,
     pub reference_handling: ApiReferenceHandling,
     pub replicate_deletes: bool,
+    /// A plaintext copy was asked for; it applies while its creator holds the source key.
+    pub plaintext: bool,
     pub created_by: String,
     pub created_at: String,
     pub state: String,
@@ -269,6 +283,12 @@ node checks WRITE on the target bucket before it accepts its half of the relatio
 - `once` and `reference` mode queue an initial backfill run as part of creation; `continuous`
   instead replicates versions as they are written.
 - `reference` mode forces `preserve` reference handling whatever the body asks for.
+- An encrypting target receives each copy sealed to its own key. A locked source key leaves
+  copies waiting until the next unlock of the source bucket; `status.awaiting_key` counts them.
+- An encrypted source refuses a target bucket that does not encrypt unless `plaintext` is true and
+  the creator is a current key holder of the source bucket, checked here and before each run. A
+  refusal found later fails the relationship with `failure_reason` `plaintext_required`.
+- With encryption off and no retained encrypted archives, `plaintext` has no effect.
 - Completion is observed by polling the relationship, whose `pending_jobs`, `last_synced_at` and
   counters advance as replication drains.
 
@@ -291,7 +311,8 @@ node checks WRITE on the target bucket before it accepts its half of the relatio
             },
             "mode": "once",
             "reference_handling": "materialize",
-            "replicate_deletes": false
+            "replicate_deletes": false,
+            "plaintext": false
         })
     ),
     responses(
@@ -306,10 +327,12 @@ node checks WRITE on the target bucket before it accepts its half of the relatio
                 "mode": "once",
                 "reference_handling": "materialize",
                 "replicate_deletes": false,
+                "plaintext": false,
                 "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 "created_at": "2026-04-09T14:23:11.123+00:00",
                 "state": "enabled",
                 "status": {
+                    "awaiting_key": 0,
                     "counters": {
                         "versions_synced": 0,
                         "bytes_synced": 0,
@@ -321,7 +344,21 @@ node checks WRITE on the target bucket before it accepts its half of the relatio
         ),
         (status = 400, description = "The endpoints are identical, a bucket name is empty or contains `/`, the bucket is a workspace bucket, the prefix is not a confined relative path, or the target node id does not parse", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token from another realm or path-restricted, no READ on the source bucket, or the target node refused the mirror", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm or path-restricted, no READ on the source bucket, the target node refused the mirror, `not_holder` when `plaintext` is set and the caller is no current key holder of the encrypted source bucket, or `plaintext_required` when the encrypted source would copy into a bucket of this node that does not encrypt",
+            body = ErrorResponse,
+            examples(
+                ("Not a key holder" = (
+                    summary = "plaintext was asked for by a caller who holds no source key",
+                    value = json!({"error": "the caller holds no key of bucket research-raw", "code": "not_holder"})
+                )),
+                ("Plaintext required" = (
+                    summary = "an encrypted source would copy into a bucket that does not encrypt",
+                    value = json!({"error": "an encrypted source copies into a bucket that does not encrypt only with plaintext", "code": "plaintext_required"})
+                ))
+            )
+        ),
         (status = 404, description = "The source bucket is unknown to this node, or the target node does not know the target bucket", body = ErrorResponse),
         (status = 409, description = "An enabled relationship with the same source, target and mode already exists", body = ErrorResponse),
         (status = 502, description = "The target node could not be reached to store its mirror; nothing was created, a partial mirror is repaired in the background, and the caller may retry", body = ErrorResponse)
@@ -372,6 +409,13 @@ pub async fn create_sync(
         Permission::READ,
     )
     .await?;
+    let plaintext = match request.plaintext {
+        true => plaintext_holder(&state, &request.source.bucket, auth.user_id).await?,
+        false => false,
+    };
+    if !request.plaintext && target_node == state.get_node_id() {
+        refuse_plain_target(&state, &request.source.bucket, &request.target.bucket).await?;
+    }
 
     let mode = SyncMode::from(request.mode);
     let reference_handling = if mode == SyncMode::Reference {
@@ -426,6 +470,13 @@ pub async fn create_sync(
         return Err(error);
     }
 
+    if plaintext {
+        let consent = consent_write(relationship_consent(relationship.id), auth.user_id)
+            .map_err(ServerError::InternalError)?;
+        store_consent(&context, consent)
+            .await
+            .map_err(ServerError::InternalError)?;
+    }
     if let Err(error) = create_sync_relationship(&context, relationship.clone())
         .await
         .map_err(map_create_error)
@@ -460,7 +511,9 @@ pub async fn create_sync(
 
     clear_repair(&state, &relationship, SyncMirrorIntent::Reconcile).await;
 
-    Ok((StatusCode::CREATED, Json(map_relationship(&relationship))))
+    let mut response = map_relationship(&relationship);
+    response.plaintext = plaintext;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 #[utoipa::path(
@@ -503,10 +556,12 @@ pub async fn create_sync(
                         "mode": "continuous",
                         "reference_handling": "materialize",
                         "replicate_deletes": true,
+                        "plaintext": false,
                         "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                         "created_at": "2026-04-09T14:23:11.123+00:00",
                         "state": "enabled",
                         "status": {
+                            "awaiting_key": 0,
                             "last_synced_at": "2026-04-09T15:02:44.907+00:00",
                             "counters": {
                                 "versions_synced": 128,
@@ -565,7 +620,7 @@ pub async fn list_sync(
         Vec::new()
     };
 
-    Ok(Json(SyncListResponse {
+    let mut response = SyncListResponse {
         outgoing: filter_relationships(
             outgoing,
             auth.user_id,
@@ -578,7 +633,11 @@ pub async fn list_sync(
             SyncRelationshipDirection::Incoming,
             params.prefix.as_deref(),
         ),
-    }))
+    };
+    for relationship in response.outgoing.iter_mut() {
+        annotate(&state, relationship).await?;
+    }
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -611,10 +670,12 @@ creator may read a relationship, so one created by somebody else is refused rath
                     "mode": "once",
                     "reference_handling": "materialize",
                     "replicate_deletes": false,
+                    "plaintext": false,
                     "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                     "created_at": "2026-04-09T14:23:11.123+00:00",
                     "state": "enabled",
                     "status": {
+                        "awaiting_key": 0,
                         "last_synced_at": "2026-04-09T15:02:44.907+00:00",
                         "counters": {
                             "versions_synced": 128,
@@ -649,8 +710,10 @@ pub async fn get_sync(
     let last_synced_at = map_time(relationship.status.last_synced_at);
     let last_error = relationship.status.last_error.clone();
 
+    let mut response = map_relationship(&relationship);
+    annotate(&state, &mut response).await?;
     Ok(Json(SyncDetailResponse {
-        relationship: map_relationship(&relationship),
+        relationship: response,
         pending_jobs,
         oldest_lag_ms,
         last_synced_at,
@@ -720,10 +783,12 @@ creator may change a relationship, and READ on the source bucket is checked as w
                 "mode": "continuous",
                 "reference_handling": "preserve",
                 "replicate_deletes": false,
+                "plaintext": false,
                 "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 "created_at": "2026-04-09T14:23:11.123+00:00",
                 "state": "enabled",
                 "status": {
+                    "awaiting_key": 0,
                     "counters": {
                         "versions_synced": 128,
                         "bytes_synced": 4294967296_i64,
@@ -775,7 +840,9 @@ pub async fn update_sync(
         changed |= apply_state(&mut relationship, requested.into());
     }
     if !changed {
-        return Ok(Json(map_relationship(&relationship)));
+        let mut response = map_relationship(&relationship);
+        annotate(&state, &mut response).await?;
+        return Ok(Json(response));
     }
     let source_group_id = load_bucket(
         &state,
@@ -821,7 +888,9 @@ pub async fn update_sync(
     if !was_enabled && updated.state == SyncState::Enabled {
         queue_relationship(&state, &auth, &updated).await?;
     }
-    Ok(Json(map_relationship(&updated)))
+    let mut response = map_relationship(&updated);
+    annotate(&state, &mut response).await?;
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -958,6 +1027,10 @@ pub async fn delete_sync(
     kick_mirror_repair(&context).await;
     if remove_mirror(&state, &relationship).await {
         clear_repair(&state, &relationship, SyncMirrorIntent::Delete).await;
+    }
+    let consent = consent_delete(relationship_consent(relationship.id));
+    if let Err(error) = store_consent(&context, consent).await {
+        warn!(%error, relationship_id = %relationship.id, "Failed to remove a plaintext copy request");
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -1350,6 +1423,7 @@ fn map_relationship(relationship: &SyncRelationship) -> SyncRelationshipResponse
         mode: relationship.mode.into(),
         reference_handling: relationship.reference_handling.into(),
         replicate_deletes: relationship.replicate_deletes,
+        plaintext: false,
         created_by: relationship.created_by.to_string(),
         created_at: map_time(Some(relationship.created_at)).unwrap_or_default(),
         state: state.to_string(),
@@ -1357,6 +1431,7 @@ fn map_relationship(relationship: &SyncRelationship) -> SyncRelationshipResponse
         status: SyncStatusResponse {
             last_synced_at: map_time(relationship.status.last_synced_at),
             last_error: relationship.status.last_error.clone(),
+            awaiting_key: 0,
             counters: SyncCountersResponse {
                 versions_synced: relationship.status.counters.versions_synced,
                 bytes_synced: relationship.status.counters.bytes_synced,
@@ -1365,6 +1440,44 @@ fn map_relationship(relationship: &SyncRelationship) -> SyncRelationshipResponse
             },
         },
     }
+}
+
+/// Fills what this node keeps beside a relationship: the plaintext request of its creator and
+/// the copy jobs that wait for a source key now.
+async fn annotate(
+    state: &ServerState,
+    response: &mut SyncRelationshipResponse,
+) -> ServerResult<()> {
+    let id = parse_id(&response.id)?;
+    let context = state.get_ctx();
+    let consent = read_consent(&context, relationship_consent(id)).await;
+    response.plaintext = consent.map_err(ServerError::InternalError)?.is_some();
+    let awaiting = awaiting_jobs(&context, id).await;
+    response.status.awaiting_key =
+        awaiting.map_err(|error| ServerError::InternalError(error.to_string()))?;
+    Ok(())
+}
+
+/// An encrypted source refuses a target bucket of this node that does not encrypt.
+async fn refuse_plain_target(state: &ServerState, source: &str, target: &str) -> ServerResult<()> {
+    let context = state.get_ctx();
+    let encrypted = |bucket| source_encrypted(&context, bucket);
+    let source = encrypted(source)
+        .await
+        .map_err(ServerError::InternalError)?;
+    if !source
+        || encrypted(target)
+            .await
+            .map_err(ServerError::InternalError)?
+    {
+        return Ok(());
+    }
+    Err(ServerError::Refused(
+        StatusCode::FORBIDDEN,
+        "plaintext_required",
+        "an encrypted source copies into a bucket that does not encrypt only with plaintext"
+            .to_string(),
+    ))
 }
 
 fn map_time(value: Option<SystemTime>) -> Option<String> {

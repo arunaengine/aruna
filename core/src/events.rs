@@ -101,6 +101,35 @@ pub enum SubOperationEvent {
     UserUpdated {
         result: Result<(), String>,
     },
+    KeyRequestsOpened {
+        request_ids: Vec<Ulid>,
+    },
+    /// Epoch due markers were written in the caller's transaction.
+    EpochsMarked {
+        result: Result<(), StorageError>,
+    },
+    /// A key request run failed and may succeed on retry.
+    KeyRequestsFailed,
+    /// One reissue page finished; `more` pages remain.
+    ReissuePaged {
+        more: bool,
+    },
+    /// One version of a re-key page ended.
+    VersionRekeyed {
+        outcome: RekeyOutcome,
+    },
+}
+
+/// How the re-key of one version ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RekeyOutcome {
+    Moved,
+    Skipped,
+    /// The bucket key is locked on this node.
+    Locked,
+    Failed,
+    /// The version needs a later page; this page stops before it.
+    Unfinished,
 }
 
 #[derive(Debug, PartialEq)]
@@ -213,6 +242,7 @@ pub enum BlobEvent {
     ComposeReserved {
         share: WorkingShare,
     },
+    Abe(Box<crate::structs::storage::abe::AbeEvent>),
 }
 
 #[derive(Debug, PartialEq)]

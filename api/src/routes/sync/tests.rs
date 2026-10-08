@@ -10,11 +10,19 @@ use crate::tests::routes::{
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, MIRROR_REPAIR_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE,
+    MIRROR_REPAIR_KEYSPACE, REPLICATION_JOB_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, VersionKey};
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState,
+};
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::EncodingClass;
 use tempfile::TempDir;
 
 fn test_node(seed: u8) -> NodeId {
@@ -126,7 +134,114 @@ fn create_request(target_node: NodeId) -> CreateSyncRequest {
         mode: ApiSyncMode::Once,
         reference_handling: ApiReferenceHandling::default(),
         replicate_deletes: false,
+        plaintext: false,
     }
+}
+
+async fn decrypting_source(state: &ServerState, user: UserId) {
+    let key = BucketKeyRef::new(Ulid::from_bytes([7; 16]), 1);
+    let settings = BucketEncryption {
+        bucket_id: Some(key.bucket_id),
+        key_generation: 1,
+        ..Default::default()
+    };
+    let mut record = BucketKeyRecord::new(key, Ulid::from_bytes([8; 16]), [9; 32], 0);
+    record.state = KeyState::Retiring;
+    let version = BlobVersion::materialized(
+        [10; 32],
+        BackendRef::node_default(),
+        EncodingClass::Pithos { digest: [11; 32] },
+        SystemTime::UNIX_EPOCH,
+        user,
+        None,
+    );
+    for (space, row, value) in [
+        (
+            BUCKET_ENCRYPTION_KEYSPACE,
+            b"source".to_vec(),
+            settings.to_bytes().unwrap(),
+        ),
+        (
+            BUCKET_KEY_KEYSPACE,
+            key.key().to_vec(),
+            record.to_bytes().unwrap(),
+        ),
+        (
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new("source", "old", Ulid::from_bytes([12; 16]))
+                .to_bytes()
+                .unwrap(),
+            version.to_bytes().unwrap(),
+        ),
+    ] {
+        write_doc(&state.get_ctx(), space, row.into(), value.into()).await;
+    }
+}
+
+#[tokio::test]
+async fn decrypting_copy_consent() {
+    use crate::routes::storage::blobs::{ReplicateBlobRequest, replicate_blob};
+    use aruna_operations::jobs::store::iter_prefix_page;
+    use aruna_operations::replication::plaintext::{job_consent, read_consent};
+    let (_dir, state, auth, _) = test_state().await;
+    decrypting_source(&state, auth.user_id).await;
+    let (status, _) = replicate_blob(
+        State(state.clone()),
+        Extension(Some(auth.clone())),
+        Json(ReplicateBlobRequest {
+            bucket: "source".to_string(),
+            path: Some("old".to_string()),
+            version_id: Some(Ulid::from_bytes([12; 16]).to_string()),
+            node_id: test_node(4).to_string(),
+            plaintext: true,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (jobs, _) = iter_prefix_page(
+        &state.get_ctx().storage_handle,
+        REPLICATION_JOB_KEYSPACE,
+        None,
+        None,
+        2,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        read_consent(&state.get_ctx(), job_consent(&jobs[0].0))
+            .await
+            .unwrap(),
+        Some(auth.user_id)
+    );
+}
+
+#[tokio::test]
+async fn decrypting_sync_consent() {
+    use aruna_operations::replication::plaintext::read_consent;
+    let (_dir, state, auth, _) = test_state().await;
+    decrypting_source(&state, auth.user_id).await;
+    let mut request = create_request(state.get_node_id());
+    request.plaintext = true;
+    let (status, Json(response)) = create_sync(
+        State(state.clone()),
+        Extension(Some(auth.clone())),
+        Extension(Some(ValidatedBearer::new_for_test("sync-test-token"))),
+        Json(request),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(response.plaintext);
+    let id = Ulid::from_string(&response.id).unwrap();
+    assert_eq!(
+        read_consent(&state.get_ctx(), relationship_consent(id))
+            .await
+            .unwrap(),
+        Some(auth.user_id)
+    );
 }
 
 #[test]

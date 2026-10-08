@@ -46,6 +46,13 @@ impl ChangeEncryptionOperation {
                     &copies,
                     &report,
                 )?);
+                // Every new generation carries ABE parameters, so the group index lists it.
+                let group = group_bucket_key(self.input.group_id, &self.input.bucket);
+                rows.push((
+                    GROUP_ENCRYPTED_KEYSPACE.to_string(),
+                    group,
+                    Vec::new().into(),
+                ));
                 Some(record.clone())
             }
             None => {

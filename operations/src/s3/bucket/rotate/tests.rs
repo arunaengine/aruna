@@ -155,10 +155,11 @@ fn generated(operation: &mut ChangeEncryptionOperation) -> Effects {
     }));
     let private = SecretBytes::new(vec![4; 32]);
     let public_key = aruna_core::structs::storage::encryption::public_key_of(&private).unwrap();
-    operation.step(Event::Blob(BlobEvent::BucketKeyGenerated {
+    let effects = operation.step(Event::Blob(BlobEvent::BucketKeyGenerated {
         public_key,
         private_key: SharedSecret::new(private),
-    }))
+    }));
+    crate::s3::bucket::key::abe::admit_parameters(operation, effects)
 }
 
 #[test]
@@ -390,6 +391,12 @@ fn concurrent_put_converted() {
             key: Vec::new().into(),
             value: Some(location.to_bytes().unwrap().into()),
         }));
+        // The version has no envelope rows.
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+            panic!("expected the envelope reads, got {effects:?}")
+        };
+        let values = reads.iter().map(|(_, key)| (key.clone(), None)).collect();
+        let effects = rewrite.step(Event::Storage(StorageEvent::BatchReadResult { values }));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Blob(BlobEffect::AdmitRead { .. })]

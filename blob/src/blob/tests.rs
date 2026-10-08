@@ -3530,6 +3530,7 @@ fn group_effect(backend_id: Ulid) -> BlobEffect {
         stream_id: Ulid::generate(),
         resolved: ResolvedBackend::new(BackendRef::Group(backend_id), None),
         keep_alive: false,
+        object: None,
     }
 }
 

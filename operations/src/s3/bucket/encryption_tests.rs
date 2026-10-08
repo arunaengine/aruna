@@ -85,6 +85,7 @@ fn generated(operation: &mut EnableEncryptionOperation) -> (Effects, [u8; 32]) {
         public_key: public,
         private_key: SharedSecret::new(private),
     }));
+    let effects = crate::s3::bucket::key::abe::admit_parameters(operation, effects);
     (effects, public)
 }
 
@@ -144,7 +145,8 @@ fn managed_enable_writes() {
             KEY_COPY_KEYSPACE,
             aruna_core::keyspaces::TRANSITION_KEYSPACE,
             aruna_core::keyspaces::TRANSITION_QUEUE_KEYSPACE,
-            aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE
+            aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE,
+            aruna_core::keyspaces::GROUP_ENCRYPTED_KEYSPACE
         ]
     );
     // The enable records its mode change in the same batch.

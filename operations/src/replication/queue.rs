@@ -5,7 +5,6 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
-use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -20,6 +19,7 @@ use aruna_core::structs::execution::notification_watch::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::replication::{ArunaArn, ReplicationFailure};
 use aruna_core::structs::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, sync_relationship_key,
@@ -29,6 +29,7 @@ use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, Key};
+use aruna_core::{NodeId, UserId};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -38,6 +39,8 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
+use super::parking::{PARKED_DUE, park_job};
+use super::plaintext::{consent_delete, consent_write, job_consent, plaintext_allowed};
 use super::protocol::{ReferenceAdvance, ReplicationMode, SyncOrigin};
 use super::version_replication::{
     ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
@@ -170,6 +173,8 @@ struct ReplicationScanCursor {
 enum BlobJobOutcome {
     Succeeded,
     TerminalFailure,
+    /// The job waits, parked, for one of these locked source keys.
+    AwaitingKey(Vec<BucketKeyRef>),
 }
 
 #[derive(Default)]
@@ -395,6 +400,7 @@ pub fn schedule_blob_drain() -> Effect {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum QueueBlobState {
     Init,
+    ClearConsent,
     ReadExisting,
     WriteJob,
     ScheduleDrain,
@@ -407,6 +413,8 @@ pub struct QueueBlobOperation {
     job: BlobJobRecord,
     state: QueueBlobState,
     output: Option<Result<QueueBlobResult, BlobQueueError>>,
+    /// The plaintext request this queueing records: `Some(None)` withdraws an earlier one.
+    consent: Option<Option<UserId>>,
 }
 
 impl QueueBlobOperation {
@@ -415,7 +423,16 @@ impl QueueBlobOperation {
             job: BlobJobRecord::new(input, source_delete_marker, unix_timestamp_millis()),
             state: QueueBlobState::Init,
             output: None,
+            consent: None,
         }
+    }
+
+    /// Records whether the requester of this explicit copy asked for plaintext. A withdrawn
+    /// request is deleted before the job is written; a new one commits with it.
+    pub fn with_plaintext(mut self, plaintext: bool) -> Self {
+        let requester = self.job.input.auth_context.user_id;
+        self.consent = Some(plaintext.then_some(requester));
+        self
     }
 
     pub fn new_relationship(
@@ -432,6 +449,7 @@ impl QueueBlobOperation {
             ),
             state: QueueBlobState::Init,
             output: None,
+            consent: None,
         }
     }
 
@@ -460,12 +478,58 @@ impl QueueBlobOperation {
             Err(error) => return self.fail(error.into()),
         };
         self.state = QueueBlobState::WriteJob;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space,
-            key,
-            value,
+        let Some(Effect::Storage(StorageEffect::Write {
+            key_space: consent_space,
+            key: consent_key,
+            value: consent_value,
+            ..
+        })) = self.consent_effect(&key)
+        else {
+            return smallvec![Effect::Storage(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: None,
+            })];
+        };
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes: vec![
+                (key_space, key, value),
+                (consent_space, consent_key, consent_value)
+            ],
             txn_id: None,
         })]
+    }
+
+    /// The write of a granted plaintext request for the job stored under `key`.
+    fn consent_effect(&self, key: &Key) -> Option<Effect> {
+        let requester = self.consent.flatten()?;
+        consent_write(job_consent(key), requester).ok()
+    }
+
+    /// Withdraws an earlier plaintext request before the job is written again.
+    fn clear_consent(&mut self) -> Effects {
+        let key = match blob_job_key(&self.job) {
+            Ok(key) => key,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = QueueBlobState::ClearConsent;
+        smallvec![consent_delete(job_consent(&key))]
+    }
+
+    /// A preferred existing job stays, but a granted request is still recorded for it.
+    fn keep_existing(&mut self) -> Effects {
+        let key = match blob_job_key(&self.job) {
+            Ok(key) => key,
+            Err(error) => return self.fail(error.into()),
+        };
+        match self.consent_effect(&key) {
+            Some(effect) => {
+                self.state = QueueBlobState::WriteJob;
+                smallvec![effect]
+            }
+            None => self.schedule_drain(),
+        }
     }
 
     fn schedule_drain(&mut self) -> Effects {
@@ -488,18 +552,26 @@ impl Operation for QueueBlobOperation {
     type Error = BlobQueueError;
 
     fn start(&mut self) -> Effects {
-        self.read_existing()
+        match self.consent {
+            Some(None) => self.clear_consent(),
+            _ => self.read_existing(),
+        }
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            QueueBlobState::Init => self.read_existing(),
+            QueueBlobState::Init => self.start(),
+            QueueBlobState::ClearConsent => match event {
+                Event::Storage(StorageEvent::DeleteResult { .. }) => self.read_existing(),
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+            },
             QueueBlobState::ReadExisting => match event {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
                 }) => match BlobJobRecord::from_bytes(&value) {
                     Ok(existing) if blob_job_preferred(&existing, &self.job) => {
-                        self.schedule_drain()
+                        self.keep_existing()
                     }
                     Ok(_) | Err(_) => self.write_job(),
                 },
@@ -508,7 +580,9 @@ impl Operation for QueueBlobOperation {
                 other => self.fail(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
             },
             QueueBlobState::WriteJob => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => self.schedule_drain(),
+                Event::Storage(
+                    StorageEvent::WriteResult { .. } | StorageEvent::BatchWriteResult { .. },
+                ) => self.schedule_drain(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
             },
@@ -1127,6 +1201,12 @@ pub async fn process_blob_batch(
                 delete_blob_job(&context.storage_handle, job_key).await?;
                 failed = failed.saturating_add(1);
             }
+            // No attempt, no error: the next unlock of a key makes the job due again.
+            Ok(BlobJobOutcome::AwaitingKey(keys)) => {
+                if let Some(due_at_ms) = park_job(context, job_key, &job, &keys).await? {
+                    next_due_ms = min_due_at(next_due_ms, due_at_ms);
+                }
+            }
             Err(error) => {
                 let retry_due_at =
                     reschedule_blob_job(&context.storage_handle, job_key, &job, error).await?;
@@ -1422,7 +1502,10 @@ async fn process_blob_job(
         } else {
             job.writer_auth_context.clone().or(Some(creator))
         };
+        let consent = super::plaintext::relationship_consent(relationship.id);
+        let plaintext = plaintext_allowed(context, bucket, relationship.created_by, consent);
         operation = operation
+            .with_plaintext(plaintext.await?)
             .with_relationship(
                 relationship.clone(),
                 job.origin.clone(),
@@ -1459,9 +1542,12 @@ async fn process_blob_job(
             }
             Err((SourceAuthorizationError::Unavailable(error), _)) => return Err(error),
         };
+        let consent = job_consent(&blob_job_key(job).map_err(|error| error.to_string())?);
+        let plaintext = plaintext_allowed(context, &job.input.bucket, writer.user_id, consent);
         operation = operation
             .with_source_authorization(source_authorization)
-            .with_writer_auth(writer.clone());
+            .with_writer_auth(writer.clone())
+            .with_plaintext(plaintext.await?);
         None
     };
 
@@ -1486,6 +1572,16 @@ async fn finish_blob_job(
 ) -> Result<BlobJobOutcome, String> {
     let failure: Option<ReplicationFailure>;
     let error = match drive(operation, context).await {
+        Ok(result) if result.failed == 0 && !result.awaiting.is_empty() => {
+            if result.replicated > 0
+                && let Some(relationship) = relationship.as_mut()
+            {
+                mark_progress(relationship, result.replicated, result.replicated_bytes);
+                let stored = store_relationship(context, relationship.clone()).await?;
+                cache_relationship(relationships, job, relationship, stored);
+            }
+            return Ok(BlobJobOutcome::AwaitingKey(result.awaiting));
+        }
         Ok(result) if result.failed == 0 => {
             if let Some(relationship) = relationship.as_mut() {
                 mark_success(relationship, result.replicated, result.replicated_bytes);
@@ -1544,6 +1640,20 @@ async fn finish_blob_job(
             error.to_string()
         }
     };
+    // A refused plaintext copy fails the relationship until it is changed and run again.
+    if failure == Some(ReplicationFailure::PlaintextRefused)
+        && let Some(relationship) = relationship.as_mut()
+    {
+        relationship.state = SyncState::Failed {
+            reason: "plaintext_required".to_string(),
+        };
+        mark_failure(relationship, &error);
+        let stored = store_relationship(context, relationship.clone()).await?;
+        cache_relationship(relationships, job, relationship, stored);
+        if stored && let Some(group_id) = watch_group_id {
+            emit_sync_watch(context, relationship, group_id, 0, Some(&error)).await;
+        }
+    }
     if failure.is_some_and(ReplicationFailure::is_denied) {
         return Ok(BlobJobOutcome::TerminalFailure);
     }
@@ -2421,6 +2531,9 @@ async fn scan_due_jobs(
             && let Some(existing) = read_blob_job(storage, &canonical_key).await?
         {
             job = existing;
+        }
+        if job.due_at_ms == PARKED_DUE {
+            continue;
         }
         if job.due_at_ms > now_ms {
             next_due_ms = min_due_at(next_due_ms, job.due_at_ms);

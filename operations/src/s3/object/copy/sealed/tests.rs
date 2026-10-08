@@ -264,8 +264,13 @@ fn copy_skips_content() {
         })
     };
     let mut effects = operation.start();
-    // An ungoverned bucket needs no gate, so the transaction starts at once.
+    // An ungoverned bucket needs no gate; a source without envelope rows needs no key.
     effects.extend(operation.step(missing()));
+    effects.extend(
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(Vec::<u8>::new().into(), None); 4],
+        })),
+    );
     let txn_id = Ulid::from_bytes([1; 16]);
     effects.extend(operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id })));
     effects.extend(operation.step(missing()));
@@ -389,3 +394,6 @@ async fn governed_copy_registered() {
     let refused = drive(SealedCopyOperation::new(request), &context).await;
     assert!(matches!(refused, Err(SealedCopyError::PolicyGate(_))));
 }
+
+#[path = "abe_tests.rs"]
+mod abe;

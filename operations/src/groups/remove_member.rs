@@ -508,7 +508,7 @@ impl RemoveFromOperation {
             admin_outbox_written,
             was_member,
         };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        smallvec![crate::abe::mark_due(Some(self.input.group_id), txn_id)]
     }
 
     fn handle_commit_transaction(
@@ -672,6 +672,11 @@ impl Operation for RemoveFromOperation {
             Ok(event) => event,
             Err(effects) => return effects,
         };
+        if let RemoveFromState::CommitTransaction { txn_id, .. } = self.state
+            && let Some(next) = crate::abe::marked(&event, txn_id)
+        {
+            return next.unwrap_or_else(|error| self.fail(error.into()));
+        }
 
         match self.state.clone() {
             RemoveFromState::Auth => self.handle_authorization(event),

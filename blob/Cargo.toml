@@ -11,6 +11,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aruna-kpabe = { workspace = true }
 lru = { workspace = true }
 aruna-core = { workspace = true }
 aruna-net = { workspace = true }

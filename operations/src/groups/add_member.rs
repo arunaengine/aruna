@@ -492,12 +492,22 @@ impl AddUserOperation {
         admin_outbox_written: bool,
         newly_added: bool,
     ) -> Effects {
+        // An assigned DENY rule can narrow the member's existing READ scopes.
+        let deny = self.input.role_ids.iter().any(|id| {
+            auth_doc
+                .roles
+                .get(id)
+                .is_some_and(|r| r.permissions.values().any(|p| *p == Permission::DENY))
+        });
         self.state = AddUserState::CommitTransaction {
             txn_id,
             auth_doc,
             admin_outbox_written,
             newly_added,
         };
+        if deny {
+            return smallvec![crate::abe::mark_due(Some(self.input.group_id), txn_id)];
+        }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -690,6 +700,11 @@ impl Operation for AddUserOperation {
             Ok(event) => event,
             Err(effects) => return effects,
         };
+        if let AddUserState::CommitTransaction { txn_id, .. } = self.state
+            && let Some(next) = crate::abe::marked(&event, txn_id)
+        {
+            return next.unwrap_or_else(|error| self.fail(error.into()));
+        }
 
         match self.state.clone() {
             AddUserState::Auth => self.handle_authorization(event),
@@ -1308,6 +1323,44 @@ pub mod test {
         assert!(operation.is_complete());
         let result = operation.finalize().unwrap();
         assert!(!result.roles[&role_id].assigned_users.contains(&member_id));
+    }
+
+    #[test]
+    fn deny_assignment_marks() {
+        let realm_id = RealmId::from_bytes([41u8; 32]);
+        let actor = Actor {
+            node_id: node(42),
+            user_id: UserId::local(Ulid::from_bytes([43u8; 16]), realm_id),
+            realm_id,
+        };
+        let member_id = UserId::local(Ulid::from_bytes([44u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([45u8; 16]);
+        let role_id = Ulid::from_bytes([46u8; 16]);
+        let mut auth_doc = seeded_user_role(group_id, role_id);
+        let role = auth_doc.roles.get_mut(&role_id).unwrap();
+        role.permissions
+            .insert("/test".to_string(), Permission::DENY);
+        let mut operation = AddUserOperation::new(AddUserInput {
+            actor: actor.clone(),
+            group_id,
+            user_id: member_id,
+            role_ids: HashSet::from([role_id]),
+        });
+        let txn_id = TxnId::generate();
+        let doc = Some(auth_doc.to_bytes(&actor).unwrap().into());
+        operation.emit_auth_write(txn_id, doc, None, None).unwrap();
+
+        // The existing DENY role's assignment marks epochs due before its transaction commits.
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let marked = SubOperationEvent::EpochsMarked { result: Ok(()) };
+        let effects = operation.step(Event::SubOperation(marked));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: id })] if *id == txn_id
+        ));
     }
 
     #[tokio::test]

@@ -3,9 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::keyspaces::GROUP_DELETE_KEYSPACE;
+use aruna_core::admin_documents::roles_narrowed;
+use aruna_core::keyspaces::{
+    BUCKET_ENCRYPTION_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+};
 use aruna_core::storage_entries::group_deletion_entries;
 use aruna_core::structs::identity::group_delete::{GroupDeleteRecord, MembershipFence};
+use aruna_core::structs::storage::abe_access::{due_rows, indexed_buckets};
 
 pub(crate) async fn apply_admin_operation(
     storage: &StorageHandle,
@@ -29,6 +33,59 @@ pub(crate) async fn apply_admin_operation(
             "admin document operation target does not match document sync target".to_string(),
         )),
     }
+}
+
+/// Epoch due rows for this node's encrypted buckets of a group, or of all groups without one,
+/// when `event` or the `narrowed` materialization can narrow a READ scope; epochs stay node-local.
+async fn due_writes(
+    storage: &StorageHandle,
+    event: &AdminDocumentEvent,
+    narrowed: bool,
+    group_id: Option<GroupId>,
+    txn_id: Option<TxnId>,
+) -> Result<Vec<(String, ByteView, Value)>> {
+    if !narrowed && !event.op.narrows_reads() {
+        return Ok(Vec::new());
+    }
+    let rows = match storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            prefix: group_id.map(|g| g.to_bytes().to_vec().into()),
+            start: None,
+            limit: usize::MAX,
+            txn_id,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => {
+            return Err(NetError::Dht(format!(
+                "unexpected index scan event: {other:?}"
+            )));
+        }
+    };
+    let buckets = indexed_buckets(&rows);
+    if buckets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reads = buckets
+        .iter()
+        .map(|b| (BUCKET_ENCRYPTION_KEYSPACE.to_string(), b.as_bytes().into()))
+        .collect();
+    let settings = match storage
+        .send_storage_effect(StorageEffect::BatchRead { reads, txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => {
+            return Err(NetError::Dht(format!(
+                "unexpected settings event: {other:?}"
+            )));
+        }
+    };
+    Ok(due_rows(&buckets, settings, unix_timestamp_millis()).0)
 }
 
 pub(in crate::document_sync) async fn persist_stale_event(
@@ -124,6 +181,9 @@ pub(in crate::document_sync) async fn apply_user_operation(
     .transpose()
     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     let user = materialize_user_operation(user_id, previous_user.as_ref(), &reducer_state, &event);
+    // Turning inactive ends READ; a replay or repeat leaves the status unchanged.
+    let deactivating =
+        !previous_user.as_ref().is_some_and(User::is_deactivated) && user.is_deactivated();
 
     let mut writes = vec![
         (
@@ -145,9 +205,6 @@ pub(in crate::document_sync) async fn apply_user_operation(
     let subject_ids = changed_subject_id
         .map(|subject_id| vec![subject_id])
         .unwrap_or_else(|| user.subject_ids.clone());
-    if subject_ids.is_empty() {
-        return replace_batch_transactionally(storage, deletes, writes).await;
-    }
 
     // A transient SSI conflict must never wedge the topic: retry with yields,
     // bounded as a livelock safety valve.
@@ -156,6 +213,13 @@ pub(in crate::document_sync) async fn apply_user_operation(
         let txn_id = start_storage_transaction(storage).await?;
         let mut attempt_writes = writes.clone();
         let mut attempt_deletes = deletes.clone();
+        // Markers come from this attempt so a bucket encrypted meanwhile is included.
+        if deactivating {
+            match due_writes(storage, &event, true, None, Some(txn_id)).await {
+                Ok(due) => attempt_writes.extend(due),
+                Err(error) => return Err(abort_error(storage, txn_id, error).await),
+            }
+        }
         for subject_id in &subject_ids {
             let subject_key = subject_index_key(subject_id);
             let mut claims = match transaction_read(
@@ -464,7 +528,9 @@ async fn group_transaction(
         roles: Default::default(),
         policies: Default::default(),
     });
+    let before = auth_doc.roles.clone();
     materialize_group_authorization(&mut auth_doc, &reducer_state, &event);
+    let narrowed = roles_narrowed(&before, &auth_doc.roles);
     let group_writes = group_reducer_entries(storage, group_id, &reducer_state, txn_id).await?;
 
     let mut writes = vec![
@@ -480,6 +546,8 @@ async fn group_transaction(
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     ];
     writes.extend(group_writes);
+    let due = due_writes(storage, &event, narrowed, Some(group_id), Some(txn_id)).await?;
+    writes.extend(due);
     writes.extend(
         conflict_write_entries(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -545,31 +613,7 @@ pub(in crate::document_sync) async fn apply_realm_authorization(
         return Ok(());
     }
 
-    let previous_auth_doc = storage_read_from(
-        storage,
-        document_target.storage_keyspace().to_string(),
-        document_target.storage_key(),
-    )
-    .await?
-    .map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    let mut auth_doc = previous_auth_doc.unwrap_or_else(|| RealmAuthorizationDocument {
-        realm_id,
-        roles: Default::default(),
-        operation_restrictions: Default::default(),
-    });
-    materialize_realm_authorization(&mut auth_doc, &reducer_state, &event);
-
     let mut writes = vec![
-        (
-            document_target.storage_keyspace().to_string(),
-            document_target.storage_key(),
-            auth_doc
-                .to_bytes(&event.actor)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                .into(),
-        ),
         reducer_state_entry(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     ];
@@ -577,10 +621,66 @@ pub(in crate::document_sync) async fn apply_realm_authorization(
         conflict_write_entries(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     );
+    let deletes = stale_conflict_deletes(previous_state.as_ref(), Some(&reducer_state));
 
-    let stale_conflict_deletes =
-        stale_conflict_deletes(previous_state.as_ref(), Some(&reducer_state));
-    replace_batch_transactionally(storage, stale_conflict_deletes, writes).await
+    // The roles and markers come from each attempt, so a bucket encrypted meanwhile is included.
+    for _ in 0..APPLY_CONFLICT_ATTEMPTS {
+        tokio::task::yield_now().await;
+        let txn_id = start_storage_transaction(storage).await?;
+        let previous = match transaction_read(
+            storage,
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+            Some(txn_id),
+        )
+        .await
+        {
+            Ok(previous) => previous,
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        };
+        let auth_doc = previous.map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes));
+        let mut auth_doc = match auth_doc.transpose() {
+            Ok(doc) => doc.unwrap_or_else(|| RealmAuthorizationDocument {
+                realm_id,
+                roles: Default::default(),
+                operation_restrictions: Default::default(),
+            }),
+            Err(error) => {
+                let error = NetError::Bootstrap(error.to_string());
+                return Err(abort_error(storage, txn_id, error).await);
+            }
+        };
+        let before = auth_doc.roles.clone();
+        materialize_realm_authorization(&mut auth_doc, &reducer_state, &event);
+        let narrowed = roles_narrowed(&before, &auth_doc.roles);
+        let doc = match auth_doc.to_bytes(&event.actor) {
+            Ok(doc) => doc,
+            Err(error) => {
+                let error = NetError::Bootstrap(error.to_string());
+                return Err(abort_error(storage, txn_id, error).await);
+            }
+        };
+        let mut attempt_writes = writes.clone();
+        attempt_writes.push((
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+            doc.into(),
+        ));
+        match due_writes(storage, &event, narrowed, None, Some(txn_id)).await {
+            Ok(due) => attempt_writes.extend(due),
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        }
+        match replace_batch_in(storage, txn_id, deletes.clone(), attempt_writes).await {
+            Ok(()) => return Ok(()),
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
+                abort_txn(storage, txn_id).await?;
+            }
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        }
+    }
+    Err(NetError::Dht(
+        "realm authorization apply conflict retries exhausted".to_string(),
+    ))
 }
 
 /// Realm-config ops the reducer stores as order-insensitive immutable values
@@ -1292,6 +1392,7 @@ async fn apply_realm_config(
         );
         let mut revocation_index =
             needs_index.then(|| reducer_state.revocation_index(effective_now));
+        let mut applied = false;
         if is_revocation {
             let Some(index) = revocation_index.as_mut() else {
                 return Err(abort_error(
@@ -1306,14 +1407,33 @@ async fn apply_realm_config(
                     abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
                 );
             }
-        } else if let Err(error) = reducer_state.apply(&event) {
-            return Err(abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await);
+        } else {
+            match reducer_state.apply(&event) {
+                Ok(status) => applied = status == AdminApplyStatus::Applied,
+                Err(error) => {
+                    return Err(abort_error(
+                        storage,
+                        txn_id,
+                        NetError::Bootstrap(error.to_string()),
+                    )
+                    .await);
+                }
+            }
         }
         reducer_state.advance_revocation_floor(effective_now);
         if let Some(index) = revocation_index.as_mut() {
             index.compact(&mut reducer_state);
         }
 
+        let cutoff_owner = match &event.op {
+            AdminDocumentOperation::ConfigTokenRevoked { token_owner, .. } => Some(*token_owner),
+            _ => None,
+        };
+        let cutoff_before = cutoff_owner.and_then(|owner| {
+            previous_config
+                .as_ref()
+                .and_then(|config| config.user_cutoff(&owner, effective_now))
+        });
         let (config, config_changed) = match plan_realm_change(
             previous_config,
             realm_id,
@@ -1334,6 +1454,13 @@ async fn apply_realm_config(
             return Ok(());
         }
 
+        // A new or later user cutoff ends READ for a deactivated account; a replay leaves it equal.
+        let cutoff_raised = cutoff_owner.is_some_and(|owner| {
+            config
+                .as_ref()
+                .and_then(|config| config.user_cutoff(&owner, effective_now))
+                > cutoff_before
+        });
         let mut writes = Vec::new();
         if config_changed && let Some(config) = config {
             let bytes = match config.to_bytes(&event.actor) {
@@ -1362,6 +1489,13 @@ async fn apply_realm_config(
             }
         };
         writes.push(reducer_write);
+        // A replayed policy event is a duplicate and writes no new due marker.
+        if applied || cutoff_raised {
+            match due_writes(storage, &event, cutoff_raised, None, Some(txn_id)).await {
+                Ok(due) => writes.extend(due),
+                Err(error) => return Err(abort_error(storage, txn_id, error).await),
+            }
+        }
         if previous_state
             .as_ref()
             .is_none_or(|previous| previous.conflicts != reducer_state.conflicts)

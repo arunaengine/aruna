@@ -7,7 +7,7 @@ use crate::placement::policy::{PolicyGateError, gate_decision, union_refs, write
 use crate::s3::multipart::part_upload::{UploadPartError, UploadPartInput, UploadPartOperation};
 use crate::s3::object::copy::{CopySourceConditions, evaluate_source_conditions};
 use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectOperation, ObjectRangeRequest,
+    GetObjectError, GetObjectInput, ObjectRangeRequest, TokenRead, read_local,
 };
 use crate::s3::purge_fence::ensure_write_allowed;
 use aruna_core::effects::StorageEffect;
@@ -67,25 +67,31 @@ pub async fn upload_part_copy(
     context: &DriverContext,
     input: PartCopyInput,
 ) -> Result<PartCopyResult, PartCopyError> {
+    upload_part_token(context, input, None).await
+}
+
+/// `upload_part_copy` where `token` admits the source read while its bucket key is locked.
+pub async fn upload_part_token(
+    context: &DriverContext,
+    input: PartCopyInput,
+    token: Option<TokenRead>,
+) -> Result<PartCopyResult, PartCopyError> {
     ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
         .await
         .map_err(|error| PartCopyError::UploadPart(UploadPartError::PurgeFence(error)))?;
     let destination_upload = validate_destination_upload(context, &input).await?;
 
-    let source = drive(
-        GetObjectOperation::new(GetObjectInput {
-            bucket: input.source_bucket,
-            key: input.source_key,
-            version_id: input.source_version_id,
-            range: input.range,
-            group_id: input.source_group_id,
-            user_identity: input.source_auth_context.user_id,
-            node_id: input.node_id,
-        })
-        .with_restrictions(input.source_auth_context.path_restrictions.clone()),
-        context,
-    )
-    .await?;
+    let source_input = GetObjectInput {
+        bucket: input.source_bucket,
+        key: input.source_key,
+        version_id: input.source_version_id,
+        range: input.range,
+        group_id: input.source_group_id,
+        user_identity: input.source_auth_context.user_id,
+        node_id: input.node_id,
+    };
+    let restrictions = input.source_auth_context.path_restrictions.clone();
+    let source = read_local(context, source_input, restrictions, token.as_ref()).await?;
 
     let source_version_id = source.version_id;
     let source_last_modified = source

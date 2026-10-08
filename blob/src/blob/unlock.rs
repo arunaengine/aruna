@@ -407,6 +407,23 @@ impl UnlockRegistry {
         Ok((session.secret.clone(), session.public_key))
     }
 
+    /// A lease of `archive` with a key a token opened. It pins the archive and holds `slot` like
+    /// a registry lease, but belongs to no unlock session.
+    pub(super) fn token_lease(
+        &self,
+        key: BucketKeyRef,
+        archive: ArchiveKey,
+        secret: SharedSecret,
+        slot: OwnedSemaphorePermit,
+    ) -> Result<ReadLease, BlobError> {
+        let guard = LeaseGuard {
+            secret,
+            _pin: self.pin(archive.clone())?,
+            _slot: slot,
+        };
+        Ok(ReadLease::new(key, archive, Ulid::nil(), Arc::new(guard)))
+    }
+
     /// Pins an archive without a key, so cleanup keeps it while keyless work uses it.
     /// An archive claimed for deletion is refused.
     pub(super) fn pin(&self, archive: ArchiveKey) -> Result<ArchivePin, BlobError> {

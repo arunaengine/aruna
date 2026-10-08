@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::{
@@ -10,12 +11,19 @@ use aruna_core::credential_encryption::{
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{ACCESS_OWNER_KEYSPACE, USER_ACCESS_KEYSPACE};
+use aruna_core::keyspaces::{
+    ACCESS_OWNER_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
 use aruna_core::structs::identity::auth::PathRestriction;
-use aruna_core::structs::storage::blob::UserAccess;
-use aruna_core::types::{Effects, GroupId};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
+use aruna_core::structs::storage::encryption::BucketEncryption;
+use aruna_core::structs::storage::key_audit::{
+    AuditAction, AuditOutcome, BucketAuditRecord, next_event_id,
+};
+use aruna_core::types::{Effects, GroupId, Key, Value};
 use rand::distr::Alphanumeric;
 use rand::{RngExt, rng};
 use smallvec::smallvec;
@@ -23,7 +31,10 @@ use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::index::{MAX_ACTIVE_CREDENTIALS, decode_index, encode_index, owner_key};
+use super::index::{
+    MAX_ACTIVE_CREDENTIALS, decode_index, encode_index, owner_key, token_deletes, token_scan,
+};
+use crate::s3::bucket::key::rows::{Row, audit_row};
 
 pub const DEFAULT_CREDENTIAL_TTL: Duration = Duration::from_secs(24 * 60 * 60 * 365);
 
@@ -43,6 +54,15 @@ pub enum CreateUserState {
     CommitTransaction,
     Finish,
     Error,
+    ReadTokenBuckets {
+        index: std::collections::BTreeSet<String>,
+    },
+    ScanStaleTokens {
+        index: std::collections::BTreeSet<String>,
+    },
+    DeleteStaleTokens {
+        index: std::collections::BTreeSet<String>,
+    },
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -73,6 +93,12 @@ pub enum CreateUserError {
     NotFinished,
     #[error("User access creation failed")]
     CreateAccessFailed,
+    #[error("bucket {0} does not exist")]
+    NoSuchBucket(String),
+    #[error("bucket {0} is not encrypted")]
+    NotEncrypted(String),
+    #[error("bucket {0} is not in the credential's group")]
+    OtherGroup(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -94,6 +120,62 @@ pub struct CreateUserOperation {
     txn_id: Option<ulid::Ulid>,
     state: CreateUserState,
     output: Result<(String, Secret, UserAccess), CreateUserError>,
+    tokens: Option<TokenPlan>,
+    /// Deleted credentials whose token grants still go, and where the current one's scan stands.
+    stale_tokens: (Vec<String>, Option<Key>),
+}
+
+/// The encrypted buckets a new credential reads with its token, and the audit rows of each.
+#[derive(Debug, Default, PartialEq)]
+struct TokenPlan {
+    buckets: Vec<String>,
+    origin: Option<(RealmId, NodeId)>,
+    now_ms: u64,
+    written: Vec<Row>,
+}
+
+impl TokenPlan {
+    /// Every bucket must exist in `group` and encrypt; each gets one audit entry.
+    fn check_buckets(
+        &mut self,
+        values: Vec<(Key, Option<Value>)>,
+        caller: UserId,
+        access_key: &str,
+        group: GroupId,
+    ) -> Result<(), CreateUserError> {
+        let (_, node_id) = self.origin.ok_or(CreateUserError::CreateAccessFailed)?;
+        let mut values = values.into_iter();
+        for bucket in &self.buckets {
+            let (Some(info), Some(settings)) = (values.next(), values.next()) else {
+                return Err(CreateUserError::CreateAccessFailed);
+            };
+            let Some(info) = info.1 else {
+                return Err(CreateUserError::NoSuchBucket(bucket.clone()));
+            };
+            if BucketInfo::from_bytes(&info)?.group_id != group {
+                return Err(CreateUserError::OtherGroup(bucket.clone()));
+            }
+            let active = BucketEncryption::from_row(settings.1.as_deref())?.active_key();
+            let key = active.ok_or_else(|| CreateUserError::NotEncrypted(bucket.clone()))?;
+            let audit = BucketAuditRecord {
+                event_id: next_event_id(self.now_ms),
+                bucket_id: key.bucket_id,
+                at_ms: self.now_ms,
+                action: AuditAction::TokenCreated,
+                actor: Some(caller),
+                node_id,
+                generation: Some(key.generation),
+                session_id: None,
+                intent_id: None,
+                sequence: None,
+                deadline_ms: None,
+                reason: Some(format!("token for access key {access_key}")),
+                outcome: AuditOutcome::Applied,
+            };
+            self.written.push(audit_row(&audit)?);
+        }
+        Ok(())
+    }
 }
 
 impl CreateUserOperation {
@@ -115,6 +197,78 @@ impl CreateUserOperation {
             txn_id: None,
             state: CreateUserState::Init,
             output: Err(CreateUserError::NotFinished),
+            tokens: None,
+            stale_tokens: (Vec::new(), None),
+        }
+    }
+
+    /// Checks that each of `buckets` exists and encrypts, in the credential's transaction. The
+    /// caller then opens key requests for the credential's token key.
+    pub fn with_tokens(
+        mut self,
+        buckets: Vec<String>,
+        origin: (RealmId, NodeId),
+        now_ms: u64,
+    ) -> Self {
+        self.tokens = Some(TokenPlan {
+            buckets,
+            origin: Some(origin),
+            now_ms,
+            ..TokenPlan::default()
+        });
+        self
+    }
+
+    /// Reads each token bucket's record and settings in the credential's transaction.
+    fn read_token_buckets(&mut self, index: std::collections::BTreeSet<String>) -> Effects {
+        let Some(plan) = self.tokens.as_ref() else {
+            return self.write_credentials(index);
+        };
+        let reads = plan
+            .buckets
+            .iter()
+            .flat_map(|bucket| {
+                let key: Key = bucket.as_bytes().to_vec().into();
+                [
+                    (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
+                    (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key),
+                ]
+            })
+            .collect();
+        self.state = CreateUserState::ReadTokenBuckets { index };
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// Every bucket must exist and encrypt; then the credential is written.
+    fn token_buckets_read(
+        &mut self,
+        event: Event,
+        index: std::collections::BTreeSet<String>,
+    ) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.handle_error(CreateUserError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                received: event,
+            });
+        };
+        let caller = self.config.user_identity;
+        let access_key = self
+            .access
+            .as_ref()
+            .map(|access| access.access_key.as_str());
+        let checked = match (self.tokens.as_mut(), access_key) {
+            (Some(plan), Some(access_key)) => {
+                plan.check_buckets(values, caller, access_key, self.config.group_id)
+            }
+            _ => Err(CreateUserError::CreateAccessFailed),
+        };
+        match checked {
+            Ok(()) => self.write_credentials(index),
+            Err(error) => self.handle_error(error),
         }
     }
 
@@ -276,6 +430,7 @@ impl CreateUserOperation {
                 return self.handle_error(CreateUserError::CreateAccessFailed);
             };
             self.state = CreateUserState::DeleteStale { index: active };
+            self.stale_tokens = (stale.clone(), None);
             return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                 deletes: stale
                     .into_iter()
@@ -289,7 +444,7 @@ impl CreateUserOperation {
                 txn_id: Some(txn_id),
             })];
         }
-        self.write_credentials(active)
+        self.read_token_buckets(active)
     }
 
     fn handle_stale_deleted(
@@ -304,7 +459,71 @@ impl CreateUserOperation {
                 received: event,
             });
         };
-        self.write_credentials(index)
+        self.scan_stale_tokens(index)
+    }
+
+    /// The token grants of each deleted credential go in the same transaction, a page at a time.
+    fn scan_stale_tokens(&mut self, index: std::collections::BTreeSet<String>) -> Effects {
+        let (Some(txn_id), Some(access_key)) = (self.txn_id, self.stale_tokens.0.last()) else {
+            return self.read_token_buckets(index);
+        };
+        let scan = token_scan(access_key, self.stale_tokens.1.take(), txn_id);
+        self.state = CreateUserState::ScanStaleTokens { index };
+        smallvec![scan]
+    }
+
+    fn stale_tokens_scanned(
+        &mut self,
+        event: Event,
+        index: std::collections::BTreeSet<String>,
+    ) -> Effects {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return self.handle_error(CreateUserError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::IterResult)",
+                received: event,
+            });
+        };
+        let (Some(txn_id), Some(access_key)) = (self.txn_id, self.stale_tokens.0.last()) else {
+            return self.handle_error(CreateUserError::CreateAccessFailed);
+        };
+        if values.is_empty() {
+            self.stale_tokens.0.pop();
+            return self.scan_stale_tokens(index);
+        }
+        let deletes = match token_deletes(access_key, values) {
+            Ok(deletes) => deletes,
+            Err(error) => return self.handle_error(error.into()),
+        };
+        self.stale_tokens.1 = next_start_after;
+        self.state = CreateUserState::DeleteStaleTokens { index };
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn stale_tokens_deleted(
+        &mut self,
+        event: Event,
+        index: std::collections::BTreeSet<String>,
+    ) -> Effects {
+        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
+            return self.handle_error(CreateUserError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
+                received: event,
+            });
+        };
+        // The last page of this credential leaves no cursor; the next credential follows.
+        if self.stale_tokens.1.is_none() {
+            self.stale_tokens.0.pop();
+        }
+        self.scan_stale_tokens(index)
     }
 
     fn write_credentials(&mut self, index: std::collections::BTreeSet<String>) -> Effects {
@@ -322,20 +541,24 @@ impl CreateUserOperation {
             Ok(value) => value,
             Err(err) => return self.handle_error(err.into()),
         };
+        let mut writes = vec![
+            (
+                USER_ACCESS_KEYSPACE.to_string(),
+                access.access_key.as_bytes().into(),
+                bytes.into(),
+            ),
+            (
+                ACCESS_OWNER_KEYSPACE.to_string(),
+                owner_key(self.config.user_identity),
+                index_value,
+            ),
+        ];
+        if let Some(plan) = self.tokens.as_mut() {
+            writes.append(&mut plan.written);
+        }
         self.state = CreateUserState::WriteCredentials;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![
-                (
-                    USER_ACCESS_KEYSPACE.to_string(),
-                    access.access_key.as_bytes().into(),
-                    bytes.into(),
-                ),
-                (
-                    ACCESS_OWNER_KEYSPACE.to_string(),
-                    owner_key(self.config.user_identity),
-                    index_value,
-                ),
-            ],
+            writes,
             txn_id: Some(txn_id),
         })]
     }
@@ -414,6 +637,15 @@ impl Operation for CreateUserOperation {
             CreateUserState::CommitTransaction => self.handle_committed(event),
             CreateUserState::Finish => smallvec![],
             CreateUserState::Error => self.abort(),
+            CreateUserState::ReadTokenBuckets { ref index } => {
+                self.token_buckets_read(event, index.clone())
+            }
+            CreateUserState::ScanStaleTokens { ref index } => {
+                self.stale_tokens_scanned(event, index.clone())
+            }
+            CreateUserState::DeleteStaleTokens { ref index } => {
+                self.stale_tokens_deleted(event, index.clone())
+            }
         }
     }
 
@@ -443,6 +675,9 @@ impl Operation for CreateUserOperation {
 mod pure_tests {
     use super::*;
     use crate::s3::access::index::owner_key;
+    use aruna_core::effects::IterStart;
+    use aruna_core::keyspaces::{ABE_GRANT_KEYSPACE, ABE_REQUEST_KEYSPACE, TOKEN_GRANT_KEYSPACE};
+    use aruna_core::structs::storage::abe_access::token_prefix;
 
     fn owner_read(op: &CreateUserOperation, value: Option<aruna_core::types::Value>) -> Event {
         Event::Storage(StorageEvent::BatchReadResult {
@@ -598,6 +833,61 @@ mod pure_tests {
             [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id: Some(id) })]
                 if *id == txn_id && deletes.len() == 1
         ));
+        let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        // The stale credential's token grants go in the same transaction: one full page, then
+        // the rest after its cursor.
+        let [
+            Effect::Storage(StorageEffect::Iter {
+                key_space,
+                prefix,
+                start: None,
+                txn_id: Some(id),
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the token index scan, got {effects:?}");
+        };
+        assert_eq!((key_space.as_str(), *id), (TOKEN_GRANT_KEYSPACE, txn_id));
+        let prefix = prefix.clone().unwrap();
+        assert_eq!(prefix.as_ref(), token_prefix(&stale_key).as_slice());
+        let request = |bucket: u8| vec![bucket; 80];
+        let row = |bucket: u8| [token_prefix(&stale_key), request(bucket)].concat();
+        let page = |bucket: u8, next: bool| {
+            let key = Key::from(row(bucket));
+            Event::Storage(StorageEvent::IterResult {
+                values: vec![(key.clone(), Value::from(Vec::new()))],
+                next_start_after: next.then_some(key),
+            })
+        };
+        let effects = op.step(page(1, true));
+        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice()
+        else {
+            panic!("expected the token deletes, got {effects:?}");
+        };
+        let deleted: Vec<_> = deletes
+            .iter()
+            .map(|(space, key)| (space.as_str(), key.to_vec()))
+            .collect();
+        assert_eq!(
+            deleted,
+            [
+                (ABE_REQUEST_KEYSPACE, request(1)),
+                (ABE_GRANT_KEYSPACE, request(1)),
+                (TOKEN_GRANT_KEYSPACE, row(1)),
+            ]
+        );
+        let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { start: Some(IterStart::After(after)), .. })]
+                if after.as_ref() == row(1).as_slice()
+        ));
+        op.step(page(2, false));
         let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
             entries: Vec::new(),
         }));
@@ -758,5 +1048,143 @@ mod pure_tests {
             op.finalize().unwrap_err(),
             CreateUserError::InvalidStateEvent { .. }
         ));
+    }
+
+    mod tokens {
+        use super::*;
+        use aruna_core::structs::identity::realm::RealmId;
+        use aruna_core::structs::storage::blob::BucketInfo;
+        use aruna_core::structs::storage::encryption::EncryptionMode;
+        use aruna_core::structs::storage::format::Compression;
+
+        const BUCKET_ID: Ulid = Ulid::from_bytes([4; 16]);
+
+        fn user(seed: u8) -> UserId {
+            UserId::new(Ulid::from_bytes([seed; 16]), RealmId::from_bytes([1; 32]))
+        }
+
+        fn info() -> BucketInfo {
+            BucketInfo {
+                group_id: Ulid::from_bytes([3; 16]),
+                created_at: SystemTime::UNIX_EPOCH,
+                created_by: user(1),
+                cors_configuration: None,
+                storage_routing: Vec::new(),
+                placement_policies: Vec::new(),
+                placement_policy_generation: 0,
+                compression: Compression::Off,
+            }
+        }
+
+        fn sealed() -> BucketEncryption {
+            BucketEncryption {
+                mode: EncryptionMode::VaultLocked,
+                bucket_id: Some(BUCKET_ID),
+                key_generation: 2,
+                ..Default::default()
+            }
+        }
+
+        fn rows(values: Vec<Option<Vec<u8>>>) -> Event {
+            let values = values
+                .into_iter()
+                .map(|value| (Key::from(Vec::new()), value.map(Value::from)))
+                .collect();
+            Event::Storage(StorageEvent::BatchReadResult { values })
+        }
+
+        /// Runs a token credential of `caller` for bucket `sealed` up to its bucket read.
+        fn started(caller: UserId) -> CreateUserOperation {
+            let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
+            let config = make_config(caller, Ulid::from_bytes([3; 16]));
+            let buckets = vec!["sealed".to_string()];
+            let mut operation = CreateUserOperation::new(config, test_key()).with_tokens(
+                buckets,
+                (caller.realm_id, node),
+                9,
+            );
+            operation.start();
+            let txn_id = Ulid::from_bytes([9; 16]);
+            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+            operation.step(owner_read(&operation, None));
+            let access_key = operation.access.as_ref().unwrap().access_key.clone();
+            let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+                values: vec![(access_key.into(), None)],
+            }));
+            let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
+            else {
+                panic!("expected the bucket read, got {effects:?}");
+            };
+            let spaces: Vec<_> = reads.iter().map(|(space, _)| space.as_str()).collect();
+            assert_eq!(spaces, [S3_BUCKET_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE]);
+            operation
+        }
+
+        fn failed(operation: CreateUserOperation) -> CreateUserError {
+            match operation.finalize() {
+                Err(error) => error,
+                Ok(_) => panic!("the credential was created"),
+            }
+        }
+
+        #[test]
+        fn token_bucket_audited() {
+            // Any caller may name an encrypted bucket, locked or not; key holders issue later.
+            let mut operation = started(user(2));
+            let effects = operation.step(rows(vec![
+                Some(info().to_bytes().unwrap()),
+                Some(sealed().to_bytes().unwrap()),
+            ]));
+            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
+            else {
+                panic!("expected the credential writes, got {effects:?}");
+            };
+            let spaces: Vec<_> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
+            assert_eq!(
+                spaces,
+                [
+                    USER_ACCESS_KEYSPACE,
+                    ACCESS_OWNER_KEYSPACE,
+                    aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE,
+                ]
+            );
+            let audit = BucketAuditRecord::from_bytes(&writes[2].2).unwrap();
+            assert_eq!(
+                (audit.action, audit.actor, audit.bucket_id, audit.generation),
+                (AuditAction::TokenCreated, Some(user(2)), BUCKET_ID, Some(2))
+            );
+        }
+
+        #[test]
+        fn unusable_buckets_refused() {
+            let mut operation = started(user(1));
+            operation.step(rows(vec![None, None]));
+            assert_eq!(
+                failed(operation),
+                CreateUserError::NoSuchBucket("sealed".to_string())
+            );
+
+            let mut operation = started(user(1));
+            operation.step(rows(vec![Some(info().to_bytes().unwrap()), None]));
+            assert_eq!(
+                failed(operation),
+                CreateUserError::NotEncrypted("sealed".to_string())
+            );
+
+            // A bucket of another group gets no token keys from this credential.
+            let mut operation = started(user(1));
+            let other = BucketInfo {
+                group_id: Ulid::from_bytes([4; 16]),
+                ..info()
+            };
+            operation.step(rows(vec![
+                Some(other.to_bytes().unwrap()),
+                Some(sealed().to_bytes().unwrap()),
+            ]));
+            assert_eq!(
+                failed(operation),
+                CreateUserError::OtherGroup("sealed".to_string())
+            );
+        }
     }
 }

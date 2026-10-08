@@ -288,7 +288,7 @@ impl Operation for RecoveryNoticeOperation {
                 let Some(key) = self.key else {
                     return self.fail(RecoveryNoticeError::NotFinished);
                 };
-                match decode(&values, SealedCopy::from_bytes) {
+                match decode(&SealedCopy::user_rows(values), SealedCopy::from_bytes) {
                     Ok(copies) => self.copies = copies,
                     Err(error) => return self.fail(error),
                 }

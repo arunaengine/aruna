@@ -117,6 +117,15 @@ pub struct RoleResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreatedRoleResponse {
+    #[serde(flatten)]
+    pub role: RoleResponse,
+    /// Open scoped key request ids created for assigned users in encrypted buckets on this node.
+    #[serde(default)]
+    pub key_requests: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[schema(as = AddGroupMemberRequest)]
 pub struct AddMemberRequest {
     pub user_id: String,
@@ -128,6 +137,9 @@ pub struct AddMemberRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GroupRolesResponse {
     pub roles: Vec<RoleResponse>,
+    /// Open scoped key request ids created for the member in encrypted buckets on this node.
+    #[serde(default)]
+    pub key_requests: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
@@ -1371,6 +1383,8 @@ administrative path for the user being added, so authority can be granted per me
 - When `role_ids` is omitted or empty the user is assigned the group's `user` role, and the request
   is rejected when that role is missing or ambiguous.
 - Adding a user who already holds the roles is accepted and changes nothing.
+- `key_requests` lists open scoped key requests for the member in encrypted buckets on this node;
+  holders are notified when the caller holds no bucket key.
 - The change commits here and reaches the rest of the realm through document sync."#,
     request_body(
         content = AddMemberRequest,
@@ -1399,7 +1413,8 @@ administrative path for the user being added, so authority can be granted per me
                         ],
                         "public": false
                     }
-                ]
+                ],
+                "key_requests": ["01JABCDEF0123456789ABCDEFG"]
             })
         ),
         (status = 400, description = "Malformed ids, a user id standing for everyone, or no default `user` role to fall back on", body = ErrorResponse),
@@ -1467,11 +1482,15 @@ pub async fn add_group_member(
     )
     .await
     .map_err(map_member_error)?;
+    let members = vec![user_id];
+    let key_requests =
+        crate::routes::storage::abe::member_requests(&state, &auth, group_id, members).await;
 
     Ok((
         StatusCode::CREATED,
         Json(GroupRolesResponse {
             roles: map_roles(auth_doc, state.get_realm_id()),
+            key_requests,
         }),
     ))
 }
@@ -1551,6 +1570,7 @@ pub async fn remove_group_member(
     )
     .await
     .map_err(map_removal_error)?;
+    crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1602,6 +1622,7 @@ pub async fn leave_group(
     )
     .await
     .map_err(map_removal_error)?;
+    crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1620,6 +1641,8 @@ administrative path.
 - Each permission path is granted as `READ`, `WRITE` or `DENY`, accepted case-insensitively and
   reported capitalised.
 - The role commits here and reaches the rest of the realm through document sync.
+- `key_requests` lists open scoped key requests for assigned users in encrypted buckets on this
+  node; holders are notified when the caller holds no bucket key.
 
 **Limits**
 - The name is trimmed, must not be empty, and must not be `admin` or `user`, which are reserved for
@@ -1647,7 +1670,7 @@ administrative path.
         (
             status = 201,
             description = "The created role as stored, with its generated id",
-            body = RoleResponse,
+            body = CreatedRoleResponse,
             example = json!({
                 "role_id": "01JROLEREADERS123456789ABC",
                 "name": "readers",
@@ -1657,7 +1680,8 @@ administrative path.
                 "assigned_users": [
                     "01JUSER02ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
                 ],
-                "public": false
+                "public": false,
+                "key_requests": ["01JABCDEF0123456789ABCDEFG"]
             })
         ),
         (status = 400, description = "Reserved or empty name, an unknown grant value, a permission path outside the group, a malformed assigned user, or a public role asking for more than `READ`", body = ErrorResponse),
@@ -1673,7 +1697,7 @@ pub async fn create_group_role(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
     Json(request): Json<CreateRoleRequest>,
-) -> ServerResult<(StatusCode, Json<RoleResponse>)> {
+) -> ServerResult<(StatusCode, Json<CreatedRoleResponse>)> {
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let realm_id = state.get_realm_id();
@@ -1725,6 +1749,7 @@ pub async fn create_group_role(
         assigned_users.insert(UserId::nil(realm_id));
     }
 
+    let narrows = permissions.values().any(|p| p == &Permission::DENY);
     let role_id = Ulid::generate();
     let (_, auth_doc) = drive(
         AddRoleOperation::new(AddRoleConfig {
@@ -1736,7 +1761,7 @@ pub async fn create_group_role(
                 role_id,
                 name,
                 permissions,
-                assigned_users,
+                assigned_users: assigned_users.clone(),
             },
         }),
         &state.get_ctx(),
@@ -1749,6 +1774,14 @@ pub async fn create_group_role(
         .find(|role| role.role_id == role_id.to_string())
         .ok_or_else(|| ServerError::InternalError("created role missing".to_string()))?;
 
+    // A DENY rule can narrow existing READ scopes.
+    if narrows {
+        crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
+    }
+    let members = assigned_users.into_iter().collect();
+    let key_requests =
+        crate::routes::storage::abe::member_requests(&state, &auth, group_id, members).await;
+    let role = CreatedRoleResponse { role, key_requests };
     Ok((StatusCode::CREATED, Json(role)))
 }
 
@@ -1820,6 +1853,7 @@ pub async fn delete_group_role(
         }
         other => ServerError::InternalError(other.to_string()),
     })?;
+    crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

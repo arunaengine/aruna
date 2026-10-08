@@ -1,0 +1,25 @@
+# Manifest of aruna-kpabe, the KP-ABE key encapsulation crate.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-kpabe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aes-gcm-core = { workspace = true }
+bls12_381_plus = { workspace = true }
+rand_core = { workspace = true }
+sha2 = { workspace = true, features = ["zeroize"] }
+sha2_010 = { workspace = true }
+thiserror-core = { workspace = true }
+zeroize = { workspace = true, features = ["alloc"] }
+
+[dev-dependencies]
+hex = { workspace = true }
+rand = { workspace = true }
+serde_json = { workspace = true }

@@ -41,6 +41,7 @@ use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
 
+mod abe;
 pub mod bulk;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +57,9 @@ pub enum DeleteObjectState {
     ApplyHeadTransition,
     DeletePathIndex,
     DeleteTargetVersion,
+    ReadEnvelopeVersion,
+    ReadEnvelopeRows,
+    DeleteEnvelopeRows,
     RemoveManagedCopies,
     DeleteMultipartSummary,
     ReadMultipartParts,
@@ -171,6 +175,7 @@ pub struct DeleteObjectOperation {
     multipart_part_keys: Vec<Key>,
     multipart_delete_index: usize,
     target_size: Option<u64>,
+    envelope_bytes: u64,
     target_location: Option<BlobLocationKey>,
     /// The Pithos archive the deleted version used, with its stored location.
     target_archive: Option<(ArchiveKey, Option<BackendLocation>)>,
@@ -201,6 +206,7 @@ impl DeleteObjectOperation {
             multipart_part_keys: Vec::new(),
             multipart_delete_index: 0,
             target_size: None,
+            envelope_bytes: 0,
             target_location: None,
             target_archive: None,
             live_before_marker: false,
@@ -592,7 +598,7 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
 
-        self.remove_managed_copies()
+        self.read_envelope_version()
     }
 
     /// Joins the delete transaction, so no local registration outlives the
@@ -783,9 +789,14 @@ impl DeleteObjectOperation {
                 0
             };
             let bytes = self.target_size.map_or(0, |size| -i128::from(size));
+            let envelope = -i128::from(self.envelope_bytes);
             UsageDelta {
                 objects,
-                logical_bytes: if target.referenced { 0 } else { bytes },
+                logical_bytes: if target.referenced {
+                    envelope
+                } else {
+                    bytes + envelope
+                },
                 referenced_bytes: if target.referenced { bytes } else { 0 },
                 ..Default::default()
             }
@@ -1035,6 +1046,9 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::ApplyHeadTransition => self.head_transition_applied(event),
             DeleteObjectState::DeletePathIndex => self.target_path_deleted(event),
             DeleteObjectState::DeleteTargetVersion => self.target_version_deleted(event),
+            DeleteObjectState::ReadEnvelopeVersion => self.envelope_version_read(event),
+            DeleteObjectState::ReadEnvelopeRows => self.envelope_rows_read(event),
+            DeleteObjectState::DeleteEnvelopeRows => self.envelope_rows_deleted(event),
             DeleteObjectState::RemoveManagedCopies => self.handle_copies_removed(event),
             DeleteObjectState::DeleteMultipartSummary => self.summary_deleted(event),
             DeleteObjectState::ReadMultipartParts => self.parts_read(event),

@@ -1184,7 +1184,7 @@ fn omitted_parts_deleted() {
     let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice() else {
         panic!("expected batch delete effect");
     };
-    assert_eq!(deletes.len(), 3);
+    assert_eq!(deletes.len(), 4);
     let omitted_key = MultipartPartKey::new(op.input.upload_id, 2)
         .to_bytes()
         .unwrap();
@@ -1730,6 +1730,339 @@ fn sealed_rotation_refused() {
         operation.cleanup.take_error(),
         Some(CompleteUploadError::BucketKey(_))
     ));
+    assert!(operation.reclaim_pending);
+}
+
+/// Answers the envelope fence of a sealed completion; `pending` stores an epoch 1 envelope.
+fn abe_fenced(pending: bool, epoch: u64) -> CompleteUploadOperation {
+    use aruna_core::structs::storage::abe::{EnvelopePlan, create_envelope, create_parameters};
+    let (mut operation, location) = sealed_operation(&[b"first"]);
+    operation.txn_id = Some(Ulid::from_parts(4, 4));
+    operation.composed_location = Some(location);
+    let input = &operation.input;
+    let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
+    let key = sealed_plan().key;
+    let parameters = create_parameters(&secret, input.realm_id, input.node_id, key).unwrap();
+    let (envelope, _) = create_envelope(EnvelopePlan {
+        parameters: parameters.clone(),
+        epoch: 1,
+        write_id: Ulid::from_parts(6, 6),
+        object_key: input.key.clone(),
+        bucket_public: [3; 32],
+    })
+    .unwrap();
+    let row = pending.then(|| envelope.to_bytes().unwrap().into());
+    operation.state = CompleteUploadState::FenceAbe;
+    operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (b"pending".to_vec().into(), row),
+            (
+                b"p".to_vec().into(),
+                Some(parameters.to_bytes().unwrap().into()),
+            ),
+            (
+                b"e".to_vec().into(),
+                Some(epoch.to_be_bytes().to_vec().into()),
+            ),
+        ],
+    }));
+    operation
+}
+
+#[test]
+fn stale_epoch_reclaims() {
+    // A raised epoch refuses the completion; the record reset also deletes the pending envelope.
+    let mut operation = abe_fenced(true, 2);
+    assert!(operation.reclaim_pending);
+    operation.step(Event::Storage(StorageEvent::TransactionAborted {
+        txn_id: Ulid::from_parts(4, 4),
+    }));
+    let txn_id = Ulid::from_parts(4, 5);
+    operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    let mut record = operation.upload_record.clone().unwrap();
+    record.status = MultipartUploadStatus::Completing;
+    record.completing_since_ms = Some(TEST_NOW_MS);
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"upload".to_vec().into(),
+        value: Some(record.to_bytes().unwrap().into()),
+    }));
+    let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: b"upload".to_vec().into(),
+    }));
+    let [Effect::Storage(StorageEffect::Delete { key_space, key, .. })] = effects.as_slice() else {
+        panic!("expected the pending envelope delete, got {effects:?}")
+    };
+    assert_eq!(key_space, ABE_PENDING_KEYSPACE);
+    assert_eq!(key.as_ref(), operation.input.upload_id.to_bytes());
+    let effects = operation.step(Event::Storage(StorageEvent::DeleteResult {
+        key: key.clone(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit })] if *commit == txn_id
+    ));
+    assert!(matches!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::BlobError(BlobError::Abe(
+            AbeError::Epoch
+        )))
+    ));
+}
+
+/// Refuses the commit of a published envelope and answers the reset's recheck with `epoch`.
+fn conflict_recheck(epoch: u64) -> (CompleteUploadOperation, Effects) {
+    use aruna_core::structs::storage::abe::create_parameters;
+    use aruna_core::structs::storage::encryption::EncryptionMode;
+    let mut operation = abe_fenced(true, 1);
+    let envelope = operation.envelope.take().unwrap();
+    operation.envelope_bytes = 10;
+    operation.state = CompleteUploadState::CommitFinalizeTransaction;
+    operation.step(Event::Storage(StorageEvent::Error {
+        error: StorageError::TransactionConflict,
+    }));
+    let txn_id = Ulid::from_parts(4, 5);
+    operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    let mut record = operation.upload_record.clone().unwrap();
+    record.status = MultipartUploadStatus::Completing;
+    record.completing_since_ms = Some(TEST_NOW_MS);
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"upload".to_vec().into(),
+        value: Some(record.to_bytes().unwrap().into()),
+    }));
+    let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: b"upload".to_vec().into(),
+    }));
+    let [
+        Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: read,
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("expected the pending recheck, got {effects:?}")
+    };
+    assert_eq!((reads.len(), *read), (4, Some(txn_id)));
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(Ulid::from_parts(8, 8)),
+        key_generation: 1,
+        storage_generation: 2,
+        ..Default::default()
+    };
+    let input = &operation.input;
+    let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
+    let key = sealed_plan().key;
+    let parameters = create_parameters(&secret, input.realm_id, input.node_id, key).unwrap();
+    let values = vec![
+        (
+            reads[0].1.clone(),
+            Some(settings.to_bytes().unwrap().into()),
+        ),
+        (
+            reads[1].1.clone(),
+            Some(envelope.to_bytes().unwrap().into()),
+        ),
+        (
+            reads[2].1.clone(),
+            Some(parameters.to_bytes().unwrap().into()),
+        ),
+        (
+            reads[3].1.clone(),
+            Some(epoch.to_be_bytes().to_vec().into()),
+        ),
+    ];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    (operation, effects)
+}
+
+#[test]
+fn conflict_reclaims_stale() {
+    // An epoch raised between the fence read and the commit drops the pending envelope.
+    let (_, effects) = conflict_recheck(2);
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Delete { key_space, .. })] if key_space == ABE_PENDING_KEYSPACE
+        ),
+        "{effects:?}"
+    );
+    // An unrelated conflict keeps it, so the upload stays retryable.
+    let (_, effects) = conflict_recheck(1);
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        ),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn bucket_only_publishes() {
+    // A generation without admitted parameters completes without an envelope.
+    let (mut operation, location) = sealed_operation(&[b"first"]);
+    operation.txn_id = Some(Ulid::from_parts(4, 4));
+    operation.composed_location = Some(location);
+    operation.state = CompleteUploadState::FenceAbe;
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (b"pending".to_vec().into(), None),
+            (b"p".to_vec().into(), None),
+            (b"e".to_vec().into(), None),
+        ],
+    }));
+    assert!(
+        !matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ),
+        "{effects:?}"
+    );
+    assert!(operation.envelope.is_none());
+    assert!(operation.cleanup.take_error().is_none());
+}
+
+#[test]
+fn missing_envelope_refused() {
+    // An upload of a generation with admitted parameters never publishes without its envelope.
+    let mut operation = abe_fenced(false, 1);
+    assert!(!operation.reclaim_pending);
+    assert!(matches!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::BlobError(BlobError::Abe(
+            AbeError::Stale
+        )))
+    ));
+}
+
+#[test]
+fn envelope_publishes_charged() {
+    // A current envelope is published with the version and charged to the group.
+    let mut operation = abe_fenced(true, 1);
+    assert!(operation.envelope.is_some());
+    let location = operation.composed_location.clone().unwrap();
+    operation.final_location = Some(location);
+    operation.version_id = Some(Ulid::from_parts(5, 1));
+    operation.state = CompleteUploadState::WriteVersionRecord;
+    let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: b"version".to_vec().into(),
+    }));
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice() else {
+        panic!("expected the envelope rows, got {effects:?}")
+    };
+    assert_eq!(*txn_id, operation.txn_id);
+    let spaces: Vec<_> = writes.iter().map(|(space, ..)| space.as_str()).collect();
+    assert_eq!(
+        spaces,
+        [
+            aruna_core::keyspaces::ABE_ENVELOPE_KEYSPACE,
+            aruna_core::keyspaces::ABE_VERSION_KEYSPACE,
+            aruna_core::keyspaces::ABE_ARCHIVE_KEYSPACE,
+        ]
+    );
+    assert!(operation.envelope_bytes > 0);
+    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Write { key_space, .. })]
+            if key_space == aruna_core::keyspaces::COPY_OWNER_KEYSPACE
+    ));
+}
+
+/// Publishes the fenced pending envelope under a metadata limit, returning the step's effects.
+fn publish_envelope(metadata_bytes: u64) -> (CompleteUploadOperation, Effects) {
+    let limits = RoCrateLimits {
+        metadata_bytes,
+        ..Default::default()
+    };
+    let mut operation = abe_fenced(true, 1).with_rocrate_limits(limits);
+    operation.final_location = operation.composed_location.clone();
+    operation.version_id = Some(Ulid::from_parts(5, 1));
+    operation.state = CompleteUploadState::WriteVersionRecord;
+    let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: b"version".to_vec().into(),
+    }));
+    (operation, effects)
+}
+
+#[test]
+fn envelope_limit_boundary() {
+    // The metadata limit and the charge count a pending mapping at its promoted size.
+    use aruna_core::structs::storage::abe::{EnvelopeArchive, envelope_charge};
+    let (operation, effects) = publish_envelope(u64::MAX);
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("expected the envelope rows, got {effects:?}")
+    };
+    let (envelope, id, mapping) = (&writes[0].2, &writes[0].1, &writes[2].2);
+    let location = operation.final_location.as_ref().unwrap();
+    let mut archive: EnvelopeArchive = postcard::from_bytes(mapping).unwrap();
+    assert!(archive.location_key.is_empty());
+    let key = BlobLocationKey::new(
+        [1; 32],
+        location.format.encoding(),
+        location.backend.clone(),
+    );
+    archive.location_key = key.to_bytes();
+    let promoted = postcard::to_allocvec(&archive).unwrap();
+    assert!(promoted.len() > mapping.len() + 1);
+    assert_eq!(
+        operation.envelope_bytes,
+        envelope_charge(envelope, &promoted)
+    );
+    assert_eq!(operation.envelope_bytes, envelope_charge(envelope, mapping));
+    let metadata = &operation.upload_record.as_ref().unwrap().metadata;
+    let metadata = postcard::to_allocvec(metadata).unwrap();
+    let limit = operation.envelope_bytes + (id.len() + metadata.len()) as u64;
+    let (_, effects) = publish_envelope(limit);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchWrite { .. })]
+    ));
+    let (mut operation, _) = publish_envelope(limit - 1);
+    assert!(matches!(
+        operation.cleanup.take_error(),
+        Some(CompleteUploadError::BlobError(BlobError::Abe(
+            AbeError::Limit
+        )))
+    ));
+}
+
+#[test]
+fn ceiling_covers_promotion() {
+    // A completion exactly at the ceiling has paid for the mapping its keyed read promotes.
+    use aruna_core::structs::storage::usage::UsageCounters;
+    for (slack, exceeded) in [(0, false), (1, true)] {
+        let (mut operation, _) = publish_envelope(u64::MAX);
+        let size = operation.final_location.as_ref().unwrap().blob_size;
+        let used = 7;
+        operation.input.quota_ceiling = Some(used + size + operation.envelope_bytes - slack);
+        operation.state = CompleteUploadState::WriteReplicationObligation;
+        operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"obligation".to_vec().into(),
+        }));
+        assert!(matches!(operation.state, CompleteUploadState::EnforceQuota));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"realm".to_vec().into(),
+            value: None,
+        }));
+        let counters = UsageCounters {
+            logical_bytes: used,
+            ..Default::default()
+        };
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"group".to_vec().into(),
+            value: Some(counters.to_bytes().unwrap().into()),
+        }));
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        let error = operation.cleanup.take_error();
+        let refused = matches!(error, Some(CompleteUploadError::QuotaExceeded { .. }));
+        assert_eq!(refused, exceeded, "slack {slack}: {error:?}");
+    }
 }
 
 #[test]

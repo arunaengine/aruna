@@ -69,6 +69,12 @@ impl EffectClass {
 
 fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
     match effect {
+        BlobEffect::Abe(effect) => match effect.as_ref() {
+            aruna_core::structs::storage::abe::AbeEffect::Write { .. } => {
+                (EffectClass::Transfer, "write_object")
+            }
+            _ => (EffectClass::Local, "abe"),
+        },
         BlobEffect::Write { .. } => (EffectClass::Transfer, "write"),
         BlobEffect::WritePart { .. } => (EffectClass::Transfer, "write_part"),
         BlobEffect::Compose { .. } => (EffectClass::Transfer, "compose"),
@@ -111,6 +117,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::ReadSealed { .. } => (EffectClass::Read, "read_sealed"),
         BlobEffect::ServeSealedRead { .. } => (EffectClass::Transfer, "serve_sealed_read"),
         BlobEffect::ReserveCompose { .. } => (EffectClass::Local, "reserve_compose"),
+        BlobEffect::ReplicateLeased { .. } => (EffectClass::Transfer, "replicate_leased"),
     }
 }
 
@@ -119,7 +126,8 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
 fn blob_effect_mutates(effect: &BlobEffect) -> bool {
     matches!(
         effect,
-        BlobEffect::Write { .. }
+        BlobEffect::Abe(_)
+            | BlobEffect::Write { .. }
             | BlobEffect::WritePart { .. }
             | BlobEffect::Compose { .. }
             | BlobEffect::OpenUpload { .. }
@@ -134,6 +142,7 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::RewriteCopy { .. }
             | BlobEffect::WritePiece { .. }
             | BlobEffect::ComposePieces { .. }
+            | BlobEffect::ReplicateLeased { .. }
     )
 }
 
@@ -652,6 +661,7 @@ impl BlobHandler {
 
     async fn dispatch_effect(&self, effect: BlobEffect) -> BlobEvent {
         match effect {
+            BlobEffect::Abe(effect) => self.abe_effect(*effect).await,
             BlobEffect::Write {
                 bucket,
                 key,
@@ -801,9 +811,17 @@ impl BlobHandler {
                 lease,
                 target,
                 grants_only,
+                object,
             } => {
                 let (lease, target) = (lease.map(|lease| *lease), *target);
-                let rewrite = self.rewrite_copy(&bucket, &key, source, lease, target, grants_only);
+                let rewrite = self.rewrite_copy(
+                    &bucket,
+                    &key,
+                    source,
+                    lease,
+                    target,
+                    (grants_only, object.map(|key| *key)),
+                );
                 Box::pin(rewrite).await
             }
             BlobEffect::ReadUnlockedKey { key } => self.read_unlocked(key),
@@ -813,10 +831,13 @@ impl BlobHandler {
                 resolved,
                 created_by,
                 content_offset,
+                object,
                 blob,
             } => {
                 let part = MultipartPartKey::new(upload_id, part_number);
-                Box::pin(self.seal_piece(part, resolved, created_by, content_offset, blob)).await
+                let piece =
+                    self.seal_piece(part, resolved, created_by, (content_offset, object), blob);
+                Box::pin(piece).await
             }
             BlobEffect::ComposePieces {
                 bucket,
@@ -867,11 +888,12 @@ impl BlobHandler {
                 stream_id,
                 resolved,
                 keep_alive,
+                object,
             } => {
                 Box::pin(self.handle_incoming_replication(
                     replication_id,
                     stream_id,
-                    resolved,
+                    (resolved, object),
                     keep_alive,
                 ))
                 .await
@@ -902,6 +924,18 @@ impl BlobHandler {
                 size,
                 expected_blake3,
             } => Box::pin(self.receive_read(stream_id, size, expected_blake3)).await,
+            BlobEffect::ReplicateLeased {
+                replication_id,
+                stream_id,
+                location,
+                lease,
+                regrant,
+                object,
+            } => {
+                let ids = (replication_id, stream_id);
+                let regrant = regrant.map(|plan| (*plan, object));
+                Box::pin(self.replicate_leased(ids, location, *lease, regrant)).await
+            }
         }
     }
 

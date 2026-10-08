@@ -242,7 +242,7 @@ impl SetPoliciesOperation {
             return self.fail(SetPoliciesError::MissingTransaction);
         };
         self.state = SetPoliciesState::CommitTransaction { document };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        smallvec![crate::abe::mark_due(None, txn_id)]
     }
 
     fn fail(&mut self, error: SetPoliciesError) -> Effects {
@@ -282,6 +282,12 @@ impl Operation for SetPoliciesOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let (SetPoliciesState::CommitTransaction { .. }, Some(txn_id)) =
+            (&self.state, self.txn_id)
+            && let Some(next) = crate::abe::marked(&event, txn_id)
+        {
+            return next.unwrap_or_else(|error| self.fail(error.into()));
+        }
         match self.state.clone() {
             SetPoliciesState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {

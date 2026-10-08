@@ -35,7 +35,7 @@ fn keys(user_id: UserId) -> KeyLookup {
     }])
 }
 
-fn copy(user_id: UserId) -> Vec<u8> {
+fn copy(user_id: UserId) -> (Key, Value) {
     let copy = SealedCopy {
         key: BucketKeyRef::new(BUCKET_ID, 1),
         user_id,
@@ -45,7 +45,7 @@ fn copy(user_id: UserId) -> Vec<u8> {
         ciphertext: vec![0; 48],
         created_at_ms: 1,
     };
-    copy.to_bytes().unwrap()
+    (copy.key().into(), copy.to_bytes().unwrap().into())
 }
 
 fn rows(values: Vec<Vec<u8>>) -> Event {
@@ -92,7 +92,10 @@ fn checked(admins: &[UserId], marker: Option<Vec<u8>>) -> (RecoveryNoticeOperati
     let values = authority_rows(&info, Some(&settings), admins);
     operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
     operation.step(rows(Vec::new()));
-    operation.step(rows(vec![copy(user(1)), copy(user(2))]));
+    operation.step(Event::Storage(StorageEvent::IterResult {
+        values: vec![copy(user(1)), copy(user(2))],
+        next_start_after: None,
+    }));
     let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
         key: Key::from(Vec::new()),
         value: marker.map(Value::from),

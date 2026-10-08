@@ -139,36 +139,6 @@ pub(crate) async fn batch_write_to(
     }
 }
 
-pub(super) async fn replace_batch_transactionally(
-    storage: &StorageHandle,
-    deletes: Vec<(String, ByteView)>,
-    writes: Vec<(String, ByteView, Value)>,
-) -> Result<()> {
-    // As in realm-config applies: a transient SSI conflict must never abort
-    // inbound processing, or ops land without meta and the topic wedges.
-    let mut last = None;
-    for _ in 0..APPLY_CONFLICT_ATTEMPTS {
-        tokio::task::yield_now().await;
-        let txn_id = start_storage_transaction(storage).await?;
-        match replace_batch_in(storage, txn_id, deletes.clone(), writes.clone()).await {
-            Ok(()) => return Ok(()),
-            Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                last = Some(NetError::Storage(StorageError::TransactionConflict));
-            }
-            Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error);
-            }
-        }
-    }
-    Err(last.unwrap_or_else(|| NetError::Dht("apply conflict retries exhausted".to_string())))
-}
-
 pub(super) async fn replace_batch_in(
     storage: &StorageHandle,
     txn_id: TxnId,

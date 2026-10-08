@@ -15,8 +15,10 @@ use aruna_api::routes::sync::{
     SyncRelationshipResponse, SyncSourceRequest, SyncTargetRequest,
 };
 use aruna_core::UserId;
+use aruna_core::compute::SecretBytes;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::key_seal::{SealedSecret, open_sealed};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
     RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
@@ -25,12 +27,16 @@ use aruna_core::keyspaces::{
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::storage::abe::GRANT_PURPOSE;
+use aruna_core::structs::storage::abe_access::KeyGrant;
 use aruna_core::structs::storage::blob::{
     BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, VersionKey, group_permission_path,
 };
+use aruna_core::structs::storage::encryption::public_key_of;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
+use aruna_kpabe::{Envelope, UserKey};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
 use aws_sdk_s3::Client as S3Client;
@@ -40,7 +46,9 @@ use aws_sdk_s3::types::{
     DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
     ReplicationRule, ReplicationRuleStatus,
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::StatusCode;
+use serde_json::json;
 use shared::{
     JoinerNode, SeedNode, TestResult, bucket_arn, create_bearer_token, create_group_http,
     create_onboarding_secret, create_restricted_credentials, create_s3_credentials, s3_client,
@@ -547,6 +555,7 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
                     mode: ApiSyncMode::Continuous,
                     reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -709,6 +718,7 @@ async fn once_syncs_prefix() -> TestResult<()> {
                     mode: ApiSyncMode::Once,
                     reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: false,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -846,6 +856,7 @@ async fn reference_syncs_lazily() -> TestResult<()> {
                     mode: ApiSyncMode::Reference,
                     reference_handling: ApiReferenceHandling::Preserve,
                     replicate_deletes: true,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -1117,6 +1128,7 @@ async fn quota_surfaces_failure() -> TestResult<()> {
                     mode: ApiSyncMode::Once,
                     reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: false,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -1207,6 +1219,7 @@ async fn permission_rechecks_creator() -> TestResult<()> {
                     mode: ApiSyncMode::Continuous,
                     reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -1319,6 +1332,7 @@ async fn chain_blocks_cycle() -> TestResult<()> {
                     mode: ApiSyncMode::Continuous,
                     reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -1339,6 +1353,7 @@ async fn chain_blocks_cycle() -> TestResult<()> {
                     mode: ApiSyncMode::Continuous,
                     reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -1359,6 +1374,7 @@ async fn chain_blocks_cycle() -> TestResult<()> {
                     mode: ApiSyncMode::Continuous,
                     reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
+                    plaintext: false,
                 },
             )
             .await?;
@@ -1875,6 +1891,196 @@ async fn compression_matrix_replicates() -> TestResult<()> {
                 );
             }
         }
+        Ok(())
+    }
+    .await;
+
+    harness.shutdown().await;
+    result
+}
+
+/// Turns on `node_managed` encryption of `bucket` through S3.
+async fn encrypt_bucket(client: &S3Client, bucket: &str) -> TestResult<()> {
+    use aws_sdk_s3::types::{
+        ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+        ServerSideEncryptionRule,
+    };
+    let default = ServerSideEncryptionByDefault::builder()
+        .sse_algorithm(ServerSideEncryption::Aes256)
+        .build()?;
+    let rule = ServerSideEncryptionRule::builder()
+        .apply_server_side_encryption_by_default(default)
+        .build();
+    let configuration = ServerSideEncryptionConfiguration::builder()
+        .rules(rule)
+        .build()?;
+    client
+        .put_bucket_encryption()
+        .bucket(bucket)
+        .server_side_encryption_configuration(configuration)
+        .send()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_sync_regrants() -> TestResult<()> {
+    // The locked target reads the copy with a scoped key of its own bucket alone.
+    let harness = ReplicationHarness::new("replication-encrypted-group").await?;
+
+    let result = async {
+        let (source, target) = ("encrypted-source", "encrypted-target");
+        let key = "sealed/object.txt";
+        let body = b"sealed on the source, granted to the target".repeat(64);
+        let (http, token) = (reqwest::Client::new(), &harness.seed_token);
+        let base = &harness.joiner.base_url;
+        shared::add_user(harness.joiner.context.as_ref(), harness.seed.user_id).await?;
+        harness.create_bucket_pair(source, target).await?;
+        encrypt_bucket(&harness.seed_client, source).await?;
+        let user_private = SecretBytes::new(vec![7; 32]);
+        let user_public = public_key_of(&user_private).unwrap();
+        let response = http
+            .post(format!("{base}/api/v1/access/users/me/keys"))
+            .bearer_auth(token)
+            .json(&json!({"key_id":"sync-reader","public_key":STANDARD.encode(user_public),"has_recovery":true}))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let encryption = format!("{base}/api/v1/data/buckets/{target}/storage/encryption");
+        let response = http
+            .put(&encryption)
+            .bearer_auth(token)
+            .json(&json!({"mode":"vault_locked","expected_generation":0}))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        // The unlocked target issues a scoped key at once; the read below happens while locked.
+        let response = http
+            .post(format!("{base}/api/v1/data/buckets/{target}/abe/requests"))
+            .bearer_auth(token)
+            .json(&json!({"scope":{"kind":"subtree","value":"sealed/"}}))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let issued: serde_json::Value = response.json().await?;
+        let grant = KeyGrant::from_bytes(&STANDARD.decode(issued["record"].as_str().unwrap())?)?;
+        let parameters = grant.context.request.parameters.public()?;
+        let private: &[u8; 32] = user_private.expose().try_into()?;
+        let sealed = SealedSecret {
+            enc: grant.enc,
+            ciphertext: grant.ciphertext.clone(),
+        };
+        let transport = [&grant.enc[..], &grant.ciphertext].concat();
+        let scoped = UserKey::open(&parameters, &transport, |_| {
+            open_sealed(private, &sealed, GRANT_PURPOSE, &grant.context.bytes().unwrap())
+                .map_err(|_| aruna_kpabe::Error)
+        })?;
+        let response = http
+            .post(format!("{encryption}/lock"))
+            .bearer_auth(token)
+            .send()
+            .await?;
+        assert!(response.status().is_success());
+        let relationship = harness
+            .post_sync(
+                &harness.seed.base_url,
+                &harness.seed_token,
+                CreateSyncRequest {
+                    source: SyncSourceRequest {
+                        bucket: source.to_string(),
+                        prefix: None,
+                    },
+                    target: SyncTargetRequest {
+                        node_id: harness.joiner.config.node_id.to_string(),
+                        bucket: target.to_string(),
+                        prefix: None,
+                    },
+                    mode: ApiSyncMode::Continuous,
+                    reference_handling: ApiReferenceHandling::Materialize,
+                    replicate_deletes: false,
+                    plaintext: false,
+                },
+            )
+            .await?;
+        assert!(!relationship.plaintext);
+
+        let put = harness
+            .seed_client
+            .put_object()
+            .bucket(source)
+            .key(key)
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await?;
+        // The target published its own envelope and object key for the copy.
+        let version = put.version_id().unwrap_or_default();
+        let query = [("bucket", target), ("key", key), ("version_id", version)];
+        let envelope_route = format!("{base}/api/v1/data/blobs/envelope");
+        let url = reqwest::Url::parse_with_params(&envelope_route, query)?;
+        wait_until("target envelope", shared::WAIT_CAP, Duration::from_millis(200), || {
+            let request = http.get(url.clone()).bearer_auth(token);
+            async move { request.send().await.is_ok_and(|r| r.status() == StatusCode::OK) }
+        })
+        .await?;
+        let mut envelopes = Vec::new();
+        for (base, bucket) in [(base, target), (&harness.seed.base_url, source)] {
+            let route = format!("{base}/api/v1/data/blobs/envelope");
+            let query = [("bucket", bucket), ("key", key), ("version_id", version)];
+            let url = reqwest::Url::parse_with_params(&route, query)?;
+            let response = http.get(url).bearer_auth(token).send().await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            envelopes.push(response.json::<serde_json::Value>().await?);
+        }
+        let public = |envelope: &serde_json::Value| envelope["context"]["public_key"].clone();
+        assert_ne!(public(&envelopes[0]), public(&envelopes[1]));
+
+        // The scoped key opens the target envelope; the first keyed read promotes the pending hash.
+        let decode = |value: &serde_json::Value| STANDARD.decode(value.as_str().unwrap());
+        let cipher = Envelope::from_bytes(&parameters, &decode(&envelopes[0]["envelope"]["abe"])?)?;
+        let context = decode(&envelopes[0]["context"]["bytes"])?;
+        let object = aruna_kpabe::open(&parameters, &scoped, &cipher, &context)?;
+        let header = STANDARD.encode(object.as_bytes());
+        let row = VersionKey::new(target, key, version.parse::<Ulid>()?).to_bytes()?;
+        let content = format!("{base}/api/v1/data/blobs/content");
+        let url = reqwest::Url::parse_with_params(&content, query)?;
+        for pending in [true, false] {
+            let stored = harness
+                .joiner
+                .context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                    key: row.clone().into(),
+                    txn_id: None,
+                })
+                .await;
+            let Event::Storage(StorageEvent::ReadResult { value: Some(stored), .. }) = stored else {
+                return Err(std::io::Error::other("missing target version").into());
+            };
+            let state = BlobVersion::from_bytes(&stored)?.state;
+            assert_eq!(matches!(state, BlobVersionState::PendingContent { .. }), pending);
+            let response = http
+                .get(url.clone())
+                .bearer_auth(token)
+                .header("x-aruna-object-key", &header)
+                .send()
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.bytes().await?.as_ref(), body.as_slice());
+        }
+        let response = http.get(&encryption).bearer_auth(token).send().await?;
+        let status: serde_json::Value = response.json().await?;
+        assert_eq!(status["unlock"]["state"], "locked");
+
+        let detail = harness
+            .get_sync(
+                &harness.seed.base_url,
+                &harness.seed_token,
+                &relationship.id,
+            )
+            .await?;
+        assert_eq!(detail.relationship.status.awaiting_key, 0);
+        assert_eq!(detail.relationship.status.last_error, None);
         Ok(())
     }
     .await;

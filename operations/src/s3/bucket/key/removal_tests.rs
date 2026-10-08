@@ -146,12 +146,15 @@ fn run_by(case: Case, admin: bool) -> (RemoveHolderOperation, Effects) {
         .map(|grant| grant.to_bytes().unwrap())
         .collect();
     operation.step(rows(grants));
-    let copies = case
+    let copies: Vec<_> = case
         .copies
         .iter()
-        .map(|copy| copy.to_bytes().unwrap())
+        .map(|copy| (Key::from(copy.key()), Value::from(copy.to_bytes().unwrap())))
         .collect();
-    operation.step(rows(copies));
+    operation.step(Event::Storage(StorageEvent::IterResult {
+        values: copies,
+        next_start_after: None,
+    }));
     let keys = case.keys.iter().map(|&(generation, state)| {
         let key = BucketKeyRef::new(BUCKET_ID, generation);
         let mut record = BucketKeyRecord::new(key, Ulid::generate(), [5; 32], 1);

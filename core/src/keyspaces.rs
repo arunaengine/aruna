@@ -101,12 +101,26 @@ pub const COMPRESSION_QUEUE_KEYSPACE: &str = "compression_migration_queue";
 pub const HIDDEN_RESERVATION_KEYSPACE: &str = "blob_hidden_reservations";
 /// Key generations of encrypted buckets, keyed by bucket id and generation. Public keys only.
 pub const BUCKET_KEY_KEYSPACE: &str = "bucket_keys";
+
+pub const ABE_PARAMETERS_KEYSPACE: &str = "abe_parameters";
+pub const ABE_EPOCH_KEYSPACE: &str = "abe_epochs";
+pub const ABE_ENVELOPE_KEYSPACE: &str = "abe_envelopes";
+pub const ABE_VERSION_KEYSPACE: &str = "abe_versions";
+pub const ABE_ARCHIVE_KEYSPACE: &str = "abe_archives";
+pub const ABE_REQUEST_KEYSPACE: &str = "abe_requests";
+pub const ABE_GRANT_KEYSPACE: &str = "abe_grants";
+/// Envelopes of open multipart uploads, keyed by upload id. Never served while pending.
+pub const ABE_PENDING_KEYSPACE: &str = "abe_pending";
+/// Same-bucket copies published while locked, keyed by version. Never served while pending.
+pub const ABE_COPY_KEYSPACE: &str = "abe_copies";
 /// Key holders of encrypted buckets, keyed by bucket id and user.
 pub const BUCKET_HOLDER_KEYSPACE: &str = "bucket_holders";
 /// Bucket private keys sealed to user keys, keyed by bucket id, generation and holder.
 pub const KEY_COPY_KEYSPACE: &str = "bucket_key_copies";
 /// Encryption settings of node-local buckets, keyed by bucket name. No row means off.
 pub const BUCKET_ENCRYPTION_KEYSPACE: &str = "bucket_encryption";
+/// Encrypted node-local buckets of each group, keyed by group id and bucket name. Values are empty.
+pub const GROUP_ENCRYPTED_KEYSPACE: &str = "group_encrypted_buckets";
 /// Key state audit of encrypted buckets, keyed by bucket id and time-ordered event id.
 pub const BUCKET_AUDIT_KEYSPACE: &str = "bucket_audit";
 /// Complete locations of archives whose content hash is unknown, keyed by archive id and backend.
@@ -125,6 +139,21 @@ pub const KEY_WAIT_KEYSPACE: &str = "job_key_waits";
 pub const PENDING_RECLAIM_KEYSPACE: &str = "pending_reclaims";
 /// The weakened recovery each encrypted bucket's holders were last told about, by bucket id.
 pub const BUCKET_RECOVERY_KEYSPACE: &str = "bucket_recovery";
+/// Key requests and grants of each S3 credential's token, keyed by access key, a zero byte and
+/// the request key. Values are empty.
+pub const TOKEN_GRANT_KEYSPACE: &str = "token_grants";
+/// The content hash a sender claimed for a received pending archive, keyed by archive.
+pub const PENDING_CLAIM_KEYSPACE: &str = "pending_claims";
+/// Replication jobs waiting for a locked source key, keyed by key reference and job key.
+pub const COPY_WAIT_KEYSPACE: &str = "replication_key_waits";
+/// Plaintext copy requests of encrypted sources, keyed by job key or relationship id.
+pub const PLAINTEXT_COPY_KEYSPACE: &str = "replication_plaintext";
+/// Buckets whose epoch must rise after a lost READ scope, keyed by bucket id. Values are times.
+pub const ABE_DUE_KEYSPACE: &str = "abe_epoch_due";
+/// Key reissue progress after an epoch raise, keyed by bucket id: epoch, phase and cursor.
+pub const ABE_REISSUE_KEYSPACE: &str = "abe_reissues";
+/// Scoped re-key progress, keyed by bucket id: prefix, epoch, cursor and count.
+pub const ABE_REKEY_KEYSPACE: &str = "abe_rekeys";
 /// Durable evidence of a copy that failed hash/bao verification (§8.2), keyed
 /// per (hash, backend) so re-hitting the same corrupt copy overwrites its row.
 pub const BLOB_QUARANTINE_KEYSPACE: &str = "blob_quarantine";
@@ -381,6 +410,15 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BLOB_RECLAIM_KEYSPACE,
     COMPRESSION_MIGRATION_KEYSPACE,
     COMPRESSION_QUEUE_KEYSPACE,
+    ABE_PARAMETERS_KEYSPACE,
+    ABE_EPOCH_KEYSPACE,
+    ABE_ENVELOPE_KEYSPACE,
+    ABE_VERSION_KEYSPACE,
+    ABE_ARCHIVE_KEYSPACE,
+    ABE_REQUEST_KEYSPACE,
+    ABE_GRANT_KEYSPACE,
+    ABE_PENDING_KEYSPACE,
+    ABE_COPY_KEYSPACE,
     BUCKET_KEY_KEYSPACE,
     BUCKET_HOLDER_KEYSPACE,
     KEY_COPY_KEYSPACE,
@@ -490,6 +528,14 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     KEY_WAIT_KEYSPACE,
     PENDING_RECLAIM_KEYSPACE,
     BUCKET_RECOVERY_KEYSPACE,
+    PENDING_CLAIM_KEYSPACE,
+    COPY_WAIT_KEYSPACE,
+    PLAINTEXT_COPY_KEYSPACE,
+    GROUP_ENCRYPTED_KEYSPACE,
+    TOKEN_GRANT_KEYSPACE,
+    ABE_DUE_KEYSPACE,
+    ABE_REISSUE_KEYSPACE,
+    ABE_REKEY_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

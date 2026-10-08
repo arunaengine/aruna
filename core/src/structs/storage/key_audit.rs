@@ -22,6 +22,8 @@ pub enum AuditAction {
     HolderGrant,
     HolderRemoval,
     Rotation,
+    /// A token credential got sealed copies of the bucket key.
+    TokenCreated,
 }
 
 /// A volatile change records its intent before it applies, then its outcome; an intent alone

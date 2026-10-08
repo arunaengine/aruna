@@ -113,6 +113,7 @@ pub struct GroupJoinOperation {
     deletes: Vec<(KeySpace, Key)>,
     changed: bool,
     notifications: bool,
+    deny: bool,
     output: Option<Result<JoinRequestState, GroupJoinError>>,
 }
 
@@ -126,6 +127,7 @@ impl GroupJoinOperation {
             deletes: Vec::new(),
             changed: false,
             notifications: false,
+            deny: false,
             output: None,
         }
     }
@@ -315,11 +317,13 @@ impl GroupJoinOperation {
             AdminDocumentOperation::GroupJoinRequested { request } => request.request_id,
             AdminDocumentOperation::GroupJoinDecided { decision } => {
                 for role_id in &decision.role_ids {
-                    auth.roles
+                    let role = auth
+                        .roles
                         .get_mut(role_id)
-                        .ok_or(GroupJoinError::InvalidRoles)?
-                        .assigned_users
-                        .insert(decision.user_id);
+                        .ok_or(GroupJoinError::InvalidRoles)?;
+                    let added = role.assigned_users.insert(decision.user_id);
+                    // A newly assigned DENY rule can narrow the member's existing READ scopes.
+                    self.deny |= added && role.permissions.values().any(|p| *p == Permission::DENY);
                 }
                 decision.request_id
             }
@@ -411,6 +415,9 @@ impl GroupJoinOperation {
             return self.fail(GroupJoinError::UnexpectedEvent);
         };
         self.state = State::Commit;
+        if self.deny {
+            return smallvec![crate::abe::mark_due(Some(self.input.group_id), txn_id)];
+        }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 }
@@ -494,8 +501,19 @@ impl Operation for GroupJoinOperation {
                 }
                 self.commit()
             }
+            (
+                State::Commit,
+                event @ Event::SubOperation(SubOperationEvent::EpochsMarked { .. }),
+            ) if self.deny => {
+                self.deny = false;
+                match self.txn_id.and_then(|id| crate::abe::marked(&event, id)) {
+                    Some(Ok(effects)) => effects,
+                    Some(Err(error)) => self.fail(error.into()),
+                    None => self.fail(GroupJoinError::UnexpectedEvent),
+                }
+            }
             (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { txn_id }))
-                if Some(txn_id) == self.txn_id =>
+                if Some(txn_id) == self.txn_id && !self.deny =>
             {
                 self.txn_id = None;
                 if self.changed {
@@ -773,5 +791,131 @@ mod pure_tests {
             operation.finalize(),
             Err(GroupJoinError::Storage(StorageError::TransactionConflict))
         );
+    }
+
+    #[test]
+    fn deny_approval_marks() {
+        let realm_id = RealmId::from_bytes([17; 32]);
+        let group_id = Ulid::from_bytes([13; 16]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[11; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([11; 16]), realm_id),
+            realm_id,
+        };
+        let member = Actor {
+            user_id: UserId::local(Ulid::from_bytes([12; 16]), realm_id),
+            ..actor.clone()
+        };
+        let mut auth_doc =
+            GroupAuthorizationDocument::default_group_doc(actor.user_id, realm_id, group_id);
+        let role = auth_doc
+            .roles
+            .values_mut()
+            .find(|role| role.name == "user")
+            .unwrap();
+        role.permissions.insert("/blocked".into(), Permission::DENY);
+        let group = Group {
+            group_id,
+            realm_id,
+            display_name: "Group".into(),
+            owner: actor.user_id,
+            roles: auth_doc.roles.keys().copied().collect(),
+        };
+        let mut reducer = AdminDocumentState::new(AdminDocumentTarget::Group { group_id });
+        for role in auth_doc.roles.values() {
+            let role = AdminRoleDefinition::from(role);
+            let op = AdminDocumentOperation::GroupRoleCreated { role };
+            reducer.apply_operation(&actor, op).unwrap();
+        }
+        let request_id = Ulid::from_bytes([15; 16]);
+        let request = JoinRequest {
+            request_id,
+            group_id,
+            user_id: member.user_id,
+            message: None,
+            created_at: 1,
+        };
+        let op = AdminDocumentOperation::GroupJoinRequested { request };
+        reducer.apply_operation(&member, op).unwrap();
+        let config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        let input = GroupJoinInput {
+            actor: actor.clone(),
+            auth: AuthContext {
+                user_id: actor.user_id,
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            group_id,
+            action: JoinAction::Decide {
+                request_id,
+                approve: true,
+                role_ids: BTreeSet::new(),
+                reason: None,
+            },
+            now_ms: 2,
+        };
+        let mut values = vec![
+            (
+                group_id.to_bytes().to_vec().into(),
+                Some(group.to_bytes(&actor).unwrap().into()),
+            ),
+            (
+                group_id.to_bytes().to_vec().into(),
+                Some(auth_doc.to_bytes(&actor).unwrap().into()),
+            ),
+            (
+                reducer_state_key(&reducer.target),
+                Some(reducer_state_entry(&reducer).unwrap().2),
+            ),
+            (
+                realm_id.as_bytes().to_vec().into(),
+                Some(config.to_bytes(&actor).unwrap().into()),
+            ),
+        ];
+        let txn_id = Ulid::from_bytes([16; 16]);
+        let decide = |values: Vec<(Key, Option<Value>)>| {
+            let mut operation = GroupJoinOperation::new(input.clone());
+            operation.start();
+            operation.step(Event::SubOperation(
+                SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+            ));
+            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+            let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+            (operation, effects)
+        };
+        let (mut operation, effects) = decide(values.clone());
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one atomic batch: {effects:?}");
+        };
+        let writes = writes.clone();
+        let mut effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        if let [Effect::Storage(StorageEffect::BatchDelete { .. })] = effects.as_slice() {
+            effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+                entries: Vec::new(),
+            }));
+        }
+
+        // The newly assigned DENY role marks epochs due before the approval commits.
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let marked = SubOperationEvent::EpochsMarked { result: Ok(()) };
+        let effects = operation.step(Event::SubOperation(marked));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: id })] if *id == txn_id
+        ));
+
+        // A duplicate decision keeps its plain commit fast path.
+        for (slot, space) in [(1, AUTH_KEYSPACE), (2, DOCUMENT_STATE_KEYSPACE)] {
+            let written = writes.iter().find(|(keyspace, _, _)| keyspace == space);
+            values[slot].1 = Some(written.unwrap().2.clone());
+        }
+        let (_, effects) = decide(values);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        ));
     }
 }

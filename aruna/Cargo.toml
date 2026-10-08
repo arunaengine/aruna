@@ -62,6 +62,7 @@ byteview = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
+aruna-kpabe = { workspace = true }
 axum = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 rmcp = { workspace = true, features = [

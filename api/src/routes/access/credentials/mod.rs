@@ -8,7 +8,9 @@ use crate::server::state::ServerState;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{UserAccess, group_permission_path};
+use aruna_operations::abe::{KeyAction, KeyOperation, KeyResult};
 use aruna_operations::driver::drive;
+use aruna_operations::driver::now_ms;
 use aruna_operations::s3::access::create::{
     CreateUserConfig, CreateUserError, CreateUserOperation, DEFAULT_CREDENTIAL_TTL,
 };
@@ -18,8 +20,10 @@ use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation}
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 use std::{str::FromStr, sync::Arc};
 use ulid::Ulid;
@@ -56,6 +60,13 @@ pub struct CreateS3Request {
     #[schema(default = 31536000)]
     pub expires_in_seconds: Option<u64>,
     pub path_restrictions: Option<Vec<CreatePathRestriction>>,
+    /// Encrypted buckets on this node the credential may read while they are locked.
+    #[serde(default)]
+    pub encrypted_buckets: Option<Vec<String>>,
+    /// Padded base64 of the 32-byte X25519 public key of the client's token; required with
+    /// `encrypted_buckets`.
+    #[serde(default)]
+    pub token_public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -63,7 +74,13 @@ pub struct CreateS3Request {
 pub struct CreateS3Response {
     pub access_key_id: String,
     pub access_secret: String,
+    /// Open key requests of the token, for key holders to issue; empty when none are open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_requests: Vec<String>,
 }
+
+/// Most encrypted buckets one token credential may name.
+const MAX_TOKEN_BUCKETS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[schema(as = S3PathRestrictionResponse)]
@@ -308,9 +325,20 @@ to the group data root and can never widen them.
   only the access key id, and a lost secret means creating a new credential.
 - The credential is stored on the node that served the request and is accepted by that node's S3
   endpoint.
+- `encrypted_buckets` names encrypted buckets on this node, with `token_public_key`. The token is an
+  X25519 private key the client generates and keeps; the node stores only its public key. After
+  the credential commits, the node opens key requests for the token over the caller's read scopes
+  in each bucket, narrowed by the path restrictions. An unlocked or node managed bucket issues
+  them at once; otherwise `key_requests` lists them for a key holder to issue, as for members.
+  A token key opens only these scopes, never the bucket key.
+- S3 clients send the lowercase hex of the token as `aws_session_token` in the signed
+  `x-amz-security-token` header, and then read these scopes while the bucket is locked. Token
+  credentials do not work in presigned URLs. Revoking the credential deletes its key requests
+  and grants.
 
 **Limits**
 - The optional lifetime is given in seconds between 60 and 31536000 and defaults to 31536000.
+- `encrypted_buckets` names at most 64 buckets.
 - A restriction pattern is relative to the group data root or an absolute path inside it, may name
   an exact path or a subtree with a trailing `/**`, and takes `READ`, `WRITE` or `DENY` case
   insensitively; at most 50 restrictions are accepted.
@@ -326,23 +354,37 @@ to the group data root and can never widen them.
                     "pattern": "shared/**",
                     "permission": "READ"
                 }
-            ]
+            ],
+            "encrypted_buckets": ["research-raw"],
+            "token_public_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
         })
     ),
     responses(
         (
             status = 201,
-            description = "Credential created; `access_secret` is the plaintext secret access key and is shown only here",
+            description = "Credential created; `access_secret` is the plaintext secret access key, shown only here, and `key_requests` the token's open key requests",
             body = CreateS3Response,
             example = json!({
                 "access_key_id": "01JAKEY0123456789ABCDEFGHJ",
-                "access_secret": "<one-time-secret-shown-only-in-this-response>"
+                "access_secret": "<one-time-secret-shown-only-in-this-response>",
+                "key_requests": ["01JREQ00123456789ABCDEFGHJ"]
             })
         ),
-        (status = 400, description = "The group id is not a ULID, the lifetime is out of range, or a restriction is malformed or exceeds the count limit", body = ErrorResponse),
+        (
+            status = 400,
+            description = "The group id is not a ULID, the lifetime is out of range, a restriction is malformed or exceeds the count limit, too many encrypted buckets are named, `token_public_key` is missing or malformed, `bucket_not_encrypted` when a named bucket does not encrypt, or `bucket_outside_group` when it belongs to another group",
+            body = ErrorResponse,
+            example = json!({"error": "bucket research-raw is not encrypted", "code": "bucket_not_encrypted"})
+        ),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, the caller may read no part of the group data path, or a restriction reaches outside the group root or the caller's own grant", body = ErrorResponse),
-        (status = 409, description = "The caller already holds 16 active credentials; revoke or let one expire first", body = ErrorResponse)
+        (
+            status = 403,
+            description = "Token belongs to another realm, the caller may read no part of the group data path, or a restriction reaches outside the group root or the caller's own grant",
+            body = ErrorResponse
+        ),
+        (status = 404, description = "A named encrypted bucket does not exist on this node", body = ErrorResponse),
+        (status = 409, description = "The caller already holds 16 active credentials", body = ErrorResponse),
+        (status = 413, description = "`encryption_limit` when a named bucket already holds the caller's 64 key grants; the new credential is revoked", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -386,33 +428,94 @@ pub async fn create_s3_credentials(
         return Err(ServerError::BadRequest);
     }
     let expiry = credential_expiry(SystemTime::now(), request.expires_in_seconds)?;
-    let result = drive(
-        CreateUserOperation::new(
-            CreateUserConfig {
-                user_identity,
-                group_id,
-                expiry,
-                path_restrictions,
-                issued_by: *node_id.as_bytes(),
-            },
-            state.credential_encryption_key().clone(),
-        ),
-        &state.get_ctx(),
-    )
-    .await;
+    let buckets: BTreeSet<String> = request
+        .encrypted_buckets
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if buckets.len() > MAX_TOKEN_BUCKETS {
+        return Err(ServerError::BadRequest);
+    }
+    let token_key = match (buckets.is_empty(), request.token_public_key) {
+        (true, _) => None,
+        (false, None) => return Err(ServerError::BadRequest),
+        (false, Some(key)) => {
+            let mut public = [0u8; 32];
+            match STANDARD.decode_slice(key.as_bytes(), &mut public) {
+                Ok(32) if key.len() == 44 => Some(public),
+                _ => return Err(ServerError::BadRequest),
+            }
+        }
+    };
+    let mut operation = CreateUserOperation::new(
+        CreateUserConfig {
+            user_identity,
+            group_id,
+            expiry,
+            path_restrictions,
+            issued_by: *node_id.as_bytes(),
+        },
+        state.credential_encryption_key().clone(),
+    );
+    if !buckets.is_empty() {
+        let buckets = buckets.iter().cloned().collect();
+        operation = operation.with_tokens(buckets, (realm_id, node_id), now_ms());
+    }
+    let (access_key_id, access_secret, access) = match drive(operation, &state.get_ctx()).await {
+        Ok(created) => created,
+        Err(CreateUserError::LimitReached) => {
+            return Err(ServerError::Conflict(
+                "active credential limit reached".to_string(),
+            ));
+        }
+        Err(error) => return Err(token_refusal(error)),
+    };
+    // A bucket that gets neither a grant nor an open request revokes the new credential.
+    let mut key_requests = Vec::new();
+    if let Some(public_key) = token_key {
+        for bucket in buckets {
+            let action = KeyAction::Token {
+                access_key: access_key_id.clone(),
+                public_key,
+                restrictions: access.path_restrictions.clone(),
+            };
+            let operation = KeyOperation::new(bucket, auth.clone(), node_id, action, now_ms());
+            match drive(operation, &state.get_ctx()).await {
+                Ok(KeyResult::Opened(ids)) => key_requests.extend(ids.iter().map(Ulid::to_string)),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(event = "abe.token_keys.failed", error = %error);
+                    let revoke = RevokeUserOperation::new(access_key_id.clone());
+                    if let Err(failed) = drive(revoke, &state.get_ctx()).await {
+                        tracing::warn!(event = "abe.token_revoke.failed", error = %failed);
+                    }
+                    return Err(crate::routes::storage::abe::key_error(error));
+                }
+            }
+        }
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateS3Response {
+            access_key_id,
+            access_secret: access_secret.expose().to_string(),
+            key_requests,
+        }),
+    ))
+}
 
-    match result {
-        Ok((access_key_id, access_secret, _)) => Ok((
-            StatusCode::CREATED,
-            Json(CreateS3Response {
-                access_key_id,
-                access_secret: access_secret.expose().to_string(),
-            }),
-        )),
-        Err(CreateUserError::LimitReached) => Err(ServerError::Conflict(
-            "active credential limit reached".to_string(),
-        )),
-        Err(err) => Err(ServerError::InternalError(err.to_string())),
+/// The REST answer to a failed credential creation; token failures carry their own codes.
+fn token_refusal(error: CreateUserError) -> ServerError {
+    let message = error.to_string();
+    match error {
+        CreateUserError::NoSuchBucket(_) => ServerError::NotFound,
+        CreateUserError::NotEncrypted(_) => {
+            ServerError::Refused(StatusCode::BAD_REQUEST, "bucket_not_encrypted", message)
+        }
+        CreateUserError::OtherGroup(_) => {
+            ServerError::Refused(StatusCode::BAD_REQUEST, "bucket_outside_group", message)
+        }
+        _ => ServerError::InternalError(message),
     }
 }
 
@@ -429,8 +532,8 @@ WRITE on the group the credential is bound to is deliberately not enough.
 
 **Behavior**
 - Only credentials held by the node that serves the request can be revoked here.
-- The record is not deleted: it keeps appearing in the owner's listing with a revocation timestamp
-  and the `revoked` status, and the node stops accepting the key for new S3 requests."#,
+- Revoking deletes the credential record, its owner index entry and its token key requests and
+  grants. It no longer appears in the owner's listing, and the node refuses the key for new S3 requests."#,
     params(("access_key_id" = String, Path, description = "Access key id of the credential to revoke, as returned when it was created or listed")),
     responses(
         (status = 204, description = "Credential revoked"),
@@ -474,7 +577,11 @@ pub async fn revoke_s3_credentials(
     }
 
     match drive(RevokeUserOperation::new(access_key_id), &state.get_ctx()).await {
-        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Ok(_) => {
+            let group = Some(credential.group_id);
+            crate::routes::storage::abe::epoch_due(&state, &auth, group).await;
+            Ok(StatusCode::NO_CONTENT)
+        }
         Err(RevokeUserError::NotFound) => Err(ServerError::NotFound),
         Err(err) => Err(ServerError::InternalError(err.to_string())),
     }

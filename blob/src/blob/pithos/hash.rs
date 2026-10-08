@@ -45,7 +45,7 @@ impl BlobHandler {
             hasher.update(&chunk);
         }
         if size != location.blob_size {
-            return Err(BlobError::ReadError(format!(
+            return Err(BlobError::IntegrityCheckFailed(format!(
                 "sealed copy holds {size} bytes, recorded {}",
                 location.blob_size
             )));

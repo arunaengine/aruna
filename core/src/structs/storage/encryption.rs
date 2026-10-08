@@ -26,10 +26,9 @@ use zeroize::Zeroizing;
 pub const COPY_PURPOSE: &[u8] = b"aruna bucket key copy v1";
 /// Holder tag of a user copy in a copy key.
 const USER_TAG: u8 = 1;
-/// Reserved for token credential copies (stage 5): tag, then the access key. Never stored yet.
-const TOKEN_TAG: u8 = 2;
 const REF_LEN: usize = 24;
 const USER_KEY_LEN: usize = 48;
+const TOKEN_LEN: usize = 32;
 
 /// Names one key generation of one bucket. Keys bind to a stable id, because a deleted
 /// bucket's name may be used again.
@@ -348,7 +347,14 @@ impl SealedCopy {
         [&key.key()[..], &[USER_TAG], &user_id.to_storage_key()].concat()
     }
 
-    /// Reads the reference and user of a copy key. Token copies are refused until stage 5.
+    /// The user copy rows of a `bucket_key_copies` scan; token copies are left out undecoded.
+    pub fn user_rows<K: AsRef<[u8]>, V>(rows: Vec<(K, V)>) -> Vec<(K, V)> {
+        rows.into_iter()
+            .filter(|(key, _)| Self::parse_key(key.as_ref()).is_ok())
+            .collect()
+    }
+
+    /// Reads the reference and user of a copy key. A token copy key is refused.
     pub fn parse_key(bytes: &[u8]) -> Result<(BucketKeyRef, UserId, Ulid), ConversionError> {
         let (reference, rest) = bytes
             .split_at_checked(REF_LEN)
@@ -362,7 +368,6 @@ impl SealedCopy {
                     Ulid::from_bytes(record.try_into()?),
                 ))
             }
-            Some((&TOKEN_TAG, _)) => Err(BucketKeyError::Unsupported.into()),
             _ => Err(ConversionError::InvalidLength(
                 "sealed copy holder".to_string(),
             )),
@@ -375,6 +380,38 @@ impl SealedCopy {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// The access key and token of a token credential, held for one request only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TokenCredential {
+    pub access_key: String,
+    pub token: SharedSecret,
+}
+
+impl TokenCredential {
+    /// The token as clients send it in `x-amz-security-token`: lowercase hex.
+    pub fn encode(token: &SecretBytes) -> Zeroizing<String> {
+        Zeroizing::new(hex::encode(token.expose()))
+    }
+
+    /// Reads a token a client sent; anything but 32 hex-encoded bytes is refused.
+    pub fn parse(access_key: &str, text: &[u8]) -> Option<Self> {
+        let mut bytes = Zeroizing::new([0u8; TOKEN_LEN]);
+        hex::decode_to_slice(text, bytes.as_mut_slice()).ok()?;
+        Some(Self {
+            access_key: access_key.to_string(),
+            token: SharedSecret::new(SecretBytes::new(bytes.to_vec())),
+        })
+    }
+}
+
+impl fmt::Debug for TokenCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenCredential")
+            .field("access_key", &self.access_key)
+            .finish_non_exhaustive()
     }
 }
 
@@ -565,6 +602,9 @@ pub enum BucketKeyError {
     Seal,
     #[error("this encrypted bucket operation is not supported yet")]
     Unsupported,
+    /// The token of a token credential does not open its copy of the bucket key.
+    #[error("the token does not open the bucket key")]
+    InvalidToken,
 }
 
 #[cfg(test)]
@@ -605,8 +645,6 @@ mod tests {
                 .key()
                 .starts_with(&SealedCopy::user_prefix(reference, user(6)))
         );
-        let token = [&reference.key()[..], &[TOKEN_TAG], b"ACCESSKEY"].concat();
-        assert!(SealedCopy::parse_key(&token).is_err());
         assert_eq!(
             SealedCopy::from_bytes(&copy.to_bytes().unwrap()).unwrap(),
             copy
@@ -855,5 +893,33 @@ mod tests {
         tampered.ciphertext[0] ^= 1;
         let opened = open_sealed(&private, &tampered, &info, &[]);
         assert_eq!(opened.unwrap_err(), KeySealError::Open);
+    }
+
+    #[test]
+    fn tokens_parse_strictly() {
+        let (_, token) = generate_key().unwrap();
+        let text = TokenCredential::encode(token.bytes());
+        assert_eq!(text.len(), 64);
+        let parsed = TokenCredential::parse("KEY", text.as_bytes()).unwrap();
+        assert_eq!((parsed.access_key.as_str(), &parsed.token), ("KEY", &token));
+        for invalid in [&text[..62], format!("{}00", *text).as_str(), "zz", ""] {
+            assert!(TokenCredential::parse("KEY", invalid.as_bytes()).is_none());
+        }
+    }
+
+    #[test]
+    fn tokens_never_formatted() {
+        const CANARY: [u8; 32] = *b"canary-token-key-7a2c-0000-00000";
+        let text = TokenCredential::encode(&SecretBytes::new(CANARY.to_vec()));
+        let credential = TokenCredential::parse("TOKENKEY", text.as_bytes()).unwrap();
+        let canary = String::from_utf8_lossy(&CANARY).to_string();
+        for formatted in [
+            format!("{credential:?}"),
+            BucketKeyError::InvalidToken.to_string(),
+        ] {
+            assert!(!formatted.contains(&canary), "{formatted}");
+            assert!(!formatted.contains(&*text), "{formatted}");
+            assert!(!formatted.contains("99, 97, 110"), "{formatted}");
+        }
     }
 }

@@ -298,7 +298,8 @@ async fn build_response(
 fn verify_node_origin(records: &[NotificationRecord], peer: NodeId) -> Result<(), String> {
     let foreign = records.iter().any(|record| match &record.kind {
         NotificationKind::BucketRestartLocked { node_id, .. }
-        | NotificationKind::BucketRecoveryDegraded { node_id, .. } => *node_id != peer,
+        | NotificationKind::BucketRecoveryDegraded { node_id, .. }
+        | NotificationKind::BucketKeyPending { node_id, .. } => *node_id != peer,
         _ => false,
     });
     match foreign {
@@ -591,6 +592,17 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             if bucket.is_empty() || group_id.is_nil() {
                 return Err("bucket key notification has empty bucket or group".to_string());
             }
+        }
+        NotificationKind::BucketKeyPending {
+            bucket,
+            group_id,
+            member_user_id,
+            ..
+        } => {
+            if bucket.is_empty() || group_id.is_nil() {
+                return Err("bucket key notification has empty bucket or group".to_string());
+            }
+            validate_kind_user("member_user_id", member_user_id, recipient_realm)?;
         }
     }
     Ok(())

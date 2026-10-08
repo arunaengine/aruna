@@ -68,6 +68,7 @@ pub struct RevokeTokenOperation {
     txn_id: Option<TxnId>,
     state: RevokeTokenState,
     output: Option<Result<RealmConfigDocument, RevokeTokenError>>,
+    cutoff_raised: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +160,7 @@ impl RevokeTokenOperation {
             txn_id: None,
             state: RevokeTokenState::Init,
             output: None,
+            cutoff_raised: false,
         }
     }
 
@@ -490,7 +492,12 @@ impl RevokeTokenOperation {
         });
         let admin_event = admin_event.transpose()?;
         revocation_index.compact(&mut reducer_state);
+        let owner = self.config.token_owner;
+        let cutoff_before = document.user_cutoff(&owner, self.config.now);
         document.merge_revocation_index(&revocation_index, self.config.now);
+        // A new or later user cutoff ends READ for a deactivated account.
+        self.cutoff_raised =
+            apply_event && document.user_cutoff(&owner, self.config.now) > cutoff_before;
         let stale_conflict_deletes =
             stale_conflict_deletes(Some(&previous_reducer_state), Some(&reducer_state));
 
@@ -558,6 +565,9 @@ impl RevokeTokenOperation {
             return self.fail(RevokeTokenError::MissingTransaction);
         };
         self.state = RevokeTokenState::CommitTransaction { document };
+        if self.cutoff_raised {
+            return smallvec![crate::abe::mark_due(None, txn_id)];
+        }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -590,6 +600,12 @@ impl Operation for RevokeTokenOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let (RevokeTokenState::CommitTransaction { .. }, Some(txn_id)) =
+            (&self.state, self.txn_id)
+            && let Some(next) = crate::abe::marked(&event, txn_id)
+        {
+            return next.unwrap_or_else(|error| self.fail(error.into()));
+        }
         match self.state.clone() {
             RevokeTokenState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
@@ -1450,6 +1466,82 @@ mod tests {
             }) => aruna_core::reducer::decode_reducer_state(&bytes).expect("reducer state decodes"),
             other => panic!("unexpected reducer state read: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn cutoff_marks_due() {
+        // A new user cutoff marks encrypted buckets due in its transaction; a repeat does not.
+        use aruna_core::keyspaces::{
+            ABE_DUE_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+        };
+        use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+        let (_dir, context, actor) = setup_realm().await;
+        let settings = BucketEncryption {
+            mode: EncryptionMode::NodeManaged,
+            bucket_id: Some(Ulid::from_bytes([8u8; 16])),
+            key_generation: 1,
+            ..Default::default()
+        };
+        let index = [&Ulid::from_bytes([9u8; 16]).to_bytes()[..], b"bucket-a"].concat();
+        let writes = vec![
+            (
+                BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                b"bucket-a".to_vec().into(),
+                settings.to_bytes().unwrap().into(),
+            ),
+            (
+                GROUP_ENCRYPTED_KEYSPACE.to_string(),
+                index.into(),
+                Vec::new().into(),
+            ),
+        ];
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+        let owner = UserId::local(Ulid::from_bytes([10u8; 16]), actor.realm_id);
+        let cutoff = || {
+            admin_request(
+                &actor,
+                &aruna_core::auth::user_cutoff_hash(&owner),
+                owner,
+                aruna_core::auth::user_cutoff_expiry(1_000),
+                1_000,
+            )
+        };
+
+        drive(RevokeTokenOperation::new(cutoff()), &context)
+            .await
+            .unwrap();
+        assert_eq!(iter_values(&context, ABE_DUE_KEYSPACE, None).await.len(), 1);
+
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: ABE_DUE_KEYSPACE.to_string(),
+                key: Ulid::from_bytes([8u8; 16]).to_bytes().to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::DeleteResult { .. })
+        ));
+        drive(RevokeTokenOperation::new(cutoff()), &context)
+            .await
+            .unwrap();
+        assert!(
+            iter_values(&context, ABE_DUE_KEYSPACE, None)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -54,6 +54,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::bucket::usage::router())
         .merge(storage::compression::router())
         .merge(storage::encryption::router())
+        .merge(storage::abe::router())
         .merge(storage::bucket::keys::router())
         .merge(drs::router())
         .merge(staging::router())
@@ -109,6 +110,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
             state.clone(),
             request_tracing_middleware,
         ))
+        .layer(axum::middleware::from_fn(crate::object_key::middleware))
         .with_state(state)
 }
 
@@ -227,6 +229,17 @@ pub(crate) mod tests {
         ("GET", "/data/sync/quarantine"),
         ("GET", "/data/sync/quarantine/{record_id}"),
         ("GET", "/metadata/audit"),
+        ("POST", "/data/buckets/{bucket}/abe/requests"),
+        ("GET", "/data/buckets/{bucket}/abe/requests"),
+        (
+            "POST",
+            "/data/buckets/{bucket}/abe/requests/{request_id}/grant",
+        ),
+        ("GET", "/data/buckets/{bucket}/abe/grants"),
+        ("POST", "/data/buckets/{bucket}/abe/epoch"),
+        ("POST", "/data/buckets/{bucket}/abe/rekey"),
+        ("GET", "/data/blobs/envelope"),
+        ("GET", "/data/blobs/content"),
         ("GET", "/data/blobs/locations"),
         ("GET", "/data/buckets/{bucket}/placement"),
         ("GET", "/data/buckets/{bucket}/placement/coverage"),
@@ -236,6 +249,7 @@ pub(crate) mod tests {
         ("GET", "/data/buckets/{bucket}/storage/encryption/audit"),
         ("GET", "/data/buckets/{bucket}/storage/encryption/copies/me"),
         ("GET", "/data/buckets/{bucket}/storage/encryption/holders"),
+        ("GET", "/data/buckets/{bucket}/storage/encryption/tokens"),
         ("GET", "/data/buckets/{bucket}/storage/routing"),
         ("GET", "/data/buckets/{bucket}/usage"),
         ("GET", "/data/sync/relationships"),

@@ -1204,6 +1204,9 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
         }
         GetObjectError::NotFinished => internal_error("object read did not finish"),
         GetObjectError::GetObjectFailed => internal_error("object read failed"),
+        error @ (GetObjectError::PendingContent(_) | GetObjectError::Abe(_)) => {
+            internal_error(error)
+        }
     }
 }
 

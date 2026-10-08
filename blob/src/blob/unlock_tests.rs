@@ -482,3 +482,29 @@ fn timer_spares_extension() {
     );
     assert!(admit(&mut registry, key, archive(1), new).is_err());
 }
+
+#[test]
+fn token_leases_pin() {
+    let registry = UnlockRegistry::with_leases(UNLOCKED_BUCKETS, 1);
+    let key = reference(1, 1);
+    let slot = registry.lease_slots().try_acquire_owned().unwrap();
+    // A token lease needs no unlock session, yet holds the key, the archive and the slot.
+    let lease = registry
+        .token_lease(key, archive(1), private(1), slot)
+        .unwrap();
+    assert_eq!(LeaseGuard::secret(&lease), Some(&private(1)));
+    assert_eq!((lease.key, lease.session_id), (key, Ulid::nil()));
+    assert!(registry.claim_delete(&archive(1)).is_err());
+    assert!(registry.lease_slots().try_acquire_owned().is_err());
+    drop(lease);
+    assert!(registry.lease_slots().try_acquire_owned().is_ok());
+    // An archive claimed for deletion is not leased.
+    let claim = registry.claim_delete(&archive(1)).unwrap();
+    let slot = registry.lease_slots().try_acquire_owned().unwrap();
+    assert!(
+        registry
+            .token_lease(key, archive(1), private(1), slot)
+            .is_err()
+    );
+    drop(claim);
+}

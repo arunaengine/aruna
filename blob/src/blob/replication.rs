@@ -20,14 +20,15 @@ use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobQuarantineRecord, ResolvedBackend,
 };
-use aruna_core::structs::storage::encryption::ReadLease;
-use aruna_core::structs::storage::format::{StoredFormat, StoredLayout};
+use aruna_core::structs::storage::encryption::{ReadLease, SealPlan};
+use aruna_core::structs::storage::format::{Compression, StoredFormat, StoredLayout};
 use aruna_core::time::unix_timestamp_millis;
 use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::round_up_to_chunks;
 use bao_tree::{BaoTree, ByteRanges};
 use bytes::BytesMut;
+use std::collections::HashMap;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
@@ -93,7 +94,7 @@ impl BlobHandler {
     }
 
     /// Serves the plaintext of a copy of an encrypting bucket to an authorized reader. The lease
-    /// keeps the key and the archive in use until the transfer ends; replication never does this.
+    /// keeps the key and the archive in use until the transfer ends.
     pub async fn serve_sealed_read(
         &self,
         stream_id: Ulid,
@@ -267,69 +268,125 @@ impl BlobHandler {
         location: BackendLocation,
         keep_alive: bool,
     ) -> BlobEvent {
-        let mut reader = match self.slice_reader(&location).await {
+        let reader = match self.slice_reader(&location).await {
             Ok(reader) => reader,
             Err(err) => return BlobEvent::Error(err),
         };
-        let mut outboard =
-            match PreOrderOutboard::<BytesMut>::create(&mut reader, BAO_BLOCK_SIZE).await {
-                Ok(outboard) => outboard,
-                Err(err) => {
-                    return BlobEvent::Error(BlobError::OutboardCreationFailed(err.to_string()));
-                }
-            };
+        let ids = (replication_id, stream_id);
+        let size = location.blob_size;
+        match self
+            .send_replica(ids, location.clone(), reader, size, keep_alive)
+            .await
+        {
+            Ok(()) => BlobEvent::ReplicationFinished { location },
+            Err(event) => event,
+        }
+    }
 
-        let stream = match self.connection_handle(stream_id).await {
-            Ok(stream) => stream,
-            Err(event) => return event,
+    /// Sends a copy of an encrypting bucket under `lease`. With `regrant` a sealed copy is granted
+    /// to that key and object key, and its stored bytes are sent; otherwise its plaintext is sent.
+    pub async fn replicate_leased(
+        &self,
+        (replication_id, stream_id): (Ulid, Ulid),
+        location: BackendLocation,
+        lease: ReadLease,
+        regrant: Option<(SealPlan, Option<[u8; 32]>)>,
+    ) -> BlobEvent {
+        let ids = (replication_id, stream_id);
+        let sealed = matches!(location.format.layout, StoredLayout::Pithos(_));
+        let sent = match (regrant, sealed) {
+            (Some((plan, object)), true) => {
+                match self.regrant_reader(&location, lease, (&plan, object)).await {
+                    Ok((reader, sent)) => {
+                        let size = sent.stored_size();
+                        self.send_replica(ids, sent, reader, size, true).await
+                    }
+                    Err(error) => Err(BlobEvent::Error(error)),
+                }
+            }
+            (Some(_), false) => {
+                let message = "only a sealed copy is granted to another key";
+                Err(BlobEvent::Error(BlobError::ReadError(message.to_string())))
+            }
+            (None, true) => match self.sealed_reader(&location, lease).await {
+                Ok(reader) => {
+                    let size = location.blob_size;
+                    let plain = plain_sent(&location);
+                    let reader = SliceReader::Sealed(reader);
+                    self.send_replica(ids, plain, reader, size, true).await
+                }
+                Err(error) => Err(BlobEvent::Error(error)),
+            },
+            // A plain copy of an encrypting bucket keeps its bucket lease until the transfer ends.
+            (None, false) => match self.slice_reader(&location).await {
+                Ok(reader) => {
+                    let _lease = lease;
+                    let size = location.blob_size;
+                    let plain = plain_sent(&location);
+                    self.send_replica(ids, plain, reader, size, true).await
+                }
+                Err(error) => Err(BlobEvent::Error(error)),
+            },
         };
+        match sent {
+            Ok(()) => BlobEvent::ReplicationFinished { location },
+            Err(event) => event,
+        }
+    }
+
+    /// Announces `sent` with the bao root of `size` bytes of `reader`, then streams them.
+    async fn send_replica<R: iroh_io::AsyncSliceReader>(
+        &self,
+        (replication_id, stream_id): (Ulid, Ulid),
+        sent: BackendLocation,
+        mut reader: R,
+        size: u64,
+        keep_alive: bool,
+    ) -> Result<(), BlobEvent> {
+        let mut outboard = PreOrderOutboard::<BytesMut>::create(&mut reader, BAO_BLOCK_SIZE)
+            .await
+            .map_err(|err| BlobEvent::Error(BlobError::OutboardCreationFailed(err.to_string())))?;
+
+        let stream = self.connection_handle(stream_id).await?;
         let mut stream = stream.lock().await;
 
         let replication_init = ReplicationMessage {
             id: replication_id,
             msg_type: MessageType::BaoTreeInfo {
-                location: location.clone(),
+                location: sent,
                 root: outboard.root,
             },
         };
         let sx = &mut stream.0;
-        if let Err(event) = send_replication_message(
+        send_replication_message(
             sx,
             replication_init,
             self.io_timeout(),
             "sending replication tree info",
         )
-        .await
-        {
-            return event;
-        }
+        .await?;
 
         let rx = &mut stream.1;
-        match read_replication_message(
+        let msg = read_replication_message(
             rx,
             self.io_timeout(),
             "waiting for replication tree info acknowledgement",
         )
-        .await
-        {
-            Ok(msg) => {
-                if let Err(err) = validate_init_ack(msg, replication_id) {
-                    return BlobEvent::Error(err);
-                }
-            }
-            Err(err) => return err,
-        }
+        .await?;
+        validate_init_ack(msg, replication_id).map_err(BlobEvent::Error)?;
 
         let sx = &mut stream.0;
         let mut sx_wrapper = SendStreamWrapper::new(sx, self.transfer_idle_timeout());
-        let ranges = ByteRanges::from(0..location.blob_size);
+        let ranges = ByteRanges::from(0..size);
         let ranges = round_up_to_chunks(&ranges);
         debug!("Chunk Ranges: {:#?}", ranges.boundaries());
 
         if let Err(err) =
             encode_ranges_validated(reader, &mut outboard, &ranges, &mut sx_wrapper).await
         {
-            return BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()));
+            return Err(BlobEvent::Error(BlobError::ReplicationFailed(
+                err.to_string(),
+            )));
         }
 
         if !keep_alive {
@@ -340,14 +397,14 @@ impl BlobHandler {
         if !keep_alive {
             self.connections.lock().await.remove(&stream_id);
         }
-        BlobEvent::ReplicationFinished { location }
+        Ok(())
     }
 
     pub async fn handle_incoming_replication(
         &self,
         replication_id: Option<Ulid>,
         stream_id: Ulid,
-        resolved: ResolvedBackend,
+        (resolved, object): (ResolvedBackend, Option<[u8; 32]>),
         keep_alive: bool,
     ) -> BlobEvent {
         let (_replication_id, root, mut location) = {
@@ -387,6 +444,16 @@ impl BlobHandler {
             }
         };
 
+        // A received archive is stored as it is, and only when sealed to the key asked for.
+        let sealed = matches!(location.format.layout, StoredLayout::Pithos(_));
+        if sealed && location.format.bucket_key() != resolved.encryption.map(|plan| plan.key) {
+            let message = "the archive is not sealed to this bucket key";
+            return BlobEvent::Error(BlobError::ReplicationRejected(message.to_string()));
+        }
+        let size = match sealed {
+            true => location.stored_size(),
+            false => location.blob_size,
+        };
         // Reserve and record the destination before the replica is written.
         let backend_root = match self.registry.config_for(&resolved.backend) {
             Ok(config) => config.root.clone(),
@@ -401,8 +468,10 @@ impl BlobHandler {
             Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
         };
         location.ulid = ulid;
-        // The sender's format describes its own copy; this node stores with its own setting.
-        location.format = StoredFormat::default();
+        // The sender's plain format describes its own copy; this node stores with its own setting.
+        if !sealed {
+            location.format = StoredFormat::default();
+        }
         let Some(mut reservation) = self.hold_reservation(location.ulid) else {
             return BlobEvent::Error(BlobError::ReplicationFailed(
                 "too many active blob reservations".to_string(),
@@ -428,6 +497,22 @@ impl BlobHandler {
                 return event;
             }
         };
+        // Plaintext for an encrypting bucket is sealed with its plan, like any new write.
+        if let (false, Some(plan)) = (sealed, resolved.encryption) {
+            let received = (stream, root);
+            let sealing = (plan, resolved.compression, object);
+            let written = self.receive_sealing(received, location, operator, sealing);
+            let event = Box::pin(written).await;
+            if matches!(&event, BlobEvent::ReplicationFinished { .. })
+                || matches!(&event, BlobEvent::Error(BlobError::WriteCleanup { .. }))
+            {
+                reservation.retain();
+            }
+            if !keep_alive {
+                _ = self.close_connection(stream_id).await;
+            }
+            return event;
+        }
         let mut stream = stream.lock().await;
         let rx = &mut stream.1;
         let rx_wrapper = RecvStreamWrapper::new(rx, self.transfer_idle_timeout());
@@ -446,6 +531,7 @@ impl BlobHandler {
         )
         .await
         {
+            Ok(writer) if sealed => writer.encoded(Compression::Off),
             Ok(writer) => writer.encoded(resolved.compression),
             Err(BlobLibError::IoError(error)) if error.kind() == std::io::ErrorKind::TimedOut => {
                 reservation.retain();
@@ -460,11 +546,11 @@ impl BlobHandler {
             }
         };
         let mut ob = PreOrderOutboard {
-            tree: BaoTree::new(location.blob_size, BAO_BLOCK_SIZE),
+            tree: BaoTree::new(size, BAO_BLOCK_SIZE),
             root,
             data: BytesMut::new(),
         };
-        let byte_ranges = ByteRanges::from(0..location.blob_size);
+        let byte_ranges = ByteRanges::from(0..size);
         let chunk_ranges = round_up_to_chunks(&byte_ranges);
 
         debug!("Try to decode chunks received from bidi stream");
@@ -520,7 +606,8 @@ impl BlobHandler {
                                 }
                             }
                         } else {
-                            location.hashes = hashes;
+                            // Hashes of archive bytes are a transfer check, never an identity.
+                            location.hashes = if sealed { HashMap::new() } else { hashes };
                             reservation.retain();
                             match self.finalize_reservation(&location).await {
                                 Ok(()) => BlobEvent::ReplicationFinished { location },
@@ -540,6 +627,88 @@ impl BlobHandler {
         }
         event
     }
+
+    /// Decodes plaintext checked against `root` and writes it sealed with `plan` and `object`,
+    /// reusing the write path of new objects. The written content hash must equal `root`.
+    async fn receive_sealing(
+        &self,
+        (stream, root): (super::SharedBiStream, blake3::Hash),
+        location: BackendLocation,
+        operator: opendal::Operator,
+        (plan, compression, object): (SealPlan, Compression, Option<[u8; 32]>),
+    ) -> BlobEvent {
+        let size = location.blob_size;
+        let (writer, reader) = tokio::io::duplex(64 * 1024);
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let idle = self.transfer_idle_timeout();
+        tokio::spawn(async move {
+            let result: Result<(), BlobError> = async {
+                let mut stream = stream.lock().await;
+                let receiver = RecvStreamWrapper::new(&mut stream.1, idle);
+                let mut writer = BaoReadWriter::new(writer);
+                let mut outboard = PreOrderOutboard {
+                    tree: BaoTree::new(size, BAO_BLOCK_SIZE),
+                    root,
+                    data: BytesMut::new(),
+                };
+                let ranges = round_up_to_chunks(&ByteRanges::from(0..size));
+                decode_ranges(receiver, ranges, &mut writer, &mut outboard)
+                    .await
+                    .map_err(|error| BlobError::ReplicationFailed(error.to_string()))?;
+                writer
+                    .finish(size, *root.as_bytes())
+                    .map_err(|error| BlobError::IntegrityCheckFailed(error.to_string()))
+            }
+            .await;
+            _ = completion_tx.send(result);
+        });
+        let blob = BackendStream::new(tokio_util::io::ReaderStream::new(reader)).on_success_async(
+            move || async move {
+                completion_rx
+                    .await
+                    .map_err(|_| StreamError(Box::new(BlobError::ChannelClosed)))?
+                    .map_err(|error| StreamError(Box::new(error)))
+            },
+        );
+        let seal = (Some(plan), None, object);
+        let written = self.write_encoded(
+            location.clone(),
+            operator,
+            blob,
+            compression,
+            seal,
+            Some(size),
+        );
+        match Box::pin(written).await {
+            BlobEvent::WriteFinished { location }
+                if location.get_blake3() == Some(root.as_bytes().as_slice()) =>
+            {
+                match self.finalize_reservation(&location).await {
+                    Ok(()) => BlobEvent::ReplicationFinished { location },
+                    Err(error) => BlobEvent::Error(BlobError::WriteCleanup {
+                        location,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            BlobEvent::WriteFinished { location } => BlobEvent::Error(BlobError::WriteCleanup {
+                location,
+                message: "replicated content hash mismatch".to_string(),
+            }),
+            BlobEvent::Error(error @ BlobError::WriteCleanup { .. }) => BlobEvent::Error(error),
+            other => {
+                _ = self.release_reservation(&location).await;
+                other
+            }
+        }
+    }
+}
+
+/// The location a plaintext transfer announces: the receiver stores the bytes with its own format.
+fn plain_sent(location: &BackendLocation) -> BackendLocation {
+    let mut plain = location.clone();
+    plain.format = StoredFormat::default();
+    plain
 }
 
 /// Resolves one observation to a reader whose bytes provably carry the named

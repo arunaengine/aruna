@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+mod abe;
 mod backend;
 mod control_plane;
 mod frames;

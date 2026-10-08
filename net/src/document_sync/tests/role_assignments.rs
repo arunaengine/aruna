@@ -841,3 +841,171 @@ async fn new_realm_materializes() {
         BTreeMap::from([(role_id, BTreeSet::from([assigned_user_id]))])
     );
 }
+
+#[tokio::test]
+async fn deny_assignment_marks() {
+    use aruna_core::keyspaces::{
+        ABE_DUE_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+    };
+    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([13; 32]);
+    let group_id = Ulid::from_parts(41, 1);
+    let role_id = Ulid::from_parts(42, 2);
+    let member = UserId::local(Ulid::from_parts(43, 3), realm_id);
+    let actor = test_actor(
+        9,
+        UserId::local(Ulid::from_parts(44, 4), realm_id),
+        realm_id,
+    );
+    let target = AdminDocumentTarget::Group { group_id };
+    let document_target = DocumentTarget::GroupAuthorization { group_id };
+    let bucket_id = Ulid::from_parts(45, 5);
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(bucket_id),
+        key_generation: 1,
+        ..Default::default()
+    };
+    let index = [&group_id.to_bytes()[..], b"bucket-a"].concat();
+    let rows = vec![
+        (
+            BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            b"bucket-a".to_vec().into(),
+            settings.to_bytes().unwrap().into(),
+        ),
+        (
+            GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            index.into(),
+            Vec::new().into(),
+        ),
+    ];
+    crate::document_sync::storage::batch_write_to(&storage, rows)
+        .await
+        .unwrap();
+    let role = admin_role(role_id, "Blocked", "/datasets/**", Permission::DENY);
+    let ops = [
+        AdminDocumentOperation::GroupRoleCreated { role },
+        AdminDocumentOperation::GroupAssignmentAdded {
+            role_id,
+            user_id: member,
+        },
+    ];
+    let due: ByteView = bucket_id.to_bytes().to_vec().into();
+    for (seq, op) in (1..).zip(ops) {
+        // The role's own marker was consumed by a raise before the assignment arrives.
+        batch_delete_to(&storage, vec![(ABE_DUE_KEYSPACE.to_string(), due.clone())])
+            .await
+            .unwrap();
+        let id = Ulid::from_parts(46, u128::from(seq));
+        let event = test_admin_event(id, target.clone(), &actor, seq, op);
+        apply_admin_operation(&storage, document_target.clone(), event)
+            .await
+            .expect("admin operation applies");
+    }
+    assert!(
+        read_storage_value(&storage, ABE_DUE_KEYSPACE, due)
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn realm_removal_rescans() {
+    // A bucket encrypted before the removal commits conflicts it; the retry marks that bucket due.
+    use crate::document_sync::storage::batch_write_to;
+    use aruna_core::keyspaces::{
+        ABE_DUE_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+    };
+    use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+    let (_dir, real) = test_storage();
+    let realm_id = RealmId::from_bytes([71; 32]);
+    let role_id = Ulid::from_parts(1_670, 1);
+    let reader = UserId::local(Ulid::from_parts(1_671, 1), realm_id);
+    let actor = test_actor(
+        14,
+        UserId::local(Ulid::from_parts(1_672, 1), realm_id),
+        realm_id,
+    );
+    let target = AdminDocumentTarget::Realm { realm_id };
+    let document_target = DocumentTarget::RealmAuthorization { realm_id };
+    let role = admin_role(role_id, "Readers", "/datasets/**", Permission::READ);
+    let ops = [
+        AdminDocumentOperation::RealmRoleCreated { role },
+        AdminDocumentOperation::RealmAssignmentAdded {
+            role_id,
+            user_id: reader,
+        },
+    ];
+    for (seq, op) in (1..).zip(ops) {
+        let event = test_admin_event(
+            Ulid::from_parts(1_673, seq),
+            target.clone(),
+            &actor,
+            seq as u64,
+            op,
+        );
+        apply_admin_operation(&real, document_target.clone(), event)
+            .await
+            .expect("realm operation applies");
+    }
+    let bucket_id = Ulid::from_parts(1_674, 1);
+    let settings = BucketEncryption {
+        mode: EncryptionMode::NodeManaged,
+        bucket_id: Some(bucket_id),
+        key_generation: 1,
+        ..Default::default()
+    };
+    let index = [&Ulid::from_parts(1_675, 1).to_bytes()[..], b"bucket-r"].concat();
+    let rows = vec![
+        (
+            BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            b"bucket-r".to_vec().into(),
+            settings.to_bytes().unwrap().into(),
+        ),
+        (
+            GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            index.into(),
+            Vec::new().into(),
+        ),
+    ];
+
+    let (storage, receivers) = StorageHandle::new();
+    let backing = real.clone();
+    let worker = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("worker runtime");
+        let mut rows = Some(rows);
+        while let Ok((effect, response, ..)) = receivers.foreground.recv() {
+            if matches!(effect, StorageEffect::CommitTransaction { .. })
+                && let Some(rows) = rows.take()
+            {
+                runtime.block_on(batch_write_to(&backing, rows)).unwrap();
+            }
+            let Event::Storage(event) = runtime.block_on(backing.send_storage_effect(effect))
+            else {
+                panic!("storage event expected");
+            };
+            response.send(event);
+        }
+    });
+
+    let removal = AdminDocumentOperation::RealmAssignmentRemoved {
+        role_id,
+        user_id: reader,
+    };
+    let event = test_admin_event(Ulid::from_parts(1_673, 3), target, &actor, 3, removal);
+    apply_admin_operation(&storage, document_target, event)
+        .await
+        .expect("removal applies");
+    drop(storage);
+    worker.join().expect("storage worker");
+    let due: ByteView = bucket_id.to_bytes().to_vec().into();
+    assert!(
+        read_storage_value(&real, ABE_DUE_KEYSPACE, due)
+            .await
+            .is_some()
+    );
+}

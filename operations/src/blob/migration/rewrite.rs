@@ -6,7 +6,8 @@
 use crate::blob::cleanup::schedule_cleanup_effect;
 use crate::blob::managed_copy::{ManagedCopyError, check_serveable, read_effect};
 use crate::blob::records::{blob_location_read, owner_delete_effect, read_version_effect};
-use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
+use crate::node::usage_stats::{QuotaGate, StoredDelta, UsageCounterUpdate, UsageUpdateError};
+use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -16,14 +17,18 @@ use aruna_core::keyspaces::{
     TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
+use aruna_core::structs::storage::abe::{ObjectEnvelope, PendingCopy};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobVersion, BlobVersionState, CopyOwner, ManagedCopyKey,
     ManagedCopyRecord, ResolvedBackend, VersionKey,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
-use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, ReadLease};
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
+};
 use aruna_core::structs::storage::transition::{EncryptionTransition, TransitionKind, cleanup_key};
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -33,6 +38,9 @@ pub enum RewriteState {
     Init,
     ReadVersion,
     ReadLocation,
+    ReadEnvelope,
+    KeepEnvelope,
+    CreateEnvelope,
     Admit,
     Rewrite,
     StartTransaction,
@@ -42,6 +50,8 @@ pub enum RewriteState {
     ReadTarget,
     WriteRows,
     DropOwner,
+    DropEnvelope,
+    Quota,
     UpdateUsage,
     Commit,
     Abort,
@@ -59,6 +69,8 @@ pub enum RewriteOutcome {
     Skipped,
     /// The source copy needs a key generation that is locked on this node.
     AwaitingKey,
+    /// A re-key must come back: the version is still pending or changed before publication.
+    Unfinished,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -99,6 +111,20 @@ pub struct RewriteVersionOperation {
     copy: Option<ManagedCopyRecord>,
     owns_row: bool,
     usage: Option<UsageCounterUpdate>,
+    /// The version's envelope rows read before the rewrite, when the transition moves them.
+    envelope_rows: Option<abe::EnvelopeRows>,
+    /// The envelope to publish: a new one for a new generation, else the version's own.
+    envelope: Option<ObjectEnvelope>,
+    /// The pending copy row that a re-encoding in the same generation points at the new copy.
+    pending: Option<PendingCopy>,
+    /// The bucket's group and the usage charge of the replaced envelope rows.
+    charge: Option<(GroupId, u64)>,
+    /// Realm quota and origin; none leaves the group unlimited.
+    quota: Option<(QuotaConfig, RealmId, NodeId)>,
+    gate: Option<QuotaGate>,
+    deletes: Vec<(String, Key)>,
+    /// A scoped re-key of the current generation, outside any transition.
+    rekey: bool,
     output: Option<Result<RewriteOutcome, RewriteError>>,
 }
 
@@ -117,7 +143,49 @@ impl RewriteVersionOperation {
             copy: None,
             owns_row: false,
             usage: None,
+            envelope_rows: None,
+            envelope: None,
+            pending: None,
+            charge: None,
+            quota: None,
+            gate: None,
+            deletes: Vec::new(),
+            rekey: false,
             output: None,
+        }
+    }
+
+    /// Gives a version of the target generation a new object key and envelope; `transition`
+    /// names that generation and is not stored.
+    pub fn rekey(mut self) -> Self {
+        self.rekey = true;
+        self
+    }
+
+    /// A re-key moves only archives already in the target format; a transition the others.
+    fn moves(&self, old: &BackendLocation) -> bool {
+        let target = self.transition.target.plan.map(|plan| plan.key);
+        match self.rekey {
+            true => {
+                old.format
+                    .bucket_key()
+                    .is_some_and(|key| Some(key) == target)
+                    && !self.transition.needs(old)
+            }
+            false => self.transition.needs(old),
+        }
+    }
+
+    pub fn with_quota(mut self, quota: QuotaConfig, realm: RealmId, node: NodeId) -> Self {
+        self.quota = Some((quota, realm, node));
+        self
+    }
+
+    /// A re-key waits for a pending version instead of skipping it.
+    fn waits(&self, pending: bool) -> RewriteOutcome {
+        match self.rekey && pending {
+            true => RewriteOutcome::Unfinished,
+            false => RewriteOutcome::Skipped,
         }
     }
 
@@ -197,7 +265,9 @@ impl RewriteVersionOperation {
             _ => None,
         };
         let Some(key) = key else {
-            return self.end(RewriteOutcome::Skipped);
+            // Pending content keeps its old envelope until promotion.
+            let pending = matches!(version.state, BlobVersionState::PendingContent { .. });
+            return self.end(self.waits(pending));
         };
         self.version = Some(version);
         self.state = RewriteState::ReadLocation;
@@ -211,15 +281,16 @@ impl RewriteVersionOperation {
             Ok(None) => return self.end(RewriteOutcome::Skipped),
             Err(effects) => return effects,
         };
-        if old.staging || old.partial || !self.transition.needs(&old) {
-            return self.end(RewriteOutcome::Skipped);
+        if old.staging || old.partial || !self.moves(&old) {
+            // A sealed archive in another format or generation waits for its transition.
+            let sealed = old.staging || old.partial || old.format.bucket_key().is_some();
+            return self.end(self.waits(sealed));
         }
-        let source = old.format.bucket_key();
-        let archive = ArchiveKey::of(&old);
         self.old = Some(old);
-        let Some(key) = source else {
-            return self.rewrite();
-        };
+        self.read_envelope()
+    }
+
+    fn admit(&mut self, key: BucketKeyRef, archive: ArchiveKey) -> Effects {
         self.state = RewriteState::Admit;
         smallvec![Effect::Blob(BlobEffect::AdmitRead { key, archive })]
     }
@@ -256,6 +327,9 @@ impl RewriteVersionOperation {
             lease: self.lease.take().map(Box::new),
             target: Box::new(resolved),
             grants_only: sealed && self.transition.kind == TransitionKind::Rotate,
+            object: (self.envelope.as_ref())
+                .or(self.pending.as_ref().map(|pending| &pending.source))
+                .map(|envelope| Box::new(envelope.context.public_key)),
         })]
     }
 
@@ -288,11 +362,16 @@ impl RewriteVersionOperation {
         self.txn_id = Some(txn_id);
         self.state = RewriteState::ReadSettings;
         let bucket: Key = self.version_key.bucket.as_bytes().to_vec().into();
+        let mut reads = vec![
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.clone()),
+            (TRANSITION_KEYSPACE.to_string(), bucket),
+        ];
+        match self.envelope_reads() {
+            Ok(envelope) => reads.extend(envelope),
+            Err(error) => return self.fail(error),
+        }
         smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.clone()),
-                (TRANSITION_KEYSPACE.to_string(), bucket),
-            ],
+            reads,
             txn_id: Some(txn_id),
         })]
     }
@@ -303,8 +382,7 @@ impl RewriteVersionOperation {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected(event);
         };
-        let rows: Vec<Option<Value>> = values.into_iter().map(|(_, value)| value).collect();
-        let [settings, transition] = rows.as_slice() else {
+        let Some(([(_, settings), (_, transition)], envelope)) = values.split_first_chunk() else {
             return self.fail(RewriteError::NotFinished);
         };
         let settings = BucketEncryption::from_row(settings.as_ref().map(|row| row.as_ref()));
@@ -312,6 +390,7 @@ impl RewriteVersionOperation {
             .as_ref()
             .map(|row| EncryptionTransition::from_bytes(row));
         let current = match (settings, stored.transpose()) {
+            (Ok(settings), _) if self.rekey => self.transition.still_current(&settings),
             (Ok(settings), Ok(Some(stored))) => {
                 stored.started_at_ms == self.transition.started_at_ms
                     && stored.kind == self.transition.kind
@@ -320,8 +399,14 @@ impl RewriteVersionOperation {
             (Ok(_), Ok(None)) => false,
             (Err(error), _) | (_, Err(error)) => return self.fail(error.into()),
         };
+        // A re-key comes back for a version that changed before publication.
         if !current {
-            return self.end(RewriteOutcome::Skipped);
+            return self.end(self.waits(true));
+        }
+        match self.check_envelope(envelope) {
+            Ok(true) => {}
+            Ok(false) => return self.end(self.waits(true)),
+            Err(error) => return self.fail(error),
         }
         match read_version_effect(&self.version_key, self.txn_id) {
             Ok(effect) => {
@@ -338,7 +423,7 @@ impl RewriteVersionOperation {
             Err(effects) => return effects,
         };
         if current != self.version {
-            return self.end(RewriteOutcome::Skipped);
+            return self.end(self.waits(true));
         }
         let governed = (self.version.as_ref()).is_some_and(|v| !v.placement_policies.is_empty());
         let Some(old) = self.old.as_ref().filter(|_| governed) else {
@@ -407,6 +492,9 @@ impl Operation for RewriteVersionOperation {
             RewriteState::Init => self.start(),
             RewriteState::ReadVersion => self.handle_version(event),
             RewriteState::ReadLocation => self.handle_location(event),
+            RewriteState::ReadEnvelope => self.handle_envelope(event),
+            RewriteState::KeepEnvelope => self.handle_kept(event),
+            RewriteState::CreateEnvelope => self.handle_created(event),
             RewriteState::Admit => self.handle_admit(event),
             RewriteState::Rewrite => self.handle_rewritten(event),
             RewriteState::StartTransaction => self.handle_started(event),
@@ -416,9 +504,14 @@ impl Operation for RewriteVersionOperation {
             RewriteState::ReadTarget => self.handle_target(event),
             RewriteState::WriteRows => self.handle_rows(event),
             RewriteState::DropOwner => match event {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => self.update_usage(),
+                Event::Storage(StorageEvent::DeleteResult { .. }) => self.drop_envelope(),
                 other => self.unexpected(other),
             },
+            RewriteState::DropEnvelope => match event {
+                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.update_usage(),
+                other => self.unexpected(other),
+            },
+            RewriteState::Quota => self.handle_quota(event),
             RewriteState::UpdateUsage => self.handle_usage(event),
             RewriteState::Commit => self.handle_commit(event),
             RewriteState::Abort => match event {
@@ -454,9 +547,12 @@ impl Operation for RewriteVersionOperation {
             })
     }
 }
-#[path = "../rewrite_rows.rs"]
+#[path = "../rewrite/rows.rs"]
 mod rows;
 
+#[path = "../rewrite/abe.rs"]
+mod abe;
+
 #[cfg(test)]
-#[path = "../rewrite_tests.rs"]
+#[path = "../rewrite/tests.rs"]
 mod tests;

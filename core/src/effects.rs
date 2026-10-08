@@ -157,6 +157,8 @@ pub enum BlobEffect {
         /// Each node routes its own replica; the sender's backend is ignored.
         resolved: ResolvedBackend,
         keep_alive: bool,
+        /// A plaintext replica is also sealed to this object key.
+        object: Option<[u8; 32]>,
     },
     ServeRead {
         stream_id: Ulid,
@@ -246,6 +248,8 @@ pub enum BlobEffect {
         lease: Option<Box<ReadLease>>,
         target: Box<ResolvedBackend>,
         grants_only: bool,
+        /// A new object public key, a second recipient of the sealed copy.
+        object: Option<Box<[u8; 32]>>,
     },
     /// Seals one part of an encrypted upload as a Pithos piece with the plan in `resolved`.
     /// The piece records a content tree at `content_offset` when one is given.
@@ -255,6 +259,8 @@ pub enum BlobEffect {
         resolved: ResolvedBackend,
         created_by: UserId,
         content_offset: Option<u64>,
+        /// The upload's object public key, a second recipient of the piece.
+        object: Option<[u8; 32]>,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
     /// Composes the stored pieces of `parts`, in order, into one archive without a key, within
@@ -286,7 +292,7 @@ pub enum BlobEffect {
         lease: Box<ReadLease>,
     },
     /// Serves the plaintext of `location`, a copy of an encrypting bucket, to an authorized
-    /// remote reader under `lease`. Replication of sealed copies stays refused.
+    /// remote reader under `lease`. Replication sends through `ReplicateLeased`.
     ServeSealedRead {
         stream_id: Ulid,
         location: BackendLocation,
@@ -298,6 +304,18 @@ pub enum BlobEffect {
     ReserveCompose {
         content: u64,
     },
+    /// Sends the copy at `location` of an encrypting bucket under `lease`, which covers the
+    /// transfer. A sealed copy with `regrant` is granted to that key and `object`, and sent as
+    /// stored bytes; otherwise the plaintext is sent. Answers `ReplicationFinished`.
+    ReplicateLeased {
+        replication_id: Ulid,
+        stream_id: Ulid,
+        location: BackendLocation,
+        lease: Box<ReadLease>,
+        regrant: Option<Box<crate::structs::storage::encryption::SealPlan>>,
+        object: Option<[u8; 32]>,
+    },
+    Abe(Box<crate::structs::storage::abe::AbeEffect>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

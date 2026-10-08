@@ -87,6 +87,21 @@ pub(crate) fn describe_event(event: &Event) -> String {
             SubOperationEvent::UserUpdated { .. } => {
                 "Event::SubOperation(SubOperationEvent::UserUpdated)".to_string()
             }
+            SubOperationEvent::KeyRequestsOpened { .. } => {
+                "Event::SubOperation(SubOperationEvent::KeyRequestsOpened)".to_string()
+            }
+            SubOperationEvent::EpochsMarked { .. } => {
+                "Event::SubOperation(SubOperationEvent::EpochsMarked)".to_string()
+            }
+            SubOperationEvent::KeyRequestsFailed => {
+                "Event::SubOperation(SubOperationEvent::KeyRequestsFailed)".to_string()
+            }
+            SubOperationEvent::ReissuePaged { .. } => {
+                "Event::SubOperation(SubOperationEvent::ReissuePaged)".to_string()
+            }
+            SubOperationEvent::VersionRekeyed { .. } => {
+                "Event::SubOperation(SubOperationEvent::VersionRekeyed)".to_string()
+            }
         },
         Event::Task(_) => "Event::Task".to_string(),
         Event::Search() => "Event::Search".to_string(),
