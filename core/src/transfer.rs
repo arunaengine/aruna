@@ -144,14 +144,6 @@ pub fn import_key(
     Ok(format!("federation-{digest}"))
 }
 
-/// The upload id an import key always maps to, so a retried transfer reuses one upload.
-pub fn import_upload(key: &str) -> Ulid {
-    let digest: [u8; 32] = Sha256::digest(key.as_bytes()).into();
-    let mut bytes = [0; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    Ulid::from_bytes(bytes)
-}
-
 fn check_lifetime(issued_at: u64, expires_at: u64, now: u64) -> Result<(), TransferError> {
     let lifetime = expires_at.checked_sub(issued_at);
     if !lifetime.is_some_and(|secs| secs > 0 && secs <= MAX_TRANSFER_SECS)
