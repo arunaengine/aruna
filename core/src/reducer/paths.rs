@@ -16,6 +16,7 @@ pub const CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 pub const CONFIG_DESCRIPTION_PATH: &str = "realm_config.description";
 pub const CONFIG_QUOTA_PATH: &str = "realm_config.quota";
 pub const CONFIG_COMPUTE_PATH: &str = "realm_config.compute";
+pub const CONFIG_FEDERATION_PATH: &str = "realm_config.federation";
 pub const CONFIG_POLICIES_PATH: &str = "realm_config.request_policies";
 pub const CONFIG_STRATEGY_PATH: &str = "realm_config.placement.default_strategy";
 pub const JOB_FAMILY_PATH: &str = "realm_config.placement.job_family_strategy";
@@ -96,6 +97,9 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         }
         AdminDocumentOperation::ConfigComputeSet { .. } => {
             vec![CONFIG_COMPUTE_PATH.to_string()]
+        }
+        AdminDocumentOperation::ConfigFederationSet { .. } => {
+            vec![CONFIG_FEDERATION_PATH.to_string()]
         }
         AdminDocumentOperation::ConfigPoliciesSet { .. } => {
             vec![CONFIG_POLICIES_PATH.to_string()]
@@ -433,6 +437,10 @@ pub(super) fn compute_from_value(value: &str) -> Option<RealmComputeConfig> {
     serde_json::from_str(value)
         .ok()
         .map(|compute| canonical_compute(&compute))
+}
+
+pub(super) fn federation_value(settings: &crate::federation::FederationSettings) -> String {
+    serde_json::to_string(settings).expect("admin document federation settings serialize")
 }
 
 pub(super) fn quota_from_value(value: &str) -> Option<QuotaConfig> {
