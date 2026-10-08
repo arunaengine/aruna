@@ -613,45 +613,74 @@ pub(in crate::document_sync) async fn apply_realm_authorization(
         return Ok(());
     }
 
-    let previous_auth_doc = storage_read_from(
-        storage,
-        document_target.storage_keyspace().to_string(),
-        document_target.storage_key(),
-    )
-    .await?
-    .map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    let mut auth_doc = previous_auth_doc.unwrap_or_else(|| RealmAuthorizationDocument {
-        realm_id,
-        roles: Default::default(),
-        operation_restrictions: Default::default(),
-    });
-    let before = auth_doc.roles.clone();
-    materialize_realm_authorization(&mut auth_doc, &reducer_state, &event);
-    let narrowed = roles_narrowed(&before, &auth_doc.roles);
-
     let mut writes = vec![
-        (
-            document_target.storage_keyspace().to_string(),
-            document_target.storage_key(),
-            auth_doc
-                .to_bytes(&event.actor)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                .into(),
-        ),
         reducer_state_entry(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     ];
-    writes.extend(due_writes(storage, &event, narrowed, None, None).await?);
     writes.extend(
         conflict_write_entries(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     );
+    let deletes = stale_conflict_deletes(previous_state.as_ref(), Some(&reducer_state));
 
-    let stale_conflict_deletes =
-        stale_conflict_deletes(previous_state.as_ref(), Some(&reducer_state));
-    replace_batch_transactionally(storage, stale_conflict_deletes, writes).await
+    // The roles and markers come from each attempt, so a bucket encrypted meanwhile is included.
+    for _ in 0..APPLY_CONFLICT_ATTEMPTS {
+        tokio::task::yield_now().await;
+        let txn_id = start_storage_transaction(storage).await?;
+        let previous = match transaction_read(
+            storage,
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+            Some(txn_id),
+        )
+        .await
+        {
+            Ok(previous) => previous,
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        };
+        let auth_doc = previous.map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes));
+        let mut auth_doc = match auth_doc.transpose() {
+            Ok(doc) => doc.unwrap_or_else(|| RealmAuthorizationDocument {
+                realm_id,
+                roles: Default::default(),
+                operation_restrictions: Default::default(),
+            }),
+            Err(error) => {
+                let error = NetError::Bootstrap(error.to_string());
+                return Err(abort_error(storage, txn_id, error).await);
+            }
+        };
+        let before = auth_doc.roles.clone();
+        materialize_realm_authorization(&mut auth_doc, &reducer_state, &event);
+        let narrowed = roles_narrowed(&before, &auth_doc.roles);
+        let doc = match auth_doc.to_bytes(&event.actor) {
+            Ok(doc) => doc,
+            Err(error) => {
+                let error = NetError::Bootstrap(error.to_string());
+                return Err(abort_error(storage, txn_id, error).await);
+            }
+        };
+        let mut attempt_writes = writes.clone();
+        attempt_writes.push((
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+            doc.into(),
+        ));
+        match due_writes(storage, &event, narrowed, None, Some(txn_id)).await {
+            Ok(due) => attempt_writes.extend(due),
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        }
+        match replace_batch_in(storage, txn_id, deletes.clone(), attempt_writes).await {
+            Ok(()) => return Ok(()),
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
+                abort_txn(storage, txn_id).await?;
+            }
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        }
+    }
+    Err(NetError::Dht(
+        "realm authorization apply conflict retries exhausted".to_string(),
+    ))
 }
 
 /// Realm-config ops the reducer stores as order-insensitive immutable values
