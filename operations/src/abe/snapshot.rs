@@ -68,6 +68,7 @@ impl KeyOperation {
         let mut holders = admin_users(
             realm.roles.values().chain(group.roles.values()),
             &group_admin_path(self.auth.realm_id, info.group_id),
+            self.auth.realm_id,
         );
         let admin = holders.contains(&self.auth.user_id);
         holders.insert(info.created_by);

@@ -239,3 +239,46 @@ async fn lists_then_removes() {
         StatusCode::CONFLICT | StatusCode::NOT_FOUND
     ));
 }
+
+#[tokio::test]
+async fn federated_keys_refused() {
+    // Federated users neither receive a grant nor extend an unlock, whatever roles they hold.
+    let fixture = fixture().await;
+    let foreign = UserId::new(Ulid::generate(), RealmId([9; 32]));
+    let refused = |error: ServerError| {
+        matches!(
+            error,
+            ServerError::Refused(
+                StatusCode::FORBIDDEN,
+                "foreign_encryption_keys_unsupported",
+                _
+            )
+        )
+    };
+    let grant = grant_holder(
+        State(fixture.state.clone()),
+        Extension(Some(fixture.owner.clone())),
+        Path(BUCKET.to_string()),
+        Json(GrantRequest {
+            user_id: foreign.to_string(),
+        }),
+    )
+    .await;
+    assert!(refused(grant.unwrap_err()));
+    let caller = AuthContext {
+        user_id: foreign,
+        ..fixture.owner.clone()
+    };
+    let extend = extend_unlock(
+        State(fixture.state.clone()),
+        Extension(Some(caller)),
+        Path(BUCKET.to_string()),
+        Json(ExtendRequest {
+            generation: 1,
+            session_id: Ulid::generate().to_string(),
+            duration_ms: None,
+        }),
+    )
+    .await;
+    assert!(refused(extend.unwrap_err()));
+}
