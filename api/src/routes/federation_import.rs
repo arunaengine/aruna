@@ -14,24 +14,23 @@ use crate::routes::rocrate_import::{
     submit_import,
 };
 use crate::server::state::ServerState;
-use aruna_core::federation::{RealmDescriptor, Signed};
-use aruna_core::handoff::descriptor_digest;
+use aruna_core::federation::Signed;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{RoCrateMediaType, RoCrateUploadRecord};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
-use aruna_core::transfer::{
-    ExportGrant, ImportDestination, ImportIntent, MAX_TRANSFER_SECS, TransferError, check_grant,
-    check_intent, import_key,
-};
+use aruna_core::transfer::{ExportGrant, ImportDestination, ImportIntent, TransferError};
 use aruna_operations::driver::drive;
 use aruna_operations::federation::import::{
-    ImportError, ImportRecord, authorize_import, check_cutoff, reusable_upload, write_import,
+    ImportError, ImportRecord, authorize_import, reusable_upload, write_import,
+};
+use aruna_operations::federation::transfer::{
+    AdmitTransferConfig, AdmitTransferOperation, IssueIntentConfig, IssueIntentOperation,
+    TransferAdmitError,
 };
 use aruna_operations::jobs::import::{
     CreateRoCrateConfig, CreateRoCrateOperation, load_rocrate_upload, write_rocrate_upload,
 };
-use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
@@ -109,22 +108,21 @@ fn gateway(code: &'static str, message: String) -> ServerError {
     ServerError::Refused(StatusCode::BAD_GATEWAY, code, message)
 }
 
-/// This realm's current signed descriptor.
-async fn current_descriptor(state: &ServerState) -> ServerResult<Signed<RealmDescriptor>> {
-    let config = drive(
-        GetConfigOperation::new(state.get_realm_id()),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
-    let settings = config.federation.ok_or_else(|| {
-        ServerError::Refused(
-            StatusCode::FORBIDDEN,
-            "federation_disabled",
-            "this realm has no federation settings".to_string(),
-        )
-    })?;
-    Ok(settings.descriptor)
+fn admission_refused(error: TransferAdmitError) -> ServerError {
+    let message = error.to_string();
+    match error {
+        TransferAdmitError::Disabled => {
+            ServerError::Refused(StatusCode::FORBIDDEN, "federation_disabled", message)
+        }
+        TransferAdmitError::Rejected(error) => transfer_refused(error),
+        TransferAdmitError::CutOff => {
+            ServerError::Refused(StatusCode::FORBIDDEN, "import_denied", message)
+        }
+        TransferAdmitError::Config(_) => ServerError::ServiceUnavailableReason(message),
+        TransferAdmitError::Sign(_) | TransferAdmitError::NotFinished => {
+            ServerError::InternalError(message)
+        }
+    }
 }
 
 fn principal(state: &ServerState, intent: &ImportIntent) -> AuthContext {
@@ -144,27 +142,26 @@ async fn admit(
     grant: &Signed<ExportGrant>,
     secret: Option<&[u8]>,
 ) -> ServerResult<String> {
-    let (local, now) = (state.get_realm_id(), unix_timestamp_secs());
-    let descriptor = current_descriptor(state).await?;
-    check_intent(intent, &local, &descriptor, secret, now).map_err(transfer_refused)?;
-    check_grant(grant, intent, now).map_err(transfer_refused)?;
-    let (payload, source) = (&intent.payload, Some(grant.payload.source));
-    let auth = principal(state, payload);
+    let admit = AdmitTransferOperation::new(AdmitTransferConfig {
+        realm_id: state.get_realm_id(),
+        intent: intent.clone(),
+        grant: grant.clone(),
+        secret: secret.map(<[u8]>::to_vec),
+        now: unix_timestamp_secs(),
+    });
     let context = state.get_ctx();
-    check_cutoff(&context, local, payload)
-        .await
-        .map_err(import_refused)?;
+    let key = drive(admit, &context).await.map_err(admission_refused)?;
+    let (payload, source) = (&intent.payload, Some(grant.payload.source));
     authorize_import(
         &context,
-        &auth,
+        &principal(state, payload),
         &payload.destination,
         source,
         state.get_node_id(),
     )
     .await
     .map_err(import_refused)?;
-    import_key(&grant.payload, &payload.destination)
-        .map_err(|error| transfer_refused(TransferError::Signature(error)))
+    Ok(key)
 }
 
 /// Admits a push from the source realm; `None` without intent and grant headers.
@@ -376,7 +373,6 @@ pub async fn create_intent(
             "nonce must be a hex SHA-256 digest".into(),
         ));
     }
-    let descriptor = current_descriptor(&state).await?;
     let limits = state.rocrate_limits();
     let target = ImportTargetRequest {
         bucket: request.bucket,
@@ -399,22 +395,17 @@ pub async fn create_intent(
     authorize_import(&context, &auth, &destination, None, state.get_node_id())
         .await
         .map_err(import_refused)?;
-    let now = unix_timestamp_secs();
     let limit = limits.direct_upload_bytes;
-    let intent = ImportIntent {
+    let issue = IssueIntentOperation::new(IssueIntentConfig {
         realm_id: state.get_realm_id(),
-        descriptor_digest: descriptor_digest(&descriptor)
-            .map_err(|error| ServerError::InternalError(error.to_string()))?,
         principal: auth.user_id,
         destination,
         max_bytes: request.max_bytes.unwrap_or(limit).min(limit),
         nonce: request.nonce.to_ascii_lowercase(),
-        issued_at: now,
-        expires_at: now.saturating_add(MAX_TRANSFER_SECS),
-        intent_id: Ulid::generate(),
-    };
-    let signed = Signed::sign(intent, state.node_capabilities())
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        node_capabilities: state.node_capabilities().clone(),
+        now: unix_timestamp_secs(),
+    });
+    let signed = drive(issue, &context).await.map_err(admission_refused)?;
     Ok(Json(signed))
 }
 
