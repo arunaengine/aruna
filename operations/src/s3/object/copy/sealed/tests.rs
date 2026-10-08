@@ -395,5 +395,5 @@ async fn governed_copy_registered() {
     assert!(matches!(refused, Err(SealedCopyError::PolicyGate(_))));
 }
 
-#[path = "sealed_abe_tests.rs"]
+#[path = "abe_tests.rs"]
 mod abe;

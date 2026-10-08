@@ -2100,7 +2100,7 @@ mod pure_tests {
 }
 
 #[cfg(test)]
-#[path = "put_tests.rs"]
+#[path = "tests.rs"]
 mod test;
 
 /// F1 acceptance: no byte-materialization effect and no registration may be
@@ -2533,5 +2533,5 @@ mod decision_tests {
     }
 }
 
-#[path = "put_abe.rs"]
+#[path = "abe.rs"]
 pub(crate) mod abe;

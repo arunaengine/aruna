@@ -802,5 +802,5 @@ impl Operation for SealedCopyOperation {
 }
 
 #[cfg(test)]
-#[path = "sealed_tests.rs"]
+#[path = "tests.rs"]
 mod tests;

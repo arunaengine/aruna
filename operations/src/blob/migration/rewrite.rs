@@ -547,12 +547,12 @@ impl Operation for RewriteVersionOperation {
             })
     }
 }
-#[path = "../rewrite_rows.rs"]
+#[path = "../rewrite/rows.rs"]
 mod rows;
 
-#[path = "../rewrite_abe.rs"]
+#[path = "../rewrite/abe.rs"]
 mod abe;
 
 #[cfg(test)]
-#[path = "../rewrite_tests.rs"]
+#[path = "../rewrite/tests.rs"]
 mod tests;
