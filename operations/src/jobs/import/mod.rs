@@ -178,6 +178,8 @@ enum ImportFailure {
     Validation(Vec<MetadataValidationViolation>),
     Cancelled,
     Interrupted,
+    /// Waits without spending an attempt, such as for fresh consent to an import from a realm.
+    Deferred(String),
 }
 
 pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> JobRunOutcome {
@@ -300,6 +302,9 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
                 }
             }
             Err(ImportFailure::Interrupted) => return JobRunOutcome::Interrupted,
+            Err(ImportFailure::Deferred(error)) => {
+                return JobRunOutcome::Deferred(JobError::retryable(error));
+            }
             Err(ImportFailure::Validation(violations)) => {
                 if let Err(error) = write_validation_rows(ctx, &violations).await {
                     return retryable_error(error);
@@ -1471,10 +1476,12 @@ async fn ensure_targets(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<()
 /// An import of another realm's artifact keeps its intent binding and import policies.
 async fn ensure_federated(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<(), ImportFailure> {
     use crate::federation::import::{ImportError, recheck_import};
-    recheck_import(&ctx.driver, spec, ctx.owner_node_id)
+    let now = aruna_core::time::unix_timestamp_secs();
+    recheck_import(&ctx.driver, spec, ctx.owner_node_id, now)
         .await
         .map_err(|error| match error {
             ImportError::Storage(error) => ImportFailure::Retryable(error),
+            ImportError::Expired => ImportFailure::Deferred(error.to_string()),
             error => ImportFailure::Permanent(error.to_string()),
         })
 }
@@ -2165,7 +2172,9 @@ fn write_state(checkpoint: &ImportCheckpoint) -> String {
 
 fn failure_message(error: ImportFailure) -> String {
     match error {
-        ImportFailure::Permanent(message) | ImportFailure::Retryable(message) => message,
+        ImportFailure::Permanent(message)
+        | ImportFailure::Retryable(message)
+        | ImportFailure::Deferred(message) => message,
         ImportFailure::Validation(violations) => validation_message(&violations),
         ImportFailure::Cancelled => "import cancelled".to_string(),
         ImportFailure::Interrupted => "import interrupted".to_string(),

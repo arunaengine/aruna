@@ -14,7 +14,9 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::transfer::{ExportGrant, ImportDestination, ImportIntent};
+use aruna_core::transfer::{
+    ExportGrant, ImportDestination, ImportIntent, TransferError, check_grant, check_intent,
+};
 use aruna_core::{NodeId, UserId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -26,6 +28,7 @@ use crate::driver::{DriverContext, drive};
 use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome};
 use crate::jobs::import::load_rocrate_upload;
 use crate::jobs::key_wake::read_row;
+use crate::realm::get_config::GetConfigOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 pub const IMPORT_OPERATION: &str = "federation.import";
@@ -47,6 +50,8 @@ pub enum ImportError {
     NoBucket,
     #[error("the import key is bound to another transfer")]
     Conflict,
+    #[error("the import waits for a fresh intent and grant")]
+    Expired,
     #[error("import storage failed: {0}")]
     Storage(String),
 }
@@ -217,12 +222,13 @@ fn bound(spec: &ImportRoCrateSpec, intent: &ImportIntent) -> bool {
         && normalized(&spec.metadata.path) == normalized(&destination.metadata_path)
 }
 
-/// Rechecks an import of another realm's artifact at every step; other imports pass. Expiry
-/// of the intent does not stop a running import, it was authorized when the job began.
+/// Rechecks an import of another realm's artifact at every step; other imports pass. An expired
+/// intent or grant, or a superseded descriptor, pauses the job until a fresh consent rebinds it.
 pub async fn recheck_import(
     context: &DriverContext,
     spec: &ImportRoCrateSpec,
     node_id: NodeId,
+    now: u64,
 ) -> Result<(), ImportError> {
     let ImportRoCrateSource::Upload { upload_id } = &spec.source else {
         return Ok(());
@@ -234,6 +240,17 @@ pub async fn recheck_import(
     if !bound(spec, intent) {
         return Err(ImportError::Unbound);
     }
+    let local = spec.auth_context.realm_id;
+    let config = drive(GetConfigOperation::new(local), context)
+        .await
+        .map_err(|error| ImportError::Storage(error.to_string()))?;
+    let descriptor = config.federation.ok_or(ImportError::Denied)?.descriptor;
+    check_intent(&record.intent, &local, &descriptor, None, now)
+        .and_then(|()| check_grant(&record.grant, &record.intent, now))
+        .map_err(|error| match error {
+            TransferError::BadLifetime | TransferError::StaleDescriptor => ImportError::Expired,
+            _ => ImportError::Unbound,
+        })?;
     let source = Some(record.grant.payload.source);
     authorize_import(
         context,
@@ -249,6 +266,7 @@ pub async fn recheck_import(
 mod tests {
     use super::*;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::federation::RealmDescriptor;
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::execution::job::{
         ImportMetadataTarget, ImportRoCrateTarget, RoCrateLimits,
@@ -291,10 +309,53 @@ mod tests {
         UserId::new(Ulid::from_bytes([3; 16]), realm(1))
     }
 
+    fn descriptor() -> Signed<RealmDescriptor> {
+        let descriptor = RealmDescriptor {
+            realm_id: realm(2),
+            name: "B".to_string(),
+            description: String::new(),
+            api_url: Url::parse("https://b.example.org/api/v1").unwrap(),
+            portal_url: Url::parse("https://b.example.org/").unwrap(),
+            issued_at: 1,
+        };
+        Signed::sign(descriptor, &signer(2)).unwrap()
+    }
+
+    /// Stores realm 2's federation settings with `descriptor`.
+    async fn seed_config(context: &DriverContext, descriptor: Signed<RealmDescriptor>) {
+        use aruna_core::document::DocumentTarget;
+        use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMode};
+        use aruna_core::structs::identity::auth::Actor;
+        use aruna_core::structs::identity::realm::RealmConfigDocument;
+        let mut config = RealmConfigDocument::default_for_realm(realm(2), Vec::new());
+        config.federation = Some(FederationSettings {
+            name: "B".to_string(),
+            api_url: descriptor.payload.api_url.clone(),
+            portal_url: descriptor.payload.portal_url.clone(),
+            registry_url: None,
+            registration: RegistrationMode::Enabled,
+            accepted_realms: AcceptedRealms::None,
+            descriptor,
+        });
+        let actor = Actor {
+            node_id: node(),
+            user_id: UserId::new(Ulid::from_bytes([2; 16]), realm(2)),
+            realm_id: realm(2),
+        };
+        let target = DocumentTarget::RealmConfig { realm_id: realm(2) };
+        let effect = StorageEffect::Write {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key().to_vec().into(),
+            value: config.to_bytes(&actor).unwrap().into(),
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(effect).await;
+    }
+
     fn record() -> ImportRecord {
         let intent = ImportIntent {
             realm_id: realm(2),
-            descriptor_digest: String::new(),
+            descriptor_digest: aruna_core::handoff::descriptor_digest(&descriptor()).unwrap(),
             principal: principal(),
             destination: ImportDestination {
                 group_id: Ulid::from_bytes([1; 16]),
@@ -308,10 +369,11 @@ mod tests {
             expires_at: 1 + MAX_TRANSFER_SECS,
             intent_id: Ulid::from_bytes([4; 16]),
         };
+        let intent = Signed::sign(intent, &signer(2)).unwrap();
         let grant = ExportGrant {
             source: realm(1),
             audience: realm(2),
-            intent_digest: String::new(),
+            intent_digest: aruna_core::transfer::intent_digest(&intent).unwrap(),
             export_job_id: Ulid::from_bytes([5; 16]),
             document_id: Ulid::from_bytes([6; 16]),
             source_revision: Ulid::from_bytes([7; 16]),
@@ -324,7 +386,7 @@ mod tests {
             expires_at: 1 + MAX_TRANSFER_SECS,
         };
         ImportRecord {
-            intent: Signed::sign(intent, &signer(2)).unwrap(),
+            intent,
             grant: Signed::sign(grant, &signer(1)).unwrap(),
         }
     }
@@ -352,6 +414,8 @@ mod tests {
         }
     }
 
+    const NOW: u64 = 100;
+
     fn node() -> NodeId {
         iroh::SecretKey::from_bytes(&[8; 32]).public()
     }
@@ -362,7 +426,7 @@ mod tests {
         let upload_id = Ulid::from_bytes([9; 16]);
         // An ordinary upload import has no record and is not rechecked here.
         assert_eq!(
-            recheck_import(&context, &spec(upload_id), node()).await,
+            recheck_import(&context, &spec(upload_id), node(), NOW).await,
             Ok(())
         );
         write_import(&context, "key", upload_id, &record())
@@ -375,11 +439,11 @@ mod tests {
         assert_eq!(bound_upload(&context, other, "key").await, Ok(None));
         let mut moved = spec(upload_id);
         moved.target.prefix = "elsewhere".to_string();
-        let checked = recheck_import(&context, &moved, node()).await;
+        let checked = recheck_import(&context, &moved, node(), NOW).await;
         assert_eq!(checked, Err(ImportError::Unbound));
         let mut other = spec(upload_id);
         other.auth_context.user_id = UserId::new(Ulid::from_bytes([4; 16]), realm(2));
-        let checked = recheck_import(&context, &other, node()).await;
+        let checked = recheck_import(&context, &other, node(), NOW).await;
         assert_eq!(checked, Err(ImportError::Unbound));
     }
 
@@ -453,7 +517,27 @@ mod tests {
             txn_id: None,
         };
         context.storage_handle.send_storage_effect(effect).await;
-        let checked = recheck_import(&context, &spec(upload_id), node()).await;
+        seed_config(&context, descriptor()).await;
+        let checked = recheck_import(&context, &spec(upload_id), node(), NOW).await;
         assert_eq!(checked, Err(ImportError::Denied));
+    }
+
+    #[tokio::test]
+    async fn expired_consent_pauses() {
+        // An expired consent or a superseded descriptor waits for fresh consent.
+        let (_dir, context) = context();
+        let upload_id = Ulid::from_bytes([9; 16]);
+        write_import(&context, "key", upload_id, &record())
+            .await
+            .unwrap();
+        seed_config(&context, descriptor()).await;
+        let late = 1 + MAX_TRANSFER_SECS;
+        let checked = recheck_import(&context, &spec(upload_id), node(), late).await;
+        assert_eq!(checked, Err(ImportError::Expired));
+        let mut newer = descriptor().payload;
+        newer.issued_at = 2;
+        seed_config(&context, Signed::sign(newer, &signer(2)).unwrap()).await;
+        let checked = recheck_import(&context, &spec(upload_id), node(), NOW).await;
+        assert_eq!(checked, Err(ImportError::Expired));
     }
 }

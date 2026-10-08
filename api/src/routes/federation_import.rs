@@ -100,6 +100,7 @@ fn import_refused(error: ImportError) -> ServerError {
         ImportError::Conflict => {
             ServerError::Refused(StatusCode::CONFLICT, "import_conflict", message)
         }
+        ImportError::Expired => transfer_refused(TransferError::BadLifetime),
         ImportError::Storage(_) => ServerError::ServiceUnavailableReason(message),
     }
 }
@@ -192,6 +193,8 @@ pub(crate) async fn pushed_upload(
     else {
         return Ok(None);
     };
+    // The source's push confirms its grant again; a paused import resumes with this consent.
+    rebind(state, &push.intent, &push.grant, &push.key, upload_id).await?;
     load_rocrate_upload(&context, upload_id)
         .await
         .map_err(ServerError::InternalError)
@@ -240,6 +243,59 @@ pub(crate) async fn bind_upload(
         .ok_or(ServerError::NotFound)
 }
 
+/// Replaces the intent and grant of a bound upload with a fresh consent to the same transfer.
+async fn rebind(
+    state: &ServerState,
+    intent: &Signed<ImportIntent>,
+    grant: &Signed<ExportGrant>,
+    key: &str,
+    upload_id: Ulid,
+) -> ServerResult<()> {
+    let binding = ImportRecord {
+        intent: intent.clone(),
+        grant: grant.clone(),
+    };
+    let bound = write_import(&state.get_ctx(), key, upload_id, &binding)
+        .await
+        .map_err(import_refused)?;
+    if bound != upload_id {
+        return Err(import_refused(ImportError::Conflict));
+    }
+    Ok(())
+}
+
+/// Sends `method` for the grant's artifact to the source realm through the egress guard.
+async fn source_request(
+    state: &ServerState,
+    method: reqwest::Method,
+    grant: &Signed<ExportGrant>,
+) -> ServerResult<reqwest::Response> {
+    let context = state.get_ctx();
+    let blob = context
+        .blob_handle
+        .as_ref()
+        .ok_or(ServerError::ServiceUnavailable)?;
+    let unreachable = |error: String| gateway("pull_unreachable", error);
+    let response = blob
+        .repository_request(method, grant.payload.artifact_url.clone())
+        .map_err(|error| unreachable(error.to_string()))?
+        .header(GRANT_HEADER, encode_header(grant)?)
+        .timeout(PULL_TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| unreachable(error.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        let message = format!("source realm answered {status}");
+        return Err(ServerError::Refused(
+            StatusCode::FORBIDDEN,
+            "source_refused",
+            message,
+        ));
+    }
+    Ok(response)
+}
+
 /// A `Sync` byte stream over a response body, as the upload writer needs.
 fn shared_stream(
     body: impl Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
@@ -261,28 +317,7 @@ async fn pull_artifact(
     grant: &Signed<ExportGrant>,
 ) -> ServerResult<RoCrateUploadRecord> {
     let context = state.get_ctx();
-    let blob = context
-        .blob_handle
-        .as_ref()
-        .ok_or(ServerError::ServiceUnavailable)?;
-    let unreachable = |error: String| gateway("pull_unreachable", error);
-    let response = blob
-        .repository_request(reqwest::Method::GET, grant.payload.artifact_url.clone())
-        .map_err(|error| unreachable(error.to_string()))?
-        .header(GRANT_HEADER, encode_header(grant)?)
-        .timeout(PULL_TIMEOUT)
-        .send()
-        .await
-        .map_err(|error| unreachable(error.to_string()))?;
-    let status = response.status();
-    if !status.is_success() {
-        let message = format!("source realm answered {status}");
-        return Err(ServerError::Refused(
-            StatusCode::FORBIDDEN,
-            "source_refused",
-            message,
-        ));
-    }
+    let response = source_request(state, reqwest::Method::GET, grant).await?;
     let expires_at_ms =
         unix_timestamp_millis().saturating_add(state.rocrate_limits().upload_retention_ms);
     let config = CreateRoCrateConfig {
@@ -394,9 +429,12 @@ binds the call to the portal that requested the intent.
 - The intent must name this realm's current descriptor and the secret; the grant must be signed
   by its source realm for this intent. WRITE and the `federation.import` policies are checked
   again, and on every step of the import job.
-- When an earlier push or pull of the same import key left an upload on this node, it is used.
-  Otherwise this node pulls the artifact from the grant's artifact URL through its egress guard.
-  If that fails, the answer is 502 with code `pull_unreachable` and the source realm may push.
+- When an earlier push or pull of the same import key left an upload on this node, it is used
+  once the source answers a HEAD of the artifact with the grant. Otherwise this node pulls the
+  artifact from the grant's artifact URL through its egress guard. If either fails, the answer is
+  502 with code `pull_unreachable` and the source realm may push.
+- A fresh intent and grant for the same transfer replace the stored ones, so an import paused by
+  an expired consent continues as the same job. A push with fresh consent does the same.
 - The import key covers source realm, document, dataset and selection digests, destination
   bucket, prefix and metadata path: a retry returns the same job with `created` false, a
   different plan for the same key is a 409. Existing keys are never overwritten."#,
@@ -435,7 +473,12 @@ pub async fn create_import(
         .await
         .map_err(import_refused)?;
     let upload_id = match bound {
-        Some(upload_id) => upload_id,
+        // A bound upload starts or resumes only after the source confirms the grant again.
+        Some(upload_id) => {
+            source_request(&state, reqwest::Method::HEAD, &grant).await?;
+            rebind(&state, &intent, &grant, &key, upload_id).await?;
+            upload_id
+        }
         None => {
             let record = pull_artifact(&state, &intent, &grant).await?;
             bind_upload(&state, &intent, &grant, &key, &record)
