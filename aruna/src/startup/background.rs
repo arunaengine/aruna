@@ -262,6 +262,7 @@ mod tests {
             task_handle.clone(),
             jobs_runtime.clone(),
             aruna_core::structs::execution::job::RoCrateLimits::default(),
+            None,
         )
         .await;
         let background = Background {

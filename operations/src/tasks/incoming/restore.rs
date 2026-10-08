@@ -93,8 +93,17 @@ pub async fn install_task_queues(
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
+    node_capabilities: Option<NodeCapabilities>,
 ) -> TaskQueues {
-    install_task_handler(context, task_handle, jobs_runtime, rocrate_limits, true).await
+    install_task_handler(
+        context,
+        task_handle,
+        jobs_runtime,
+        rocrate_limits,
+        node_capabilities,
+        true,
+    )
+    .await
 }
 
 /// Test convenience: installs the inbound handler, then restores and starts
@@ -107,10 +116,16 @@ pub async fn start_task_queues(
     jobs_runtime: Arc<JobsRuntime>,
     shutdown: &Shutdown,
 ) {
-    install_task_queues(context, task_handle, jobs_runtime, RoCrateLimits::default())
-        .await
-        .restore_and_start(shutdown)
-        .await;
+    install_task_queues(
+        context,
+        task_handle,
+        jobs_runtime,
+        RoCrateLimits::default(),
+        None,
+    )
+    .await
+    .restore_and_start(shutdown)
+    .await;
 }
 
 async fn install_task_handler(
@@ -118,6 +133,7 @@ async fn install_task_handler(
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
+    node_capabilities: Option<NodeCapabilities>,
     refresh_holders: bool,
 ) -> TaskQueues {
     let handler_context = context.clone();
@@ -129,7 +145,8 @@ async fn install_task_handler(
     }
     let handler = Arc::new(
         OperationsTaskHandler::new(handler_context, jobs_runtime.clone())
-            .with_rocrate_limits(rocrate_limits),
+            .with_rocrate_limits(rocrate_limits)
+            .with_node_capabilities(node_capabilities),
     );
     task_handle.set_inbound_handler(handler.clone()).await;
     // Prime the origin-side watch interest cache from any digests already in
@@ -212,6 +229,10 @@ impl TaskQueues {
             return;
         }
         crate::node::node_info::restore_info_timer(&context.storage_handle, &task_handle).await;
+        if stopped() {
+            return;
+        }
+        crate::federation::publish::restore_publish_timer(&task_handle).await;
         if stopped() {
             return;
         }
@@ -329,6 +350,27 @@ impl OperationsTaskHandler {
             crate::node::node_info::INFO_PUBLISH_INTERVAL,
         )
         .await;
+    }
+
+    pub(super) async fn publish_registration(&self) {
+        let key = TaskKey::PublishRegistration;
+        match (self.context.net_handle.as_ref(), &self.node_capabilities) {
+            (Some(net_handle), Some(capabilities)) => {
+                if let Err(error) = crate::federation::publish::publish_registration(
+                    &self.context,
+                    *net_handle.realm_id(),
+                    net_handle.node_id(),
+                    capabilities,
+                )
+                .await
+                {
+                    warn!(task_id = ?key, error = %error, "Failed to publish registry registration");
+                }
+            }
+            _ => warn!(task_id = ?key, "Cannot publish registration without net handle or keys"),
+        }
+        self.reschedule_timer(key, crate::federation::publish::PUBLISH_INTERVAL)
+            .await;
     }
 
     pub(super) async fn publish_watch_interest(&self) {
@@ -1068,6 +1110,7 @@ mod stop_tests {
             task_handle.clone(),
             JobsRuntime::new_paused(),
             RoCrateLimits::default(),
+            None,
         )
         .await;
         (temp_dir, task_handle, queues, Shutdown::new())
