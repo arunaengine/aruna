@@ -990,6 +990,7 @@ async fn write_next(
         routing,
     })
     .with_bucket_guard(bucket_info)
+    .create_only()
     .with_rocrate_limits(spec.limits.clone())
     .with_restrictions(spec.auth_context.path_restrictions.clone());
     if let Some(gate) = gate {

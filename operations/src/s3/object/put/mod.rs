@@ -141,6 +141,8 @@ pub enum PutObjectError {
     BlobWriteFailed(BlobError),
     #[error("preassigned version exists without a materialized blob")]
     InvalidPreassignedVersion,
+    #[error("an object already exists at this key")]
+    ObjectExists,
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
@@ -220,6 +222,8 @@ pub struct PutObjectOperation {
     /// The written location belongs to another version; never delete it.
     adopted: bool,
     was_live: bool,
+    /// Refuses the write when the key has a live head; a replayed preassigned version passes.
+    create_only: bool,
     usage_update: Option<UsageCounterUpdate>,
     quota_gate: Option<QuotaGate>,
     output: Option<Result<BackendLocation, PutObjectError>>,
@@ -273,6 +277,7 @@ impl PutObjectOperation {
             adopt: None,
             adopted: false,
             was_live: false,
+            create_only: false,
             usage_update: None,
             quota_gate: None,
             output: None,
@@ -320,6 +325,11 @@ impl PutObjectOperation {
 
     pub fn with_bucket_guard(mut self, bucket: BucketInfo) -> Self {
         self.expected_bucket = Some(bucket);
+        self
+    }
+
+    pub fn create_only(mut self) -> Self {
+        self.create_only = true;
         self
     }
 
@@ -1035,6 +1045,9 @@ impl PutObjectOperation {
         self.was_live = value
             .and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok())
             .is_some_and(|version| !version.is_deleted());
+        if self.create_only && self.was_live {
+            return self.emit_error(PutObjectError::ObjectExists);
+        }
 
         let existing_pointer = self.existing_pointer.clone();
         self.write_current_lookup(existing_pointer.as_ref())
