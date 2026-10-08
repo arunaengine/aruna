@@ -307,6 +307,7 @@ pub async fn start_push(
     publish: bool,
 ) -> Result<JobId, LinkError> {
     let spec = ExportRoCrateSpec {
+        selection: None,
         destination: Some(link.destination(publish)),
         auth_context: AuthContext {
             user_id: link.created_by,

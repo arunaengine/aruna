@@ -423,6 +423,7 @@ fn export_job(job_id: JobId, owner: UserId, expires_at_ms: u64) -> JobRecord {
     let mut record = JobRecord::new(
         job_id,
         JobPayload::ExportRoCrate(ExportRoCrateSpec {
+            selection: None,
             destination: None,
             auth_context: auth_for(owner).unwrap(),
             document_id,

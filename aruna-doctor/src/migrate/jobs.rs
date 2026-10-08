@@ -249,6 +249,7 @@ impl From<LegacyExportSpec> for ExportRoCrateSpec {
             auth_context: legacy.auth_context,
             document_id: legacy.document_id,
             limits: legacy.limits,
+            selection: None,
         }
     }
 }
@@ -431,6 +432,7 @@ mod tests {
         let mut record = JobRecord::new(
             job_id,
             JobPayload::ExportRoCrate(ExportRoCrateSpec {
+                selection: None,
                 destination: None,
                 auth_context: auth(),
                 document_id: Ulid::from_bytes([2u8; 16]),

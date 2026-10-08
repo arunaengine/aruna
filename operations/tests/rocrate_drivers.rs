@@ -188,6 +188,7 @@ async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(materialized.processed, 1);
 
     let export = ExportRoCrateSpec {
+        selection: None,
         destination: None,
         auth_context: AuthContext {
             user_id: fixture.actor.user_id,
@@ -833,6 +834,7 @@ async fn local_denial_omits() -> Result<(), Box<dyn std::error::Error>> {
         document_id,
     );
     let export = ExportRoCrateSpec {
+        selection: None,
         destination: None,
         auth_context: AuthContext {
             user_id: fixture.actor.user_id,
