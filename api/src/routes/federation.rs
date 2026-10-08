@@ -141,7 +141,27 @@ management node serves the call and signs the descriptor; every other node relay
         })
     ),
     responses(
-        (status = 200, description = "The stored settings with the signed descriptor", body = RealmFederation),
+        (status = 200, description = "The stored settings with the signed descriptor", body = RealmFederation,
+            example = json!({
+                "name": "Example realm",
+                "api_url": "https://api.example.org/api/v1",
+                "portal_url": "https://portal.example.org/",
+                "registry_url": "https://registry.example.org/",
+                "registration": "enabled",
+                "accepted_realms": {"mode": "any"},
+                "descriptor": {
+                    "payload": {
+                        "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                        "name": "Example realm",
+                        "description": "",
+                        "api_url": "https://api.example.org/api/v1",
+                        "portal_url": "https://portal.example.org/",
+                        "issued_at": 1791000000
+                    },
+                    "signer": "Realm",
+                    "signature": "<hex ed25519 signature>"
+                }
+            })),
         (status = 400, description = "A malformed or non-HTTPS URL, an empty or too long name, a malformed realm id or too many accepted realms", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
@@ -244,7 +264,19 @@ fn map_federation_error(error: SetFederationError) -> ServerError {
   the realm id, which is the realm's ed25519 public key.
 - A newer `issued_at` supersedes older descriptors."#,
     responses(
-        (status = 200, description = "The signed realm descriptor", body = Value),
+        (status = 200, description = "The signed realm descriptor", body = Value,
+            example = json!({
+                "payload": {
+                    "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                    "name": "Example realm",
+                    "description": "",
+                    "api_url": "https://api.example.org/api/v1",
+                    "portal_url": "https://portal.example.org/",
+                    "issued_at": 1791000000
+                },
+                "signer": "Realm",
+                "signature": "<hex ed25519 signature>"
+            })),
         (status = 404, description = "The realm has no federation settings")
     )
 )]
