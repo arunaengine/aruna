@@ -2438,3 +2438,74 @@ fn selection_keeps_references() {
     assert_eq!(graph[1]["identifier"], left.to_string());
     assert_eq!(graph[2]["@id"], foreign.to_w3id());
 }
+
+#[test]
+fn facts_need_selected_files() {
+    // A grant pins only a finished export that kept every selected file.
+    let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+    let version = Ulid::from_bytes([4; 16]);
+    let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        root: "/data".to_string(),
+        storage_bucket: "storage".to_string(),
+        backend_path: "bucket/key".to_string(),
+        ulid: version,
+        format: StoredFormat::default(),
+        created_by: Default::default(),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        staging: false,
+        partial: false,
+        blob_size: 5,
+        hashes: HashMap::new(),
+    };
+    let entity = ExportEntity {
+        entity_id: "data.csv".to_string(),
+        local_path: None,
+        storage_key: None,
+        exact: None,
+        hash: None,
+        hash_realm: None,
+        candidates: vec![ExportCandidate {
+            source: CandidateSource::Local {
+                location: location.clone(),
+                group_id: Ulid::from_bytes([6; 16]),
+                permission_path: "/object".to_string(),
+                node_id,
+                bucket: "bucket".to_string(),
+                key: "key".to_string(),
+            },
+            report_source: ExportReportSource::Local,
+            resolved_version: Some(version),
+            expected_blake3: None,
+        }],
+        omission: None,
+        message: None,
+        zip_path: Some("data.csv".to_string()),
+        report_source: Some(ExportReportSource::Local),
+        resolved_version: Some(version),
+        path_synthesized: false,
+        content: Some(([7; 32], 5)),
+    };
+    let mut checkpoint = ExportCheckpoint {
+        winning_event_id: Some(Ulid::from_bytes([8; 16])),
+        dataset_digest: Some([9; 32]),
+        entities: vec![entity],
+        artifact: Some(ArtifactRef {
+            location,
+            blake3: [1; 32],
+            size: 100,
+            expires_at_ms: 0,
+        }),
+        ..Default::default()
+    };
+    let files = ["data.csv".to_string()];
+    let facts = checkpoint.export_facts(&files).unwrap();
+    assert_eq!(facts.versions.len(), 1);
+    assert_eq!(facts.versions[0].size, 5);
+    let source = ("bucket".to_string(), "/object".to_string(), false);
+    assert_eq!(facts.sources, vec![source]);
+    assert!(checkpoint.export_facts(&["other".to_string()]).is_none());
+    checkpoint.entities[0].omission = Some(ReasonCode::Denied);
+    assert!(checkpoint.export_facts(&files).is_none());
+}
