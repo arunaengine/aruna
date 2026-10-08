@@ -5,15 +5,19 @@
 use super::*;
 use crate::abe::copies::{CopyEnvelopeOperation, CopyOutcome, copy_row};
 use crate::abe::envelope::EnvelopeOperation;
+use crate::abe::rekey::RekeyOperation;
 use crate::s3::object::put::abe::envelope_write;
 use aruna_core::compute::SecretBytes;
 use aruna_core::keyspaces::{
     ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE, ABE_REKEY_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    BUCKET_KEY_KEYSPACE,
 };
 use aruna_core::structs::storage::abe::{
     EnvelopeArchive, EnvelopePlan, check_copy, copy_envelope, create_envelope, create_parameters,
 };
-use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode, public_key_of};
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketKeyRecord, EncryptionMode, public_key_of,
+};
 
 struct Sealed {
     secret: SecretBytes,
@@ -328,6 +332,44 @@ async fn copy_restarts_rekey() {
     // The source outside the prefix keeps its envelope.
     let (kept, _) = envelope_of(storage, SOURCE, source_id).await.unwrap();
     assert_eq!(kept, source);
+}
+
+#[tokio::test]
+async fn copy_resets_page() {
+    // A copy into foo/ after the first page scanned stops that page from finishing the pass.
+    let (_temp, context) = context();
+    let storage = &context.storage_handle;
+    let (sealed, source_id, _) = sealed(storage).await;
+    let key = sealed.location.format.bucket_key().unwrap();
+    let record = BucketKeyRecord::new(key, Ulid::generate(), sealed.public, 0);
+    put(
+        storage,
+        BUCKET_KEY_KEYSPACE,
+        key.key(),
+        record.to_bytes().unwrap(),
+    )
+    .await;
+    let mut operation = RekeyOperation::new("bucket", "foo/", 4, None, SystemTime::UNIX_EPOCH);
+    let mut effects: Vec<Effect> = operation.start().into_iter().collect();
+    while !operation.is_complete() {
+        let Effect::Storage(effect) = effects.remove(0) else {
+            panic!("unexpected effect");
+        };
+        let scan = matches!(effect, StorageEffect::Iter { .. });
+        let event = storage.send_storage_effect(effect).await;
+        if scan {
+            let copy = copy_input(&sealed, (SOURCE, source_id), "foo/a");
+            let operation = SealedCopyOperation::new(copy);
+            run(operation, storage, Some(&sealed), Race::Off)
+                .await
+                .unwrap();
+        }
+        effects.extend(operation.step(event));
+    }
+    let (_, done) = operation.finalize().unwrap();
+    assert!(!done);
+    let id = key.bucket_id.to_bytes().to_vec();
+    assert!(get(storage, ABE_REKEY_KEYSPACE, id).await.is_some());
 }
 
 #[tokio::test]

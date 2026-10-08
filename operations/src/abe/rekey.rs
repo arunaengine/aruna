@@ -8,6 +8,7 @@ use crate::blob::migration::rewrite::{RewriteOutcome, RewriteVersionOperation};
 use crate::driver::{DriverContext, drive};
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, RekeyOutcome, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     ABE_DUE_KEYSPACE, ABE_EPOCH_KEYSPACE, ABE_REKEY_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
@@ -67,9 +68,10 @@ enum Step {
     ClaimRead,
     ClaimWrite,
     ClaimCommit,
+    Start,
+    Hold,
     Scan,
     Run,
-    Start,
     Check,
     Save,
     Commit,
@@ -265,10 +267,19 @@ impl RekeyOperation {
         self.save()
     }
 
+    /// Saves in the transaction that read the row before the scan, so any write to it conflicts.
     fn save(&mut self) -> Effects {
-        self.step = Step::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
+        let Some(txn_id) = self.txn else {
+            return self.finish(Err(KeyError::Storage));
+        };
+        self.step = Step::Check;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (ABE_REKEY_KEYSPACE.to_string(), self.id.clone()),
+                (ABE_EPOCH_KEYSPACE.to_string(), self.id.clone()),
+                (ABE_DUE_KEYSPACE.to_string(), self.id.clone()),
+            ],
+            txn_id: Some(txn_id),
         })]
     }
 
@@ -410,6 +421,25 @@ impl Operation for RekeyOperation {
             }
             (Step::ClaimCommit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
                 self.txn = None;
+                self.step = Step::Start;
+                smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                    read: false
+                })]
+            }
+            (Step::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
+                self.txn = Some(txn_id);
+                self.step = Step::Hold;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: ABE_REKEY_KEYSPACE.to_string(),
+                    key: self.id.clone(),
+                    txn_id: Some(txn_id),
+                })]
+            }
+            // Another call moved the pass after the claim; its own save stands.
+            (Step::Hold, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                if value != self.seen {
+                    return self.end();
+                }
                 self.scan()
             }
             (
@@ -425,18 +455,6 @@ impl Operation for RekeyOperation {
             }
             (Step::Run, Event::SubOperation(SubOperationEvent::VersionRekeyed { outcome })) => {
                 self.version_done(outcome)
-            }
-            (Step::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn = Some(txn_id);
-                self.step = Step::Check;
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![
-                        (ABE_REKEY_KEYSPACE.to_string(), self.id.clone()),
-                        (ABE_EPOCH_KEYSPACE.to_string(), self.id.clone()),
-                        (ABE_DUE_KEYSPACE.to_string(), self.id.clone()),
-                    ],
-                    txn_id: Some(txn_id),
-                })]
             }
             (Step::Check, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.check_read(values)
@@ -455,6 +473,17 @@ impl Operation for RekeyOperation {
             },
             (Step::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
                 self.txn = None;
+                self.end()
+            }
+            // A copy, raise or removal wrote a read row during the page; the next call resumes.
+            (
+                Step::Commit,
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }),
+            ) => {
+                self.txn = None;
+                self.done = false;
                 self.end()
             }
             _ => self.finish(Err(KeyError::Storage)),
@@ -500,6 +529,7 @@ mod tests {
         };
         let unit = EncryptionTransition::new(TransitionKind::Rotate, None, target, 3, 0);
         operation.unit = Some(unit);
+        operation.txn = Some(TxnId::generate());
         operation.step = Step::Scan;
         operation
     }
@@ -517,10 +547,8 @@ mod tests {
         }))
     }
 
-    /// Answers the save transaction with the progress row `seen`, epoch 2 and no due marker.
+    /// Answers the save reads with the progress row `seen`, epoch 2 and no due marker.
     fn saved(operation: &mut RekeyOperation, seen: Option<Value>) -> Effects {
-        let txn_id = TxnId::generate();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let values = vec![
             (Key::from(Vec::new()), seen),
             (
@@ -549,7 +577,10 @@ mod tests {
         let effects = ended(&mut operation, RekeyOutcome::Moved);
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+            [Effect::Storage(StorageEffect::BatchRead {
+                txn_id: Some(_),
+                ..
+            })]
         ));
         let progress = written(&saved(&mut operation, None));
         assert_eq!(
@@ -653,9 +684,13 @@ mod tests {
             entries: Vec::new(),
         }));
         let txn_id = TxnId::generate();
-        let effects = first.step(Event::Storage(StorageEvent::TransactionCommitted {
+        first.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id,
         }));
+        let txn_id = TxnId::generate();
+        first.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let seen = first.seen.clone();
+        let effects = claim_read(&mut first, seen);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Iter { .. })]
