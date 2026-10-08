@@ -21,10 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     let listen = std::env::var(LISTEN_VAR).unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let data = PathBuf::from(std::env::var(DATA_VAR).unwrap_or_else(|_| "data".to_string()));
-    let state = Arc::new(RegistryState {
-        store: Store::open(&data)?,
-        egress: EgressGuard::new(EgressPolicy::strict())?,
-    });
+    let state = Arc::new(RegistryState::new(
+        Store::open(&data)?,
+        EgressGuard::new(EgressPolicy::strict())?,
+    ));
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     info!(listen = %listen, data = %data.display(), "Registry listening");
     axum::serve(listener, router(state))

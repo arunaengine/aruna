@@ -15,6 +15,7 @@ aruna-blob = { workspace = true }
 aruna-core = { workspace = true }
 axum = { workspace = true }
 fjall = { workspace = true }
+governor = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

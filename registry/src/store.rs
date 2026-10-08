@@ -32,6 +32,8 @@ pub enum StoreError {
     Replayed,
     #[error("issued_at is too far in the future")]
     FutureIssued,
+    #[error("realm has no entry")]
+    NotFound,
     #[error("registry storage is unavailable")]
     Poisoned,
     #[error(transparent)]
@@ -102,6 +104,9 @@ impl Store {
 
     pub fn withdraw(&self, realm_id: &RealmId, issued_at: u64, now: u64) -> Result<(), StoreError> {
         let _guard = self.writer.lock().map_err(|_| StoreError::Poisoned)?;
+        if !self.entries.contains_key(realm_id.as_bytes())? {
+            return Err(StoreError::NotFound);
+        }
         self.check_issued(realm_id, issued_at, now)?;
         let mut batch = self.db.batch();
         batch.remove(&self.entries, realm_id.as_bytes().to_vec());
@@ -212,12 +217,25 @@ pub(crate) mod tests {
             store.register(&realm, &entry(120, 151), 151),
             Err(StoreError::Replayed)
         ));
-        assert!(matches!(
-            store.withdraw(&realm, 150, 152),
-            Err(StoreError::Replayed)
-        ));
         store.register(&realm, &entry(160, 160), 160).unwrap();
         assert!(store.entry(&realm, 160).unwrap().is_some());
+        assert!(matches!(
+            store.withdraw(&realm, 150, 161),
+            Err(StoreError::Replayed)
+        ));
+    }
+
+    #[test]
+    fn withdraw_without_entry() {
+        // Nothing is stored, so a later registration with an older issue time still counts.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let realm = realm_id();
+        assert!(matches!(
+            store.withdraw(&realm, 200, 200),
+            Err(StoreError::NotFound)
+        ));
+        store.register(&realm, &entry(100, 201), 201).unwrap();
     }
 
     #[test]
