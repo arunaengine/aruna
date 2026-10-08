@@ -6,10 +6,11 @@
 use std::collections::BTreeMap;
 
 use aruna_core::UserId;
-use aruna_core::effects::BlobEffect;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::federation::{FederationError, Signed};
-use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, FEDERATION_KEYSPACE};
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, FEDERATION_KEYSPACE, JOB_STATE_KEYSPACE};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{ExportSelection, JobId};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -18,7 +19,9 @@ use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::transfer::{
     ExportGrant, MAX_TRANSFER_SECS, TransferError, check_issued, selection_digest,
 };
+use aruna_core::types::Effects;
 use serde::{Deserialize, Serialize};
+use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 use url::Url;
@@ -28,7 +31,7 @@ use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome};
-use crate::jobs::export::stored_checkpoint;
+use crate::jobs::export::ExportCheckpoint;
 use crate::jobs::key_wake::read_row;
 use crate::replication::plaintext::is_holder;
 
@@ -219,7 +222,137 @@ pub struct GrantRequest<'a> {
     pub now: u64,
 }
 
-/// Signs the grant of a finished export after the current checks and stores its record. A
+/// Owned inputs of [`IssueGrantOperation`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct IssueGrantConfig {
+    pub realm_id: RealmId,
+    pub principal: UserId,
+    pub job_id: JobId,
+    pub document_id: Ulid,
+    pub document_path: String,
+    pub selection: ExportSelection,
+    pub artifact_url: Url,
+    pub capabilities: NodeCapabilities,
+    pub now: u64,
+}
+
+/// Reads the grant record and checkpoint of an export, then returns the stored grant while it
+/// is valid, or signs a new one from the finished checkpoint. Nothing is written here.
+#[derive(Debug, PartialEq)]
+pub struct IssueGrantOperation {
+    config: IssueGrantConfig,
+    output: Option<Result<(bool, GrantRecord), GrantError>>,
+}
+
+impl IssueGrantOperation {
+    pub fn new(config: IssueGrantConfig) -> Self {
+        Self {
+            config,
+            output: None,
+        }
+    }
+
+    fn stored(&self, record: GrantRecord) -> Result<(bool, GrantRecord), GrantError> {
+        if record.revoked {
+            return Err(GrantError::Revoked);
+        }
+        let config = &self.config;
+        check_issued(
+            &record.grant,
+            &config.realm_id,
+            config.job_id.as_ulid(),
+            config.now,
+        )?;
+        Ok((true, record))
+    }
+
+    fn sign(&self, checkpoint: ExportCheckpoint) -> Result<(bool, GrantRecord), GrantError> {
+        let config = &self.config;
+        let selection = &config.selection;
+        let facts = checkpoint
+            .export_facts(&selection.files)
+            .ok_or(GrantError::Unfinished)?;
+        let grant = ExportGrant {
+            source: config.realm_id,
+            audience: selection.audience,
+            intent_digest: selection.intent_digest.clone(),
+            export_job_id: config.job_id.as_ulid(),
+            document_id: config.document_id,
+            source_revision: facts.revision,
+            dataset_digest: hex::encode(facts.dataset_digest),
+            selection_digest: selection_digest(facts.revision, &facts.versions)?,
+            artifact_url: config.artifact_url.clone(),
+            artifact_blake3: hex::encode(facts.artifact.blake3),
+            artifact_size: facts.artifact.size,
+            issued_at: config.now,
+            expires_at: config.now.saturating_add(MAX_TRANSFER_SECS),
+        };
+        let record = GrantRecord {
+            grant: Signed::sign(grant, &config.capabilities)?,
+            principal: config.principal,
+            document_path: config.document_path.clone(),
+            with_files: !selection.files.is_empty(),
+            sources: facts.sources,
+            revoked: false,
+        };
+        Ok((false, record))
+    }
+
+    fn decide(&self, event: Event) -> Result<(bool, GrantRecord), GrantError> {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return Err(GrantError::Storage(format!("unexpected event {event:?}")));
+        };
+        let [(_, record), (_, checkpoint)] = values.as_slice() else {
+            return Err(GrantError::Storage("unexpected read result".to_string()));
+        };
+        let decode = |error: postcard::Error| GrantError::Storage(error.to_string());
+        if let Some(record) = record {
+            return self.stored(postcard::from_bytes(record).map_err(decode)?);
+        }
+        let checkpoint = checkpoint.as_ref().ok_or(GrantError::Unfinished)?;
+        self.sign(postcard::from_bytes(checkpoint).map_err(decode)?)
+    }
+}
+
+impl Operation for IssueGrantOperation {
+    /// Whether the record was stored before, and the record.
+    type Output = (bool, GrantRecord);
+    type Error = GrantError;
+
+    fn start(&mut self) -> Effects {
+        let job_id = self.config.job_id;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (FEDERATION_KEYSPACE.to_string(), record_key(job_id).into()),
+                (
+                    JOB_STATE_KEYSPACE.to_string(),
+                    job_id.to_bytes().to_vec().into()
+                ),
+            ],
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.output = Some(self.decide(event));
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output
+            .unwrap_or(Err(GrantError::Storage("not finished".to_string())))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+/// Issues the grant of a finished export after the current checks and stores its record. A
 /// repeated request returns the stored grant while it is valid; an expired grant needs a new
 /// intent and export.
 pub async fn issue_grant(
@@ -227,47 +360,22 @@ pub async fn issue_grant(
     request: GrantRequest<'_>,
 ) -> Result<Signed<ExportGrant>, GrantError> {
     let auth = request.auth;
-    if let Some(record) = read_record(context, request.job_id).await? {
-        if record.revoked {
-            return Err(GrantError::Revoked);
-        }
-        let job = request.job_id.as_ulid();
-        check_issued(&record.grant, &auth.realm_id, job, request.now)?;
-        recheck(context, auth, &record).await?;
+    let issue = IssueGrantOperation::new(IssueGrantConfig {
+        realm_id: auth.realm_id,
+        principal: auth.user_id,
+        job_id: request.job_id,
+        document_id: request.document_id,
+        document_path: request.document_path,
+        selection: request.selection.clone(),
+        artifact_url: request.artifact_url,
+        capabilities: request.capabilities.clone(),
+        now: request.now,
+    });
+    let (stored, record) = drive(issue, context).await?;
+    recheck(context, auth, &record).await?;
+    if stored {
         return Ok(record.grant);
     }
-    let checkpoint = stored_checkpoint(&context.storage_handle, request.job_id)
-        .await
-        .map_err(GrantError::Storage)?
-        .ok_or(GrantError::Unfinished)?;
-    let selection = request.selection;
-    let facts = checkpoint
-        .export_facts(&selection.files)
-        .ok_or(GrantError::Unfinished)?;
-    let grant = ExportGrant {
-        source: auth.realm_id,
-        audience: selection.audience,
-        intent_digest: selection.intent_digest.clone(),
-        export_job_id: request.job_id.as_ulid(),
-        document_id: request.document_id,
-        source_revision: facts.revision,
-        dataset_digest: hex::encode(facts.dataset_digest),
-        selection_digest: selection_digest(facts.revision, &facts.versions)?,
-        artifact_url: request.artifact_url,
-        artifact_blake3: hex::encode(facts.artifact.blake3),
-        artifact_size: facts.artifact.size,
-        issued_at: request.now,
-        expires_at: request.now.saturating_add(MAX_TRANSFER_SECS),
-    };
-    let record = GrantRecord {
-        grant: Signed::sign(grant, request.capabilities)?,
-        principal: auth.user_id,
-        document_path: request.document_path,
-        with_files: !selection.files.is_empty(),
-        sources: facts.sources,
-        revoked: false,
-    };
-    recheck(context, auth, &record).await?;
     let key = record_key(request.job_id);
     // A racing request may have stored its grant or a revocation first; that one wins.
     match change_record(context, RecordChange::StoreGrant { key, record }).await? {
@@ -310,7 +418,6 @@ pub async fn revoke_grant(context: &DriverContext, job_id: JobId) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::effects::StorageEffect;
     use ed25519_dalek::SigningKey;
     use tempfile::{TempDir, tempdir};
 
@@ -565,6 +672,47 @@ mod tests {
             admitted,
             Err(GrantError::Transfer(TransferError::BadLifetime))
         );
+    }
+
+    #[test]
+    fn issue_reads_without_writing() {
+        // The issue decision never writes: a revoked record refuses, no checkpoint is unfinished.
+        let record = record();
+        let config = IssueGrantConfig {
+            realm_id: local(),
+            principal: record.principal,
+            job_id: job(),
+            document_id: record.grant.payload.document_id,
+            document_path: record.document_path.clone(),
+            selection: ExportSelection {
+                files: Vec::new(),
+                audience: record.grant.payload.audience,
+                intent_digest: String::new(),
+            },
+            artifact_url: record.grant.payload.artifact_url.clone(),
+            capabilities: capabilities(),
+            now: NOW,
+        };
+        let read = |record: Option<Vec<u8>>| {
+            Event::Storage(StorageEvent::BatchReadResult {
+                values: vec![
+                    (Vec::new().into(), record.map(Into::into)),
+                    (Vec::new().into(), None),
+                ],
+            })
+        };
+        let mut operation = IssueGrantOperation::new(config.clone());
+        assert_eq!(operation.start().len(), 1);
+        assert!(operation.step(read(None)).is_empty());
+        assert_eq!(operation.finalize(), Err(GrantError::Unfinished));
+        let revoked = GrantRecord {
+            revoked: true,
+            ..record
+        };
+        let mut operation = IssueGrantOperation::new(config);
+        operation.start();
+        operation.step(read(Some(postcard::to_allocvec(&revoked).unwrap())));
+        assert_eq!(operation.finalize(), Err(GrantError::Revoked));
     }
 
     #[tokio::test]
