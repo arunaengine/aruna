@@ -328,7 +328,7 @@ impl RekeyOperation {
             RekeyOutcome::Locked => self.stopped = Some(KeyError::Locked),
             RekeyOutcome::Failed => self.stopped = Some(KeyError::Storage),
             // The pass stays unfinished while an in-scope version still waits.
-            RekeyOutcome::Unfinished => return self.save(),
+            RekeyOutcome::Unfinished => self.stopped = Some(KeyError::Unfinished),
         }
         // A stopped page keeps its cursor before this version.
         if self.stopped.is_some() {
@@ -640,8 +640,7 @@ mod tests {
             (row("foo/a").0.to_vec(), 1)
         );
         committed(&mut operation);
-        let (_, done) = operation.finalize().unwrap();
-        assert!(!done);
+        assert_eq!(operation.finalize(), Err(KeyError::Unfinished));
     }
 
     /// A first page for `prefix` that waits for the progress row read in its claim.

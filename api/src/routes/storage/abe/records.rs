@@ -458,7 +458,8 @@ pub async fn raise_epoch(
 - Versions outside the prefix and copies that still need the old key stay unchanged.
 - A raise or removal during the walk starts it again, so `done` covers it.
 - A copy into the prefix during the walk starts it again too.
-- A version whose content or format is still pending keeps `done` false until it is re-keyed.
+- A version whose content or format is still pending saves the place before it and returns 409
+  `rekey_pending`; repeat the call later.
 - One prefix per bucket: the first call claims it before changing any version.
 - The node needs the bucket key: `node_managed`, or unlocked on this node."#,
     params(("bucket" = String, Path, description = "Node-local S3 bucket name")),
@@ -467,7 +468,7 @@ pub async fn raise_epoch(
         (status = 400, body = ErrorResponse, description = "Prefix is not empty and does not end in a slash"),
         (status = 401, body = ErrorResponse, description = "Bearer token required"), (status = 403, body = ErrorResponse, description = "Caller is no current key holder"),
         (status = 404, body = ErrorResponse, description = "Bucket missing or not encrypted"),
-        (status = 409, body = ErrorResponse, description = "Another prefix is being re-keyed, or the bucket key is locked here"),
+        (status = 409, body = ErrorResponse, description = "Another prefix is being re-keyed, a version is still pending, or the bucket key is locked here"),
         (status = 503, body = ErrorResponse, description = "A concurrent change or busy storage; retry")),
     security(("bearer_auth" = [])))]
 pub async fn rekey_subtree(

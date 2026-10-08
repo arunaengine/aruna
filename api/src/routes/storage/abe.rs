@@ -76,6 +76,9 @@ pub(crate) fn key_error(error: KeyError) -> ServerError {
         KeyError::Bound(_) => {
             ServerError::Refused(StatusCode::PAYLOAD_TOO_LARGE, "enumeration_limit", message)
         }
+        KeyError::Unfinished => {
+            ServerError::Refused(StatusCode::CONFLICT, "rekey_pending", message)
+        }
         KeyError::Session => ServerError::Refused(StatusCode::CONFLICT, "session_policy", message),
     }
 }

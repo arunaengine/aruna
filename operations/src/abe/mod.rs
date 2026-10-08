@@ -86,6 +86,8 @@ pub enum KeyError {
     Locked,
     #[error("the prefix holds at least {0} more readable files than one enumerated grant names")]
     Bound(usize),
+    #[error("a file in this folder is still being uploaded or converted; try again shortly")]
+    Unfinished,
     #[error(
         "a read policy depends on the session, so ask for this grant while the bucket is unlocked"
     )]
