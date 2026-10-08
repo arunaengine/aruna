@@ -6,8 +6,6 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::federation::Signed;
 use aruna_core::keyspaces::FEDERATION_KEYSPACE;
 use aruna_core::structs::execution::job::{ImportRoCrateSource, ImportRoCrateSpec};
@@ -23,6 +21,7 @@ use ulid::Ulid;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
+use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome};
 use crate::jobs::key_wake::read_row;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
@@ -91,26 +90,25 @@ fn upload_key(import_key: &str) -> Vec<u8> {
 }
 
 /// Binds a verified upload to its intent and grant, and the import key to that upload, so a
-/// retried transfer reuses it.
+/// retried transfer reuses it. Returns the bound upload; an earlier binding wins a race.
 pub async fn write_import(
     context: &DriverContext,
     import_key: &str,
     upload_id: Ulid,
     record: &ImportRecord,
-) -> Result<(), ImportError> {
-    let value = postcard::to_allocvec(record).map_err(|e| ImportError::Storage(e.to_string()))?;
-    let entry =
-        |key: Vec<u8>, value: Vec<u8>| (FEDERATION_KEYSPACE.to_string(), key.into(), value.into());
-    let effect = StorageEffect::BatchWrite {
-        writes: vec![
-            entry(record_key(upload_id), value),
-            entry(upload_key(import_key), upload_id.to_bytes().to_vec()),
-        ],
-        txn_id: None,
+) -> Result<Ulid, ImportError> {
+    let change = RecordChange::BindImport {
+        key: upload_key(import_key),
+        record_key: record_key(upload_id),
+        upload_id,
+        record: record.clone(),
     };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        other => Err(ImportError::Storage(format!("{other:?}"))),
+    match drive(RecordOperation::new(change), context).await {
+        Ok(RecordOutcome::Bound(bound)) => Ok(bound),
+        Ok(other) => Err(ImportError::Storage(format!(
+            "unexpected outcome {other:?}"
+        ))),
+        Err(error) => Err(ImportError::Storage(error.to_string())),
     }
 }
 
@@ -192,6 +190,7 @@ pub async fn recheck_import(
 mod tests {
     use super::*;
     use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::execution::job::{
         ImportMetadataTarget, ImportRoCrateTarget, RoCrateLimits,
