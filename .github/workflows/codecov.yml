@@ -144,7 +144,7 @@ jobs:
           docker logs minio >&2 || true
           exit 1
 
-      # Shows whether the coverage export stays within memory at two threads.
+      # Shows whether the coverage export stays within memory at four threads.
       - name: Sample memory use
         run: nohup sh -c 'while sleep 5; do printf "%s " "$(date +%T)"; free -m | sed -n 2p; done' > memory.log 2>&1 &
 
@@ -172,6 +172,15 @@ jobs:
           -E '(package(aruna-blob) & kind(lib) & test(/^blob::tests::s3_/))
           | (package(aruna-operations) & binary(multipart) & test(/^s3_/))'
 
+      # The export's memory grows with the code size and reached the runner's 16 GB on main.
+      - name: Add swap space
+        run: |
+          sudo fallocate -l 8G /mnt/coverage.swap
+          sudo chmod 600 /mnt/coverage.swap
+          sudo mkswap /mnt/coverage.swap
+          sudo swapon /mnt/coverage.swap
+          free -m
+
       - name: Collect coverage
         # LLVM exports use Rayon's pool, independently of grcov's parser threads;
         # one export per core, since every shard exports nearly every test binary.
@@ -179,7 +188,7 @@ jobs:
           RAYON_NUM_THREADS: 1
         run: |
           grcov . \
-            --threads 2 \
+            --threads 4 \
             --binary-path ./target/debug/deps/ \
             --source-dir . \
             --output-type lcov \
