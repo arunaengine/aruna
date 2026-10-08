@@ -72,7 +72,7 @@ pub(crate) fn refuse_foreign_keys(auth: &AuthContext) -> ServerResult<()> {
     Ok(())
 }
 
-fn foreign_keys(message: String) -> ServerError {
+pub(crate) fn foreign_keys(message: String) -> ServerError {
     ServerError::Refused(
         StatusCode::FORBIDDEN,
         "foreign_encryption_keys_unsupported",
