@@ -1503,7 +1503,9 @@ async fn process_blob_job(
             job.writer_auth_context.clone().or(Some(creator))
         };
         let consent = super::plaintext::relationship_consent(relationship.id);
-        let plaintext = plaintext_allowed(context, bucket, relationship.created_by, consent);
+        let realm_id = job.input.auth_context.realm_id;
+        let plaintext =
+            plaintext_allowed(context, realm_id, bucket, relationship.created_by, consent);
         operation = operation
             .with_plaintext(plaintext.await?)
             .with_relationship(
@@ -1543,7 +1545,8 @@ async fn process_blob_job(
             Err((SourceAuthorizationError::Unavailable(error), _)) => return Err(error),
         };
         let consent = job_consent(&blob_job_key(job).map_err(|error| error.to_string())?);
-        let plaintext = plaintext_allowed(context, &job.input.bucket, writer.user_id, consent);
+        let (realm_id, bucket) = (job.input.auth_context.realm_id, &job.input.bucket);
+        let plaintext = plaintext_allowed(context, realm_id, bucket, writer.user_id, consent);
         operation = operation
             .with_source_authorization(source_authorization)
             .with_writer_auth(writer.clone())
