@@ -70,7 +70,7 @@ pub fn schedule_info_publish(after: Duration) -> Effect {
 
 /// Assembles this node's info document from its executors, current
 /// placement-view labels, given urls, and local usage, then persists it under the
-/// single-writer node-info key without queuing replication.
+/// single-writer node-info key as owed to replication, which the next tick performs.
 pub async fn seed_info_document(
     ctx: &DriverContext,
     node_id: NodeId,
@@ -104,7 +104,19 @@ pub async fn seed_info_document(
         demand: demand_snapshot(ctx, epoch).await?,
         reservation,
     };
-    write_info_document(&ctx.storage_handle, &document).await
+    let txn_id = begin_write(&ctx.storage_handle).await?;
+    let written = match write_info_row(&ctx.storage_handle, &document, Some(txn_id)).await {
+        Ok(()) => write_owed(ctx, epoch.publisher_generation, txn_id).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = written {
+        abort_txn(&ctx.storage_handle, txn_id).await;
+        return Err(error);
+    }
+    match commit_txn(&ctx.storage_handle, txn_id).await? {
+        true => Ok(()),
+        false => Err("node info seed conflicted with another revision".to_string()),
+    }
 }
 
 /// Seeds this node's current info document and replicates it over the shared
@@ -422,14 +434,13 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
     }
 }
 
-/// Heartbeat: revises the persisted node-info document and publishes it only when a durable
-/// field changed or `publish` is set, then pushes live telemetry to the sync peers. Scans run
+/// Heartbeat: revises the persisted node-info document, publishes it while a committed revision
+/// is still owed to replication, then pushes live telemetry to the sync peers. Scans run
 /// outside the revision, so [`revise_node_info`] never carries stale drain backwards.
 pub async fn refresh_info_heartbeat(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
-    publish: bool,
     sequence: u64,
 ) -> Result<(), String> {
     let Some(document) = read_info_document(&ctx.storage_handle, node_id).await? else {
@@ -449,7 +460,7 @@ pub async fn refresh_info_heartbeat(
         load_permille: read_load_permille(),
         heartbeat_at_ms: now,
     };
-    let revised = revise_node_info(ctx, node_id, realm_id, |document| {
+    revise_node_info(ctx, node_id, realm_id, |document| {
         document.executors = executors.clone();
         document.labels = labels.clone();
         document.reservation = reservation;
@@ -457,7 +468,7 @@ pub async fn refresh_info_heartbeat(
         document.utilization = utilization;
     })
     .await?;
-    if revised || publish {
+    if read_owed(ctx, None).await?.is_some() {
         replicate_node_info(ctx, node_id, realm_id).await?;
     }
     let (Some(net_handle), Some(stored)) = (
@@ -580,6 +591,7 @@ async fn write_revision(
     document.reservation.epoch = document.epoch;
     document.updated_at_ms = now;
     write_info_row(&ctx.storage_handle, &document, Some(txn_id)).await?;
+    write_owed(ctx, document.epoch.publisher_generation, txn_id).await?;
     Ok(true)
 }
 
@@ -659,6 +671,9 @@ const DEPARTURE_KEY: &[u8] = b"departure";
 /// The operator's own compute drain, kept apart from an observed departure so
 /// returning to placement can never silently undrain a node an operator drained.
 const OPERATOR_DRAIN_KEY: &[u8] = b"operator_drain";
+/// The newest advertisement revision not yet handed to replication. It is written in the same
+/// transaction as that revision, so a failure after the commit only delays the publish.
+const PUBLISH_OWED_KEY: &[u8] = b"publish_owed";
 
 /// Applies an observed departure, or a return, to this node's compute plane. Departing
 /// stops offers/admissions, records reserved executions as unresolved without blocking
@@ -1010,26 +1025,96 @@ async fn replicate_node_info(
     node_id: NodeId,
     realm_id: RealmId,
 ) -> Result<(), String> {
+    let owed = read_owed(ctx, None).await?;
     // A device belongs to no sync topic, so its info document stays local:
     // an outbox row for it could never be published, only retried forever.
     let config = load_realm_config(ctx, realm_id).await?;
-    if node_kind(&config, node_id).is_some_and(|kind| !kind.is_sync_eligible()) {
-        return Ok(());
+    if node_kind(&config, node_id).is_none_or(|kind| kind.is_sync_eligible()) {
+        drive(
+            ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+                realm_id,
+                local_node_id: node_id,
+                excluded_peers: Vec::new(),
+                documents: vec![DocumentTarget::NodeInfo { realm_id, node_id }],
+                // Shared-topic genesis is bootstrapped by publish_core_documents;
+                // explicit publishes and periodic heartbeats only publish into it.
+                allow_genesis: false,
+            }),
+            ctx,
+        )
+        .await
+        .map_err(|error| format!("node info replication failed: {error}"))?;
     }
-    drive(
-        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
-            realm_id,
-            local_node_id: node_id,
-            excluded_peers: Vec::new(),
-            documents: vec![DocumentTarget::NodeInfo { realm_id, node_id }],
-            // Shared-topic genesis is bootstrapped by publish_core_documents;
-            // explicit publishes and periodic heartbeats only publish into it.
-            allow_genesis: false,
-        }),
-        ctx,
-    )
-    .await
-    .map_err(|error| format!("node info replication failed: {error}"))
+    match owed {
+        Some(owed) => settle_owed(ctx, owed).await,
+        None => Ok(()),
+    }
+}
+
+/// The owed advertisement revision; an unreadable value counts as owed.
+async fn read_owed(ctx: &DriverContext, txn_id: Option<TxnId>) -> Result<Option<u64>, String> {
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            key: Key::from(PUBLISH_OWED_KEY.to_vec()),
+            txn_id,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(
+            value.map(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).map_or(0, u64::from_be_bytes))
+        ),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("owed publish read failed: {other:?}")),
+    }
+}
+
+async fn write_owed(ctx: &DriverContext, generation: u64, txn_id: TxnId) -> Result<(), String> {
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            key: Key::from(PUBLISH_OWED_KEY.to_vec()),
+            value: Value::from(generation.to_be_bytes().to_vec()),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("owed publish write failed: {other:?}")),
+    }
+}
+
+/// Clears the owed revision once replication took it; a revision committed meanwhile stays owed.
+async fn settle_owed(ctx: &DriverContext, published: u64) -> Result<(), String> {
+    let txn_id = begin_write(&ctx.storage_handle).await?;
+    let cleared = match read_owed(ctx, Some(txn_id)).await {
+        Ok(Some(owed)) if owed <= published => {
+            match ctx
+                .storage_handle
+                .send_storage_effect(StorageEffect::Delete {
+                    key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+                    key: Key::from(PUBLISH_OWED_KEY.to_vec()),
+                    txn_id: Some(txn_id),
+                })
+                .await
+            {
+                Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+                Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+                other => Err(format!("owed publish delete failed: {other:?}")),
+            }
+        }
+        Ok(_) => Ok(()),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = cleared {
+        abort_txn(&ctx.storage_handle, txn_id).await;
+        return Err(error);
+    }
+    // A conflict means another revision was committed; it stays owed for the next tick.
+    commit_txn(&ctx.storage_handle, txn_id).await.map(|_| ())
 }
 
 pub(crate) async fn write_info_document(
@@ -1314,7 +1399,7 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, true, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
             .await
             .unwrap();
 
@@ -1471,7 +1556,7 @@ mod tests {
         let expected_labels = build_view(&config).nodes[0].labels.clone();
         write_realm_config(&ctx, &config).await;
 
-        refresh_info_heartbeat(&ctx, local, realm_id, false, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
             .await
             .unwrap();
         let second = read_info_document(&ctx.storage_handle, local)
@@ -1513,7 +1598,7 @@ mod tests {
         let local = node(1);
         write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
 
-        refresh_info_heartbeat(&ctx, local, realm_id, false, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
             .await
             .unwrap();
         assert!(
@@ -2237,7 +2322,7 @@ mod tests {
         .unwrap();
 
         write_operator_drain(&ctx, true).await.unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, false, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
             .await
             .unwrap();
         let drained = read_info_document(&ctx.storage_handle, local)
@@ -2247,7 +2332,7 @@ mod tests {
         assert!(drained.compute_draining && !drained.leaving);
 
         write_operator_drain(&ctx, false).await.unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, false, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
             .await
             .unwrap();
         let released = read_info_document(&ctx.storage_handle, local)
@@ -2280,7 +2365,7 @@ mod tests {
             .await
             .unwrap();
 
-        refresh_info_heartbeat(&ctx, local, realm_id, false, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
             .await
             .unwrap();
 
@@ -2311,7 +2396,7 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, false, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
             .await
             .unwrap();
 
@@ -2324,7 +2409,7 @@ mod tests {
     }
 
     /// Ticks with unchanged durable fields write no revision and queue no publish; an owed
-    /// publish queues the stored row again without a new revision.
+    /// revision is published by the next tick without a new revision, then cleared.
     #[tokio::test]
     async fn unchanged_skips_publish() {
         let dir = tempdir().unwrap();
@@ -2349,8 +2434,9 @@ mod tests {
             .unwrap();
         let queued = read_outbox(&ctx).await.len();
 
+        assert_eq!(read_owed(&ctx, None).await.unwrap(), None);
         for sequence in 1..=3 {
-            refresh_info_heartbeat(&ctx, local, realm_id, false, sequence)
+            refresh_info_heartbeat(&ctx, local, realm_id, sequence)
                 .await
                 .unwrap();
         }
@@ -2361,7 +2447,13 @@ mod tests {
         assert_eq!(stored, seeded);
         assert_eq!(read_outbox(&ctx).await.len(), queued);
 
-        refresh_info_heartbeat(&ctx, local, realm_id, true, 4)
+        // A publish that failed after its revision committed leaves the revision owed.
+        let txn_id = begin_write(&ctx.storage_handle).await.unwrap();
+        write_owed(&ctx, seeded.epoch.publisher_generation, txn_id)
+            .await
+            .unwrap();
+        assert!(commit_txn(&ctx.storage_handle, txn_id).await.unwrap());
+        refresh_info_heartbeat(&ctx, local, realm_id, 4)
             .await
             .unwrap();
         let stored = read_info_document(&ctx.storage_handle, local)
@@ -2370,5 +2462,6 @@ mod tests {
             .unwrap();
         assert_eq!(stored, seeded);
         assert_eq!(read_outbox(&ctx).await.len(), queued + 1);
+        assert_eq!(read_owed(&ctx, None).await.unwrap(), None);
     }
 }
