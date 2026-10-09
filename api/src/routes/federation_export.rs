@@ -19,6 +19,7 @@ use aruna_core::transfer::{ExportGrant, ImportIntent, TransferError, check_remot
 use aruna_operations::federation::export::{
     GrantError, GrantRequest, admit_grant, authorize_export, issue_grant, read_record, revoke_grant,
 };
+use aruna_operations::federation::import::header_value;
 use aruna_operations::jobs::service::{read_artifact_routed, read_owned_job, submit_export_job};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -68,15 +69,13 @@ pub struct FederatedExportRequest {
     pub files: Vec<String>,
 }
 
-/// Header carrying a signed export grant as unpadded base64url JSON.
-pub(crate) const GRANT_HEADER: &str = "x-aruna-export-grant";
+pub(crate) use aruna_operations::federation::import::GRANT_HEADER;
 /// Header carrying a signed import intent as unpadded base64url JSON.
 pub(crate) const INTENT_HEADER: &str = "x-aruna-import-intent";
 const PUSH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 pub(crate) fn encode_header<T: Serialize>(value: &T) -> ServerResult<String> {
-    let json = serde_json::to_vec(value).map_err(|e| ServerError::InternalError(e.to_string()))?;
-    Ok(URL_SAFE_NO_PAD.encode(json))
+    header_value(value).map_err(|e| ServerError::InternalError(e.to_string()))
 }
 
 pub(crate) fn decode_header<T: DeserializeOwned>(

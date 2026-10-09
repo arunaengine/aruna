@@ -79,6 +79,8 @@ use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, Pu
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 
 const PAYLOAD_CHUNK_BYTES: usize = 64 * 1024;
+/// Longest wait for the source realm to confirm a grant.
+const SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ImportPhase {
@@ -212,6 +214,8 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
         }
     };
 
+    // Each run, a start or a resume, first needs the source's confirmation of the grant.
+    let mut confirmed = false;
     loop {
         if ctx.shutdown.is_cancelled() {
             return JobRunOutcome::Interrupted;
@@ -231,6 +235,17 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
         }
 
         let result = match checkpoint.phase {
+            ImportPhase::Acquire
+            | ImportPhase::Inspect
+            | ImportPhase::Validate
+            | ImportPhase::Write
+            | ImportPhase::Rewrite
+            | ImportPhase::Create
+                if !confirmed =>
+            {
+                confirmed = true;
+                ensure_source(ctx, spec).await
+            }
             ImportPhase::Acquire => Box::pin(acquire_source(ctx, spec, &mut checkpoint))
                 .await
                 .map(|input| {
@@ -1471,6 +1486,20 @@ async fn ensure_targets(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<()
     .await?;
     ensure_metadata_permission(ctx, spec).await?;
     ensure_federated(ctx, spec).await
+}
+
+/// An import of another realm's artifact starts or resumes only after its source confirms the
+/// grant: a refusal fails the job, an unreachable source waits for the next pull or push.
+async fn ensure_source(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<(), ImportFailure> {
+    use crate::federation::import::{ImportError, confirm_source};
+    ensure_federated(ctx, spec).await?;
+    confirm_source(&ctx.driver, spec, SOURCE_TIMEOUT)
+        .await
+        .map_err(|error| match error {
+            ImportError::Storage(error) => ImportFailure::Retryable(error),
+            ImportError::Unreachable(_) => ImportFailure::Deferred(error.to_string()),
+            error => ImportFailure::Permanent(error.to_string()),
+        })
 }
 
 /// An import of another realm's artifact keeps its intent binding and import policies.

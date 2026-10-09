@@ -38,6 +38,8 @@ pub const IMPORT_OPERATION: &str = "federation.import";
 pub struct ImportRecord {
     pub intent: Signed<ImportIntent>,
     pub grant: Signed<ExportGrant>,
+    /// The source confirmed the grant since the import job last started; a start consumes it.
+    pub confirmed: bool,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -54,6 +56,72 @@ pub enum ImportError {
     Expired,
     #[error("import storage failed: {0}")]
     Storage(String),
+    #[error("the source realm could not be reached: {0}")]
+    Unreachable(String),
+    #[error("the source realm answered {0}")]
+    Refused(reqwest::StatusCode),
+}
+
+/// Header carrying a signed export grant as unpadded base64url JSON.
+pub const GRANT_HEADER: &str = "x-aruna-export-grant";
+
+/// The unpadded base64url JSON of a signed transfer value, as a header carries it.
+pub fn header_value<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
+    use base64::Engine;
+    let json = serde_json::to_vec(value)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json))
+}
+
+/// Sends `method` for the grant's artifact to the source realm through the egress guard.
+pub async fn source_request(
+    context: &DriverContext,
+    method: reqwest::Method,
+    grant: &Signed<ExportGrant>,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Response, ImportError> {
+    let unreachable = |error: String| ImportError::Unreachable(error);
+    let blob = context
+        .blob_handle
+        .as_ref()
+        .ok_or_else(|| ImportError::Storage("blob handle unavailable".to_string()))?;
+    let header = header_value(grant).map_err(|error| ImportError::Storage(error.to_string()))?;
+    let response = blob
+        .repository_request(method, grant.payload.artifact_url.clone())
+        .map_err(|error| unreachable(error.to_string()))?
+        .header(GRANT_HEADER, header)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|error| unreachable(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ImportError::Refused(response.status()));
+    }
+    Ok(response)
+}
+
+/// Before a bound import starts or resumes: a confirmation the source gave since the last start
+/// (a pull or a push), or else a fresh confirmation of the grant by the source now.
+pub async fn confirm_source(
+    context: &DriverContext,
+    spec: &ImportRoCrateSpec,
+    timeout: std::time::Duration,
+) -> Result<(), ImportError> {
+    let ImportRoCrateSource::Upload { upload_id } = &spec.source else {
+        return Ok(());
+    };
+    let Some(record) = read_import(context, *upload_id).await? else {
+        return Ok(());
+    };
+    let change = RecordChange::ConsumeConfirmation {
+        record_key: record_key(*upload_id),
+    };
+    match drive(RecordOperation::new(change), context).await {
+        Ok(RecordOutcome::Confirmed(true)) => Ok(()),
+        Ok(_) => source_request(context, reqwest::Method::HEAD, &record.grant, timeout)
+            .await
+            .map(drop),
+        Err(error) => Err(ImportError::Storage(error.to_string())),
+    }
 }
 
 fn record_key(upload_id: Ulid) -> Vec<u8> {
@@ -404,6 +472,7 @@ pub(crate) mod tests {
         ImportRecord {
             intent,
             grant: Signed::sign(grant, &signer(1)).unwrap(),
+            confirmed: false,
         }
     }
 
@@ -575,5 +644,27 @@ pub(crate) mod tests {
         seed_cutoff(&context, descriptor(), Some(cutoff)).await;
         let checked = recheck_import(&context, &spec(upload_id), node(), NOW).await;
         assert_eq!(checked, Err(ImportError::Expired));
+    }
+
+    #[tokio::test]
+    async fn source_confirms_once() {
+        // A pull or push confirmation serves one start; a resume asks the source again.
+        let (_dir, context) = context();
+        let upload_id = Ulid::from_bytes([9; 16]);
+        let confirmed = ImportRecord {
+            confirmed: true,
+            ..record()
+        };
+        write_import(&context, "key", upload_id, &confirmed)
+            .await
+            .unwrap();
+        let timeout = std::time::Duration::from_secs(1);
+        let started = confirm_source(&context, &spec(upload_id), timeout).await;
+        assert_eq!(started, Ok(()));
+        let stored = read_import(&context, upload_id).await.unwrap().unwrap();
+        assert!(!stored.confirmed);
+        // The resume asks the source again; this context has no egress, so it cannot.
+        let resumed = confirm_source(&context, &spec(upload_id), timeout).await;
+        assert!(matches!(resumed, Err(ImportError::Storage(_))));
     }
 }
