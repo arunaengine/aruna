@@ -135,6 +135,9 @@ pub static UNDELIVERABLE_RECORD_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 const DRAIN_SUBBATCH_RECORDS: usize = 512;
+/// Outbox records remembered as published; past it they are forgotten and published once
+/// more, which only costs log space.
+const MAX_PUBLISHED_RECORDS: usize = 65_536;
 /// Pages one drain invocation may examine, so a large or blocked queue cannot
 /// monopolise a task invocation.
 const OUTBOX_INVOCATION_PAGES: usize = 2;
@@ -200,6 +203,9 @@ pub(crate) struct OperationsTaskHandler {
     // Rotation state of the bounded outbox drain. Loss on restart is fine: the
     // next rotation opens at the head.
     rotation: std::sync::Mutex<OutboxRotation>,
+    // Outbox records whose op this process already created, so a retry only syncs them.
+    // Loss on restart is fine: such a record is published once more.
+    published_records: std::sync::Mutex<BTreeSet<Vec<u8>>>,
     drain_guard: tokio::sync::Mutex<()>,
     outbox_limits: OutboxLimits,
     // When a device may next fetch the realm documents, and how many attempts
@@ -335,6 +341,7 @@ impl OperationsTaskHandler {
             migration_cursor: std::sync::Mutex::new(None),
             wake_cursor: std::sync::Mutex::new(None),
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
+            published_records: std::sync::Mutex::new(BTreeSet::new()),
             drain_guard: tokio::sync::Mutex::new(()),
             outbox_limits: OutboxLimits::default(),
             realm_documents: std::sync::Mutex::new((0, 0)),

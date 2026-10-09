@@ -617,7 +617,13 @@ impl OperationsTaskHandler {
             warn!(%error, "Failed to delete relayed admin outbox records");
         }
 
-        let (groups, subbatches) = Self::build_drain_batches(to_publish);
+        let (groups, subbatches) = {
+            let published = self
+                .published_records
+                .lock()
+                .expect("published records poisoned");
+            Self::build_drain_batches(to_publish, &published)
+        };
         invocation.groups += groups;
         invocation.subbatches += subbatches.len();
         let (publish_elapsed, outcome) = self
@@ -740,6 +746,14 @@ impl OperationsTaskHandler {
         let mut outcome = DrainSyncOutcome::default();
         let mut awaiting_sync: Option<DrainSubBatch> = None;
         for mut subbatch in subbatches {
+            if subbatch.documents.is_empty() {
+                let synced = self
+                    .sync_drain_subbatch(retry_key, net_handle, awaiting_sync.take())
+                    .await;
+                outcome.merge(synced);
+                awaiting_sync = Some(subbatch);
+                continue;
+            }
             let documents = std::mem::take(&mut subbatch.documents);
             let peers = subbatch.peers.clone();
             let (batch_topics, batch_origins) = subbatch.ordering_domains();
@@ -761,7 +775,10 @@ impl OperationsTaskHandler {
             match publish_event {
                 Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsPublished {
                     ..
-                })) => awaiting_sync = Some(subbatch),
+                })) => {
+                    self.note_published(&subbatch.record_keys);
+                    awaiting_sync = Some(subbatch);
+                }
                 Event::Net(NetEvent::DocumentSync(
                     DocumentNetEvent::DocumentsPartiallyPublished {
                         published_indices,
@@ -789,6 +806,7 @@ impl OperationsTaskHandler {
                     }
                     match subbatch.sync_subset(&published_indices) {
                         Some(published) if !published.record_keys.is_empty() => {
+                            self.note_published(&published.record_keys);
                             awaiting_sync = Some(published);
                         }
                         Some(_) => {}
@@ -831,29 +849,38 @@ impl OperationsTaskHandler {
     }
 }
 
+/// Sub-batches keyed by whether their records only sync and by their sorted peers.
+type PublishGroups =
+    BTreeMap<(bool, Vec<aruna_core::NodeId>), (Vec<aruna_core::NodeId>, Vec<DrainSubBatch>)>;
+
 impl OperationsTaskHandler {
-    fn build_drain_batches(records: Vec<DrainRecord>) -> (usize, Vec<DrainSubBatch>) {
-        let mut publish_groups: BTreeMap<
-            Vec<aruna_core::NodeId>,
-            (Vec<aruna_core::NodeId>, Vec<DrainSubBatch>),
-        > = BTreeMap::new();
+    /// Groups records by peers into sub-batches. A record already published by this process
+    /// goes into a sub-batch without documents, which only syncs.
+    fn build_drain_batches(
+        records: Vec<DrainRecord>,
+        published: &BTreeSet<Vec<u8>>,
+    ) -> (usize, Vec<DrainSubBatch>) {
+        let mut publish_groups: PublishGroups = BTreeMap::new();
         for (record_key, record, topic) in records {
             let origin = admin_origin(&record);
-            let document = publish_from_outbox(
-                record.outbox_id,
-                record.target.clone(),
-                record.event,
-                record.placement,
-                record.allow_genesis,
-            );
+            let sync_only = published.contains(&record_key);
+            let document = (!sync_only).then(|| {
+                publish_from_outbox(
+                    record.outbox_id,
+                    record.target.clone(),
+                    record.event,
+                    record.placement,
+                    record.allow_genesis,
+                )
+            });
             let mut peer_key = record.peers.clone();
             crate::sync::shard_placement::sort_node_ids(&mut peer_key);
             let (peers, subbatches) = publish_groups
-                .entry(peer_key)
+                .entry((sync_only, peer_key))
                 .or_insert_with(|| (record.peers.clone(), Vec::new()));
             if subbatches
                 .last()
-                .is_none_or(|subbatch| subbatch.documents.len() >= DRAIN_SUBBATCH_RECORDS)
+                .is_none_or(|subbatch| subbatch.record_keys.len() >= DRAIN_SUBBATCH_RECORDS)
             {
                 subbatches.push(DrainSubBatch {
                     peers: peers.clone(),
@@ -865,7 +892,7 @@ impl OperationsTaskHandler {
                 });
             }
             let subbatch = subbatches.last_mut().expect("sub-batch was just pushed");
-            subbatch.documents.push(document);
+            subbatch.documents.extend(document);
             subbatch.topics.push(topic);
             subbatch.origins.push(origin);
             subbatch.targets.push(record.target);
@@ -1152,12 +1179,13 @@ impl OperationsTaskHandler {
                 let delete_count = record_keys.len();
                 let deleted = crate::sync::document_outbox::delete_outbox_records(
                     &self.context.storage_handle,
-                    record_keys,
+                    record_keys.clone(),
                 )
                 .await;
                 outcome.delete_elapsed = delete_started.elapsed();
                 if deleted.is_ok() {
                     outcome.deleted += delete_count;
+                    self.forget_published(&record_keys);
                 }
                 if let Err(error) = deleted {
                     warn!(task_id = ?retry_key, error = %error, "Failed to delete document sync outbox records");
@@ -1180,5 +1208,28 @@ impl OperationsTaskHandler {
             }
         }
         outcome
+    }
+}
+
+impl OperationsTaskHandler {
+    fn note_published(&self, record_keys: &[Vec<u8>]) {
+        let mut published = self
+            .published_records
+            .lock()
+            .expect("published records poisoned");
+        if published.len() + record_keys.len() > MAX_PUBLISHED_RECORDS {
+            published.clear();
+        }
+        published.extend(record_keys.iter().cloned());
+    }
+
+    fn forget_published(&self, record_keys: &[Vec<u8>]) {
+        let mut published = self
+            .published_records
+            .lock()
+            .expect("published records poisoned");
+        for record_key in record_keys {
+            published.remove(record_key);
+        }
     }
 }

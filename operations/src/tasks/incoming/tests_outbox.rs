@@ -1148,6 +1148,75 @@ async fn draining_a_topics() {
     net.shutdown().await;
 }
 
+/// A record whose sync keeps failing is published once: later drains only sync it, so
+/// retries add no new op to its topic.
+#[tokio::test]
+async fn retry_publishes_once() {
+    use ::irokle::Storage as _;
+
+    let realm_id = RealmId::from_bytes([62u8; 32]);
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let net = make_net_handle(realm_id, &storage, [62u8; 32]).await;
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: Some(net.clone()),
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
+    });
+    // An unreachable server peer makes every sync of the realm topic fail.
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.ensure_node(net.node_id(), RealmNodeKind::Management);
+    config.ensure_node(node(63), RealmNodeKind::Server);
+    net.refresh_document_peers(&config)
+        .await
+        .expect("refresh peers");
+    let record = crate::sync::document_outbox::new_outbox_record(
+        net.node_id(),
+        DocumentTarget::RealmConfig { realm_id },
+        Vec::new(),
+        DocumentOutboxEvent::Upsert {
+            bytes: b"config".to_vec(),
+            change: change(),
+        },
+        aruna_core::structs::placement::record::PlacementRef::NIL,
+        true,
+    );
+    let key = outbox_key(&record).to_vec();
+    write_outbox_record(&storage, &record).await;
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+    let topic = DocumentTarget::RealmConfig { realm_id }.sync_topic_id(
+        realm_id,
+        &aruna_core::structs::placement::record::PlacementRef::NIL,
+    );
+    let ops = || {
+        net.document_sync_node()
+            .storage()
+            .list_op_ids(&topic)
+            .expect("topic ops read")
+            .len()
+    };
+
+    handler.drain_sync_outbox().await;
+    let published = ops();
+    assert!(published > 0, "the first drain publishes the record");
+    for _ in 0..2 {
+        handler.drain_sync_outbox().await;
+    }
+    assert!(
+        read_outbox_record(&storage, &key)
+            .await
+            .expect("read retried record")
+            .is_some(),
+        "the unsynced record stays"
+    );
+    assert_eq!(ops(), published, "a retry created another op");
+    net.shutdown().await;
+}
+
 struct ConfigHarness {
     _dir: tempfile::TempDir,
     storage: aruna_storage::StorageHandle,
