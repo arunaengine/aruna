@@ -1,8 +1,9 @@
-//! Re-encodes job records and RO-Crate checkpoints from before repository transfers.
+//! Re-encodes job records and RO-Crate checkpoints from before repository transfers, and job
+//! records whose session references predate the display name or the linked login.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{Rewrites, decode_error};
+use super::{Rewrites, decode_error, session_refs};
 use crate::explorer::ExplorerError;
 use aruna_core::repository::{ExportIdentity, LinkFailure, RepositoryRecord};
 use aruna_core::structs::MintPersistentSpec;
@@ -11,7 +12,8 @@ use aruna_core::structs::execution::job::{
     ArtifactRef, AttemptIntent, CapturedInput, CopyJobSpec, ExecutionSpec, ExportOmissionCounts,
     ExportRoCrateResult, ExportRoCrateSpec, ImportRoCrateResult, ImportRoCrateSpec, JobClaim,
     JobError, JobExecutionClass, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload,
-    JobState, OutputObject, RoCrateLimits, StagingJobSpec, WorkspaceMode,
+    JobState, OutputObject, RoCrateLimits, StagingJobSpec, WorkspaceMode, encode_dedup_value,
+    parse_dedup_value,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
@@ -23,6 +25,80 @@ use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use ulid::Ulid;
+
+/// Job records in an older layout. A record rewritten for its session references gets the plan
+/// digest of its rewritten payload, so a retry with the same idempotency key still matches.
+pub(super) fn job_rows(
+    db: &OptimisticTxDatabase,
+    keyspace: &OptimisticTxKeyspace,
+    name: &str,
+) -> Result<Rewrites, ExplorerError> {
+    let mut scanned = 0;
+    let mut rows = Vec::new();
+    for entry in db.read_tx().iter(keyspace) {
+        let (key, value) = entry.into_inner()?;
+        scanned += 1;
+        if round_trips::<JobRecord>(&value) {
+            continue;
+        }
+        let record = upgraded(&value).ok_or_else(|| decode_error(name, &key, "unknown shape"))?;
+        let bytes = record
+            .to_bytes()
+            .map_err(|error| decode_error(name, &key, error))?;
+        rows.push((key.to_vec(), bytes));
+    }
+    Ok(Rewrites { scanned, rows })
+}
+
+/// The current record of an older row; every byte of the row must be used.
+fn upgraded(value: &[u8]) -> Option<JobRecord> {
+    const CURRENT: usize = 4;
+    if let Ok(legacy) = session_refs::decode::<LegacyJob>(value, CURRENT) {
+        return Some(legacy.into());
+    }
+    // Session references with three fields lack the linked login, with two also the name.
+    for fields in [3, 2] {
+        let record = session_refs::decode::<JobRecord>(value, fields)
+            .or_else(|_| session_refs::decode::<LegacyJob>(value, fields).map(Into::into));
+        if let Ok(mut record) = record {
+            record.plan_digest = record.plan_digest.map(|_| record.payload.plan_digest());
+            return Some(record);
+        }
+    }
+    None
+}
+
+/// Dedup rows that name a rewritten job with another plan digest than the job now has.
+pub(super) fn dedup_rows(
+    db: &OptimisticTxDatabase,
+    keyspace: &OptimisticTxKeyspace,
+    jobs: &[(Vec<u8>, Vec<u8>)],
+    name: &str,
+) -> Result<Rewrites, ExplorerError> {
+    let mut digests = BTreeMap::new();
+    for (key, value) in jobs {
+        let record =
+            JobRecord::from_bytes(value).map_err(|error| decode_error(name, key, error))?;
+        if let Some(digest) = record.plan_digest {
+            digests.insert(record.job_id, digest);
+        }
+    }
+    let mut scanned = 0;
+    let mut rows = Vec::new();
+    for entry in db.read_tx().iter(keyspace) {
+        let (key, value) = entry.into_inner()?;
+        scanned += 1;
+        let (job_id, stored) =
+            parse_dedup_value(&value).map_err(|error| decode_error(name, &key, error))?;
+        match digests.get(&job_id) {
+            Some(digest) if *digest != stored => {
+                rows.push((key.to_vec(), encode_dedup_value(job_id, *digest)));
+            }
+            _ => {}
+        }
+    }
+    Ok(Rewrites { scanned, rows })
+}
 
 /// Which checkpoint shape a job keeps under its id.
 #[derive(Clone, Copy)]
@@ -584,5 +660,72 @@ mod tests {
 
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert_eq!((again.jobs_rewritten, again.checkpoints_rewritten), (0, 0));
+    }
+
+    /// `bytes` with the one occurrence of `from` replaced by `to`.
+    fn splice(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+        let at = bytes
+            .windows(from.len())
+            .position(|window| window == from)
+            .unwrap();
+        [&bytes[..at], to, &bytes[at + from.len()..]].concat()
+    }
+
+    #[test]
+    fn rewrites_old_sessions() {
+        // Sessions stored without the display name, or without the linked login, gain empty
+        // fields; the plan digest and the dedup row follow the rewritten payload.
+        use aruna_core::keyspaces::DEDUP_INDEX_KEYSPACE;
+        use aruna_core::structs::execution::job::{encode_dedup_value, parse_dedup_value};
+        use aruna_core::structs::identity::auth::{SessionKind, SessionRef};
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("db");
+        let session = SessionRef {
+            sid: Ulid::from_bytes([6u8; 16]).to_string(),
+            kind: SessionKind::Portal,
+            name: None,
+            via: None,
+        };
+        let full = postcard::to_allocvec(&session).unwrap();
+        let (mut jobs, mut dedup, mut current) = (Vec::new(), Vec::new(), Vec::new());
+        // The layout of main lacks both fields; the layout before linked logins lacks one.
+        for (seed, kept) in [(1u8, full.len() - 2), (2, full.len() - 1)] {
+            let job_id = JobId::from_bytes([seed; 16]);
+            let mut record = import_job(job_id);
+            let JobPayload::ImportRoCrate(spec) = &mut record.payload else {
+                panic!("an import job");
+            };
+            spec.auth_context.session = Some(session.clone());
+            let payload = postcard::to_allocvec(&record.payload).unwrap();
+            let old_payload = splice(&payload, &full, &full[..kept]);
+            let old_digest = *blake3::hash(&old_payload).as_bytes();
+            record.plan_digest = Some(old_digest);
+            let stored = splice(&record.to_bytes().unwrap(), &full, &full[..kept]);
+            jobs.push((job_record_key(job_id).to_vec(), stored));
+            dedup.push((vec![seed], encode_dedup_value(job_id, old_digest)));
+            record.plan_digest = Some(record.payload.plan_digest());
+            current.push(record);
+        }
+        fn rows(rows: &[(Vec<u8>, Vec<u8>)]) -> Vec<(&[u8], Vec<u8>)> {
+            rows.iter()
+                .map(|(key, value)| (key.as_slice(), value.clone()))
+                .collect()
+        }
+        write(&path, JOB_KEYSPACE, rows(&jobs));
+        write(&path, DEDUP_INDEX_KEYSPACE, rows(&dedup));
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+        assert_eq!((output.jobs_rewritten, output.job_dedup_rewritten), (2, 2));
+        let stored_jobs = read(&path, JOB_KEYSPACE);
+        let stored_dedup = read(&path, DEDUP_INDEX_KEYSPACE);
+        for (seed, record) in [1u8, 2].into_iter().zip(&current) {
+            let key = job_record_key(record.job_id).to_vec();
+            assert_eq!(JobRecord::from_bytes(&stored_jobs[&key]).unwrap(), *record);
+            let (job_id, digest) = parse_dedup_value(&stored_dedup[&vec![seed]]).unwrap();
+            assert_eq!((job_id, Some(digest)), (record.job_id, record.plan_digest));
+        }
+        let again = migrate_output(path.to_str().unwrap()).unwrap();
+        assert_eq!((again.jobs_rewritten, again.job_dedup_rewritten), (0, 0));
     }
 }
