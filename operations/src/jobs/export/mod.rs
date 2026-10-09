@@ -903,9 +903,13 @@ async fn resolve_entries(
                 .hash_realm
                 .is_none_or(|realm_id| realm_id == spec.auth_context.realm_id)
         });
-        // Without an exact version or content hash, an `s3://` location names this node's
-        // current version of that key.
-        let current = match (&entity.exact, hash, &entity.storage_key) {
+        // Without an exact version or content hash of this realm, an `s3://` location names this
+        // node's current version of that key.
+        let local_exact = entity
+            .exact
+            .as_ref()
+            .filter(|exact| exact.realm_id == spec.auth_context.realm_id);
+        let current = match (local_exact, hash, &entity.storage_key) {
             (None, None, Some(location)) => current_version(ctx, spec, location).await,
             _ => None,
         };
