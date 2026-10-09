@@ -272,6 +272,39 @@ async fn origin_scoped_dedup() -> TestResult<()> {
     Ok(())
 }
 
+/// Stores upload `[seed; 16]` of `owner` on `node`, which an import submission claims.
+async fn seed_upload(node: &TestNode, owner: aruna_core::UserId, seed: u8) -> TestResult<()> {
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        root: "/data".to_string(),
+        storage_bucket: "storage".to_string(),
+        backend_path: "_jobs/input".to_string(),
+        ulid: Ulid::from_bytes([seed; 16]),
+        format: Default::default(),
+        created_by: owner,
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        staging: false,
+        partial: false,
+        blob_size: 1,
+        hashes: Default::default(),
+    };
+    let record = aruna_core::structs::execution::job::RoCrateUploadRecord {
+        upload_id: Ulid::from_bytes([seed; 16]),
+        owner,
+        location,
+        blake3: [seed; 32],
+        size: 1,
+        media_type: aruna_core::structs::execution::job::RoCrateMediaType::Zip,
+        expires_at_ms: u64::MAX,
+        claimed_by: None,
+    };
+    let storage = &node.context.storage_handle;
+    aruna_operations::jobs::import::write_rocrate_upload(storage, &record).await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn cap_stays_local() -> TestResult<()> {
     // Active-job caps are per-origin: a full origin rejects while another
@@ -303,6 +336,7 @@ async fn cap_stays_local() -> TestResult<()> {
         document_id: Ulid::from_bytes([seed; 16]),
     };
     let ingress = realm.node(0);
+    seed_upload(ingress, realm.user_id, 1).await?;
     let first = submit_rocrate_import(
         ingress.context.as_ref(),
         import_spec(1),
@@ -324,6 +358,7 @@ async fn cap_stays_local() -> TestResult<()> {
     ));
 
     let other = realm.node(1);
+    seed_upload(other, realm.user_id, 3).await?;
     let accepted = submit_rocrate_import(
         other.context.as_ref(),
         import_spec(3),

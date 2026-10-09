@@ -10,22 +10,25 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{ACTIVE_USER_KEYSPACE, DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
+use aruna_core::keyspaces::{
+    ACTIVE_USER_KEYSPACE, DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    ActiveJobKind, JobId, JobPayload, JobRecord, WorkspaceMode, job_active_prefix, job_record_key,
-    parse_dedup_value,
+    ActiveJobKind, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobPayload, JobRecord,
+    RoCrateUploadRecord, WorkspaceMode, job_active_prefix, job_record_key, parse_dedup_value,
 };
 use aruna_core::structured_id::{
     BucketId, ClockHealthError, JobId as RoutableJobId, PlacementHandle, StructuredIdGenerator,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Effects, TxnId};
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
+use super::import::{UploadClaimError, claim_upload, upload_key};
 use super::store::{decode_job_record, dedup_index_key, job_insert_entries};
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
@@ -103,6 +106,8 @@ pub enum SubmitJobError {
     Composition(#[from] aruna_core::structs::execution::job::CompositionError),
     #[error("active RO-Crate job limit reached ({limit})")]
     ActiveJobLimit { limit: u32 },
+    #[error(transparent)]
+    Upload(#[from] UploadClaimError),
     #[error("unexpected event while submitting job: {0}")]
     UnexpectedEvent(String),
 }
@@ -125,6 +130,9 @@ enum SubmitState {
     CheckActive {
         txn_id: TxnId,
     },
+    ClaimUpload {
+        txn_id: TxnId,
+    },
     WriteJob {
         txn_id: Option<TxnId>,
     },
@@ -143,6 +151,9 @@ enum SubmitState {
 pub struct SubmitJobOperation {
     record: JobRecord,
     group_checked: bool,
+    upload_checked: bool,
+    /// The claim of the upload an upload-backed import reads, written with the job.
+    upload_claim: Option<(String, Key, Value)>,
     active_cap: Option<u32>,
     state: SubmitState,
     output: Option<Result<SubmitJobResult, SubmitJobError>>,
@@ -180,6 +191,8 @@ impl SubmitJobOperation {
         Self {
             record,
             group_checked: false,
+            upload_checked: false,
+            upload_claim: None,
             active_cap,
             state: SubmitState::Init,
             output: None,
@@ -192,6 +205,7 @@ impl SubmitJobOperation {
             SubmitState::ReadDedup { txn_id }
             | SubmitState::VerifyDedup { txn_id, .. }
             | SubmitState::CheckActive { txn_id }
+            | SubmitState::ClaimUpload { txn_id }
             | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
             SubmitState::WriteJob { txn_id } => txn_id,
             _ => None,
@@ -205,6 +219,8 @@ impl SubmitJobOperation {
 
     fn start_transaction(&mut self) -> Effects {
         self.group_checked = false;
+        self.upload_checked = false;
+        self.upload_claim = None;
         self.state = SubmitState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
@@ -285,15 +301,64 @@ impl SubmitJobOperation {
                 txn_id: Some(txn_id)
             })];
         }
-        let writes = match job_insert_entries(&self.record) {
+        // An upload-backed import claims its upload with the job, so it keeps it across expiry.
+        if !self.upload_checked
+            && let Some(upload_id) = self.upload()
+        {
+            let Some(txn_id) = txn_id else {
+                return self.start_transaction();
+            };
+            self.state = SubmitState::ClaimUpload { txn_id };
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
+                key: upload_key(upload_id),
+                txn_id: Some(txn_id),
+            })];
+        }
+        let mut writes = match job_insert_entries(&self.record) {
             Ok(writes) => writes,
             Err(error) => return self.fail(error.into()),
         };
+        writes.extend(self.upload_claim.clone());
         self.state = SubmitState::WriteJob { txn_id };
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id,
         })]
+    }
+
+    fn upload(&self) -> Option<ulid::Ulid> {
+        match &self.record.payload {
+            JobPayload::ImportRoCrate(ImportRoCrateSpec {
+                source: ImportRoCrateSource::Upload { upload_id },
+                ..
+            }) => Some(*upload_id),
+            _ => None,
+        }
+    }
+
+    /// Applies the upload claim rule to the stored upload `value` for this job.
+    fn claim(
+        &mut self,
+        upload_id: ulid::Ulid,
+        value: Option<&[u8]>,
+    ) -> Result<(), UploadClaimError> {
+        let value = value.ok_or(UploadClaimError::NotFound)?;
+        let invalid = |error: postcard::Error| UploadClaimError::Invalid(error.to_string());
+        let mut upload: RoCrateUploadRecord = postcard::from_bytes(value).map_err(invalid)?;
+        let record = &self.record;
+        if claim_upload(
+            &mut upload,
+            record.created_by,
+            record.job_id,
+            record.created_at_ms,
+        )? {
+            let value = postcard::to_allocvec(&upload).map_err(invalid)?;
+            let key_space = ROCRATE_UPLOAD_KEYSPACE.to_string();
+            self.upload_claim = Some((key_space, upload_key(upload_id), value.into()));
+        }
+        self.upload_checked = true;
+        Ok(())
     }
 
     fn schedule_drain(&mut self) -> Effects {
@@ -433,6 +498,21 @@ impl Operation for SubmitJobOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
             },
+            SubmitState::ClaimUpload { txn_id } => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let Some(upload_id) = self.upload() else {
+                        return self.fail(SubmitJobError::UnexpectedEvent(
+                            "upload claim without an upload".to_string(),
+                        ));
+                    };
+                    match self.claim(upload_id, value.as_deref()) {
+                        Ok(()) => self.write_job(Some(txn_id)),
+                        Err(error) => self.fail(error.into()),
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+            },
             SubmitState::WriteJob { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => match txn_id {
                     Some(txn_id) => {
@@ -485,6 +565,7 @@ impl Operation for SubmitJobOperation {
             SubmitState::ReadDedup { txn_id }
             | SubmitState::VerifyDedup { txn_id, .. }
             | SubmitState::CheckActive { txn_id }
+            | SubmitState::ClaimUpload { txn_id }
             | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
             SubmitState::WriteJob { txn_id } => txn_id,
             _ => None,
@@ -612,6 +693,25 @@ mod tests {
             }),
             ..base
         }
+    }
+
+    /// Points the import of `spec` at upload `[seed; 16]` and stores it unclaimed until `expires`.
+    async fn seed_upload(
+        storage: &StorageHandle,
+        spec: &mut SubmitJobSpec,
+        seed: u8,
+        expires: u64,
+    ) -> Ulid {
+        let JobPayload::ImportRoCrate(import) = &mut spec.payload else {
+            panic!("expected import payload");
+        };
+        let upload_id = Ulid::from_bytes([seed; 16]);
+        import.source = ImportRoCrateSource::Upload { upload_id };
+        let record = crate::jobs::import::upload_record(spec.created_by, upload_id, expires);
+        crate::jobs::import::write_rocrate_upload(storage, &record)
+            .await
+            .unwrap();
+        upload_id
     }
 
     #[test]
@@ -760,7 +860,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
-        let first = drive(operation(rocrate_spec(1, None)), &ctx).await.unwrap();
+        let mut first = rocrate_spec(1, None);
+        seed_upload(&storage, &mut first, 3, u64::MAX).await;
+        let first = drive(operation(first), &ctx).await.unwrap();
 
         assert_eq!(
             drive(operation(rocrate_spec(1, None)), &ctx).await,
@@ -782,12 +884,43 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            drive(operation(rocrate_spec(1, None)), &ctx)
-                .await
-                .unwrap()
-                .created
-        );
+        let mut third = rocrate_spec(1, None);
+        seed_upload(&storage, &mut third, 6, u64::MAX).await;
+        assert!(drive(operation(third), &ctx).await.unwrap().created);
+    }
+
+    #[tokio::test]
+    async fn claims_upload_atomically() {
+        // An upload-backed import claims its upload in the creating transaction, so the job
+        // keeps it across expiry; a refused claim leaves no job or dedup row behind.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+        let mut first = rocrate_spec(4, Some(b"first".to_vec()));
+        let upload_id = seed_upload(&storage, &mut first, 3, 2_000).await;
+        let created = drive(operation(first.clone()), &ctx).await.unwrap();
+        let stored = crate::jobs::import::read_rocrate_upload(&storage, upload_id).await;
+        assert_eq!(stored.unwrap().unwrap().claimed_by, Some(created.job_id));
+        let owner = first.created_by;
+        let reclaimed = crate::jobs::import::claim_rocrate_upload(
+            &storage,
+            upload_id,
+            owner,
+            created.job_id,
+            3_000,
+        )
+        .await;
+        assert!(reclaimed.is_ok());
+        let mut other = first;
+        other.dedup_key = Some(b"other".to_vec());
+        let claimed = Err(SubmitJobError::Upload(UploadClaimError::AlreadyClaimed));
+        assert_eq!(drive(operation(other), &ctx).await, claimed);
+        let mut late = rocrate_spec(4, Some(b"late".to_vec()));
+        seed_upload(&storage, &mut late, 6, 1_000).await;
+        let expired = Err(SubmitJobError::Upload(UploadClaimError::Expired));
+        assert_eq!(drive(operation(late), &ctx).await, expired);
+        assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 1);
     }
 
     #[tokio::test]
@@ -795,7 +928,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
-        let submission = rocrate_spec(1, Some(b"import".to_vec()));
+        let mut submission = rocrate_spec(1, Some(b"import".to_vec()));
+        seed_upload(&storage, &mut submission, 3, u64::MAX).await;
         let first = drive(operation(submission.clone()), &ctx).await.unwrap();
         let second = drive(operation(submission.clone()), &ctx).await.unwrap();
 

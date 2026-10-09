@@ -9,11 +9,14 @@ mod reader;
 pub(crate) mod rewrite;
 mod upload;
 
+#[cfg(test)]
+pub(crate) use upload::tests::upload_record;
 pub use upload::{
     CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation, UploadClaimError,
     claim_rocrate_upload, delete_rocrate_upload, load_rocrate_upload, read_rocrate_upload,
     write_rocrate_upload,
 };
+pub(crate) use upload::{claim_upload, upload_key};
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
