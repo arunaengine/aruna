@@ -2225,6 +2225,56 @@ async fn sealed_local_export() {
         received.extend_from_slice(&chunk.unwrap());
     }
     assert_eq!(received, FIXTURE_BYTES);
+
+    // An export into another realm fails for a reader without the key, naming the bucket.
+    let reader = UserId::local(Ulid::from_bytes([116; 16]), realm_id);
+    let mut group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+    let viewer = group_auth
+        .roles
+        .values_mut()
+        .find(|role| role.name == "viewer");
+    viewer.unwrap().assigned_users.insert(reader);
+    let group = aruna_core::structs::identity::group::Group {
+        display_name: "export".to_string(),
+        group_id,
+        realm_id,
+        roles: group_auth.roles.keys().copied().collect(),
+        owner,
+    };
+    let actor = Actor {
+        node_id,
+        user_id: owner,
+        realm_id,
+    };
+    let key = group_id.to_bytes().to_vec();
+    let writes = vec![
+        (
+            AUTH_KEYSPACE.to_string(),
+            key.clone().into(),
+            group_auth.to_bytes(&actor).unwrap().into(),
+        ),
+        (
+            GROUP_KEYSPACE.to_string(),
+            key.into(),
+            group.to_bytes(&actor).unwrap().into(),
+        ),
+    ];
+    let write = StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
+    };
+    driver.storage_handle.send_storage_effect(write).await;
+    let mut spec = remote_spec(realm_id, reader);
+    spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
+        files: Vec::new(),
+        audience: RealmId::from_bytes([117; 32]),
+        intent_digest: String::new(),
+    });
+    let refused = crate::federation::export::GrantError::NotHolder("remote".to_string());
+    assert!(matches!(
+        open_candidate(driver, &spec, &candidate, true).await,
+        Err(ExportFailure::Permanent(message)) if message == refused.to_string()
+    ));
     node.net.shutdown().await;
 }
 
@@ -2615,6 +2665,29 @@ fn facts_need_selection() {
     checkpoint.entities[0].candidates[0].source = local;
     checkpoint.entities[0].omission = Some(ReasonCode::Denied);
     assert!(checkpoint.export_facts(&files).is_none());
+}
+
+#[test]
+fn selected_file_buckets() {
+    // Only selected File entities name buckets, by an ARN of this realm or a storage location.
+    let realm_id = RealmId::from_bytes([2; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+    let version = Ulid::from_bytes([4; 16]);
+    let arn = |bucket: &str| VersionedObjectArn::new(realm_id, node_id, bucket, "a.csv", version);
+    let (sealed, other) = (arn("sealed").unwrap(), arn("other").unwrap());
+    let located = stored_file(1, "s3://located/c.csv");
+    let document = crate_document(&[
+        json!({"@id": sealed.to_string(), "@type": "File"}),
+        json!({"@id": other.to_string(), "@type": "File"}),
+        located.clone(),
+    ]);
+    let files = [
+        sealed.to_string(),
+        located["@id"].as_str().unwrap().to_string(),
+    ];
+    let buckets = file_buckets(&document.to_string(), realm_id, &files).unwrap();
+    let expected = BTreeSet::from(["located".to_string(), "sealed".to_string()]);
+    assert_eq!(buckets, expected);
 }
 
 #[tokio::test]

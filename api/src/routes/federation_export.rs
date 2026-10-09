@@ -17,7 +17,8 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::transfer::{ExportGrant, ImportIntent, TransferError, check_remote, intent_digest};
 use aruna_operations::federation::export::{
-    GrantError, GrantRequest, admit_grant, authorize_export, issue_grant, read_record, revoke_grant,
+    GrantError, GrantRequest, admit_grant, authorize_export, check_holder, issue_grant,
+    read_record, revoke_grant,
 };
 use aruna_operations::federation::import::header_value;
 use aruna_operations::jobs::service::{read_artifact_routed, read_owned_job, submit_export_job};
@@ -110,6 +111,9 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
     let message = error.to_string();
     match error {
         GrantError::Denied => ServerError::Refused(StatusCode::FORBIDDEN, "export_denied", message),
+        GrantError::NotHolder(_) => {
+            ServerError::Refused(StatusCode::FORBIDDEN, "key_holder_required", message)
+        }
         GrantError::Revoked => ServerError::Refused(StatusCode::GONE, "grant_revoked", message),
         GrantError::Missing => ServerError::NotFound,
         GrantError::Unfinished => {
@@ -138,6 +142,9 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
 - Only the File entities named in `files` travel; every other one stays a reference by its web
   identifier with the original ARN as `identifier`. Encrypted files need an unlocked bucket key
   that the caller holds. Selected files must be stored on this node.
+- A selected file in an encrypting bucket whose key the caller does not hold now is refused
+  here with code `key_holder_required`. The export job checks each file again and fails with
+  the same message when the caller lost the key since.
 - Repeating the call for the same intent returns the same job with `created` false."#,
     request_body(
         content = FederatedExportRequest,
@@ -160,9 +167,10 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
             })),
         (status = 400, description = "A malformed document id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The intent or descriptor was refused (code `transfer_rejected`), or READ or a policy denied the export (code `export_denied`)", body = ErrorResponse),
+        (status = 403, description = "The intent or descriptor was refused (code `transfer_rejected`), READ or a policy denied the export (code `export_denied`), or the caller holds no key of a selected encrypted file's bucket (code `key_holder_required`)", body = ErrorResponse),
         (status = 404, description = "No such document on this node", body = ErrorResponse),
-        (status = 409, description = "The caller's active RO-Crate job limit is reached", body = ErrorResponse)
+        (status = 409, description = "The caller's active RO-Crate job limit is reached", body = ErrorResponse),
+        (status = 503, description = "The dataset crate could not be read for the key holder check", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -185,9 +193,16 @@ pub async fn create_export(
     let audience = request.descriptor.payload.realm_id;
     let with_files = !request.files.is_empty();
     let path = &record.permission_path;
-    authorize_export(&state.get_ctx(), &auth, path, audience, with_files)
+    let context = state.get_ctx();
+    authorize_export(&context, &auth, path, audience, with_files)
         .await
         .map_err(grant_refused)?;
+    if with_files {
+        let limit = state.rocrate_limits().metadata_bytes;
+        check_holder(&context, &auth, document_id, &request.files, limit)
+            .await
+            .map_err(grant_refused)?;
+    }
     let digest = intent_digest(&request.intent)
         .map_err(|error| transfer_refused(TransferError::Signature(error)))?;
     let key = format!("federation-{digest}");

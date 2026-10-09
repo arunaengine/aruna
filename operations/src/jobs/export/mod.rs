@@ -680,6 +680,24 @@ pub(crate) async fn crate_jsonld(
     }
 }
 
+/// The buckets that the File entities `files` of crate `jsonld` name by ARN or storage location.
+pub(crate) fn file_buckets(
+    jsonld: &str,
+    realm_id: RealmId,
+    files: &[String],
+) -> Result<BTreeSet<String>, String> {
+    let canonical = craqle::canonicalize_jsonld(jsonld).map_err(|error| error.to_string())?;
+    let document: JsonValue = serde_json::from_str(jsonld).map_err(|error| error.to_string())?;
+    let entities = recognize_entities(&document, &canonical.nquads, realm_id)
+        .map_err(|error| format!("{error:?}"))?;
+    Ok(entities
+        .into_iter()
+        .filter(|entity| files.contains(&entity.entity_id))
+        .filter_map(|entity| entity.storage_key)
+        .map(|key| key.bucket)
+        .collect())
+}
+
 /// The crate a dataset exports with its event and context digest: the raw revision, else a
 /// scaffold's rendered graph, the crate the dataset view shows.
 async fn read_crate(
@@ -1960,7 +1978,8 @@ async fn open_local_txn(
             .await
             .map_err(ExportFailure::Retryable)?
     {
-        return Ok(CandidateOpen::Status(OpenStatus::Denied));
+        let refused = crate::federation::export::GrantError::NotHolder(bucket.to_string());
+        return Err(ExportFailure::Permanent(refused.to_string()));
     }
     let (effect, held) = match (lease, location.format.bucket_key()) {
         (Some(lease), Some(_)) => {
