@@ -465,6 +465,14 @@ impl ArunaValidationState for RevocationBlindState<'_> {
         self.0.is_trusted_realm(realm_id).await
     }
 
+    async fn linked_owner(
+        &self,
+        realm_id: &aruna_core::structs::identity::realm::RealmId,
+        via: &aruna_core::UserId,
+    ) -> Result<Option<aruna_core::UserId>, ArunaBearerError> {
+        self.0.linked_owner(realm_id, via).await
+    }
+
     async fn issuer_decoding_key(
         &self,
         issuer_pubkey: &str,
@@ -1949,6 +1957,7 @@ mod test {
             issuer_pubkey: None,
             delegation_signature: None,
             name: None,
+            via: None,
         };
         let der = issuer_key
             .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)

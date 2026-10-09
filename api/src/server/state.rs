@@ -21,7 +21,8 @@ use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
 use aruna_operations::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_token_revoked, realm_user_cutoff,
+    ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_linked_owner,
+    realm_token_revoked, realm_user_cutoff,
 };
 use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::{DriverContext, drive};
@@ -720,6 +721,17 @@ impl ArunaValidationState for ServerState {
         user_id: &UserId,
     ) -> Result<Option<u64>, ArunaBearerError> {
         realm_user_cutoff(&self.driver_ctx.storage_handle, *realm_id, user_id).await
+    }
+
+    async fn linked_owner(
+        &self,
+        realm_id: &RealmId,
+        via: &UserId,
+    ) -> Result<Option<UserId>, ArunaBearerError> {
+        if *realm_id != self.get_realm_id() {
+            return Ok(None);
+        }
+        realm_linked_owner(&self.driver_ctx.storage_handle, via).await
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {

@@ -79,6 +79,7 @@ mod specification_tests {
 
 /// Credential a forwarded metadata or job-control request carries to the holder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum AuthToken {
     Bearer(MetadataBearerToken),
     Internal(AuthContext),

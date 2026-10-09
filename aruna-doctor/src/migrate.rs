@@ -17,7 +17,7 @@ use aruna_core::keyspaces::{
     JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE,
     QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE,
     SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
-    SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USER_SESSION_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
@@ -28,6 +28,7 @@ use aruna_core::structs::execution::job::{
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
 use aruna_core::structs::storage::blob::{BlobVersion, BucketInfo};
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
@@ -46,6 +47,7 @@ mod mappings;
 mod sessions;
 mod sizes;
 mod uploads;
+mod user_sessions;
 mod vault;
 mod versions;
 
@@ -112,6 +114,9 @@ pub struct MigrateOutput {
     pub info_quarantine_deleted: usize,
     /// Applied and fan-out sync cursors of the former node info topics.
     pub info_cursors_deleted: usize,
+    /// Login sessions from before a session named the linked login it came through.
+    pub user_sessions_scanned: usize,
+    pub user_sessions_rewritten: usize,
 }
 
 pub async fn migrate(database_path: String, sync_path: Option<String>) -> Result<(), CliError> {
@@ -164,6 +169,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let applied_rows = db.keyspace(APPLIED_OPS_KEYSPACE, KeyspaceCreateOptions::default)?;
     let quarantine_rows = db.keyspace(SYNC_QUARANTINE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let usage_rows = db.keyspace(QUARANTINE_USAGE_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let login_rows = db.keyspace(USER_SESSION_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -204,6 +210,11 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             usage: &usage_rows,
             outbox: &outbox_rows,
         },
+    )?;
+    let logins = rewrites::<UserSession, user_sessions::LegacySession>(
+        &db,
+        &login_rows,
+        USER_SESSION_KEYSPACE,
     )?;
     let record = |target: &DocumentTarget| matches!(target, DocumentTarget::GitRecord { .. });
     let git_outbox = mappings::outbox_rows(
@@ -257,6 +268,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&size_rows, &sizes.rows),
         (&version_rows, &versions.rows),
         (&bucket_rows, &buckets.rows),
+        (&login_rows, &logins.rows),
         (&index_rows, &index.writes),
         (&job_rows, &jobs.rows),
         (&state_rows, &checkpoints.rows),
@@ -353,6 +365,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         info_outbox_deleted: info.outbox.len(),
         info_quarantine_deleted: info.quarantine.len(),
         info_cursors_deleted: info.cursors.len() + fanout_cursors,
+        user_sessions_scanned: logins.scanned,
+        user_sessions_rewritten: logins.rows.len(),
     })
 }
 

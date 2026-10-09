@@ -200,6 +200,7 @@ fn sign_aruna_token(
         issuer_pubkey: None,
         delegation_signature: None,
         name: None,
+        via: None,
     };
     let NodeCapabilities::Management {
         realm_encoding_key, ..
@@ -1666,6 +1667,7 @@ async fn federated_profile_synthesized() {
             sid: Ulid::generate().to_string(),
             kind: SessionKind::Federated,
             name: Some("Ada".to_string()),
+            via: None,
         }),
     };
     let info = super::build_user_response(&state, auth.clone())

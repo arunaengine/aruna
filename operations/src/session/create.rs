@@ -37,6 +37,8 @@ pub struct CreateSessionConfig {
     /// Display name a federated session carries in its token.
     pub name: Option<String>,
     pub restrictions: Option<Vec<PathRestriction>>,
+    /// The linked login of another realm a federated session of a local account came through.
+    pub via: Option<UserId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,6 +154,7 @@ impl CreateSessionOperation {
             sid: self.sid.clone(),
             kind: self.config.kind,
             name: self.config.name.clone(),
+            via: self.config.via,
         };
         let token = mint_token(&CreateTokenConfig {
             time: self.config.time,
@@ -171,6 +174,7 @@ impl CreateSessionOperation {
             expires_at: self.config.expiry,
             token_hash: bearer_token_hash(&token),
             revoked: false,
+            via: self.config.via,
         });
         self.token = Some(Secret::new(token));
         Ok(())
@@ -416,6 +420,7 @@ mod pure_tests {
             label: None,
             name: None,
             restrictions: None,
+            via: None,
         }
     }
 
@@ -434,6 +439,7 @@ mod pure_tests {
             expires_at,
             token_hash: "a".repeat(64),
             revoked,
+            via: None,
         }
     }
 

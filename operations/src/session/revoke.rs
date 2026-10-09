@@ -302,6 +302,7 @@ mod pure_tests {
             expires_at: 20,
             token_hash: "a".repeat(64),
             revoked: true,
+            via: None,
         };
         let mut operation = RevokeSessionOperation::new(
             Actor {
@@ -336,6 +337,7 @@ mod pure_tests {
             expires_at: 20,
             token_hash: "a".repeat(64),
             revoked: false,
+            via: None,
         };
         let mut operation = RevokeSessionOperation::new(
             Actor {

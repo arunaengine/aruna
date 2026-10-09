@@ -94,6 +94,11 @@ pub fn mint_token(config: &CreateTokenConfig) -> Result<String, CreateTokenError
             .session
             .as_ref()
             .and_then(|session| session.name.clone()),
+        via: config
+            .session
+            .as_ref()
+            .and_then(|session| session.via)
+            .map(|via| via.to_string()),
     };
     let header = Header::new(Algorithm::EdDSA);
     match &config.node_capabilities {
@@ -266,6 +271,7 @@ mod test {
                 sid: sid.clone(),
                 kind: SessionKind::Assistant,
                 name: None,
+                via: None,
             }),
             restrictions: None,
         })

@@ -798,6 +798,7 @@ pub struct PolicyFetchEffect {
 
 /// What a vault fetch asks the holders of one user's vault for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum VaultQuery {
     /// The caller's own heads; each holder checks the forwarded token again.
     Heads { auth_token: Option<AuthToken> },

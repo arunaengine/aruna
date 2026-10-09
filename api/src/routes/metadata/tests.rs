@@ -4000,6 +4000,7 @@ fn test_token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenCla
         issuer_pubkey: None,
         delegation_signature: None,
         name: None,
+        via: None,
     }
 }
 
