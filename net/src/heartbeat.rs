@@ -242,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn silence_counts_from_start() {
+    fn silence_from_start() {
         let table = HeartbeatTable::default();
         let before = table.silence(&node(1));
         table.record(node(1), heartbeat(1, 1), || true);
