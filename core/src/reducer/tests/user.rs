@@ -540,7 +540,7 @@ fn concurrent_name_recorded() {
 }
 
 #[test]
-fn alias_links_foreign_only() {
+fn links_foreign_only() {
     // Only a non-nil login of another realm is linked, and never shows up as a subject.
     let mut state = user_state();
     let actor = actor(node(1));

@@ -292,7 +292,7 @@ async fn admits_federated_membership() {
 }
 
 #[tokio::test]
-async fn keeps_foreign_actors_out() {
+async fn keeps_foreigners_out() {
     // Foreign actors stay out of user, realm-authorization and unrelated config documents.
     let (_dir, storage) = test_storage();
     let realm = federated_realm(&storage).await;

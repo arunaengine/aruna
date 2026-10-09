@@ -2510,7 +2510,7 @@ fn nested_references_cleaned() {
 }
 
 #[test]
-fn facts_need_selected_files() {
+fn facts_need_selection() {
     // A grant pins only a finished export that kept every selected file.
     let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
     let version = Ulid::from_bytes([4; 16]);

@@ -44,7 +44,7 @@ mod tests {
     use aruna_core::keyspaces::USER_SESSION_KEYSPACE;
 
     #[test]
-    fn adds_no_linked_login() {
+    fn adds_empty_login() {
         let old = LegacySession {
             sid: "01JCNCTR0123456789ABCDEFGH".to_string(),
             user_id: UserId::default(),

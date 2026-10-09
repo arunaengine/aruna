@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_other_realm_group() {
+    fn refuses_foreign_group() {
         let (mut state, _) = realm_group(8);
         let before = state.clone();
         assert_eq!(

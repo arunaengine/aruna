@@ -529,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn cuts_off_federated_user() {
+    fn cuts_federated_user() {
         // A federated user has no record here; deactivation writes only the cutoff.
         let mut fixture = fixture();
         fixture.target = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId::from_bytes([6u8; 32]));
