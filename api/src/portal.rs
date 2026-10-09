@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::csp::{PortalCspConfig, PortalSecurity, portal_security_headers};
-use crate::error::ServerSetupError;
+use crate::error::{ServerError, ServerSetupError};
 use crate::server::state::{PortalRuntimeState, ServerState};
+use aruna_operations::driver::drive;
+use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -78,16 +80,32 @@ fn api_base_url(api_public_url: &str) -> String {
 #[serde(rename_all = "camelCase")]
 struct PortalRuntimeConfig<'a> {
     api_base_url: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registry_url: Option<String>,
 }
 
 async fn portal_config(State(state): State<PortalState>) -> Response {
-    match portal_dir(&state.server).await {
-        Ok(_) => Json(PortalRuntimeConfig {
-            api_base_url: &state.api_base_url,
-        })
-        .into_response(),
-        Err(error) => error.into_response(),
+    if let Err(error) = portal_dir(&state.server).await {
+        return error.into_response();
     }
+    let registry_url = match drive(
+        GetConfigOperation::new(state.server.get_realm_id()),
+        &state.server.get_ctx(),
+    )
+    .await
+    {
+        Ok(config) => config
+            .federation
+            .and_then(|settings| settings.registry_url)
+            .map(String::from),
+        Err(GetConfigError::DocumentNotFound) => None,
+        Err(error) => return ServerError::InternalError(error.to_string()).into_response(),
+    };
+    Json(PortalRuntimeConfig {
+        api_base_url: &state.api_base_url,
+        registry_url,
+    })
+    .into_response()
 }
 
 async fn realm_descriptor(State(state): State<PortalState>) -> Response {
@@ -215,11 +233,17 @@ mod tests {
     use crate::server::state::{PortalStatus, ServerState};
     use crate::server::{MAX_BODY_SIZE, Server, ServerConfig};
     use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::federation::{
+        AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode, Signed,
+    };
     use aruna_core::keys::generate_signing_key;
+    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
     use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::realm::get_config::GetConfigOperation;
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use axum::body::{Body, to_bytes};
@@ -232,6 +256,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tower::ServiceExt;
     use ulid::Ulid;
+    use url::Url;
 
     async fn setup_state() -> (Arc<ServerState>, TempDir) {
         let tempdir = tempdir().unwrap();
@@ -496,6 +521,85 @@ mod tests {
         assert_eq!(index.status(), StatusCode::OK);
         let body = to_bytes(index.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"<html>portal</html>");
+    }
+
+    async fn registry_url(router: Router) -> serde_json::Value {
+        let response = router
+            .oneshot(request(Method::GET, "/portal-config.json"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["registryUrl"].clone()
+    }
+
+    #[tokio::test]
+    async fn serves_registry_url() {
+        // The realm picker reads the registry from the current settings, and none while unset.
+        let tempdir = tempdir().unwrap();
+        let (state, _state_dir) = setup_state().await;
+        let realm_id = state.get_realm_id();
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: actor.clone(),
+                realm_description: "Realm".to_string(),
+                oidc_providers: vec![],
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
+            }),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+        std::fs::write(tempdir.path().join("index.html"), "<html>portal</html>").unwrap();
+        enable_portal(&state, tempdir.path()).await;
+        let router = super::router(
+            state.clone(),
+            PortalConfig {
+                api_public_url: TEST_API_URL.to_string(),
+                csp: PortalCspConfig::new(Vec::new()),
+            },
+        );
+        assert_eq!(registry_url(router.clone()).await, serde_json::Value::Null);
+
+        let mut config = drive(GetConfigOperation::new(realm_id), &state.get_ctx())
+            .await
+            .unwrap();
+        let descriptor = RealmDescriptor {
+            realm_id,
+            name: "Realm".to_string(),
+            description: String::new(),
+            api_url: Url::parse("https://api.example.org/api/v1").unwrap(),
+            portal_url: Url::parse("https://portal.example.org/").unwrap(),
+            issued_at: 1,
+        };
+        let signer = NodeCapabilities::management_node(generate_signing_key()).unwrap();
+        config.federation = Some(FederationSettings {
+            name: descriptor.name.clone(),
+            api_url: descriptor.api_url.clone(),
+            portal_url: descriptor.portal_url.clone(),
+            registry_url: Some(Url::parse("https://registry.example.org/").unwrap()),
+            registration: RegistrationMode::Enabled,
+            accepted_realms: AcceptedRealms::None,
+            descriptor: Signed::sign(descriptor, &signer).unwrap(),
+        });
+        state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: realm_id.as_bytes().to_vec().into(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert_eq!(registry_url(router).await, "https://registry.example.org/");
     }
 
     #[test]
