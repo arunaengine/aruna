@@ -362,6 +362,14 @@ pub enum AdminDocumentOperation {
     ConfigFederationSet {
         settings: Box<crate::federation::FederationSettings>,
     },
+    /// Links a login of another realm to this local account.
+    UserAliasAdded {
+        alias: UserId,
+    },
+    /// Removes a linked login of another realm from this local account.
+    UserAliasRemoved {
+        alias: UserId,
+    },
 }
 
 impl AdminDocumentOperation {

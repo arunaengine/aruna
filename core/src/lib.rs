@@ -26,6 +26,7 @@ pub mod join_request;
 pub mod key_seal;
 pub mod keys;
 pub mod keyspaces;
+pub mod link;
 pub mod metadata;
 pub mod metrics;
 pub mod node_vault;

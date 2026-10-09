@@ -5,6 +5,7 @@
 use super::*;
 use aruna_core::auth::{bearer_token_hash, user_cutoff_expiry, user_cutoff_hash};
 use aruna_core::join_request::{JoinDecision, JoinDecisionKind, JoinRequest};
+use aruna_core::keyspaces::FEDERATION_KEYSPACE;
 use std::collections::BTreeSet;
 
 struct Realm {
@@ -374,4 +375,67 @@ async fn keeps_foreign_actors_out() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn linked_logins_replicate() {
+    // Only the owner links; a second claim makes the login unusable; owner removal resolves it.
+    use aruna_core::link::{alias_claims_key, alias_owner};
+    let (_dir, storage) = test_storage();
+    let realm = federated_realm(&storage).await;
+    let (realm_id, foreign) = (realm.realm_id, realm.foreign.user_id);
+    let second = Actor {
+        user_id: UserId::local(Ulid::from_parts(714, 1), realm_id),
+        ..realm.owner.clone()
+    };
+    let alias = |actor: &Actor, user_id: UserId, seq: u64, added: bool| {
+        let op = if added {
+            AdminDocumentOperation::UserAliasAdded { alias: foreign }
+        } else {
+            AdminDocumentOperation::UserAliasRemoved { alias: foreign }
+        };
+        realm.event(actor, seq, AdminDocumentTarget::User { user_id }, op)
+    };
+    let claims = || async {
+        let bytes = storage_read_from(
+            &storage,
+            FEDERATION_KEYSPACE.to_string(),
+            alias_claims_key(&foreign).into(),
+        )
+        .await
+        .unwrap();
+        bytes
+            .map(|bytes| postcard::from_bytes::<BTreeSet<UserId>>(&bytes).unwrap())
+            .unwrap_or_default()
+    };
+    let (first, other) = (realm.owner.user_id, second.user_id);
+    let rejected = |outcome: AdminEventValidation| {
+        assert!(
+            matches!(outcome, AdminEventValidation::Rejected(_)),
+            "{outcome:?}"
+        );
+    };
+    // Neither the foreign login itself nor another local user may add the link.
+    rejected(receive(&storage, realm_id, alias(&realm.foreign, first, 1, true)).await);
+    rejected(receive(&storage, realm_id, alias(&second, first, 1, true)).await);
+    let linked = alias(&realm.owner, first, 1, true);
+    assert_eq!(
+        receive(&storage, realm_id, linked).await,
+        AdminEventValidation::Accepted
+    );
+    assert_eq!(alias_owner(&claims().await), Some(first));
+    // A conflicting replicated claim disables the login instead of picking an account.
+    let claimed = alias(&second, other, 1, true);
+    assert_eq!(
+        receive(&storage, realm_id, claimed).await,
+        AdminEventValidation::Accepted
+    );
+    assert_eq!(claims().await, BTreeSet::from([first, other]));
+    assert_eq!(alias_owner(&claims().await), None);
+    let removed = alias(&realm.owner, first, 2, false);
+    assert_eq!(
+        receive(&storage, realm_id, removed).await,
+        AdminEventValidation::Accepted
+    );
+    assert_eq!(alias_owner(&claims().await), Some(other));
 }

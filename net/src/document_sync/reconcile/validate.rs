@@ -548,7 +548,14 @@ pub(in crate::document_sync) async fn validate_user_authority(
     }
 
     let self_service = event.actor.user_id == user_id;
-    let management_bootstrap = event.actor.user_id.is_nil_in(realm_id)
+    // Only the account owner links a login; the owner or a realm administrator unlinks it.
+    let alias = matches!(
+        event.op,
+        AdminDocumentOperation::UserAliasAdded { .. }
+            | AdminDocumentOperation::UserAliasRemoved { .. }
+    );
+    let management_bootstrap = !alias
+        && event.actor.user_id.is_nil_in(realm_id)
         && matches!(origin_kind, RealmNodeKind::Management)
         && event.origin_seq <= 2
         && previous_state.is_none_or(|state| {
@@ -558,7 +565,10 @@ pub(in crate::document_sync) async fn validate_user_authority(
                 .keys()
                 .all(|origin| *origin == event.origin_node_id)
         });
-    let realm_admin = if self_service || management_bootstrap {
+    let realm_admin = if self_service
+        || management_bootstrap
+        || matches!(event.op, AdminDocumentOperation::UserAliasAdded { .. })
+    {
         false
     } else {
         let Some(auth) = read_realm_authorization(storage, realm_id).await? else {
@@ -578,7 +588,7 @@ pub(in crate::document_sync) async fn validate_user_authority(
             auth.roles.values(),
         )
     };
-    let group_admin = if self_service || management_bootstrap || realm_admin {
+    let group_admin = if self_service || management_bootstrap || realm_admin || alias {
         false
     } else if let Some(group_id) = service_owner(event, previous_state, current_user.as_ref()) {
         let Some(auth) = read_group_authorization(storage, group_id).await? else {
@@ -1631,7 +1641,9 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::UserAttributeRemoved { .. }
         | AdminDocumentOperation::UserNameSet { .. }
         | AdminDocumentOperation::SubjectIdAdded { .. }
-        | AdminDocumentOperation::SubjectIdRemoved { .. } => AdminOperationFamily::User,
+        | AdminDocumentOperation::SubjectIdRemoved { .. }
+        | AdminDocumentOperation::UserAliasAdded { .. }
+        | AdminDocumentOperation::UserAliasRemoved { .. } => AdminOperationFamily::User,
         AdminDocumentOperation::ConfigNodeEnsured { .. }
         | AdminDocumentOperation::ConfigNodeRemoved { .. }
         | AdminDocumentOperation::OidcProviderUpserted { .. }

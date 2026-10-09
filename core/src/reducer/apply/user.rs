@@ -1,4 +1,4 @@
-//! Applies user events for names, subject ids and validated attributes.
+//! Applies user events for names, subject ids, linked logins and validated attributes.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -25,6 +25,24 @@ impl AdminDocumentState {
             AdminDocumentOperation::UserAttributeRemoved { key } => {
                 validate_attribute_key(key)?;
                 self.apply_user_attribute(event, key, None);
+            }
+            AdminDocumentOperation::UserAliasAdded { alias }
+            | AdminDocumentOperation::UserAliasRemoved { alias } => {
+                let AdminDocumentTarget::User { user_id } = &event.target else {
+                    return Err(AdminDocumentError::UnsupportedTarget);
+                };
+                // Only a login of another realm is linked; never a local or public principal.
+                if alias.realm_id == user_id.realm_id || alias.is_nil() {
+                    return Err(AdminDocumentError::UnsupportedTarget);
+                }
+                let added = matches!(event.op, AdminDocumentOperation::UserAliasAdded { .. });
+                let path = user_alias_path(alias);
+                let value = added.then(|| alias.to_string());
+                let current = self.user_subject_ids.get(&path).cloned();
+                match self.reduce_value(event, &path, current, value) {
+                    Some(version) => self.user_subject_ids.insert(path, version),
+                    None => self.user_subject_ids.remove(&path),
+                };
             }
             _ => return Err(AdminDocumentError::UnsupportedTarget),
         }
