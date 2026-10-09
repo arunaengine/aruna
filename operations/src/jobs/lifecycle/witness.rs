@@ -459,9 +459,14 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
             return RoundOutcome::Retry { after_ms: base };
         }
     };
-    let silent = silent_nodes(net, family, &records, window);
+    let running = running_nodes(family, &records);
+    let silent = silent_nodes(net, &running, window);
     if suppressed(family, &records, &silent) {
-        return RoundOutcome::Done;
+        // An unfinished execution suppresses only while its node reports, so look again later.
+        return match suppressed(family, &records, &running) {
+            true => RoundOutcome::Done,
+            false => RoundOutcome::Retry { after_ms: window },
+        };
     }
     let Some(spec) = stored_spec(family, &records) else {
         return RoundOutcome::Retry { after_ms: base };
@@ -718,15 +723,8 @@ pub(crate) fn suppressed(
     })
 }
 
-/// Executor nodes of an unfinished execution that sent no heartbeat within the catch-up window.
-/// Without any heartbeat the silence counts from this node's start, so a restart alone never
-/// makes a node silent before the window has passed.
-fn silent_nodes(
-    net: &NetHandle,
-    family: JobFamilyId,
-    records: &[JobRecordEnvelope],
-    window_ms: u64,
-) -> BTreeSet<NodeId> {
+/// Executor nodes of the family's unfinished executions.
+fn running_nodes(family: JobFamilyId, records: &[JobRecordEnvelope]) -> BTreeSet<NodeId> {
     let Ok(Some(projection)) = reduce_family(family, records) else {
         return BTreeSet::new();
     };
@@ -735,6 +733,15 @@ fn silent_nodes(
         .iter()
         .filter(|execution| !execution.state.is_terminal())
         .map(|execution| execution.executor_node_id)
+        .collect()
+}
+
+/// The `running` nodes that sent no heartbeat within the catch-up window. Without any heartbeat
+/// the silence counts from this node's start, so a restart alone never makes a node silent early.
+fn silent_nodes(net: &NetHandle, running: &BTreeSet<NodeId>, window_ms: u64) -> BTreeSet<NodeId> {
+    running
+        .iter()
+        .copied()
         .filter(|node| net.heartbeat_silence(*node).as_millis() > u128::from(window_ms))
         .collect()
 }
