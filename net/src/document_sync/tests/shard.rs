@@ -382,6 +382,92 @@ async fn shard_membership_exact() {
     service.shutdown().await;
 }
 
+/// A cancelled reconcile keeps the reconcile lock until its queued control writes
+/// end, so a newer reconcile cannot run before them and be overwritten.
+#[test]
+fn reconcile_survives_cancel() {
+    // One blocking thread, held by the test, keeps the reconcile's writes queued.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime builds");
+    runtime.block_on(async {
+        let (_dir, storage) = test_storage();
+        let doc = tempfile::tempdir().expect("document sync dir");
+        let realm_id = restart_realm();
+        let service = DocumentSyncService::open_with_policy(
+            test_endpoint(83).await,
+            storage,
+            doc.path().join("document-sync"),
+            &[node(84), node(85)],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            ::irokle::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+        let local_node = service.local_node_id().expect("local node id");
+        let (current_node, stale_node) = (node(84), node(85));
+        let shard_topic = restart_topic();
+        service
+            .ensure_sync_topics(&[shard_topic], vec![current_node, stale_node])
+            .expect("shard topic exists");
+
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (occupied, ready) = tokio::sync::oneshot::channel();
+        let occupier = tokio::task::spawn_blocking(move || {
+            occupied
+                .send(())
+                .expect("test waits for the blocking thread");
+            let _ = held.recv();
+        });
+        ready.await.expect("blocking thread occupied");
+        let reconcile = tokio::spawn({
+            let service = service.clone();
+            async move {
+                let members = vec![local_node, current_node];
+                service
+                    .reconcile_shard_membership(
+                        &[shard_topic],
+                        members.clone(),
+                        members,
+                        &BTreeSet::new(),
+                        &BTreeSet::new(),
+                    )
+                    .await
+            }
+        });
+        while service.reconcile_lock.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+        reconcile.abort();
+        assert!(
+            reconcile
+                .await
+                .expect_err("reconcile cancelled")
+                .is_cancelled()
+        );
+        assert!(
+            service.reconcile_lock.try_lock().is_err(),
+            "a cancelled reconcile released its lock before its writes ran"
+        );
+
+        release.send(()).expect("blocking thread waits");
+        occupier.await.expect("blocking thread ends");
+        drop(service.reconcile_lock.lock().await);
+        let state = service
+            .node()
+            .storage()
+            .topic_state(&shard_topic)
+            .expect("shard state reads")
+            .expect("shard state exists");
+        assert!(!state.members.contains(&node_to_peer(&stale_node)));
+        service.shutdown().await;
+    });
+}
+
 #[tokio::test]
 async fn covered_dependency_retained() {
     use ::irokle::{Ed25519Signer, Signer as _};

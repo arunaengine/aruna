@@ -42,7 +42,7 @@ impl DocumentSyncService {
             return Ok(());
         }
 
-        let _reconcile_guard = self.reconcile_lock.lock().await;
+        let reconcile_guard = Arc::clone(&self.reconcile_lock).lock_owned().await;
         let local_peer = self.node.peer_id();
         // Membership and publish authority are separate sets; the adapter
         // installs exactly the sets it is handed and policy stays in operations.
@@ -135,9 +135,11 @@ impl DocumentSyncService {
             )));
         }
 
-        // Control writes and the flush block, so they run off the async runtime.
+        // Control writes and the flush block, so they run off the async runtime. The task
+        // owns the guard: a cancelled caller cannot let a newer reconcile in before it ends.
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
+            let _reconcile_guard = reconcile_guard;
             service.write_shard_controls(states, &member_peers, local_peer)
         })
         .await
