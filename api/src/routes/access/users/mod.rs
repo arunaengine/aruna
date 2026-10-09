@@ -197,6 +197,8 @@ pub struct UserPreferencesResponse {
 #[schema(as = GetUserInfoResponse)]
 pub struct UserInfoResponse {
     pub user: GetUserResponse,
+    /// Logins of other realms that open sessions of this account, for removal.
+    pub linked_logins: Vec<String>,
     pub realm: UserRealmResponse,
     pub groups: Vec<UserGroupResponse>,
     pub preferences: UserPreferencesResponse,
@@ -464,8 +466,8 @@ async fn build_user_response(
         return Err(ServerError::Forbidden);
     }
     let user = match auth.session.as_ref() {
-        // A federated user has no record here; the token's display name stands in for it.
-        Some(session) if session.kind == SessionKind::Federated => User {
+        // An unlinked federated user has no record here; the token's name stands in for it.
+        Some(session) if session.kind == SessionKind::Federated && session.via.is_none() => User {
             user_id: auth.user_id,
             name: session
                 .name
@@ -480,8 +482,10 @@ async fn build_user_response(
     let preferences = preferences_from_attributes(&user.attributes);
     let realm_roles = collect_realm_roles(read_realm_authorization(state).await?, auth.user_id);
     let groups = collect_group_memberships(state, auth.user_id).await?;
+    let linked_logins = crate::routes::federation_link::linked_logins(&user).linked_logins;
 
     Ok(UserInfoResponse {
+        linked_logins,
         user: user.into(),
         realm: UserRealmResponse {
             realm_id: state.get_realm_id().to_string(),
@@ -834,6 +838,7 @@ takes no user id.
                         ]
                     }
                 ],
+                "linked_logins": [],
                 "preferences": {
                     "preferred_profile_path": "datasets/proteomics",
                     "favourite_metadata_ids": ["01JMETADATA0123456789ABCDE"],
@@ -930,6 +935,7 @@ user document and takes no user id.
                         ]
                     }
                 ],
+                "linked_logins": [],
                 "preferences": {
                     "preferred_profile_path": null,
                     "favourite_metadata_ids": [],
