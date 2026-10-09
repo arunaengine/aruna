@@ -422,13 +422,14 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
     }
 }
 
-/// Heartbeat: refreshes the persisted node-info document's placement-view labels, utilization
-/// and timestamps, republishes it, then pushes live telemetry to the sync peers. Scans run
+/// Heartbeat: revises the persisted node-info document and publishes it only when a durable
+/// field changed or `publish` is set, then pushes live telemetry to the sync peers. Scans run
 /// outside the revision, so [`revise_node_info`] never carries stale drain backwards.
 pub async fn refresh_info_heartbeat(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
+    publish: bool,
     sequence: u64,
 ) -> Result<(), String> {
     let Some(document) = read_info_document(&ctx.storage_handle, node_id).await? else {
@@ -456,7 +457,7 @@ pub async fn refresh_info_heartbeat(
         document.utilization = utilization;
     })
     .await?;
-    if revised {
+    if revised || publish {
         replicate_node_info(ctx, node_id, realm_id).await?;
     }
     let (Some(net_handle), Some(stored)) = (
@@ -494,12 +495,32 @@ pub async fn refresh_info_heartbeat(
     Ok(())
 }
 
+/// The advertisement without telemetry and publication stamps; only a change here publishes.
+fn durable_view(document: &NodeInfoDocument) -> NodeInfoDocument {
+    let mut view = document.clone();
+    for executor in &mut view.executors {
+        executor.availability = None;
+    }
+    view.utilization = NodeUtilization {
+        storage_bytes_used: 0,
+        documents_held: None,
+        load_permille: None,
+        heartbeat_at_ms: 0,
+    };
+    view.demand = ComputeDemandSnapshot::default();
+    view.reservation = ComputeReservationSnapshot::default();
+    view.updated_at_ms = 0;
+    view.epoch.publisher_generation = 0;
+    view.epoch.observed_at_ms = 0;
+    view
+}
+
 /// Node-info revisions one publisher retries after another committed first.
 const NODE_INFO_ATTEMPTS: usize = 3;
 
 /// Applies `revise` to the current node-info row inside one write transaction,
-/// also stamping the next epoch and re-reading published drain/departure state. All
-/// publishers use it, so concurrent rounds cannot overwrite; `Ok(false)` means no row.
+/// also stamping the next epoch and re-reading published drain/departure state. All publishers
+/// use it, so concurrent rounds cannot overwrite; `Ok(false)` means no row or no durable change.
 async fn revise_node_info(
     ctx: &DriverContext,
     node_id: NodeId,
@@ -540,7 +561,15 @@ async fn write_revision(
     else {
         return Ok(false);
     };
+    let stored = durable_view(&document);
     revise(&mut document);
+    // The published drain is exactly the operator's durable flag or a departure,
+    // both read here, so no publisher carries a stale copy of them forward.
+    document.compute_draining = operator_drain(ctx, Some(txn_id)).await? || document.leaving;
+    document.epoch.membership_generation = generation;
+    if durable_view(&document) == stored {
+        return Ok(false);
+    }
     let now = unix_timestamp_millis();
     document.epoch = AdvertisementEpoch {
         membership_generation: generation,
@@ -549,9 +578,6 @@ async fn write_revision(
     };
     document.demand.epoch = document.epoch;
     document.reservation.epoch = document.epoch;
-    // The published drain is exactly the operator's durable flag or a departure,
-    // both read here, so no publisher carries a stale copy of them forward.
-    document.compute_draining = operator_drain(ctx, Some(txn_id)).await? || document.leaving;
     document.updated_at_ms = now;
     write_info_row(&ctx.storage_handle, &document, Some(txn_id)).await?;
     Ok(true)
@@ -1288,7 +1314,7 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, true, 1)
             .await
             .unwrap();
 
@@ -1445,7 +1471,7 @@ mod tests {
         let expected_labels = build_view(&config).nodes[0].labels.clone();
         write_realm_config(&ctx, &config).await;
 
-        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, false, 1)
             .await
             .unwrap();
         let second = read_info_document(&ctx.storage_handle, local)
@@ -1487,7 +1513,7 @@ mod tests {
         let local = node(1);
         write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
 
-        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, false, 1)
             .await
             .unwrap();
         assert!(
@@ -2211,7 +2237,7 @@ mod tests {
         .unwrap();
 
         write_operator_drain(&ctx, true).await.unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, false, 1)
             .await
             .unwrap();
         let drained = read_info_document(&ctx.storage_handle, local)
@@ -2221,7 +2247,7 @@ mod tests {
         assert!(drained.compute_draining && !drained.leaving);
 
         write_operator_drain(&ctx, false).await.unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, false, 1)
             .await
             .unwrap();
         let released = read_info_document(&ctx.storage_handle, local)
@@ -2254,7 +2280,7 @@ mod tests {
             .await
             .unwrap();
 
-        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, false, 1)
             .await
             .unwrap();
 
@@ -2285,7 +2311,7 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, false, 1)
             .await
             .unwrap();
 
@@ -2295,5 +2321,54 @@ mod tests {
             .unwrap();
         assert_eq!(stored.utilization.documents_held, Some(0));
         assert!(stored.utilization.load_permille.is_some());
+    }
+
+    /// Ticks with unchanged durable fields write no revision and queue no publish; an owed
+    /// publish queues the stored row again without a new revision.
+    #[tokio::test]
+    async fn unchanged_skips_publish() {
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([18u8; 32]);
+        let local = node(1);
+        write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
+        publish_node_info(
+            &ctx,
+            local,
+            realm_id,
+            NodeUrls {
+                api: None,
+                s3: None,
+            },
+        )
+        .await
+        .unwrap();
+        let seeded = read_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        let queued = read_outbox(&ctx).await.len();
+
+        for sequence in 1..=3 {
+            refresh_info_heartbeat(&ctx, local, realm_id, false, sequence)
+                .await
+                .unwrap();
+        }
+        let stored = read_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, seeded);
+        assert_eq!(read_outbox(&ctx).await.len(), queued);
+
+        refresh_info_heartbeat(&ctx, local, realm_id, true, 4)
+            .await
+            .unwrap();
+        let stored = read_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, seeded);
+        assert_eq!(read_outbox(&ctx).await.len(), queued + 1);
     }
 }
