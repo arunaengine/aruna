@@ -42,7 +42,7 @@ use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use axum::body::Body;
 use axum::extract::{FromRequest, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::{Extension, Json};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -1199,6 +1199,22 @@ async fn admin_sets_quota() {
     assert_eq!(quota.devices_per_user, Some(3));
 }
 
+fn federation_body(name: &str) -> RealmFederation {
+    RealmFederation {
+        name: name.to_string(),
+        api_url: "https://api.example.org/api/v1".to_string(),
+        portal_url: "https://portal.example.org/".to_string(),
+        registry_url: Some("https://registry.example.org/".to_string()),
+        registration: RegistrationSetting::Disabled,
+        accepted_realms: AcceptedRealmsSetting::Any,
+        descriptor: None,
+    }
+}
+
+fn first_setup() -> HeaderMap {
+    HeaderMap::from_iter([(header::IF_NONE_MATCH, HeaderValue::from_static("*"))])
+}
+
 #[tokio::test]
 async fn federation_admin_reads() {
     let (state, realm_id, admin, _tempdir) = setup_management_state().await;
@@ -1207,27 +1223,24 @@ async fn federation_admin_reads() {
         |auth: Option<AuthContext>| get_realm_federation(State(state.clone()), Extension(auth));
     assert!(matches!(
         read(Some(auth.clone())).await,
-        Err(ServerError::NotFound)
+        Err(ServerError::Refused(
+            StatusCode::NOT_FOUND,
+            "federation_unset",
+            _
+        ))
     ));
 
-    let body = RealmFederation {
-        name: "Realm".to_string(),
-        api_url: "https://api.example.org/api/v1".to_string(),
-        portal_url: "https://portal.example.org/".to_string(),
-        registry_url: Some("https://registry.example.org/".to_string()),
-        registration: RegistrationSetting::Disabled,
-        accepted_realms: AcceptedRealmsSetting::Any,
-        descriptor: None,
-    };
-    let (_, Json(stored)) = set_realm_federation(
+    let (stored_headers, Json(stored)) = set_realm_federation(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Json(body),
+        first_setup(),
+        Json(federation_body("Realm")),
     )
     .await
     .unwrap();
-    let Json(loaded) = read(Some(auth)).await.unwrap();
+    let (headers, Json(loaded)) = read(Some(auth)).await.unwrap();
     assert_eq!(loaded, stored);
+    assert_eq!(headers[header::ETAG], stored_headers[header::ETAG]);
 
     // Only a realm config admin reads the settings.
     let stranger = admin_auth(realm_id, UserId::local(Ulid::generate(), realm_id));
@@ -1236,6 +1249,50 @@ async fn federation_admin_reads() {
         Err(ServerError::Forbidden)
     ));
     assert!(matches!(read(None).await, Err(ServerError::Unauthorized)));
+}
+
+#[tokio::test]
+async fn federation_preconditions() {
+    // A change names the settings it read; a stale or missing precondition changes nothing.
+    let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+    let auth = admin_auth(realm_id, admin);
+    let put = |headers: HeaderMap, name: &str| {
+        set_realm_federation(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            headers,
+            Json(federation_body(name)),
+        )
+    };
+    let refused = |result: Result<_, ServerError>| match result {
+        Err(ServerError::Refused(status, code, _)) => (status, code),
+        other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+    };
+    let if_match = |headers: &HeaderMap| {
+        HeaderMap::from_iter([(header::IF_MATCH, headers[header::ETAG].clone())])
+    };
+
+    assert_eq!(
+        refused(put(HeaderMap::new(), "Realm").await).0,
+        StatusCode::PRECONDITION_REQUIRED
+    );
+    let (first, _) = put(first_setup(), "Realm").await.unwrap();
+    assert_eq!(
+        refused(put(first_setup(), "Other").await),
+        (StatusCode::PRECONDITION_FAILED, "settings_changed")
+    );
+    let (second, Json(stored)) = put(if_match(&first), "Second").await.unwrap();
+    assert_ne!(second[header::ETAG], first[header::ETAG]);
+    assert_eq!(
+        refused(put(if_match(&first), "Stale").await),
+        (StatusCode::PRECONDITION_FAILED, "settings_changed")
+    );
+    let (headers, Json(loaded)) =
+        get_realm_federation(State(state.clone()), Extension(Some(auth.clone())))
+            .await
+            .unwrap();
+    assert_eq!(loaded, stored);
+    assert_eq!(headers[header::ETAG], second[header::ETAG]);
 }
 
 /// Anonymous callers keep what they need to authenticate; realm topology,

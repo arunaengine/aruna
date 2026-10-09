@@ -49,6 +49,8 @@ pub struct SetFederationConfig {
     pub registry_url: Option<Url>,
     pub registration: RegistrationMode,
     pub accepted_realms: AcceptedRealms,
+    /// Digest of the settings the caller read; `None` requires that none are stored.
+    pub expected: Option<String>,
     /// Unix seconds; the descriptor's `issued_at` never goes below the stored one.
     pub now: u64,
 }
@@ -101,6 +103,8 @@ pub enum SetFederationError {
     NotManagementNode,
     #[error("invalid federation settings: {reason}")]
     InvalidSettings { reason: String },
+    #[error("the federation settings changed since they were read")]
+    SettingsChanged,
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("operation did not finish")]
@@ -169,6 +173,17 @@ impl SetFederationOperation {
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
         if !is_management(&document, self.config.actor.node_id) {
             return Err(SetFederationError::NotManagementNode);
+        }
+        let current = document
+            .federation
+            .as_ref()
+            .map(FederationSettings::digest)
+            .transpose()
+            .map_err(|error| SetFederationError::InvalidSettings {
+                reason: error.to_string(),
+            })?;
+        if current != self.config.expected {
+            return Err(SetFederationError::SettingsChanged);
         }
 
         let target = self.admin_target();
@@ -561,6 +576,7 @@ mod tests {
             registry_url: None,
             registration: RegistrationMode::Enabled,
             accepted_realms: AcceptedRealms::None,
+            expected: None,
             now: 100,
         }
     }
@@ -626,7 +642,7 @@ mod tests {
         let actor = actor();
         seed(&ctx, &actor, RealmNodeKind::Management, true).await;
 
-        let config = request(&actor, "https://api.example.org");
+        let mut config = request(&actor, "https://api.example.org");
         drive(SetFederationOperation::new(config.clone()), &ctx)
             .await
             .expect("settings store");
@@ -634,6 +650,7 @@ mod tests {
         assert_eq!(first.descriptor.verify(&actor.realm_id), Ok(()));
         assert_eq!(first.descriptor.payload.issued_at, 100);
 
+        config.expected = Some(first.digest().unwrap());
         drive(SetFederationOperation::new(config), &ctx)
             .await
             .expect("settings store again");
@@ -676,6 +693,38 @@ mod tests {
         document.federation = Some(stored);
         let signed = operation.signed_settings(&document, &state).unwrap();
         assert_eq!(signed.descriptor.payload.issued_at, 501);
+    }
+
+    #[tokio::test]
+    async fn refuses_changed_settings() {
+        // A write based on an older read, or a first setup over stored settings, changes nothing.
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        let actor = actor();
+        seed(&ctx, &actor, RealmNodeKind::Management, true).await;
+        let mut config = request(&actor, "https://api.example.org");
+        drive(SetFederationOperation::new(config.clone()), &ctx)
+            .await
+            .expect("first setup stores");
+        let first = stored(&ctx, &actor).await.expect("settings stored");
+
+        let error = drive(SetFederationOperation::new(config.clone()), &ctx)
+            .await
+            .expect_err("a second first setup is refused");
+        assert_eq!(error, SetFederationError::SettingsChanged);
+
+        config.expected = Some(first.digest().unwrap());
+        drive(SetFederationOperation::new(config.clone()), &ctx)
+            .await
+            .expect("a write on the current settings stores");
+        let second = stored(&ctx, &actor).await.expect("settings stored");
+
+        config.api_url = Url::parse("https://other.example.org").unwrap();
+        let error = drive(SetFederationOperation::new(config), &ctx)
+            .await
+            .expect_err("a write on older settings is refused");
+        assert_eq!(error, SetFederationError::SettingsChanged);
+        assert_eq!(stored(&ctx, &actor).await, Some(second));
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@
 
 use crate::auth::{ensure_permission, require_realm_auth};
 use crate::error::{ServerError, ServerResult};
+use crate::routes::git::expected;
 use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMode};
@@ -17,7 +18,7 @@ use aruna_operations::realm::set_federation::{
     SetFederationConfig, SetFederationError, SetFederationOperation,
 };
 use axum::extract::State;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
@@ -108,6 +109,45 @@ fn parse_url(value: &str) -> ServerResult<Url> {
     Url::parse(value).map_err(|error| ServerError::BadRequestReason(format!("{value}: {error}")))
 }
 
+fn config_missing() -> ServerError {
+    ServerError::Refused(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "realm_config_missing",
+        "this node holds no configuration document for its realm".to_string(),
+    )
+}
+
+/// The settings with their digest as a quoted `ETag`, the version a later change names.
+fn settings_response(
+    settings: &FederationSettings,
+) -> ServerResult<(HeaderMap, Json<RealmFederation>)> {
+    let digest = settings
+        .digest()
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let etag = HeaderValue::from_str(&format!("\"{digest}\""))
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    Ok((
+        HeaderMap::from_iter([(header::ETAG, etag)]),
+        Json(RealmFederation::from_settings(settings)?),
+    ))
+}
+
+/// The settings digest a change expects: `If-Match` names one, `If-None-Match: *` none.
+fn expected_settings(headers: &HeaderMap) -> ServerResult<Option<String>> {
+    if let Some(digest) = expected(headers) {
+        return Ok(Some(digest));
+    }
+    match headers.get(header::IF_NONE_MATCH) {
+        Some(value) if value.as_bytes().trim_ascii() == b"*" => Ok(None),
+        _ => Err(ServerError::Refused(
+            StatusCode::PRECONDITION_REQUIRED,
+            "precondition_required",
+            "send If-Match with the settings ETag, or If-None-Match: * for a first setup"
+                .to_string(),
+        )),
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/system/realm/federation",
@@ -119,9 +159,14 @@ fn parse_url(value: &str) -> ServerResult<Url> {
 
 **Behavior**
 - The body has the form the PUT route takes and returns. Load it before a change, so a save
-  keeps the settings the change does not touch."#,
+  keeps the settings the change does not touch.
+- The `ETag` header holds the quoted digest of the stored settings. A change sends it back as
+  `If-Match`.
+- A realm without federation settings answers 404 with code `federation_unset`; the first setup
+  then sends `If-None-Match: *`."#,
     responses(
         (status = 200, description = "The stored settings with the signed descriptor", body = RealmFederation,
+            headers(("ETag" = String, description = "Quoted digest of the stored settings")),
             example = json!({
                 "name": "Example realm",
                 "api_url": "https://api.example.org/api/v1",
@@ -144,14 +189,15 @@ fn parse_url(value: &str) -> ServerResult<Url> {
             })),
         (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
-        (status = 404, description = "The realm has no federation settings, or this node holds no configuration document for its realm", body = crate::error::ErrorResponse)
+        (status = 404, description = "The realm has no federation settings; code `federation_unset`", body = crate::error::ErrorResponse),
+        (status = 503, description = "This node holds no configuration document for its realm; code `realm_config_missing`", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_realm_federation(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-) -> ServerResult<Json<RealmFederation>> {
+) -> ServerResult<(HeaderMap, Json<RealmFederation>)> {
     let auth = require_realm_auth(&state, auth)?;
     ensure_permission(
         &state,
@@ -166,11 +212,17 @@ pub async fn get_realm_federation(
     )
     .await
     .map_err(|error| match error {
-        GetConfigError::DocumentNotFound => ServerError::NotFound,
+        GetConfigError::DocumentNotFound => config_missing(),
         error => ServerError::InternalError(error.to_string()),
     })?;
-    let settings = config.federation.ok_or(ServerError::NotFound)?;
-    Ok(Json(RealmFederation::from_settings(&settings)?))
+    let settings = config.federation.ok_or_else(|| {
+        ServerError::Refused(
+            StatusCode::NOT_FOUND,
+            "federation_unset",
+            "the realm has no federation settings".to_string(),
+        )
+    })?;
+    settings_response(&settings)
 }
 
 #[utoipa::path(
@@ -189,6 +241,12 @@ management node serves the call and signs the descriptor; every other node relay
 - `registry_url` is optional; without it the realm sends nothing to a registry.
 - `registration` acts only when a registry URL is set.
 - `accepted_realms` defaults to `none`. `any` must be chosen explicitly.
+- The call needs one precondition. `If-Match` names the `ETag` of the settings the change is
+  based on. `If-None-Match: *` is for the first setup, when the realm has no settings yet.
+- The precondition is checked in the same transaction as the write. Settings changed since they
+  were read, or already set up, answer 412 with code `settings_changed`; reload and apply the
+  change again. A call without a precondition answers 428.
+- The response carries the `ETag` of the new settings.
 
 **Limits**
 - URLs must use HTTPS; plain HTTP is accepted only for loopback hosts.
@@ -205,8 +263,13 @@ management node serves the call and signs the descriptor; every other node relay
             "accepted_realms": {"mode": "only", "realms": ["AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"]}
         })
     ),
+    params(
+        ("If-Match" = Option<String>, Header, description = "Quoted `ETag` of the settings the change is based on"),
+        ("If-None-Match" = Option<String>, Header, description = "`*` for the first setup, when the realm has no settings yet")
+    ),
     responses(
         (status = 200, description = "The stored settings with the signed descriptor", body = RealmFederation,
+            headers(("ETag" = String, description = "Quoted digest of the new settings")),
             example = json!({
                 "name": "Example realm",
                 "api_url": "https://api.example.org/api/v1",
@@ -230,18 +293,20 @@ management node serves the call and signs the descriptor; every other node relay
         (status = 400, description = "A malformed or non-HTTPS URL, an empty or too long name, a malformed realm id or too many accepted realms", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
-        (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = crate::error::ErrorResponse),
+        (status = 412, description = "The settings changed since they were read, or are already set up; code `settings_changed`", body = crate::error::ErrorResponse),
+        (status = 428, description = "Neither `If-Match` nor `If-None-Match: *` was sent", body = crate::error::ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable; code `no_management_node`", body = crate::error::ErrorResponse)
+        (status = 503, description = "This node holds no configuration document for its realm (code `realm_config_missing`), storage cleanup capacity is exhausted, or no management node was reachable (code `no_management_node`)", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn set_realm_federation(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    headers: HeaderMap,
     Json(request): Json<RealmFederation>,
-) -> ServerResult<(StatusCode, Json<RealmFederation>)> {
+) -> ServerResult<(HeaderMap, Json<RealmFederation>)> {
     let auth = require_realm_auth(&state, auth)?;
     ensure_permission(
         &state,
@@ -250,6 +315,7 @@ pub async fn set_realm_federation(
         Permission::WRITE,
     )
     .await?;
+    let expected = expected_settings(&headers)?;
     let accepted_realms = match request.accepted_realms {
         AcceptedRealmsSetting::None => AcceptedRealms::None,
         AcceptedRealmsSetting::Any => AcceptedRealms::Any,
@@ -280,6 +346,7 @@ pub async fn set_realm_federation(
             RegistrationSetting::Disabled => RegistrationMode::Disabled,
         },
         accepted_realms,
+        expected,
         now: unix_timestamp_secs(),
     };
     let stored = drive(SetFederationOperation::new(config), &state.get_ctx())
@@ -289,15 +356,17 @@ pub async fn set_realm_federation(
         .federation
         .as_ref()
         .ok_or_else(|| ServerError::InternalError("federation settings missing".to_string()))?;
-    Ok((
-        StatusCode::OK,
-        Json(RealmFederation::from_settings(settings)?),
-    ))
+    settings_response(settings)
 }
 
 fn map_federation_error(error: SetFederationError) -> ServerError {
     match error {
-        SetFederationError::ConfigMissing => ServerError::NotFound,
+        SetFederationError::ConfigMissing => config_missing(),
+        SetFederationError::SettingsChanged => ServerError::Refused(
+            StatusCode::PRECONDITION_FAILED,
+            "settings_changed",
+            "the federation settings changed since they were read; reload them".to_string(),
+        ),
         SetFederationError::Unauthorized | SetFederationError::NotManagementNode => {
             ServerError::Forbidden
         }

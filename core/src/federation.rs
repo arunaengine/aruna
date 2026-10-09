@@ -236,6 +236,11 @@ pub struct FederationSettings {
 }
 
 impl FederationSettings {
+    /// Hex SHA-256 over the postcard encoding, so equal settings have equal digests.
+    pub fn digest(&self) -> Result<String, FederationError> {
+        crate::transfer::digest_of(self)
+    }
+
     /// Checks bounds, URL rules and that the descriptor is signed for these values.
     pub fn validate(&self, realm_id: &RealmId) -> Result<(), FederationError> {
         if self.name.trim().is_empty() || self.name.chars().count() > MAX_NAME_LEN {

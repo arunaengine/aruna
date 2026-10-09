@@ -105,7 +105,7 @@ pub enum TransferError {
     TooLarge,
 }
 
-fn digest_of<T: Serialize>(value: &T) -> Result<String, FederationError> {
+pub(crate) fn digest_of<T: Serialize>(value: &T) -> Result<String, FederationError> {
     let bytes = postcard::to_allocvec(value)
         .map_err(|error| FederationError::Encoding(error.to_string()))?;
     Ok(hex::encode(Sha256::digest(bytes)))
