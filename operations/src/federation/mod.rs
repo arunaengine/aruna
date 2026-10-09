@@ -4,6 +4,7 @@
 
 pub mod export;
 pub mod import;
+pub mod link;
 pub mod login;
 pub mod publish;
 pub mod records;
