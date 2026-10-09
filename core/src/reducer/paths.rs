@@ -59,6 +59,8 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         | AdminDocumentOperation::SubjectIdRemoved { subject_id } => {
             vec![user_subject_path(subject_id)]
         }
+        AdminDocumentOperation::UserAliasAdded { alias }
+        | AdminDocumentOperation::UserAliasRemoved { alias } => vec![user_alias_path(alias)],
         AdminDocumentOperation::RealmRoleAdded { role_id }
         | AdminDocumentOperation::RealmRoleCreated {
             role: AdminRoleDefinition { role_id, .. },
@@ -222,6 +224,12 @@ pub fn user_attribute_path(key: &str) -> String {
 
 pub fn user_subject_path(subject_id: &str) -> String {
     format!("user.subject_ids.{subject_id}")
+}
+
+pub const USER_ALIAS_PREFIX: &str = "user.aliases.";
+
+pub fn user_alias_path(alias: &UserId) -> String {
+    format!("{USER_ALIAS_PREFIX}{alias}")
 }
 
 pub fn group_role_path(role_id: &RoleId) -> String {

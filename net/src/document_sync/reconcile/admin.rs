@@ -5,7 +5,8 @@
 use super::*;
 use aruna_core::admin_documents::roles_narrowed;
 use aruna_core::keyspaces::{
-    BUCKET_ENCRYPTION_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, FEDERATION_KEYSPACE, GROUP_DELETE_KEYSPACE,
+    GROUP_ENCRYPTED_KEYSPACE,
 };
 use aruna_core::storage_entries::group_deletion_entries;
 use aruna_core::structs::identity::group_delete::{GroupDeleteRecord, MembershipFence};
@@ -140,6 +141,8 @@ pub(in crate::document_sync) async fn apply_user_operation(
             | AdminDocumentOperation::SubjectIdRemoved { .. }
             | AdminDocumentOperation::UserAttributeSet { .. }
             | AdminDocumentOperation::UserAttributeRemoved { .. }
+            | AdminDocumentOperation::UserAliasAdded { .. }
+            | AdminDocumentOperation::UserAliasRemoved { .. }
     ) {
         return Err(NetError::Bootstrap(
             "admin document operation sync only supports user name, subject, and attribute updates"
@@ -149,6 +152,11 @@ pub(in crate::document_sync) async fn apply_user_operation(
     let changed_subject_id = match &event.op {
         AdminDocumentOperation::SubjectIdAdded { subject_id }
         | AdminDocumentOperation::SubjectIdRemoved { subject_id } => Some(subject_id.clone()),
+        _ => None,
+    };
+    let changed_alias = match &event.op {
+        AdminDocumentOperation::UserAliasAdded { alias }
+        | AdminDocumentOperation::UserAliasRemoved { alias } => Some(*alias),
         _ => None,
     };
 
@@ -202,9 +210,11 @@ pub(in crate::document_sync) async fn apply_user_operation(
     );
 
     let deletes = stale_conflict_deletes(previous_state.as_ref(), Some(&reducer_state));
-    let subject_ids = changed_subject_id
-        .map(|subject_id| vec![subject_id])
-        .unwrap_or_else(|| user.subject_ids.clone());
+    let subject_ids = match (&changed_subject_id, changed_alias) {
+        (Some(subject_id), _) => vec![subject_id.clone()],
+        (None, Some(_)) => Vec::new(),
+        (None, None) => user.subject_ids.clone(),
+    };
 
     // A transient SSI conflict must never wedge the topic: retry with yields,
     // bounded as a livelock safety valve.
@@ -272,6 +282,34 @@ pub(in crate::document_sync) async fn apply_user_operation(
             } else {
                 attempt_deletes.push((SUBJECT_CLAIMS_KEYSPACE.to_string(), subject_key.clone()));
                 attempt_deletes.push((SUBJECT_INDEX_KEYSPACE.to_string(), subject_key));
+            }
+        }
+        // Claims of the linked login; more than one claim leaves it unusable until resolved.
+        if let Some(alias) = changed_alias {
+            let key = ByteView::from(aruna_core::link::alias_claims_key(&alias));
+            let mut claims = match transaction_read(
+                storage,
+                FEDERATION_KEYSPACE.to_string(),
+                key.clone(),
+                Some(txn_id),
+            )
+            .await?
+            {
+                Some(bytes) => postcard::from_bytes::<BTreeSet<UserId>>(&bytes)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+                None => BTreeSet::new(),
+            };
+            if user.alias_user_ids.contains(&alias) {
+                claims.insert(user_id);
+            } else {
+                claims.remove(&user_id);
+            }
+            if claims.is_empty() {
+                attempt_deletes.push((FEDERATION_KEYSPACE.to_string(), key));
+            } else {
+                let value = postcard::to_allocvec(&claims)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                attempt_writes.push((FEDERATION_KEYSPACE.to_string(), key, value.into()));
             }
         }
         match replace_batch_in(storage, txn_id, attempt_deletes, attempt_writes).await {
@@ -1202,6 +1240,14 @@ pub(in crate::document_sync) fn materialize_user_operation(
                 && !user.subject_ids.contains(&materialized_subject_id)
             {
                 user.subject_ids.push(materialized_subject_id);
+            }
+        }
+        AdminDocumentOperation::UserAliasAdded { alias }
+        | AdminDocumentOperation::UserAliasRemoved { alias } => {
+            if reducer_state.materialized_alias(alias) {
+                user.alias_user_ids.insert(*alias);
+            } else {
+                user.alias_user_ids.remove(alias);
             }
         }
         AdminDocumentOperation::UserAttributeSet { key, .. }
