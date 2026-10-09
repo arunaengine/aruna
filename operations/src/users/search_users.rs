@@ -20,6 +20,8 @@ pub struct SearchUsersInput {
     pub query: String,
     pub limit: usize,
     pub start_after: Option<String>,
+    /// Matches only active, non-service accounts whose public name is the whole query.
+    pub exact_name: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -150,7 +152,12 @@ impl SearchUsersOperation {
             }
 
             let user = User::from_bytes(&value)?;
-            if user.user_id.realm_id != self.input.realm_id || !user.public_matches(&query) {
+            let matched = if self.input.exact_name {
+                user.public_name_is(&query)
+            } else {
+                user.public_matches(&query)
+            };
+            if user.user_id.realm_id != self.input.realm_id || !matched {
                 continue;
             }
 
@@ -279,6 +286,7 @@ mod pure_tests {
             query: query.to_string(),
             limit,
             start_after: None,
+            exact_name: false,
         }
     }
 
