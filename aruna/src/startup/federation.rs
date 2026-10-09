@@ -8,7 +8,9 @@ use std::time::Duration;
 use aruna_api::portal::api_base_url;
 use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
-use aruna_core::federation::{AcceptedRealms, MAX_NAME_LEN, RegistrationMode};
+use aruna_core::federation::{
+    AcceptedRealms, MAX_NAME_LEN, RegistrationMode, valid_federation_url,
+};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::driver::{DriverContext, drive};
@@ -33,6 +35,8 @@ enum Skip {
     RegistryOff,
     #[error("{0} is not set")]
     MissingUrl(&'static str),
+    #[error("{0} must use HTTPS")]
+    NotHttps(&'static str),
     #[error("{0} is not a public address")]
     PrivateUrl(&'static str),
 }
@@ -134,6 +138,9 @@ async fn public_url(
     let url = value
         .and_then(|value| Url::parse(value).ok())
         .ok_or(Skip::MissingUrl(key))?;
+    if !valid_federation_url(&url) {
+        return Err(Skip::NotHttps(key));
+    }
     match is_public(&url, policy).await {
         true => Ok(url),
         false => Err(Skip::PrivateUrl(key)),
@@ -271,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn skips_each_reason() {
-        // No registry, a missing URL, or a URL the node's egress rules refuse never registers.
+        // No registry, a missing URL, a public HTTP URL, or a URL the egress rules refuse never registers.
         let registry = Url::parse(REGISTRY).unwrap();
         let strict = EgressPolicy::strict();
         let denied = EgressPolicy::strict().with_deny(vec!["30.255.255.0/29".parse().unwrap()]);
@@ -297,6 +304,13 @@ mod tests {
                 Some(PORTAL),
                 &strict,
                 Skip::PrivateUrl("API_PUBLIC_URL"),
+            ),
+            (
+                Some(&registry),
+                Some("http://30.255.255.1:3000"),
+                Some(PORTAL),
+                &strict,
+                Skip::NotHttps("API_PUBLIC_URL"),
             ),
             (
                 Some(&registry),
