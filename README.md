@@ -163,6 +163,26 @@ encrypted.
   encryption gets copies of an encrypted bucket only when the request sets `plaintext: true` and
   the requester holds the key of the source bucket.
 
+## Realm Registry
+
+By default, a realm lists itself in the global registry at `https://registry.aruna-engine.org`,
+so the portals of other realms can find it.
+
+- **What it sends.** A registration signed with the realm key, renewed every 6 hours. It holds
+  the realm's public facts (realm id, name, description, public API and portal URL) and three
+  counts: live datasets, groups and configured nodes. It holds no users, data or metadata.
+- **How it starts.** When the realm has no federation settings, one management node creates them
+  on start: the name from `REALM_DESCRIPTION`, the URLs from `API_PUBLIC_URL` and
+  `PORTAL_PUBLIC_URL`, the default registry and registration turned on. Existing settings are
+  never changed.
+- **Only public realms.** No settings are created when one of the two URLs is missing or points
+  to a loopback or private address. Local tools (`just preview`, `just local-cluster`, Compose)
+  never register.
+- **Opting out.** Before the first start, set `FEDERATION_REGISTRY_URL` to another registry, or to
+  an empty value to turn the default off. Once the settings exist, a realm admin changes them with
+  `PUT /api/v1/system/realm/federation`. Turning registration off sends up to three withdrawals;
+  removing the registry sends nothing more, and the entry expires after 72 hours.
+
 ## Avoiding Common Pitfalls
 
 Most problems with a new node come from a few settings. These tips help you avoid them.
