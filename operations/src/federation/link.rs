@@ -10,9 +10,10 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::federation::{FederationError, Signed};
+use aruna_core::handoff::{HandoffError, LoginHandoff, check_handoff};
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::link::{
-    LinkAction, LinkConfirmation, LinkError, MAX_LINK_SECS, check_confirmation,
+    LinkAction, LinkConfirmation, LinkError, MAX_LINK_SECS, check_confirmation, link_secret,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{
@@ -52,6 +53,8 @@ pub enum LinkLoginError {
     #[error(transparent)]
     Confirmation(#[from] LinkError),
     #[error(transparent)]
+    Handoff(#[from] HandoffError),
+    #[error(transparent)]
     Sign(#[from] FederationError),
     #[error(transparent)]
     Storage(#[from] StorageError),
@@ -81,14 +84,15 @@ fn config_read(auth: &AuthContext) -> (String, ByteView) {
     (target.storage_keyspace().to_string(), target.storage_key())
 }
 
-/// An unrestricted portal session of a local account, issued at most `MAX_LINK_SECS` ago.
-fn fresh_local(auth: &AuthContext, issued_at: u64, now: u64) -> bool {
+/// An unrestricted portal session of a local account whose primary login was at most
+/// `MAX_LINK_SECS` ago; renewals keep that time and child sessions have none.
+fn fresh_local(auth: &AuthContext, auth_time: Option<u64>, now: u64) -> bool {
     let portal = auth.session.as_ref().map(|session| session.kind) == Some(SessionKind::Portal);
     portal
         && auth.path_restrictions.is_none()
         && auth.user_id.realm_id == auth.realm_id
         && !auth.user_id.is_nil()
-        && issued_at.saturating_add(MAX_LINK_SECS) >= now
+        && auth_time.is_some_and(|login| login.saturating_add(MAX_LINK_SECS) >= now)
 }
 
 /// An active account that is not a service account.
@@ -132,10 +136,12 @@ fn batch_values(event: Event) -> Result<Vec<Option<ByteView>>, LinkLoginError> {
 pub struct ConfirmLinkConfig {
     /// The caller's local portal login.
     pub auth_context: AuthContext,
-    pub local_issued_at: u64,
-    /// The verified federated login this realm issued for the other realm's user.
-    pub foreign: AuthContext,
-    pub foreign_issued_at: u64,
+    /// Primary login time from the caller's token claims.
+    pub auth_time: Option<u64>,
+    /// A login handoff of the other realm made for this link attempt.
+    pub handoff: Signed<LoginHandoff>,
+    /// The browser secret whose `link_secret` with the caller's session the nonce hashes.
+    pub secret: Vec<u8>,
     pub node_capabilities: NodeCapabilities,
     pub now: u64,
 }
@@ -155,37 +161,31 @@ impl ConfirmLinkOperation {
         }
     }
 
-    fn foreign_user(&self) -> Option<UserId> {
-        let (foreign, local) = (&self.config.foreign, &self.config.auth_context);
-        let session = foreign.session.as_ref()?;
-        let fresh = self.config.foreign_issued_at.saturating_add(MAX_LINK_SECS) >= self.config.now;
-        (session.kind == SessionKind::Federated
-            && session.via.is_none()
-            && foreign.realm_id == local.realm_id
-            && foreign.user_id.realm_id != local.realm_id
-            && !foreign.user_id.is_nil()
-            && foreign.path_restrictions.is_none()
-            && fresh)
-            .then_some(foreign.user_id)
-    }
-
     fn sign(&self, event: Event) -> Result<Signed<LinkConfirmation>, LinkLoginError> {
         let values = batch_values(event)?;
-        let [user, config] = values.as_slice() else {
+        let [user, realm] = values.as_slice() else {
             return Err(LinkLoginError::NotFinished);
         };
         usable_account(user.as_ref())?;
-        let foreign = self.foreign_user().ok_or(LinkLoginError::ForeignRefused)?;
-        if !admitted(&read_config(config.as_ref())?, &foreign) {
-            return Err(LinkLoginError::ForeignRefused);
-        }
+        let settings = read_config(realm.as_ref())?
+            .federation
+            .ok_or(LinkLoginError::ForeignRefused)?;
         let config = &self.config;
+        let sid = config
+            .auth_context
+            .session
+            .as_ref()
+            .map(|session| session.sid.as_str());
+        let secret = link_secret(sid.unwrap_or_default(), &config.secret);
+        let realm_id = config.auth_context.realm_id;
+        check_handoff(&config.handoff, &realm_id, &settings, &secret, config.now)?;
+        let handoff = &config.handoff.payload;
         let confirmation = LinkConfirmation {
-            realm_id: config.auth_context.realm_id,
+            realm_id,
             action: LinkAction::Link,
             local_user: config.auth_context.user_id,
-            foreign_user: foreign,
-            foreign_issued_at: config.foreign_issued_at,
+            foreign_user: handoff.user,
+            foreign_issued_at: handoff.issued_at,
             issued_at: config.now,
             expires_at: config.now.saturating_add(MAX_LINK_SECS),
             confirmation_id: Ulid::generate(),
@@ -200,12 +200,8 @@ impl Operation for ConfirmLinkOperation {
 
     fn start(&mut self) -> Effects {
         let config = &self.config;
-        if !fresh_local(&config.auth_context, config.local_issued_at, config.now) {
+        if !fresh_local(&config.auth_context, config.auth_time, config.now) {
             self.output = Some(Err(LinkLoginError::LocalRefused));
-            return smallvec![];
-        }
-        if self.foreign_user().is_none() {
-            self.output = Some(Err(LinkLoginError::ForeignRefused));
             return smallvec![];
         }
         let auth = &config.auth_context;
@@ -279,7 +275,8 @@ impl AliasUpdate {
 pub struct LinkLoginConfig {
     pub actor: Actor,
     pub auth_context: AuthContext,
-    pub local_issued_at: u64,
+    /// Primary login time from the caller's token claims.
+    pub auth_time: Option<u64>,
     pub confirmation: Signed<LinkConfirmation>,
     pub now: u64,
 }
@@ -355,7 +352,7 @@ impl Operation for LinkLoginOperation {
     fn start(&mut self) -> Effects {
         let config = &self.config;
         let auth = &config.auth_context;
-        if !fresh_local(auth, config.local_issued_at, config.now) {
+        if !fresh_local(auth, config.auth_time, config.now) {
             return self.finish(Err(LinkLoginError::LocalRefused));
         }
         let checked = check_confirmation(
@@ -614,6 +611,7 @@ mod tests {
     use aruna_core::federation::{
         AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode,
     };
+    use aruna_core::handoff::secret_nonce;
     use aruna_core::structs::identity::auth::SessionRef;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::time::unix_timestamp_secs;
@@ -637,8 +635,46 @@ mod tests {
         UserId::local(Ulid::from_bytes([seed; 16]), realm())
     }
 
+    const SECRET: &[u8] = b"link attempt secret";
+
+    fn home_key() -> SigningKey {
+        SigningKey::from_bytes(&[22; 32])
+    }
+
     fn foreign() -> UserId {
-        UserId::new(Ulid::from_bytes([1; 16]), RealmId::from_bytes([22; 32]))
+        let home = RealmId::from_bytes(home_key().verifying_key().to_bytes());
+        UserId::new(Ulid::from_bytes([1; 16]), home)
+    }
+
+    fn sid() -> String {
+        Ulid::from_bytes([9; 16]).to_string()
+    }
+
+    fn descriptor() -> Signed<RealmDescriptor> {
+        let descriptor = RealmDescriptor {
+            realm_id: realm(),
+            name: "B".to_string(),
+            description: String::new(),
+            api_url: Url::parse("https://b.example.org/api/v1").unwrap(),
+            portal_url: Url::parse("https://b.example.org/").unwrap(),
+            issued_at: 1,
+        };
+        Signed::sign(descriptor, &capabilities()).unwrap()
+    }
+
+    /// A handoff of the home realm whose nonce hashes `secret`.
+    fn handoff(secret: &[u8], now: u64) -> Signed<LoginHandoff> {
+        let nonce = secret_nonce(secret);
+        let payload = LoginHandoff::new(
+            foreign().realm_id,
+            foreign(),
+            &descriptor(),
+            nonce,
+            None,
+            now,
+        );
+        let home = NodeCapabilities::management_node(home_key()).unwrap();
+        Signed::sign(payload.unwrap(), &home).unwrap()
     }
 
     fn session(user_id: UserId, kind: SessionKind) -> AuthContext {
@@ -647,7 +683,7 @@ mod tests {
             realm_id: realm(),
             path_restrictions: None,
             session: Some(SessionRef {
-                sid: Ulid::from_bytes([9; 16]).to_string(),
+                sid: sid(),
                 kind,
                 name: None,
                 via: None,
@@ -696,23 +732,16 @@ mod tests {
             let bytes = user.to_bytes(&actor(local(seed))).unwrap();
             put(&context, USER_KEYSPACE, local(seed).to_bytes(), bytes).await;
         }
-        let descriptor = RealmDescriptor {
-            realm_id: realm(),
-            name: "B".to_string(),
-            description: String::new(),
-            api_url: Url::parse("https://b.example.org/api/v1").unwrap(),
-            portal_url: Url::parse("https://b.example.org/").unwrap(),
-            issued_at: 1,
-        };
+        let descriptor = descriptor();
         let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
         config.federation = Some(FederationSettings {
             name: "B".to_string(),
-            api_url: descriptor.api_url.clone(),
-            portal_url: descriptor.portal_url.clone(),
+            api_url: descriptor.payload.api_url.clone(),
+            portal_url: descriptor.payload.portal_url.clone(),
             registry_url: None,
             registration: RegistrationMode::Enabled,
             accepted_realms: AcceptedRealms::Any,
-            descriptor: Signed::sign(descriptor, &capabilities()).unwrap(),
+            descriptor,
         });
         let target = DocumentTarget::RealmConfig { realm_id: realm() };
         let bytes = config.to_bytes(&actor(local(2))).unwrap();
@@ -726,15 +755,12 @@ mod tests {
         (dir, context)
     }
 
-    fn confirm(user: UserId, local_issued_at: u64, now: u64) -> ConfirmLinkOperation {
+    fn confirm(user: UserId, auth_time: Option<u64>, now: u64) -> ConfirmLinkOperation {
         ConfirmLinkOperation::new(ConfirmLinkConfig {
             auth_context: session(user, SessionKind::Portal),
-            local_issued_at,
-            foreign: AuthContext {
-                user_id: foreign(),
-                ..session(foreign(), SessionKind::Federated)
-            },
-            foreign_issued_at: now,
+            auth_time,
+            handoff: handoff(&link_secret(&sid(), SECRET), now),
+            secret: SECRET.to_vec(),
             node_capabilities: capabilities(),
             now,
         })
@@ -744,7 +770,7 @@ mod tests {
         LinkLoginOperation::new(LinkLoginConfig {
             actor: actor(user),
             auth_context: session(user, SessionKind::Portal),
-            local_issued_at: now,
+            auth_time: Some(now),
             confirmation,
             now,
         })
@@ -752,25 +778,55 @@ mod tests {
 
     #[test]
     fn stale_logins_refused() {
-        // Old, child-kind or linked logins never get a confirmation; nothing is read.
+        // An old primary login, a child token without one, or another kind never confirms.
         let now = 10_000;
-        let mut old = confirm(local(2), now - MAX_LINK_SECS - 1, now);
-        assert!(old.start().is_empty());
-        assert_eq!(old.finalize(), Err(LinkLoginError::LocalRefused));
-        let mut api = confirm(local(2), now, now);
+        for auth_time in [Some(now - MAX_LINK_SECS - 1), None] {
+            let mut stale = confirm(local(2), auth_time, now);
+            assert!(stale.start().is_empty());
+            assert_eq!(stale.finalize(), Err(LinkLoginError::LocalRefused));
+            let mut linking = link(local(2), confirmation(now), now);
+            linking.config.auth_time = auth_time;
+            assert!(linking.start().is_empty());
+            assert_eq!(linking.finalize(), Err(LinkLoginError::LocalRefused));
+        }
+        let mut api = confirm(local(2), Some(now), now);
         api.config.auth_context = session(local(2), SessionKind::Api);
         assert!(api.start().is_empty());
         assert_eq!(api.finalize(), Err(LinkLoginError::LocalRefused));
-        let mut chained = confirm(local(2), now, now);
-        if let Some(session) = chained.config.foreign.session.as_mut() {
-            session.via = Some(local(3));
+    }
+
+    fn confirmation(now: u64) -> Signed<LinkConfirmation> {
+        let payload = LinkConfirmation {
+            realm_id: realm(),
+            action: LinkAction::Link,
+            local_user: local(2),
+            foreign_user: foreign(),
+            foreign_issued_at: now,
+            issued_at: now,
+            expires_at: now + MAX_LINK_SECS,
+            confirmation_id: Ulid::from_bytes([8; 16]),
+        };
+        Signed::sign(payload, &capabilities()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn handoff_bound_attempt() {
+        // Only a fresh handoff bound to this session's attempt confirms the foreign side.
+        let (_dir, context) = context().await;
+        let now = unix_timestamp_secs();
+        let bound = drive(confirm(local(2), Some(now), now), &context).await;
+        assert_eq!(bound.unwrap().payload.foreign_user, foreign());
+        let other_sid = Ulid::from_bytes([10; 16]).to_string();
+        for secret in [SECRET.to_vec(), link_secret(&other_sid, SECRET)] {
+            let mut unbound = confirm(local(2), Some(now), now);
+            unbound.config.handoff = handoff(&secret, now);
+            let refused = drive(unbound, &context).await;
+            assert_eq!(refused, Err(HandoffError::WrongSecret.into()));
         }
-        assert!(chained.start().is_empty());
-        assert_eq!(chained.finalize(), Err(LinkLoginError::ForeignRefused));
-        let mut aged = confirm(local(2), now, now);
-        aged.config.foreign_issued_at = now - MAX_LINK_SECS - 1;
-        assert!(aged.start().is_empty());
-        assert_eq!(aged.finalize(), Err(LinkLoginError::ForeignRefused));
+        let mut aged = confirm(local(2), Some(now), now);
+        aged.config.handoff = handoff(&link_secret(&sid(), SECRET), now - MAX_LINK_SECS);
+        let refused = drive(aged, &context).await;
+        assert_eq!(refused, Err(HandoffError::BadLifetime.into()));
     }
 
     #[tokio::test]
@@ -778,7 +834,9 @@ mod tests {
         // The confirmed login links once; another account and another caller are refused.
         let (_dir, context) = context().await;
         let now = unix_timestamp_secs();
-        let confirmation = drive(confirm(local(2), now, now), &context).await.unwrap();
+        let confirmation = drive(confirm(local(2), Some(now), now), &context)
+            .await
+            .unwrap();
         // A confirmation is only good for the account it names.
         let stolen = drive(link(local(3), confirmation.clone(), now), &context).await;
         assert_eq!(
@@ -792,7 +850,9 @@ mod tests {
         // Replaying the confirmation while linked changes nothing.
         let replay = drive(link(local(2), confirmation, now), &context).await;
         assert!(replay.is_ok());
-        let other = drive(confirm(local(3), now, now), &context).await.unwrap();
+        let other = drive(confirm(local(3), Some(now), now), &context)
+            .await
+            .unwrap();
         let claimed = drive(link(local(3), other, now), &context).await;
         assert_eq!(
             claimed,
@@ -805,7 +865,9 @@ mod tests {
         // A cutoff of the foreign login after its session voids an unused or replayed confirmation.
         let (_dir, context) = context().await;
         let now = unix_timestamp_secs();
-        let confirmation = drive(confirm(local(2), now, now), &context).await.unwrap();
+        let confirmation = drive(confirm(local(2), Some(now), now), &context)
+            .await
+            .unwrap();
         let target = DocumentTarget::RealmConfig { realm_id: realm() };
         let mut config = RealmConfigDocument::from_bytes(
             &crate::jobs::key_wake::read_row(
@@ -841,7 +903,9 @@ mod tests {
         // Only the owner unlinks here; the cutoff lands first and voids older confirmations.
         let (_dir, context) = context().await;
         let now = unix_timestamp_secs();
-        let confirmation = drive(confirm(local(2), now, now), &context).await.unwrap();
+        let confirmation = drive(confirm(local(2), Some(now), now), &context)
+            .await
+            .unwrap();
         drive(link(local(2), confirmation.clone(), now), &context)
             .await
             .unwrap();

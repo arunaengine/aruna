@@ -318,6 +318,7 @@ impl Topology {
             delegation_signature: None,
             name: None,
             via: None,
+            auth_time: None,
         };
         let key_pem = self
             .signing_key

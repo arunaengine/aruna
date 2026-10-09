@@ -1958,6 +1958,7 @@ mod test {
             delegation_signature: None,
             name: None,
             via: None,
+            auth_time: None,
         };
         let der = issuer_key
             .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)

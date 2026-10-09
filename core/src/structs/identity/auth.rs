@@ -94,6 +94,9 @@ pub struct TokenClaims {
     /// The linked login of another realm a federated session of a local account came through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// Time of the primary login this token descends from; renewal keeps it, children lack it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_time: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +362,7 @@ mod tests {
             delegation_signature: None,
             name: None,
             via: None,
+            auth_time: None,
         })
         .unwrap();
 
@@ -385,6 +389,7 @@ mod tests {
             delegation_signature: None,
             name: None,
             via: None,
+            auth_time: None,
         })
         .unwrap();
 
@@ -406,6 +411,7 @@ mod tests {
             delegation_signature: None,
             name,
             via: None,
+            auth_time: None,
         }
     }
 

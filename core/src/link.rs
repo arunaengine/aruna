@@ -16,6 +16,7 @@ use crate::structs::identity::realm::RealmId;
 pub const LINK_DOMAIN: &str = "aruna-link-confirmation-v1";
 /// Longest lifetime of a confirmation, and the oldest login of either side it accepts.
 pub const MAX_LINK_SECS: u64 = 300;
+const LINK_ATTEMPT: &str = "aruna-link-attempt-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinkAction {
@@ -30,7 +31,7 @@ pub struct LinkConfirmation {
     pub action: LinkAction,
     pub local_user: UserId,
     pub foreign_user: UserId,
-    /// Issuance of the foreign login's session; a later cutoff of that login voids the link.
+    /// Issuance of the foreign login's handoff; a later cutoff of that login voids the link.
     pub foreign_issued_at: u64,
     pub issued_at: u64,
     pub expires_at: u64,
@@ -52,6 +53,12 @@ pub enum LinkError {
     Unbound,
     #[error("the confirmation lifetime is invalid or over")]
     BadLifetime,
+}
+
+/// What a link attempt's handoff nonce hashes: the browser secret bound to the caller's
+/// local session, so a handoff made for a plain login or another session cannot link.
+pub fn link_secret(sid: &str, secret: &[u8]) -> Vec<u8> {
+    [LINK_ATTEMPT.as_bytes(), &[0], sid.as_bytes(), &[0], secret].concat()
 }
 
 /// Key of the local accounts that claim `alias` in the federation keyspace.

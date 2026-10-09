@@ -5,9 +5,11 @@
 
 use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::federation_login::SECRET_LEN;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::federation::Signed;
+use aruna_core::handoff::LoginHandoff;
 use aruna_core::link::LinkConfirmation;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::user::User;
@@ -41,8 +43,11 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 pub struct LinkConfirmationRequest {
-    /// The token of the federated session this realm just issued for the other realm's login.
-    pub federated_token: String,
+    /// A login handoff of the other realm made for this link attempt.
+    #[schema(value_type = Object)]
+    pub handoff: Signed<LoginHandoff>,
+    /// Hex of the 32 byte browser secret of this attempt.
+    pub secret: String,
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
@@ -64,7 +69,7 @@ fn link_refused(error: LinkLoginError) -> ServerError {
         LinkLoginError::LocalRefused | LinkLoginError::ForeignRefused => {
             ServerError::Refused(StatusCode::FORBIDDEN, "link_refused", message)
         }
-        LinkLoginError::CutOff | LinkLoginError::Confirmation(_) => {
+        LinkLoginError::CutOff | LinkLoginError::Confirmation(_) | LinkLoginError::Handoff(_) => {
             ServerError::Refused(StatusCode::FORBIDDEN, "link_refused", message)
         }
         LinkLoginError::Unauthorized => ServerError::Forbidden,
@@ -79,16 +84,16 @@ fn link_refused(error: LinkLoginError) -> ServerError {
     }
 }
 
-/// The verified claims of the caller's own bearer token.
-async fn bearer_issued_at(
+/// The primary login time in the verified claims of the caller's own bearer token.
+async fn bearer_auth_time(
     state: &ServerState,
     bearer: Option<ValidatedBearer>,
-) -> ServerResult<u64> {
+) -> ServerResult<Option<u64>> {
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let claims = decode_bearer_token(state, bearer.as_str())
         .await
         .map_err(|_| ServerError::Unauthorized)?;
-    Ok(claims.iat)
+    Ok(claims.auth_time)
 }
 
 fn actor(state: &ServerState, auth: &AuthContext) -> Actor {
@@ -106,24 +111,29 @@ fn actor(state: &ServerState, auth: &AuthContext) -> Actor {
     summary = "Confirm a login of another realm for linking",
     description = r#"Signs a short-lived confirmation that binds the caller's local account and a login of another realm.
 
-**Authentication**: a portal session of an active local account, opened at most 5 minutes ago,
-without path restrictions. Renewed or child tokens are refused when older than that.
+**Authentication**: a portal session of an active local account without path restrictions,
+whose primary login was at most 5 minutes ago. Renewals keep the time of that login; child
+sessions have none and are refused.
 
 **Behavior**
-- `federated_token` must be a federated session this realm issued at most 5 minutes ago for a
-  user of another realm, not itself a linked login, and that realm must still be admitted.
-- The foreign identity comes only from the verified token, never from a request field.
+- `handoff` must be a fresh login handoff of the other realm for this realm, checked like a
+  login, and that realm must still be admitted.
+- The handoff is bound to this attempt: its nonce is the hex SHA-256 of the UTF-8 bytes
+  `aruna-link-attempt-v1`, a zero byte, the caller's session id (`sid` claim), a zero byte and
+  the 32 secret bytes. A handoff made for a plain login or for another session is refused.
+- The foreign identity comes only from the verified handoff, never from a request field.
 - The confirmation names this realm, both full user ids and the link action, and lives 5 minutes.
   Show both identities to the user before calling the link route."#,
     request_body(
         content = LinkConfirmationRequest,
-        example = json!({ "federated_token": "EXAMPLE-FEDERATED-SESSION-TOKEN" })
+        example = json!({ "handoff": { "payload": { "issuer": "<home realm id>", "user": "<user id of the other realm>" }, "signer": "Realm", "signature": "<hex>" }, "secret": "<hex of the 32 byte browser secret>" })
     ),
     responses(
         (status = 200, description = "The signed link confirmation", body = serde_json::Value,
             example = json!({ "payload": { "realm_id": "<this realm id>", "action": "Link", "local_user": "<local user id>", "foreign_user": "<user id of the other realm>", "foreign_issued_at": 1791000000, "issued_at": 1791000010, "expires_at": 1791000310, "confirmation_id": "01JLINK0123456789ABCDEFGHJ" }, "signer": "Realm", "signature": "<hex>" })),
+        (status = 400, description = "A malformed secret", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "A login is too old, of the wrong kind, of an inactive or service account, or of a realm no longer admitted (code `link_refused`)", body = ErrorResponse)
+        (status = 403, description = "A login is too old, of the wrong kind, of an inactive or service account, or a handoff is invalid, not bound to this attempt, or of a realm no longer admitted (code `link_refused`)", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -134,18 +144,16 @@ pub async fn create_confirmation(
     Json(request): Json<LinkConfirmationRequest>,
 ) -> ServerResult<Json<Signed<LinkConfirmation>>> {
     let auth = require_realm_auth(&state, auth)?;
-    let local_issued_at = bearer_issued_at(&state, bearer).await?;
-    let foreign = decode_bearer_token(state.as_ref(), &request.federated_token)
-        .await
-        .map_err(|_| link_refused(LinkLoginError::ForeignRefused))?;
-    let foreign_issued_at = foreign.iat;
-    let foreign =
-        AuthContext::try_from(foreign).map_err(|_| link_refused(LinkLoginError::ForeignRefused))?;
+    let auth_time = bearer_auth_time(&state, bearer).await?;
+    let secret = hex::decode(&request.secret)
+        .ok()
+        .filter(|secret| secret.len() == SECRET_LEN)
+        .ok_or_else(|| ServerError::BadRequestReason("secret must be 32 hex bytes".to_string()))?;
     let confirm = ConfirmLinkOperation::new(ConfirmLinkConfig {
         auth_context: auth,
-        local_issued_at,
-        foreign,
-        foreign_issued_at,
+        auth_time,
+        handoff: request.handoff,
+        secret,
         node_capabilities: state.node_capabilities().clone(),
         now: unix_timestamp_secs(),
     });
@@ -194,11 +202,11 @@ pub async fn create_link(
     Json(request): Json<LinkRequest>,
 ) -> ServerResult<Json<LinkedLoginsResponse>> {
     let auth = require_realm_auth(&state, auth)?;
-    let local_issued_at = bearer_issued_at(&state, bearer).await?;
+    let auth_time = bearer_auth_time(&state, bearer).await?;
     let link = LinkLoginOperation::new(LinkLoginConfig {
         actor: actor(&state, &auth),
         auth_context: auth,
-        local_issued_at,
+        auth_time,
         confirmation: request.confirmation,
         now: unix_timestamp_secs(),
     });

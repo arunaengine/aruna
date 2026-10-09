@@ -201,6 +201,7 @@ fn sign_aruna_token(
         delegation_signature: None,
         name: None,
         via: None,
+        auth_time: None,
     };
     let NodeCapabilities::Management {
         realm_encoding_key, ..
@@ -1412,6 +1413,19 @@ async fn refresh_preserves_kind() {
     let refreshed: GetTokenResponse = refreshed.json().await.unwrap();
     let claims = handle_token(&node.state, &refreshed.token).await.unwrap();
     assert_eq!(claims.session_kind, Some(SessionKind::Assistant));
+    // Only the primary login carries its time; renewal keeps it and children never get one.
+    let login = handle_token(&node.state, &portal_token).await.unwrap();
+    assert!(login.auth_time.is_some());
+    assert_eq!(claims.auth_time, None);
+    let renewed = reqwest::Client::new()
+        .get(format!("{}/api/v1/access/token", node.base_url))
+        .bearer_auth(&portal_token)
+        .send()
+        .await
+        .unwrap();
+    let renewed: GetTokenResponse = renewed.json().await.unwrap();
+    let renewed = handle_token(&node.state, &renewed.token).await.unwrap();
+    assert_eq!(renewed.auth_time, login.auth_time);
 
     node.server_task.abort();
     node.net.shutdown().await;

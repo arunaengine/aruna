@@ -35,7 +35,7 @@ use utoipa_axum::routes;
 const LOGINS_PER_MINUTE: u32 = 10;
 /// Tracked client addresses before idle ones are dropped.
 const LIMITER_ADDRESSES: usize = 4_096;
-const SECRET_LEN: usize = 32;
+pub(crate) const SECRET_LEN: usize = 32;
 
 static LOGIN_LIMITER: LazyLock<DefaultKeyedRateLimiter<IpAddr>> = LazyLock::new(login_limiter);
 
