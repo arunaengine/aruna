@@ -315,6 +315,8 @@ mod tests {
         operation.auth.session = Some(SessionRef {
             sid: Ulid::from_bytes([12; 16]).to_string(),
             kind: SessionKind::Assistant,
+            name: None,
+            via: None,
         });
         assert_eq!(operation.scope_allowed(&scope), Err(KeyError::Denied));
         let recipient = operation.auth.user_id;
@@ -364,6 +366,8 @@ mod tests {
         operation.auth.session = Some(SessionRef {
             sid: Ulid::from_bytes([12; 16]).to_string(),
             kind: SessionKind::Assistant,
+            name: None,
+            via: None,
         });
         let user = operation.auth.user_id;
         let record = UserKeyRecord {

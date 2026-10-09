@@ -9,11 +9,14 @@ mod reader;
 pub(crate) mod rewrite;
 mod upload;
 
+#[cfg(test)]
+pub(crate) use upload::tests::upload_record;
 pub use upload::{
     CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation, UploadClaimError,
     claim_rocrate_upload, delete_rocrate_upload, load_rocrate_upload, read_rocrate_upload,
     write_rocrate_upload,
 };
+pub(crate) use upload::{claim_upload, upload_key, upload_stale};
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
@@ -79,6 +82,8 @@ use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, Pu
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 
 const PAYLOAD_CHUNK_BYTES: usize = 64 * 1024;
+/// Longest wait for the source realm to confirm a grant.
+const SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ImportPhase {
@@ -178,6 +183,8 @@ enum ImportFailure {
     Validation(Vec<MetadataValidationViolation>),
     Cancelled,
     Interrupted,
+    /// Waits without spending an attempt, such as for fresh consent to an import from a realm.
+    Deferred(String),
 }
 
 pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> JobRunOutcome {
@@ -210,6 +217,8 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
         }
     };
 
+    // Each run, a start or a resume, first needs the source's confirmation of the grant.
+    let mut confirmed = false;
     loop {
         if ctx.shutdown.is_cancelled() {
             return JobRunOutcome::Interrupted;
@@ -229,6 +238,17 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
         }
 
         let result = match checkpoint.phase {
+            ImportPhase::Acquire
+            | ImportPhase::Inspect
+            | ImportPhase::Validate
+            | ImportPhase::Write
+            | ImportPhase::Rewrite
+            | ImportPhase::Create
+                if !confirmed =>
+            {
+                confirmed = true;
+                ensure_source(ctx, spec).await
+            }
             ImportPhase::Acquire => Box::pin(acquire_source(ctx, spec, &mut checkpoint))
                 .await
                 .map(|input| {
@@ -284,11 +304,7 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
                     return retryable_error(error);
                 }
             }
-            Err(ImportFailure::Retryable(error))
-                if !ctx.final_attempt || checkpoint.phase == ImportPhase::Cleanup =>
-            {
-                return retryable_error(error);
-            }
+            Err(ImportFailure::Retryable(error)) => return retryable_error(error),
             Err(ImportFailure::Cancelled) => {
                 checkpoint.cancelled = true;
                 if let Err(error) = mark_not_attempted(ctx, plan.as_ref(), &mut checkpoint).await {
@@ -300,6 +316,9 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
                 }
             }
             Err(ImportFailure::Interrupted) => return JobRunOutcome::Interrupted,
+            Err(ImportFailure::Deferred(error)) => {
+                return JobRunOutcome::Deferred(JobError::retryable(error));
+            }
             Err(ImportFailure::Validation(violations)) => {
                 if let Err(error) = write_validation_rows(ctx, &violations).await {
                     return retryable_error(error);
@@ -310,7 +329,7 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
                     return retryable_error(error);
                 }
             }
-            Err(ImportFailure::Retryable(error) | ImportFailure::Permanent(error)) => {
+            Err(ImportFailure::Permanent(error)) => {
                 if let Err(report_error) = write_phase_error(ctx, checkpoint.phase, &error).await {
                     return retryable_error(report_error);
                 }
@@ -328,57 +347,6 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
             }
         }
     }
-}
-
-pub(crate) async fn cleanup_after_panic(
-    ctx: &JobContext,
-    spec: &ImportRoCrateSpec,
-) -> JobRunOutcome {
-    const PANIC_MESSAGE: &str = "job payload panicked";
-
-    let mut checkpoint = match read_checkpoint(ctx).await {
-        Ok(Some(checkpoint)) => checkpoint,
-        Ok(None) => ImportCheckpoint::default(),
-        Err(error) => return retryable_error(error),
-    };
-    let phase = checkpoint.phase;
-    let mut cleanup_errors = Vec::new();
-    if let Err(error) = write_phase_error(ctx, phase, PANIC_MESSAGE).await {
-        cleanup_errors.push(error);
-    }
-    checkpoint.failure = Some(PANIC_MESSAGE.to_string());
-    let plan = match read_plan(ctx).await {
-        Ok(plan) => plan,
-        Err(error) => {
-            cleanup_errors.push(error);
-            None
-        }
-    };
-    if phase == ImportPhase::Write
-        && let Err(error) = mark_write_failure(ctx, plan.as_ref(), &mut checkpoint).await
-    {
-        cleanup_errors.push(error);
-    }
-    checkpoint.phase = ImportPhase::Cleanup;
-    if let Err(error) = persist_checkpoint(ctx, &checkpoint).await {
-        cleanup_errors.push(error);
-    }
-    if let Err(error) = cleanup_source(ctx, spec, plan.as_ref(), &mut checkpoint).await {
-        cleanup_errors.push(failure_message(error));
-    }
-    if let Err(error) = persist_checkpoint(ctx, &checkpoint).await {
-        cleanup_errors.push(error);
-    }
-    let message = if cleanup_errors.is_empty() {
-        format!("{PANIC_MESSAGE}; {}", write_state(&checkpoint))
-    } else {
-        format!(
-            "{PANIC_MESSAGE}; {}; cleanup errors: {}",
-            write_state(&checkpoint),
-            cleanup_errors.join("; ")
-        )
-    };
-    JobRunOutcome::Failed(JobError::permanent(message))
 }
 
 fn transfer_failure(error: super::repository::TransferError) -> ImportFailure {
@@ -862,6 +830,7 @@ async fn write_next(
     checkpoint: &mut ImportCheckpoint,
     plan: &ImportPlan,
 ) -> Result<(), ImportFailure> {
+    ensure_federated(ctx, spec).await?;
     if checkpoint.next_entry >= plan.entries.len() {
         checkpoint.phase = ImportPhase::Rewrite;
         return Ok(());
@@ -989,6 +958,7 @@ async fn write_next(
         routing,
     })
     .with_bucket_guard(bucket_info)
+    .create_only()
     .with_rocrate_limits(spec.limits.clone())
     .with_restrictions(spec.auth_context.path_restrictions.clone());
     if let Some(gate) = gate {
@@ -1132,6 +1102,7 @@ async fn create_document(
     checkpoint: &mut ImportCheckpoint,
 ) -> Result<(), ImportFailure> {
     ensure_metadata_permission(ctx, spec).await?;
+    ensure_federated(ctx, spec).await?;
     ensure_valid_path(spec)?;
     let jsonld = checkpoint
         .rewritten_json
@@ -1461,7 +1432,35 @@ async fn ensure_targets(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<()
         Permission::WRITE,
     )
     .await?;
-    ensure_metadata_permission(ctx, spec).await
+    ensure_metadata_permission(ctx, spec).await?;
+    ensure_federated(ctx, spec).await
+}
+
+/// An import of another realm's artifact starts or resumes only after its source confirms the
+/// grant: a refusal fails the job, an unreachable source waits for the next pull or push.
+async fn ensure_source(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<(), ImportFailure> {
+    use crate::federation::import::{ImportError, confirm_source};
+    ensure_federated(ctx, spec).await?;
+    confirm_source(&ctx.driver, spec, SOURCE_TIMEOUT)
+        .await
+        .map_err(|error| match error {
+            ImportError::Storage(error) => ImportFailure::Retryable(error),
+            ImportError::Unreachable(_) => ImportFailure::Deferred(error.to_string()),
+            error => ImportFailure::Permanent(error.to_string()),
+        })
+}
+
+/// An import of another realm's artifact keeps its intent binding and import policies.
+async fn ensure_federated(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<(), ImportFailure> {
+    use crate::federation::import::{ImportError, recheck_import};
+    let now = aruna_core::time::unix_timestamp_secs();
+    recheck_import(&ctx.driver, spec, ctx.owner_node_id, now)
+        .await
+        .map_err(|error| match error {
+            ImportError::Storage(error) => ImportFailure::Retryable(error),
+            ImportError::Expired => ImportFailure::Deferred(error.to_string()),
+            error => ImportFailure::Permanent(error.to_string()),
+        })
 }
 
 async fn ensure_metadata_permission(
@@ -2150,7 +2149,9 @@ fn write_state(checkpoint: &ImportCheckpoint) -> String {
 
 fn failure_message(error: ImportFailure) -> String {
     match error {
-        ImportFailure::Permanent(message) | ImportFailure::Retryable(message) => message,
+        ImportFailure::Permanent(message)
+        | ImportFailure::Retryable(message)
+        | ImportFailure::Deferred(message) => message,
         ImportFailure::Validation(violations) => validation_message(&violations),
         ImportFailure::Cancelled => "import cancelled".to_string(),
         ImportFailure::Interrupted => "import interrupted".to_string(),
@@ -2171,17 +2172,30 @@ fn classify_gate(error: GateContextError) -> ImportFailure {
 pub(crate) mod tests {
 
     use super::*;
-    use aruna_core::UserId;
-    use aruna_core::structs::execution::job::{
-        ImportMetadataTarget, ImportRoCrateTarget, JobClaim, JobId, JobPayload, JobRecord,
-        JobState, RoCrateUploadRecord,
-    };
-    use aruna_core::structs::identity::realm::RealmId;
-    use tokio_util::sync::CancellationToken;
 
-    use crate::jobs::executor::ProgressReporter;
-    use crate::jobs::store::insert_job;
-    use crate::tests::staging::setup_driver_context;
+    /// Encoded checkpoint of a job that holds one claimed upload as hidden input.
+    pub(crate) fn checkpoint_bytes(
+        location: BackendLocation,
+        size: u64,
+        blake3: [u8; 32],
+        upload_id: Ulid,
+    ) -> Vec<u8> {
+        postcard::to_allocvec(&ImportCheckpoint {
+            refs: RoCrateCheckpointRefs {
+                hidden_locations: vec![location.clone()],
+            },
+            input: Some(ImportInput {
+                location,
+                size,
+                blake3,
+                upload_id: Some(upload_id),
+                eln: false,
+            }),
+            phase: ImportPhase::Inspect,
+            ..Default::default()
+        })
+        .unwrap()
+    }
 
     #[test]
     fn target_checks_limits() {
@@ -2370,140 +2384,5 @@ pub(crate) mod tests {
             ),
         ));
         assert!(matches!(failure, ImportFailure::Permanent(_)));
-    }
-
-    #[tokio::test]
-    async fn panic_releases_upload() {
-        let fixture = setup_driver_context().await;
-        let driver = Arc::new(fixture.driver_context.clone());
-        let blob = driver.blob_handle.as_ref().unwrap();
-        let realm_id = RealmId::from_bytes([1; 32]);
-        let owner = UserId::new(Ulid::from_bytes([2; 16]), realm_id);
-        let upload_id = Ulid::from_bytes([3; 16]);
-        let job_id = JobId::from_bytes([4; 16]);
-        let token = Ulid::from_bytes([5; 16]);
-        let Event::Blob(BlobEvent::HiddenSpooled {
-            location,
-            blake3,
-            size,
-        }) = blob
-            .send_blob_effect(BlobEffect::SpoolHidden {
-                namespace: upload_id,
-                name: "input".to_string(),
-                created_by: owner,
-                max_bytes: Some(1),
-                deadline: None,
-                blob: BackendStream::new(stream::iter([Ok::<Bytes, io::Error>(
-                    Bytes::from_static(b"x"),
-                )])),
-            })
-            .await
-        else {
-            panic!("upload spool must succeed")
-        };
-        write_rocrate_upload(
-            &driver.storage_handle,
-            &RoCrateUploadRecord {
-                upload_id,
-                owner,
-                location: location.clone(),
-                blake3,
-                size,
-                media_type: RoCrateMediaType::Zip,
-                expires_at_ms: u64::MAX,
-                claimed_by: Some(job_id),
-            },
-        )
-        .await
-        .unwrap();
-
-        let node_id = iroh::SecretKey::from_bytes(&[6; 32]).public();
-        let spec = ImportRoCrateSpec {
-            auth_context: AuthContext {
-                user_id: owner,
-                realm_id,
-                path_restrictions: None,
-                session: None,
-            },
-            source: ImportRoCrateSource::Upload { upload_id },
-            target: ImportRoCrateTarget {
-                bucket: "target".to_string(),
-                prefix: "crate".to_string(),
-            },
-            metadata: ImportMetadataTarget {
-                group_id: Ulid::from_bytes([7; 16]),
-                path: "crate".to_string(),
-                public: false,
-            },
-            limits: Default::default(),
-            document_id: Ulid::from_bytes([8; 16]),
-        };
-        let mut record = JobRecord::new(
-            job_id,
-            JobPayload::ImportRoCrate(spec.clone()),
-            owner,
-            node_id,
-            1,
-            1,
-            None,
-        );
-        record.state = JobState::Running;
-        record.claim = Some(JobClaim {
-            holder_node_id: node_id,
-            claim_token: token,
-            lease_expires_ms: u64::MAX,
-        });
-        insert_job(&driver.storage_handle, &record).await.unwrap();
-        let ctx = JobContext {
-            driver: driver.clone(),
-            job_id,
-            owner_node_id: node_id,
-            claim_token: token,
-            final_attempt: true,
-            cancel: CancellationToken::new(),
-            shutdown: CancellationToken::new(),
-            progress: ProgressReporter::from_progress(&record.progress),
-        };
-        persist_checkpoint(
-            &ctx,
-            &ImportCheckpoint {
-                refs: RoCrateCheckpointRefs {
-                    hidden_locations: vec![location.clone()],
-                },
-                input: Some(ImportInput {
-                    location,
-                    size,
-                    blake3,
-                    upload_id: Some(upload_id),
-                    eln: false,
-                }),
-                phase: ImportPhase::Inspect,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        let JobRunOutcome::Failed(error) = cleanup_after_panic(&ctx, &spec).await else {
-            panic!("panic cleanup must fail the job")
-        };
-        assert_eq!(
-            error.kind,
-            aruna_core::structs::execution::job::JobErrorKind::Permanent
-        );
-        assert!(
-            load_rocrate_upload(&driver, upload_id)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(matches!(
-            blob.send_blob_effect(BlobEffect::ListHidden {
-                namespace: Some(upload_id),
-                cursor: None,
-            })
-            .await,
-            Event::Blob(BlobEvent::HiddenListed { entries, .. }) if entries.is_empty()
-        ));
     }
 }

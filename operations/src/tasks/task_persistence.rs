@@ -164,7 +164,7 @@ async fn shorten_timer(
     }
 }
 
-async fn read_timer(
+pub(crate) async fn read_timer(
     storage: &StorageHandle,
     key: &TaskKey,
 ) -> Result<Option<PersistedTaskTimer>, String> {

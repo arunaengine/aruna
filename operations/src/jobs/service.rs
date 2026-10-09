@@ -676,7 +676,7 @@ async fn route_record(
 /// Derives the immutable owner from the JobId alone using replicated placement
 /// state, so resolution never asks another node. A missing or unsynced binding is
 /// `Unavailable` (503); only a provably invalid id maps to `NotFound`.
-pub(crate) async fn resolve_job_owner(
+pub async fn resolve_job_owner(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<NodeId, JobRouteError> {

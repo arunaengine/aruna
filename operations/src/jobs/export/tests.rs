@@ -148,6 +148,7 @@ async fn node_with(realm_id: RealmId, metadata: bool) -> BaoNode {
 
 fn remote_spec(realm_id: RealmId, user_id: UserId) -> ExportRoCrateSpec {
     ExportRoCrateSpec {
+        selection: None,
         destination: None,
         auth_context: AuthContext {
             user_id,
@@ -324,6 +325,7 @@ fn versions_roundtrip() {
         let entities = recognized_entities(&imported, realm_id).expect("entities resolve");
         assert!(entities.is_empty());
         let spec = ExportRoCrateSpec {
+            selection: None,
             destination: None,
             auth_context: AuthContext {
                 user_id: UserId::nil(realm_id),
@@ -575,6 +577,7 @@ async fn assert_roundtrip(handle: &BlobHandle, eln: bool, version: &str, seed: u
                 .is_some_and(|path| described.values().any(|value| value == path))
     }));
     let spec = ExportRoCrateSpec {
+        selection: None,
         destination: None,
         auth_context: AuthContext {
             user_id: UserId::nil(realm_id),
@@ -1095,6 +1098,109 @@ async fn denies_foreign_alias() {
         CandidateSource::Local { group_id, .. } if *group_id == foreign
     )));
     node.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn foreign_arn_located() {
+    // A versioned ARN of another realm with an `s3://` location of this node resolves to the
+    // current version there, like a File entity without an ARN.
+    let (node, owner, candidate) = local_candidate().await;
+    let realm_id = owner.realm_id;
+    let version = candidate.resolved_version.unwrap();
+    let head = aruna_core::structs::storage::blob::CurrentVersionPointer::new(version);
+    let head_key = aruna_core::structs::storage::blob::BlobHeadKey::new("remote", "payload");
+    let write = StorageEffect::Write {
+        key_space: BLOB_HEAD_KEYSPACE.to_string(),
+        key: head_key.to_bytes().unwrap().into(),
+        value: head.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    node.driver.storage_handle.send_storage_effect(write).await;
+    let other = RealmId::from_bytes([107; 32]);
+    let foreign = VersionedObjectArn::new(
+        other,
+        node.net.node_id(),
+        "other",
+        "file",
+        Ulid::from_bytes([108; 16]),
+    )
+    .unwrap();
+    let document = json!({"@graph": [{"@id": foreign.to_string(), "@type": "File",
+        "contentUrl": "s3://remote/payload"}]});
+    let mut checkpoint = ExportCheckpoint {
+        entities: recognized_entities(&document, realm_id).unwrap(),
+        ..Default::default()
+    };
+    let ctx = job_context(node.driver.clone(), node.net.node_id());
+    resolve_entries(
+        &ctx,
+        &remote_spec(realm_id, owner),
+        &mut checkpoint,
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+        &mut BTreeSet::new(),
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+    let entity = &checkpoint.entities[0];
+    assert_eq!(entity.omission, None);
+    assert!(entity.candidates.iter().any(|found| matches!(
+        &found.source,
+        CandidateSource::Local { bucket, key, .. } if bucket == "remote" && key == "payload"
+    ) && found.resolved_version == Some(version)));
+    node.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn selection_skips_discovery() {
+    // An export into another realm resolves a hash locally and never asks the DHT for holders,
+    // so a node without discovery reports no outage for it.
+    let dir = tempfile::tempdir().unwrap();
+    let driver = DriverContext {
+        storage_handle: FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let user = UserId::local(Ulid::from_bytes([150; 16]), RealmId::from_bytes([151; 32]));
+    let ctx = job_context(
+        Arc::new(driver),
+        iroh::SecretKey::from_bytes(&[152; 32]).public(),
+    );
+    let mut spec = remote_spec(user.realm_id, user);
+    let selection = aruna_core::structs::execution::job::ExportSelection {
+        files: Vec::new(),
+        audience: RealmId::from_bytes([153; 32]),
+        intent_digest: String::new(),
+    };
+    for (selection, unavailable) in [(None, true), (Some(selection), false)] {
+        spec.selection = selection;
+        let mut candidates = Vec::new();
+        let found = extend_hash_candidates(
+            &ctx,
+            &spec,
+            [154; 32],
+            None,
+            &mut candidates,
+            &mut false,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+        )
+        .await;
+        assert_eq!(found.unwrap(), unavailable);
+        assert!(candidates.is_empty());
+    }
 }
 
 #[test]
@@ -1718,6 +1824,7 @@ fn plan_rejects_oversize() {
         report_source: None,
         resolved_version: None,
         path_synthesized: false,
+        content: None,
     }];
     let opened = [ProbedEntry {
         entity_index: 0,
@@ -1889,6 +1996,19 @@ async fn dates_follow_versions() {
     assert_eq!(payload_year, 2107);
 }
 
+#[test]
+fn dates_follow_snapshot() {
+    // Every export of one pinned snapshot stamps the same time, never the time of the job.
+    let event_id = Ulid::from_bytes([74; 16]);
+    let checkpoint = ExportCheckpoint {
+        winning_event_id: Some(event_id),
+        ..ExportCheckpoint::default()
+    };
+    let moment = archive::snapshot_moment(&checkpoint);
+    assert_eq!(moment.ok(), Some(event_id.timestamp_ms()));
+    assert!(archive::snapshot_moment(&ExportCheckpoint::default()).is_err());
+}
+
 #[tokio::test]
 async fn archives_are_deterministic() {
     assert_eq!(sample_archive().await, sample_archive().await);
@@ -1921,6 +2041,7 @@ async fn corrupt_source_retries() {
             report_source: None,
             resolved_version: None,
             path_synthesized: false,
+            content: None,
         }],
         ..Default::default()
     };
@@ -2207,6 +2328,55 @@ async fn sealed_local_export() {
         received.extend_from_slice(&chunk.unwrap());
     }
     assert_eq!(received, FIXTURE_BYTES);
+
+    // An export into another realm refuses this copy for a reader without the key.
+    let reader = UserId::local(Ulid::from_bytes([116; 16]), realm_id);
+    let mut group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+    let viewer = group_auth
+        .roles
+        .values_mut()
+        .find(|role| role.name == "viewer");
+    viewer.unwrap().assigned_users.insert(reader);
+    let group = aruna_core::structs::identity::group::Group {
+        display_name: "export".to_string(),
+        group_id,
+        realm_id,
+        roles: group_auth.roles.keys().copied().collect(),
+        owner,
+    };
+    let actor = Actor {
+        node_id,
+        user_id: owner,
+        realm_id,
+    };
+    let key = group_id.to_bytes().to_vec();
+    let writes = vec![
+        (
+            AUTH_KEYSPACE.to_string(),
+            key.clone().into(),
+            group_auth.to_bytes(&actor).unwrap().into(),
+        ),
+        (
+            GROUP_KEYSPACE.to_string(),
+            key.into(),
+            group.to_bytes(&actor).unwrap().into(),
+        ),
+    ];
+    let write = StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
+    };
+    driver.storage_handle.send_storage_effect(write).await;
+    let mut spec = remote_spec(realm_id, reader);
+    spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
+        files: Vec::new(),
+        audience: RealmId::from_bytes([117; 32]),
+        intent_digest: String::new(),
+    });
+    assert!(matches!(
+        open_candidate(driver, &spec, &candidate, true).await,
+        Ok(CandidateOpen::Status(OpenStatus::NotHolder))
+    ));
     node.net.shutdown().await;
 }
 
@@ -2399,4 +2569,447 @@ async fn plaintext_export_parks() {
     );
     client.net.shutdown().await;
     source.net.shutdown().await;
+}
+
+#[test]
+fn selection_keeps_references() {
+    // Every left-out source form becomes a web id with its original identifier; the selected
+    // file travels and source-local locations are dropped.
+    let realm_id = RealmId::from_bytes([2; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+    let version = Ulid::from_bytes([4; 16]);
+    let arn = |key: &str| VersionedObjectArn::new(realm_id, node_id, "bucket", key, version);
+    let (kept, left) = (arn("kept").unwrap(), arn("left").unwrap());
+    let other_realm = RealmId::from_bytes([9; 32]);
+    let foreign = VersionedObjectArn::new(other_realm, node_id, "bucket", "f", version).unwrap();
+    let other = VersionedObjectArn::new(other_realm, node_id, "bucket", "g", version).unwrap();
+    let located = arn("located").unwrap();
+    let mut document = json!({
+        "@graph": [
+            {"@id": kept.to_string(), "@type": "File"},
+            {"@id": left.to_string(), "@type": "File", "localPath": "data/left.csv"},
+            {"@id": foreign.to_w3id(), "@type": "File"},
+            {"@id": other.to_string(), "@type": "File"},
+            {"@id": "s3://bucket/located", "@type": "File",
+                "contentUrl": ["s3://bucket/located", "https://example.org/located"]},
+        ]
+    });
+    let mut entities = recognized_entities(&document, realm_id).unwrap();
+    // A web identifier of another realm is an external reference, not unsupported.
+    assert_eq!(entities[2].omission, Some(ReasonCode::External));
+    assert_eq!(entities[3].omission, Some(ReasonCode::Unsupported));
+
+    keep_references(&mut entities, &[kept.to_string()]);
+    assert_eq!(entities[0].omission, None);
+    assert_eq!(entities[1].omission, Some(ReasonCode::External));
+    // A location without a current version cannot be named in another realm.
+    let failed = add_references(&mut document.clone(), &entities);
+    assert!(matches!(failed, Err(ExportFailure::Permanent(_))));
+    entities[4].exact = Some(located.clone());
+    add_references(&mut document, &entities).unwrap();
+
+    let graph = document["@graph"].as_array().unwrap();
+    assert_eq!(graph[0]["@id"], kept.to_string());
+    assert_eq!(graph[1]["@id"], left.to_w3id());
+    assert_eq!(graph[1]["identifier"], left.to_string());
+    assert!(graph[1].get("localPath").is_none());
+    assert_eq!(graph[2]["@id"], foreign.to_w3id());
+    assert_eq!(graph[3]["@id"], other.to_w3id());
+    assert_eq!(graph[3]["identifier"], other.to_string());
+    assert_eq!(graph[4]["@id"], located.to_w3id());
+    assert_eq!(
+        graph[4]["contentUrl"],
+        json!(["https://example.org/located"])
+    );
+}
+
+#[test]
+fn nested_references_cleaned() {
+    // Aliased graphs, nested File entities and structured locations are cleaned as well.
+    let realm_id = RealmId::from_bytes([2; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+    let version = Ulid::from_bytes([4; 16]);
+    let left = VersionedObjectArn::new(realm_id, node_id, "bucket", "left", version).unwrap();
+    let mut document = json!({
+        "@context": [
+            "https://w3id.org/ro/crate/1.2/context",
+            {"graphItems": "@graph", "idAlias": "@id", "pathAlias": LOCAL_PATH_IRI}
+        ],
+        "graphItems": [{
+            "idAlias": "./",
+            "@type": "Dataset",
+            "hasPart": [{
+                "idAlias": left.to_string(),
+                "@type": "File",
+                "pathAlias": "data/left.csv",
+                "contentUrl": [
+                    {"@id": "s3://bucket/left"},
+                    {"@value": "s3://bucket/left"},
+                    "https://example.org/left"
+                ]
+            }]
+        }]
+    });
+    let mut entities = recognized_entities(&document, realm_id).unwrap();
+    keep_references(&mut entities, &[]);
+    add_references(&mut document, &entities).unwrap();
+
+    let nested = &document["graphItems"][0]["hasPart"][0];
+    assert_eq!(nested["idAlias"], left.to_w3id());
+    assert_eq!(nested["identifier"], left.to_string());
+    assert!(nested.get("pathAlias").is_none());
+    assert_eq!(nested["contentUrl"], json!(["https://example.org/left"]));
+}
+
+#[test]
+fn bare_links_unchanged() {
+    // A link in `hasPart` stays a bare id, so the importing realm sees one definition.
+    let realm_id = RealmId::from_bytes([2; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+    let version = Ulid::from_bytes([4; 16]);
+    let left = VersionedObjectArn::new(realm_id, node_id, "bucket", "left", version).unwrap();
+    let mut document = json!({
+        "@graph": [
+            {"@id": "./", "@type": "Dataset", "hasPart": [{"@id": left.to_string()}]},
+            {"@id": left.to_string(), "@type": "File"},
+        ]
+    });
+    let mut entities = recognized_entities(&document, realm_id).unwrap();
+    keep_references(&mut entities, &[]);
+    add_references(&mut document, &entities).unwrap();
+
+    let graph = document["@graph"].as_array().unwrap();
+    assert_eq!(graph[0]["hasPart"], json!([{"@id": left.to_w3id()}]));
+    assert_eq!(graph[1]["identifier"], left.to_string());
+}
+
+#[test]
+fn facts_need_selection() {
+    // A grant pins only a finished export that kept every selected file.
+    let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+    let version = Ulid::from_bytes([4; 16]);
+    let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        root: "/data".to_string(),
+        storage_bucket: "storage".to_string(),
+        backend_path: "bucket/key".to_string(),
+        ulid: version,
+        format: StoredFormat::default(),
+        created_by: Default::default(),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        staging: false,
+        partial: false,
+        blob_size: 5,
+        hashes: HashMap::new(),
+    };
+    let entity = ExportEntity {
+        entity_id: "data.csv".to_string(),
+        local_path: None,
+        storage_key: None,
+        exact: None,
+        hash: None,
+        hash_realm: None,
+        candidates: vec![ExportCandidate {
+            source: CandidateSource::Local {
+                location: location.clone(),
+                group_id: Ulid::from_bytes([6; 16]),
+                permission_path: "/object".to_string(),
+                node_id,
+                bucket: "bucket".to_string(),
+                key: "key".to_string(),
+            },
+            report_source: ExportReportSource::Local,
+            resolved_version: Some(version),
+            expected_blake3: None,
+        }],
+        omission: None,
+        message: None,
+        zip_path: Some("data.csv".to_string()),
+        report_source: Some(ExportReportSource::Local),
+        resolved_version: Some(version),
+        path_synthesized: false,
+        content: Some(([7; 32], 5)),
+    };
+    let mut checkpoint = ExportCheckpoint {
+        winning_event_id: Some(Ulid::from_bytes([8; 16])),
+        dataset_digest: Some([9; 32]),
+        entities: vec![entity],
+        artifact: Some(ArtifactRef {
+            location,
+            blake3: [1; 32],
+            size: 100,
+            expires_at_ms: 0,
+        }),
+        ..Default::default()
+    };
+    let files = ["data.csv".to_string()];
+    let facts = checkpoint.export_facts(&files).unwrap();
+    assert_eq!(facts.versions.len(), 1);
+    assert_eq!(facts.versions[0].size, 5);
+    let source = &facts.sources[0];
+    assert_eq!(
+        (source.bucket.as_str(), source.key.as_str()),
+        ("bucket", "key")
+    );
+    assert_eq!(
+        (source.version_id, source.blake3, source.size),
+        (version, [7; 32], 5)
+    );
+    assert!(checkpoint.export_facts(&["other".to_string()]).is_none());
+    // A selected file without a version read on this node pins nothing.
+    let local = checkpoint.entities[0].candidates[0].source.clone();
+    checkpoint.entities[0].candidates[0].source = CandidateSource::RemoteHash {
+        node_id,
+        hash: [7; 32],
+    };
+    assert!(checkpoint.export_facts(&files).is_none());
+    checkpoint.entities[0].candidates[0].source = local;
+    checkpoint.entities[0].omission = Some(ReasonCode::Denied);
+    assert!(checkpoint.export_facts(&files).is_none());
+}
+
+#[tokio::test]
+async fn selection_reads_locally() {
+    // An export into another realm never reads a selected file through another node.
+    let realm_id = RealmId::from_bytes([64; 32]);
+    let node = bao_node(realm_id).await;
+    let hash = [65; 32];
+    let candidate = ExportCandidate {
+        source: CandidateSource::RemoteHash {
+            node_id: iroh::SecretKey::from_bytes(&[66; 32]).public(),
+            hash,
+        },
+        report_source: ExportReportSource::Hash,
+        resolved_version: None,
+        expected_blake3: Some(hash),
+    };
+    let mut spec = remote_spec(realm_id, UserId::nil(realm_id));
+    spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
+        files: vec!["data.csv".to_string()],
+        audience: RealmId::from_bytes([67; 32]),
+        intent_digest: String::new(),
+    });
+    let opened = open_candidate(node.driver.as_ref(), &spec, &candidate, true).await;
+    assert!(matches!(
+        opened.unwrap(),
+        CandidateOpen::Status(OpenStatus::Denied)
+    ));
+    node.net.shutdown().await;
+}
+
+/// One payload stored twice on a node: a plain copy in encrypting bucket `remote` and one in
+/// plain bucket `plain`, both with a hash alias. A viewer reads both but holds no bucket key.
+async fn two_copies() -> (BaoNode, UserId, UserId, [ExportCandidate; 2]) {
+    let realm_id = RealmId::from_bytes([131; 32]);
+    let owner = UserId::local(Ulid::from_bytes([132; 16]), realm_id);
+    let viewer = UserId::local(Ulid::from_bytes([133; 16]), realm_id);
+    let group_id = Ulid::from_bytes([134; 16]);
+    let versions = [Ulid::from_bytes([135; 16]), Ulid::from_bytes([136; 16])];
+    let node = bao_node(realm_id).await;
+    let node_id = node.net.node_id();
+    let blob = node.driver.blob_handle.as_ref().unwrap();
+    let Event::Blob(BlobEvent::WriteFinished { location }) = blob
+        .send_blob_effect(BlobEffect::Write {
+            resolved: aruna_core::structs::storage::blob::ResolvedBackend::node_default(),
+            bucket: "remote".to_string(),
+            key: "payload".to_string(),
+            created_by: owner,
+            blob: byte_stream(FIXTURE_BYTES),
+            size: None,
+        })
+        .await
+    else {
+        panic!("blob write failed")
+    };
+    let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
+    seed_bao(&node, node_id, owner, group_id, versions[0], &location).await;
+    encrypting_bucket(&node, "remote", Ulid::from_bytes([137; 16])).await;
+    let mut group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+    let role = group_auth
+        .roles
+        .values_mut()
+        .find(|role| role.name == "viewer");
+    role.unwrap().assigned_users.insert(viewer);
+    let group = aruna_core::structs::identity::group::Group {
+        display_name: "export".to_string(),
+        group_id,
+        realm_id,
+        roles: group_auth.roles.keys().copied().collect(),
+        owner,
+    };
+    let actor = Actor {
+        node_id,
+        user_id: owner,
+        realm_id,
+    };
+    let bucket = BucketInfo {
+        group_id,
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: owner,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+    };
+    let version = BlobVersion::materialized(
+        hash,
+        BackendRef::node_default(),
+        location.format.encoding(),
+        std::time::SystemTime::UNIX_EPOCH,
+        owner,
+        None,
+    );
+    let group_key = group_id.to_bytes().to_vec();
+    let plain_key = VersionKey::new("plain", "payload", versions[1]);
+    let mut writes = vec![
+        (
+            AUTH_KEYSPACE.to_string(),
+            group_key.clone().into(),
+            group_auth.to_bytes(&actor).unwrap().into(),
+        ),
+        (
+            GROUP_KEYSPACE.to_string(),
+            group_key.into(),
+            group.to_bytes(&actor).unwrap().into(),
+        ),
+        (
+            S3_BUCKET_KEYSPACE.to_string(),
+            b"plain".to_vec().into(),
+            bucket.to_bytes().unwrap().into(),
+        ),
+        (
+            BLOB_VERSIONS_KEYSPACE.to_string(),
+            plain_key.to_bytes().unwrap().into(),
+            version.to_bytes().unwrap().into(),
+        ),
+    ];
+    let buckets = ["remote", "plain"];
+    for (bucket, version_id) in buckets.into_iter().zip(versions) {
+        let alias = HashIndex::new(
+            hash, version_id, realm_id, group_id, node_id, bucket, "payload",
+        );
+        let key = alias.to_bytes().unwrap().into();
+        writes.push((PATHS_INDEX_KEYSPACE.to_string(), key, Vec::new().into()));
+    }
+    let write = StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
+    };
+    assert!(matches!(
+        node.driver.storage_handle.send_storage_effect(write).await,
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+    ));
+    let candidates = [0, 1].map(|index| ExportCandidate {
+        source: CandidateSource::Local {
+            location: location.clone(),
+            group_id,
+            permission_path: object_permission_path(
+                realm_id,
+                group_id,
+                node_id,
+                buckets[index],
+                "payload",
+            ),
+            node_id,
+            bucket: buckets[index].to_string(),
+            key: "payload".to_string(),
+        },
+        report_source: ExportReportSource::Hash,
+        resolved_version: Some(versions[index]),
+        expected_blake3: Some(hash),
+    });
+    (node, owner, viewer, candidates)
+}
+
+#[tokio::test]
+async fn unheld_copy_skipped() {
+    // A copy whose bucket key the caller lacks does not stop an export into another realm from
+    // reading another copy; only when none opens does the job fail with the holder message.
+    let (node, _, viewer, candidates) = two_copies().await;
+    let ctx = job_context(node.driver.clone(), node.net.node_id());
+    let mut spec = remote_spec(viewer.realm_id, viewer);
+    spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
+        files: vec!["data/payload".to_string()],
+        audience: RealmId::from_bytes([138; 32]),
+        intent_digest: String::new(),
+    });
+    let entity = |candidates: &[ExportCandidate]| ExportEntity {
+        entity_id: "data/payload".to_string(),
+        local_path: None,
+        storage_key: None,
+        exact: None,
+        hash: candidates[0].expected_blake3,
+        hash_realm: None,
+        candidates: candidates.to_vec(),
+        omission: None,
+        message: None,
+        zip_path: None,
+        report_source: None,
+        resolved_version: None,
+        path_synthesized: false,
+        content: None,
+    };
+    let mut checkpoint = ExportCheckpoint {
+        entities: vec![entity(&candidates)],
+        ..Default::default()
+    };
+    let probed = probe_sources(&ctx, &spec, &mut checkpoint, &BTreeMap::new()).await;
+    assert_eq!(probed.unwrap()[0].candidate_index, 1);
+    let mut checkpoint = ExportCheckpoint {
+        entities: vec![entity(&candidates[..1])],
+        ..Default::default()
+    };
+    let refused = crate::federation::export::GrantError::NotHolder("remote".to_string());
+    assert!(matches!(
+        probe_sources(&ctx, &spec, &mut checkpoint, &BTreeMap::new()).await,
+        Err(ExportFailure::Permanent(message)) if message == refused.to_string()
+    ));
+    node.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn consent_resolves_hashes() {
+    // Consent resolves a file named only by its hash as the job does: one copy the caller may
+    // read is enough, and a file whose every copy needs a key the caller lacks is refused.
+    let (node, owner, viewer, candidates) = two_copies().await;
+    let node_id = node.net.node_id();
+    let hash = hex::encode(candidates[0].expected_blake3.unwrap());
+    let file = format!(
+        "{}{hash}",
+        aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX
+    );
+    let jsonld = crate_document(&[json!({"@id": file, "@type": "File", "name": "payload"})]);
+    let jsonld = jsonld.to_string();
+    let spec = |user_id| {
+        let mut spec = remote_spec(viewer.realm_id, user_id);
+        spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
+            files: vec![file.clone()],
+            audience: RealmId::from_bytes([138; 32]),
+            intent_digest: String::new(),
+        });
+        spec
+    };
+    let (viewing, owning) = (spec(viewer), spec(owner));
+    let unheld = unheld_bucket(&node.driver, &viewing, node_id, &jsonld).await;
+    assert_eq!(unheld, Ok(None));
+    encrypting_bucket(&node, "plain", Ulid::from_bytes([139; 16])).await;
+    let unheld = unheld_bucket(&node.driver, &viewing, node_id, &jsonld).await;
+    assert!(matches!(unheld, Ok(Some(bucket)) if bucket == "plain" || bucket == "remote"));
+    let unheld = unheld_bucket(&node.driver, &owning, node_id, &jsonld).await;
+    assert_eq!(unheld, Ok(None));
+    // A foreign user is refused like any non-holder, not with a storage failure.
+    let foreign = UserId::new(viewer.user_ulid, RealmId::from_bytes([140; 32]));
+    let mut foreign_spec = spec(viewer);
+    foreign_spec.auth_context.user_id = foreign;
+    let CandidateSource::Local {
+        location, bucket, ..
+    } = &candidates[0].source
+    else {
+        panic!("a local copy")
+    };
+    let allowed = holder_allows(node.driver.as_ref(), &foreign_spec, location, bucket, None).await;
+    assert!(matches!(allowed, Ok(false)));
+    node.net.shutdown().await;
 }

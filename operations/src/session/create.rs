@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::index::{MAX_USER_SESSIONS, decode_index, encode_index, owner_key};
-use crate::auth::create_token::{CreateTokenConfig, CreateTokenError, mint_token};
+use crate::auth::create_token::{CreateTokenConfig, CreateTokenError, mint_login_token};
 use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::compute::Secret;
@@ -34,7 +34,13 @@ pub struct CreateSessionConfig {
     pub node_capabilities: NodeCapabilities,
     pub kind: SessionKind,
     pub label: Option<String>,
+    /// Display name a federated session carries in its token.
+    pub name: Option<String>,
     pub restrictions: Option<Vec<PathRestriction>>,
+    /// The linked login of another realm a federated session of a local account came through.
+    pub via: Option<UserId>,
+    /// Time of the primary login this session descends from; `None` for child sessions.
+    pub auth_time: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,16 +155,21 @@ impl CreateSessionOperation {
         let session_ref = SessionRef {
             sid: self.sid.clone(),
             kind: self.config.kind,
+            name: self.config.name.clone(),
+            via: self.config.via,
         };
-        let token = mint_token(&CreateTokenConfig {
-            time: self.config.time,
-            expiry: Some(self.config.expiry),
-            user_id: self.config.user_id,
-            realm_id: self.config.realm_id,
-            node_capabilities: self.config.node_capabilities.clone(),
-            session: Some(session_ref),
-            restrictions: self.config.restrictions.clone(),
-        })?;
+        let token = mint_login_token(
+            &CreateTokenConfig {
+                time: self.config.time,
+                expiry: Some(self.config.expiry),
+                user_id: self.config.user_id,
+                realm_id: self.config.realm_id,
+                node_capabilities: self.config.node_capabilities.clone(),
+                session: Some(session_ref),
+                restrictions: self.config.restrictions.clone(),
+            },
+            self.config.auth_time,
+        )?;
         self.session = Some(UserSession {
             sid: self.sid.clone(),
             user_id: self.config.user_id,
@@ -168,6 +179,7 @@ impl CreateSessionOperation {
             expires_at: self.config.expiry,
             token_hash: bearer_token_hash(&token),
             revoked: false,
+            via: self.config.via,
         });
         self.token = Some(Secret::new(token));
         Ok(())
@@ -411,7 +423,10 @@ mod pure_tests {
             node_capabilities: NodeCapabilities::management_node(signing_key).unwrap(),
             kind: SessionKind::Portal,
             label: None,
+            name: None,
             restrictions: None,
+            via: None,
+            auth_time: None,
         }
     }
 
@@ -430,6 +445,7 @@ mod pure_tests {
             expires_at,
             token_hash: "a".repeat(64),
             revoked,
+            via: None,
         }
     }
 

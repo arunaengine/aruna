@@ -46,6 +46,9 @@ services:
     volumes:
       - ${ARUNA_COMPOSE_DATA_DIR:-../target/node/storage}:/data
       - ${ARUNA_COMPOSE_ENV_FILE:-./compose.aruna.env}:/run/.env:ro
+    # A local stack never registers with the global registry, whatever env file it mounts.
+    environment:
+      FEDERATION_REGISTRY_URL: ""
     restart: unless-stopped
   prometheus:
     image: prom/prometheus:v3.5.3@sha256:ddc2493835a1509976d5e4e0c94199c4f843ce1f42dd6bcfc8231ba734a93ff7

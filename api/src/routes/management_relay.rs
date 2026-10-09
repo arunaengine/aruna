@@ -10,7 +10,7 @@ use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::body::Bytes;
-use axum::extract::{FromRequest, MatchedPath, Request, State};
+use axum::extract::{FromRequest, MatchedPath, OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -58,6 +58,7 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("PUT", "/access/policies/realm"),
     ("PUT", "/access/users/{id}/status"),
     ("PUT", "/compute/config"),
+    ("PUT", "/system/realm/federation"),
     ("PUT", "/system/realm/quota"),
 ];
 
@@ -123,9 +124,20 @@ async fn relay(state: &Arc<ServerState>, route: &'static str, request: Request) 
     }
 
     let method = request.method().clone();
-    let uri = request.uri().clone();
+    // Inside the `/api/v1` nest the URI lacks that prefix; the original URI keeps it.
+    let uri = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map_or_else(|| request.uri().clone(), |original| original.0.clone());
     let authorization = request.headers().get(header::AUTHORIZATION).cloned();
     let content_type = request.headers().get(header::CONTENT_TYPE).cloned();
+    let preconditions: Vec<_> = [header::IF_MATCH, header::IF_NONE_MATCH]
+        .into_iter()
+        .filter_map(|name| {
+            let value = request.headers().get(&name)?.clone();
+            Some((name, value))
+        })
+        .collect();
     let body = match Bytes::from_request(request, &()).await {
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
@@ -147,6 +159,9 @@ async fn relay(state: &Arc<ServerState>, route: &'static str, request: Request) 
         }
         if let Some(content_type) = &content_type {
             outgoing = outgoing.header(header::CONTENT_TYPE, content_type.clone());
+        }
+        for (name, value) in &preconditions {
+            outgoing = outgoing.header(name, value.clone());
         }
         match outgoing.send().await {
             Ok(response) if may_try_response(route, response.status()) => {
@@ -227,7 +242,7 @@ async fn relayed_response(route: &'static str, url: &str, response: reqwest::Res
 }
 
 fn relayed_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
-    [&header::CONTENT_TYPE, &header::RETRY_AFTER]
+    [&header::CONTENT_TYPE, &header::RETRY_AFTER, &header::ETAG]
         .into_iter()
         .filter_map(|name| {
             headers

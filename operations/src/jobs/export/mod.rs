@@ -28,7 +28,7 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobVersion, BucketInfo, HashIndex, ManagedCopyKey, VersionKey,
     ensure_confined_path, object_permission_path,
 };
-use aruna_core::structs::storage::data_identity::DataIdentity;
+use aruna_core::structs::storage::data_identity::{DataIdentity, content_id};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };
@@ -230,6 +230,8 @@ struct ExportEntity {
     report_source: Option<ExportReportSource>,
     resolved_version: Option<Ulid>,
     path_synthesized: bool,
+    /// Plaintext hash and size of the included version.
+    content: Option<([u8; 32], u64)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -324,6 +326,8 @@ enum ResolveResult {
 #[derive(Clone, Copy, Debug)]
 enum OpenStatus {
     Denied,
+    /// An export into another realm needs a bucket key of this copy that the caller lacks.
+    NotHolder,
     Missing,
     Offline,
     Corrupt,
@@ -678,6 +682,81 @@ pub(crate) async fn crate_jsonld(
     }
 }
 
+/// The bucket that refuses a selected file of crate `jsonld` at consent: the job's resolution
+/// finds copies of it on this node, and the holder rule refuses each of them.
+pub(crate) async fn unheld_bucket(
+    driver: &std::sync::Arc<DriverContext>,
+    spec: &ExportRoCrateSpec,
+    node_id: NodeId,
+    jsonld: &str,
+) -> Result<Option<String>, String> {
+    let failed = |error: ExportFailure| format!("{error:?}");
+    let canonical = craqle::canonicalize_jsonld(jsonld).map_err(|error| error.to_string())?;
+    let document: JsonValue = serde_json::from_str(jsonld).map_err(|error| error.to_string())?;
+    let realm_id = spec.auth_context.realm_id;
+    let mut entities =
+        recognize_entities(&document, &canonical.nquads, realm_id).map_err(failed)?;
+    let files = spec
+        .selection
+        .as_ref()
+        .map(|selection| &selection.files[..]);
+    entities.retain(|entity| files.unwrap_or_default().contains(&entity.entity_id));
+    let mut checkpoint = ExportCheckpoint {
+        entities,
+        ..Default::default()
+    };
+    // The resolution runs outside a job; it never reads the job id.
+    let ctx = JobContext {
+        driver: driver.clone(),
+        job_id: JobId::from_bytes([u8::MAX; 16]),
+        owner_node_id: node_id,
+        claim_token: Ulid::nil(),
+        final_attempt: false,
+        cancel: tokio_util::sync::CancellationToken::new(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        progress: super::executor::ProgressReporter::from_progress(
+            &aruna_core::structs::execution::job::JobProgress::new("entries"),
+        ),
+    };
+    resolve_entries(
+        &ctx,
+        spec,
+        &mut checkpoint,
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+        &mut BTreeSet::new(),
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+    )
+    .await
+    .map_err(failed)?;
+    for entity in &checkpoint.entities {
+        let mut unheld = None;
+        for candidate in &entity.candidates {
+            let CandidateSource::Local {
+                location, bucket, ..
+            } = &candidate.source
+            else {
+                continue;
+            };
+            if holder_allows(driver, spec, location, bucket, None)
+                .await
+                .map_err(failed)?
+            {
+                unheld = None;
+                break;
+            }
+            unheld.get_or_insert_with(|| bucket.clone());
+        }
+        if unheld.is_some() {
+            return Ok(unheld);
+        }
+    }
+    Ok(None)
+}
+
 /// The crate a dataset exports with its event and context digest: the raw revision, else a
 /// scaffold's rendered graph, the crate the dataset view shows.
 async fn read_crate(
@@ -745,7 +824,11 @@ async fn snapshot_export(
     let canonical = craqle::validate_rocrate_jsonld(&jsonld).map_err(map_crate_error)?;
     let document: JsonValue = serde_json::from_str(&jsonld)
         .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
-    let entities = recognize_entities(&document, &canonical.nquads, spec.auth_context.realm_id)?;
+    let mut entities =
+        recognize_entities(&document, &canonical.nquads, spec.auth_context.realm_id)?;
+    if let Some(selection) = &spec.selection {
+        keep_references(&mut entities, &selection.files);
+    }
     if entities.len() as u64 > spec.limits.max_entries {
         return Err(ExportFailure::Permanent(format!(
             "RO-Crate has more than {} File entities",
@@ -802,6 +885,14 @@ async fn resolve_entries(
         }
         let entity = &checkpoint.entities[index];
         if entity.omission.is_some() {
+            // An export into a realm names a location it leaves out by its current version here.
+            if spec.selection.is_some()
+                && entity.exact.is_none()
+                && entity.hash.is_none()
+                && let Some(location) = entity.storage_key.clone()
+            {
+                checkpoint.entities[index].exact = current_version(ctx, spec, &location).await;
+            }
             ctx.progress.advance(1);
             continue;
         }
@@ -812,9 +903,13 @@ async fn resolve_entries(
                 .hash_realm
                 .is_none_or(|realm_id| realm_id == spec.auth_context.realm_id)
         });
-        // Without an exact version or content hash, an `s3://` location names this node's
-        // current version of that key.
-        let current = match (&entity.exact, hash, &entity.storage_key) {
+        // Without an exact version or content hash of this realm, an `s3://` location names this
+        // node's current version of that key.
+        let local_exact = entity
+            .exact
+            .as_ref()
+            .filter(|exact| exact.realm_id == spec.auth_context.realm_id);
+        let current = match (local_exact, hash, &entity.storage_key) {
             (None, None, Some(location)) => current_version(ctx, spec, location).await,
             _ => None,
         };
@@ -995,6 +1090,10 @@ async fn extend_hash_candidates(
             .ok_or_else(|| ExportFailure::Retryable("alias cache unavailable".to_string()))?;
         merge_candidates(candidates, cached, MAX_LOCAL_CANDIDATES);
         *denied |= *cached_denied;
+    }
+    // An export into another realm reads only local copies, so other holders are never needed.
+    if spec.selection.is_some() {
+        return Ok(false);
     }
 
     let holders = match drive(
@@ -1654,11 +1753,13 @@ async fn probe_sources_checked(
         let mut missing = false;
         let mut offline = false;
         let mut corrupt = false;
+        let mut unheld = None;
         let mut selected = None;
         let failed = candidate_failures.get(&index);
-        for status in failed.into_iter().flat_map(|failed| failed.values()) {
+        for (candidate_index, status) in failed.into_iter().flatten() {
             match status {
                 OpenStatus::Denied => denied = true,
+                OpenStatus::NotHolder => unheld = local_bucket(candidates.get(*candidate_index)),
                 OpenStatus::Missing => missing = true,
                 OpenStatus::Offline => offline = true,
                 OpenStatus::Corrupt => corrupt = true,
@@ -1718,6 +1819,9 @@ async fn probe_sources_checked(
                     ));
                 }
                 CandidateOpen::Status(OpenStatus::Denied) => denied = true,
+                CandidateOpen::Status(OpenStatus::NotHolder) => {
+                    unheld = local_bucket(Some(&candidate));
+                }
                 CandidateOpen::Status(OpenStatus::Missing) => missing = true,
                 CandidateOpen::Status(OpenStatus::Offline) => offline = true,
                 CandidateOpen::Status(OpenStatus::Corrupt) => corrupt = true,
@@ -1731,6 +1835,11 @@ async fn probe_sources_checked(
             return Err(ExportFailure::Retryable(
                 "payload integrity check failed".to_string(),
             ));
+        }
+        // No copy opened and one of them needs a bucket key the caller lacks.
+        if let Some(bucket) = unheld {
+            let refused = crate::federation::export::GrantError::NotHolder(bucket);
+            return Err(ExportFailure::Permanent(refused.to_string()));
         }
 
         let entity = &mut checkpoint.entities[index];
@@ -1768,6 +1877,10 @@ async fn open_candidate_checked(
     candidate: &ExportCandidate,
     metadata_only: bool,
 ) -> Result<CandidateOpen, ExportFailure> {
+    // Another node cannot enforce the export consent, so an export into a realm reads locally.
+    if spec.selection.is_some() && !matches!(candidate.source, CandidateSource::Local { .. }) {
+        return Ok(CandidateOpen::Status(OpenStatus::Denied));
+    }
     match &candidate.source {
         CandidateSource::Local {
             location,
@@ -1923,6 +2036,9 @@ async fn open_local_txn(
             "blob handle unavailable".to_string(),
         ));
     };
+    if !holder_allows(driver, spec, location, bucket, Some(txn_id)).await? {
+        return Ok(CandidateOpen::Status(OpenStatus::NotHolder));
+    }
     // An encrypting bucket admits plaintext only under a read lease; a locked key parks the job.
     let lease = match read_admission(driver, location, bucket, txn_id).await? {
         Ok(lease) => lease,
@@ -1991,19 +2107,10 @@ async fn read_admission(
     bucket: &str,
     txn_id: TxnId,
 ) -> Result<Result<Option<ReadLease>, BucketKeyRef>, ExportFailure> {
-    let (key, archive) = match location.format.bucket_key() {
-        Some(key) => (key, ArchiveKey::of(location)),
-        None => {
-            let key = bucket.as_bytes().to_vec().into();
-            let row = storage_value(driver, BUCKET_ENCRYPTION_KEYSPACE, key, Some(txn_id)).await?;
-            let settings = BucketEncryption::from_row(row.as_deref())
-                .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-            match settings.active_key() {
-                Some(key) => (key, ArchiveKey::of(location)),
-                None => return Ok(Ok(None)),
-            }
-        }
+    let Some(key) = read_key(driver, location, bucket, Some(txn_id)).await? else {
+        return Ok(Ok(None));
     };
+    let archive = ArchiveKey::of(location);
     let Some(blob_handle) = driver.blob_handle.as_ref() else {
         return Err(ExportFailure::Retryable(
             "blob handle unavailable".to_string(),
@@ -2020,6 +2127,50 @@ async fn read_admission(
         event => Err(ExportFailure::Retryable(format!(
             "read admission failed: {event:?}"
         ))),
+    }
+}
+
+/// The bucket key a read of a copy in `bucket` needs: its own key for a sealed copy, the active
+/// bucket key for a plain copy of an encrypting bucket, none for a plain bucket.
+async fn read_key(
+    driver: &DriverContext,
+    location: &BackendLocation,
+    bucket: &str,
+    txn_id: Option<TxnId>,
+) -> Result<Option<BucketKeyRef>, ExportFailure> {
+    if let Some(key) = location.format.bucket_key() {
+        return Ok(Some(key));
+    }
+    let key = bucket.as_bytes().to_vec().into();
+    let row = storage_value(driver, BUCKET_ENCRYPTION_KEYSPACE, key, txn_id).await?;
+    let settings = BucketEncryption::from_row(row.as_deref())
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    Ok(settings.active_key())
+}
+
+/// The holder rule of an export into another realm: a copy that needs a bucket key is readable
+/// only for a current key holder of its bucket.
+async fn holder_allows(
+    driver: &DriverContext,
+    spec: &ExportRoCrateSpec,
+    location: &BackendLocation,
+    bucket: &str,
+    txn_id: Option<TxnId>,
+) -> Result<bool, ExportFailure> {
+    if spec.selection.is_none() || read_key(driver, location, bucket, txn_id).await?.is_none() {
+        return Ok(true);
+    }
+    let auth = &spec.auth_context;
+    crate::replication::plaintext::is_holder(driver, auth.realm_id, bucket, auth.user_id)
+        .await
+        .map_err(ExportFailure::Retryable)
+}
+
+/// The bucket of a candidate read on this node.
+fn local_bucket(candidate: Option<&ExportCandidate>) -> Option<String> {
+    match candidate.map(|candidate| &candidate.source) {
+        Some(CandidateSource::Local { bucket, .. }) => Some(bucket.clone()),
+        _ => None,
     }
 }
 

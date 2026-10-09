@@ -40,6 +40,7 @@ async fn export_spec(
         .await?,
     );
     Ok(ExportRoCrateSpec {
+        selection: None,
         auth_context: import.auth_context,
         document_id: doc_id(1),
         limits: RoCrateLimits::default(),

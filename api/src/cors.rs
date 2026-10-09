@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::routes::federation::export::{GRANT_HEADER, INTENT_HEADER};
 use axum::http::Method;
 use http::HeaderMap;
 use http::HeaderName;
@@ -154,6 +155,10 @@ impl CorsConfig {
                     HeaderName::from_static("mcp-name"),
                     HeaderName::from_static("mcp-protocol-version"),
                     HeaderName::from_static("mcp-session-id"),
+                    HeaderName::from_static(GRANT_HEADER),
+                    HeaderName::from_static(INTENT_HEADER),
+                    header::IF_MATCH,
+                    header::IF_NONE_MATCH,
                 ])
                 // The portal is always cross-origin now, so its retry backoff
                 // and download filenames depend on these being readable.
@@ -162,6 +167,7 @@ impl CorsConfig {
                     header::RETRY_AFTER,
                     header::CONTENT_RANGE,
                     header::ACCEPT_RANGES,
+                    header::ETAG,
                 ])
                 .max_age(CORS_MAX_AGE),
         )
@@ -288,7 +294,7 @@ mod tests {
                 .headers()
                 .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
                 .unwrap(),
-            "content-disposition,retry-after,content-range,accept-ranges"
+            "content-disposition,retry-after,content-range,accept-ranges,etag"
         );
     }
 

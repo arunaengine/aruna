@@ -200,7 +200,7 @@ pub(super) fn store(state: &ServerState) -> ServerResult<&GitStore> {
 }
 
 /// The version from `If-Match`, with or without quotes.
-pub(super) fn expected(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn expected(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::IF_MATCH)
         .and_then(|value| value.to_str().ok())

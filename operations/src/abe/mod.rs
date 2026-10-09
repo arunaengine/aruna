@@ -78,6 +78,8 @@ pub enum KeyError {
     Missing,
     #[error("access to the encryption record is denied")]
     Denied,
+    #[error("users of another realm cannot hold this realm's encryption keys")]
+    Foreign,
     #[error("encryption storage is unavailable")]
     Storage,
     #[error("a re-key of another prefix is unfinished in this bucket")]
@@ -427,7 +429,10 @@ impl Operation for KeyOperation {
     type Output = KeyResult;
     type Error = KeyError;
     fn start(&mut self) -> Effects {
-        if self.auth.user_id.realm_id != self.auth.realm_id || self.auth.user_id.is_nil() {
+        if self.auth.federated() {
+            return self.fail(KeyError::Foreign);
+        }
+        if self.auth.user_id.is_nil() {
             return self.fail(KeyError::Denied);
         }
         self.state = State::Start;
@@ -573,6 +578,23 @@ mod tests {
     use aruna_core::structs::identity::auth::{Permission, Role};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::encryption::BucketKeyRef;
+
+    #[test]
+    fn refuses_foreign_user() {
+        // A federated user served by realm 1 cannot request keys there.
+        let foreign = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
+        let auth = AuthContext {
+            user_id: foreign,
+            realm_id: RealmId([1; 32]),
+            path_restrictions: None,
+            session: None,
+        };
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let action = KeyAction::Request(KeyScope::Subtree("foo/".into()));
+        let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
+        assert!(operation.start().is_empty());
+        assert_eq!(operation.finalize(), Err(KeyError::Foreign));
+    }
 
     #[test]
     fn due_refuses_grant() {

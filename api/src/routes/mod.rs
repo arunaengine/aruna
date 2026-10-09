@@ -17,6 +17,7 @@ pub mod audit;
 pub mod device;
 pub mod drs;
 pub mod execution;
+pub mod federation;
 pub mod git;
 pub mod info;
 pub mod link_routes;
@@ -49,6 +50,11 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(audit::router())
         .merge(assistant::router())
         .merge(info::router())
+        .merge(federation::router())
+        .merge(federation::export::router())
+        .merge(federation::import::router())
+        .merge(federation::link::router())
+        .merge(federation::login::router())
         .merge(onboarding::router())
         .merge(storage::blobs::router())
         .merge(storage::bucket::usage::router())
@@ -317,6 +323,8 @@ pub(crate) mod tests {
         ("PATCH", "/access/groups/{id}"),
         ("GET", "/system/info"),
         ("GET", "/system/realm"),
+        ("GET", "/system/realm/descriptor"),
+        ("GET", "/system/realm/federation"),
         ("GET", "/system/realm/placement"),
         ("GET", "/system/usage"),
         ("GET", "/compute/jobs"),
@@ -489,6 +497,18 @@ pub(crate) mod tests {
         ("POST", "/system/assistant/providers/{id}/proxy/{*path}"),
         ("POST", "/system/assistant/providers/{id}/test"),
         ("POST", "/access/sessions"),
+        ("POST", "/federation/login-handoffs"),
+        ("POST", "/federation/sessions"),
+        ("POST", "/federation/exports"),
+        ("POST", "/federation/exports/{job_id}/grant"),
+        ("DELETE", "/federation/exports/{job_id}/grant"),
+        ("POST", "/federation/exports/{job_id}/push"),
+        ("POST", "/federation/import-intents"),
+        ("POST", "/federation/imports"),
+        ("POST", "/federation/link-confirmations"),
+        ("POST", "/federation/links"),
+        ("GET", "/federation/links"),
+        ("DELETE", "/federation/links/{user_id}/{login}"),
         ("POST", "/access/users/resolve"),
         ("POST", "/access/s3/sessions"),
         ("POST", "/access/s3/sessions/{access_key_id}/refresh"),
@@ -519,6 +539,7 @@ pub(crate) mod tests {
             "/data/groups/{group_id}/storage/backends/{backend_id}",
         ),
         ("PUT", "/data/groups/{group_id}/storage/routing"),
+        ("PUT", "/system/realm/federation"),
         ("PUT", "/system/realm/quota"),
         ("PUT", "/metadata/{document_id}/rocrate"),
         (

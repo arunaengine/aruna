@@ -5,7 +5,8 @@
 use super::*;
 use aruna_core::admin_documents::roles_narrowed;
 use aruna_core::keyspaces::{
-    BUCKET_ENCRYPTION_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, FEDERATION_KEYSPACE, GROUP_DELETE_KEYSPACE,
+    GROUP_ENCRYPTED_KEYSPACE,
 };
 use aruna_core::storage_entries::group_deletion_entries;
 use aruna_core::structs::identity::group_delete::{GroupDeleteRecord, MembershipFence};
@@ -140,6 +141,8 @@ pub(in crate::document_sync) async fn apply_user_operation(
             | AdminDocumentOperation::SubjectIdRemoved { .. }
             | AdminDocumentOperation::UserAttributeSet { .. }
             | AdminDocumentOperation::UserAttributeRemoved { .. }
+            | AdminDocumentOperation::UserAliasAdded { .. }
+            | AdminDocumentOperation::UserAliasRemoved { .. }
     ) {
         return Err(NetError::Bootstrap(
             "admin document operation sync only supports user name, subject, and attribute updates"
@@ -151,129 +154,31 @@ pub(in crate::document_sync) async fn apply_user_operation(
         | AdminDocumentOperation::SubjectIdRemoved { subject_id } => Some(subject_id.clone()),
         _ => None,
     };
+    let changed_alias = match &event.op {
+        AdminDocumentOperation::UserAliasAdded { alias }
+        | AdminDocumentOperation::UserAliasRemoved { alias } => Some(*alias),
+        _ => None,
+    };
 
-    let previous_state = storage_read_from(
-        storage,
-        DOCUMENT_STATE_KEYSPACE.to_string(),
-        reducer_state_key(&event.target),
-    )
-    .await?
-    .map(|bytes| decode_reducer_state(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    let mut reducer_state = previous_state
-        .clone()
-        .unwrap_or_else(|| AdminDocumentState::new(event.target.clone()));
-    let apply_status = reducer_state
-        .apply(&event)
-        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if persist_stale_event(storage, apply_status, &reducer_state).await? {
-        return Ok(());
-    }
-
-    let previous_user = storage_read_from(
-        storage,
-        document_target.storage_keyspace().to_string(),
-        document_target.storage_key(),
-    )
-    .await?
-    .map(|bytes| User::from_bytes(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    let user = materialize_user_operation(user_id, previous_user.as_ref(), &reducer_state, &event);
-    // Turning inactive ends READ; a replay or repeat leaves the status unchanged.
-    let deactivating =
-        !previous_user.as_ref().is_some_and(User::is_deactivated) && user.is_deactivated();
-
-    let mut writes = vec![
-        (
-            document_target.storage_keyspace().to_string(),
-            document_target.storage_key(),
-            user.to_bytes(&event.actor)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                .into(),
-        ),
-        reducer_state_entry(&reducer_state)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-    ];
-    writes.extend(
-        conflict_write_entries(&reducer_state)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-    );
-
-    let deletes = stale_conflict_deletes(previous_state.as_ref(), Some(&reducer_state));
-    let subject_ids = changed_subject_id
-        .map(|subject_id| vec![subject_id])
-        .unwrap_or_else(|| user.subject_ids.clone());
-
-    // A transient SSI conflict must never wedge the topic: retry with yields,
-    // bounded as a livelock safety valve.
+    // A transient SSI conflict must never wedge the topic: retry with yields, bounded as a
+    // livelock safety valve. Each attempt rereads, so a concurrent local change is kept.
     for _ in 0..APPLY_CONFLICT_ATTEMPTS {
         tokio::task::yield_now().await;
         let txn_id = start_storage_transaction(storage).await?;
-        let mut attempt_writes = writes.clone();
-        let mut attempt_deletes = deletes.clone();
-        // Markers come from this attempt so a bucket encrypted meanwhile is included.
-        if deactivating {
-            match due_writes(storage, &event, true, None, Some(txn_id)).await {
-                Ok(due) => attempt_writes.extend(due),
-                Err(error) => return Err(abort_error(storage, txn_id, error).await),
-            }
-        }
-        for subject_id in &subject_ids {
-            let subject_key = subject_index_key(subject_id);
-            let mut claims = match transaction_read(
-                storage,
-                SUBJECT_CLAIMS_KEYSPACE.to_string(),
-                subject_key.clone(),
-                Some(txn_id),
-            )
-            .await?
-            {
-                Some(bytes) => postcard::from_bytes::<BTreeSet<UserId>>(&bytes)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-                None => {
-                    let mut claims = BTreeSet::new();
-                    if let Some(bytes) = transaction_read(
-                        storage,
-                        SUBJECT_INDEX_KEYSPACE.to_string(),
-                        subject_key.clone(),
-                        Some(txn_id),
-                    )
-                    .await?
-                    {
-                        claims.insert(
-                            UserId::from_storage_key(&bytes)
-                                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-                        );
-                    }
-                    claims
-                }
-            };
-            if user.subject_ids.contains(subject_id) {
-                claims.insert(user_id);
-            } else {
-                claims.remove(&user_id);
-            }
-
-            if let Some(canonical_user_id) = claims.first().copied() {
-                attempt_writes.push((
-                    SUBJECT_CLAIMS_KEYSPACE.to_string(),
-                    subject_key.clone(),
-                    postcard::to_allocvec(&claims)
-                        .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                        .into(),
-                ));
-                attempt_writes.push((
-                    SUBJECT_INDEX_KEYSPACE.to_string(),
-                    subject_key,
-                    subject_index_value(canonical_user_id),
-                ));
-            } else {
-                attempt_deletes.push((SUBJECT_CLAIMS_KEYSPACE.to_string(), subject_key.clone()));
-                attempt_deletes.push((SUBJECT_INDEX_KEYSPACE.to_string(), subject_key));
-            }
-        }
+        let subject_id = changed_subject_id.as_deref();
+        let batch = user_batch(
+            storage,
+            txn_id,
+            &document_target,
+            &event,
+            subject_id,
+            changed_alias,
+        );
+        let (attempt_deletes, attempt_writes) = match batch.await {
+            Ok(Some(batch)) => batch,
+            Ok(None) => return abort_txn(storage, txn_id).await,
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        };
         match replace_batch_in(storage, txn_id, attempt_deletes, attempt_writes).await {
             Ok(()) => return Ok(()),
             Err(NetError::Storage(StorageError::TransactionConflict)) => {
@@ -292,6 +197,177 @@ pub(in crate::document_sync) async fn apply_user_operation(
     Err(NetError::Dht(
         "user subject claim apply conflict retries exhausted".to_string(),
     ))
+}
+
+type UserBatch = (Vec<(String, ByteView)>, Vec<(String, ByteView, Value)>);
+
+/// The deletes and writes of one attempt to apply a user event, read inside `txn_id`: the
+/// stored user and reducer state, their reduction and materialization, and the claims. `None`
+/// for a duplicate event.
+pub(in crate::document_sync) async fn user_batch(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    document_target: &DocumentTarget,
+    event: &AdminDocumentEvent,
+    changed_subject_id: Option<&str>,
+    changed_alias: Option<UserId>,
+) -> Result<Option<UserBatch>> {
+    let DocumentTarget::User { user_id } = *document_target else {
+        return Err(NetError::Bootstrap(
+            "user batch needs a user target".to_string(),
+        ));
+    };
+    let previous_state = transaction_read(
+        storage,
+        DOCUMENT_STATE_KEYSPACE.to_string(),
+        reducer_state_key(&event.target),
+        Some(txn_id),
+    )
+    .await?
+    .map(|bytes| decode_reducer_state(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let mut reducer_state = previous_state
+        .clone()
+        .unwrap_or_else(|| AdminDocumentState::new(event.target.clone()));
+    let apply_status = reducer_state
+        .apply(event)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    match apply_status {
+        AdminApplyStatus::Applied => {}
+        AdminApplyStatus::Duplicate => return Ok(None),
+        AdminApplyStatus::Redundant | AdminApplyStatus::StaleOriginSequence => {
+            let entry = reducer_state_entry(&reducer_state)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            return Ok(Some((Vec::new(), vec![entry])));
+        }
+    }
+
+    let previous_user = transaction_read(
+        storage,
+        document_target.storage_keyspace().to_string(),
+        document_target.storage_key(),
+        Some(txn_id),
+    )
+    .await?
+    .map(|bytes| User::from_bytes(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let user = materialize_user_operation(user_id, previous_user.as_ref(), &reducer_state, event);
+    // Turning inactive ends READ; a replay or repeat leaves the status unchanged.
+    let deactivating =
+        !previous_user.as_ref().is_some_and(User::is_deactivated) && user.is_deactivated();
+
+    let mut attempt_writes = vec![
+        (
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+            user.to_bytes(&event.actor)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .into(),
+        ),
+        reducer_state_entry(&reducer_state)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+    ];
+    attempt_writes.extend(
+        conflict_write_entries(&reducer_state)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+    );
+
+    let mut attempt_deletes = stale_conflict_deletes(previous_state.as_ref(), Some(&reducer_state));
+    let subject_ids = match (changed_subject_id, changed_alias) {
+        (Some(subject_id), _) => vec![subject_id.to_string()],
+        (None, Some(_)) => Vec::new(),
+        (None, None) => user.subject_ids.clone(),
+    };
+
+    // Markers come from this attempt so a bucket encrypted meanwhile is included.
+    if deactivating {
+        attempt_writes.extend(due_writes(storage, event, true, None, Some(txn_id)).await?);
+    }
+    for subject_id in &subject_ids {
+        let subject_key = subject_index_key(subject_id);
+        let mut claims = match transaction_read(
+            storage,
+            SUBJECT_CLAIMS_KEYSPACE.to_string(),
+            subject_key.clone(),
+            Some(txn_id),
+        )
+        .await?
+        {
+            Some(bytes) => postcard::from_bytes::<BTreeSet<UserId>>(&bytes)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            None => {
+                let mut claims = BTreeSet::new();
+                if let Some(bytes) = transaction_read(
+                    storage,
+                    SUBJECT_INDEX_KEYSPACE.to_string(),
+                    subject_key.clone(),
+                    Some(txn_id),
+                )
+                .await?
+                {
+                    claims.insert(
+                        UserId::from_storage_key(&bytes)
+                            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+                    );
+                }
+                claims
+            }
+        };
+        if user.subject_ids.contains(subject_id) {
+            claims.insert(user_id);
+        } else {
+            claims.remove(&user_id);
+        }
+
+        if let Some(canonical_user_id) = claims.first().copied() {
+            attempt_writes.push((
+                SUBJECT_CLAIMS_KEYSPACE.to_string(),
+                subject_key.clone(),
+                postcard::to_allocvec(&claims)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                    .into(),
+            ));
+            attempt_writes.push((
+                SUBJECT_INDEX_KEYSPACE.to_string(),
+                subject_key,
+                subject_index_value(canonical_user_id),
+            ));
+        } else {
+            attempt_deletes.push((SUBJECT_CLAIMS_KEYSPACE.to_string(), subject_key.clone()));
+            attempt_deletes.push((SUBJECT_INDEX_KEYSPACE.to_string(), subject_key));
+        }
+    }
+    // Claims of the linked login; more than one claim leaves it unusable until resolved.
+    if let Some(alias) = changed_alias {
+        let key = ByteView::from(aruna_core::link::alias_claims_key(&alias));
+        let mut claims = match transaction_read(
+            storage,
+            FEDERATION_KEYSPACE.to_string(),
+            key.clone(),
+            Some(txn_id),
+        )
+        .await?
+        {
+            Some(bytes) => postcard::from_bytes::<BTreeSet<UserId>>(&bytes)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            None => BTreeSet::new(),
+        };
+        if user.alias_user_ids.contains(&alias) {
+            claims.insert(user_id);
+        } else {
+            claims.remove(&user_id);
+        }
+        if claims.is_empty() {
+            attempt_deletes.push((FEDERATION_KEYSPACE.to_string(), key));
+        } else {
+            let value = postcard::to_allocvec(&claims)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            attempt_writes.push((FEDERATION_KEYSPACE.to_string(), key, value.into()));
+        }
+    }
+    Ok(Some((attempt_deletes, attempt_writes)))
 }
 
 pub(in crate::document_sync) async fn group_reducer_entries(
@@ -737,6 +813,7 @@ fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
             | AdminDocumentOperation::TransitionStallReported { .. }
             | AdminDocumentOperation::TransitionDrainReported { .. }
             | AdminDocumentOperation::ConfigComputeSet { .. }
+            | AdminDocumentOperation::ConfigFederationSet { .. }
             | AdminDocumentOperation::ConfigTokenRevoked { .. }
     )
 }
@@ -1203,6 +1280,14 @@ pub(in crate::document_sync) fn materialize_user_operation(
                 user.subject_ids.push(materialized_subject_id);
             }
         }
+        AdminDocumentOperation::UserAliasAdded { alias }
+        | AdminDocumentOperation::UserAliasRemoved { alias } => {
+            if reducer_state.materialized_alias(alias) {
+                user.alias_user_ids.insert(*alias);
+            } else {
+                user.alias_user_ids.remove(alias);
+            }
+        }
         AdminDocumentOperation::UserAttributeSet { key, .. }
         | AdminDocumentOperation::UserAttributeRemoved { key } => {
             let path = user_attribute_path(key);
@@ -1265,9 +1350,15 @@ fn validate_config_target(
 /// Whether a realm-config event's origin node and actor belong to the target
 /// realm.
 fn validate_config_actor(realm_id: RealmId, event: &AdminDocumentEvent) -> Result<()> {
+    // A federated user may only revoke its own token, which this realm issued.
+    let own_revocation = matches!(
+        &event.op,
+        AdminDocumentOperation::ConfigTokenRevoked { token_owner, .. }
+            if *token_owner == event.actor.user_id && !token_owner.is_nil()
+    );
     if event.origin_node_id != event.actor.node_id
         || event.actor.realm_id != realm_id
-        || event.actor.user_id.realm_id != realm_id
+        || (event.actor.user_id.realm_id != realm_id && !own_revocation)
     {
         return Err(NetError::Bootstrap(
             "realm config event actor and origin do not match the target realm".to_string(),
@@ -1299,8 +1390,7 @@ fn validate_revocation_snapshot(
     } = &event.op
         && (!aruna_core::auth::valid_token_hash(token_hash)
             || !valid_revocation_expiry(*expires_at, raw_now)
-            || token_owner.is_nil()
-            || token_owner.realm_id != realm_id)
+            || token_owner.is_nil())
     {
         return Err(NetError::Bootstrap(
             "replicated revocation has invalid hash, expiry, or owner".to_string(),
@@ -1317,7 +1407,7 @@ async fn apply_realm_config(
     let realm_id = validate_config_target(&document_target, &event)?;
     if !config_mutation_allowed(&event.op) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node membership updates, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, compute updates, and token revocations"
+            "realm config admin operation sync only supports node membership updates, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, compute updates, federation updates, and token revocations"
                 .to_string(),
         ));
     }

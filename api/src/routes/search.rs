@@ -991,6 +991,7 @@ async fn run_users(
             query: query.to_string(),
             limit,
             start_after: cursor,
+            exact_name: false,
         }),
         &state.get_ctx(),
     )

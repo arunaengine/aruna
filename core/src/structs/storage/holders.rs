@@ -6,6 +6,7 @@
 use crate::UserId;
 use crate::permission_path::permission_pattern_matches;
 use crate::structs::identity::auth::{Permission, Role};
+use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::user::vault::UserKeyRecord;
 use crate::structs::storage::encryption::{BucketHolder, HolderOrigin, SealedCopy};
 use serde::{Deserialize, Serialize};
@@ -127,11 +128,12 @@ pub fn revision_with_facts(
     *hasher.finalize().as_bytes()
 }
 
-/// Users with WRITE on `admin_path` through the realm and group roles; a matching deny of the
-/// user wins. Public roles grant no admin rights.
+/// Local users of `realm_id` with WRITE on `admin_path` through the realm and group roles; a
+/// matching deny of the user wins. Public roles and federated users hold no bucket keys.
 pub fn admin_users<'a>(
     roles: impl IntoIterator<Item = &'a Role>,
     admin_path: &str,
+    realm_id: RealmId,
 ) -> BTreeSet<UserId> {
     let mut decisions: BTreeMap<UserId, (bool, bool)> = BTreeMap::new();
     for role in roles {
@@ -140,7 +142,8 @@ pub fn admin_users<'a>(
             .iter()
             .filter(|(pattern, _)| permission_pattern_matches(pattern, admin_path));
         for (_, permission) in patterns {
-            for user_id in role.assigned_users.iter().filter(|user| !user.is_nil()) {
+            let local = |user: &&UserId| !user.is_nil() && user.realm_id == realm_id;
+            for user_id in role.assigned_users.iter().filter(local) {
                 let (write, deny) = decisions.entry(*user_id).or_default();
                 *write |= *permission == Permission::WRITE;
                 *deny |= *permission == Permission::DENY;

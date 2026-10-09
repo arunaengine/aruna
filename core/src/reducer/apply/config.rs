@@ -36,6 +36,13 @@ impl AdminDocumentState {
             AdminDocumentOperation::ConfigComputeSet { compute } => {
                 self.apply_config_setting(event, CONFIG_COMPUTE_PATH, compute_value(compute));
             }
+            AdminDocumentOperation::ConfigFederationSet { settings } => {
+                self.apply_config_setting(
+                    event,
+                    CONFIG_FEDERATION_PATH,
+                    federation_value(settings),
+                );
+            }
             AdminDocumentOperation::ConfigPoliciesSet { policies } => {
                 self.apply_config_setting(event, CONFIG_POLICIES_PATH, policies_value(policies));
             }

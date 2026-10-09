@@ -565,7 +565,8 @@ fn join_payload_validates() {
         actor_user_id,
     };
     assert!(validate_inbound_kind(&valid, realm_id).is_ok());
-    assert!(validate_inbound_kind(&valid, RealmId::from_bytes([8; 32])).is_err());
+    // A federated requester of another realm may be named on an admin-bound record.
+    assert!(validate_inbound_kind(&valid, RealmId::from_bytes([8; 32])).is_ok());
     let invalid = NotificationKind::GroupJoinRequested {
         group_id,
         request_id: Ulid::nil(),
@@ -1474,6 +1475,10 @@ fn metadata_path_accepted() {
     };
 
     assert!(validate_watch_event(&event, realm_id, 1_000).is_ok());
+    // A federated actor is accepted; the event itself must still belong to this realm.
+    event.actor = UserId::new(Ulid::generate(), RealmId::from_bytes([78u8; 32]));
+    assert!(validate_watch_event(&event, realm_id, 1_000).is_ok());
+    assert!(validate_watch_event(&event, RealmId::from_bytes([78u8; 32]), 1_000).is_err());
 
     event.path = format!("meta/{group_id}/datasets/project/");
     assert_eq!(

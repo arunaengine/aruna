@@ -100,7 +100,6 @@ impl RevokeSessionOperation {
         if session.sid.as_bytes() != key
             || session.sid != self.session_id
             || session.user_id != self.actor.user_id
-            || session.user_id.realm_id != self.actor.realm_id
         {
             return Err(RevokeSessionError::NotFound);
         }
@@ -303,6 +302,7 @@ mod pure_tests {
             expires_at: 20,
             token_hash: "a".repeat(64),
             revoked: true,
+            via: None,
         };
         let mut operation = RevokeSessionOperation::new(
             Actor {
@@ -320,5 +320,39 @@ mod pure_tests {
         }));
 
         assert!(operation.finalize().unwrap().unwrap().revoked);
+    }
+
+    #[test]
+    fn revokes_federated_session() {
+        // A federated user served by realm 3 revokes its own session and token.
+        let realm_id = RealmId::from_bytes([3; 32]);
+        let user_id = UserId::new(Ulid::from_bytes([4; 16]), RealmId::from_bytes([9; 32]));
+        let session_id = Ulid::from_bytes([5; 16]).to_string();
+        let record = UserSession {
+            sid: session_id.clone(),
+            user_id,
+            kind: SessionKind::Federated,
+            label: None,
+            created_at: 10,
+            expires_at: 20,
+            token_hash: "a".repeat(64),
+            revoked: false,
+            via: None,
+        };
+        let mut operation = RevokeSessionOperation::new(
+            Actor {
+                node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
+                user_id,
+                realm_id,
+            },
+            session_id.clone(),
+            15,
+        );
+        operation.start();
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: session_id.as_bytes().into(),
+            value: Some(record.to_bytes().unwrap().into()),
+        }));
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
     }
 }

@@ -548,7 +548,14 @@ pub(in crate::document_sync) async fn validate_user_authority(
     }
 
     let self_service = event.actor.user_id == user_id;
-    let management_bootstrap = event.actor.user_id.is_nil_in(realm_id)
+    // Only the account owner links a login; the owner or a realm administrator unlinks it.
+    let alias = matches!(
+        event.op,
+        AdminDocumentOperation::UserAliasAdded { .. }
+            | AdminDocumentOperation::UserAliasRemoved { .. }
+    );
+    let management_bootstrap = !alias
+        && event.actor.user_id.is_nil_in(realm_id)
         && matches!(origin_kind, RealmNodeKind::Management)
         && event.origin_seq <= 2
         && previous_state.is_none_or(|state| {
@@ -558,7 +565,10 @@ pub(in crate::document_sync) async fn validate_user_authority(
                 .keys()
                 .all(|origin| *origin == event.origin_node_id)
         });
-    let realm_admin = if self_service || management_bootstrap {
+    let realm_admin = if self_service
+        || management_bootstrap
+        || matches!(event.op, AdminDocumentOperation::UserAliasAdded { .. })
+    {
         false
     } else {
         let Some(auth) = read_realm_authorization(storage, realm_id).await? else {
@@ -578,7 +588,7 @@ pub(in crate::document_sync) async fn validate_user_authority(
             auth.roles.values(),
         )
     };
-    let group_admin = if self_service || management_bootstrap || realm_admin {
+    let group_admin = if self_service || management_bootstrap || realm_admin || alias {
         false
     } else if let Some(group_id) = service_owner(event, previous_state, current_user.as_ref()) {
         let Some(auth) = read_group_authorization(storage, group_id).await? else {
@@ -1258,7 +1268,9 @@ async fn validate_admin_envelope(
     {
         return reject("relayed admin event publisher is not a realm relay node");
     }
-    if event.actor.user_id.realm_id != event.actor.realm_id {
+    if event.actor.user_id.realm_id != event.actor.realm_id
+        && !foreign_actor_allowed(event, realm_id)
+    {
         return reject("actor user and actor realm do not match");
     }
     if event.event_id.is_nil() || event.origin_seq == 0 {
@@ -1273,6 +1285,19 @@ async fn validate_admin_envelope(
         return reject("event origin sequence does not follow its observed clock");
     }
     Ok(AdminEventValidation::Accepted)
+}
+
+/// A federated user acts through the reconciled realm only on group events, which the group
+/// authority check still decides, and to revoke its own token.
+fn foreign_actor_allowed(event: &AdminDocumentEvent, realm_id: RealmId) -> bool {
+    event.actor.realm_id == realm_id
+        && !event.actor.user_id.is_nil()
+        && match &event.op {
+            AdminDocumentOperation::ConfigTokenRevoked { token_owner, .. } => {
+                *token_owner == event.actor.user_id
+            }
+            _ => matches!(event.target, AdminDocumentTarget::Group { .. }),
+        }
 }
 
 /// Whether the dispatched family agrees with both the sync target address and
@@ -1340,12 +1365,17 @@ fn validate_event_scope(event: &AdminDocumentEvent) -> std::result::Result<(), S
     Ok(())
 }
 
-/// Whether a role assignment names a user in the event actor's realm.
+/// Whether a role assignment names a user in the event actor's realm. Group roles may also
+/// name a federated user of another realm; realm roles stay local.
 fn validate_role_assignment(event: &AdminDocumentEvent) -> std::result::Result<(), String> {
     match &event.op {
         AdminDocumentOperation::GroupAssignmentAdded { user_id, .. }
         | AdminDocumentOperation::GroupAssignmentRemoved { user_id, .. }
-        | AdminDocumentOperation::RealmAssignmentAdded { user_id, .. }
+            if user_id.realm_id != event.actor.realm_id && user_id.is_nil() =>
+        {
+            Err("role assignment names another realm's public principal".to_string())
+        }
+        AdminDocumentOperation::RealmAssignmentAdded { user_id, .. }
         | AdminDocumentOperation::RealmAssignmentRemoved { user_id, .. }
             if user_id.realm_id != event.actor.realm_id =>
         {
@@ -1420,6 +1450,14 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
             // meaningless, so it is refused before it reaches storage.
             if compute.validate().is_err() {
                 return Err("realm compute configuration is malformed".to_string());
+            }
+        }
+        AdminDocumentOperation::ConfigFederationSet { settings } => {
+            // Only a holder of the realm key or its delegate can publish a descriptor.
+            if let AdminDocumentTarget::RealmConfig { realm_id } = &event.target
+                && let Err(error) = settings.validate(realm_id)
+            {
+                return Err(format!("realm federation settings rejected: {error}"));
             }
         }
         AdminDocumentOperation::CandidateMapPublished { map } => {
@@ -1520,7 +1558,8 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
             if !valid_revocation_expiry(*expires_at, unix_timestamp_secs()) {
                 return Err("revoked bearer token expiry exceeds the admission window".to_string());
             }
-            if token_owner.is_nil() || token_owner.realm_id != event.actor.realm_id {
+            // A token this realm issued may belong to a federated user of another realm.
+            if token_owner.is_nil() {
                 return Err("revoked bearer token owner is malformed".to_string());
             }
         }
@@ -1602,7 +1641,9 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::UserAttributeRemoved { .. }
         | AdminDocumentOperation::UserNameSet { .. }
         | AdminDocumentOperation::SubjectIdAdded { .. }
-        | AdminDocumentOperation::SubjectIdRemoved { .. } => AdminOperationFamily::User,
+        | AdminDocumentOperation::SubjectIdRemoved { .. }
+        | AdminDocumentOperation::UserAliasAdded { .. }
+        | AdminDocumentOperation::UserAliasRemoved { .. } => AdminOperationFamily::User,
         AdminDocumentOperation::ConfigNodeEnsured { .. }
         | AdminDocumentOperation::ConfigNodeRemoved { .. }
         | AdminDocumentOperation::OidcProviderUpserted { .. }
@@ -1634,6 +1675,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::TransitionStallReported { .. }
         | AdminDocumentOperation::TransitionDrainReported { .. }
         | AdminDocumentOperation::ConfigComputeSet { .. }
+        | AdminDocumentOperation::ConfigFederationSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
     };
 

@@ -54,6 +54,8 @@ pub struct OidcIdentity {
     pub issuer: String,
     pub subject_id: String,
     pub display_name: Option<String>,
+    /// Verified provider login time; `None` when the provider did not send it.
+    pub auth_time: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +96,8 @@ struct OidcClaims {
     given_name: Option<String>,
     #[serde(default)]
     family_name: Option<String>,
+    #[serde(default)]
+    auth_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -263,6 +267,7 @@ impl OidcValidator {
             issuer: claims.iss,
             subject_id: claims.sub,
             display_name,
+            auth_time: claims.auth_time,
         })
     }
 }
@@ -463,6 +468,14 @@ impl ArunaValidationState for RevocationBlindState<'_> {
         realm_id: &aruna_core::structs::identity::realm::RealmId,
     ) -> bool {
         self.0.is_trusted_realm(realm_id).await
+    }
+
+    async fn linked_owner(
+        &self,
+        realm_id: &aruna_core::structs::identity::realm::RealmId,
+        via: &aruna_core::UserId,
+    ) -> Result<Option<aruna_core::UserId>, ArunaBearerError> {
+        self.0.linked_owner(realm_id, via).await
     }
 
     async fn issuer_decoding_key(
@@ -1948,6 +1961,9 @@ mod test {
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,
+            name: None,
+            via: None,
+            auth_time: None,
         };
         let der = issuer_key
             .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)

@@ -29,8 +29,8 @@ use aruna_core::keyspaces::{
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{
     ExportRoCrateSpec, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
-    ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload, JobRecord, JobResultPayload,
-    ReasonCode, RoCrateLimits, RoCrateMediaType, RoCrateUploadRecord,
+    ImportRoCrateSpec, ImportRoCrateTarget, JobErrorKind, JobId, JobPayload, JobRecord,
+    JobResultPayload, ReasonCode, RoCrateLimits, RoCrateMediaType, RoCrateUploadRecord,
 };
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
@@ -188,6 +188,7 @@ async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(materialized.processed, 1);
 
     let export = ExportRoCrateSpec {
+        selection: None,
         destination: None,
         auth_context: AuthContext {
             user_id: fixture.actor.user_id,
@@ -361,9 +362,19 @@ async fn rejects_before_writes() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn rollback_removes_writes() -> Result<(), Box<dyn std::error::Error>> {
+    check_rollback(false).await
+}
+
+#[tokio::test]
+async fn final_failure_cleans() -> Result<(), Box<dyn std::error::Error>> {
+    // A permanent error on the final attempt still runs the failure cleanup.
+    check_rollback(true).await
+}
+
+async fn check_rollback(final_attempt: bool) -> Result<(), Box<dyn std::error::Error>> {
     // The second payload fails its checksum after the first one has landed.
     let fixture = build_fixture(false).await?;
-    let existing = put_object(&fixture, "imported/data1.txt", b"kept".to_vec()).await?;
+    let existing = put_object(&fixture, "imported/kept.txt", b"kept".to_vec()).await?;
     let mut archive = pair_archive().await?;
     let local = zip_offsets(&archive, b"PK\x03\x04")[2];
     let central = zip_offsets(&archive, b"PK\x01\x02")[2];
@@ -373,19 +384,27 @@ async fn rollback_removes_writes() -> Result<(), Box<dyn std::error::Error>> {
     let upload_id = create_upload(&fixture, archive).await?;
     let spec = import_spec(&fixture, upload_id, document_id);
     let job_id = job_id();
-    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let mut context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    context.final_attempt = final_attempt;
 
     let JobRunOutcome::Failed(error) = run_rocrate_import(&context, &spec).await else {
         return Err("checksum mismatch did not fail the import".into());
     };
 
+    assert_eq!(error.kind, JobErrorKind::Permanent);
     assert!(
         error.message.contains("1 written object was removed"),
         "{}",
         error.message
     );
+    assert!(
+        object_versions(&fixture, "imported/data1.txt")
+            .await?
+            .is_empty()
+    );
     assert_eq!(
-        object_versions(&fixture, "imported/data1.txt").await?,
+        object_versions(&fixture, "imported/kept.txt").await?,
         vec![existing.version_id]
     );
     assert!(
@@ -407,9 +426,9 @@ async fn rollback_removes_writes() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn resumes_pending_rollback() -> Result<(), Box<dyn std::error::Error>> {
-    // A run that dies inside cleanup leaves written versions behind, so the
-    // resumed run must load the plan and roll them back.
+async fn final_retry_resumes() -> Result<(), Box<dyn std::error::Error>> {
+    // A temporary error on the final attempt must leave the job retryable, so the
+    // later run resumes the write instead of finding a failed job.
     let mut fixture = build_fixture(true).await?;
     let document_id = doc_id(1);
     let upload_id = create_upload(&fixture, pair_archive().await?).await?;
@@ -442,22 +461,23 @@ async fn resumes_pending_rollback() -> Result<(), Box<dyn std::error::Error>> {
     gate_result?;
 
     // Break every bucket lookup once the first payload is committed: the next
-    // write fails, and the rollback that follows cannot finish either.
+    // write fails with a temporary error.
     let gate = fixture.gate.as_ref().expect("gated fixture");
     gate.fail_buckets(true);
     gate.release();
-    let JobRunOutcome::Failed(interrupted) = first_run.await? else {
+    let JobRunOutcome::Failed(temporary) = first_run.await? else {
         return Err("import with an unreadable bucket did not fail".into());
     };
+    assert_eq!(temporary.kind, JobErrorKind::Retryable);
     assert!(
-        interrupted.message.contains("rollback cannot read bucket"),
+        !temporary.message.contains("written object"),
         "{}",
-        interrupted.message
+        temporary.message
     );
     assert_eq!(
         object_versions(&fixture, "imported/data1.txt").await?.len(),
         1,
-        "the interrupted cleanup must leave its write in place"
+        "a temporary error must not roll back the first write"
     );
     gate.fail_buckets(false);
 
@@ -471,27 +491,15 @@ async fn resumes_pending_rollback() -> Result<(), Box<dyn std::error::Error>> {
     let second_context =
         claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
 
-    let JobRunOutcome::Failed(error) = run_rocrate_import(&second_context, &spec).await else {
-        return Err("resumed cleanup did not fail the import".into());
+    let JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) =
+        run_rocrate_import(&second_context, &spec).await
+    else {
+        return Err("resumed import did not succeed".into());
     };
-
-    assert!(
-        error.message.contains("1 written object was removed"),
-        "{}",
-        error.message
-    );
-    assert!(
-        object_versions(&fixture, "imported/data1.txt")
-            .await?
-            .is_empty()
-    );
-    let rows = read_rows(&fixture, job_id).await?;
-    let first = rows
-        .iter()
-        .find(|row| row.entry_key == "data1.txt")
-        .ok_or("first entry report row is missing")?;
-    assert_eq!(first.code, ReasonCode::Failed);
-    assert_eq!(first.detail.version_id, None);
+    assert_eq!(result.imported, 2);
+    for key in ["imported/data1.txt", "imported/data2.txt"] {
+        assert_eq!(object_versions(&fixture, key).await?.len(), 1, "{key}");
+    }
 
     fixture.stop().await;
     Ok(())
@@ -833,6 +841,7 @@ async fn local_denial_omits() -> Result<(), Box<dyn std::error::Error>> {
         document_id,
     );
     let export = ExportRoCrateSpec {
+        selection: None,
         destination: None,
         auth_context: AuthContext {
             user_id: fixture.actor.user_id,

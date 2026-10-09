@@ -73,7 +73,10 @@ impl Operation for MemberKeysOperation {
     type Output = Vec<Ulid>;
     type Error = KeyError;
     fn start(&mut self) -> Effects {
-        self.members.retain(|member| !member.is_nil());
+        // Federated members of another realm get no key requests.
+        let realm_id = self.auth.realm_id;
+        self.members
+            .retain(|member| !member.is_nil() && member.realm_id == realm_id);
         if self.members.is_empty() {
             return self.next();
         }
@@ -119,5 +122,29 @@ impl Operation for MemberKeysOperation {
     }
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::realm::RealmId;
+
+    #[test]
+    fn skips_foreign_members() {
+        // Approving a federated member opens no key request and scans nothing.
+        let realm_id = RealmId([1; 32]);
+        let auth = AuthContext {
+            user_id: UserId::new(Ulid::from_bytes([2; 16]), realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let foreign = UserId::new(Ulid::from_bytes([3; 16]), RealmId([9; 32]));
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let group_id = Ulid::from_bytes([4; 16]);
+        let mut operation = MemberKeysOperation::new(auth, node, group_id, vec![foreign], 1);
+        assert!(operation.start().is_empty());
+        assert_eq!(operation.finalize(), Ok(Vec::new()));
     }
 }

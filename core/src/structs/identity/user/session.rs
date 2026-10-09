@@ -17,6 +17,8 @@ pub struct UserSession {
     pub expires_at: u64,
     pub token_hash: String,
     pub revoked: bool,
+    /// The linked login of another realm a federated session of this account came through.
+    pub via: Option<UserId>,
 }
 
 impl UserSession {

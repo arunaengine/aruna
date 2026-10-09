@@ -34,6 +34,8 @@ const OIDC_ORIGIN_TTL: Duration = Duration::from_secs(60);
 const OIDC_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const ORIGIN_OPENER_POLICY: HeaderName = HeaderName::from_static("cross-origin-opener-policy");
+/// Portal paths of the federation popup pages a realm portal opens at the home realm.
+pub(crate) const FEDERATION_POPUP_PREFIX: &str = "/federation/";
 
 /// Extra origins the portal document may connect to, on top of this node's own
 /// REST origin, its S3 interface and the realm's OIDC providers. Needed when a
@@ -235,12 +237,18 @@ pub(crate) async fn portal_security_headers(
         }
     };
 
+    // Portal pages keep the link to federation popups they open; the popup pages keep their opener.
+    let opener_policy = if request.uri().path().starts_with(FEDERATION_POPUP_PREFIX) {
+        "unsafe-none"
+    } else {
+        "same-origin-allow-popups"
+    };
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_SECURITY_POLICY, policy);
     headers.insert(
         ORIGIN_OPENER_POLICY,
-        HeaderValue::from_static("same-origin"),
+        HeaderValue::from_static(opener_policy),
     );
     response
 }

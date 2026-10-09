@@ -80,6 +80,8 @@ pub enum TaskKey {
     RecordAudit {
         record: Box<crate::structs::storage::key_audit::BucketAuditRecord>,
     },
+    /// Registers the realm with its registry, or withdraws it, on the reporting node.
+    PublishRegistration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

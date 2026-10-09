@@ -9,24 +9,26 @@ use aruna::identity::PersistedNodeState;
 use aruna_core::NodeId;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, seal_bytes};
 use aruna_core::document::DocumentTarget;
+use aruna_core::federation::FederationSettings;
 use aruna_core::git::GitRecord;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, EVENT_LOG_KEYSPACE,
-    EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, DEDUP_INDEX_KEYSPACE,
+    EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE,
     FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE,
     JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE,
     SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SYNC_OUTBOX_KEYSPACE, UPLOAD_KEYSPACE,
-    UPLOAD_PART_KEYSPACE,
+    UPLOAD_PART_KEYSPACE, USER_SESSION_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
 use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
-    JobRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
+    JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
 use aruna_core::structs::storage::blob::{BlobVersion, BucketInfo};
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
@@ -41,9 +43,11 @@ mod buckets;
 mod git;
 mod jobs;
 mod mappings;
+mod session_refs;
 mod sessions;
 mod sizes;
 mod uploads;
+mod user_sessions;
 mod vault;
 mod versions;
 
@@ -76,9 +80,13 @@ pub struct MigrateOutput {
     /// Identifier index rows written or removed so the index matches the mappings.
     pub identifier_index_written: usize,
     pub identifier_index_removed: usize,
-    /// Local job records; export jobs gain empty repository fields.
+    /// Local job records; export jobs gain empty repository fields, and session references
+    /// without a display name or linked login gain empty ones.
     pub jobs_scanned: usize,
     pub jobs_rewritten: usize,
+    /// Dedup rows whose plan digest follows a rewritten job.
+    pub job_dedup_scanned: usize,
+    pub job_dedup_rewritten: usize,
     /// Checkpoints of RO-Crate import and export jobs.
     pub checkpoints_scanned: usize,
     pub checkpoints_rewritten: usize,
@@ -103,6 +111,9 @@ pub struct MigrateOutput {
     /// Bucket records from before buckets carried a compression setting.
     pub buckets_scanned: usize,
     pub buckets_rewritten: usize,
+    /// Login sessions from before a session named the linked login it came through.
+    pub user_sessions_scanned: usize,
+    pub user_sessions_rewritten: usize,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -140,6 +151,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let cleanup_rows = db.keyspace(BLOB_CLEANUP_KEYSPACE, KeyspaceCreateOptions::default)?;
     let version_rows = db.keyspace(BLOB_VERSIONS_KEYSPACE, KeyspaceCreateOptions::default)?;
     let bucket_rows = db.keyspace(S3_BUCKET_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let login_rows = db.keyspace(USER_SESSION_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let dedup_rows = db.keyspace(DEDUP_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -171,6 +184,11 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     )?;
     let buckets =
         rewrites::<BucketInfo, buckets::LegacyBucket>(&db, &bucket_rows, S3_BUCKET_KEYSPACE)?;
+    let logins = rewrites::<UserSession, user_sessions::LegacySession>(
+        &db,
+        &login_rows,
+        USER_SESSION_KEYSPACE,
+    )?;
     let record = |target: &DocumentTarget| matches!(target, DocumentTarget::GitRecord { .. });
     let git_outbox = mappings::outbox_rows(
         &db,
@@ -185,7 +203,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         &index_rows,
         ID_MAPPING_KEYSPACE,
     )?;
-    let jobs = rewrites::<JobRecord, jobs::LegacyJob>(&db, &job_rows, JOB_KEYSPACE)?;
+    let jobs = jobs::job_rows(&db, &job_rows, JOB_KEYSPACE)?;
+    let dedup = jobs::dedup_rows(&db, &dedup_rows, &jobs.rows, DEDUP_INDEX_KEYSPACE)?;
     let kinds = jobs::checkpoint_kinds(&db, &job_rows, &jobs.rows, JOB_KEYSPACE)?;
     let checkpoints = jobs::checkpoint_rows(&db, &state_rows, &kinds, JOB_STATE_KEYSPACE)?;
     let keys = node_secret(&db)?.map(|secret| {
@@ -223,8 +242,10 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         (&size_rows, &sizes.rows),
         (&version_rows, &versions.rows),
         (&bucket_rows, &buckets.rows),
+        (&login_rows, &logins.rows),
         (&index_rows, &index.writes),
         (&job_rows, &jobs.rows),
+        (&dedup_rows, &dedup.rows),
         (&state_rows, &checkpoints.rows),
         (&owner_rows, &stale.owner_writes),
         (&cleanup_rows, &old_uploads.blob_deletes),
@@ -291,6 +312,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         identifier_index_removed: index.removes.len(),
         jobs_scanned: jobs.scanned,
         jobs_rewritten: jobs.rows.len(),
+        job_dedup_scanned: dedup.scanned,
+        job_dedup_rewritten: dedup.rows.len(),
         checkpoints_scanned: checkpoints.scanned,
         checkpoints_rewritten: checkpoints.rows.len(),
         git_records_scanned: git_records.scanned,
@@ -307,6 +330,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         versions_rewritten: versions.rows.len(),
         buckets_scanned: buckets.scanned,
         buckets_rewritten: buckets.rows.len(),
+        user_sessions_scanned: logins.scanned,
+        user_sessions_rewritten: logins.rows.len(),
     })
 }
 
@@ -410,13 +435,15 @@ fn realm_configs(
 }
 
 /// Appends the trailing defaults an older row lacks, shortest suffix first, so
-/// a row missing only the newest value keeps the one it already has.
+/// a row missing only the newest value keeps the one it already has. Every older
+/// row also lacks the federation settings, which follow the timeouts.
 fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
+    let federation = postcard::to_allocvec(&None::<FederationSettings>).ok()?;
     let idle = postcard::to_allocvec(&IDLE_AFTER_MS).ok()?;
     let catch_up = postcard::to_allocvec(&CATCH_UP_MS).ok()?;
-    let mut both = catch_up;
-    both.extend_from_slice(&idle);
-    for suffix in [idle, both] {
+    let idle_on = [idle.as_slice(), &federation].concat();
+    let both = [catch_up.as_slice(), &idle_on].concat();
+    for suffix in [federation, idle_on, both] {
         let mut bytes = value.to_vec();
         bytes.extend_from_slice(&suffix);
         if RealmConfigDocument::from_bytes(&bytes).is_ok() {
@@ -786,22 +813,26 @@ mod tests {
 
     #[test]
     fn rewrites_realm_configs() {
-        // Legacy documents decode with defaults for catch-up and session idle timeouts.
-        // Current documents remain byte-identical.
+        // Legacy documents decode with defaults for catch-up and session idle timeouts and
+        // without federation settings. Current documents remain byte-identical.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         let document = RealmConfigDocument::new(REALM, Vec::new(), 3);
         let current = postcard::to_allocvec(&document).unwrap();
+        // Every legacy layout ends where the fields it lacks would start.
+        let federation = postcard::to_allocvec(&None::<super::FederationSettings>).unwrap();
         let idle = postcard::to_allocvec(&IDLE_AFTER_MS).unwrap();
         let catch_up = postcard::to_allocvec(&CATCH_UP_MS).unwrap();
-        let one_missing = current[..current.len() - idle.len()].to_vec();
-        let both_missing = current[..current.len() - idle.len() - catch_up.len()].to_vec();
+        let unfederated = current[..current.len() - federation.len()].to_vec();
+        let one_missing = unfederated[..unfederated.len() - idle.len()].to_vec();
+        let both_missing = one_missing[..one_missing.len() - catch_up.len()].to_vec();
         write(
             &path,
             REALM_CONFIG_KEYSPACE,
             vec![
                 (b"old", both_missing),
                 (b"newer", one_missing),
+                (b"main", unfederated),
                 (b"new", current.clone()),
             ],
         );
@@ -810,10 +841,11 @@ mod tests {
 
         assert_eq!(
             (output.realm_configs_scanned, output.realm_configs_rewritten),
-            (3, 2)
+            (4, 3)
         );
         let rows = read(&path, REALM_CONFIG_KEYSPACE);
         assert_eq!(rows[b"new".as_slice()], current);
+        assert_eq!(rows[b"main".as_slice()], current);
         let migrated = RealmConfigDocument::from_bytes(&rows[b"old".as_slice()]).unwrap();
         assert_eq!(migrated.compute.catch_up_ms, CATCH_UP_MS);
         assert_eq!(migrated.compute.session_idle_ms, IDLE_AFTER_MS);

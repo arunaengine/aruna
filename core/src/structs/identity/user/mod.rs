@@ -50,6 +50,16 @@ impl User {
             .get(SERVICE_GROUP_ATTRIBUTE)
             .and_then(|group| group.parse().ok())
     }
+
+    /// Whether `via` opens sessions of this account: it is linked, and replication left no
+    /// second linked login of the same realm; such a conflict stays unusable until one is removed.
+    pub fn linked_login(&self, via: &UserId) -> bool {
+        self.alias_user_ids.contains(via)
+            && !self
+                .alias_user_ids
+                .iter()
+                .any(|alias| alias != via && alias.realm_id == via.realm_id)
+    }
 }
 
 #[cfg(test)]

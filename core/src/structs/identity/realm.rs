@@ -213,6 +213,8 @@ pub struct RealmConfigDocument {
     /// Operator knowledge the planner reads: directed transfer bandwidth and
     /// the staleness bound of ranking telemetry.
     pub compute: crate::structs::placement::compute_config::RealmComputeConfig,
+    /// Realm-wide federation settings and the descriptor signed from them.
+    pub federation: Option<crate::federation::FederationSettings>,
 }
 
 /// One realm-wide bearer token revocation. The expiry is the revoked token's
@@ -468,6 +470,8 @@ impl RealmConfigDocument {
         // Exclude request policies because they do not route requests; each receiver enforces its local set,
         // and nodes without a realm-config bucket may never observe them.
         canonical.request_policies.clear();
+        // Exclude federation settings for the same reason: they never route requests.
+        canonical.federation = None;
         let encoded = postcard::to_allocvec(&canonical)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"aruna-realm-config-v1");
@@ -504,6 +508,7 @@ impl RealmConfigDocument {
             placement_activations: Vec::new(),
             placement_transitions: Vec::new(),
             compute: crate::structs::placement::compute_config::RealmComputeConfig::default(),
+            federation: None,
         }
     }
 
@@ -1198,6 +1203,7 @@ mod test {
             candidate_maps: Vec::new(),
             placement_activations: Vec::new(),
             placement_transitions: Vec::new(),
+            federation: None,
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -1756,6 +1762,7 @@ mod test {
             candidate_maps: Vec::new(),
             placement_activations: Vec::new(),
             placement_transitions: Vec::new(),
+            federation: None,
         };
 
         assert_eq!(document.replication_factor_for(other_group_id, None), 3);

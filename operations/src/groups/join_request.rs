@@ -339,6 +339,7 @@ impl GroupJoinOperation {
                 RoutingContext {
                     group_auth: Some(&auth),
                     realm_auth: None,
+                    realm_id: self.input.actor.realm_id,
                 },
                 self.input.now_ms,
             )
@@ -441,7 +442,6 @@ impl Operation for GroupJoinOperation {
             || self.input.actor.user_id.is_nil()
             || self.input.auth.user_id != self.input.actor.user_id
             || self.input.auth.realm_id != self.input.actor.realm_id
-            || self.input.actor.user_id.realm_id != self.input.actor.realm_id
         {
             return self.fail(GroupJoinError::Unauthorized);
         }
@@ -583,8 +583,9 @@ mod pure_tests {
             user_id: UserId::local(Ulid::from_bytes([1; 16]), realm_id),
             realm_id,
         };
+        // A federated user of realm 9 asks to join and is approved.
         let member = Actor {
-            user_id: UserId::local(Ulid::from_bytes([2; 16]), realm_id),
+            user_id: UserId::new(Ulid::from_bytes([2; 16]), RealmId::from_bytes([9; 32])),
             ..actor.clone()
         };
         let auth_doc =
@@ -603,6 +604,16 @@ mod pure_tests {
             roles: auth_doc.roles.keys().copied().collect(),
         };
         let mut reducer = AdminDocumentState::new(AdminDocumentTarget::Group { group_id });
+        reducer
+            .apply_operation(
+                &actor,
+                AdminDocumentOperation::GroupCreated {
+                    realm_id,
+                    display_name: "Group".into(),
+                    owner: actor.user_id,
+                },
+            )
+            .unwrap();
         for role in auth_doc.roles.values() {
             reducer
                 .apply_operation(

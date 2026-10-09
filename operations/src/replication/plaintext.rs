@@ -15,6 +15,7 @@ use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
     PLAINTEXT_COPY_KEYSPACE,
 };
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketHolder, BucketKeyRecord, HolderOrigin, KeyState,
 };
@@ -117,17 +118,22 @@ pub async fn consent_required(context: &DriverContext, bucket: &str) -> Result<b
     }
 }
 
-/// Whether `user` holds the key of `bucket` now: its creator, a current group admin, or an
-/// explicit holder. Losing the admin role ends it at once (D30).
+/// Whether `user` holds the key of `bucket` in realm `realm_id` now: its creator, a current group
+/// admin, or an explicit holder. Losing the admin role ends it at once (D30). A user of another
+/// realm never holds one.
 pub async fn is_holder(
     context: &DriverContext,
+    realm_id: RealmId,
     bucket: &str,
     user: UserId,
 ) -> Result<bool, String> {
+    if user.realm_id != realm_id {
+        return Ok(false);
+    }
     let info = drive(GetBucketOperation::new(bucket.to_string()), context)
         .await
         .map_err(|error| error.to_string())?;
-    let (realm_id, group_id) = (user.realm_id, info.group_id);
+    let group_id = info.group_id;
     let read = authority_read(bucket, realm_id, group_id, None);
     let Effect::Storage(read) = read else {
         return Err("not a storage read".to_string());
@@ -157,6 +163,7 @@ pub async fn is_holder(
 /// request in `row` must be theirs, and they must still hold the bucket key.
 pub async fn plaintext_allowed(
     context: &DriverContext,
+    realm_id: RealmId,
     bucket: &str,
     requester: UserId,
     row: Vec<u8>,
@@ -164,27 +171,27 @@ pub async fn plaintext_allowed(
     if read_consent(context, row).await? != Some(requester) {
         return Ok(false);
     }
-    is_holder(context, bucket, requester).await
+    is_holder(context, realm_id, bucket, requester).await
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, S3_BUCKET_KEYSPACE};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
-    use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+    use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::encryption::{EncryptionMode, GrantState};
     use std::time::SystemTime;
 
-    fn user(seed: u8) -> UserId {
+    pub(crate) fn user(seed: u8) -> UserId {
         UserId::new(Ulid::from_bytes([seed; 16]), RealmId::from_bytes([3; 32]))
     }
 
     /// An encrypting bucket created by user 1, whose group user 2 administers, with an explicit
     /// grant to user 3.
-    async fn bucket(context: &DriverContext) {
+    pub(crate) async fn bucket(context: &DriverContext) {
         let realm_id = RealmId::from_bytes([3; 32]);
         let group_id = Ulid::from_bytes([4; 16]);
         let bucket_id = Ulid::from_bytes([5; 16]);
@@ -266,15 +273,19 @@ mod tests {
         let (_dir, storage) = crate::tests::s3::test_storage();
         let context = crate::tests::s3::test_context(storage);
         bucket(&context).await;
+        let realm = RealmId::from_bytes([3; 32]);
         assert!(source_encrypted(&context, "sealed").await.unwrap());
         for (seed, holder) in [(1, true), (2, true), (3, true), (4, false)] {
-            assert_eq!(is_holder(&context, "sealed", user(seed)).await, Ok(holder));
+            assert_eq!(
+                is_holder(&context, realm, "sealed", user(seed)).await,
+                Ok(holder)
+            );
         }
 
         let row = relationship_consent(Ulid::from_bytes([6; 16]));
         // No request, or a request of another user, never permits plaintext.
         assert!(
-            !plaintext_allowed(&context, "sealed", user(1), row.clone())
+            !plaintext_allowed(&context, realm, "sealed", user(1), row.clone())
                 .await
                 .unwrap()
         );
@@ -282,12 +293,12 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !plaintext_allowed(&context, "sealed", user(4), row.clone())
+            !plaintext_allowed(&context, realm, "sealed", user(4), row.clone())
                 .await
                 .unwrap()
         );
         assert!(
-            !plaintext_allowed(&context, "sealed", user(1), row.clone())
+            !plaintext_allowed(&context, realm, "sealed", user(1), row.clone())
                 .await
                 .unwrap()
         );
@@ -295,7 +306,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            plaintext_allowed(&context, "sealed", user(1), row.clone())
+            plaintext_allowed(&context, realm, "sealed", user(1), row.clone())
                 .await
                 .unwrap()
         );
@@ -303,9 +314,23 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !plaintext_allowed(&context, "sealed", user(1), row)
+            !plaintext_allowed(&context, realm, "sealed", user(1), row)
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_never_holds() {
+        // A user of another realm holds no key here, even with the ULID of the bucket's creator.
+        let (_dir, storage) = crate::tests::s3::test_storage();
+        let context = crate::tests::s3::test_context(storage);
+        bucket(&context).await;
+        let local = RealmId::from_bytes([3; 32]);
+        let foreign = UserId::new(Ulid::from_bytes([1; 16]), RealmId::from_bytes([9; 32]));
+        assert_eq!(
+            is_holder(&context, local, "sealed", foreign).await,
+            Ok(false)
         );
     }
 }

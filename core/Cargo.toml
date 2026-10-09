@@ -35,6 +35,7 @@ irokle = { workspace = true }
 futures = { workspace = true }
 prometheus-client = { workspace = true }
 ed25519-dalek = { workspace = true }
+url = { workspace = true, features = ["serde"] }
 getrandom = { workspace = true }
 cel-interpreter = { workspace = true }
 globset = { workspace = true }

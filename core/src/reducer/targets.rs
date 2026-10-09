@@ -21,9 +21,20 @@ impl AdminDocumentState {
         }
 
         self.user_subject_ids
-            .values()
-            .filter_map(|version| version.value.clone())
+            .iter()
+            .filter(|(path, _)| !path.starts_with(USER_ALIAS_PREFIX))
+            .filter_map(|(_, version)| version.value.clone())
             .collect()
+    }
+
+    /// Whether `alias` is linked to this user without a conflicting replicated claim.
+    pub fn materialized_alias(&self, alias: &UserId) -> bool {
+        let path = user_alias_path(alias);
+        !self.conflicts.contains_key(&path)
+            && self
+                .user_subject_ids
+                .get(&path)
+                .is_some_and(|version| version.value.is_some())
     }
 
     pub fn materialized_user_attributes(&self) -> BTreeMap<String, String> {
@@ -254,6 +265,17 @@ impl AdminDocumentState {
             .get(CONFIG_COMPUTE_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(compute_from_value)
+    }
+
+    pub fn materialized_realm_federation(&self) -> Option<crate::federation::FederationSettings> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(CONFIG_FEDERATION_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| serde_json::from_str(value).ok())
     }
 
     pub fn materialized_realm_quota(&self) -> Option<QuotaConfig> {

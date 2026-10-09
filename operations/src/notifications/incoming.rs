@@ -353,11 +353,9 @@ fn validate_watch_event(event: &WatchEvent, realm_id: RealmId, now_ms: u64) -> R
             event.occurred_at_ms
         ));
     }
+    // A federated user of another realm may act on this realm's resources.
     if event.actor.is_nil() {
         return Err("watch event has empty actor".to_string());
-    }
-    if event.actor.realm_id != realm_id {
-        return Err("watch event actor realm must match event realm".to_string());
     }
     if event.path.is_empty() {
         return Err("watch event has empty path".to_string());
@@ -483,7 +481,7 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             if group_id.is_nil() || request_id.is_nil() {
                 return Err("join notification has empty group or request id".into());
             }
-            validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
+            validate_group_user("actor_user_id", actor_user_id)?;
         }
         NotificationKind::AddedToGroup {
             group_id,
@@ -496,7 +494,7 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             if group_id.is_nil() {
                 return Err("notification record has empty group_id".to_string());
             }
-            validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
+            validate_group_user("actor_user_id", actor_user_id)?;
         }
         NotificationKind::GroupMemberAdded {
             group_id,
@@ -507,8 +505,8 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             if group_id.is_nil() {
                 return Err("notification record has empty group_id".to_string());
             }
-            validate_kind_user("member_user_id", member_user_id, recipient_realm)?;
-            validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
+            validate_group_user("member_user_id", member_user_id)?;
+            validate_group_user("actor_user_id", actor_user_id)?;
         }
         NotificationKind::NodeOnboarded { realm_id, .. } => {
             if *realm_id != recipient_realm {
@@ -639,6 +637,14 @@ fn validate_sync_path(
         .ok_or_else(|| "notification record sync path is not canonical".to_string())?;
     if resource.group_id != group_id || resource.node_id != node_id || resource.bucket != bucket {
         return Err("notification record sync path does not match detail".to_string());
+    }
+    Ok(())
+}
+
+/// Group records may name a federated user of another realm as actor or member.
+fn validate_group_user(field: &str, user_id: &UserId) -> Result<(), String> {
+    if user_id.is_nil() {
+        return Err(format!("notification record has empty {field}"));
     }
     Ok(())
 }

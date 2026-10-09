@@ -193,6 +193,7 @@ async fn emit_onboarded_notification(realm_id: RealmId, node_id: NodeId, context
         RoutingContext {
             group_auth: None,
             realm_auth: Some(&realm_auth),
+            realm_id,
         },
         unix_timestamp_millis(),
     );

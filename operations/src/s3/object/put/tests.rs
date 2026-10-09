@@ -1135,6 +1135,35 @@ pub async fn test_put_object() {
         CurrentVersionPointer::from_bytes(blob_head_value.as_ref()).unwrap(),
         CurrentVersionPointer::new_with_generation(result.version_id, 1)
     );
+
+    // A create-only write replays its own version but never replaces a live head.
+    let create = |version_id| {
+        let body = tokio_util::io::ReaderStream::new(&retry_data[..]);
+        PutObjectOperation::new(PutObjectConfig {
+            user_id,
+            group_id,
+            realm_id,
+            node_id,
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "some-file.txt".to_string(),
+                content_length: Some(retry_data.len() as u64),
+                body: Some(BackendStream::new(body)),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: Some(version_id),
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        })
+        .create_only()
+    };
+    let replay = drive(create(preassigned_version_id), &context).await;
+    assert_eq!(replay.unwrap(), result);
+    let other = drive(create(Ulid::generate()), &context).await;
+    assert!(matches!(other, Err(PutObjectError::ObjectExists)));
 }
 
 #[tokio::test]

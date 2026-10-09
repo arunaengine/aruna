@@ -5,6 +5,7 @@
 use crate::NodeId;
 use crate::UserId;
 use crate::errors::ConversionError;
+use crate::federation::MAX_NAME_LEN;
 use crate::structs::identity::realm::RealmId;
 use crate::types::RoleId;
 use core::fmt;
@@ -87,6 +88,15 @@ pub struct TokenClaims {
     /// Delegation signature: Realm signature over issuer_pubkey
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegation_signature: Option<String>,
+    /// Bounded display name of a federated session's user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The linked login of another realm a federated session of a local account came through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    /// Time of the primary login this token descends from; renewal keeps it, children lack it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_time: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +105,8 @@ pub enum SessionKind {
     Portal,
     Assistant,
     Api,
+    /// A session this realm issued for a user of another realm after a login handoff.
+    Federated,
 }
 
 impl fmt::Display for SessionKind {
@@ -103,6 +115,7 @@ impl fmt::Display for SessionKind {
             Self::Portal => "portal",
             Self::Assistant => "assistant",
             Self::Api => "api",
+            Self::Federated => "federated",
         })
     }
 }
@@ -111,6 +124,10 @@ impl fmt::Display for SessionKind {
 pub struct SessionRef {
     pub sid: String,
     pub kind: SessionKind,
+    /// Display-only name of a federated user; never used for authorization.
+    pub name: Option<String>,
+    /// Linked login of another realm; login history and revocation only, never permissions.
+    pub via: Option<UserId>,
 }
 
 /// Path restriction for token scope.
@@ -201,6 +218,15 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
+    /// A user of another realm, or a session opened through a login of another realm.
+    pub fn federated(&self) -> bool {
+        self.user_id.realm_id != self.realm_id
+            || self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.kind == SessionKind::Federated)
+    }
+
     /// The Everyone principal: unauthenticated requests are permission-checked
     /// as the nil user, so exactly the roles that assign the realm-scoped
     /// `UserId::nil` (public roles, `Role::is_public`) grant them access.
@@ -220,14 +246,34 @@ impl TryFrom<TokenClaims> for AuthContext {
     fn try_from(value: TokenClaims) -> Result<Self, Self::Error> {
         let user_id = UserId::from_string(&value.sub)?;
         let realm_id = RealmId::from_base64(&value.iss)?;
-        if user_id.realm_id != realm_id {
+        // Only a federated session names a user of another realm than its issuer.
+        let federated = value.session_kind == Some(SessionKind::Federated);
+        if user_id.realm_id != realm_id && !federated {
             return Err(ConversionError::InvalidUserId);
+        }
+        let name = match value.name {
+            Some(name) if !federated || name.chars().count() > MAX_NAME_LEN => {
+                return Err(ConversionError::InvalidSessionClaim);
+            }
+            name => name,
+        };
+        // A linked login names a local account and the foreign login it came through.
+        let via = value.via.as_deref().map(UserId::from_string).transpose()?;
+        if via.is_some_and(|via| {
+            !federated || via.realm_id == realm_id || via.is_nil() || user_id.realm_id != realm_id
+        }) {
+            return Err(ConversionError::InvalidSessionClaim);
         }
         let path_restrictions = value.restrictions;
         let session = match (value.sid, value.session_kind) {
             (Some(sid), Some(kind)) => {
                 Ulid::from_string(&sid)?;
-                Some(SessionRef { sid, kind })
+                Some(SessionRef {
+                    sid,
+                    kind,
+                    name,
+                    via,
+                })
             }
             (None, None) => None,
             _ => return Err(ConversionError::InvalidSessionClaim),
@@ -314,6 +360,9 @@ mod tests {
             restrictions: Some(restrictions.clone()),
             issuer_pubkey: None,
             delegation_signature: None,
+            name: None,
+            via: None,
+            auth_time: None,
         })
         .unwrap();
 
@@ -338,10 +387,70 @@ mod tests {
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,
+            name: None,
+            via: None,
+            auth_time: None,
         })
         .unwrap();
 
         assert_eq!(auth.session.unwrap().sid, sid);
+    }
+
+    fn foreign_claims(kind: SessionKind, name: Option<String>) -> TokenClaims {
+        let user_id = UserId::new(Ulid::from_bytes([9u8; 16]), RealmId::from_bytes([1u8; 32]));
+        TokenClaims {
+            sub: user_id.to_string(),
+            iss: RealmId::from_bytes([7u8; 32]).to_base64(),
+            iat: 1,
+            exp: 2,
+            jti: "token-id".to_string(),
+            sid: Some(Ulid::from_bytes([8u8; 16]).to_string()),
+            session_kind: Some(kind),
+            restrictions: None,
+            issuer_pubkey: None,
+            delegation_signature: None,
+            name,
+            via: None,
+            auth_time: None,
+        }
+    }
+
+    #[test]
+    fn foreign_only_federated() {
+        // A foreign subject is accepted only in a federated session, with a bounded name.
+        let auth =
+            AuthContext::try_from(foreign_claims(SessionKind::Federated, Some("Ada".into())))
+                .unwrap();
+        assert_ne!(auth.user_id.realm_id, auth.realm_id);
+        assert_eq!(auth.session.unwrap().name.as_deref(), Some("Ada"));
+        for kind in [SessionKind::Portal, SessionKind::Api] {
+            assert!(AuthContext::try_from(foreign_claims(kind, None)).is_err());
+        }
+        let long = "a".repeat(crate::federation::MAX_NAME_LEN + 1);
+        assert!(AuthContext::try_from(foreign_claims(SessionKind::Federated, Some(long))).is_err());
+    }
+
+    #[test]
+    fn linked_login_local() {
+        // A linked login names a local account and the foreign login, only in a federated session.
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let local = UserId::new(Ulid::from_bytes([3u8; 16]), realm_id);
+        let foreign = foreign_claims(SessionKind::Federated, None).sub;
+        let linked = |kind, sub: String, via: String| TokenClaims {
+            sub,
+            via: Some(via),
+            ..foreign_claims(kind, None)
+        };
+        let claims = linked(SessionKind::Federated, local.to_string(), foreign.clone());
+        let auth = AuthContext::try_from(claims).unwrap();
+        assert_eq!(auth.user_id, local);
+        assert_eq!(auth.session.unwrap().via.unwrap().to_string(), foreign);
+        let portal = linked(SessionKind::Portal, local.to_string(), foreign.clone());
+        assert!(AuthContext::try_from(portal).is_err());
+        let both_foreign = linked(SessionKind::Federated, foreign.clone(), foreign);
+        assert!(AuthContext::try_from(both_foreign).is_err());
+        let local_via = linked(SessionKind::Federated, local.to_string(), local.to_string());
+        assert!(AuthContext::try_from(local_via).is_err());
     }
 }
 

@@ -68,6 +68,8 @@ struct TestOidcClaims {
     exp: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_time: Option<u64>,
 }
 
 struct TestNode {
@@ -150,6 +152,7 @@ fn sign_oidc_token(
     signing_key: &SigningKey,
     subject: &str,
     name: Option<&str>,
+    auth_time: Option<u64>,
 ) -> String {
     let mut header = Header::new(Algorithm::EdDSA);
     header.kid = Some(kid.to_string());
@@ -159,6 +162,7 @@ fn sign_oidc_token(
         aud: "aruna-api".to_string(),
         exp: chrono::Utc::now().timestamp().max(0) as u64 + 600,
         name: name.map(str::to_string),
+        auth_time,
     };
     let key_pem = signing_key
         .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
@@ -199,6 +203,9 @@ fn sign_aruna_token(
         restrictions,
         issuer_pubkey: None,
         delegation_signature: None,
+        name: None,
+        via: None,
+        auth_time: None,
     };
     let NodeCapabilities::Management {
         realm_encoding_key, ..
@@ -391,7 +398,8 @@ async fn register_via_oidc(
     name: &str,
     onboarding_secret: Option<String>,
 ) -> (RegisterUserResponse, String) {
-    let oidc_token = sign_oidc_token(issuer, kid, signing_key, subject, Some(name));
+    let login = Some(super::now_timestamp());
+    let oidc_token = sign_oidc_token(issuer, kid, signing_key, subject, Some(name), login);
     let register = reqwest::Client::new()
         .post(format!("{}/api/v1/access/users/register", node.base_url))
         .bearer_auth(&oidc_token)
@@ -982,6 +990,7 @@ async fn registration_consumes_secret() {
             &signing_key,
             "bootstrap-subject-2",
             Some("Other Admin"),
+            None,
         ))
         .json(&RegisterUserRequest {
             onboarding_secret: Some(onboarding_secret),
@@ -1340,7 +1349,14 @@ async fn registered_user_token() {
     let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
     let node = spawn_test_node(provider, true).await;
 
-    let oidc_token = sign_oidc_token(issuer, kid, &signing_key, "subject-123", Some("Alice"));
+    let oidc_token = sign_oidc_token(
+        issuer,
+        kid,
+        &signing_key,
+        "subject-123",
+        Some("Alice"),
+        None,
+    );
     let register = reqwest::Client::new()
         .post(format!("{}/api/v1/access/users/register", node.base_url))
         .bearer_auth(&oidc_token)
@@ -1410,6 +1426,58 @@ async fn refresh_preserves_kind() {
     let refreshed: GetTokenResponse = refreshed.json().await.unwrap();
     let claims = handle_token(&node.state, &refreshed.token).await.unwrap();
     assert_eq!(claims.session_kind, Some(SessionKind::Assistant));
+    // Only the primary login carries its time; renewal keeps it and children never get one.
+    let login = handle_token(&node.state, &portal_token).await.unwrap();
+    assert!(login.auth_time.is_some());
+    assert_eq!(claims.auth_time, None);
+    let renewed = reqwest::Client::new()
+        .get(format!("{}/api/v1/access/token", node.base_url))
+        .bearer_auth(&portal_token)
+        .send()
+        .await
+        .unwrap();
+    let renewed: GetTokenResponse = renewed.json().await.unwrap();
+    let renewed = handle_token(&node.state, &renewed.token).await.unwrap();
+    assert_eq!(renewed.auth_time, login.auth_time);
+
+    node.server_task.abort();
+    node.net.shutdown().await;
+    oidc_task.abort();
+}
+
+#[tokio::test]
+async fn provider_login_time() {
+    let issuer = "https://issuer.example";
+    let kid = "main-key";
+    let signing_key = generate_signing_key();
+    let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+    let node = spawn_test_node(provider, true).await;
+    let (_registered, _token) = register_via_oidc(
+        &node,
+        issuer,
+        kid,
+        &signing_key,
+        "subject-123",
+        "Alice",
+        None,
+    )
+    .await;
+
+    // The token keeps the provider's login time, or none, never the exchange time.
+    let old_login = super::now_timestamp() - 3600;
+    for auth_time in [Some(old_login), None] {
+        let oidc_token = sign_oidc_token(issuer, kid, &signing_key, "subject-123", None, auth_time);
+        let response = reqwest::Client::new()
+            .get(format!("{}/api/v1/access/token", node.base_url))
+            .bearer_auth(&oidc_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let token: GetTokenResponse = response.json().await.unwrap();
+        let claims = handle_token(&node.state, &token.token).await.unwrap();
+        assert_eq!(claims.auth_time, auth_time);
+    }
 
     node.server_task.abort();
     node.net.shutdown().await;
@@ -1590,7 +1658,14 @@ async fn deactivation_cuts_tokens() {
         me(&user_token).await.unwrap().status(),
         StatusCode::UNAUTHORIZED
     );
-    let oidc_token = sign_oidc_token(issuer, kid, &signing_key, "user-subject", Some("User"));
+    let oidc_token = sign_oidc_token(
+        issuer,
+        kid,
+        &signing_key,
+        "user-subject",
+        Some("User"),
+        None,
+    );
     let renewed = client
         .get(format!("{}/api/v1/access/token", node.base_url))
         .bearer_auth(&oidc_token)
@@ -1617,4 +1692,69 @@ async fn deactivation_cuts_tokens() {
     node.server_task.abort();
     node.net.shutdown().await;
     oidc_task.abort();
+}
+
+#[tokio::test]
+async fn federated_profile_synthesized() {
+    // A federated session sees its full id and token name, and cannot renew its token.
+    use aruna_core::structs::identity::auth::{AuthContext, SessionRef};
+    use axum::Extension;
+    use axum::response::IntoResponse;
+    let (_dir, storage) = crate::tests::routes::test_storage();
+    let context = Arc::new(crate::tests::routes::test_context(storage));
+    let signing_key = generate_signing_key();
+    let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+    let node_id = iroh::SecretKey::generate().public();
+    drive(
+        CreateRealmOperation::new(CreateRealmConfig {
+            actor: Actor {
+                node_id,
+                user_id: UserId::nil(realm_id),
+                realm_id,
+            },
+            realm_description: "Realm".to_string(),
+            oidc_providers: Vec::new(),
+            node_location: None,
+            node_weight: None,
+            node_labels: Default::default(),
+        }),
+        &context,
+    )
+    .await
+    .unwrap();
+    let state = Arc::new(
+        crate::tests::routes::test_state(
+            context,
+            realm_id,
+            node_id,
+            NodeCapabilities::management_node(signing_key).unwrap(),
+        )
+        .await,
+    );
+    let foreign = UserId::new(Ulid::generate(), RealmId::from_bytes([9; 32]));
+    let auth = AuthContext {
+        user_id: foreign,
+        realm_id,
+        path_restrictions: None,
+        session: Some(SessionRef {
+            sid: Ulid::generate().to_string(),
+            kind: SessionKind::Federated,
+            name: Some("Ada".to_string()),
+            via: None,
+        }),
+    };
+    let info = super::build_user_response(&state, auth.clone())
+        .await
+        .unwrap();
+    assert_eq!(info.user.user_id, foreign.to_string());
+    assert_eq!(info.user.name, "Ada");
+    assert!(info.user.attributes.is_empty());
+    let error = super::get_token(
+        State(state),
+        axum::http::HeaderMap::new(),
+        Extension(Some(auth)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
 }

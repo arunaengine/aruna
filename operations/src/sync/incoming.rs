@@ -878,6 +878,8 @@ async fn reconcile_inbound_topics(
         // Transition-free: a heavy transition step here would stall document
         // application; the reconcile arms the SyncPlacements timer instead.
         reconcile_shard_topics(context, *net_handle.realm_id(), net_handle.node_id()).await;
+        let (realm_id, node_id) = (*net_handle.realm_id(), net_handle.node_id());
+        crate::federation::publish::publish_soon(context, realm_id, node_id).await;
     }
     refresh_usage_targets(context, net_handle.node_id(), &targets.targets).await;
     refresh_target_interest(context, &targets.targets).await;

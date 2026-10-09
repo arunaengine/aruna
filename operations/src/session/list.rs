@@ -233,6 +233,7 @@ mod pure_tests {
             expires_at: 20,
             token_hash: "a".repeat(64),
             revoked: true,
+            via: None,
         };
         let mut operation = ListSessionOperation::new(user_id);
         operation.start();

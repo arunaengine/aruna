@@ -371,6 +371,17 @@ pub struct ExportRoCrateSpec {
     pub auth_context: AuthContext,
     pub document_id: Ulid,
     pub limits: RoCrateLimits,
+    /// Set for an export into another realm.
+    pub selection: Option<ExportSelection>,
+}
+
+/// An export into another realm: only the `files` entities travel, every other File entity
+/// stays a reference. No files means metadata only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportSelection {
+    pub files: Vec<String>,
+    pub audience: crate::structs::identity::realm::RealmId,
+    pub intent_digest: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
