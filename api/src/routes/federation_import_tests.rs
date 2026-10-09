@@ -492,6 +492,38 @@ async fn losing_spool_discarded() {
 }
 
 #[tokio::test]
+async fn conflicting_winner_refused() {
+    // A racing winner of another transfer is never reused; the loser gets a 409.
+    let fixture = fixture(false).await;
+    let intent = intent(&fixture, fixture.user);
+    let other = grant(&intent, b"another artifact");
+    let grant = grant(&intent, BODY);
+    let key = import_key(&grant.payload, &intent.payload.destination).unwrap();
+    let (first, second) = (Ulid::generate(), Ulid::generate());
+    seed_upload(&fixture, first).await;
+    seed_upload(&fixture, second).await;
+    let context = fixture.state.get_ctx();
+    let winner = ImportRecord {
+        intent: intent.clone(),
+        grant: other,
+        confirmed: false,
+    };
+    write_import(&context, &key, first, &winner).await.unwrap();
+    let losing = load_rocrate_upload(&context, second)
+        .await
+        .unwrap()
+        .unwrap();
+    let refused = bind_upload(&fixture.state, &intent, &grant, &key, &losing).await;
+    let status = axum::response::IntoResponse::into_response(refused.unwrap_err()).status();
+    assert_eq!(status, StatusCode::CONFLICT);
+    let discarded = load_rocrate_upload(&context, second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(discarded.expires_at_ms, 0);
+}
+
+#[tokio::test]
 async fn retry_keeps_plan() {
     // A federation-bound import retried from another session is the same job, not a conflict.
     let fixture = fixture(false).await;

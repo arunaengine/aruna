@@ -187,6 +187,12 @@ pub async fn write_import(
         record: record.clone(),
     };
     match drive(RecordOperation::new(change), context).await {
+        // A racing upload won the key: it is reused only for the same transfer.
+        Ok(RecordOutcome::Bound(bound)) if bound != upload_id => {
+            let (intent, grant) = (&record.intent.payload, &record.grant.payload);
+            check_bound(context, bound, intent, grant).await?;
+            Ok(bound)
+        }
         Ok(RecordOutcome::Bound(bound)) => Ok(bound),
         Ok(other) => Err(ImportError::Storage(format!(
             "unexpected outcome {other:?}"
@@ -252,6 +258,17 @@ pub async fn reusable_upload(
     let Some(upload_id) = bound_upload(context, intent.principal, import_key).await? else {
         return Ok(None);
     };
+    check_bound(context, upload_id, intent, grant).await?;
+    Ok(Some(upload_id))
+}
+
+/// Refuses a bound upload whose record or upload belongs to another transfer.
+async fn check_bound(
+    context: &DriverContext,
+    upload_id: Ulid,
+    intent: &ImportIntent,
+    grant: &ExportGrant,
+) -> Result<(), ImportError> {
     let stored = read_import(context, upload_id)
         .await?
         .ok_or_else(|| ImportError::Storage("upload binding without record".to_string()))?;
@@ -261,7 +278,7 @@ pub async fn reusable_upload(
     if !same_transfer(&stored, upload.as_ref(), intent, grant) {
         return Err(ImportError::Conflict);
     }
-    Ok(Some(upload_id))
+    Ok(())
 }
 
 pub async fn read_import(
@@ -666,5 +683,21 @@ pub(crate) mod tests {
         // The resume asks the source again; this context has no egress, so it cannot.
         let resumed = confirm_source(&context, &spec(upload_id), timeout).await;
         assert!(matches!(resumed, Err(ImportError::Storage(_))));
+    }
+
+    #[tokio::test]
+    async fn racing_binding_checked() {
+        // The winner of a racing binding serves only the same transfer; another one is refused.
+        let (_dir, context) = context();
+        let (first, second) = (Ulid::from_bytes([9; 16]), Ulid::from_bytes([10; 16]));
+        write_import(&context, "key", first, &record())
+            .await
+            .unwrap();
+        let same = write_import(&context, "key", second, &record()).await;
+        assert_eq!(same, Ok(first));
+        let mut other = record();
+        other.grant.payload.artifact_size += 1;
+        let conflict = write_import(&context, "key", second, &other).await;
+        assert_eq!(conflict, Err(ImportError::Conflict));
     }
 }

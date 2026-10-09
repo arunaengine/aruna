@@ -229,13 +229,11 @@ pub(crate) async fn bind_upload(
         confirmed: true,
     };
     let context = state.get_ctx();
-    let bound = write_import(&context, key, record.upload_id, &binding)
-        .await
-        .map_err(import_refused)?;
-    if bound == record.upload_id {
+    let bound = write_import(&context, key, record.upload_id, &binding).await;
+    if bound == Ok(record.upload_id) {
         return Ok(record.clone());
     }
-    // An expired upload is removed by the next hidden sweep.
+    // An expired upload is removed by the next hidden sweep; a conflicting winner is a 409.
     let losing = RoCrateUploadRecord {
         expires_at_ms: 0,
         ..record.clone()
@@ -243,6 +241,7 @@ pub(crate) async fn bind_upload(
     write_rocrate_upload(&context.storage_handle, &losing)
         .await
         .map_err(ServerError::ServiceUnavailableReason)?;
+    let bound = bound.map_err(import_refused)?;
     load_rocrate_upload(&context, bound)
         .await
         .map_err(ServerError::InternalError)?
