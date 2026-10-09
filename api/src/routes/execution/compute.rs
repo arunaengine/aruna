@@ -628,15 +628,21 @@ pub async fn get_compute_snapshots(
         .values()
         .map(|document| {
             let held = heartbeats.get(&document.node_id);
-            let (reservation, demand) = held
-                .map_or((&document.reservation, &document.demand), |held| {
-                    (&held.heartbeat.reservation, &held.heartbeat.demand)
-                });
+            let (epoch, reservation, demand) = held.map_or(
+                (document.epoch, &document.reservation, &document.demand),
+                |held| {
+                    (
+                        held.heartbeat.epoch,
+                        &held.heartbeat.reservation,
+                        &held.heartbeat.demand,
+                    )
+                },
+            );
             NodeSnapshotBody {
                 node_id: document.node_id.to_string(),
-                membership_generation: document.epoch.membership_generation,
-                publisher_generation: document.epoch.publisher_generation,
-                observed_at_ms: document.epoch.observed_at_ms,
+                membership_generation: epoch.membership_generation,
+                publisher_generation: epoch.publisher_generation,
+                observed_at_ms: epoch.observed_at_ms,
                 compute_draining: document.compute_draining,
                 leaving: document.leaving,
                 reserved: reservation.reserved.into(),
