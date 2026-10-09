@@ -154,7 +154,8 @@ a path-restricted delegated token are both refused.
   the same import is refused with 409 and code `import_conflict`.
 - After an import used that upload, a repeated push still returns it, with `expires_at` set to
   the current time. Only a retry of that import with its idempotency key accepts it, and that
-  retry returns the same job.
+  retry returns the same job. An earlier upload that expired unused is replaced: the push stores
+  its bytes as a new upload and returns that one.
 - Bytes are hashed and spooled as they arrive, so the archive never has to fit in memory.
 - The upload is private to the caller and to this node, whose base URL is returned as
   `owner_node_url`.

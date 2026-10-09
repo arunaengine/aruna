@@ -187,6 +187,7 @@ pub(crate) async fn admit_push(
 
 /// The upload an earlier transfer of the same import key left on this node. After an import
 /// used it, the answer still names it, so that import's idempotency key returns the same job.
+/// An upload that expired unused is not returned; the push then stores and binds new bytes.
 pub(crate) async fn pushed_upload(
     state: &ServerState,
     push: &Push,
@@ -207,7 +208,7 @@ pub(crate) async fn pushed_upload(
     let owner_node_url = owner_node_url(state).await?;
     match record {
         Some(record) => upload_response(&record, owner_node_url).map(Some),
-        // An import used the upload, or it expired; the answer cannot start another import.
+        // An import job used the upload; its import key returns that job, never another one.
         None => Ok(Some(UploadRoCrateResponse {
             upload_id: upload_id.to_string(),
             blake3: grant.artifact_blake3.clone(),
@@ -425,9 +426,10 @@ binds the call to the portal that requested the intent.
   again, and on every step of the import job. An intent issued before a credential cutoff of its
   principal is refused.
 - When an earlier push or pull of the same import key left an upload on this node, it is used
-  once the source answers a HEAD of the artifact with the grant. Otherwise this node pulls the
-  artifact from the grant's artifact URL through its egress guard. If either fails, the answer is
-  502 with code `pull_unreachable` and the source realm may push.
+  once the source answers a HEAD of the artifact with the grant. Otherwise, also when that upload
+  expired unused, this node pulls the artifact from the grant's artifact URL through its egress
+  guard and binds the new upload instead. If either fails, the answer is 502 with code
+  `pull_unreachable` and the source realm may push.
 - A fresh intent and grant for the same transfer replace the stored ones, so an import paused by
   an expired consent continues as the same job. A push with fresh consent does the same.
 - The import key covers source realm, document, dataset and selection digests, destination
