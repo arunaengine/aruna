@@ -54,6 +54,8 @@ pub struct OidcIdentity {
     pub issuer: String,
     pub subject_id: String,
     pub display_name: Option<String>,
+    /// Verified provider login time; `None` when the provider did not send it.
+    pub auth_time: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +96,8 @@ struct OidcClaims {
     given_name: Option<String>,
     #[serde(default)]
     family_name: Option<String>,
+    #[serde(default)]
+    auth_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -263,6 +267,7 @@ impl OidcValidator {
             issuer: claims.iss,
             subject_id: claims.sub,
             display_name,
+            auth_time: claims.auth_time,
         })
     }
 }

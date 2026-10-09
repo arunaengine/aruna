@@ -68,6 +68,8 @@ struct TestOidcClaims {
     exp: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_time: Option<u64>,
 }
 
 struct TestNode {
@@ -150,6 +152,7 @@ fn sign_oidc_token(
     signing_key: &SigningKey,
     subject: &str,
     name: Option<&str>,
+    auth_time: Option<u64>,
 ) -> String {
     let mut header = Header::new(Algorithm::EdDSA);
     header.kid = Some(kid.to_string());
@@ -159,6 +162,7 @@ fn sign_oidc_token(
         aud: "aruna-api".to_string(),
         exp: chrono::Utc::now().timestamp().max(0) as u64 + 600,
         name: name.map(str::to_string),
+        auth_time,
     };
     let key_pem = signing_key
         .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
@@ -394,7 +398,8 @@ async fn register_via_oidc(
     name: &str,
     onboarding_secret: Option<String>,
 ) -> (RegisterUserResponse, String) {
-    let oidc_token = sign_oidc_token(issuer, kid, signing_key, subject, Some(name));
+    let login = Some(super::now_timestamp());
+    let oidc_token = sign_oidc_token(issuer, kid, signing_key, subject, Some(name), login);
     let register = reqwest::Client::new()
         .post(format!("{}/api/v1/access/users/register", node.base_url))
         .bearer_auth(&oidc_token)
@@ -985,6 +990,7 @@ async fn registration_consumes_secret() {
             &signing_key,
             "bootstrap-subject-2",
             Some("Other Admin"),
+            None,
         ))
         .json(&RegisterUserRequest {
             onboarding_secret: Some(onboarding_secret),
@@ -1343,7 +1349,14 @@ async fn registered_user_token() {
     let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
     let node = spawn_test_node(provider, true).await;
 
-    let oidc_token = sign_oidc_token(issuer, kid, &signing_key, "subject-123", Some("Alice"));
+    let oidc_token = sign_oidc_token(
+        issuer,
+        kid,
+        &signing_key,
+        "subject-123",
+        Some("Alice"),
+        None,
+    );
     let register = reqwest::Client::new()
         .post(format!("{}/api/v1/access/users/register", node.base_url))
         .bearer_auth(&oidc_token)
@@ -1426,6 +1439,45 @@ async fn refresh_preserves_kind() {
     let renewed: GetTokenResponse = renewed.json().await.unwrap();
     let renewed = handle_token(&node.state, &renewed.token).await.unwrap();
     assert_eq!(renewed.auth_time, login.auth_time);
+
+    node.server_task.abort();
+    node.net.shutdown().await;
+    oidc_task.abort();
+}
+
+#[tokio::test]
+async fn provider_login_time() {
+    let issuer = "https://issuer.example";
+    let kid = "main-key";
+    let signing_key = generate_signing_key();
+    let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+    let node = spawn_test_node(provider, true).await;
+    let (_registered, _token) = register_via_oidc(
+        &node,
+        issuer,
+        kid,
+        &signing_key,
+        "subject-123",
+        "Alice",
+        None,
+    )
+    .await;
+
+    // The token keeps the provider's login time, or none, never the exchange time.
+    let old_login = super::now_timestamp() - 3600;
+    for auth_time in [Some(old_login), None] {
+        let oidc_token = sign_oidc_token(issuer, kid, &signing_key, "subject-123", None, auth_time);
+        let response = reqwest::Client::new()
+            .get(format!("{}/api/v1/access/token", node.base_url))
+            .bearer_auth(&oidc_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let token: GetTokenResponse = response.json().await.unwrap();
+        let claims = handle_token(&node.state, &token.token).await.unwrap();
+        assert_eq!(claims.auth_time, auth_time);
+    }
 
     node.server_task.abort();
     node.net.shutdown().await;
@@ -1606,7 +1658,14 @@ async fn deactivation_cuts_tokens() {
         me(&user_token).await.unwrap().status(),
         StatusCode::UNAUTHORIZED
     );
-    let oidc_token = sign_oidc_token(issuer, kid, &signing_key, "user-subject", Some("User"));
+    let oidc_token = sign_oidc_token(
+        issuer,
+        kid,
+        &signing_key,
+        "user-subject",
+        Some("User"),
+        None,
+    );
     let renewed = client
         .get(format!("{}/api/v1/access/token", node.base_url))
         .bearer_auth(&oidc_token)
