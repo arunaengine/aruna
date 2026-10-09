@@ -346,7 +346,7 @@ pub async fn set_realm_federation(
             user_id: auth.user_id,
             realm_id: state.get_realm_id(),
         },
-        auth_context: auth,
+        auth_context: Some(auth),
         node_capabilities: state.node_capabilities().clone(),
         name: request.name,
         api_url: parse_url(&request.api_url)?,
