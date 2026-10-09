@@ -228,6 +228,7 @@ impl AccountStatusOperation {
                 set_attributes,
                 remove_attributes,
                 system: true,
+                alias: None,
             }),
             |result| Event::SubOperation(SubOperationEvent::UserUpdated {
                 result: result.map(|_| ()).map_err(|error| error.to_string()),
