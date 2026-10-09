@@ -17,6 +17,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::heartbeat::NodeHeartbeat;
 use aruna_core::keyspaces::{
     COMPUTE_DEPARTURE_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
     JOB_RESERVATION_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE,
@@ -421,13 +422,14 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
     }
 }
 
-/// Heartbeat: refreshes the persisted node-info document's placement-view labels,
-/// utilization and timestamps, then republishes it; URLs stay startup-seeded. Scans
-/// run outside the revision, so [`revise_node_info`] never carries stale drain backwards.
+/// Heartbeat: refreshes the persisted node-info document's placement-view labels, utilization
+/// and timestamps, republishes it, then pushes live telemetry to the sync peers. Scans run
+/// outside the revision, so [`revise_node_info`] never carries stale drain backwards.
 pub async fn refresh_info_heartbeat(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
+    sequence: u64,
 ) -> Result<(), String> {
     let Some(document) = read_info_document(&ctx.storage_handle, node_id).await? else {
         return Ok(());
@@ -440,25 +442,56 @@ pub async fn refresh_info_heartbeat(
     let executors = advertised_executors(ctx, &config, node_id, &reservation.reserved, now).await?;
     let labels = node_labels(ctx, &config, node_id)?;
     let storage_bytes_used = local_storage_bytes(ctx).await?;
-    let documents_held = held_documents(ctx, node_id, &config).await;
-    let load_permille = read_load_permille();
+    let utilization = NodeUtilization {
+        storage_bytes_used,
+        documents_held: held_documents(ctx, node_id, &config).await,
+        load_permille: read_load_permille(),
+        heartbeat_at_ms: now,
+    };
     let revised = revise_node_info(ctx, node_id, realm_id, |document| {
         document.executors = executors.clone();
         document.labels = labels.clone();
         document.reservation = reservation;
         document.demand = demand.clone();
-        document.utilization = NodeUtilization {
-            storage_bytes_used,
-            documents_held,
-            load_permille,
-            heartbeat_at_ms: now,
-        };
+        document.utilization = utilization;
     })
     .await?;
-    match revised {
-        true => replicate_node_info(ctx, node_id, realm_id).await,
-        false => Ok(()),
+    if revised {
+        replicate_node_info(ctx, node_id, realm_id).await?;
     }
+    let (Some(net_handle), Some(stored)) = (
+        ctx.net_handle.as_ref(),
+        read_info_document(&ctx.storage_handle, node_id).await?,
+    ) else {
+        return Ok(());
+    };
+    if !node_kind(&config, node_id).is_some_and(|kind| kind.is_sync_eligible()) {
+        return Ok(());
+    }
+    let mut availability: Vec<_> = executors
+        .iter()
+        .filter_map(|executor| Some((executor.kind.clone(), executor.availability?)))
+        .collect();
+    availability.sort_by(|left, right| left.0.cmp(&right.0));
+    // The heartbeat names the committed advertisement, so peers match it to the row they hold.
+    let epoch = AdvertisementEpoch {
+        observed_at_ms: now,
+        ..stored.epoch
+    };
+    let heartbeat = NodeHeartbeat {
+        realm_id,
+        epoch,
+        sequence,
+        utilization,
+        availability,
+        reservation: ComputeReservationSnapshot {
+            epoch,
+            ..reservation
+        },
+        demand: ComputeDemandSnapshot { epoch, ..demand },
+    };
+    crate::node::heartbeat::send_heartbeat(net_handle, heartbeat).await;
+    Ok(())
 }
 
 /// Node-info revisions one publisher retries after another committed first.
@@ -1264,7 +1297,7 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1).await.unwrap();
 
         assert!(
             read_info_document(&ctx.storage_handle, local)
@@ -1419,7 +1452,7 @@ mod tests {
         let expected_labels = build_view(&config).nodes[0].labels.clone();
         write_realm_config(&ctx, &config).await;
 
-        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1).await.unwrap();
         let second = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
@@ -1459,7 +1492,7 @@ mod tests {
         let local = node(1);
         write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
 
-        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1).await.unwrap();
         assert!(
             read_info_document(&ctx.storage_handle, local)
                 .await
@@ -2180,7 +2213,7 @@ mod tests {
         .unwrap();
 
         write_operator_drain(&ctx, true).await.unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1).await.unwrap();
         let drained = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
@@ -2188,7 +2221,7 @@ mod tests {
         assert!(drained.compute_draining && !drained.leaving);
 
         write_operator_drain(&ctx, false).await.unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1).await.unwrap();
         let released = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
@@ -2219,7 +2252,7 @@ mod tests {
             .await
             .unwrap();
 
-        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1).await.unwrap();
 
         let stored = read_info_document(&ctx.storage_handle, local)
             .await
@@ -2248,7 +2281,7 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1).await.unwrap();
 
         let stored = read_info_document(&ctx.storage_handle, local)
             .await
@@ -2257,4 +2290,5 @@ mod tests {
         assert_eq!(stored.utilization.documents_held, Some(0));
         assert!(stored.utilization.load_permille.is_some());
     }
+
 }

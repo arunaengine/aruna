@@ -1,21 +1,71 @@
-//! Receives heartbeats with live telemetry from sync peers over the heartbeat protocol. One stream
-//! carries one length-prefixed heartbeat and no response; nothing is written to disk.
+//! Pushes and receives heartbeats with live telemetry between sync peers over the heartbeat
+//! protocol. One stream carries one length-prefixed heartbeat and no response; nothing is written
+//! to disk.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::alpn::Alpn;
 use aruna_core::heartbeat::{MAX_HEARTBEAT_BYTES, NodeHeartbeat};
+use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
-use tokio::io::AsyncReadExt;
+use futures_util::{StreamExt, stream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
 
 /// Deadline for reading or sending one heartbeat.
 pub(crate) const HEARTBEAT_IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Heartbeat sends in flight at once.
+const PARALLEL_SENDS: usize = 16;
+
+/// Keeps this node's own `heartbeat` and pushes it to every sync peer. Sends are best effort: a
+/// failed one only logs, and the next tick sends again.
+pub async fn send_heartbeat(net_handle: &NetHandle, heartbeat: NodeHeartbeat) {
+    let bytes = match heartbeat.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(%error, "Not sending an invalid heartbeat");
+            return;
+        }
+    };
+    net_handle.record_own_heartbeat(heartbeat);
+    let frame = [(bytes.len() as u32).to_be_bytes().as_slice(), &bytes].concat();
+    stream::iter(net_handle.realm_peers().await)
+        .map(|peer| {
+            let frame = &frame;
+            async move {
+                let sent = timeout(HEARTBEAT_IO_TIMEOUT, push_frame(net_handle, peer, frame)).await;
+                (peer, sent)
+            }
+        })
+        .buffer_unordered(PARALLEL_SENDS)
+        .for_each(|(peer, sent)| async move {
+            match sent {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => debug!(%peer, %error, "Heartbeat send failed"),
+                Err(_) => debug!(%peer, "Heartbeat send timed out"),
+            }
+        })
+        .await;
+}
+
+async fn push_frame(net_handle: &NetHandle, peer: NodeId, frame: &[u8]) -> Result<(), String> {
+    let mut stream = net_handle
+        .open_stream(peer, Alpn::Heartbeat)
+        .await
+        .map_err(|error| error.to_string())?;
+    stream
+        .0
+        .write_all(frame)
+        .await
+        .map_err(|error| error.to_string())?;
+    stream.0.finish().map_err(|error| error.to_string())
+}
 
 /// Reads one heartbeat of `peer` and stores it when the sender is a sync peer of this realm and
 /// the heartbeat is newer than the held one.

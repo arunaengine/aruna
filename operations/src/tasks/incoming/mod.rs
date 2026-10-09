@@ -211,6 +211,8 @@ pub(crate) struct OperationsTaskHandler {
     // When a device may next fetch the realm documents, and how many attempts
     // have failed. Loss on restart is fine: a restart fetches them anyway.
     realm_documents: std::sync::Mutex<(u32, u64)>,
+    // Sequence of the last heartbeat this process sent; the startup revision orders restarts.
+    heartbeat_sequence: std::sync::atomic::AtomicU64,
 }
 
 /// Outcome counts accumulated across the invocations of one rotation.
@@ -345,6 +347,7 @@ impl OperationsTaskHandler {
             drain_guard: tokio::sync::Mutex::new(()),
             outbox_limits: OutboxLimits::default(),
             realm_documents: std::sync::Mutex::new((0, 0)),
+            heartbeat_sequence: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
