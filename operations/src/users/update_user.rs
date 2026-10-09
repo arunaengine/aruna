@@ -63,14 +63,20 @@ pub struct UpdateUserInput {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AliasChange {
-    Add(UserId),
+    /// Links a login confirmed for its session issued at `issued_at`; every transaction attempt
+    /// rechecks the account, the realm's admission and cutoffs at `now`.
+    Add {
+        alias: UserId,
+        issued_at: u64,
+        now: u64,
+    },
     Remove(UserId),
 }
 
 impl AliasChange {
     fn alias(&self) -> UserId {
         match self {
-            Self::Add(alias) | Self::Remove(alias) => *alias,
+            Self::Add { alias, .. } | Self::Remove(alias) => *alias,
         }
     }
 }
@@ -149,6 +155,12 @@ pub enum UpdateUserError {
     AliasRealmTaken,
     #[error("the account has no such linked login")]
     AliasMissing,
+    #[error("the account is inactive or a service account")]
+    AliasInactive,
+    #[error("the login's realm is no longer admitted")]
+    AliasNotAdmitted,
+    #[error("the login was cut off after it was confirmed")]
+    AliasCutOff,
     #[error(transparent)]
     AuthorizationError(#[from] AuthorizationError),
     #[error(transparent)]
@@ -369,6 +381,18 @@ impl UpdateUserOperation {
             return Err(UpdateUserError::UserIdMismatch);
         }
 
+        let realm_config = realm_config_value
+            .as_deref()
+            .map(RealmConfigDocument::from_bytes)
+            .transpose()?;
+        if let Some(AliasChange::Add {
+            alias,
+            issued_at,
+            now,
+        }) = self.input.alias
+        {
+            check_link(&user, realm_config.as_ref(), &alias, issued_at, now)?;
+        }
         let was_deactivated = user.is_deactivated();
         apply_updates(&mut user, &self.input)?;
         let claims = self
@@ -408,10 +432,6 @@ impl UpdateUserOperation {
         let document_target = DocumentTarget::User {
             user_id: user.user_id,
         };
-        let realm_config = realm_config_value
-            .as_deref()
-            .map(RealmConfigDocument::from_bytes)
-            .transpose()?;
         let placement = realm_config
             .as_ref()
             .map(|config| target_placement_ref(config, &document_target, Default::default()))
@@ -783,7 +803,7 @@ fn admin_document_operations(input: &UpdateUserInput) -> Vec<AdminDocumentOperat
     }
 
     match input.alias {
-        Some(AliasChange::Add(alias)) => {
+        Some(AliasChange::Add { alias, .. }) => {
             operations.push(AdminDocumentOperation::UserAliasAdded { alias });
         }
         Some(AliasChange::Remove(alias)) => {
@@ -793,6 +813,33 @@ fn admin_document_operations(input: &UpdateUserInput) -> Vec<AdminDocumentOperat
     }
 
     operations
+}
+
+/// Refuses a link when the account turned inactive, the login's realm is no longer admitted,
+/// or the login was cut off after the confirmed session.
+fn check_link(
+    user: &User,
+    config: Option<&RealmConfigDocument>,
+    alias: &UserId,
+    issued_at: u64,
+    now: u64,
+) -> Result<(), UpdateUserError> {
+    if user.is_deactivated() || user.service_group().is_some() {
+        return Err(UpdateUserError::AliasInactive);
+    }
+    let admitted = config
+        .and_then(|config| config.federation.as_ref())
+        .is_some_and(|settings| settings.accepted_realms.admits(&alias.realm_id));
+    if !admitted {
+        return Err(UpdateUserError::AliasNotAdmitted);
+    }
+    if config
+        .and_then(|config| config.user_cutoff(alias, now))
+        .is_some_and(|cutoff| issued_at < cutoff)
+    {
+        return Err(UpdateUserError::AliasCutOff);
+    }
+    Ok(())
 }
 
 /// Applies a link or unlink to the account and returns the login's new ownership claims. A
@@ -812,7 +859,7 @@ fn apply_alias(
         .map_err(ConversionError::from)?
         .unwrap_or_default();
     match change {
-        AliasChange::Add(_) => {
+        AliasChange::Add { .. } => {
             if claims.iter().any(|owner| *owner != user.user_id) {
                 return Err(UpdateUserError::AliasClaimed);
             }
