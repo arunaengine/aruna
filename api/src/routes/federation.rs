@@ -9,7 +9,7 @@ use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMode};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::driver::drive;
@@ -117,6 +117,19 @@ fn config_missing() -> ServerError {
     )
 }
 
+/// Policy checks need the realm config, so its absence is read before they can turn it into 403.
+async fn read_config(state: &ServerState) -> ServerResult<RealmConfigDocument> {
+    drive(
+        GetConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| match error {
+        GetConfigError::DocumentNotFound => config_missing(),
+        error => ServerError::InternalError(error.to_string()),
+    })
+}
+
 /// The settings with their digest as a quoted `ETag`, the version a later change names.
 fn settings_response(
     settings: &FederationSettings,
@@ -199,6 +212,7 @@ pub async fn get_realm_federation(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(HeaderMap, Json<RealmFederation>)> {
     let auth = require_realm_auth(&state, auth)?;
+    let config = read_config(&state).await?;
     ensure_permission(
         &state,
         &auth,
@@ -206,15 +220,6 @@ pub async fn get_realm_federation(
         Permission::WRITE,
     )
     .await?;
-    let config = drive(
-        GetConfigOperation::new(state.get_realm_id()),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| match error {
-        GetConfigError::DocumentNotFound => config_missing(),
-        error => ServerError::InternalError(error.to_string()),
-    })?;
     let settings = config.federation.ok_or_else(|| {
         ServerError::Refused(
             StatusCode::NOT_FOUND,
@@ -308,6 +313,7 @@ pub async fn set_realm_federation(
     Json(request): Json<RealmFederation>,
 ) -> ServerResult<(HeaderMap, Json<RealmFederation>)> {
     let auth = require_realm_auth(&state, auth)?;
+    read_config(&state).await?;
     ensure_permission(
         &state,
         &auth,
