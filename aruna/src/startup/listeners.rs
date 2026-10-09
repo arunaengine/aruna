@@ -287,6 +287,7 @@ async fn bind_all(
         &config.portal,
         config.api_public_url.as_deref(),
         PortalCspConfig::new(config.portal_csp_origins.clone()),
+        config.registry_url.as_ref().map(ToString::to_string),
         state.clone(),
         shutdown,
     )
@@ -371,6 +372,7 @@ async fn bind_portal(
     portal: &PortalConfig,
     api_public_url: Option<&str>,
     csp: PortalCspConfig,
+    registry_url: Option<String>,
     state: Arc<ServerState>,
     shutdown: &Shutdown,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, Box<dyn std::error::Error>> {
@@ -386,6 +388,7 @@ async fn bind_portal(
     let portal_config = aruna_api::portal::PortalConfig {
         api_public_url: api_public_url.to_string(),
         csp,
+        registry_url,
     };
     let token = shutdown.token();
     let handle = tokio::spawn(async move {

@@ -34,12 +34,15 @@ const NO_CACHE: &str = "no-cache";
 pub struct PortalConfig {
     pub api_public_url: String,
     pub csp: PortalCspConfig,
+    /// The registry the portal lists while the realm has no federation settings.
+    pub registry_url: Option<String>,
 }
 
 #[derive(Clone)]
 struct PortalState {
     server: Arc<ServerState>,
     api_base_url: Arc<str>,
+    registry_url: Option<String>,
 }
 
 pub fn router(state: Arc<ServerState>, config: PortalConfig) -> Router {
@@ -55,6 +58,7 @@ pub fn router(state: Arc<ServerState>, config: PortalConfig) -> Router {
         .with_state(PortalState {
             server: state,
             api_base_url: Arc::from(api_base_url),
+            registry_url: config.registry_url,
         })
 }
 
@@ -94,11 +98,12 @@ async fn portal_config(State(state): State<PortalState>) -> Response {
     )
     .await
     {
-        Ok(config) => config
-            .federation
-            .and_then(|settings| settings.registry_url)
-            .map(String::from),
-        Err(GetConfigError::DocumentNotFound) => None,
+        // Stored settings decide, also a cleared URL; without them the node default applies.
+        Ok(config) => match config.federation {
+            Some(settings) => settings.registry_url.map(String::from),
+            None => state.registry_url.clone(),
+        },
+        Err(GetConfigError::DocumentNotFound) => state.registry_url.clone(),
         Err(error) => return ServerError::InternalError(error.to_string()).into_response(),
     };
     Json(PortalRuntimeConfig {
@@ -347,6 +352,7 @@ mod tests {
             PortalConfig {
                 api_public_url: TEST_API_URL.to_string(),
                 csp: PortalCspConfig::new(vec!["https://peer.test/".to_string()]),
+                registry_url: None,
             },
         );
 
@@ -535,7 +541,7 @@ mod tests {
 
     #[tokio::test]
     async fn serves_registry_url() {
-        // The realm picker reads the registry from the current settings, and none while unset.
+        // The realm picker reads the registry from the settings, and the node default while unset.
         let tempdir = tempdir().unwrap();
         let (state, _state_dir) = setup_state().await;
         let realm_id = state.get_realm_id();
@@ -564,9 +570,13 @@ mod tests {
             PortalConfig {
                 api_public_url: TEST_API_URL.to_string(),
                 csp: PortalCspConfig::new(Vec::new()),
+                registry_url: Some("https://default.example.org/".to_string()),
             },
         );
-        assert_eq!(registry_url(router.clone()).await, serde_json::Value::Null);
+        assert_eq!(
+            registry_url(router.clone()).await,
+            "https://default.example.org/"
+        );
 
         let mut config = drive(GetConfigOperation::new(realm_id), &state.get_ctx())
             .await
@@ -599,7 +609,26 @@ mod tests {
                 txn_id: None,
             })
             .await;
-        assert_eq!(registry_url(router).await, "https://registry.example.org/");
+        assert_eq!(
+            registry_url(router.clone()).await,
+            "https://registry.example.org/"
+        );
+
+        // A cleared URL in the settings means no registry, not the node default.
+        if let Some(settings) = config.federation.as_mut() {
+            settings.registry_url = None;
+        }
+        state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: realm_id.as_bytes().to_vec().into(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert_eq!(registry_url(router).await, serde_json::Value::Null);
     }
 
     #[test]
