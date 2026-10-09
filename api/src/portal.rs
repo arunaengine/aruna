@@ -76,7 +76,8 @@ pub async fn serve(
         .map_err(|error| ServerSetupError::Runtime(error.to_string()))
 }
 
-fn api_base_url(api_public_url: &str) -> String {
+/// The API base the portal calls: the public URL with `/api/v1` appended.
+pub fn api_base_url(api_public_url: &str) -> String {
     format!("{}{API_PATH}", api_public_url.trim_end_matches('/'))
 }
 

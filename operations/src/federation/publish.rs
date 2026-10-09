@@ -68,7 +68,7 @@ pub enum Publication {
 }
 
 /// Whether `node_id` is the management node with the lowest id.
-fn is_reporting(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+pub fn is_reporting(config: &RealmConfigDocument, node_id: NodeId) -> bool {
     config
         .nodes
         .iter()
