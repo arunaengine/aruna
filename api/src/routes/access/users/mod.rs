@@ -19,6 +19,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_secs as now_timestamp;
+use aruna_operations::auth::bearer_token::decode_bearer_token;
 use aruna_operations::auth::token_subject::{SubjectCheckError, SubjectCheckOperation};
 use aruna_operations::device::remove_node::{
     DeviceEvictionScope, RemoveNodeConfig, RemoveNodeError, RemoveNodeOperation,
@@ -329,6 +330,7 @@ async fn issue_user_session(
     expiry: u64,
     kind: SessionKind,
     restrictions: Option<Vec<PathRestriction>>,
+    auth_time: Option<u64>,
 ) -> ServerResult<String> {
     let created = drive(
         CreateSessionOperation::new(CreateSessionConfig {
@@ -342,6 +344,7 @@ async fn issue_user_session(
             name: None,
             restrictions,
             via: None,
+            auth_time,
         }),
         &state.get_ctx(),
     )
@@ -736,7 +739,7 @@ async fn get_token(
     headers: HeaderMap,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<GetTokenResponse>)> {
-    let (user_id, kind, restrictions) = match auth {
+    let (user_id, kind, restrictions, auth_time) = match auth {
         Some(aruna_ctx) => {
             if aruna_ctx
                 .session
@@ -750,7 +753,13 @@ async fn get_token(
                 .session
                 .as_ref()
                 .map_or(SessionKind::Portal, |session| session.kind);
-            (aruna_ctx.user_id, kind, aruna_ctx.path_restrictions)
+            // Renewal keeps the primary login time, so it never makes a login look fresh.
+            let token = bearer_token(&headers).ok_or(ServerError::Unauthorized)?;
+            let claims = decode_bearer_token(state.as_ref(), token)
+                .await
+                .map_err(|_| ServerError::Unauthorized)?;
+            let restrictions = aruna_ctx.path_restrictions;
+            (aruna_ctx.user_id, kind, restrictions, claims.auth_time)
         }
         None => {
             let token = bearer_token(&headers).ok_or(ServerError::Unauthorized)?;
@@ -764,7 +773,12 @@ async fn get_token(
             )
             .await
             .map_err(|err| ServerError::InternalError(err.to_string()))?;
-            (user.user_id, SessionKind::Portal, None)
+            (
+                user.user_id,
+                SessionKind::Portal,
+                None,
+                Some(now_timestamp()),
+            )
         }
     };
 
@@ -772,7 +786,7 @@ async fn get_token(
     let expiry = now_timestamp()
         .checked_add(TOKEN_EXPIRY_SECONDS)
         .ok_or_else(|| ServerError::InternalError("token expiry overflow".to_string()))?;
-    let token = issue_user_session(&state, user_id, expiry, kind, restrictions).await?;
+    let token = issue_user_session(&state, user_id, expiry, kind, restrictions, auth_time).await?;
 
     Ok((StatusCode::OK, Json(GetTokenResponse { token })))
 }

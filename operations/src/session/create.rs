@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::index::{MAX_USER_SESSIONS, decode_index, encode_index, owner_key};
-use crate::auth::create_token::{CreateTokenConfig, CreateTokenError, mint_token};
+use crate::auth::create_token::{CreateTokenConfig, CreateTokenError, mint_login_token};
 use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::compute::Secret;
@@ -39,6 +39,8 @@ pub struct CreateSessionConfig {
     pub restrictions: Option<Vec<PathRestriction>>,
     /// The linked login of another realm a federated session of a local account came through.
     pub via: Option<UserId>,
+    /// Time of the primary login this session descends from; `None` for child sessions.
+    pub auth_time: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,15 +158,18 @@ impl CreateSessionOperation {
             name: self.config.name.clone(),
             via: self.config.via,
         };
-        let token = mint_token(&CreateTokenConfig {
-            time: self.config.time,
-            expiry: Some(self.config.expiry),
-            user_id: self.config.user_id,
-            realm_id: self.config.realm_id,
-            node_capabilities: self.config.node_capabilities.clone(),
-            session: Some(session_ref),
-            restrictions: self.config.restrictions.clone(),
-        })?;
+        let token = mint_login_token(
+            &CreateTokenConfig {
+                time: self.config.time,
+                expiry: Some(self.config.expiry),
+                user_id: self.config.user_id,
+                realm_id: self.config.realm_id,
+                node_capabilities: self.config.node_capabilities.clone(),
+                session: Some(session_ref),
+                restrictions: self.config.restrictions.clone(),
+            },
+            self.config.auth_time,
+        )?;
         self.session = Some(UserSession {
             sid: self.sid.clone(),
             user_id: self.config.user_id,
@@ -421,6 +426,7 @@ mod pure_tests {
             name: None,
             restrictions: None,
             via: None,
+            auth_time: None,
         }
     }
 

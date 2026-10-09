@@ -4001,6 +4001,7 @@ fn test_token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenCla
         delegation_signature: None,
         name: None,
         via: None,
+        auth_time: None,
     }
 }
 

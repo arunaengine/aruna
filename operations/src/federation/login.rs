@@ -224,6 +224,7 @@ impl FederatedLoginOperation {
             name: handoff.name.clone(),
             restrictions: None,
             via,
+            auth_time: None,
         });
         let effects = session.start();
         self.state = FederatedLoginState::Session(session);
