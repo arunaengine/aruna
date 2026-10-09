@@ -168,7 +168,7 @@ pub async fn plaintext_allowed(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, S3_BUCKET_KEYSPACE};
     use aruna_core::structs::identity::auth::Actor;
@@ -178,13 +178,13 @@ mod tests {
     use aruna_core::structs::storage::encryption::{EncryptionMode, GrantState};
     use std::time::SystemTime;
 
-    fn user(seed: u8) -> UserId {
+    pub(crate) fn user(seed: u8) -> UserId {
         UserId::new(Ulid::from_bytes([seed; 16]), RealmId::from_bytes([3; 32]))
     }
 
     /// An encrypting bucket created by user 1, whose group user 2 administers, with an explicit
     /// grant to user 3.
-    async fn bucket(context: &DriverContext) {
+    pub(crate) async fn bucket(context: &DriverContext) {
         let realm_id = RealmId::from_bytes([3; 32]);
         let group_id = Ulid::from_bytes([4; 16]);
         let bucket_id = Ulid::from_bytes([5; 16]);
