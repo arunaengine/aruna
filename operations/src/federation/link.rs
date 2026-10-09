@@ -114,14 +114,6 @@ fn read_config(value: Option<&ByteView>) -> Result<RealmConfigDocument, LinkLogi
         .ok_or(LinkLoginError::ForeignRefused)
 }
 
-/// Whether the realm still admits logins of `foreign`'s realm.
-fn admitted(config: &RealmConfigDocument, foreign: &UserId) -> bool {
-    config
-        .federation
-        .as_ref()
-        .is_some_and(|settings| settings.accepted_realms.admits(&foreign.realm_id))
-}
-
 fn batch_values(event: Event) -> Result<Vec<Option<ByteView>>, LinkLoginError> {
     match event {
         Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -229,6 +221,16 @@ impl Operation for ConfirmLinkOperation {
     }
 }
 
+/// The link refusal a failed alias change stands for.
+fn link_error(error: UpdateUserError) -> LinkLoginError {
+    match error {
+        UpdateUserError::AliasInactive => LinkLoginError::LocalRefused,
+        UpdateUserError::AliasNotAdmitted => LinkLoginError::ForeignRefused,
+        UpdateUserError::AliasCutOff => LinkLoginError::CutOff,
+        error => error.into(),
+    }
+}
+
 /// Runs the replicated alias change, restarting it on a commit conflict so ownership is reread.
 #[derive(Debug, PartialEq)]
 struct AliasUpdate {
@@ -262,11 +264,11 @@ impl AliasUpdate {
                 if self.retries < LINK_RETRIES =>
             {
                 self.retries += 1;
-                let mut restarted = effects;
-                restarted.extend(self.update.start());
-                (restarted, None)
+                // The conflicted commit already ended its transaction; its abort would fail
+                // the restarted update with an unknown transaction.
+                (self.update.start(), None)
             }
-            result => (effects, Some(result.map_err(Into::into))),
+            result => (effects, Some(result.map_err(link_error))),
         }
     }
 }
@@ -283,13 +285,13 @@ pub struct LinkLoginConfig {
 
 #[derive(Debug, PartialEq)]
 enum LinkState {
-    Read,
     Update(Box<AliasUpdate>),
     Done,
 }
 
 /// Links the confirmed foreign login to the caller's account through the replicated user
-/// document, after the confirmation, the realm's admission and the foreign cutoff are rechecked.
+/// document; the account, the realm's admission and the foreign cutoff are rechecked inside
+/// every transaction attempt.
 #[derive(Debug, PartialEq)]
 pub struct LinkLoginOperation {
     config: LinkLoginConfig,
@@ -301,7 +303,7 @@ impl LinkLoginOperation {
     pub fn new(config: LinkLoginConfig) -> Self {
         Self {
             config,
-            state: LinkState::Read,
+            state: LinkState::Done,
             output: None,
         }
     }
@@ -312,26 +314,10 @@ impl LinkLoginOperation {
         smallvec![]
     }
 
-    fn admit(&self, event: Event) -> Result<UpdateUserInput, LinkLoginError> {
-        let values = batch_values(event)?;
-        let [user, config] = values.as_slice() else {
-            return Err(LinkLoginError::NotFinished);
-        };
-        usable_account(user.as_ref())?;
-        let realm = read_config(config.as_ref())?;
-        let payload = &self.config.confirmation.payload;
-        if !admitted(&realm, &payload.foreign_user) {
-            return Err(LinkLoginError::ForeignRefused);
-        }
-        // A cutoff of the foreign login after its confirmed session voids the confirmation.
-        if realm
-            .user_cutoff(&payload.foreign_user, self.config.now)
-            .is_some_and(|cutoff| payload.foreign_issued_at < cutoff)
-        {
-            return Err(LinkLoginError::CutOff);
-        }
+    fn input(&self) -> UpdateUserInput {
         let config = &self.config;
-        Ok(UpdateUserInput {
+        let payload = &config.confirmation.payload;
+        UpdateUserInput {
             actor: config.actor.clone(),
             auth_context: config.auth_context.clone(),
             self_realm_id: config.auth_context.realm_id,
@@ -340,8 +326,12 @@ impl LinkLoginOperation {
             set_attributes: Default::default(),
             remove_attributes: Vec::new(),
             system: false,
-            alias: Some(AliasChange::Add(payload.foreign_user)),
-        })
+            alias: Some(AliasChange::Add {
+                alias: payload.foreign_user,
+                issued_at: payload.foreign_issued_at,
+                now: config.now,
+            }),
+        }
     }
 }
 
@@ -364,23 +354,14 @@ impl Operation for LinkLoginOperation {
         if let Err(error) = checked {
             return self.finish(Err(error.into()));
         }
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![user_read(&auth.user_id), config_read(auth)],
-            txn_id: None,
-        })]
+        let mut update = Box::new(AliasUpdate::new(self.input()));
+        let effects = update.update.start();
+        self.state = LinkState::Update(update);
+        effects
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match std::mem::replace(&mut self.state, LinkState::Done) {
-            LinkState::Read => match self.admit(event) {
-                Ok(input) => {
-                    let mut update = Box::new(AliasUpdate::new(input));
-                    let effects = update.update.start();
-                    self.state = LinkState::Update(update);
-                    effects
-                }
-                Err(error) => self.finish(Err(error)),
-            },
             LinkState::Update(mut update) => match update.step(event) {
                 (effects, None) => {
                     self.state = LinkState::Update(update);
@@ -406,7 +387,7 @@ impl Operation for LinkLoginOperation {
     fn abort(&mut self) -> Effects {
         match &mut self.state {
             LinkState::Update(update) => update.update.abort(),
-            _ => smallvec![],
+            LinkState::Done => smallvec![],
         }
     }
 }
@@ -860,6 +841,22 @@ mod tests {
         );
     }
 
+    /// The realm config with a cutoff of the foreign login after `now`.
+    async fn cutoff_config(context: &DriverContext, now: u64) -> (String, Vec<u8>, Vec<u8>) {
+        let target = DocumentTarget::RealmConfig { realm_id: realm() };
+        let key = target.storage_key().to_vec();
+        let keyspace = target.storage_keyspace().to_string();
+        let row = crate::jobs::key_wake::read_row(&context.storage_handle, &keyspace, key.clone());
+        let mut config = RealmConfigDocument::from_bytes(&row.await.unwrap().unwrap()).unwrap();
+        config
+            .revoked_tokens
+            .push(aruna_core::structs::identity::realm::TokenRevocation {
+                token_hash: user_cutoff_hash(&foreign()),
+                expires_at: user_cutoff_expiry(now + 1),
+            });
+        (keyspace, key, config.to_bytes(&actor(local(2))).unwrap())
+    }
+
     #[tokio::test]
     async fn cutoff_voids_confirmation() {
         // A cutoff of the foreign login after its session voids an unused or replayed confirmation.
@@ -868,34 +865,81 @@ mod tests {
         let confirmation = drive(confirm(local(2), Some(now), now), &context)
             .await
             .unwrap();
-        let target = DocumentTarget::RealmConfig { realm_id: realm() };
-        let mut config = RealmConfigDocument::from_bytes(
-            &crate::jobs::key_wake::read_row(
-                &context.storage_handle,
-                target.storage_keyspace(),
-                target.storage_key().to_vec(),
-            )
-            .await
-            .unwrap()
-            .unwrap(),
-        )
-        .unwrap();
-        config
-            .revoked_tokens
-            .push(aruna_core::structs::identity::realm::TokenRevocation {
-                token_hash: user_cutoff_hash(&foreign()),
-                expires_at: user_cutoff_expiry(now + 1),
-            });
-        let bytes = config.to_bytes(&actor(local(2))).unwrap();
-        put(
-            &context,
-            target.storage_keyspace(),
-            target.storage_key().to_vec(),
-            bytes,
-        )
-        .await;
+        let (keyspace, key, bytes) = cutoff_config(&context, now).await;
+        put(&context, &keyspace, key, bytes).await;
         let linked = drive(link(local(2), confirmation, now), &context).await;
         assert_eq!(linked, Err(LinkLoginError::CutOff));
+    }
+
+    /// Commits `write` outside the link's transaction right after its first read inside it.
+    #[derive(Debug, PartialEq)]
+    struct Racing {
+        link: LinkLoginOperation,
+        write: Option<StorageEffect>,
+        held: Option<Event>,
+    }
+
+    impl Operation for Racing {
+        type Output = User;
+        type Error = LinkLoginError;
+
+        fn start(&mut self) -> Effects {
+            self.link.start()
+        }
+
+        fn step(&mut self, event: Event) -> Effects {
+            if let Some(held) = self.held.take() {
+                return self.link.step(held);
+            }
+            if matches!(event, Event::Storage(StorageEvent::BatchReadResult { .. }))
+                && let Some(write) = self.write.take()
+            {
+                self.held = Some(event);
+                return smallvec![Effect::Storage(write)];
+            }
+            self.link.step(event)
+        }
+
+        fn is_complete(&self) -> bool {
+            self.link.is_complete()
+        }
+
+        fn finalize(self) -> Result<User, LinkLoginError> {
+            self.link.finalize()
+        }
+
+        fn abort(&mut self) -> Effects {
+            self.link.abort()
+        }
+    }
+
+    #[tokio::test]
+    async fn racing_cutoff_wins() {
+        // A cutoff committed while the link's transaction is open is seen on its retry.
+        let (_dir, context) = context().await;
+        let now = unix_timestamp_secs();
+        let confirmation = drive(confirm(local(2), Some(now), now), &context)
+            .await
+            .unwrap();
+        let (key_space, key, value) = cutoff_config(&context, now).await;
+        let racing = Racing {
+            link: link(local(2), confirmation, now),
+            write: Some(StorageEffect::Write {
+                key_space,
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            }),
+            held: None,
+        };
+        assert_eq!(drive(racing, &context).await, Err(LinkLoginError::CutOff));
+        let row = crate::jobs::key_wake::read_row(
+            &context.storage_handle,
+            USER_KEYSPACE,
+            local(2).to_bytes(),
+        );
+        let user = User::from_bytes(&row.await.unwrap().unwrap()).unwrap();
+        assert!(!user.alias_user_ids.contains(&foreign()));
     }
 
     #[tokio::test]
