@@ -362,9 +362,19 @@ async fn rejects_before_writes() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn rollback_removes_writes() -> Result<(), Box<dyn std::error::Error>> {
+    check_rollback(false).await
+}
+
+#[tokio::test]
+async fn final_failure_cleans() -> Result<(), Box<dyn std::error::Error>> {
+    // A permanent error on the final attempt still runs the failure cleanup.
+    check_rollback(true).await
+}
+
+async fn check_rollback(final_attempt: bool) -> Result<(), Box<dyn std::error::Error>> {
     // The second payload fails its checksum after the first one has landed.
     let fixture = build_fixture(false).await?;
-    let existing = put_object(&fixture, "imported/data1.txt", b"kept".to_vec()).await?;
+    let existing = put_object(&fixture, "imported/kept.txt", b"kept".to_vec()).await?;
     let mut archive = pair_archive().await?;
     let local = zip_offsets(&archive, b"PK\x03\x04")[2];
     let central = zip_offsets(&archive, b"PK\x01\x02")[2];
@@ -374,19 +384,27 @@ async fn rollback_removes_writes() -> Result<(), Box<dyn std::error::Error>> {
     let upload_id = create_upload(&fixture, archive).await?;
     let spec = import_spec(&fixture, upload_id, document_id);
     let job_id = job_id();
-    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let mut context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    context.final_attempt = final_attempt;
 
     let JobRunOutcome::Failed(error) = run_rocrate_import(&context, &spec).await else {
         return Err("checksum mismatch did not fail the import".into());
     };
 
+    assert_eq!(error.kind, JobErrorKind::Permanent);
     assert!(
         error.message.contains("1 written object was removed"),
         "{}",
         error.message
     );
+    assert!(
+        object_versions(&fixture, "imported/data1.txt")
+            .await?
+            .is_empty()
+    );
     assert_eq!(
-        object_versions(&fixture, "imported/data1.txt").await?,
+        object_versions(&fixture, "imported/kept.txt").await?,
         vec![existing.version_id]
     );
     assert!(
