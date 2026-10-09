@@ -10,6 +10,8 @@ mod snapshot;
 mod transport;
 mod versions;
 
+pub(crate) use versions::expected;
+
 use crate::auth::{map_authorize_error, require_unrestricted_auth};
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
