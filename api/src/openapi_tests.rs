@@ -637,6 +637,21 @@ fn payload_id_gaps(node: &Value, in_payload: bool, gaps: &mut Vec<String>) {
     }
 }
 
+/// Words that look like a ULID but are not valid 26-character Crockford ULIDs.
+fn ulid_gaps(node: &Value, gaps: &mut Vec<String>) {
+    match node {
+        Value::String(text) => gaps.extend(
+            text.split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|word| word.len() == 26 && word.starts_with("01"))
+                .filter(|word| ulid::Ulid::from_string(word).is_err())
+                .map(str::to_string),
+        ),
+        Value::Object(fields) => fields.values().for_each(|value| ulid_gaps(value, gaps)),
+        Value::Array(items) => items.iter().for_each(|item| ulid_gaps(item, gaps)),
+        _ => {}
+    }
+}
+
 #[test]
 fn federation_example_ids() {
     // Signed payloads carry realm ids as 32 numbers and user ids as `{ user_ulid, realm_id }`.
@@ -645,6 +660,7 @@ fn federation_example_ids() {
     for (path, item) in doc["paths"].as_object().unwrap() {
         if path.contains("federation") || path == "/system/realm/descriptor" {
             payload_id_gaps(item, false, &mut gaps);
+            ulid_gaps(item, &mut gaps);
         }
     }
     assert!(

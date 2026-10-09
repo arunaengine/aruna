@@ -336,11 +336,11 @@ async fn pull_artifact(
   limit and the nonce, and lives 24 hours. It is not renewable."#,
     request_body(
         content = ImportIntentRequest,
-        example = json!({ "group_id": "01JGROUP0123456789ABCDEFGH", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run", "max_bytes": 1073741824, "nonce": "<hex sha256 of the browser secret>" })
+        example = json!({ "group_id": "01JGR0VP0123456789ABCDEFGH", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run", "max_bytes": 1073741824, "nonce": "<hex sha256 of the browser secret>" })
     ),
     responses(
         (status = 200, description = "The signed import intent", body = serde_json::Value,
-            example = json!({ "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "descriptor_digest": "<hex>", "principal": { "user_ulid": "01JDNA0123456789ABCDEFGHJK", "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "destination": { "group_id": "01JGROUP0123456789ABCDEFGH", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run" }, "max_bytes": 1073741824, "nonce": "<hex>", "issued_at": 1791000000, "expires_at": 1791086400, "intent_id": "01JINTENT0123456789ABCDEFG" }, "signer": "Realm", "signature": "<hex>" })),
+            example = json!({ "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "descriptor_digest": "<hex>", "principal": { "user_ulid": "01JDNA0123456789ABCDEFGHJK", "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "destination": { "group_id": "01JGR0VP0123456789ABCDEFGH", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run" }, "max_bytes": 1073741824, "nonce": "<hex>", "issued_at": 1791000000, "expires_at": 1791086400, "intent_id": "01J1NTENT0123456789ABCDEFG" }, "signer": "Realm", "signature": "<hex>" })),
         (status = 400, description = "A malformed nonce, id, bucket, prefix or path", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "WRITE or a policy denied the import (code `import_denied`), or federation is not set up (code `federation_disabled`)", body = ErrorResponse),
@@ -425,7 +425,7 @@ binds the call to the portal that requested the intent.
     ),
     responses(
         (status = 202, description = "The import job is recorded", body = SubmitImportResponse,
-            example = json!({ "job_id": "01JJOB0123456789ABCDEFGHIJ", "created": true, "owner_node_url": "https://b.example.org/api/v1", "status_url": "https://b.example.org/api/v1/compute/jobs/01JJOB0123456789ABCDEFGHIJ", "report_url": "https://b.example.org/api/v1/compute/jobs/01JJOB0123456789ABCDEFGHIJ/report" })),
+            example = json!({ "job_id": "01JJ0B0123456789ABCDEFGH1J", "created": true, "owner_node_url": "https://b.example.org/api/v1", "status_url": "https://b.example.org/api/v1/compute/jobs/01JJ0B0123456789ABCDEFGH1J", "report_url": "https://b.example.org/api/v1/compute/jobs/01JJ0B0123456789ABCDEFGH1J/report" })),
         (status = 400, description = "A malformed secret", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the intent's principal, the intent or grant was refused (code `transfer_rejected`), WRITE or a policy denied the import (code `import_denied`), or the source refused the pull (code `source_refused`)", body = ErrorResponse),

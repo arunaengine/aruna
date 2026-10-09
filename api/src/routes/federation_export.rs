@@ -144,19 +144,19 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
         example = json!({
             "descriptor": { "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "name": "B", "description": "", "api_url": "https://b.example.org/api/v1", "portal_url": "https://b.example.org/", "issued_at": 1791000000 }, "signer": "Realm", "signature": "<hex>" },
             "intent": { "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "descriptor_digest": "<hex>", "principal": { "user_ulid": "01JDNA0123456789ABCDEFGHJK", "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "destination": { "group_id": "<group id>", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run" }, "max_bytes": 1073741824, "nonce": "<hex>", "issued_at": 1791000000, "expires_at": 1791086400, "intent_id": "<ulid>" }, "signer": "Realm", "signature": "<hex>" },
-            "document_id": "01JDOC0123456789ABCDEFGHJK",
+            "document_id": "01JD0C0123456789ABCDEFGHJK",
             "files": ["data/reads.fastq"]
         })
     ),
     responses(
         (status = 202, description = "The export job is accepted on this node", body = SubmitExportResponse,
             example = json!({
-                "job_id": "01JJOB0123456789ABCDEFGHJK",
+                "job_id": "01JJ0B0123456789ABCDEFGHJK",
                 "created": true,
                 "owner_node_url": "https://a.example.org/api/v1",
-                "status_url": "https://a.example.org/api/v1/compute/jobs/01JJOB0123456789ABCDEFGHJK",
-                "report_url": "https://a.example.org/api/v1/compute/jobs/01JJOB0123456789ABCDEFGHJK/report",
-                "artifact_url": "https://a.example.org/api/v1/compute/jobs/01JJOB0123456789ABCDEFGHJK/artifacts/rocrate"
+                "status_url": "https://a.example.org/api/v1/compute/jobs/01JJ0B0123456789ABCDEFGHJK",
+                "report_url": "https://a.example.org/api/v1/compute/jobs/01JJ0B0123456789ABCDEFGHJK/report",
+                "artifact_url": "https://a.example.org/api/v1/compute/jobs/01JJ0B0123456789ABCDEFGHJK/artifacts/rocrate"
             })),
         (status = 400, description = "A malformed document id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
