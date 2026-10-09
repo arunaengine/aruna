@@ -1652,8 +1652,13 @@ mod tests {
 
     #[tokio::test]
     async fn import_panic_kept() {
-        let (_dir, storage) = temp_storage();
-        let driver = context(storage.clone());
+        use aruna_core::effects::BlobEffect;
+        use aruna_core::events::BlobEvent;
+        use aruna_core::stream::BackendStream;
+
+        let fixture = crate::tests::staging::setup_driver_context().await;
+        let driver = Arc::new(fixture.driver_context);
+        let storage = driver.storage_handle.clone();
         let job_id = JobId::from_bytes([0x4B; 16]);
         let token = Ulid::generate();
         let mut record = import_record(job_id);
@@ -1665,6 +1670,53 @@ mod tests {
             lease_expires_ms: 60_000,
         });
         insert_job(&storage, &record).await.unwrap();
+
+        let Event::Blob(BlobEvent::HiddenSpooled {
+            location,
+            blake3,
+            size,
+        }) = driver
+            .blob_handle
+            .as_ref()
+            .unwrap()
+            .send_blob_effect(BlobEffect::SpoolHidden {
+                namespace: job_id.as_ulid(),
+                name: "input".to_string(),
+                created_by: record.created_by,
+                max_bytes: Some(1024),
+                deadline: None,
+                blob: BackendStream::new(tokio_util::io::ReaderStream::new(std::io::Cursor::new(
+                    b"archive bytes".to_vec(),
+                ))),
+            })
+            .await
+        else {
+            panic!("input spool failed")
+        };
+        let blob_path = location.get_full_path().unwrap();
+        let blob_len = std::fs::metadata(&blob_path).unwrap().len();
+        let mut upload =
+            crate::jobs::import::upload_record(record.created_by, Ulid::from_bytes([3u8; 16]), 0);
+        upload.location = location;
+        upload.blake3 = blake3;
+        upload.size = size;
+        upload.claimed_by = Some(job_id);
+        crate::jobs::import::write_rocrate_upload(&storage, &upload)
+            .await
+            .unwrap();
+        let checkpoint_key = ByteView::from(job_id.to_bytes().to_vec());
+        let Event::Storage(aruna_core::events::StorageEvent::WriteResult { .. }) = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: JOB_STATE_KEYSPACE.to_string(),
+                key: checkpoint_key.clone(),
+                value: ByteView::from(b"checkpoint".to_vec()),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("checkpoint seed failed")
+        };
+
         let ctx = JobContext {
             driver,
             job_id,
@@ -1680,18 +1732,45 @@ mod tests {
             panic!("panic outcome must fail");
         };
         assert_eq!(error.kind, JobErrorKind::Retryable);
+        let outcome = requeue_job(
+            &storage,
+            job_id,
+            Some(token),
+            unix_timestamp_millis(),
+            None,
+            Some(error),
+        )
+        .await
+        .unwrap();
+        let RequeueOutcome::Exhausted(exhausted) = outcome else {
+            panic!("the last attempt must exhaust the job");
+        };
+        assert_eq!(exhausted.state, JobState::Indeterminate);
+        assert!(exhausted.locally_exhausted);
+
         let (rows, _) = list_job_entries(&storage, job_id, None, 10).await.unwrap();
         assert!(rows.is_empty(), "panic must not write a failure report");
-        assert!(matches!(
-            storage
-                .send_storage_effect(StorageEffect::Read {
-                    key_space: JOB_STATE_KEYSPACE.to_string(),
-                    key: ByteView::from(job_id.to_bytes().to_vec()),
-                    txn_id: None,
-                })
-                .await,
-            Event::Storage(aruna_core::events::StorageEvent::ReadResult { value: None, .. })
-        ));
+        assert_eq!(
+            crate::jobs::import::read_rocrate_upload(&storage, upload.upload_id)
+                .await
+                .unwrap(),
+            Some(upload)
+        );
+        assert_eq!(std::fs::metadata(&blob_path).unwrap().len(), blob_len);
+        let Event::Storage(aruna_core::events::StorageEvent::ReadResult {
+            value: Some(checkpoint),
+            ..
+        }) = storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: JOB_STATE_KEYSPACE.to_string(),
+                key: checkpoint_key,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("checkpoint must survive");
+        };
+        assert_eq!(checkpoint.as_ref(), b"checkpoint");
     }
 
     // A zombie execution's finish must not evict the newer execution that replaced it.
