@@ -874,7 +874,7 @@ async fn supervise(
             .await
         {
             Ok(outcome) => outcome,
-            Err(_panic) => handle_panic(ctx, record).await,
+            Err(_panic) => handle_panic(ctx),
         }
     };
     tokio::pin!(payload);
@@ -891,14 +891,9 @@ async fn supervise(
     }
 }
 
-async fn handle_panic(ctx: &JobContext, record: &JobRecord) -> JobRunOutcome {
+fn handle_panic(ctx: &JobContext) -> JobRunOutcome {
     warn!(job_id = %ctx.job_id, "Job payload panicked; failing the attempt");
-    match &record.payload {
-        JobPayload::ImportRoCrate(spec) if ctx.final_attempt => {
-            crate::jobs::import::cleanup_after_panic(ctx, spec).await
-        }
-        _ => JobRunOutcome::Failed(JobError::retryable("job payload panicked")),
-    }
+    JobRunOutcome::Failed(JobError::retryable("job payload panicked"))
 }
 
 /// Returns only when `stop` fires (payload finished) or the claim is lost. A lost claim
@@ -1656,7 +1651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn panic_routes_cleanup() {
+    async fn import_panic_kept() {
         let (_dir, storage) = temp_storage();
         let driver = context(storage.clone());
         let job_id = JobId::from_bytes([0x4B; 16]);
@@ -1681,13 +1676,12 @@ mod tests {
             progress: ProgressReporter::from_progress(&record.progress),
         };
 
-        let JobRunOutcome::Failed(error) = handle_panic(&ctx, &record).await else {
+        let JobRunOutcome::Failed(error) = handle_panic(&ctx) else {
             panic!("panic outcome must fail");
         };
-        assert_eq!(error.kind, JobErrorKind::Permanent);
+        assert_eq!(error.kind, JobErrorKind::Retryable);
         let (rows, _) = list_job_entries(&storage, job_id, None, 10).await.unwrap();
-        let row: ImportReportRow = postcard::from_bytes(rows[0].1.as_ref()).unwrap();
-        assert_eq!(row.entry_key, "failure/acquire");
+        assert!(rows.is_empty(), "panic must not write a failure report");
         assert!(matches!(
             storage
                 .send_storage_effect(StorageEffect::Read {
@@ -1696,40 +1690,8 @@ mod tests {
                     txn_id: None,
                 })
                 .await,
-            Event::Storage(aruna_core::events::StorageEvent::ReadResult { value: Some(_), .. })
+            Event::Storage(aruna_core::events::StorageEvent::ReadResult { value: None, .. })
         ));
-    }
-
-    #[tokio::test]
-    async fn final_panic_retry() {
-        let (_dir, storage) = temp_storage();
-        let driver = context(storage.clone());
-        let job_id = JobId::from_bytes([0x4C; 16]);
-        let token = Ulid::generate();
-        let mut record = probe_record(job_id, 1, 0, None);
-        record.state = JobState::Running;
-        record.attempts = JOB_MAX_ATTEMPTS - 1;
-        record.claim = Some(JobClaim {
-            holder_node_id: node_id(3),
-            claim_token: token,
-            lease_expires_ms: 60_000,
-        });
-        insert_job(&storage, &record).await.unwrap();
-        let ctx = JobContext {
-            driver,
-            job_id,
-            owner_node_id: record.owner_node_id,
-            claim_token: token,
-            final_attempt: true,
-            cancel: CancellationToken::new(),
-            shutdown: CancellationToken::new(),
-            progress: ProgressReporter::from_progress(&record.progress),
-        };
-
-        let JobRunOutcome::Failed(error) = handle_panic(&ctx, &record).await else {
-            panic!("panic outcome must fail");
-        };
-        assert_eq!(error.kind, JobErrorKind::Retryable);
     }
 
     // A zombie execution's finish must not evict the newer execution that replaced it.
