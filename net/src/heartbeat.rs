@@ -16,9 +16,19 @@ const MIN_HEARTBEAT_GAP: Duration = Duration::from_secs(10);
 const PEER_STREAMS: usize = 2;
 const TOTAL_STREAMS: usize = 64;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct HeartbeatTable {
     state: Mutex<TableState>,
+    started: Instant,
+}
+
+impl Default for HeartbeatTable {
+    fn default() -> Self {
+        Self {
+            state: Mutex::default(),
+            started: Instant::now(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -122,6 +132,16 @@ impl HeartbeatTable {
             .collect()
     }
 
+    /// Time since the last held heartbeat of `node`, or since this table started without one.
+    pub(crate) fn silence(&self, node: &NodeId) -> Duration {
+        let state = self.state.lock();
+        state
+            .held
+            .get(node)
+            .map_or(self.started, |held| held.received)
+            .elapsed()
+    }
+
     /// Drops the heartbeats of nodes that are no longer sync peers.
     pub(crate) fn retain(&self, keep: impl Fn(&NodeId) -> bool) {
         self.state.lock().held.retain(|node, _| keep(node));
@@ -219,6 +239,15 @@ mod tests {
         drop(first);
         assert!(table.slot(node(1)).is_some());
         drop(second);
+    }
+
+    #[test]
+    fn silence_counts_from_start() {
+        let table = HeartbeatTable::default();
+        let before = table.silence(&node(1));
+        table.record(node(1), heartbeat(1, 1), || true);
+        assert!(table.silence(&node(1)) <= table.silence(&node(2)));
+        assert!(table.silence(&node(2)) >= before);
     }
 
     #[test]

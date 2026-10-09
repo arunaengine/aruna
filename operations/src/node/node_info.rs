@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -17,7 +17,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::heartbeat::NodeHeartbeat;
+use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat};
 use aruna_core::keyspaces::{
     COMPUTE_DEPARTURE_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
     JOB_RESERVATION_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE,
@@ -56,8 +56,8 @@ use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocume
 /// Rows one snapshot scan reads per page.
 const SNAPSHOT_PAGE_SIZE: usize = 128;
 
-/// Interval between node-info heartbeat republishes. Peers treat a node's
-/// `heartbeat_at_ms` staleness against this cadence when scoring liveness.
+/// Interval between two heartbeats. Peers treat a heartbeat older than three
+/// intervals as stale telemetry.
 pub const INFO_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Arms (or shortens toward) the periodic node-info heartbeat publish task.
@@ -592,8 +592,8 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
     }
 }
 
-/// Local nonterminal demand merged with current member advertisements.
-/// The bool flags an understated publisher; remote demand is partition-tolerant.
+/// Local nonterminal demand merged with the fresh heartbeats of the other sync-eligible members.
+/// The bool flags an understated view: a truncated snapshot or a member without a fresh heartbeat.
 pub async fn group_demand(
     ctx: &DriverContext,
     realm_id: RealmId,
@@ -601,40 +601,31 @@ pub async fn group_demand(
     group_id: &aruna_core::types::GroupId,
 ) -> Result<(ResourceTotals, bool), String> {
     let config = load_realm_config(ctx, realm_id).await?;
-    let members: BTreeSet<NodeId> = config
-        .node_ids()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .collect();
+    let members = config
+        .sync_eligible_nodes()
+        .map_err(|error| error.to_string())?;
     let local = demand_snapshot(ctx, AdvertisementEpoch::default()).await?;
+    let fresh = crate::node::heartbeat::fresh_heartbeats(ctx.net_handle.as_ref());
+    Ok(merge_view(local, &members, node_id, &fresh, group_id))
+}
+
+fn merge_view(
+    local: ComputeDemandSnapshot,
+    members: &[NodeId],
+    node_id: NodeId,
+    fresh: &BTreeMap<NodeId, HeldHeartbeat>,
+    group_id: &aruna_core::types::GroupId,
+) -> (ResourceTotals, bool) {
+    let mut missing = false;
     let mut snapshots = vec![local];
-    let mut start: Option<Key> = None;
-    loop {
-        let (page, next) = iter_page(ctx, NODE_INFO_KEYSPACE, None, start).await?;
-        for (_, value) in &page {
-            match postcard::from_bytes::<NodeInfoDocument>(value.as_ref()) {
-                Ok(document)
-                    if document.node_id != node_id && members.contains(&document.node_id) =>
-                {
-                    snapshots.push(document.demand)
-                }
-                Ok(_) => {}
-                // An unreadable advertisement is an unobserved publisher, the
-                // same approximation a partition already leaves in this view.
-                Err(error) => {
-                    warn!(%error, "Skipping an undecodable node info row in the demand view")
-                }
-            }
-        }
-        match next {
-            Some(cursor) => start = Some(cursor),
-            None => break,
+    for member in members.iter().filter(|member| **member != node_id) {
+        match fresh.get(member) {
+            Some(held) => snapshots.push(held.heartbeat.demand.clone()),
+            None => missing = true,
         }
     }
-    Ok(aruna_core::compute::quota::merge_demand(
-        snapshots.iter(),
-        group_id,
-    ))
+    let (totals, truncated) = aruna_core::compute::quota::merge_demand(snapshots.iter(), group_id);
+    (totals, truncated || missing)
 }
 
 /// The single durable departure-report row of this node.
@@ -1297,7 +1288,9 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, 1).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+            .await
+            .unwrap();
 
         assert!(
             read_info_document(&ctx.storage_handle, local)
@@ -1452,7 +1445,9 @@ mod tests {
         let expected_labels = build_view(&config).nodes[0].labels.clone();
         write_realm_config(&ctx, &config).await;
 
-        refresh_info_heartbeat(&ctx, local, realm_id, 1).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+            .await
+            .unwrap();
         let second = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
@@ -1492,7 +1487,9 @@ mod tests {
         let local = node(1);
         write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
 
-        refresh_info_heartbeat(&ctx, local, realm_id, 1).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+            .await
+            .unwrap();
         assert!(
             read_info_document(&ctx.storage_handle, local)
                 .await
@@ -1820,21 +1817,53 @@ mod tests {
         assert!(stored.validate().is_ok());
     }
 
+    fn held_demand(node_id: NodeId, group_id: Ulid, families: Vec<DemandFamily>) -> HeldHeartbeat {
+        let epoch = AdvertisementEpoch::default();
+        HeldHeartbeat {
+            node_id,
+            heartbeat: NodeHeartbeat {
+                realm_id: RealmId::from_bytes([12u8; 32]),
+                epoch,
+                sequence: 1,
+                utilization: NodeUtilization {
+                    storage_bytes_used: 0,
+                    documents_held: None,
+                    load_permille: None,
+                    heartbeat_at_ms: 1,
+                },
+                availability: Vec::new(),
+                reservation: ComputeReservationSnapshot::default(),
+                demand: ComputeDemandSnapshot {
+                    epoch,
+                    groups: vec![DemandGroup {
+                        group_id,
+                        families,
+                        truncated: false,
+                    }],
+                    truncated: false,
+                },
+            },
+            age_ms: 0,
+            received_at_ms: 1,
+        }
+    }
+
     #[tokio::test]
     async fn merges_group_demand() {
-        // Shared families count once, removed publishers stop counting,
-        // and the local view supersedes the last heartbeat.
+        // Shared families count once, non-members stop counting, and a member
+        // without a fresh heartbeat leaves the view understated.
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([12u8; 32]);
         let local = node(1);
         let peer = node(2);
         let removed = node(3);
-        write_realm_config(&ctx, &realm_config(realm_id, &[local, peer])).await;
         let group_id = Ulid::from_bytes([2u8; 16]);
         write_family(&ctx, realm_id, family(1), group_id, LogicalJobState::Queued).await;
+        let snapshot = demand_snapshot(&ctx, AdvertisementEpoch::default())
+            .await
+            .unwrap();
 
-        let epoch = AdvertisementEpoch::default();
         let shared = DemandFamily {
             submission_id: family(1).submission_id,
             request_digest: family(1).request_digest,
@@ -1851,54 +1880,51 @@ mod tests {
             request_digest: family(4).request_digest,
             ..shared
         };
-        for (node_id, families) in [(peer, vec![shared]), (removed, vec![own])] {
-            let mut document = NodeInfoDocument {
-                node_id,
-                executors: Vec::new(),
-                labels: BTreeMap::new(),
-                urls: NodeUrls {
-                    api: None,
-                    s3: None,
-                },
-                utilization: NodeUtilization {
-                    storage_bytes_used: 0,
-                    documents_held: None,
-                    load_permille: None,
-                    heartbeat_at_ms: 1,
-                },
-                updated_at_ms: 1,
-                epoch,
-                compute_draining: false,
-                leaving: false,
-                demand: ComputeDemandSnapshot::default(),
-                reservation: ComputeReservationSnapshot::default(),
-            };
-            document.demand.groups = vec![DemandGroup {
-                group_id,
-                families,
-                truncated: false,
-            }];
-            write_info_document(&ctx.storage_handle, &document)
-                .await
-                .unwrap();
-        }
+        let fresh = BTreeMap::from([
+            (peer, held_demand(peer, group_id, vec![shared])),
+            (removed, held_demand(removed, group_id, vec![own])),
+        ]);
+
+        // The peer reports the family this node already holds locally.
+        let (totals, truncated) =
+            merge_view(snapshot.clone(), &[local, peer], local, &fresh, &group_id);
+        assert_eq!(totals.count, 1);
+        assert_eq!(totals.cpu_cores, 2);
+        assert!(!truncated);
+        let other = Ulid::from_bytes([9u8; 16]);
+        let (totals, _) = merge_view(snapshot.clone(), &[local, peer], local, &fresh, &other);
+        assert_eq!(totals.count, 0);
+
+        let (totals, truncated) =
+            merge_view(snapshot, &[local, peer, node(4)], local, &fresh, &group_id);
+        assert_eq!(totals.count, 1);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn ignores_user_devices() {
+        // A user device sends no heartbeat, so it must not leave the view understated.
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([15u8; 32]);
+        let local = node(1);
+        let mut config = realm_config(realm_id, &[local]);
+        config.ensure_node(
+            node(2),
+            RealmNodeKind::User {
+                owner: aruna_core::UserId::nil(realm_id),
+            },
+        );
+        write_realm_config(&ctx, &config).await;
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        write_family(&ctx, realm_id, family(1), group_id, LogicalJobState::Queued).await;
 
         let (totals, truncated) = group_demand(&ctx, realm_id, local, &group_id)
             .await
             .unwrap();
 
-        // The peer republishes the family this node already holds locally.
         assert_eq!(totals.count, 1);
-        assert_eq!(totals.cpu_cores, 2);
         assert!(!truncated);
-        assert_eq!(
-            group_demand(&ctx, realm_id, local, &Ulid::from_bytes([9u8; 16]))
-                .await
-                .unwrap()
-                .0
-                .count,
-            0
-        );
     }
 
     #[tokio::test]
@@ -2164,34 +2190,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_unreadable_row() {
-        // An advertisement that does not decode is an unobserved publisher, not
-        // a reason to refuse every admission on this node.
-        let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
-        let realm_id = RealmId::from_bytes([15u8; 32]);
-        let local = node(1);
-        let peer = node(2);
-        write_realm_config(&ctx, &realm_config(realm_id, &[local, peer])).await;
-        let group_id = Ulid::from_bytes([2u8; 16]);
-        write_family(&ctx, realm_id, family(1), group_id, LogicalJobState::Queued).await;
-        write_row(
-            &ctx,
-            NODE_INFO_KEYSPACE,
-            Key::from(node_info_key(peer)),
-            vec![0xFFu8; 4],
-        )
-        .await;
-
-        let (totals, truncated) = group_demand(&ctx, realm_id, local, &group_id)
-            .await
-            .unwrap();
-
-        assert_eq!(totals.count, 1);
-        assert!(!truncated);
-    }
-
-    #[tokio::test]
     async fn heartbeat_keeps_drain() {
         // A drain recorded while the heartbeat scans must survive its write, and
         // the heartbeat must never undrain a node on its own.
@@ -2213,7 +2211,9 @@ mod tests {
         .unwrap();
 
         write_operator_drain(&ctx, true).await.unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, 1).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+            .await
+            .unwrap();
         let drained = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
@@ -2221,7 +2221,9 @@ mod tests {
         assert!(drained.compute_draining && !drained.leaving);
 
         write_operator_drain(&ctx, false).await.unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, 1).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+            .await
+            .unwrap();
         let released = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
@@ -2252,7 +2254,9 @@ mod tests {
             .await
             .unwrap();
 
-        refresh_info_heartbeat(&ctx, local, realm_id, 1).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+            .await
+            .unwrap();
 
         let stored = read_info_document(&ctx.storage_handle, local)
             .await
@@ -2281,7 +2285,9 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, 1).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+            .await
+            .unwrap();
 
         let stored = read_info_document(&ctx.storage_handle, local)
             .await
@@ -2290,5 +2296,4 @@ mod tests {
         assert_eq!(stored.utilization.documents_held, Some(0));
         assert!(stored.utilization.load_permille.is_some());
     }
-
 }

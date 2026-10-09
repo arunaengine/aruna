@@ -504,6 +504,11 @@ impl NetHandle {
         self.inner.heartbeats.held()
     }
 
+    /// Time since the last heartbeat of `node`, or since this node started without one.
+    pub fn heartbeat_silence(&self, node: NodeId) -> Duration {
+        self.inner.heartbeats.silence(&node)
+    }
+
     /// Cheap clone of the origin-side watch interest cache. Consumers match
     /// events against this table without any per-event storage read.
     pub fn watch_interest_snapshot(&self) -> WatchInterestTable {
