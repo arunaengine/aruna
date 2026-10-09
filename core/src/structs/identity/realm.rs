@@ -2163,7 +2163,8 @@ mod test {
         };
         let config = RealmConfigDocument::new(RealmId([7u8; 32]), Vec::new(), 2);
         let encoded = config.to_bytes(&actor).expect("config encodes");
-        let tail = postcard::to_allocvec(&config.compute).expect("compute encodes");
+        let tail =
+            postcard::to_allocvec(&(&config.compute, &config.federation)).expect("tail encodes");
         assert!(encoded.ends_with(&tail));
 
         let truncated = &encoded[..encoded.len() - tail.len()];
