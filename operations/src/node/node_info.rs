@@ -1039,7 +1039,8 @@ async fn replicate_node_info(
                 // Shared-topic genesis is bootstrapped by publish_core_documents;
                 // explicit publishes and periodic heartbeats only publish into it.
                 allow_genesis: false,
-            }),
+            })
+            .strict(),
             ctx,
         )
         .await
@@ -1235,7 +1236,8 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
-            task_handle: None,
+            // Node info replication is strict, so its drain scheduling must succeed.
+            task_handle: Some(TaskHandle::new()),
             compute_handle: None,
         }
     }
