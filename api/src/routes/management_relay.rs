@@ -10,7 +10,7 @@ use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::body::Bytes;
-use axum::extract::{FromRequest, MatchedPath, Request, State};
+use axum::extract::{FromRequest, MatchedPath, OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -124,7 +124,11 @@ async fn relay(state: &Arc<ServerState>, route: &'static str, request: Request) 
     }
 
     let method = request.method().clone();
-    let uri = request.uri().clone();
+    // Inside the `/api/v1` nest the URI lacks that prefix; the original URI keeps it.
+    let uri = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map_or_else(|| request.uri().clone(), |original| original.0.clone());
     let authorization = request.headers().get(header::AUTHORIZATION).cloned();
     let content_type = request.headers().get(header::CONTENT_TYPE).cloned();
     let preconditions: Vec<_> = [header::IF_MATCH, header::IF_NONE_MATCH]
