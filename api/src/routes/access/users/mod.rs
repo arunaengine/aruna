@@ -715,6 +715,7 @@ somebody else.
 - The token preserves a bound session's kind; an OIDC or unbound caller receives a `portal` session.
 - A federated session is refused; it ends with its lifetime and cannot be renewed.
 - The token keeps the path restrictions of the presented token, so renewal never widens access.
+- An OIDC login keeps the provider's verified `auth_time`, not the exchange time.
 - The token is returned in this response only, so a lost one has to be reissued here.
 
 **Limits**
@@ -777,7 +778,7 @@ async fn get_token(
                 user.user_id,
                 SessionKind::Portal,
                 None,
-                Some(now_timestamp()),
+                oidc_identity.auth_time,
             )
         }
     };

@@ -112,8 +112,8 @@ fn actor(state: &ServerState, auth: &AuthContext) -> Actor {
     description = r#"Signs a short-lived confirmation that binds the caller's local account and a login of another realm.
 
 **Authentication**: a portal session of an active local account without path restrictions,
-whose primary login was at most 5 minutes ago. Renewals keep the time of that login; child
-sessions have none and are refused.
+whose OIDC provider login (`auth_time`) was at most 5 minutes ago. Renewals keep that time.
+A provider token without `auth_time` and child sessions give none and are refused.
 
 **Behavior**
 - `handoff` must be a fresh login handoff of the other realm for this realm, checked like a
