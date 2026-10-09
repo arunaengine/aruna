@@ -247,12 +247,13 @@ impl NetHandle {
             .await
     }
 
-    pub fn allow_topic_peers(
+    pub async fn allow_topic_peers(
         &self,
         topics: &[::irokle::TopicId],
         peers: Vec<NodeId>,
     ) -> Result<()> {
-        self.inner.document_sync.allow_topic_peers(topics, peers)
+        let (sync, topics) = (Arc::clone(&self.inner.document_sync), topics.to_vec());
+        run_blocking(move || sync.allow_topic_peers(&topics, peers)).await
     }
 
     /// Reconciles shard-only topics to their exact sync membership (delivery)
@@ -272,18 +273,20 @@ impl NetHandle {
             .await
     }
 
-    pub fn ensure_sync_topics(
+    pub async fn ensure_sync_topics(
         &self,
         topics: &[::irokle::TopicId],
         peers: Vec<NodeId>,
     ) -> Result<()> {
-        self.inner.document_sync.ensure_sync_topics(topics, peers)
+        let (sync, topics) = (Arc::clone(&self.inner.document_sync), topics.to_vec());
+        run_blocking(move || sync.ensure_sync_topics(&topics, peers)).await
     }
 
     /// Ensures topics this node is the only holder of. No peer is added to
     /// their membership, so a device's own topics stay entirely local.
-    pub fn ensure_local_topics(&self, topics: &[::irokle::TopicId]) -> Result<()> {
-        self.inner.document_sync.ensure_local_topics(topics)
+    pub async fn ensure_local_topics(&self, topics: &[::irokle::TopicId]) -> Result<()> {
+        let (sync, topics) = (Arc::clone(&self.inner.document_sync), topics.to_vec());
+        run_blocking(move || sync.ensure_local_topics(&topics)).await
     }
 
     /// Whether a document sync topic's genesis is known locally.
@@ -997,6 +1000,15 @@ pub(crate) fn unique_endpoint_addrs(
     }
     unique.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
     unique
+}
+
+/// Runs topic writes and flushes, which block, off the async runtime.
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?
 }
 
 pub(crate) fn unique_peer_nodes(mut nodes: Vec<NodeId>, local_id: NodeId) -> Vec<NodeId> {

@@ -887,7 +887,7 @@ async fn incident_fixture(realm_id: RealmId) -> Result<IncidentFixture, BoxError
     let config = incident_config(realm_id, &nodes, &strategy);
     write_config(&nodes, &realm_id, &config).await?;
     let (target, placement) = incident_target(&strategy)?;
-    ensure_incident_topics(realm_id, &nodes, &strategy, &target, placement)?;
+    ensure_incident_topics(realm_id, &nodes, &strategy, &target, placement).await?;
 
     Ok(IncidentFixture {
         nodes,
@@ -999,7 +999,7 @@ fn incident_target(
     ))
 }
 
-fn ensure_incident_topics(
+async fn ensure_incident_topics(
     realm_id: RealmId,
     nodes: &[TestNode],
     strategy: &aruna_core::structs::placement::record::PlacementStrategy,
@@ -1021,7 +1021,8 @@ fn ensure_incident_topics(
         .collect();
     nodes[1]
         .net
-        .ensure_sync_topics(&topics, vec![local, peer_two])?;
+        .ensure_sync_topics(&topics, vec![local, peer_two])
+        .await?;
     let topic = target.sync_topic_id(realm_id, &placement);
     assert!(
         nodes[1].net.sync_topic_exists(topic).unwrap_or(false),

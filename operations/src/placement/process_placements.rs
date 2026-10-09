@@ -314,9 +314,9 @@ pub(crate) async fn ensure_genesis_group(
         // The net layer reads an empty peer list as all realm peers. A topic held here
         // alone stays local, or the reconcile below removes those peers on every pass.
         let ensured = if co_members.is_empty() {
-            net_handle.ensure_local_topics(&to_ensure)
+            net_handle.ensure_local_topics(&to_ensure).await
         } else {
-            net_handle.ensure_sync_topics(&to_ensure, co_members)
+            net_handle.ensure_sync_topics(&to_ensure, co_members).await
         };
         match ensured {
             Ok(()) => {

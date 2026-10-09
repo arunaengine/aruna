@@ -135,6 +135,21 @@ impl DocumentSyncService {
             )));
         }
 
+        // Control writes and the flush block, so they run off the async runtime.
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            service.write_shard_controls(states, &member_peers, local_peer)
+        })
+        .await
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?
+    }
+
+    fn write_shard_controls(
+        &self,
+        states: Vec<(::irokle::TopicId, ::irokle::storage::TopicState)>,
+        member_peers: &BTreeSet<PeerId>,
+        local_peer: PeerId,
+    ) -> Result<()> {
         let oplog = Oplog::with_storage(self.node.storage().clone());
         for (topic_id, state) in states {
             let missing_peers = member_peers
