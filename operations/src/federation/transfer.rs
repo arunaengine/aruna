@@ -34,6 +34,8 @@ pub enum TransferAdmitError {
     Sign(#[from] FederationError),
     #[error("transfer operation did not finish")]
     NotFinished,
+    #[error("unexpected event after the transfer decision")]
+    UnexpectedEvent,
 }
 
 /// Reads the realm config, then decides once from it.
@@ -61,6 +63,7 @@ impl<T> ConfigStep<T> {
         decide: impl FnOnce(RealmConfigDocument) -> Result<T, TransferAdmitError>,
     ) -> Effects {
         let Some(read) = self.read.as_mut() else {
+            self.output = Some(Err(TransferAdmitError::UnexpectedEvent));
             return Effects::new();
         };
         let effects = read.step(event);
@@ -248,6 +251,22 @@ mod tests {
         let digest = descriptor_digest(&descriptor()).unwrap();
         assert_eq!(issued.payload.descriptor_digest, digest);
         assert_eq!(issued.payload.expires_at, NOW + MAX_TRANSFER_SECS);
+    }
+
+    #[test]
+    fn decided_step_closed() {
+        // After the decision every further event is refused instead of ignored.
+        let mut step = ConfigStep::<u8>::new(realm(2));
+        step.read = None;
+        step.output = Some(Ok(1));
+        let event = Event::Storage(aruna_core::events::StorageEvent::TransactionAborted {
+            txn_id: ulid::Ulid::nil(),
+        });
+        step.step(event, |_| Ok(2));
+        assert!(matches!(
+            step.output,
+            Some(Err(TransferAdmitError::UnexpectedEvent))
+        ));
     }
 
     #[tokio::test]
