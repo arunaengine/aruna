@@ -49,10 +49,10 @@ const PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(OpenApi)]
 #[openapi(tags((name = "federation", description = "Native login across realms")))]
-pub struct FederationImportApiDoc;
+pub struct ImportApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(FederationImportApiDoc::openapi())
+    OpenApiRouter::with_openapi(ImportApiDoc::openapi())
         .routes(routes!(create_intent))
         .routes(routes!(create_import))
 }

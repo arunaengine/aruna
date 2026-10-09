@@ -18,7 +18,7 @@ pub const HANDOFF_DOMAIN: &str = "aruna-login-handoff-v1";
 /// Longest lifetime of a handoff.
 pub const MAX_HANDOFF_SECS: u64 = 60;
 /// Largest accepted clock skew of the home realm ahead of the serving realm.
-pub const MAX_HANDOFF_SKEW_SECS: u64 = 30;
+pub const HANDOFF_SKEW_SECS: u64 = 30;
 /// Lifetime of the federated session a handoff opens; it is not renewable.
 pub const FEDERATED_SESSION_SECS: u64 = 8 * 3600;
 
@@ -138,7 +138,7 @@ pub fn check_handoff(
     let lifetime = payload.expires_at.checked_sub(payload.issued_at);
     if !lifetime.is_some_and(|secs| secs > 0 && secs <= MAX_HANDOFF_SECS)
         || now >= payload.expires_at
-        || payload.issued_at > now.saturating_add(MAX_HANDOFF_SKEW_SECS)
+        || payload.issued_at > now.saturating_add(HANDOFF_SKEW_SECS)
     {
         return Err(HandoffError::BadLifetime);
     }
@@ -300,7 +300,7 @@ mod tests {
         );
         assert_eq!(expired, Err(HandoffError::BadLifetime));
         let future = handoff(|payload| {
-            payload.issued_at = NOW + 1 + MAX_HANDOFF_SKEW_SECS + 1;
+            payload.issued_at = NOW + 1 + HANDOFF_SKEW_SECS + 1;
             payload.expires_at = payload.issued_at + 10;
         });
         assert_eq!(check(&future, &accepting()), Err(HandoffError::BadLifetime));

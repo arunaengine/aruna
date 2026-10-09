@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::UserId;
 use crate::federation::{FederationError, RealmDescriptor, Signable, Signed, valid_federation_url};
-use crate::handoff::{MAX_HANDOFF_SKEW_SECS, descriptor_digest, secret_nonce};
+use crate::handoff::{HANDOFF_SKEW_SECS, descriptor_digest, secret_nonce};
 use crate::structs::identity::realm::RealmId;
 use crate::types::GroupId;
 
@@ -148,7 +148,7 @@ fn check_lifetime(issued_at: u64, expires_at: u64, now: u64) -> Result<(), Trans
     let lifetime = expires_at.checked_sub(issued_at);
     if !lifetime.is_some_and(|secs| secs > 0 && secs <= MAX_TRANSFER_SECS)
         || now >= expires_at
-        || issued_at > now.saturating_add(MAX_HANDOFF_SKEW_SECS)
+        || issued_at > now.saturating_add(HANDOFF_SKEW_SECS)
     {
         return Err(TransferError::BadLifetime);
     }
