@@ -2510,6 +2510,28 @@ fn nested_references_cleaned() {
 }
 
 #[test]
+fn bare_links_unchanged() {
+    // A link in `hasPart` stays a bare id, so the importing realm sees one definition.
+    let realm_id = RealmId::from_bytes([2; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+    let version = Ulid::from_bytes([4; 16]);
+    let left = VersionedObjectArn::new(realm_id, node_id, "bucket", "left", version).unwrap();
+    let mut document = json!({
+        "@graph": [
+            {"@id": "./", "@type": "Dataset", "hasPart": [{"@id": left.to_string()}]},
+            {"@id": left.to_string(), "@type": "File"},
+        ]
+    });
+    let mut entities = recognized_entities(&document, realm_id).unwrap();
+    keep_references(&mut entities, &[]);
+    add_references(&mut document, &entities).unwrap();
+
+    let graph = document["@graph"].as_array().unwrap();
+    assert_eq!(graph[0]["hasPart"], json!([{"@id": left.to_w3id()}]));
+    assert_eq!(graph[1]["identifier"], left.to_string());
+}
+
+#[test]
 fn facts_need_selection() {
     // A grant pins only a finished export that kept every selected file.
     let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();

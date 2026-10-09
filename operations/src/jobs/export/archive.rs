@@ -1327,7 +1327,9 @@ fn clean_references(
         _ => return,
     };
     let id = keywords.object_id(object).map(|(_, id)| id.to_string());
-    if let Some(original) = id.and_then(|id| identifiers.get(&id)) {
+    // A bare link holds only its id; a property would make it a second definition.
+    let defines = object.len() > 1;
+    if let Some(original) = id.filter(|_| defines).and_then(|id| identifiers.get(&id)) {
         object
             .entry("identifier")
             .or_insert_with(|| JsonValue::String(original.clone()));
