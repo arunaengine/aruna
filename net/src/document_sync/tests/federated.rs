@@ -439,3 +439,62 @@ async fn linked_logins_replicate() {
     );
     assert_eq!(alias_owner(&claims().await), Some(other));
 }
+
+#[tokio::test]
+async fn local_change_kept() {
+    // A user event read before a concurrent local change commits retries on the new state.
+    let (_dir, storage) = test_storage();
+    let realm = federated_realm(&storage).await;
+    let (realm_id, foreign) = (realm.realm_id, realm.foreign.user_id);
+    let owner = realm.owner.user_id;
+    let user = AdminDocumentTarget::User { user_id: owner };
+    let linked = realm.event(
+        &realm.owner,
+        1,
+        user.clone(),
+        AdminDocumentOperation::UserAliasAdded { alias: foreign },
+    );
+    assert_eq!(
+        receive(&storage, realm_id, linked).await,
+        AdminEventValidation::Accepted
+    );
+    let other_node = Actor {
+        node_id: realm.foreign.node_id,
+        ..realm.owner.clone()
+    };
+    let renamed = realm.event(
+        &other_node,
+        1,
+        user.clone(),
+        AdminDocumentOperation::UserNameSet {
+            name: "Renamed".into(),
+        },
+    );
+    let target = DocumentTarget::User { user_id: owner };
+    let txn_id = start_storage_transaction(&storage).await.unwrap();
+    let batch = user_batch(&storage, txn_id, &target, &renamed, None, None).await;
+    let (deletes, writes) = batch.unwrap().unwrap();
+    // The local unlink commits while the replicated rename is still open.
+    let unlinked = realm.event(
+        &realm.owner,
+        2,
+        user,
+        AdminDocumentOperation::UserAliasRemoved { alias: foreign },
+    );
+    apply_admin_operation(&storage, target.clone(), unlinked)
+        .await
+        .unwrap();
+    let stale = replace_batch_in(&storage, txn_id, deletes, writes).await;
+    assert!(matches!(
+        stale,
+        Err(NetError::Storage(StorageError::TransactionConflict))
+    ));
+    apply_admin_operation(&storage, target.clone(), renamed)
+        .await
+        .unwrap();
+    let key = target.storage_key();
+    let stored = storage_read_from(&storage, target.storage_keyspace().to_string(), key);
+    let stored = User::from_bytes(&stored.await.unwrap().unwrap()).unwrap();
+    assert_eq!(stored.name, "Renamed");
+    assert!(!stored.alias_user_ids.contains(&foreign));
+}
