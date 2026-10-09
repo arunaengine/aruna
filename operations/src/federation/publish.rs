@@ -329,18 +329,7 @@ pub async fn publish_registration(
             descriptor,
             nodes_configured,
         } => {
-            let kpis = RealmKpis {
-                live_datasets: count_realm_documents(context, realm_id)
-                    .await
-                    .inspect_err(|error| warn!(error = %error, "Dataset count unavailable"))
-                    .ok()
-                    .flatten(),
-                groups: count_realm_groups(context, realm_id)
-                    .await
-                    .inspect_err(|error| warn!(error = %error, "Group count unavailable"))
-                    .ok(),
-                nodes_configured,
-            };
+            let kpis = realm_kpis(context, realm_id, nodes_configured).await;
             let registration = Registration {
                 descriptor,
                 kpis,
@@ -386,6 +375,26 @@ pub async fn publish_registration(
         return Err(format!("registry answered {}", response.status()));
     }
     Ok(())
+}
+
+/// The realm's totals; a count that fails is unknown (`None`), never zero.
+async fn realm_kpis(
+    context: &DriverContext,
+    realm_id: RealmId,
+    nodes_configured: Option<u64>,
+) -> RealmKpis {
+    RealmKpis {
+        live_datasets: count_realm_documents(context, realm_id)
+            .await
+            .inspect_err(|error| warn!(error = %error, "Dataset count unavailable"))
+            .ok()
+            .flatten(),
+        groups: count_realm_groups(context, realm_id)
+            .await
+            .inspect_err(|error| warn!(error = %error, "Group count unavailable"))
+            .ok(),
+        nodes_configured,
+    }
 }
 
 /// The registry route of one realm below the configured registry base URL.
@@ -706,5 +715,39 @@ mod tests {
             }
         }
         assert_eq!(sent, MAX_WITHDRAWALS);
+    }
+
+    #[tokio::test]
+    async fn failed_count_unknown() {
+        // A count that fails is reported as `null`; a count that works reports zero as zero.
+        let dir = tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = RealmId::from_bytes([7; 32]);
+        let kpis = realm_kpis(&context, realm_id, Some(2)).await;
+        assert_eq!(kpis.groups, Some(0));
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::GROUP_KEYSPACE.to_string(),
+                key: b"broken".to_vec().into(),
+                value: b"not a group".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        let kpis = realm_kpis(&context, realm_id, Some(2)).await;
+        let expected = serde_json::json!({
+            "live_datasets": null,
+            "groups": null,
+            "nodes_configured": 2
+        });
+        assert_eq!(serde_json::to_value(kpis).unwrap(), expected);
     }
 }
