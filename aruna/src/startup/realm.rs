@@ -25,6 +25,7 @@ use crate::bootstrap::{
 };
 use crate::config::{Config, StartupMode};
 use crate::identity::{mark_onboarding_phase, mark_state_complete};
+use crate::startup::federation::register_default;
 
 pub(crate) struct CoreAnnouncement {
     pub(crate) documents: Vec<DocumentTarget>,
@@ -127,6 +128,7 @@ async fn init_realm(
     if stop.is_cancelled() {
         return Ok(None);
     }
+    register_default(config, driver_ctx.as_ref()).await;
     // The subject comes first: the advertisement built from it carries no
     // execution target while this node has no placement subject yet.
     sync_placement_subject(driver_ctx.as_ref(), config).await?;
@@ -279,6 +281,7 @@ async fn provision_realm(
             driver_ctx.as_ref(),
         )
         .await?;
+        register_default(config, driver_ctx.as_ref()).await;
     }
 
     sync_placement_subject(driver_ctx.as_ref(), config).await?;
