@@ -53,6 +53,8 @@ pub enum IssueHandoffError {
     Sign(#[from] FederationError),
     #[error("handoff operation did not finish")]
     NotFinished,
+    #[error("unexpected event for the handoff operation state")]
+    UnexpectedEvent,
 }
 
 /// Signs a login handoff for the caller after the local user, session and status checks.
@@ -113,7 +115,9 @@ impl Operation for IssueHandoffOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        // Only the user read of `start` answers; before it and once decided, events are refused.
         let Some(read) = self.read.as_mut() else {
+            self.output = Some(Err(IssueHandoffError::UnexpectedEvent));
             return smallvec![];
         };
         let effects = read.step(event);
@@ -164,10 +168,13 @@ pub enum FederatedLoginError {
     Conversion(#[from] ConversionError),
     #[error("federated login did not finish")]
     NotFinished,
+    #[error("unexpected event for the federated login state")]
+    UnexpectedEvent,
 }
 
 #[derive(Debug, PartialEq)]
 enum FederatedLoginState {
+    Start,
     ReadConfig(GetConfigOperation),
     ReadClaims,
     ReadOwner(UserId),
@@ -186,10 +193,9 @@ pub struct FederatedLoginOperation {
 
 impl FederatedLoginOperation {
     pub fn new(config: FederatedLoginConfig) -> Self {
-        let read = GetConfigOperation::new(config.realm_id);
         Self {
             config,
-            state: FederatedLoginState::ReadConfig(read),
+            state: FederatedLoginState::Start,
             output: None,
         }
     }
@@ -301,10 +307,13 @@ impl Operation for FederatedLoginOperation {
     type Error = FederatedLoginError;
 
     fn start(&mut self) -> Effects {
-        match &mut self.state {
-            FederatedLoginState::ReadConfig(read) => read.start(),
-            _ => smallvec![],
+        if self.state != FederatedLoginState::Start {
+            return smallvec![];
         }
+        let mut read = GetConfigOperation::new(self.config.realm_id);
+        let effects = read.start();
+        self.state = FederatedLoginState::ReadConfig(read);
+        effects
     }
 
     fn step(&mut self, event: Event) -> Effects {
@@ -335,7 +344,9 @@ impl Operation for FederatedLoginOperation {
                 self.finish(session.finalize().map_err(Into::into));
                 effects
             }
-            FederatedLoginState::Done => smallvec![],
+            FederatedLoginState::Start | FederatedLoginState::Done => {
+                self.finish(Err(FederatedLoginError::UnexpectedEvent))
+            }
         }
     }
 
@@ -444,9 +455,7 @@ mod tests {
         assert_eq!(operation.finalize(), Err(IssueHandoffError::Deactivated));
     }
 
-    #[test]
-    fn missing_settings_refused() {
-        // Without federation settings no session is written.
+    fn login() -> FederatedLoginOperation {
         let handoff_user = UserId::new(Ulid::from_bytes([2; 16]), RealmId::from_bytes([9; 32]));
         let handoff = LoginHandoff {
             issuer: handoff_user.realm_id,
@@ -459,17 +468,46 @@ mod tests {
             expires_at: 70,
             handoff_id: Ulid::from_bytes([3; 16]),
         };
-        let mut operation = FederatedLoginOperation::new(FederatedLoginConfig {
+        FederatedLoginOperation::new(FederatedLoginConfig {
             realm_id: realm_id(),
             handoff: Signed::sign(handoff, &capabilities()).unwrap(),
             secret: vec![4; 32],
             node_capabilities: capabilities(),
             now: 10,
-        });
+        })
+    }
+
+    #[test]
+    fn missing_settings_refused() {
+        // Without federation settings no session is written.
+        let mut operation = login();
         assert_eq!(operation.start().len(), 1);
         let config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
         let effects = operation.step(read_result(config.to_bytes(&actor()).unwrap()));
         assert!(effects.is_empty());
         assert_eq!(operation.finalize(), Err(FederatedLoginError::Disabled));
+    }
+
+    #[test]
+    fn stray_events_rejected() {
+        // Events before `start` and after the decision are refused, never read as answers.
+        let config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        let answer = || read_result(config.to_bytes(&actor()).unwrap());
+        let mut early = login();
+        assert!(early.step(answer()).is_empty());
+        assert_eq!(early.finalize(), Err(FederatedLoginError::UnexpectedEvent));
+        let mut late = login();
+        late.start();
+        late.step(answer());
+        assert!(late.step(answer()).is_empty());
+        assert_eq!(late.finalize(), Err(FederatedLoginError::UnexpectedEvent));
+
+        let mut early = issue(SessionKind::Portal);
+        early.step(answer());
+        assert_eq!(early.finalize(), Err(IssueHandoffError::UnexpectedEvent));
+        let mut late = issue(SessionKind::Federated);
+        late.start();
+        late.step(answer());
+        assert_eq!(late.finalize(), Err(IssueHandoffError::UnexpectedEvent));
     }
 }

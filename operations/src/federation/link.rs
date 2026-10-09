@@ -144,6 +144,8 @@ pub struct ConfirmLinkConfig {
 #[derive(Debug, PartialEq)]
 pub struct ConfirmLinkOperation {
     config: ConfirmLinkConfig,
+    /// The read of `start` is out and unanswered.
+    reading: bool,
     output: Option<Result<Signed<LinkConfirmation>, LinkLoginError>>,
 }
 
@@ -151,6 +153,7 @@ impl ConfirmLinkOperation {
     pub fn new(config: ConfirmLinkConfig) -> Self {
         Self {
             config,
+            reading: false,
             output: None,
         }
     }
@@ -199,6 +202,7 @@ impl Operation for ConfirmLinkOperation {
             return smallvec![];
         }
         let auth = &config.auth_context;
+        self.reading = true;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![user_read(&auth.user_id), config_read(auth)],
             txn_id: None,
@@ -206,10 +210,11 @@ impl Operation for ConfirmLinkOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        // Only the one read answers; a decided confirmation takes no further event.
-        self.output = Some(match self.output {
-            Some(_) => Err(LinkLoginError::UnexpectedEvent),
-            None => self.sign(event),
+        // Only the read of `start` answers; before it and once decided, events are refused.
+        self.output = Some(if std::mem::take(&mut self.reading) {
+            self.sign(event)
+        } else {
+            Err(LinkLoginError::UnexpectedEvent)
         });
         smallvec![]
     }
@@ -798,6 +803,11 @@ mod tests {
         confirm.start();
         confirm.step(event());
         assert_eq!(confirm.finalize(), Err(LinkLoginError::UnexpectedEvent));
+        let mut early = self::confirm(local(2), Some(now), now);
+        early.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: Vec::new(),
+        }));
+        assert_eq!(early.finalize(), Err(LinkLoginError::UnexpectedEvent));
         let mut linking = link(local(2), confirmation(now), now);
         linking.config.auth_time = None;
         linking.start();
