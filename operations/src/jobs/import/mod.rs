@@ -2172,17 +2172,6 @@ fn classify_gate(error: GateContextError) -> ImportFailure {
 pub(crate) mod tests {
 
     use super::*;
-    use aruna_core::UserId;
-    use aruna_core::structs::execution::job::{
-        ImportMetadataTarget, ImportRoCrateTarget, JobClaim, JobId, JobPayload, JobRecord,
-        JobState, RoCrateUploadRecord,
-    };
-    use aruna_core::structs::identity::realm::RealmId;
-    use tokio_util::sync::CancellationToken;
-
-    use crate::jobs::executor::ProgressReporter;
-    use crate::jobs::store::insert_job;
-    use crate::tests::staging::setup_driver_context;
 
     #[test]
     fn target_checks_limits() {
