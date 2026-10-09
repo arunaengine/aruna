@@ -574,6 +574,14 @@ pub(super) fn build_rows(
     rows
 }
 
+/// The time of the pinned snapshot revision, so exports of one snapshot are byte-identical.
+pub(super) fn snapshot_moment(checkpoint: &ExportCheckpoint) -> Result<u64, ExportFailure> {
+    checkpoint
+        .winning_event_id
+        .map(|event_id| event_id.timestamp_ms())
+        .ok_or_else(|| ExportFailure::Permanent("snapshot event cursor is missing".to_string()))
+}
+
 pub(super) fn build_report(checkpoint: &ExportCheckpoint) -> Result<JsonValue, ExportFailure> {
     let event_id = checkpoint
         .winning_event_id
@@ -845,7 +853,7 @@ pub(super) async fn assemble_export(
         .ok_or_else(|| ExportFailure::Permanent("rewritten metadata is missing".to_string()))?;
     let mut entries = Vec::with_capacity(opened.len());
     let source_spec = std::sync::Arc::new(spec.clone());
-    let job_ms = unix_timestamp_millis();
+    let snapshot_ms = snapshot_moment(checkpoint)?;
     for entry in opened {
         let entity = &checkpoint.entities[entry.entity_index];
         let path = entity
@@ -872,7 +880,7 @@ pub(super) async fn assemble_export(
             expected_blake3: entry.hash,
             modified_ms: entry
                 .resolved_version
-                .map_or(job_ms, |version| version.timestamp_ms()),
+                .map_or(snapshot_ms, |version| version.timestamp_ms()),
         });
     }
     let report = checkpoint.report_json.clone();
@@ -886,7 +894,14 @@ pub(super) async fn assemble_export(
     let cancel = ctx.cancel.clone();
     let shutdown = ctx.shutdown.clone();
     let writer_task = tokio::spawn(Box::pin(write_archive_checked(
-        writer, metadata, entries, report, policies, cancel, shutdown, job_ms,
+        writer,
+        metadata,
+        entries,
+        report,
+        policies,
+        cancel,
+        shutdown,
+        snapshot_ms,
     )));
     let event = blob_handle
         .send_blob_effect(BlobEffect::SpoolHidden {
@@ -950,12 +965,12 @@ pub(super) async fn write_archive_checked(
     policies: std::sync::Arc<BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>>,
     cancel: tokio_util::sync::CancellationToken,
     shutdown: tokio_util::sync::CancellationToken,
-    job_ms: u64,
+    snapshot_ms: u64,
 ) -> Result<(), ExportFailure> {
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     let mut archive = async_zip::base::write::ZipFileWriter::with_tokio(writer);
     archive
-        .write_entry_whole(zip_entry(METADATA_PATH, job_ms), &metadata)
+        .write_entry_whole(zip_entry(METADATA_PATH, snapshot_ms), &metadata)
         .await
         .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
     for entry in entries {
@@ -1062,7 +1077,7 @@ pub(super) async fn write_archive_checked(
     }
     if let Some(report) = report {
         archive
-            .write_entry_whole(zip_entry(REPORT_PATH, job_ms), &report)
+            .write_entry_whole(zip_entry(REPORT_PATH, snapshot_ms), &report)
             .await
             .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
     }

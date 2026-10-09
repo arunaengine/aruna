@@ -1893,6 +1893,19 @@ async fn dates_follow_versions() {
     assert_eq!(payload_year, 2107);
 }
 
+#[test]
+fn dates_follow_snapshot() {
+    // Every export of one pinned snapshot stamps the same time, never the time of the job.
+    let event_id = Ulid::from_bytes([74; 16]);
+    let checkpoint = ExportCheckpoint {
+        winning_event_id: Some(event_id),
+        ..ExportCheckpoint::default()
+    };
+    let moment = archive::snapshot_moment(&checkpoint);
+    assert_eq!(moment.ok(), Some(event_id.timestamp_ms()));
+    assert!(archive::snapshot_moment(&ExportCheckpoint::default()).is_err());
+}
+
 #[tokio::test]
 async fn archives_are_deterministic() {
     assert_eq!(sample_archive().await, sample_archive().await);
