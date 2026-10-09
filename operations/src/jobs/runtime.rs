@@ -1696,19 +1696,21 @@ mod tests {
         let blob_len = std::fs::metadata(&blob_path).unwrap().len();
         let mut upload =
             crate::jobs::import::upload_record(record.created_by, Ulid::from_bytes([3u8; 16]), 0);
-        upload.location = location;
+        upload.location = location.clone();
         upload.blake3 = blake3;
         upload.size = size;
         upload.claimed_by = Some(job_id);
         crate::jobs::import::write_rocrate_upload(&storage, &upload)
             .await
             .unwrap();
+        let checkpoint_value =
+            crate::jobs::import::tests::checkpoint_bytes(location, size, blake3, upload.upload_id);
         let checkpoint_key = ByteView::from(job_id.to_bytes().to_vec());
         let Event::Storage(aruna_core::events::StorageEvent::WriteResult { .. }) = storage
             .send_storage_effect(StorageEffect::Write {
                 key_space: JOB_STATE_KEYSPACE.to_string(),
                 key: checkpoint_key.clone(),
-                value: ByteView::from(b"checkpoint".to_vec()),
+                value: ByteView::from(checkpoint_value.clone()),
                 txn_id: None,
             })
             .await
@@ -1769,7 +1771,7 @@ mod tests {
         else {
             panic!("checkpoint must survive");
         };
-        assert_eq!(checkpoint.as_ref(), b"checkpoint");
+        assert_eq!(checkpoint.as_ref(), checkpoint_value.as_slice());
     }
 
     // A zombie execution's finish must not evict the newer execution that replaced it.

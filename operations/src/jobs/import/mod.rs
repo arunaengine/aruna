@@ -2173,6 +2173,30 @@ pub(crate) mod tests {
 
     use super::*;
 
+    /// Encoded checkpoint of a job that holds one claimed upload as hidden input.
+    pub(crate) fn checkpoint_bytes(
+        location: BackendLocation,
+        size: u64,
+        blake3: [u8; 32],
+        upload_id: Ulid,
+    ) -> Vec<u8> {
+        postcard::to_allocvec(&ImportCheckpoint {
+            refs: RoCrateCheckpointRefs {
+                hidden_locations: vec![location.clone()],
+            },
+            input: Some(ImportInput {
+                location,
+                size,
+                blake3,
+                upload_id: Some(upload_id),
+                eln: false,
+            }),
+            phase: ImportPhase::Inspect,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
     #[test]
     fn target_checks_limits() {
         assert_eq!(
