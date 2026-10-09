@@ -11,12 +11,14 @@ use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
+use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, UserCapOverride};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::placement::record::PlacementScope;
 use aruna_core::structs::storage::blob::BackendRef;
+use aruna_core::structs::storage::node_info::NodeUtilization;
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use aruna_core::time::unix_timestamp_millis;
@@ -24,6 +26,7 @@ use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::{backend_used_bytes, drive};
 use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
+use aruna_operations::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use aruna_operations::node::status::load_status;
 use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::{
@@ -922,8 +925,36 @@ pub struct NodeDocumentResponse {
     pub executors: Vec<ExecutorCapabilityResponse>,
     pub labels: std::collections::BTreeMap<String, String>,
     pub urls: RealmUrlsResponse,
+    /// Live values of the held heartbeat, or those of the last published document without one.
     pub utilization: RealmUtilizationResponse,
+    pub telemetry: TelemetryState,
+    /// Age of the held heartbeat on this node's clock; absent without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_age_ms: Option<u64>,
     pub updated_at_ms: u64,
+}
+
+/// Where the live telemetry of a node comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = NodeTelemetryState)]
+pub enum TelemetryState {
+    /// A heartbeat at most three heartbeat intervals old.
+    Fresh,
+    /// An older heartbeat: the node may be down or unreachable.
+    Stale,
+    /// No heartbeat held since this node started: values of the last published document.
+    Absent,
+}
+
+impl TelemetryState {
+    pub(crate) fn of(held: Option<&HeldHeartbeat>) -> Self {
+        match held {
+            None => Self::Absent,
+            Some(held) if u128::from(held.age_ms) <= MAX_HEARTBEAT_AGE.as_millis() => Self::Fresh,
+            Some(_) => Self::Stale,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1014,6 +1045,9 @@ token of another realm or one this node cannot validate, the response is the pub
   configuration; `placement` is the node's entry in the placement map and `info` is the last node
   information document that reached this node, so both may lag or be absent, as may
   `management_urls`.
+- `info.utilization` comes from the latest heartbeat the node pushed, with `heartbeat_at_ms` as the
+  time it arrived. `info.telemetry` is `fresh` or `stale` with `info.telemetry_age_ms`, or `absent`
+  when no heartbeat is held yet, in which case the values are those of the last published document.
 - Liveness is a separate, deliberately conservative signal: presence is resolved through a bounded
   realm lookup with a four second budget, and if that lookup is stale, times out or fails, only this
   node counts as present. `present` true with `connection_status` `connected` means the peer was
@@ -1093,6 +1127,8 @@ token of another realm or one this node cannot validate, the response is the pub
                                         "load_permille": 120,
                                         "heartbeat_at_ms": 1775744591123_i64
                                     },
+                                    "telemetry": "fresh",
+                                    "telemetry_age_ms": 4200,
                                     "updated_at_ms": 1775744591123_i64
                                 }
                             },
@@ -1321,7 +1357,12 @@ pub(crate) async fn load_node_documents(
 
 fn map_node_document(
     document: &aruna_core::structs::storage::node_info::NodeInfoDocument,
+    held: Option<&HeldHeartbeat>,
 ) -> NodeDocumentResponse {
+    let utilization = held.map_or(document.utilization, |held| NodeUtilization {
+        heartbeat_at_ms: held.received_at_ms,
+        ..held.heartbeat.utilization
+    });
     NodeDocumentResponse {
         executors: document
             .executors
@@ -1338,11 +1379,13 @@ fn map_node_document(
             s3: document.urls.s3.clone(),
         },
         utilization: RealmUtilizationResponse {
-            storage_bytes_used: document.utilization.storage_bytes_used,
-            documents_held: document.utilization.documents_held,
-            load_permille: document.utilization.load_permille,
-            heartbeat_at_ms: document.utilization.heartbeat_at_ms,
+            storage_bytes_used: utilization.storage_bytes_used,
+            documents_held: utilization.documents_held,
+            load_permille: utilization.load_permille,
+            heartbeat_at_ms: utilization.heartbeat_at_ms,
         },
+        telemetry: TelemetryState::of(held),
+        telemetry_age_ms: held.map(|held| held.age_ms),
         updated_at_ms: document.updated_at_ms,
     }
 }
@@ -2111,6 +2154,7 @@ fn map_realm_nodes(
     now_ms: u64,
 ) -> Vec<NodeInfoResponse> {
     let current_node = state.get_node_id();
+    let heartbeats = held_heartbeats(state.get_ctx().net_handle.as_ref());
     config
         .nodes
         .iter()
@@ -2131,9 +2175,11 @@ fn map_realm_nodes(
                     full: entry.full,
                     draining: entry.draining,
                 });
-            let info = parsed
-                .and_then(|node_id| node_info_docs.get(&node_id))
-                .map(map_node_document);
+            let info = parsed.and_then(|node_id| {
+                node_info_docs
+                    .get(&node_id)
+                    .map(|document| map_node_document(document, heartbeats.get(&node_id)))
+            });
             // A device answering for itself is in contact by definition.
             let last_seen_ms = match (is_device, is_current) {
                 (true, true) => Some(now_ms),

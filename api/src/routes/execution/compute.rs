@@ -12,6 +12,7 @@ use aruna_core::structs::placement::compute_config::{
 };
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
+use aruna_operations::node::heartbeat::held_heartbeats;
 use aruna_operations::node::node_info::{
     departure_report, group_demand, read_info_documents, read_operator_drain, set_operator_drain,
 };
@@ -30,6 +31,7 @@ use utoipa_axum::routes;
 
 use crate::auth::{ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::info::TelemetryState;
 use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
@@ -127,6 +129,12 @@ pub struct NodeSnapshotBody {
     /// The publisher holds more nonterminal families than it reports, so the
     /// merged view understates it instead of guessing.
     pub demand_truncated: bool,
+    /// Whether the reservation and demand come from a fresh or stale heartbeat, or from the last
+    /// published document because no heartbeat is held.
+    pub telemetry: TelemetryState,
+    /// Age of the held heartbeat on this node's clock; absent without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -528,6 +536,9 @@ fn map_compute_error(error: SetComputeError) -> ServerError {
   target holds for accepted executions.
 - Every publisher stamps its snapshot with its membership and publisher generations and the time it
   observed them, so a stale or superseded advertisement is recognizable rather than averaged in.
+- `reserved` and the demand fields come from the latest heartbeat the node pushed. `telemetry` is
+  `fresh` or `stale` with `telemetry_age_ms`, or `absent` when no heartbeat is held yet, in which
+  case the values are those of the last published advertisement.
 - `group_id` adds that group's merged demand next to the standing quota it is judged against; a
   family several holders admitted still counts once.
 - `departure` is present only when this node itself departed, and lists the executions it could not
@@ -561,7 +572,9 @@ fn map_compute_error(error: SetComputeError) -> ServerError {
                         "disk_bytes": 0
                     },
                     "demand_groups": 1,
-                    "demand_truncated": false
+                    "demand_truncated": false,
+                    "telemetry": "fresh",
+                    "telemetry_age_ms": 12000
                 }
             ],
             "group": {
@@ -610,21 +623,31 @@ pub async fn get_compute_snapshots(
         .await
         .map_err(ServerError::InternalError)?;
 
+    let heartbeats = held_heartbeats(context.net_handle.as_ref());
     let nodes = documents
         .values()
-        .map(|document| NodeSnapshotBody {
-            node_id: document.node_id.to_string(),
-            membership_generation: document.epoch.membership_generation,
-            publisher_generation: document.epoch.publisher_generation,
-            observed_at_ms: document.epoch.observed_at_ms,
-            compute_draining: document.compute_draining,
-            leaving: document.leaving,
-            reserved: document.reservation.reserved.into(),
-            demand_groups: document.demand.groups.len(),
-            // Whole groups the snapshot could not name understate it just as a
-            // truncated group does.
-            demand_truncated: document.demand.truncated
-                || document.demand.groups.iter().any(|group| group.truncated),
+        .map(|document| {
+            let held = heartbeats.get(&document.node_id);
+            let (reservation, demand) = held
+                .map_or((&document.reservation, &document.demand), |held| {
+                    (&held.heartbeat.reservation, &held.heartbeat.demand)
+                });
+            NodeSnapshotBody {
+                node_id: document.node_id.to_string(),
+                membership_generation: document.epoch.membership_generation,
+                publisher_generation: document.epoch.publisher_generation,
+                observed_at_ms: document.epoch.observed_at_ms,
+                compute_draining: document.compute_draining,
+                leaving: document.leaving,
+                reserved: reservation.reserved.into(),
+                demand_groups: demand.groups.len(),
+                // Whole groups the snapshot could not name understate it just as a
+                // truncated group does.
+                demand_truncated: demand.truncated
+                    || demand.groups.iter().any(|group| group.truncated),
+                telemetry: TelemetryState::of(held),
+                telemetry_age_ms: held.map(|held| held.age_ms),
+            }
         })
         .collect();
 

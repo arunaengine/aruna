@@ -29,16 +29,22 @@ const PARALLEL_SENDS: usize = 16;
 /// Oldest heartbeat that still counts as current telemetry: three missed intervals.
 pub const MAX_HEARTBEAT_AGE: Duration = Duration::from_secs(3 * INFO_PUBLISH_INTERVAL.as_secs());
 
-/// Fresh heartbeats held for each node; none without a network.
-pub fn fresh_heartbeats(net_handle: Option<&NetHandle>) -> BTreeMap<NodeId, HeldHeartbeat> {
-    let max_age_ms = MAX_HEARTBEAT_AGE.as_millis() as u64;
+/// Heartbeats held for each node, fresh or stale; none without a network.
+pub fn held_heartbeats(net_handle: Option<&NetHandle>) -> BTreeMap<NodeId, HeldHeartbeat> {
     net_handle
         .map(NetHandle::held_heartbeats)
         .unwrap_or_default()
         .into_iter()
-        .filter(|held| held.age_ms <= max_age_ms)
         .map(|held| (held.node_id, held))
         .collect()
+}
+
+/// Fresh heartbeats held for each node; none without a network.
+pub fn fresh_heartbeats(net_handle: Option<&NetHandle>) -> BTreeMap<NodeId, HeldHeartbeat> {
+    let max_age_ms = MAX_HEARTBEAT_AGE.as_millis() as u64;
+    let mut held = held_heartbeats(net_handle);
+    held.retain(|_, held| held.age_ms <= max_age_ms);
+    held
 }
 
 /// Takes the load and executor availability of each document from the node's fresh heartbeat
