@@ -35,6 +35,8 @@ pub enum RecordChange {
         upload_id: Ulid,
         record: ImportRecord,
     },
+    /// Clears the source confirmation of an import record and reports whether it was set.
+    ConsumeConfirmation { record_key: Vec<u8> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -45,6 +47,8 @@ pub enum RecordOutcome {
     Revoked(bool),
     /// The upload bound to the import key: the new one or an earlier winner.
     Bound(Ulid),
+    /// Whether the import record held a source confirmation.
+    Confirmed(bool),
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -108,7 +112,8 @@ impl RecordOperation {
         match &self.change {
             RecordChange::StoreGrant { key, .. }
             | RecordChange::RevokeGrant { key }
-            | RecordChange::BindImport { key, .. } => key,
+            | RecordChange::BindImport { key, .. }
+            | RecordChange::ConsumeConfirmation { record_key: key } => key,
         }
     }
 
@@ -158,6 +163,19 @@ impl RecordOperation {
                         RecordOutcome::Bound(*upload_id),
                     ),
                 }
+            }
+            (RecordChange::ConsumeConfirmation { record_key }, Some(bytes)) => {
+                let mut record = postcard::from_bytes::<ImportRecord>(bytes)
+                    .map_err(|error| RecordError::Invalid(error.to_string()))?;
+                if !record.confirmed {
+                    return Ok((Vec::new(), RecordOutcome::Confirmed(false)));
+                }
+                record.confirmed = false;
+                let writes = vec![entry(record_key, encode(&record)?)];
+                (writes, RecordOutcome::Confirmed(true))
+            }
+            (RecordChange::ConsumeConfirmation { .. }, None) => {
+                (Vec::new(), RecordOutcome::Confirmed(false))
             }
         })
     }
@@ -380,6 +398,7 @@ mod tests {
                 signature: record.grant.signature.clone(),
             },
             grant: record.grant,
+            confirmed: false,
         };
         let change = RecordChange::BindImport {
             key: b"upload".to_vec(),

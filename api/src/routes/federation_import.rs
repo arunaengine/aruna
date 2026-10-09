@@ -6,7 +6,7 @@
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::federation_export::{
-    GRANT_HEADER, INTENT_HEADER, decode_header, encode_header, grant_header, transfer_refused,
+    INTENT_HEADER, decode_header, grant_header, transfer_refused,
 };
 use crate::routes::rocrate_import::{
     ImportMetadataRequest, ImportSourceRequest, ImportTargetRequest, SubmitImportRequest,
@@ -22,7 +22,7 @@ use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::transfer::{ExportGrant, ImportDestination, ImportIntent, TransferError};
 use aruna_operations::driver::drive;
 use aruna_operations::federation::import::{
-    ImportError, ImportRecord, authorize_import, reusable_upload, write_import,
+    self, ImportError, ImportRecord, authorize_import, reusable_upload, write_import,
 };
 use aruna_operations::federation::transfer::{
     AdmitTransferConfig, AdmitTransferOperation, IssueIntentConfig, IssueIntentOperation,
@@ -101,6 +101,10 @@ fn import_refused(error: ImportError) -> ServerError {
         }
         ImportError::Expired => transfer_refused(TransferError::BadLifetime),
         ImportError::Storage(_) => ServerError::ServiceUnavailableReason(message),
+        ImportError::Unreachable(_) => gateway("pull_unreachable", message),
+        ImportError::Refused(_) => {
+            ServerError::Refused(StatusCode::FORBIDDEN, "source_refused", message)
+        }
     }
 }
 
@@ -218,9 +222,11 @@ pub(crate) async fn bind_upload(
             "the artifact does not match its grant".to_string(),
         ));
     }
+    // Both callers bind right after the source confirmed the grant by a pull or a push.
     let binding = ImportRecord {
         intent: intent.clone(),
         grant: grant.clone(),
+        confirmed: true,
     };
     let context = state.get_ctx();
     let bound = write_import(&context, key, record.upload_id, &binding)
@@ -251,9 +257,11 @@ async fn rebind(
     key: &str,
     upload_id: Ulid,
 ) -> ServerResult<()> {
+    // Both callers bind right after the source confirmed the grant by a pull or a push.
     let binding = ImportRecord {
         intent: intent.clone(),
         grant: grant.clone(),
+        confirmed: true,
     };
     let bound = write_import(&state.get_ctx(), key, upload_id, &binding)
         .await
@@ -271,29 +279,8 @@ async fn source_request(
     grant: &Signed<ExportGrant>,
 ) -> ServerResult<reqwest::Response> {
     let context = state.get_ctx();
-    let blob = context
-        .blob_handle
-        .as_ref()
-        .ok_or(ServerError::ServiceUnavailable)?;
-    let unreachable = |error: String| gateway("pull_unreachable", error);
-    let response = blob
-        .repository_request(method, grant.payload.artifact_url.clone())
-        .map_err(|error| unreachable(error.to_string()))?
-        .header(GRANT_HEADER, encode_header(grant)?)
-        .timeout(PULL_TIMEOUT)
-        .send()
-        .await
-        .map_err(|error| unreachable(error.to_string()))?;
-    let status = response.status();
-    if !status.is_success() {
-        let message = format!("source realm answered {status}");
-        return Err(ServerError::Refused(
-            StatusCode::FORBIDDEN,
-            "source_refused",
-            message,
-        ));
-    }
-    Ok(response)
+    let request = import::source_request(&context, method, grant, PULL_TIMEOUT);
+    request.await.map_err(import_refused)
 }
 
 /// A `Sync` byte stream over a response body, as the upload writer needs.

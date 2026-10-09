@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::routes::federation_export::{GRANT_HEADER, encode_header};
 use crate::routes::rocrate_import::{UploadRoCrateResponse, upload_rocrate};
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
@@ -424,6 +425,7 @@ async fn bound_upload_confirmed() {
     let binding = ImportRecord {
         intent: intent.clone(),
         grant: grant.clone(),
+        confirmed: false,
     };
     let (first, second) = (Ulid::generate(), Ulid::generate());
     seed_upload(&fixture, first).await;
@@ -431,7 +433,10 @@ async fn bound_upload_confirmed() {
     write_import(&context, &key, first, &binding).await.unwrap();
     let user = fixture.user;
     let error = import(&fixture, user, &intent, &grant, SECRET).await;
-    assert!(matches!(error, Err(ServerError::ServiceUnavailable)));
+    assert!(matches!(
+        error,
+        Err(ServerError::ServiceUnavailableReason(_))
+    ));
     seed_upload(&fixture, second).await;
     let bound = write_import(&context, &key, second, &binding).await;
     assert_eq!(bound, Ok(first));
@@ -468,6 +473,7 @@ async fn losing_spool_discarded() {
     let binding = ImportRecord {
         intent: intent.clone(),
         grant: grant.clone(),
+        confirmed: false,
     };
     write_import(&context, &key, first, &binding).await.unwrap();
     let losing = load_rocrate_upload(&context, second)
@@ -495,6 +501,7 @@ async fn retry_keeps_plan() {
     let binding = ImportRecord {
         intent: intent.clone(),
         grant: grant.clone(),
+        confirmed: false,
     };
     let upload_id = Ulid::generate();
     seed_upload(&fixture, upload_id).await;
