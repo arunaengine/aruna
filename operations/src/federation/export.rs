@@ -334,7 +334,13 @@ impl Operation for IssueGrantOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        self.output = Some(self.decide(event));
+        // Only the one read answers; a decided grant takes no further event.
+        self.output = Some(match self.output {
+            Some(_) => Err(GrantError::Storage(
+                "unexpected event after the grant".to_string(),
+            )),
+            None => self.decide(event),
+        });
         smallvec![]
     }
 
@@ -709,10 +715,16 @@ mod tests {
             revoked: true,
             ..record
         };
-        let mut operation = IssueGrantOperation::new(config);
+        let mut operation = IssueGrantOperation::new(config.clone());
         operation.start();
         operation.step(read(Some(postcard::to_allocvec(&revoked).unwrap())));
         assert_eq!(operation.finalize(), Err(GrantError::Revoked));
+        // A decided grant takes no further event.
+        let mut late = IssueGrantOperation::new(config);
+        late.start();
+        late.step(read(None));
+        late.step(read(None));
+        assert!(matches!(late.finalize(), Err(GrantError::Storage(_))));
     }
 
     #[tokio::test]

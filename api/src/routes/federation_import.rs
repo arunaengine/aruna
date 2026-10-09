@@ -123,9 +123,9 @@ fn admission_refused(error: TransferAdmitError) -> ServerError {
             ServerError::Refused(StatusCode::FORBIDDEN, "import_denied", message)
         }
         TransferAdmitError::Config(_) => ServerError::ServiceUnavailableReason(message),
-        TransferAdmitError::Sign(_) | TransferAdmitError::NotFinished => {
-            ServerError::InternalError(message)
-        }
+        TransferAdmitError::Sign(_)
+        | TransferAdmitError::NotFinished
+        | TransferAdmitError::UnexpectedEvent => ServerError::InternalError(message),
     }
 }
 

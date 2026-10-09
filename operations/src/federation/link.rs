@@ -68,6 +68,8 @@ pub enum LinkLoginError {
     Revoke(#[from] RevokeTokenError),
     #[error("link operation did not finish")]
     NotFinished,
+    #[error("unexpected event for the link operation state")]
+    UnexpectedEvent,
 }
 
 fn user_read(user_id: &UserId) -> (String, ByteView) {
@@ -120,7 +122,7 @@ fn batch_values(event: Event) -> Result<Vec<Option<ByteView>>, LinkLoginError> {
             Ok(values.into_iter().map(|(_, value)| value).collect())
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        _ => Err(LinkLoginError::NotFinished),
+        _ => Err(LinkLoginError::UnexpectedEvent),
     }
 }
 
@@ -204,7 +206,11 @@ impl Operation for ConfirmLinkOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        self.output = Some(self.sign(event));
+        // Only the one read answers; a decided confirmation takes no further event.
+        self.output = Some(match self.output {
+            Some(_) => Err(LinkLoginError::UnexpectedEvent),
+            None => self.sign(event),
+        });
         smallvec![]
     }
 
@@ -372,7 +378,7 @@ impl Operation for LinkLoginOperation {
                     effects
                 }
             },
-            LinkState::Done => smallvec![],
+            LinkState::Done => self.finish(Err(LinkLoginError::UnexpectedEvent)),
         }
     }
 
@@ -534,7 +540,10 @@ impl Operation for UnlinkLoginOperation {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult {
                     allowed: Err(error),
                 }) => self.finish(Err(error.into())),
-                _ => self.finish(Err(LinkLoginError::Unauthorized)),
+                Event::SubOperation(SubOperationEvent::AuthorizationResult {
+                    allowed: Ok(false),
+                }) => self.finish(Err(LinkLoginError::Unauthorized)),
+                _ => self.finish(Err(LinkLoginError::UnexpectedEvent)),
             },
             UnlinkState::Cutoff(mut revoke) => {
                 let effects = revoke.step(event);
@@ -564,7 +573,7 @@ impl Operation for UnlinkLoginOperation {
                     effects
                 }
             },
-            UnlinkState::Done => smallvec![],
+            UnlinkState::Done => self.finish(Err(LinkLoginError::UnexpectedEvent)),
         }
     }
 
@@ -774,6 +783,43 @@ mod tests {
         api.config.auth_context = session(local(2), SessionKind::Api);
         assert!(api.start().is_empty());
         assert_eq!(api.finalize(), Err(LinkLoginError::LocalRefused));
+    }
+
+    #[test]
+    fn late_events_rejected() {
+        // Decided operations refuse every further event, and so does an unrelated answer.
+        let now = 10_000;
+        let event = || {
+            Event::Storage(StorageEvent::TransactionAborted {
+                txn_id: Ulid::nil(),
+            })
+        };
+        let mut confirm = confirm(local(2), None, now);
+        confirm.start();
+        confirm.step(event());
+        assert_eq!(confirm.finalize(), Err(LinkLoginError::UnexpectedEvent));
+        let mut linking = link(local(2), confirmation(now), now);
+        linking.config.auth_time = None;
+        linking.start();
+        linking.step(event());
+        assert_eq!(linking.finalize(), Err(LinkLoginError::UnexpectedEvent));
+        let unlink = || {
+            UnlinkLoginOperation::new(UnlinkLoginConfig {
+                actor: actor(local(3)),
+                auth_context: session(local(3), SessionKind::Portal),
+                user_id: local(2),
+                alias: foreign(),
+                now,
+            })
+        };
+        let mut authorizing = unlink();
+        authorizing.state = UnlinkState::Authorize;
+        authorizing.step(event());
+        assert_eq!(authorizing.finalize(), Err(LinkLoginError::UnexpectedEvent));
+        let mut done = unlink();
+        done.state = UnlinkState::Done;
+        done.step(event());
+        assert_eq!(done.finalize(), Err(LinkLoginError::UnexpectedEvent));
     }
 
     fn confirmation(now: u64) -> Signed<LinkConfirmation> {
