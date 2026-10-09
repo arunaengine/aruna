@@ -1101,6 +1101,61 @@ async fn denies_foreign_alias() {
 }
 
 #[tokio::test]
+async fn foreign_arn_located() {
+    // A versioned ARN of another realm with an `s3://` location of this node resolves to the
+    // current version there, like a File entity without an ARN.
+    let (node, owner, candidate) = local_candidate().await;
+    let realm_id = owner.realm_id;
+    let version = candidate.resolved_version.unwrap();
+    let head = aruna_core::structs::storage::blob::CurrentVersionPointer::new(version);
+    let head_key = aruna_core::structs::storage::blob::BlobHeadKey::new("remote", "payload");
+    let write = StorageEffect::Write {
+        key_space: BLOB_HEAD_KEYSPACE.to_string(),
+        key: head_key.to_bytes().unwrap().into(),
+        value: head.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    node.driver.storage_handle.send_storage_effect(write).await;
+    let other = RealmId::from_bytes([107; 32]);
+    let foreign = VersionedObjectArn::new(
+        other,
+        node.net.node_id(),
+        "other",
+        "file",
+        Ulid::from_bytes([108; 16]),
+    )
+    .unwrap();
+    let document = json!({"@graph": [{"@id": foreign.to_string(), "@type": "File",
+        "contentUrl": "s3://remote/payload"}]});
+    let mut checkpoint = ExportCheckpoint {
+        entities: recognized_entities(&document, realm_id).unwrap(),
+        ..Default::default()
+    };
+    let ctx = job_context(node.driver.clone(), node.net.node_id());
+    resolve_entries(
+        &ctx,
+        &remote_spec(realm_id, owner),
+        &mut checkpoint,
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+        &mut BTreeSet::new(),
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+    let entity = &checkpoint.entities[0];
+    assert_eq!(entity.omission, None);
+    assert!(entity.candidates.iter().any(|found| matches!(
+        &found.source,
+        CandidateSource::Local { bucket, key, .. } if bucket == "remote" && key == "payload"
+    ) && found.resolved_version == Some(version)));
+    node.net.shutdown().await;
+}
+
+#[tokio::test]
 async fn selection_skips_discovery() {
     // An export into another realm resolves a hash locally and never asks the DHT for holders,
     // so a node without discovery reports no outage for it.
