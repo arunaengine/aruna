@@ -152,6 +152,9 @@ a path-restricted delegated token are both refused.
   Intent, grant, size and BLAKE3 are checked, and the upload belongs to the intent's principal.
   A repeated push of the same export returns the earlier upload; a push of another artifact for
   the same import is refused with 409 and code `import_conflict`.
+- After an import used that upload, a repeated push still returns it, with `expires_at` set to
+  the current time. Only a retry of that import with its idempotency key accepts it, and that
+  retry returns the same job.
 - Bytes are hashed and spooled as they arrive, so the archive never has to fit in memory.
 - The upload is private to the caller and to this node, whose base URL is returned as
   `owner_node_url`.
@@ -216,8 +219,9 @@ pub async fn upload_rocrate(
     let mut limit = state.rocrate_limits().direct_upload_bytes;
     if let Some(push) = &push {
         limit = limit.min(push.grant.payload.artifact_size);
-        if let Some(record) = crate::routes::federation_import::pushed_upload(&state, push).await? {
-            let response = upload_response(&record, owner_node_url(&state).await?)?;
+        if let Some(response) =
+            crate::routes::federation_import::pushed_upload(&state, push).await?
+        {
             return Ok((StatusCode::CREATED, Json(response)));
         }
     }
@@ -274,7 +278,7 @@ pub async fn upload_rocrate(
     ))
 }
 
-fn upload_response(
+pub(crate) fn upload_response(
     record: &RoCrateUploadRecord,
     owner_node_url: String,
 ) -> ServerResult<UploadRoCrateResponse> {

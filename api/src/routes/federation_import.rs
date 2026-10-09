@@ -10,8 +10,8 @@ use crate::routes::federation_export::{
 };
 use crate::routes::rocrate_import::{
     ImportMetadataRequest, ImportSourceRequest, ImportTargetRequest, SubmitImportRequest,
-    SubmitImportResponse, map_upload_error, parse_import_metadata, parse_import_target,
-    submit_import,
+    SubmitImportResponse, UploadRoCrateResponse, map_upload_error, owner_node_url,
+    parse_import_metadata, parse_import_target, submit_import, upload_response,
 };
 use crate::server::state::ServerState;
 use aruna_core::federation::Signed;
@@ -34,6 +34,7 @@ use aruna_operations::jobs::import::{
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
+use chrono::Utc;
 use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
@@ -184,11 +185,12 @@ pub(crate) async fn admit_push(
     Ok(Some(Push { intent, grant, key }))
 }
 
-/// The upload an earlier transfer of the same import key left on this node.
+/// The upload an earlier transfer of the same import key left on this node. After an import
+/// used it, the answer still names it, so that import's idempotency key returns the same job.
 pub(crate) async fn pushed_upload(
     state: &ServerState,
     push: &Push,
-) -> ServerResult<Option<RoCrateUploadRecord>> {
+) -> ServerResult<Option<UploadRoCrateResponse>> {
     let context = state.get_ctx();
     let (intent, grant) = (&push.intent.payload, &push.grant.payload);
     let Some(upload_id) = reusable_upload(&context, intent, grant, &push.key)
@@ -199,9 +201,21 @@ pub(crate) async fn pushed_upload(
     };
     // The source's push confirms its grant again; a paused import resumes with this consent.
     rebind(state, &push.intent, &push.grant, &push.key, upload_id).await?;
-    load_rocrate_upload(&context, upload_id)
+    let record = load_rocrate_upload(&context, upload_id)
         .await
-        .map_err(ServerError::InternalError)
+        .map_err(ServerError::InternalError)?;
+    let owner_node_url = owner_node_url(state).await?;
+    match record {
+        Some(record) => upload_response(&record, owner_node_url).map(Some),
+        // An import used the upload, or it expired; the answer cannot start another import.
+        None => Ok(Some(UploadRoCrateResponse {
+            upload_id: upload_id.to_string(),
+            blake3: grant.artifact_blake3.clone(),
+            size: grant.artifact_size,
+            expires_at: Utc::now().to_rfc3339(),
+            owner_node_url,
+        })),
+    }
 }
 
 /// Checks a transferred upload against the grant and binds it to the intent and import key.

@@ -14,7 +14,7 @@ use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMod
 use aruna_core::handoff::descriptor_digest;
 use aruna_core::handoff::secret_nonce;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::{JobId, RoCrateLimits};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
@@ -28,7 +28,9 @@ use aruna_core::transfer::{MAX_TRANSFER_SECS, import_key, intent_digest};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::federation::import::{bound_upload, read_import};
-use aruna_operations::jobs::import::{load_rocrate_upload, write_rocrate_upload};
+use aruna_operations::jobs::import::{
+    claim_rocrate_upload, delete_rocrate_upload, load_rocrate_upload, write_rocrate_upload,
+};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -37,6 +39,7 @@ use axum::http::HeaderValue;
 use axum::http::header::CONTENT_TYPE;
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::time::SystemTime;
 use tempfile::TempDir;
 use url::Url;
@@ -414,6 +417,44 @@ async fn import(
     Ok(response)
 }
 
+/// Starts the import of `upload_id` under `key` from the user's portal session `sid`.
+async fn submit(
+    fixture: &Fixture,
+    upload_id: Ulid,
+    key: &str,
+    sid: &str,
+) -> ServerResult<SubmitImportResponse> {
+    let auth = AuthContext {
+        user_id: fixture.user,
+        realm_id: fixture.state.get_realm_id(),
+        path_restrictions: None,
+        session: Some(aruna_core::structs::identity::auth::SessionRef {
+            sid: sid.to_string(),
+            kind: aruna_core::structs::identity::auth::SessionKind::Portal,
+            name: None,
+            via: None,
+        }),
+    };
+    let request = SubmitImportRequest {
+        source: ImportSourceRequest::Upload {
+            upload_id: upload_id.to_string(),
+        },
+        target: ImportTargetRequest {
+            bucket: "lab".to_string(),
+            prefix: "imports".to_string(),
+        },
+        metadata: ImportMetadataRequest {
+            group_id: fixture.group.to_string(),
+            path: "datasets/run".to_string(),
+            public: false,
+        },
+        idempotency_key: Some(key.to_string()),
+    };
+    let state = State(fixture.state.clone());
+    let (_, Json(response)) = submit_import(state, Extension(Some(auth)), Json(request)).await?;
+    Ok(response)
+}
+
 #[tokio::test]
 async fn bound_upload_confirmed() {
     // A bound upload is used only after the source confirms its grant; a later upload never
@@ -541,41 +582,36 @@ async fn retry_keeps_plan() {
     write_import(&context, &key, upload_id, &binding)
         .await
         .unwrap();
-    let submit = |sid: &str| {
-        let auth = AuthContext {
-            user_id: fixture.user,
-            realm_id: fixture.state.get_realm_id(),
-            path_restrictions: None,
-            session: Some(aruna_core::structs::identity::auth::SessionRef {
-                sid: sid.to_string(),
-                kind: aruna_core::structs::identity::auth::SessionKind::Portal,
-                name: None,
-                via: None,
-            }),
-        };
-        let request = SubmitImportRequest {
-            source: ImportSourceRequest::Upload {
-                upload_id: upload_id.to_string(),
-            },
-            target: ImportTargetRequest {
-                bucket: "lab".to_string(),
-                prefix: "imports".to_string(),
-            },
-            metadata: ImportMetadataRequest {
-                group_id: fixture.group.to_string(),
-                path: "datasets/run".to_string(),
-                public: false,
-            },
-            idempotency_key: Some(key.clone()),
-        };
-        submit_import(
-            State(fixture.state.clone()),
-            Extension(Some(auth)),
-            Json(request),
-        )
-    };
-    let (_, Json(first)) = submit("first").await.unwrap();
-    let (_, Json(second)) = submit("second").await.unwrap();
+    let first = submit(&fixture, upload_id, &key, "first").await.unwrap();
+    let second = submit(&fixture, upload_id, &key, "second").await.unwrap();
     assert!(first.created && !second.created);
     assert_eq!(first.job_id, second.job_id);
+}
+
+#[tokio::test]
+async fn push_after_import() {
+    // A push repeated after the import used its upload names that upload again, so the import
+    // key returns the same job instead of a 404 or a second job.
+    let fixture = fixture(true).await;
+    let intent = intent(&fixture, fixture.user);
+    let grant = grant(&intent, BODY);
+    let key = import_key(&grant.payload, &intent.payload.destination).unwrap();
+    let first = push(&fixture, &intent, &grant).await.unwrap();
+    let upload_id = Ulid::from_string(&first.upload_id).unwrap();
+    let job = submit(&fixture, upload_id, &key, "first").await.unwrap();
+    // The import job claims the upload and deletes it when it ends.
+    let storage = &fixture.state.get_ctx().storage_handle;
+    let job_id = JobId::from_str(&job.job_id).unwrap();
+    let now = unix_timestamp_millis();
+    claim_rocrate_upload(storage, upload_id, fixture.user, job_id, now)
+        .await
+        .unwrap();
+    delete_rocrate_upload(storage, upload_id, job_id)
+        .await
+        .unwrap();
+    let again = push(&fixture, &intent, &grant).await.unwrap();
+    assert_eq!(again.upload_id, first.upload_id);
+    let retry = submit(&fixture, upload_id, &key, "second").await.unwrap();
+    assert!(job.created && !retry.created);
+    assert_eq!(retry.job_id, job.job_id);
 }
