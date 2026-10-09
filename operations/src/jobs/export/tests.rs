@@ -1169,7 +1169,10 @@ async fn selection_skips_discovery() {
         compute_handle: None,
     };
     let user = UserId::local(Ulid::from_bytes([150; 16]), RealmId::from_bytes([151; 32]));
-    let ctx = job_context(Arc::new(driver), iroh::SecretKey::from_bytes(&[152; 32]).public());
+    let ctx = job_context(
+        Arc::new(driver),
+        iroh::SecretKey::from_bytes(&[152; 32]).public(),
+    );
     let mut spec = remote_spec(user.realm_id, user);
     let selection = aruna_core::structs::execution::job::ExportSelection {
         files: Vec::new(),
