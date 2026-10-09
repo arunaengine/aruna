@@ -606,3 +606,270 @@ impl Operation for UnlinkLoginOperation {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::{DriverContext, drive};
+    use aruna_core::federation::{
+        AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode,
+    };
+    use aruna_core::structs::identity::auth::SessionRef;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::time::unix_timestamp_secs;
+    use ed25519_dalek::SigningKey;
+    use tempfile::{TempDir, tempdir};
+    use url::Url;
+
+    fn key() -> SigningKey {
+        SigningKey::from_bytes(&[21; 32])
+    }
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes(key().verifying_key().to_bytes())
+    }
+
+    fn capabilities() -> NodeCapabilities {
+        NodeCapabilities::management_node(key()).unwrap()
+    }
+
+    fn local(seed: u8) -> UserId {
+        UserId::local(Ulid::from_bytes([seed; 16]), realm())
+    }
+
+    fn foreign() -> UserId {
+        UserId::new(Ulid::from_bytes([1; 16]), RealmId::from_bytes([22; 32]))
+    }
+
+    fn session(user_id: UserId, kind: SessionKind) -> AuthContext {
+        AuthContext {
+            user_id,
+            realm_id: realm(),
+            path_restrictions: None,
+            session: Some(SessionRef {
+                sid: Ulid::from_bytes([9; 16]).to_string(),
+                kind,
+                name: None,
+                via: None,
+            }),
+        }
+    }
+
+    fn actor(user_id: UserId) -> Actor {
+        Actor {
+            node_id: iroh::SecretKey::from_bytes(&[23; 32]).public(),
+            user_id,
+            realm_id: realm(),
+        }
+    }
+
+    async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
+        let effect = StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(effect).await;
+    }
+
+    /// Two active local accounts and a realm that admits logins of every realm.
+    async fn context() -> (TempDir, DriverContext) {
+        let dir = tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        for seed in [2, 3] {
+            let user = User {
+                user_id: local(seed),
+                name: format!("user {seed}"),
+                subject_ids: Vec::new(),
+                alias_user_ids: Default::default(),
+                attributes: Default::default(),
+            };
+            let bytes = user.to_bytes(&actor(local(seed))).unwrap();
+            put(&context, USER_KEYSPACE, local(seed).to_bytes(), bytes).await;
+        }
+        let descriptor = RealmDescriptor {
+            realm_id: realm(),
+            name: "B".to_string(),
+            description: String::new(),
+            api_url: Url::parse("https://b.example.org/api/v1").unwrap(),
+            portal_url: Url::parse("https://b.example.org/").unwrap(),
+            issued_at: 1,
+        };
+        let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
+        config.federation = Some(FederationSettings {
+            name: "B".to_string(),
+            api_url: descriptor.api_url.clone(),
+            portal_url: descriptor.portal_url.clone(),
+            registry_url: None,
+            registration: RegistrationMode::Enabled,
+            accepted_realms: AcceptedRealms::Any,
+            descriptor: Signed::sign(descriptor, &capabilities()).unwrap(),
+        });
+        let target = DocumentTarget::RealmConfig { realm_id: realm() };
+        let bytes = config.to_bytes(&actor(local(2))).unwrap();
+        put(
+            &context,
+            target.storage_keyspace(),
+            target.storage_key().to_vec(),
+            bytes,
+        )
+        .await;
+        (dir, context)
+    }
+
+    fn confirm(user: UserId, local_issued_at: u64, now: u64) -> ConfirmLinkOperation {
+        ConfirmLinkOperation::new(ConfirmLinkConfig {
+            auth_context: session(user, SessionKind::Portal),
+            local_issued_at,
+            foreign: AuthContext {
+                user_id: foreign(),
+                ..session(foreign(), SessionKind::Federated)
+            },
+            foreign_issued_at: now,
+            node_capabilities: capabilities(),
+            now,
+        })
+    }
+
+    fn link(user: UserId, confirmation: Signed<LinkConfirmation>, now: u64) -> LinkLoginOperation {
+        LinkLoginOperation::new(LinkLoginConfig {
+            actor: actor(user),
+            auth_context: session(user, SessionKind::Portal),
+            local_issued_at: now,
+            confirmation,
+            now,
+        })
+    }
+
+    #[test]
+    fn stale_logins_refused() {
+        // Old, child-kind or linked logins never get a confirmation; nothing is read.
+        let now = 10_000;
+        let mut old = confirm(local(2), now - MAX_LINK_SECS - 1, now);
+        assert!(old.start().is_empty());
+        assert_eq!(old.finalize(), Err(LinkLoginError::LocalRefused));
+        let mut api = confirm(local(2), now, now);
+        api.config.auth_context = session(local(2), SessionKind::Api);
+        assert!(api.start().is_empty());
+        assert_eq!(api.finalize(), Err(LinkLoginError::LocalRefused));
+        let mut chained = confirm(local(2), now, now);
+        if let Some(session) = chained.config.foreign.session.as_mut() {
+            session.via = Some(local(3));
+        }
+        assert!(chained.start().is_empty());
+        assert_eq!(chained.finalize(), Err(LinkLoginError::ForeignRefused));
+        let mut aged = confirm(local(2), now, now);
+        aged.config.foreign_issued_at = now - MAX_LINK_SECS - 1;
+        assert!(aged.start().is_empty());
+        assert_eq!(aged.finalize(), Err(LinkLoginError::ForeignRefused));
+    }
+
+    #[tokio::test]
+    async fn link_owned_once() {
+        // The confirmed login links once; another account and another caller are refused.
+        let (_dir, context) = context().await;
+        let now = unix_timestamp_secs();
+        let confirmation = drive(confirm(local(2), now, now), &context).await.unwrap();
+        // A confirmation is only good for the account it names.
+        let stolen = drive(link(local(3), confirmation.clone(), now), &context).await;
+        assert_eq!(
+            stolen,
+            Err(LinkLoginError::Confirmation(LinkError::Unbound))
+        );
+        let user = drive(link(local(2), confirmation.clone(), now), &context)
+            .await
+            .unwrap();
+        assert!(user.alias_user_ids.contains(&foreign()));
+        // Replaying the confirmation while linked changes nothing.
+        let replay = drive(link(local(2), confirmation, now), &context).await;
+        assert!(replay.is_ok());
+        let other = drive(confirm(local(3), now, now), &context).await.unwrap();
+        let claimed = drive(link(local(3), other, now), &context).await;
+        assert_eq!(
+            claimed,
+            Err(LinkLoginError::Update(UpdateUserError::AliasClaimed))
+        );
+    }
+
+    #[tokio::test]
+    async fn cutoff_voids_confirmation() {
+        // A cutoff of the foreign login after its session voids an unused or replayed confirmation.
+        let (_dir, context) = context().await;
+        let now = unix_timestamp_secs();
+        let confirmation = drive(confirm(local(2), now, now), &context).await.unwrap();
+        let target = DocumentTarget::RealmConfig { realm_id: realm() };
+        let mut config = RealmConfigDocument::from_bytes(
+            &crate::jobs::key_wake::read_row(
+                &context.storage_handle,
+                target.storage_keyspace(),
+                target.storage_key().to_vec(),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        config
+            .revoked_tokens
+            .push(aruna_core::structs::identity::realm::TokenRevocation {
+                token_hash: user_cutoff_hash(&foreign()),
+                expires_at: user_cutoff_expiry(now + 1),
+            });
+        let bytes = config.to_bytes(&actor(local(2))).unwrap();
+        put(
+            &context,
+            target.storage_keyspace(),
+            target.storage_key().to_vec(),
+            bytes,
+        )
+        .await;
+        let linked = drive(link(local(2), confirmation, now), &context).await;
+        assert_eq!(linked, Err(LinkLoginError::CutOff));
+    }
+
+    #[tokio::test]
+    async fn unlink_cuts_off_first() {
+        // Only the owner unlinks here; the cutoff lands first and voids older confirmations.
+        let (_dir, context) = context().await;
+        let now = unix_timestamp_secs();
+        let confirmation = drive(confirm(local(2), now, now), &context).await.unwrap();
+        drive(link(local(2), confirmation.clone(), now), &context)
+            .await
+            .unwrap();
+        let unlink = |caller: UserId| {
+            UnlinkLoginOperation::new(UnlinkLoginConfig {
+                actor: actor(caller),
+                auth_context: session(caller, SessionKind::Portal),
+                user_id: local(2),
+                alias: foreign(),
+                now,
+            })
+        };
+        let stranger = drive(unlink(local(3)), &context).await;
+        assert!(stranger.is_err());
+        let user = drive(unlink(local(2)), &context).await.unwrap();
+        assert!(!user.alias_user_ids.contains(&foreign()));
+        let target = DocumentTarget::RealmConfig { realm_id: realm() };
+        let row = crate::jobs::key_wake::read_row(
+            &context.storage_handle,
+            target.storage_keyspace(),
+            target.storage_key().to_vec(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let config = RealmConfigDocument::from_bytes(&row).unwrap();
+        assert!(config.user_cutoff(&foreign(), now).is_some());
+        let replay = drive(link(local(2), confirmation, now), &context).await;
+        assert_eq!(replay, Err(LinkLoginError::CutOff));
+    }
+}
