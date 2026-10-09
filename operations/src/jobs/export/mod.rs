@@ -1087,6 +1087,10 @@ async fn extend_hash_candidates(
         merge_candidates(candidates, cached, MAX_LOCAL_CANDIDATES);
         *denied |= *cached_denied;
     }
+    // An export into another realm reads only local copies, so other holders are never needed.
+    if spec.selection.is_some() {
+        return Ok(false);
+    }
 
     let holders = match drive(
         GetHoldersOperation::new(hash, spec.auth_context.realm_id, ctx.owner_node_id),

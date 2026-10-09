@@ -1100,6 +1100,51 @@ async fn denies_foreign_alias() {
     node.net.shutdown().await;
 }
 
+#[tokio::test]
+async fn selection_skips_discovery() {
+    // An export into another realm resolves a hash locally and never asks the DHT for holders,
+    // so a node without discovery reports no outage for it.
+    let dir = tempfile::tempdir().unwrap();
+    let driver = DriverContext {
+        storage_handle: FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let user = UserId::local(Ulid::from_bytes([150; 16]), RealmId::from_bytes([151; 32]));
+    let ctx = job_context(Arc::new(driver), iroh::SecretKey::from_bytes(&[152; 32]).public());
+    let mut spec = remote_spec(user.realm_id, user);
+    let selection = aruna_core::structs::execution::job::ExportSelection {
+        files: Vec::new(),
+        audience: RealmId::from_bytes([153; 32]),
+        intent_digest: String::new(),
+    };
+    for (selection, unavailable) in [(None, true), (Some(selection), false)] {
+        spec.selection = selection;
+        let mut candidates = Vec::new();
+        let found = extend_hash_candidates(
+            &ctx,
+            &spec,
+            [154; 32],
+            None,
+            &mut candidates,
+            &mut false,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+        )
+        .await;
+        assert_eq!(found.unwrap(), unavailable);
+        assert!(candidates.is_empty());
+    }
+}
+
 #[test]
 fn learns_probe_hash() {
     let realm_id = RealmId::from_bytes([2; 32]);
