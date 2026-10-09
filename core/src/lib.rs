@@ -30,6 +30,7 @@ pub mod node_vault;
 pub mod onboarding;
 pub mod operation;
 pub mod permission_path;
+pub mod presence;
 pub mod recovery_code;
 pub mod reducer;
 pub mod repo_layout;
