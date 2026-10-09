@@ -17,11 +17,12 @@ use aruna_operations::federation::login::{
     IssueHandoffError, IssueHandoffOperation,
 };
 use aruna_operations::realm::get_config::GetConfigError;
+use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::{Arc, LazyLock};
@@ -60,6 +61,17 @@ pub struct LoginHandoffRequest {
     pub descriptor: Signed<RealmDescriptor>,
     /// Hex SHA-256 of the secret the serving realm's portal keeps.
     pub nonce: String,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct FederatedSessionResponse {
+    #[serde(flatten)]
+    pub session: CreateSessionResponse,
+    /// The login is linked, so the session acts as the linked local account.
+    pub linked: bool,
+    /// A local account shows the same public name; offer to log in and link it. No account is
+    /// named or selected.
+    pub account_hint: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
@@ -193,7 +205,10 @@ pub async fn create_login_handoff(
 - The home realm must be admitted by `accepted_realms` in the federation settings.
 - The session has kind `federated`, carries the display name for display only, and lasts
   8 hours. It cannot be renewed and cannot create child sessions or tokens.
-- No user record is created for the foreign user.
+- When the login is linked to exactly one active local account, the session acts as that
+  account (`linked` true) and names the login as `via`; roles come from the account only.
+- Otherwise no user record is created for the foreign user. `account_hint` is true when an
+  active local account shows the same public name, compared without case; it names nothing.
 
 **Limits**
 - A handoff lives at most 60 seconds and may be issued at most 30 seconds in the future.
@@ -221,13 +236,15 @@ pub async fn create_login_handoff(
         })
     ),
     responses(
-        (status = 201, description = "Federated session created; the token is shown only here", body = CreateSessionResponse,
+        (status = 201, description = "Federated session created; the token is shown only here", body = FederatedSessionResponse,
             example = json!({
                 "session_id": "01JCNCTR0123456789ABCDEFGH",
                 "kind": "federated",
                 "label": "",
                 "token": "EXAMPLE-SESSION-TOKEN-PLACEHOLDER",
-                "expires_at": "2026-04-09T20:00:00Z"
+                "expires_at": "2026-04-09T20:00:00Z",
+                "linked": false,
+                "account_hint": true
             })),
         (status = 400, description = "A malformed secret", body = ErrorResponse),
         (status = 403, description = "The handoff was refused, or this realm has no federation settings; code `handoff_rejected` or `federation_disabled`", body = ErrorResponse),
@@ -239,7 +256,7 @@ pub async fn create_federated_session(
     connect: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(request): Json<FederatedSessionRequest>,
-) -> ServerResult<(StatusCode, Json<CreateSessionResponse>)> {
+) -> ServerResult<(StatusCode, Json<FederatedSessionResponse>)> {
     let peer = connect.map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |Extension(info)| {
         info.0.ip()
     });
@@ -253,6 +270,7 @@ pub async fn create_federated_session(
         request.handoff.payload.handoff_id,
         request.handoff.payload.user,
     );
+    let name = request.handoff.payload.name.clone();
     let config = FederatedLoginConfig {
         realm_id: state.get_realm_id(),
         handoff: request.handoff,
@@ -273,17 +291,42 @@ pub async fn create_federated_session(
             FederatedLoginError::Session(error) => map_create_error(error),
             error => ServerError::InternalError(error.to_string()),
         })?;
-    info!(%handoff_id, %user_id, "Federated login accepted");
+    let account = created.session.user_id;
+    info!(%handoff_id, %user_id, %account, "Federated login accepted");
+    let linked = created.session.via.is_some();
+    let account_hint = match name.filter(|_| !linked) {
+        Some(name) => name_hint(&state, &name).await?,
+        None => false,
+    };
     Ok((
         StatusCode::CREATED,
-        Json(CreateSessionResponse {
-            session_id: created.session.sid,
-            kind: created.session.kind.to_string(),
-            label: created.session.label.unwrap_or_default(),
-            token: created.token.expose().to_string(),
-            expires_at: unix_rfc3339(created.session.expires_at),
+        Json(FederatedSessionResponse {
+            session: CreateSessionResponse {
+                session_id: created.session.sid,
+                kind: created.session.kind.to_string(),
+                label: created.session.label.unwrap_or_default(),
+                token: created.token.expose().to_string(),
+                expires_at: unix_rfc3339(created.session.expires_at),
+            },
+            linked,
+            account_hint,
         }),
     ))
+}
+
+/// Whether an active, non-service local account shows `name` as its public name.
+async fn name_hint(state: &ServerState, name: &str) -> ServerResult<bool> {
+    let search = SearchUsersOperation::new(SearchUsersInput {
+        realm_id: state.get_realm_id(),
+        query: name.trim().to_string(),
+        limit: 1,
+        start_after: None,
+        exact_name: true,
+    });
+    let found = drive(search, &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    Ok(!found.users.is_empty())
 }
 
 #[cfg(test)]
@@ -297,6 +340,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMode};
     use aruna_core::handoff::secret_nonce;
+    use aruna_core::keyspaces::{FEDERATION_KEYSPACE, USER_KEYSPACE};
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
@@ -399,7 +443,7 @@ mod tests {
         state: &Arc<ServerState>,
         handoff: Signed<LoginHandoff>,
         secret: [u8; SECRET_LEN],
-    ) -> ServerResult<(StatusCode, Json<CreateSessionResponse>)> {
+    ) -> ServerResult<(StatusCode, Json<FederatedSessionResponse>)> {
         create_federated_session(
             State(state.clone()),
             None,
@@ -418,8 +462,8 @@ mod tests {
         let (_dir, state, settings) = serving().await;
         let (status, Json(created)) = login(&state, handoff(&settings), SECRET).await.unwrap();
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(created.kind, "federated");
-        let claims = handle_token(&state, &created.token).await.unwrap();
+        assert_eq!(created.session.kind, "federated");
+        let claims = handle_token(&state, &created.session.token).await.unwrap();
         let auth = AuthContext::try_from(claims).unwrap();
         assert_eq!(auth.user_id, home_user());
         assert_eq!(auth.realm_id, state.get_realm_id());
@@ -431,7 +475,7 @@ mod tests {
             State(state.clone()),
             Extension(Some(auth)),
             Extension(Some(crate::auth::ValidatedBearer::new_for_test(
-                created.token,
+                created.session.token,
             ))),
             Json(CreateSessionRequest {
                 kind: "portal".to_string(),
@@ -476,6 +520,7 @@ mod tests {
                 sid: Ulid::generate().to_string(),
                 kind,
                 name: None,
+                via: None,
             })
         };
         let federated = AuthContext {
@@ -518,5 +563,54 @@ mod tests {
         }
         assert!(admit_login(&limiter, ip).is_err());
         admit_login(&limiter, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))).unwrap();
+    }
+
+    #[tokio::test]
+    async fn linked_login_maps() {
+        // A login linked to one active account opens that account's session; the hint names
+        // nothing and only matches a public name.
+        let (_dir, state, settings) = serving().await;
+        let (status, Json(plain)) = login(&state, handoff(&settings), SECRET).await.unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(!plain.linked && !plain.account_hint);
+        let realm_id = state.get_realm_id();
+        let local = UserId::local(Ulid::from_bytes([4; 16]), realm_id);
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: local,
+            realm_id,
+        };
+        let user = aruna_core::structs::identity::user::User {
+            user_id: local,
+            name: "ada".to_string(),
+            subject_ids: Vec::new(),
+            alias_user_ids: [home_user()].into(),
+            attributes: Default::default(),
+        };
+        let context = state.get_ctx();
+        let write = |key_space: &str, key: Vec<u8>, value: Vec<u8>| {
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+        };
+        let user_key = local.to_bytes();
+        write(USER_KEYSPACE, user_key, user.to_bytes(&actor).unwrap()).await;
+        let (_, Json(hinted)) = login(&state, handoff(&settings), SECRET).await.unwrap();
+        assert!(!hinted.linked && hinted.account_hint);
+        let claims = std::collections::BTreeSet::from([local]);
+        let key = aruna_core::link::alias_claims_key(&home_user());
+        let claims = postcard::to_allocvec(&claims).unwrap();
+        write(FEDERATION_KEYSPACE, key, claims).await;
+        let (_, Json(linked)) = login(&state, handoff(&settings), SECRET).await.unwrap();
+        assert!(linked.linked && !linked.account_hint);
+        let token = handle_token(&state, &linked.session.token).await.unwrap();
+        let auth = AuthContext::try_from(token).unwrap();
+        assert_eq!(auth.user_id, local);
+        assert_eq!(auth.session.unwrap().via, Some(home_user()));
     }
 }

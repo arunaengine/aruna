@@ -1206,6 +1206,7 @@ async fn search_users(
             query: q,
             limit,
             start_after: query.start_after,
+            exact_name: false,
         }),
         &state.get_ctx(),
     )

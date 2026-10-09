@@ -9,8 +9,8 @@ use ulid::Ulid;
 
 use crate::UserId;
 use crate::federation::{
-    AcceptedRealms, FederationError, FederationSettings, MAX_NAME_LEN, RealmDescriptor, Signable,
-    Signed, valid_federation_url,
+    FederationError, FederationSettings, MAX_NAME_LEN, RealmDescriptor, Signable, Signed,
+    valid_federation_url,
 };
 use crate::structs::identity::realm::RealmId;
 
@@ -142,12 +142,7 @@ pub fn check_handoff(
     {
         return Err(HandoffError::BadLifetime);
     }
-    let accepted = match &settings.accepted_realms {
-        AcceptedRealms::None => false,
-        AcceptedRealms::Only(realms) => realms.contains(&payload.issuer),
-        AcceptedRealms::Any => true,
-    };
-    if !accepted || payload.issuer == *local {
+    if !settings.accepted_realms.admits(&payload.issuer) || payload.issuer == *local {
         return Err(HandoffError::NotAccepted);
     }
     if payload
@@ -163,7 +158,7 @@ pub fn check_handoff(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::federation::RegistrationMode;
+    use crate::federation::{AcceptedRealms, RegistrationMode};
     use crate::structs::identity::auth::NodeCapabilities;
     use ed25519_dalek::SigningKey;
     use url::Url;

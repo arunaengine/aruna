@@ -3,13 +3,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::events::Event;
+use std::collections::BTreeSet;
+
+use aruna_core::UserId;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::ConversionError;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::federation::{FederationError, RealmDescriptor, Signed};
 use aruna_core::handoff::{FEDERATED_SESSION_SECS, HandoffError, LoginHandoff, check_handoff};
+use aruna_core::keyspaces::{FEDERATION_KEYSPACE, USER_KEYSPACE};
+use aruna_core::link::{alias_claims_key, alias_owner};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, SessionKind};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::user::User;
 use aruna_core::types::Effects;
+use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -149,6 +158,10 @@ pub enum FederatedLoginError {
     Rejected(#[from] HandoffError),
     #[error(transparent)]
     Session(#[from] CreateSessionError),
+    #[error(transparent)]
+    Storage(#[from] aruna_core::errors::StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
     #[error("federated login did not finish")]
     NotFinished,
 }
@@ -156,11 +169,14 @@ pub enum FederatedLoginError {
 #[derive(Debug, PartialEq)]
 enum FederatedLoginState {
     ReadConfig(GetConfigOperation),
+    ReadClaims,
+    ReadOwner(UserId),
     Session(CreateSessionOperation),
     Done,
 }
 
-/// Admits a login handoff against the current settings and opens an 8 hour federated session.
+/// Admits a login handoff against the current settings and opens an 8 hour federated session,
+/// for the local account the login is linked to when that link resolves unambiguously.
 #[derive(Debug, PartialEq)]
 pub struct FederatedLoginOperation {
     config: FederatedLoginConfig,
@@ -181,7 +197,7 @@ impl FederatedLoginOperation {
     fn admit(
         &self,
         read: Result<aruna_core::structs::identity::realm::RealmConfigDocument, GetConfigError>,
-    ) -> Result<CreateSessionOperation, FederatedLoginError> {
+    ) -> Result<(), FederatedLoginError> {
         let settings = read?.federation.ok_or(FederatedLoginError::Disabled)?;
         let config = &self.config;
         check_handoff(
@@ -191,18 +207,85 @@ impl FederatedLoginOperation {
             &config.secret,
             config.now,
         )?;
+        Ok(())
+    }
+
+    fn session(&mut self, user_id: UserId, via: Option<UserId>) -> Effects {
+        let config = &self.config;
         let handoff = &config.handoff.payload;
-        Ok(CreateSessionOperation::new(CreateSessionConfig {
+        let mut session = CreateSessionOperation::new(CreateSessionConfig {
             time: config.now,
             expiry: config.now.saturating_add(FEDERATED_SESSION_SECS),
-            user_id: handoff.user,
+            user_id,
             realm_id: config.realm_id,
             node_capabilities: config.node_capabilities.clone(),
             kind: SessionKind::Federated,
             label: None,
             name: handoff.name.clone(),
             restrictions: None,
-        }))
+            via,
+        });
+        let effects = session.start();
+        self.state = FederatedLoginState::Session(session);
+        effects
+    }
+
+    fn read(&mut self, key_space: &str, key: Vec<u8>) -> Effects {
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            txn_id: None,
+        })]
+    }
+
+    /// The linked account and its stored bytes from a storage read, or the error it carries.
+    fn read_value(event: Event) -> Result<Option<ByteView>, FederatedLoginError> {
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            _ => Err(FederatedLoginError::NotFinished),
+        }
+    }
+
+    fn claims_read(&mut self, event: Event) -> Effects {
+        let foreign = self.config.handoff.payload.user;
+        let owner = Self::read_value(event).and_then(|value| {
+            let claims = value
+                .map(|bytes| postcard::from_bytes::<BTreeSet<UserId>>(&bytes))
+                .transpose()
+                .map_err(ConversionError::from)?
+                .unwrap_or_default();
+            Ok(alias_owner(&claims))
+        });
+        match owner {
+            Ok(Some(owner)) => {
+                self.state = FederatedLoginState::ReadOwner(owner);
+                self.read(USER_KEYSPACE, owner.to_bytes())
+            }
+            Ok(None) => self.session(foreign, None),
+            Err(error) => self.finish(Err(error)),
+        }
+    }
+
+    /// A linked login opens a session of an active, non-service account that still links it.
+    fn owner_read(&mut self, event: Event, owner: UserId) -> Effects {
+        let foreign = self.config.handoff.payload.user;
+        let user = Self::read_value(event).and_then(|value| {
+            value
+                .map(|bytes| User::from_bytes(&bytes).map_err(FederatedLoginError::from))
+                .transpose()
+        });
+        match user {
+            Ok(Some(user))
+                if !user.is_deactivated()
+                    && user.service_group().is_none()
+                    && user.alias_user_ids.contains(&foreign) =>
+            {
+                self.session(owner, Some(foreign))
+            }
+            Ok(_) => self.session(foreign, None),
+            Err(error) => self.finish(Err(error)),
+        }
     }
 
     fn finish(&mut self, result: Result<CreatedSession, FederatedLoginError>) -> Effects {
@@ -232,14 +315,16 @@ impl Operation for FederatedLoginOperation {
                     return effects;
                 }
                 match self.admit(read.finalize()) {
-                    Ok(mut session) => {
-                        let effects = session.start();
-                        self.state = FederatedLoginState::Session(session);
-                        effects
+                    Ok(()) => {
+                        self.state = FederatedLoginState::ReadClaims;
+                        let key = alias_claims_key(&self.config.handoff.payload.user);
+                        self.read(FEDERATION_KEYSPACE, key)
                     }
                     Err(error) => self.finish(Err(error)),
                 }
             }
+            FederatedLoginState::ReadClaims => self.claims_read(event),
+            FederatedLoginState::ReadOwner(owner) => self.owner_read(event, owner),
             FederatedLoginState::Session(mut session) => {
                 let effects = session.step(event);
                 if !session.is_complete() {
@@ -265,7 +350,7 @@ impl Operation for FederatedLoginOperation {
         match &mut self.state {
             FederatedLoginState::ReadConfig(read) => read.abort(),
             FederatedLoginState::Session(session) => session.abort(),
-            FederatedLoginState::Done => smallvec![],
+            _ => smallvec![],
         }
     }
 }
@@ -325,6 +410,7 @@ mod tests {
                     sid: "s".to_string(),
                     kind,
                     name: None,
+                    via: None,
                 }),
             },
             descriptor: Signed::sign(descriptor, &capabilities()).unwrap(),

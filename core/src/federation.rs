@@ -211,6 +211,17 @@ pub enum AcceptedRealms {
     Any,
 }
 
+impl AcceptedRealms {
+    /// Whether logins of `realm_id` are admitted.
+    pub fn admits(&self, realm_id: &RealmId) -> bool {
+        match self {
+            Self::None => false,
+            Self::Only(realms) => realms.contains(realm_id),
+            Self::Any => true,
+        }
+    }
+}
+
 /// Realm-wide federation settings with the descriptor signed from them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FederationSettings {
