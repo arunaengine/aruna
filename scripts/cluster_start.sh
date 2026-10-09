@@ -798,6 +798,7 @@ require_commands() {
 prepare_deployment() {
   rm -rf "$DEPLOY_ROOT"
   mkdir -p "$DEPLOY_ROOT"
+  printf '%s\n' "$$" >"$DEPLOY_ROOT/cluster_start.pid"
 
   prepare_nodes
 
