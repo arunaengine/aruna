@@ -945,9 +945,8 @@ mod tests {
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
     use aruna_core::structs::execution::job::{
-        AttemptIntent, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
-        ImportRoCrateSpec, ImportRoCrateTarget, JobClaim, JobPayload, JobResultPayload,
-        RoCrateLimits,
+        AttemptIntent, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
+        ImportRoCrateTarget, JobClaim, JobPayload, JobResultPayload, RoCrateLimits,
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
