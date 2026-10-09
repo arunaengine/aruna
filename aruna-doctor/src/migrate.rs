@@ -12,7 +12,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::federation::FederationSettings;
 use aruna_core::git::GitRecord;
 use aruna_core::keyspaces::{
-    APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_SECRET_KEYSPACE,
+    APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, DEDUP_INDEX_KEYSPACE,
     EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE,
     FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE,
     JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE,
@@ -25,7 +25,7 @@ use aruna_core::structs::QUARANTINE_USAGE_KEY;
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
 use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
-    JobRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
+    JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -45,6 +45,7 @@ mod git;
 mod info_topics;
 mod jobs;
 mod mappings;
+mod session_refs;
 mod sessions;
 mod sizes;
 mod uploads;
@@ -81,9 +82,13 @@ pub struct MigrateOutput {
     /// Identifier index rows written or removed so the index matches the mappings.
     pub identifier_index_written: usize,
     pub identifier_index_removed: usize,
-    /// Local job records; export jobs gain empty repository fields.
+    /// Local job records; export jobs gain empty repository fields, and session references
+    /// without a display name or linked login gain empty ones.
     pub jobs_scanned: usize,
     pub jobs_rewritten: usize,
+    /// Dedup rows whose plan digest follows a rewritten job.
+    pub job_dedup_scanned: usize,
+    pub job_dedup_rewritten: usize,
     /// Checkpoints of RO-Crate import and export jobs.
     pub checkpoints_scanned: usize,
     pub checkpoints_rewritten: usize,
@@ -171,6 +176,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let quarantine_rows = db.keyspace(SYNC_QUARANTINE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let usage_rows = db.keyspace(QUARANTINE_USAGE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let login_rows = db.keyspace(USER_SESSION_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let dedup_rows = db.keyspace(DEDUP_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -231,7 +237,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         &index_rows,
         ID_MAPPING_KEYSPACE,
     )?;
-    let jobs = rewrites::<JobRecord, jobs::LegacyJob>(&db, &job_rows, JOB_KEYSPACE)?;
+    let jobs = jobs::job_rows(&db, &job_rows, JOB_KEYSPACE)?;
+    let dedup = jobs::dedup_rows(&db, &dedup_rows, &jobs.rows, DEDUP_INDEX_KEYSPACE)?;
     let kinds = jobs::checkpoint_kinds(&db, &job_rows, &jobs.rows, JOB_KEYSPACE)?;
     let checkpoints = jobs::checkpoint_rows(&db, &state_rows, &kinds, JOB_STATE_KEYSPACE)?;
     let keys = node_secret(&db)?.map(|secret| {
@@ -272,6 +279,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&login_rows, &logins.rows),
         (&index_rows, &index.writes),
         (&job_rows, &jobs.rows),
+        (&dedup_rows, &dedup.rows),
         (&state_rows, &checkpoints.rows),
         (&owner_rows, &stale.owner_writes),
         (&cleanup_rows, &old_uploads.blob_deletes),
@@ -346,6 +354,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         identifier_index_removed: index.removes.len(),
         jobs_scanned: jobs.scanned,
         jobs_rewritten: jobs.rows.len(),
+        job_dedup_scanned: dedup.scanned,
+        job_dedup_rewritten: dedup.rows.len(),
         checkpoints_scanned: checkpoints.scanned,
         checkpoints_rewritten: checkpoints.rows.len(),
         git_records_scanned: git_records.scanned,
