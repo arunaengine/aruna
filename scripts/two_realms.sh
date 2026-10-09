@@ -259,11 +259,41 @@ start() {
   write_summary
 }
 
+# Whether a recorded supervisor still runs: cluster_start.sh, or this script's own child before
+# it starts that script. An exited child or a pid now used by another process does not.
+supervisor_alive() {
+  local state ppid args
+
+  read -r state ppid args < <(ps -o stat=,ppid=,args= -p "$1" 2>/dev/null || true) || return 1
+  [[ "$state" != Z* ]] && [[ "$ppid" == "$$" || "$args" == *scripts/cluster_start.sh* ]]
+}
+
+# Stops the deploy script recorded for a realm and waits until its own cleanup has finished. It
+# may not have written the pid file cluster_stop.sh uses. It ignores SIGINT as a background job.
+stop_supervisor() {
+  local pid_file="$DEPLOY_ROOT/realm-$1.pid"
+  local pid
+  local deadline=$((SECONDS + 120))
+
+  [[ -f "$pid_file" ]] || return 0
+  pid="$(<"$pid_file")"
+  if supervisor_alive "$pid"; then
+    kill -TERM "$pid" 2>/dev/null || true
+    while supervisor_alive "$pid"; do
+      ((SECONDS < deadline)) || kill -KILL "$pid" 2>/dev/null || true
+      sleep 0.2
+    done
+    log "Stopped the deploy script of realm $1 (pid $pid)"
+  fi
+  rm -f "$pid_file"
+}
+
 stop() {
   local realm
   local pid
 
   for realm in a b; do
+    stop_supervisor "$realm"
     (
       while IFS= read -r setting; do
         export "${setting?}"
