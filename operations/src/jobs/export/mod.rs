@@ -326,6 +326,8 @@ enum ResolveResult {
 #[derive(Clone, Copy, Debug)]
 enum OpenStatus {
     Denied,
+    /// An export into another realm needs a bucket key of this copy that the caller lacks.
+    NotHolder,
     Missing,
     Offline,
     Corrupt,
@@ -1686,11 +1688,13 @@ async fn probe_sources_checked(
         let mut missing = false;
         let mut offline = false;
         let mut corrupt = false;
+        let mut unheld = None;
         let mut selected = None;
         let failed = candidate_failures.get(&index);
-        for status in failed.into_iter().flat_map(|failed| failed.values()) {
+        for (candidate_index, status) in failed.into_iter().flatten() {
             match status {
                 OpenStatus::Denied => denied = true,
+                OpenStatus::NotHolder => unheld = local_bucket(candidates.get(*candidate_index)),
                 OpenStatus::Missing => missing = true,
                 OpenStatus::Offline => offline = true,
                 OpenStatus::Corrupt => corrupt = true,
@@ -1750,6 +1754,9 @@ async fn probe_sources_checked(
                     ));
                 }
                 CandidateOpen::Status(OpenStatus::Denied) => denied = true,
+                CandidateOpen::Status(OpenStatus::NotHolder) => {
+                    unheld = local_bucket(Some(&candidate));
+                }
                 CandidateOpen::Status(OpenStatus::Missing) => missing = true,
                 CandidateOpen::Status(OpenStatus::Offline) => offline = true,
                 CandidateOpen::Status(OpenStatus::Corrupt) => corrupt = true,
@@ -1763,6 +1770,11 @@ async fn probe_sources_checked(
             return Err(ExportFailure::Retryable(
                 "payload integrity check failed".to_string(),
             ));
+        }
+        // No copy opened and one of them needs a bucket key the caller lacks.
+        if let Some(bucket) = unheld {
+            let refused = crate::federation::export::GrantError::NotHolder(bucket);
+            return Err(ExportFailure::Permanent(refused.to_string()));
         }
 
         let entity = &mut checkpoint.entities[index];
@@ -1959,6 +1971,9 @@ async fn open_local_txn(
             "blob handle unavailable".to_string(),
         ));
     };
+    if !holder_allows(driver, spec, location, bucket, Some(txn_id)).await? {
+        return Ok(CandidateOpen::Status(OpenStatus::NotHolder));
+    }
     // An encrypting bucket admits plaintext only under a read lease; a locked key parks the job.
     let lease = match read_admission(driver, location, bucket, txn_id).await? {
         Ok(lease) => lease,
@@ -1971,21 +1986,6 @@ async fn open_local_txn(
             }));
         }
     };
-    // An export into another realm reads encrypted files only for a current key holder.
-    if lease.is_some()
-        && spec.selection.is_some()
-        && !crate::replication::plaintext::is_holder(
-            driver,
-            spec.auth_context.realm_id,
-            bucket,
-            spec.auth_context.user_id,
-        )
-        .await
-        .map_err(ExportFailure::Retryable)?
-    {
-        let refused = crate::federation::export::GrantError::NotHolder(bucket.to_string());
-        return Err(ExportFailure::Permanent(refused.to_string()));
-    }
     let (effect, held) = match (lease, location.format.bucket_key()) {
         (Some(lease), Some(_)) => {
             let location = location.clone();
@@ -2042,19 +2042,10 @@ async fn read_admission(
     bucket: &str,
     txn_id: TxnId,
 ) -> Result<Result<Option<ReadLease>, BucketKeyRef>, ExportFailure> {
-    let (key, archive) = match location.format.bucket_key() {
-        Some(key) => (key, ArchiveKey::of(location)),
-        None => {
-            let key = bucket.as_bytes().to_vec().into();
-            let row = storage_value(driver, BUCKET_ENCRYPTION_KEYSPACE, key, Some(txn_id)).await?;
-            let settings = BucketEncryption::from_row(row.as_deref())
-                .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-            match settings.active_key() {
-                Some(key) => (key, ArchiveKey::of(location)),
-                None => return Ok(Ok(None)),
-            }
-        }
+    let Some(key) = read_key(driver, location, bucket, Some(txn_id)).await? else {
+        return Ok(Ok(None));
     };
+    let archive = ArchiveKey::of(location);
     let Some(blob_handle) = driver.blob_handle.as_ref() else {
         return Err(ExportFailure::Retryable(
             "blob handle unavailable".to_string(),
@@ -2071,6 +2062,50 @@ async fn read_admission(
         event => Err(ExportFailure::Retryable(format!(
             "read admission failed: {event:?}"
         ))),
+    }
+}
+
+/// The bucket key a read of a copy in `bucket` needs: its own key for a sealed copy, the active
+/// bucket key for a plain copy of an encrypting bucket, none for a plain bucket.
+async fn read_key(
+    driver: &DriverContext,
+    location: &BackendLocation,
+    bucket: &str,
+    txn_id: Option<TxnId>,
+) -> Result<Option<BucketKeyRef>, ExportFailure> {
+    if let Some(key) = location.format.bucket_key() {
+        return Ok(Some(key));
+    }
+    let key = bucket.as_bytes().to_vec().into();
+    let row = storage_value(driver, BUCKET_ENCRYPTION_KEYSPACE, key, txn_id).await?;
+    let settings = BucketEncryption::from_row(row.as_deref())
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    Ok(settings.active_key())
+}
+
+/// The holder rule of an export into another realm: a copy that needs a bucket key is readable
+/// only for a current key holder of its bucket.
+async fn holder_allows(
+    driver: &DriverContext,
+    spec: &ExportRoCrateSpec,
+    location: &BackendLocation,
+    bucket: &str,
+    txn_id: Option<TxnId>,
+) -> Result<bool, ExportFailure> {
+    if spec.selection.is_none() || read_key(driver, location, bucket, txn_id).await?.is_none() {
+        return Ok(true);
+    }
+    let auth = &spec.auth_context;
+    crate::replication::plaintext::is_holder(driver, auth.realm_id, bucket, auth.user_id)
+        .await
+        .map_err(ExportFailure::Retryable)
+}
+
+/// The bucket of a candidate read on this node.
+fn local_bucket(candidate: Option<&ExportCandidate>) -> Option<String> {
+    match candidate.map(|candidate| &candidate.source) {
+        Some(CandidateSource::Local { bucket, .. }) => Some(bucket.clone()),
+        _ => None,
     }
 }
 
