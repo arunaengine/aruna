@@ -1052,6 +1052,14 @@ impl InboundEventHandler for OperationsInboundHandler {
                     })
                     .await
                 }
+                Alpn::Heartbeat => {
+                    Box::pin(crate::node::heartbeat::handle_heartbeat_stream(
+                        self.context.as_ref(),
+                        stream,
+                        node_id,
+                    ))
+                    .await
+                }
                 Alpn::JobControl => {
                     Box::pin(async {
                         crate::jobs::protocol::handle_job_stream(

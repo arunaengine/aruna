@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::NodeId;
 use crate::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot, SnapshotError};
 use crate::compute::{ExecutorAvailability, MAX_ADVERTISED_EXECUTORS};
 use crate::structs::identity::realm::RealmId;
@@ -97,6 +98,16 @@ impl NodeHeartbeat {
         heartbeat.validate()?;
         Ok(heartbeat)
     }
+}
+
+/// The latest heartbeat held for one node, with its age on the receiver's monotonic clock. The
+/// receive time in wall milliseconds is for display only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldHeartbeat {
+    pub node_id: NodeId,
+    pub heartbeat: NodeHeartbeat,
+    pub age_ms: u64,
+    pub received_at_ms: u64,
 }
 
 fn revision(epoch: &AdvertisementEpoch) -> (u64, u64) {

@@ -17,6 +17,7 @@ pub mod document_sync;
 mod effect_handlers;
 pub mod error;
 mod eviction;
+mod heartbeat;
 pub mod streams;
 mod tasks;
 mod telemetry;
@@ -36,6 +37,7 @@ use aruna_core::document::{DocumentEvictedDocument, DocumentReconcileResult, Doc
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetError as CoreNetError, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat};
 use aruna_core::id::NodeId;
 use aruna_core::metrics::NotificationWatchMetrics;
 use aruna_core::structs::execution::notification_watch::{WatchInterestEntry, WatchInterestTable};
@@ -61,6 +63,7 @@ pub use connection_pool::{Monitor, PoolCounts};
 pub use dht::DhtHandle;
 pub use document_sync::{DocumentSyncService, PendingEviction, ShardGenesisProbe};
 pub use error::{NetError, Result};
+pub use heartbeat::HeartbeatSlot;
 pub use streams::StreamsService;
 
 use connection_pool::ConnectionPool;
@@ -115,6 +118,7 @@ struct NetInner {
     realm_peers: Arc<RwLock<Vec<NodeId>>>,
     inbound_admission: streams::InboundAdmission,
     watch_interest: Arc<RwLock<WatchInterestTable>>,
+    heartbeats: Arc<heartbeat::HeartbeatTable>,
     notification_watch_metrics: NotificationWatchMetrics,
     notification_wakes: broadcast::Sender<UserId>,
     dashboard_epoch: Ulid,
@@ -477,6 +481,29 @@ impl NetHandle {
         self.inner.realm_peers.read().clone()
     }
 
+    /// A slot for reading one inbound heartbeat of `node`, or none past the stream limits.
+    pub fn heartbeat_slot(&self, node: NodeId) -> Option<HeartbeatSlot> {
+        self.inner.heartbeats.slot(node)
+    }
+
+    /// Stores an admitted heartbeat of `node`. False when it is not newer than the held one,
+    /// arrives too soon after it, or `node` is no longer a sync peer.
+    pub fn record_heartbeat(&self, node: NodeId, heartbeat: NodeHeartbeat) -> bool {
+        self.inner.heartbeats.record(node, heartbeat, || {
+            self.inner.realm_peers.read().contains(&node)
+        })
+    }
+
+    pub fn record_own_heartbeat(&self, heartbeat: NodeHeartbeat) {
+        self.inner
+            .heartbeats
+            .record_own(self.inner.node_id, heartbeat);
+    }
+
+    pub fn held_heartbeats(&self) -> Vec<HeldHeartbeat> {
+        self.inner.heartbeats.held()
+    }
+
     /// Cheap clone of the origin-side watch interest cache. Consumers match
     /// events against this table without any per-event storage read.
     pub fn watch_interest_snapshot(&self) -> WatchInterestTable {
@@ -555,6 +582,10 @@ impl NetHandle {
 
     async fn refresh_realm_peers(&self, peers: Vec<NodeId>) {
         *self.inner.realm_peers.write() = peers.clone();
+        let node_id = self.inner.node_id;
+        self.inner
+            .heartbeats
+            .retain(|node| *node == node_id || peers.contains(node));
         self.inner.inbound_admission.mark_materialized();
         replace_authorized_nodes(
             &self.inner.signed_authorized_nodes,
