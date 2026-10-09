@@ -28,12 +28,13 @@ pub enum RecordChange {
     /// Sets the revoked flag of a grant record; nothing clears it.
     RevokeGrant { key: Vec<u8> },
     /// Binds an import key to an upload with its record unless another upload is bound; binding
-    /// the same upload again replaces its record.
+    /// the same upload again replaces its record. A bound `stale` upload is replaced.
     BindImport {
         key: Vec<u8>,
         record_key: Vec<u8>,
         upload_id: Ulid,
         record: ImportRecord,
+        stale: Option<Ulid>,
     },
     /// Clears the source confirmation of an import record and reports whether it was set.
     ConsumeConfirmation { record_key: Vec<u8> },
@@ -146,6 +147,7 @@ impl RecordOperation {
                     record_key,
                     upload_id,
                     record,
+                    stale,
                 },
                 stored,
             ) => {
@@ -154,7 +156,9 @@ impl RecordOperation {
                     .transpose()
                     .map_err(|_| RecordError::Invalid("invalid upload binding".to_string()))?;
                 match bound {
-                    Some(bound) if bound != *upload_id => (Vec::new(), RecordOutcome::Bound(bound)),
+                    Some(bound) if bound != *upload_id && Some(bound) != *stale => {
+                        (Vec::new(), RecordOutcome::Bound(bound))
+                    }
                     _ => (
                         vec![
                             entry(record_key, encode(record)?),
@@ -400,13 +404,14 @@ mod tests {
             grant: record.grant,
             confirmed: false,
         };
-        let change = RecordChange::BindImport {
+        let bind = |stale| RecordChange::BindImport {
             key: b"upload".to_vec(),
             record_key: b"import".to_vec(),
             upload_id: Ulid::from_bytes([2; 16]),
-            record: import,
+            record: import.clone(),
+            stale,
         };
-        let mut operation = RecordOperation::new(change);
+        let mut operation = RecordOperation::new(bind(None));
         operation.start();
         operation.step(started(1));
         let effects = operation.step(read(Some(winner.to_bytes().to_vec())));
@@ -416,5 +421,27 @@ mod tests {
         ));
         operation.step(committed(1));
         assert_eq!(operation.finalize(), Ok(RecordOutcome::Bound(winner)));
+        // A stale upload gives way in the same transaction; a newer binding is kept.
+        let replace = |stored: Ulid| {
+            let mut operation = RecordOperation::new(bind(Some(winner)));
+            operation.start();
+            operation.step(started(2));
+            let effects = operation.step(read(Some(stored.to_bytes().to_vec())));
+            let wrote = matches!(
+                effects[0],
+                Effect::Storage(StorageEffect::BatchWrite { .. })
+            );
+            if wrote {
+                operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+                    entries: Vec::new(),
+                }));
+            }
+            operation.step(committed(2));
+            (wrote, operation.finalize())
+        };
+        let replaced = Ulid::from_bytes([2; 16]);
+        assert_eq!(replace(winner), (true, Ok(RecordOutcome::Bound(replaced))));
+        let newer = Ulid::from_bytes([3; 16]);
+        assert_eq!(replace(newer), (false, Ok(RecordOutcome::Bound(newer))));
     }
 }

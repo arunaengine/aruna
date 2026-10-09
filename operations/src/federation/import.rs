@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use aruna_core::federation::Signed;
 use aruna_core::keyspaces::FEDERATION_KEYSPACE;
 use aruna_core::structs::execution::job::{
-    ImportRoCrateSource, ImportRoCrateSpec, RoCrateUploadRecord,
+    ImportRoCrateSource, ImportRoCrateSpec, RoCrateUploadRecord, user_dedup_key,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -28,6 +28,7 @@ use crate::driver::{DriverContext, drive};
 use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome};
 use crate::jobs::import::load_rocrate_upload;
 use crate::jobs::key_wake::read_row;
+use crate::jobs::store::{find_dedup_plan, read_job_record};
 use crate::realm::get_config::GetConfigOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
@@ -193,25 +194,64 @@ pub async fn write_import(
     upload_id: Ulid,
     record: &ImportRecord,
 ) -> Result<Ulid, ImportError> {
-    let change = RecordChange::BindImport {
-        key: upload_key(record.intent.payload.principal, import_key),
+    let principal = record.intent.payload.principal;
+    let bind = |stale| RecordChange::BindImport {
+        key: upload_key(principal, import_key),
         record_key: record_key(upload_id),
         upload_id,
         record: record.clone(),
+        stale,
     };
+    let mut bound = drive_binding(context, bind(None)).await?;
+    if bound != upload_id && stale_upload(context, principal, import_key, bound).await? {
+        bound = drive_binding(context, bind(Some(bound))).await?;
+    }
+    // A racing upload won the key: it is reused only for the same transfer.
+    if bound != upload_id {
+        let (intent, grant) = (&record.intent.payload, &record.grant.payload);
+        check_bound(context, bound, intent, grant).await?;
+    }
+    Ok(bound)
+}
+
+/// Runs one binding change and returns the upload bound to the import key afterwards.
+async fn drive_binding(context: &DriverContext, change: RecordChange) -> Result<Ulid, ImportError> {
     match drive(RecordOperation::new(change), context).await {
-        // A racing upload won the key: it is reused only for the same transfer.
-        Ok(RecordOutcome::Bound(bound)) if bound != upload_id => {
-            let (intent, grant) = (&record.intent.payload, &record.grant.payload);
-            check_bound(context, bound, intent, grant).await?;
-            Ok(bound)
-        }
         Ok(RecordOutcome::Bound(bound)) => Ok(bound),
         Ok(other) => Err(ImportError::Storage(format!(
             "unexpected outcome {other:?}"
         ))),
         Err(error) => Err(ImportError::Storage(error.to_string())),
     }
+}
+
+/// Whether bound upload `upload_id` can no longer start an import: it expired unused, or it is
+/// gone and no import job of `principal` holds the import key. Both states never change back.
+async fn stale_upload(
+    context: &DriverContext,
+    principal: UserId,
+    import_key: &str,
+    upload_id: Ulid,
+) -> Result<bool, ImportError> {
+    let upload = load_rocrate_upload(context, upload_id)
+        .await
+        .map_err(ImportError::Storage)?;
+    if let Some(upload) = upload {
+        let now = aruna_core::time::unix_timestamp_millis();
+        return Ok(upload.claimed_by.is_none() && upload.expires_at_ms <= now);
+    }
+    let storage = &context.storage_handle;
+    let dedup_key = user_dedup_key(principal, import_key);
+    let job = find_dedup_plan(storage, principal, &dedup_key, None)
+        .await
+        .map_err(ImportError::Storage)?;
+    let Some((job_id, _)) = job else {
+        return Ok(true);
+    };
+    let record = read_job_record(storage, job_id, None)
+        .await
+        .map_err(ImportError::Storage)?;
+    Ok(record.is_none())
 }
 
 /// The upload `principal`'s import key was bound to by an earlier transfer.
@@ -271,6 +311,10 @@ pub async fn reusable_upload(
     let Some(upload_id) = bound_upload(context, intent.principal, import_key).await? else {
         return Ok(None);
     };
+    // A stale upload is replaced when the new transfer binds its own upload.
+    if stale_upload(context, intent.principal, import_key, upload_id).await? {
+        return Ok(None);
+    }
     check_bound(context, upload_id, intent, grant).await?;
     Ok(Some(upload_id))
 }

@@ -13,7 +13,9 @@ use aruna_core::federation::RealmDescriptor;
 use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMode};
 use aruna_core::handoff::descriptor_digest;
 use aruna_core::handoff::secret_nonce;
-use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    AUTH_KEYSPACE, GROUP_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::structs::execution::job::{JobId, RoCrateLimits};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -614,4 +616,46 @@ async fn push_after_import() {
     let retry = submit(&fixture, upload_id, &key, "second").await.unwrap();
     assert!(job.created && !retry.created);
     assert_eq!(retry.job_id, job.job_id);
+}
+
+#[tokio::test]
+async fn push_replaces_expired() {
+    // A bound upload that expired unused, swept or not, gives way to a new push of the same
+    // transfer, and the import key then starts an import of the new upload.
+    let fixture = fixture(true).await;
+    let intent = intent(&fixture, fixture.user);
+    let grant = grant(&intent, BODY);
+    let key = import_key(&grant.payload, &intent.payload.destination).unwrap();
+    let context = fixture.state.get_ctx();
+    let first = push(&fixture, &intent, &grant).await.unwrap();
+    let first_id = Ulid::from_string(&first.upload_id).unwrap();
+    let mut record = load_rocrate_upload(&context, first_id)
+        .await
+        .unwrap()
+        .unwrap();
+    record.expires_at_ms = 0;
+    let storage = &context.storage_handle;
+    write_rocrate_upload(storage, &record).await.unwrap();
+    let second = push(&fixture, &intent, &grant).await.unwrap();
+    let second_id = Ulid::from_string(&second.upload_id).unwrap();
+    assert_ne!(second_id, first_id);
+    let bound = bound_upload(&context, fixture.user, &key).await;
+    assert_eq!(bound, Ok(Some(second_id)));
+    // The sweep removes the second upload unused as well.
+    let swept = storage
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
+            key: second_id.to_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        swept,
+        aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::DeleteResult { .. })
+    ));
+    let third = push(&fixture, &intent, &grant).await.unwrap();
+    let third_id = Ulid::from_string(&third.upload_id).unwrap();
+    assert!(third_id != first_id && third_id != second_id);
+    let job = submit(&fixture, third_id, &key, "first").await.unwrap();
+    assert!(job.created);
 }
