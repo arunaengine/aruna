@@ -46,10 +46,10 @@ fn login_limiter() -> DefaultKeyedRateLimiter<IpAddr> {
 
 #[derive(OpenApi)]
 #[openapi(tags((name = "federation", description = "Native login across realms")))]
-pub struct FederationLoginApiDoc;
+pub struct LoginApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(FederationLoginApiDoc::openapi())
+    OpenApiRouter::with_openapi(LoginApiDoc::openapi())
         .routes(routes!(create_login_handoff))
         .routes(routes!(create_federated_session))
 }

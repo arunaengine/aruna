@@ -37,10 +37,10 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(tags((name = "federation", description = "Native login across realms")))]
-pub struct FederationExportApiDoc;
+pub struct ExportApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(FederationExportApiDoc::openapi())
+    OpenApiRouter::with_openapi(ExportApiDoc::openapi())
         .routes(routes!(create_export))
         .routes(routes!(create_grant, delete_grant))
         .routes(routes!(push_export))

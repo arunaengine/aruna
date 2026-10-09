@@ -32,10 +32,10 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi(tags((name = "federation", description = "Native login across realms")))]
-pub struct FederationLinkApiDoc;
+pub struct LinkApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(FederationLinkApiDoc::openapi())
+    OpenApiRouter::with_openapi(LinkApiDoc::openapi())
         .routes(routes!(create_confirmation))
         .routes(routes!(create_link, list_links))
         .routes(routes!(delete_link))
