@@ -309,4 +309,42 @@ mod tests {
             Err(RegistryError::Signature(FederationError::BadSignature))
         ));
     }
+
+    async fn body(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        serde_json::from_slice(&bytes.await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn listing_marks_stale() {
+        // Both read routes mark KPIs observed 24 hours ago as stale and keep unknown ones null.
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(RegistryState::new(
+            Store::open(dir.path()).unwrap(),
+            EgressGuard::new(aruna_core::egress::EgressPolicy::strict()).unwrap(),
+        ));
+        let now = unix_timestamp_secs();
+        let entry = |observed_at| Entry {
+            registration: registration("https://realm.example.org", observed_at),
+            received_at: now,
+            verified: false,
+        };
+        let observed = now - crate::store::STALE_SECS;
+        state
+            .store
+            .register(&realm_id(), &entry(observed), now)
+            .unwrap();
+        let listed = body(list_realms(State(state.clone())).await.unwrap()).await;
+        assert_eq!(listed[0]["stale"], true);
+        let kpis = &listed[0]["registration"]["payload"]["kpis"];
+        assert_eq!(kpis["groups"], serde_json::Value::Null);
+        assert_eq!(kpis["live_datasets"], 3);
+        let path = Path(realm_id().to_string());
+        let one = body(get_realm(State(state.clone()), path).await.unwrap()).await;
+        assert_eq!(one["stale"], true);
+        // A renewal with fresh KPIs clears the mark.
+        state.store.register(&realm_id(), &entry(now), now).unwrap();
+        let listed = body(list_realms(State(state)).await.unwrap()).await;
+        assert_eq!(listed[0]["stale"], false);
+    }
 }
