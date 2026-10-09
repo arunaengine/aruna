@@ -16,7 +16,7 @@ pub use upload::{
     claim_rocrate_upload, delete_rocrate_upload, load_rocrate_upload, read_rocrate_upload,
     write_rocrate_upload,
 };
-pub(crate) use upload::{claim_upload, upload_key};
+pub(crate) use upload::{claim_upload, upload_key, upload_stale};
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;

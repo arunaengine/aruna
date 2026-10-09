@@ -469,6 +469,19 @@ pub(crate) fn claim_upload(
     }
 }
 
+/// Whether a bound upload can no longer start an import under [`claim_upload`]: it is unclaimed
+/// and expired, or it is gone and no import job holds its import key.
+pub(crate) fn upload_stale(
+    record: Option<&RoCrateUploadRecord>,
+    job_held: bool,
+    now_ms: u64,
+) -> bool {
+    match record {
+        Some(record) => record.claimed_by.is_none() && record.expires_at_ms <= now_ms,
+        None => !job_held,
+    }
+}
+
 pub async fn read_rocrate_upload(
     storage: &StorageHandle,
     upload_id: Ulid,
