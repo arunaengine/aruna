@@ -94,9 +94,22 @@ pub async fn source_request(
         .await
         .map_err(|error| unreachable(error.to_string()))?;
     if !response.status().is_success() {
-        return Err(ImportError::Refused(response.status()));
+        return Err(answer_error(response.status()));
     }
     Ok(response)
+}
+
+/// A failed or busy source stays temporary; only other answers refuse the grant.
+fn answer_error(status: reqwest::StatusCode) -> ImportError {
+    use reqwest::StatusCode;
+    if status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+    {
+        ImportError::Unreachable(status.to_string())
+    } else {
+        ImportError::Refused(status)
+    }
 }
 
 /// Before a bound import starts or resumes: a confirmation the source gave since the last start
@@ -683,6 +696,19 @@ pub(crate) mod tests {
         // The resume asks the source again; this context has no egress, so it cannot.
         let resumed = confirm_source(&context, &spec(upload_id), timeout).await;
         assert!(matches!(resumed, Err(ImportError::Storage(_))));
+    }
+
+    #[test]
+    fn busy_source_waits() {
+        // Source infrastructure and throttling defer the import; refusals of the grant end it.
+        for code in [500, 502, 503, 504, 429, 408] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert!(matches!(answer_error(status), ImportError::Unreachable(_)));
+        }
+        for code in [400, 401, 403, 404, 410] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert_eq!(answer_error(status), ImportError::Refused(status));
+        }
     }
 
     #[tokio::test]
