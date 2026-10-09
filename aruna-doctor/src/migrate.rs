@@ -9,6 +9,7 @@ use aruna::identity::PersistedNodeState;
 use aruna_core::NodeId;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, seal_bytes};
 use aruna_core::document::DocumentTarget;
+use aruna_core::federation::FederationSettings;
 use aruna_core::git::GitRecord;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, EVENT_LOG_KEYSPACE,
@@ -424,13 +425,15 @@ fn realm_configs(
 }
 
 /// Appends the trailing defaults an older row lacks, shortest suffix first, so
-/// a row missing only the newest value keeps the one it already has.
+/// a row missing only the newest value keeps the one it already has. Every older
+/// row also lacks the federation settings, which follow the timeouts.
 fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
+    let federation = postcard::to_allocvec(&None::<FederationSettings>).ok()?;
     let idle = postcard::to_allocvec(&IDLE_AFTER_MS).ok()?;
     let catch_up = postcard::to_allocvec(&CATCH_UP_MS).ok()?;
-    let mut both = catch_up;
-    both.extend_from_slice(&idle);
-    for suffix in [idle, both] {
+    let idle_on = [idle.as_slice(), &federation].concat();
+    let both = [catch_up.as_slice(), &idle_on].concat();
+    for suffix in [federation, idle_on, both] {
         let mut bytes = value.to_vec();
         bytes.extend_from_slice(&suffix);
         if RealmConfigDocument::from_bytes(&bytes).is_ok() {
@@ -800,22 +803,26 @@ mod tests {
 
     #[test]
     fn rewrites_realm_configs() {
-        // Legacy documents decode with defaults for catch-up and session idle timeouts.
-        // Current documents remain byte-identical.
+        // Legacy documents decode with defaults for catch-up and session idle timeouts and
+        // without federation settings. Current documents remain byte-identical.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         let document = RealmConfigDocument::new(REALM, Vec::new(), 3);
         let current = postcard::to_allocvec(&document).unwrap();
+        // Every legacy layout ends where the fields it lacks would start.
+        let federation = postcard::to_allocvec(&None::<super::FederationSettings>).unwrap();
         let idle = postcard::to_allocvec(&IDLE_AFTER_MS).unwrap();
         let catch_up = postcard::to_allocvec(&CATCH_UP_MS).unwrap();
-        let one_missing = current[..current.len() - idle.len()].to_vec();
-        let both_missing = current[..current.len() - idle.len() - catch_up.len()].to_vec();
+        let unfederated = current[..current.len() - federation.len()].to_vec();
+        let one_missing = unfederated[..unfederated.len() - idle.len()].to_vec();
+        let both_missing = one_missing[..one_missing.len() - catch_up.len()].to_vec();
         write(
             &path,
             REALM_CONFIG_KEYSPACE,
             vec![
                 (b"old", both_missing),
                 (b"newer", one_missing),
+                (b"main", unfederated),
                 (b"new", current.clone()),
             ],
         );
@@ -824,10 +831,11 @@ mod tests {
 
         assert_eq!(
             (output.realm_configs_scanned, output.realm_configs_rewritten),
-            (3, 2)
+            (4, 3)
         );
         let rows = read(&path, REALM_CONFIG_KEYSPACE);
         assert_eq!(rows[b"new".as_slice()], current);
+        assert_eq!(rows[b"main".as_slice()], current);
         let migrated = RealmConfigDocument::from_bytes(&rows[b"old".as_slice()]).unwrap();
         assert_eq!(migrated.compute.catch_up_ms, CATCH_UP_MS);
         assert_eq!(migrated.compute.session_idle_ms, IDLE_AFTER_MS);
