@@ -142,9 +142,10 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
 - Only the File entities named in `files` travel; every other one stays a reference by its web
   identifier with the original ARN as `identifier`. Encrypted files need an unlocked bucket key
   that the caller holds. Selected files must be stored on this node.
-- A selected file in an encrypting bucket whose key the caller does not hold now is refused
-  here with code `key_holder_required`. The export job checks each file again and fails with
-  the same message when the caller lost the key since.
+- A selected file whose copies on this node all need a bucket key that the caller does not hold
+  now is refused here with code `key_holder_required`; one copy the caller may read is enough.
+  The export job applies the same rule again and fails with the same message when no copy is
+  left that the caller may read.
 - Repeating the call for the same intent returns the same job with `created` false."#,
     request_body(
         content = FederatedExportRequest,
@@ -167,7 +168,7 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
             })),
         (status = 400, description = "A malformed document id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The intent or descriptor was refused (code `transfer_rejected`), READ or a policy denied the export (code `export_denied`), or the caller holds no key of a selected encrypted file's bucket (code `key_holder_required`)", body = ErrorResponse),
+        (status = 403, description = "The intent or descriptor was refused (code `transfer_rejected`), READ or a policy denied the export (code `export_denied`), or every copy of a selected file needs a bucket key the caller lacks (code `key_holder_required`)", body = ErrorResponse),
         (status = 404, description = "No such document on this node", body = ErrorResponse),
         (status = 409, description = "The caller's active RO-Crate job limit is reached", body = ErrorResponse),
         (status = 503, description = "The dataset crate could not be read for the key holder check", body = ErrorResponse)
@@ -197,12 +198,6 @@ pub async fn create_export(
     authorize_export(&context, &auth, path, audience, with_files)
         .await
         .map_err(grant_refused)?;
-    if with_files {
-        let limit = state.rocrate_limits().metadata_bytes;
-        check_holder(&context, &auth, document_id, &request.files, limit)
-            .await
-            .map_err(grant_refused)?;
-    }
     let digest = intent_digest(&request.intent)
         .map_err(|error| transfer_refused(TransferError::Signature(error)))?;
     let key = format!("federation-{digest}");
@@ -221,6 +216,11 @@ pub async fn create_export(
             intent_digest: digest,
         }),
     };
+    if with_files {
+        check_holder(&context, &spec, state.get_node_id())
+            .await
+            .map_err(grant_refused)?;
+    }
     let result = submit_export_job(&state.get_ctx(), spec, state.get_node_id(), Some(key))
         .await
         .map_err(map_submit_error)?;

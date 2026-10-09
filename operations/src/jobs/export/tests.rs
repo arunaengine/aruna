@@ -2666,29 +2666,6 @@ fn facts_need_selection() {
     assert!(checkpoint.export_facts(&files).is_none());
 }
 
-#[test]
-fn selected_file_buckets() {
-    // Only selected File entities name buckets, by an ARN of this realm or a storage location.
-    let realm_id = RealmId::from_bytes([2; 32]);
-    let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
-    let version = Ulid::from_bytes([4; 16]);
-    let arn = |bucket: &str| VersionedObjectArn::new(realm_id, node_id, bucket, "a.csv", version);
-    let (sealed, other) = (arn("sealed").unwrap(), arn("other").unwrap());
-    let located = stored_file(1, "s3://located/c.csv");
-    let document = crate_document(&[
-        json!({"@id": sealed.to_string(), "@type": "File"}),
-        json!({"@id": other.to_string(), "@type": "File"}),
-        located.clone(),
-    ]);
-    let files = [
-        sealed.to_string(),
-        located["@id"].as_str().unwrap().to_string(),
-    ];
-    let buckets = file_buckets(&document.to_string(), realm_id, &files).unwrap();
-    let expected = BTreeSet::from(["located".to_string(), "sealed".to_string()]);
-    assert_eq!(buckets, expected);
-}
-
 #[tokio::test]
 async fn selection_reads_locally() {
     // An export into another realm never reads a selected file through another node.
@@ -2886,5 +2863,50 @@ async fn unheld_copy_skipped() {
         probe_sources(&ctx, &spec, &mut checkpoint, &BTreeMap::new()).await,
         Err(ExportFailure::Permanent(message)) if message == refused.to_string()
     ));
+    node.net.shutdown().await;
+}
+
+#[tokio::test]
+async fn consent_resolves_hashes() {
+    // Consent resolves a file named only by its hash as the job does: one copy the caller may
+    // read is enough, and a file whose every copy needs a key the caller lacks is refused.
+    let (node, owner, viewer, candidates) = two_copies().await;
+    let node_id = node.net.node_id();
+    let hash = hex::encode(candidates[0].expected_blake3.unwrap());
+    let file = format!(
+        "{}{hash}",
+        aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX
+    );
+    let jsonld = crate_document(&[json!({"@id": file, "@type": "File", "name": "payload"})]);
+    let jsonld = jsonld.to_string();
+    let spec = |user_id| {
+        let mut spec = remote_spec(viewer.realm_id, user_id);
+        spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
+            files: vec![file.clone()],
+            audience: RealmId::from_bytes([138; 32]),
+            intent_digest: String::new(),
+        });
+        spec
+    };
+    let (viewing, owning) = (spec(viewer), spec(owner));
+    let unheld = unheld_bucket(&node.driver, &viewing, node_id, &jsonld).await;
+    assert_eq!(unheld, Ok(None));
+    encrypting_bucket(&node, "plain", Ulid::from_bytes([139; 16])).await;
+    let unheld = unheld_bucket(&node.driver, &viewing, node_id, &jsonld).await;
+    assert!(matches!(unheld, Ok(Some(bucket)) if bucket == "plain" || bucket == "remote"));
+    let unheld = unheld_bucket(&node.driver, &owning, node_id, &jsonld).await;
+    assert_eq!(unheld, Ok(None));
+    // A foreign user is refused like any non-holder, not with a storage failure.
+    let foreign = UserId::new(viewer.user_ulid, RealmId::from_bytes([140; 32]));
+    let mut foreign_spec = spec(viewer);
+    foreign_spec.auth_context.user_id = foreign;
+    let CandidateSource::Local {
+        location, bucket, ..
+    } = &candidates[0].source
+    else {
+        panic!("a local copy")
+    };
+    let allowed = holder_allows(node.driver.as_ref(), &foreign_spec, location, bucket, None).await;
+    assert!(matches!(allowed, Ok(false)));
     node.net.shutdown().await;
 }
