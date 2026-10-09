@@ -682,22 +682,79 @@ pub(crate) async fn crate_jsonld(
     }
 }
 
-/// The buckets that the File entities `files` of crate `jsonld` name by ARN or storage location.
-pub(crate) fn file_buckets(
+/// The bucket that refuses a selected file of crate `jsonld` at consent: the job's resolution
+/// finds copies of it on this node, and the holder rule refuses each of them.
+pub(crate) async fn unheld_bucket(
+    driver: &std::sync::Arc<DriverContext>,
+    spec: &ExportRoCrateSpec,
+    node_id: NodeId,
     jsonld: &str,
-    realm_id: RealmId,
-    files: &[String],
-) -> Result<BTreeSet<String>, String> {
+) -> Result<Option<String>, String> {
+    let failed = |error: ExportFailure| format!("{error:?}");
     let canonical = craqle::canonicalize_jsonld(jsonld).map_err(|error| error.to_string())?;
     let document: JsonValue = serde_json::from_str(jsonld).map_err(|error| error.to_string())?;
-    let entities = recognize_entities(&document, &canonical.nquads, realm_id)
-        .map_err(|error| format!("{error:?}"))?;
-    Ok(entities
-        .into_iter()
-        .filter(|entity| files.contains(&entity.entity_id))
-        .filter_map(|entity| entity.storage_key)
-        .map(|key| key.bucket)
-        .collect())
+    let realm_id = spec.auth_context.realm_id;
+    let mut entities =
+        recognize_entities(&document, &canonical.nquads, realm_id).map_err(failed)?;
+    let files = spec
+        .selection
+        .as_ref()
+        .map(|selection| &selection.files[..]);
+    entities.retain(|entity| files.unwrap_or_default().contains(&entity.entity_id));
+    let mut checkpoint = ExportCheckpoint {
+        entities,
+        ..Default::default()
+    };
+    // The resolution runs outside a job; it never reads the job id.
+    let ctx = JobContext {
+        driver: driver.clone(),
+        job_id: JobId::from_bytes([u8::MAX; 16]),
+        owner_node_id: node_id,
+        claim_token: Ulid::nil(),
+        final_attempt: false,
+        cancel: tokio_util::sync::CancellationToken::new(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        progress: super::executor::ProgressReporter::from_progress(
+            &aruna_core::structs::execution::job::JobProgress::new("entries"),
+        ),
+    };
+    resolve_entries(
+        &ctx,
+        spec,
+        &mut checkpoint,
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+        &mut BTreeSet::new(),
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+    )
+    .await
+    .map_err(failed)?;
+    for entity in &checkpoint.entities {
+        let mut unheld = None;
+        for candidate in &entity.candidates {
+            let CandidateSource::Local {
+                location, bucket, ..
+            } = &candidate.source
+            else {
+                continue;
+            };
+            if holder_allows(driver, spec, location, bucket, None)
+                .await
+                .map_err(failed)?
+            {
+                unheld = None;
+                break;
+            }
+            unheld.get_or_insert_with(|| bucket.clone());
+        }
+        if unheld.is_some() {
+            return Ok(unheld);
+        }
+    }
+    Ok(None)
 }
 
 /// The crate a dataset exports with its event and context digest: the raw revision, else a

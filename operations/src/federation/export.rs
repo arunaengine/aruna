@@ -3,16 +3,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::federation::{FederationError, Signed};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, FEDERATION_KEYSPACE, JOB_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{ExportSelection, JobId};
+use aruna_core::structs::execution::job::{ExportRoCrateSpec, ExportSelection, JobId};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
@@ -32,9 +33,9 @@ use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome};
-use crate::jobs::export::{ExportCheckpoint, crate_jsonld, file_buckets};
+use crate::jobs::export::{ExportCheckpoint, crate_jsonld, unheld_bucket};
 use crate::jobs::key_wake::read_row;
-use crate::replication::plaintext::{consent_required, is_holder};
+use crate::replication::plaintext::is_holder;
 
 pub const EXPORT_OPERATION: &str = "federation.export";
 
@@ -123,42 +124,22 @@ pub async fn authorize_export(
     .map_err(|_| GrantError::Denied)
 }
 
-/// Refuses a file export at consent when a selected file lies in an encrypting bucket whose key
-/// the caller does not hold now. The export job checks every file again when it reads it.
+/// Refuses a file export at consent when a selected file has copies on this node and each needs
+/// a bucket key the caller does not hold now. The export job applies the same rule.
 pub async fn check_holder(
     context: &Arc<DriverContext>,
-    auth: &AuthContext,
-    document_id: Ulid,
-    files: &[String],
-    metadata_bytes: u64,
+    spec: &ExportRoCrateSpec,
+    node_id: NodeId,
 ) -> Result<(), GrantError> {
-    let (jsonld, _) = crate_jsonld(context, auth, document_id, metadata_bytes)
+    let (auth, limit) = (&spec.auth_context, spec.limits.metadata_bytes);
+    let (jsonld, _) = crate_jsonld(context, auth, spec.document_id, limit)
         .await
         .map_err(|error| GrantError::Storage(error.to_string()))?;
-    let buckets = file_buckets(&jsonld, auth.realm_id, files).map_err(GrantError::Storage)?;
-    require_holder(context, auth.realm_id, &buckets, auth.user_id).await
-}
-
-/// Refuses `user` unless they hold the key of every bucket in `buckets` that needs one.
-async fn require_holder(
-    context: &DriverContext,
-    realm_id: RealmId,
-    buckets: &BTreeSet<String>,
-    user: UserId,
-) -> Result<(), GrantError> {
-    for bucket in buckets {
-        let encrypted = consent_required(context, bucket)
-            .await
-            .map_err(GrantError::Storage)?;
-        if encrypted
-            && !is_holder(context, realm_id, bucket, user)
-                .await
-                .map_err(GrantError::Storage)?
-        {
-            return Err(GrantError::NotHolder(bucket.clone()));
-        }
+    match unheld_bucket(context, spec, node_id, &jsonld).await {
+        Ok(None) => Ok(()),
+        Ok(Some(bucket)) => Err(GrantError::NotHolder(bucket)),
+        Err(error) => Err(GrantError::Storage(error)),
     }
-    Ok(())
 }
 
 /// Whether bucket key generation `key` is unlocked on this node.
@@ -698,27 +679,6 @@ mod tests {
         put(&context, config_space, config_key, config_bytes).await;
         let admitted = admit_grant(&context, local(), job(), &record.grant, NOW).await;
         assert_eq!(admitted, Err(GrantError::Denied));
-    }
-
-    #[tokio::test]
-    async fn consent_needs_holder() {
-        // A file export from an encrypting bucket is refused at consent for a non-holder.
-        use crate::replication::plaintext::tests::{bucket, user};
-        let (_dir, storage) = crate::tests::s3::test_storage();
-        let context = crate::tests::s3::test_context(storage);
-        bucket(&context).await;
-        let buckets = BTreeSet::from(["plain".to_string(), "sealed".to_string()]);
-        let realm = RealmId::from_bytes([3; 32]);
-        assert_eq!(
-            require_holder(&context, realm, &buckets, user(3)).await,
-            Ok(())
-        );
-        let refused = require_holder(&context, realm, &buckets, user(4)).await;
-        assert_eq!(refused, Err(GrantError::NotHolder("sealed".to_string())));
-        // A foreign user is refused like any non-holder, not with a storage failure.
-        let foreign = UserId::new(user(1).user_ulid, RealmId::from_bytes([9; 32]));
-        let refused = require_holder(&context, realm, &buckets, foreign).await;
-        assert_eq!(refused, Err(GrantError::NotHolder("sealed".to_string())));
     }
 
     #[tokio::test]
