@@ -618,30 +618,7 @@ pub(crate) mod tests {
         let mut moved = intent.clone();
         moved.destination.prefix = "elsewhere".to_string();
         assert!(!same_transfer(&stored, None, &moved, grant));
-        let mut upload = RoCrateUploadRecord {
-            upload_id: Ulid::from_bytes([9; 16]),
-            owner: principal(),
-            location: aruna_core::structs::storage::blob::BackendLocation {
-                backend: aruna_core::structs::storage::blob::BackendRef::node_default(),
-                storage_class: None,
-                root: "/data".to_string(),
-                storage_bucket: "storage".to_string(),
-                backend_path: "input".to_string(),
-                ulid: Ulid::nil(),
-                format: Default::default(),
-                created_by: principal(),
-                created_at: SystemTime::UNIX_EPOCH,
-                staging: false,
-                partial: false,
-                blob_size: 1,
-                hashes: Default::default(),
-            },
-            blake3: [0; 32],
-            size: grant.artifact_size,
-            media_type: aruna_core::structs::execution::job::RoCrateMediaType::Zip,
-            expires_at_ms: 0,
-            claimed_by: None,
-        };
+        let mut upload = upload(0);
         let mut matching = grant.clone();
         matching.artifact_blake3 = hex::encode([0; 32]);
         let mut bound = stored.clone();
@@ -755,19 +732,61 @@ pub(crate) mod tests {
         }
     }
 
+    /// Upload `[9; 16]` of the principal with the size of `record`'s grant.
+    fn upload(expires_at_ms: u64) -> RoCrateUploadRecord {
+        RoCrateUploadRecord {
+            upload_id: Ulid::from_bytes([9; 16]),
+            owner: principal(),
+            location: aruna_core::structs::storage::blob::BackendLocation {
+                backend: aruna_core::structs::storage::blob::BackendRef::node_default(),
+                storage_class: None,
+                root: "/data".to_string(),
+                storage_bucket: "storage".to_string(),
+                backend_path: "input".to_string(),
+                ulid: Ulid::nil(),
+                format: Default::default(),
+                created_by: principal(),
+                created_at: SystemTime::UNIX_EPOCH,
+                staging: false,
+                partial: false,
+                blob_size: 1,
+                hashes: Default::default(),
+            },
+            blake3: [0; 32],
+            size: record().grant.payload.artifact_size,
+            media_type: aruna_core::structs::execution::job::RoCrateMediaType::Zip,
+            expires_at_ms,
+            claimed_by: None,
+        }
+    }
+
     #[tokio::test]
     async fn racing_binding_checked() {
-        // The winner of a racing binding serves only the same transfer; another one is refused.
+        // The live winner of a racing binding serves only the same transfer; another one is
+        // refused. Once that upload is gone without an import job, a new upload replaces it.
         let (_dir, context) = context();
         let (first, second) = (Ulid::from_bytes([9; 16]), Ulid::from_bytes([10; 16]));
-        write_import(&context, "key", first, &record())
+        let live = upload(u64::MAX);
+        let storage = &context.storage_handle;
+        crate::jobs::import::write_rocrate_upload(storage, &live)
             .await
             .unwrap();
-        let same = write_import(&context, "key", second, &record()).await;
+        let mut record = record();
+        record.grant.payload.artifact_blake3 = hex::encode(live.blake3);
+        write_import(&context, "key", first, &record).await.unwrap();
+        let same = write_import(&context, "key", second, &record).await;
         assert_eq!(same, Ok(first));
-        let mut other = record();
+        let mut other = record.clone();
         other.grant.payload.artifact_size += 1;
         let conflict = write_import(&context, "key", second, &other).await;
         assert_eq!(conflict, Err(ImportError::Conflict));
+        let swept = StorageEffect::Delete {
+            key_space: aruna_core::keyspaces::ROCRATE_UPLOAD_KEYSPACE.to_string(),
+            key: first.to_bytes().to_vec().into(),
+            txn_id: None,
+        };
+        storage.send_storage_effect(swept).await;
+        let replaced = write_import(&context, "key", second, &record).await;
+        assert_eq!(replaced, Ok(second));
     }
 }
