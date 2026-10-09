@@ -430,7 +430,7 @@ binds the call to the portal that requested the intent.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the intent's principal, the intent or grant was refused (code `transfer_rejected`), WRITE or a policy denied the import (code `import_denied`), or the source refused the pull (code `source_refused`)", body = ErrorResponse),
         (status = 409, description = "The import key is bound to a different plan, or to another transfer, owner or artifact (code `import_conflict`)", body = ErrorResponse),
-        (status = 502, description = "The source realm could not be reached (code `pull_unreachable`) or sent another artifact (code `artifact_mismatch`)", body = ErrorResponse)
+        (status = 502, description = "The source realm could not be reached, failed or was busy (code `pull_unreachable`) or sent another artifact (code `artifact_mismatch`)", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
