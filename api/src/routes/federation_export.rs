@@ -142,8 +142,8 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
     request_body(
         content = FederatedExportRequest,
         example = json!({
-            "descriptor": { "payload": { "realm_id": "<destination realm id>", "name": "B", "description": "", "api_url": "https://b.example.org/api/v1", "portal_url": "https://b.example.org/", "issued_at": 1791000000 }, "signer": "Realm", "signature": "<hex>" },
-            "intent": { "payload": { "realm_id": "<destination realm id>", "descriptor_digest": "<hex>", "principal": "<user id>", "destination": { "group_id": "<group id>", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run" }, "max_bytes": 1073741824, "nonce": "<hex>", "issued_at": 1791000000, "expires_at": 1791086400, "intent_id": "<ulid>" }, "signer": "Realm", "signature": "<hex>" },
+            "descriptor": { "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "name": "B", "description": "", "api_url": "https://b.example.org/api/v1", "portal_url": "https://b.example.org/", "issued_at": 1791000000 }, "signer": "Realm", "signature": "<hex>" },
+            "intent": { "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "descriptor_digest": "<hex>", "principal": { "user_ulid": "01JDNA0123456789ABCDEFGHJK", "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "destination": { "group_id": "<group id>", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run" }, "max_bytes": 1073741824, "nonce": "<hex>", "issued_at": 1791000000, "expires_at": 1791086400, "intent_id": "<ulid>" }, "signer": "Realm", "signature": "<hex>" },
             "document_id": "01JDOC0123456789ABCDEFGHJK",
             "files": ["data/reads.fastq"]
         })
@@ -268,7 +268,7 @@ that owns the job.
     params(("job_id" = String, Path, description = "Export job id")),
     responses(
         (status = 200, description = "The signed export grant", body = serde_json::Value,
-            example = json!({ "payload": { "source": "<source realm id>", "audience": "<destination realm id>", "intent_digest": "<hex>", "export_job_id": "<ulid>", "document_id": "<ulid>", "source_revision": "<ulid>", "dataset_digest": "<hex>", "selection_digest": "<hex>", "artifact_url": "https://a.example.org/api/v1/compute/jobs/<job id>/artifacts/rocrate", "artifact_blake3": "<hex>", "artifact_size": 2048, "issued_at": 1791000000, "expires_at": 1791086400 }, "signer": "Realm", "signature": "<hex>" })),
+            example = json!({ "payload": { "source": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], "audience": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "intent_digest": "<hex>", "export_job_id": "<ulid>", "document_id": "<ulid>", "source_revision": "<ulid>", "dataset_digest": "<hex>", "selection_digest": "<hex>", "artifact_url": "https://a.example.org/api/v1/compute/jobs/<job id>/artifacts/rocrate", "artifact_blake3": "<hex>", "artifact_size": 2048, "issued_at": 1791000000, "expires_at": 1791086400 }, "signer": "Realm", "signature": "<hex>" })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The export is no longer allowed (code `export_denied`) or its grant expired (code `transfer_rejected`)", body = ErrorResponse),
         (status = 404, description = "No such export into another realm of the caller on this node", body = ErrorResponse),
@@ -369,8 +369,8 @@ that owns the job.
     request_body(
         content = PushExportRequest,
         example = json!({
-            "descriptor": { "payload": { "realm_id": "<destination realm id>", "name": "B", "description": "", "api_url": "https://b.example.org/api/v1", "portal_url": "https://b.example.org/", "issued_at": 1791000000 }, "signer": "Realm", "signature": "<hex>" },
-            "intent": { "payload": { "realm_id": "<destination realm id>", "descriptor_digest": "<hex>", "principal": "<user id>", "destination": { "group_id": "<group id>", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run" }, "max_bytes": 1073741824, "nonce": "<hex>", "issued_at": 1791000000, "expires_at": 1791086400, "intent_id": "<ulid>" }, "signer": "Realm", "signature": "<hex>" }
+            "descriptor": { "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "name": "B", "description": "", "api_url": "https://b.example.org/api/v1", "portal_url": "https://b.example.org/", "issued_at": 1791000000 }, "signer": "Realm", "signature": "<hex>" },
+            "intent": { "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "descriptor_digest": "<hex>", "principal": { "user_ulid": "01JDNA0123456789ABCDEFGHJK", "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "destination": { "group_id": "<group id>", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run" }, "max_bytes": 1073741824, "nonce": "<hex>", "issued_at": 1791000000, "expires_at": 1791086400, "intent_id": "<ulid>" }, "signer": "Realm", "signature": "<hex>" }
         })
     ),
     responses(

@@ -340,7 +340,7 @@ async fn pull_artifact(
     ),
     responses(
         (status = 200, description = "The signed import intent", body = serde_json::Value,
-            example = json!({ "payload": { "realm_id": "<this realm id>", "descriptor_digest": "<hex>", "principal": "<user id>", "destination": { "group_id": "01JGROUP0123456789ABCDEFGH", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run" }, "max_bytes": 1073741824, "nonce": "<hex>", "issued_at": 1791000000, "expires_at": 1791086400, "intent_id": "01JINTENT0123456789ABCDEFG" }, "signer": "Realm", "signature": "<hex>" })),
+            example = json!({ "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "descriptor_digest": "<hex>", "principal": { "user_ulid": "01JDNA0123456789ABCDEFGHJK", "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "destination": { "group_id": "01JGROUP0123456789ABCDEFGH", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run" }, "max_bytes": 1073741824, "nonce": "<hex>", "issued_at": 1791000000, "expires_at": 1791086400, "intent_id": "01JINTENT0123456789ABCDEFG" }, "signer": "Realm", "signature": "<hex>" })),
         (status = 400, description = "A malformed nonce, id, bucket, prefix or path", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "WRITE or a policy denied the import (code `import_denied`), or federation is not set up (code `federation_disabled`)", body = ErrorResponse),
@@ -421,7 +421,7 @@ binds the call to the portal that requested the intent.
   different plan for the same key is a 409. Existing keys are never overwritten."#,
     request_body(
         content = FederatedImportRequest,
-        example = json!({ "intent": { "payload": { "realm_id": "<this realm id>" }, "signer": "Realm", "signature": "<hex>" }, "grant": { "payload": { "source": "<source realm id>" }, "signer": "Realm", "signature": "<hex>" }, "secret": "<hex of the 32 byte browser secret>" })
+        example = json!({ "intent": { "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "signer": "Realm", "signature": "<hex>" }, "grant": { "payload": { "source": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7] }, "signer": "Realm", "signature": "<hex>" }, "secret": "<hex of the 32 byte browser secret>" })
     ),
     responses(
         (status = 202, description = "The import job is recorded", body = SubmitImportResponse,

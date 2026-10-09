@@ -124,7 +124,7 @@ sessions and other session kinds are refused, so a login cannot chain to a third
         example = json!({
             "descriptor": {
             "payload": {
-                "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
                 "name": "Serving realm",
                 "description": "",
                 "api_url": "https://b.example.org/api/v1",
@@ -141,9 +141,9 @@ sessions and other session kinds are refused, so a login cannot chain to a third
         (status = 200, description = "The signed login handoff", body = serde_json::Value,
             example = json!({
         "payload": {
-            "issuer": "<home realm id>",
-            "user": "01JCNCTR0123456789ABCDEFGH@<home realm id>",
-            "audience": "<serving realm id>",
+            "issuer": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+            "user": { "user_ulid": "01JCNCTR0123456789ABCDEFGH", "realm_id": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7] },
+            "audience": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
             "descriptor_digest": "<hex sha256 of the serving descriptor>",
             "nonce": "<hex sha256 of the browser secret>",
             "name": "Ada Lovelace",
@@ -219,9 +219,9 @@ pub async fn create_login_handoff(
         example = json!({
             "handoff": {
             "payload": {
-                "issuer": "<home realm id>",
-                "user": "01JCNCTR0123456789ABCDEFGH@<home realm id>",
-                "audience": "<serving realm id>",
+                "issuer": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+                "user": { "user_ulid": "01JCNCTR0123456789ABCDEFGH", "realm_id": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7] },
+                "audience": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
                 "descriptor_digest": "<hex sha256 of the serving descriptor>",
                 "nonce": "<hex sha256 of the browser secret>",
                 "name": "Ada Lovelace",

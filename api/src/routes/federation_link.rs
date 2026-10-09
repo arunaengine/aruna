@@ -126,11 +126,11 @@ A provider token without `auth_time` and child sessions give none and are refuse
   Show both identities to the user before calling the link route."#,
     request_body(
         content = LinkConfirmationRequest,
-        example = json!({ "handoff": { "payload": { "issuer": "<home realm id>", "user": "<user id of the other realm>" }, "signer": "Realm", "signature": "<hex>" }, "secret": "<hex of the 32 byte browser secret>" })
+        example = json!({ "handoff": { "payload": { "issuer": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], "user": { "user_ulid": "01JCNCTR0123456789ABCDEFGH", "realm_id": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7] } }, "signer": "Realm", "signature": "<hex>" }, "secret": "<hex of the 32 byte browser secret>" })
     ),
     responses(
         (status = 200, description = "The signed link confirmation", body = serde_json::Value,
-            example = json!({ "payload": { "realm_id": "<this realm id>", "action": "Link", "local_user": "<local user id>", "foreign_user": "<user id of the other realm>", "foreign_issued_at": 1791000000, "issued_at": 1791000010, "expires_at": 1791000310, "confirmation_id": "01JLINK0123456789ABCDEFGHJ" }, "signer": "Realm", "signature": "<hex>" })),
+            example = json!({ "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "action": "Link", "local_user": { "user_ulid": "01JDNA0123456789ABCDEFGHJK", "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "foreign_user": { "user_ulid": "01JCNCTR0123456789ABCDEFGH", "realm_id": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7] }, "foreign_issued_at": 1791000000, "issued_at": 1791000010, "expires_at": 1791000310, "confirmation_id": "01JLINK0123456789ABCDEFGHJ" }, "signer": "Realm", "signature": "<hex>" })),
         (status = 400, description = "A malformed secret", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A login is too old, of the wrong kind, of an inactive or service account, or a handoff is invalid, not bound to this attempt, or of a realm no longer admitted (code `link_refused`)", body = ErrorResponse)
@@ -184,7 +184,7 @@ account the confirmation names.
 - Linking never merges accounts and changes nothing at the other realm."#,
     request_body(
         content = LinkRequest,
-        example = json!({ "confirmation": { "payload": { "realm_id": "<this realm id>" }, "signer": "Realm", "signature": "<hex>" } })
+        example = json!({ "confirmation": { "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "signer": "Realm", "signature": "<hex>" } })
     ),
     responses(
         (status = 200, description = "The account with its linked logins", body = LinkedLoginsResponse,
