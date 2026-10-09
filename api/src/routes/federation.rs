@@ -216,7 +216,7 @@ management node serves the call and signs the descriptor; every other node relay
                 "accepted_realms": {"mode": "any"},
                 "descriptor": {
                     "payload": {
-                        "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                        "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
                         "name": "Example realm",
                         "description": "",
                         "api_url": "https://api.example.org/api/v1",
@@ -332,7 +332,7 @@ fn map_federation_error(error: SetFederationError) -> ServerError {
         (status = 200, description = "The signed realm descriptor", body = Value,
             example = json!({
                 "payload": {
-                    "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                    "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
                     "name": "Example realm",
                     "description": "",
                     "api_url": "https://api.example.org/api/v1",
