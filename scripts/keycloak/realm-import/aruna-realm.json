@@ -32,7 +32,8 @@
       "defaultClientScopes": [
         "profile",
         "email",
-        "roles"
+        "roles",
+        "basic"
       ],
       "optionalClientScopes": [
         "address",
