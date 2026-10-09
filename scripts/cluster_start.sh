@@ -30,6 +30,8 @@ PORTAL_DIR="${ARUNA_TEST_DEPLOY_PORTAL_DIR:-}"
 EXTRA_ORIGINS="${ARUNA_TEST_DEPLOY_EXTRA_ORIGINS:-}"
 CA_FILE="${ARUNA_TEST_DEPLOY_CA_FILE:-}"
 API_PUBLIC_URLS="${ARUNA_TEST_DEPLOY_API_PUBLIC_URLS:-}"
+# Empty by default, so local nodes never register with the global registry.
+REGISTRY_URL="${ARUNA_TEST_DEPLOY_REGISTRY_URL:-}"
 PORTAL_CORS_ORIGINS=""
 COMPUTE_EXECUTOR="${ARUNA_TEST_DEPLOY_COMPUTE_EXECUTOR:-docker}"
 # Containers must reach the host's S3 listener; loopback endpoints are rejected
@@ -113,6 +115,7 @@ Environment overrides:
   ARUNA_TEST_DEPLOY_EXTRA_ORIGINS      more comma-separated origins for CORS and the portal CSP
   ARUNA_TEST_DEPLOY_CA_FILE            PEM bundle the nodes trust for outgoing TLS
   ARUNA_TEST_DEPLOY_API_PUBLIC_URLS    comma-separated published API URLs in node order
+  ARUNA_TEST_DEPLOY_REGISTRY_URL       registry of the nodes; empty by default, so none registers
   ARUNA_TEST_DEPLOY_COMPUTE_EXECUTOR   docker (default) | apptainer | kubernetes | none
                                        docker and none are turnkey; apptainer and
                                        kubernetes need the vars below.
@@ -348,6 +351,7 @@ write_node_env() {
       printf 'S3_ADDRESS=127.0.0.1:%s\n' "$s3_port"
     fi
     printf 'REALM_DESCRIPTION=Test_Deploy_Realm\n'
+    printf 'FEDERATION_REGISTRY_URL=%s\n' "$(env_quote "$REGISTRY_URL")"
     printf 'METADATA_REPLICATION_FACTOR=3\n'
     if [[ -n "$PORTAL_DIR" ]]; then
       printf 'PORTAL_MODE=artifact\n'

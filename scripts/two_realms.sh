@@ -42,6 +42,7 @@ Usage: bash scripts/two_realms.sh start | stop
   start  Start realm A (public, 1 node), realm B (private, 2 nodes), each with its own
          Keycloak, and one aruna-registry. Needs release binaries and a built portal in
          ARUNA_TEST_DEPLOY_PORTAL_DIR. Federation settings are left to the real routes.
+         Both realms name the local registry as their default registry.
   stop   Stop both realms, their Keycloak projects, the registry and the TLS proxy.
 
 Reachability:
@@ -180,6 +181,7 @@ start_realm() {
     export ARUNA_TEST_DEPLOY_EXTRA_ORIGINS="$extra_origins"
     export ARUNA_TEST_DEPLOY_CA_FILE="$DEPLOY_ROOT/ca-bundle.pem"
     export ARUNA_TEST_DEPLOY_API_PUBLIC_URLS="$api_urls"
+    export ARUNA_TEST_DEPLOY_REGISTRY_URL="https://$PUBLIC_IP:$((PUBLIC_PORT + 1))"
     while IFS= read -r setting; do
       export "${setting?}"
     done < <(realm_env "$realm")
