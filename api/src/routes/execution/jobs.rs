@@ -3,9 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::ops::Range;
 use std::sync::Arc;
 
+use aruna_core::NodeId;
 use aruna_core::structs::execution::job::{
     CompositionError, ExportReportRow, ImportReportRow, JobId, JobRecord, JobState, KeyWait,
     SYSTEM_ENTRY_PREFIX,
@@ -23,10 +25,11 @@ use aruna_operations::jobs::lifecycle::{FamilyReport, family_report};
 use aruna_operations::jobs::service::{
     ArtifactLookup, JobKind, JobReportLookup, JobStatusView, OwnedArtifact, RoutedCancelOutcome,
     cancel_job_routed, delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed,
-    read_report_routed,
+    read_report_routed, resolve_job_owner,
 };
 use aruna_operations::jobs::store::RunDelete;
 use aruna_operations::jobs::{JobRouteError, REPORT_MAX_ROWS};
+use aruna_operations::node::node_info::read_info_documents;
 use aruna_operations::s3::object::get::ObjectRangeRequest;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -50,7 +53,7 @@ use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::{JobRequestError, admit_execution, hex32};
 use crate::rate_limit::LocalKey;
-use crate::server::state::ServerState;
+use crate::server::state::{RestInterfaceRuntime, ServerState};
 
 const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 200;
@@ -671,6 +674,10 @@ pub struct JobStatusResponse {
     /// `{node_id, bucket, group_id?}` objects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub awaiting_keys: Vec<serde_json::Value>,
+    /// Api url of the node that owns an owner-routed job, as its submission named it.
+    /// Absent for a distributed execution job and when this node does not know the url.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_node_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -721,6 +728,7 @@ pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
             .iter()
             .map(KeyWait::to_public_json)
             .collect(),
+        owner_node_url: None,
     }
 }
 
@@ -1363,7 +1371,10 @@ the link's group, who may manage the link.
   still caught up on.
 - A target that already runs, or already ran successfully, an execution of the family declines a
   second launch, so one node never runs the same request twice.
-- `run_crate` reports a side obligation of jobs that owe a run crate, not the job itself."#,
+- `run_crate` reports a side obligation of jobs that owe a run crate, not the job itself.
+- `owner_node_url` names the api url of the node that owns an owner-routed job, the same value
+  its submission returned. Calls that act on the job's node-local records go there. It is absent
+  for a distributed execution job and when this node does not know the owner's url."#,
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID; an unparseable id is 404")),
     responses(
         (
@@ -1517,7 +1528,35 @@ pub async fn get_job(
         .map_err(map_job_route)?;
     let mut response = job_view_response(&routed.job);
     response.run_crate = routed.run_crate;
+    response.owner_node_url = owner_url(&state, job_id).await;
     Ok((StatusCode::OK, Json(response)))
+}
+
+/// The `owner_node_url` of `job_urls` on the node that owns `job_id`, if known here.
+async fn owner_url(state: &ServerState, job_id: JobId) -> Option<String> {
+    let ctx = state.get_ctx();
+    // Without a network every routed read is answered by this node.
+    let owner = match ctx.net_handle {
+        Some(_) => resolve_job_owner(&ctx, job_id).await.ok()?,
+        None => state.get_node_id(),
+    };
+    node_url(state, owner, job_id).await
+}
+
+async fn node_url(state: &ServerState, node_id: NodeId, job_id: JobId) -> Option<String> {
+    if node_id == state.get_node_id() {
+        return job_urls(state, job_id)
+            .await
+            .ok()
+            .map(|urls| urls.owner_node_url);
+    }
+    let documents = read_info_documents(&state.get_ctx(), &[node_id])
+        .await
+        .ok()?;
+    let published = documents.get(&node_id)?.urls.api.clone()?;
+    // The owner derives its url from this published one, which is absolute, so no address is used.
+    let unused = SocketAddr::from(([0, 0, 0, 0], 0));
+    Some(RestInterfaceRuntime::from_bind_address(unused, Some(&published)).api_base_url)
 }
 
 pub(crate) fn coded_response(status: StatusCode, error: &str, code: &str) -> Response {

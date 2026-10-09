@@ -804,6 +804,92 @@ async fn urls_are_absolute() {
 }
 
 #[tokio::test]
+async fn names_owner_url() {
+    // A job this node owns names the url its submission returned.
+    let (_dir, state) = build_state().await;
+    state
+        .register_rest_public(
+            "127.0.0.1:3000".parse().unwrap(),
+            Some("https://owner.example/"),
+        )
+        .await;
+    let owner = user(2);
+    let job_id = JobId::from_bytes([14u8; 16]);
+    insert_job(
+        &state.get_ctx().storage_handle,
+        &job_for(job_id, owner, 1000),
+    )
+    .await
+    .unwrap();
+
+    let (_, Json(response)) = get_job(
+        State(state.clone()),
+        Extension(auth_for(owner)),
+        Extension(None),
+        Path(job_id.to_string()),
+    )
+    .await
+    .unwrap();
+    let urls = job_urls(&state, job_id).await.unwrap();
+    assert_eq!(response.owner_node_url, Some(urls.owner_node_url));
+}
+
+#[tokio::test]
+async fn remote_owner_url() {
+    // Another owner's url comes from its published api url, as that owner derives it.
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+    use aruna_core::structs::storage::node_info::{
+        AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
+    };
+
+    let (_dir, state) = build_state().await;
+    let other = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+    let job_id = JobId::from_bytes([15u8; 16]);
+    assert_eq!(node_url(&state, other, job_id).await, None);
+
+    let document = NodeInfoDocument {
+        node_id: other,
+        executors: Vec::new(),
+        labels: Default::default(),
+        urls: NodeUrls {
+            api: Some("https://other.example/".to_string()),
+            s3: None,
+        },
+        utilization: NodeUtilization {
+            storage_bytes_used: 0,
+            documents_held: None,
+            load_permille: None,
+            heartbeat_at_ms: 1_700_000_000_000,
+        },
+        updated_at_ms: 1_700_000_000_500,
+        epoch: AdvertisementEpoch {
+            membership_generation: 1,
+            publisher_generation: 1,
+            observed_at_ms: 1_700_000_000_500,
+        },
+        compute_draining: false,
+        leaving: false,
+        demand: Default::default(),
+        reservation: Default::default(),
+    };
+    state
+        .get_ctx()
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: NODE_INFO_KEYSPACE.to_string(),
+            key: node_info_key(other).into(),
+            value: document.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    assert_eq!(
+        node_url(&state, other, job_id).await.as_deref(),
+        Some("https://other.example/api/v1")
+    );
+}
+
+#[tokio::test]
 async fn foreign_not_found() {
     let (_dir, state) = build_state().await;
     let job_id = JobId::from_bytes([9u8; 16]);
