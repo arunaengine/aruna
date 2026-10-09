@@ -1974,9 +1974,14 @@ async fn open_local_txn(
     // An export into another realm reads encrypted files only for a current key holder.
     if lease.is_some()
         && spec.selection.is_some()
-        && !crate::replication::plaintext::is_holder(driver, bucket, spec.auth_context.user_id)
-            .await
-            .map_err(ExportFailure::Retryable)?
+        && !crate::replication::plaintext::is_holder(
+            driver,
+            spec.auth_context.realm_id,
+            bucket,
+            spec.auth_context.user_id,
+        )
+        .await
+        .map_err(ExportFailure::Retryable)?
     {
         let refused = crate::federation::export::GrantError::NotHolder(bucket.to_string());
         return Err(ExportFailure::Permanent(refused.to_string()));

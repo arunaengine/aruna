@@ -136,12 +136,13 @@ pub async fn check_holder(
         .await
         .map_err(|error| GrantError::Storage(error.to_string()))?;
     let buckets = file_buckets(&jsonld, auth.realm_id, files).map_err(GrantError::Storage)?;
-    require_holder(context, &buckets, auth.user_id).await
+    require_holder(context, auth.realm_id, &buckets, auth.user_id).await
 }
 
 /// Refuses `user` unless they hold the key of every bucket in `buckets` that needs one.
 async fn require_holder(
     context: &DriverContext,
+    realm_id: RealmId,
     buckets: &BTreeSet<String>,
     user: UserId,
 ) -> Result<(), GrantError> {
@@ -150,7 +151,7 @@ async fn require_holder(
             .await
             .map_err(GrantError::Storage)?;
         if encrypted
-            && !is_holder(context, bucket, user)
+            && !is_holder(context, realm_id, bucket, user)
                 .await
                 .map_err(GrantError::Storage)?
         {
@@ -213,7 +214,7 @@ async fn recheck(
             return Err(GrantError::Denied);
         }
         if let Some(key) = source.key_ref {
-            let holder = is_holder(context, &source.bucket, auth.user_id)
+            let holder = is_holder(context, auth.realm_id, &source.bucket, auth.user_id)
                 .await
                 .map_err(GrantError::Storage)?;
             if !holder || !unlocked(context, key).await? {
@@ -707,8 +708,16 @@ mod tests {
         let context = crate::tests::s3::test_context(storage);
         bucket(&context).await;
         let buckets = BTreeSet::from(["plain".to_string(), "sealed".to_string()]);
-        assert_eq!(require_holder(&context, &buckets, user(3)).await, Ok(()));
-        let refused = require_holder(&context, &buckets, user(4)).await;
+        let realm = RealmId::from_bytes([3; 32]);
+        assert_eq!(
+            require_holder(&context, realm, &buckets, user(3)).await,
+            Ok(())
+        );
+        let refused = require_holder(&context, realm, &buckets, user(4)).await;
+        assert_eq!(refused, Err(GrantError::NotHolder("sealed".to_string())));
+        // A foreign user is refused like any non-holder, not with a storage failure.
+        let foreign = UserId::new(user(1).user_ulid, RealmId::from_bytes([9; 32]));
+        let refused = require_holder(&context, realm, &buckets, foreign).await;
         assert_eq!(refused, Err(GrantError::NotHolder("sealed".to_string())));
     }
 
