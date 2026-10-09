@@ -137,7 +137,7 @@ pub async fn realm_token_revoked(
 
 /// The user's cutoff in the realm's replicated revocation set, read like the token revocation.
 /// The local account `via` is linked to: exactly one claim, by an active account that still
-/// lists the link.
+/// lists the link without a second login of that realm.
 pub async fn realm_linked_owner(
     storage: &StorageHandle,
     via: &UserId,
@@ -166,7 +166,7 @@ pub async fn realm_linked_owner(
         .transpose()
         .map_err(|_| ArunaBearerError::RevocationUnavailable)?;
     Ok(user
-        .filter(|user| !user.is_deactivated() && user.alias_user_ids.contains(via))
+        .filter(|user| !user.is_deactivated() && user.linked_login(via))
         .map(|_| owner))
 }
 

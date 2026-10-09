@@ -498,3 +498,49 @@ async fn local_change_kept() {
     assert_eq!(stored.name, "Renamed");
     assert!(!stored.alias_user_ids.contains(&foreign));
 }
+
+#[tokio::test]
+async fn two_origin_links() {
+    // Two nodes linking two logins of one home realm leave both unusable until one is removed.
+    use aruna_core::link::{alias_claims_key, alias_owner};
+    let (_dir, storage) = test_storage();
+    let realm = federated_realm(&storage).await;
+    let (realm_id, owner) = (realm.realm_id, realm.owner.user_id);
+    let home = realm.foreign.user_id.realm_id;
+    let (first, second) = (
+        UserId::new(Ulid::from_parts(715, 1), home),
+        UserId::new(Ulid::from_parts(715, 2), home),
+    );
+    let other_node = Actor {
+        node_id: realm.foreign.node_id,
+        ..realm.owner.clone()
+    };
+    let user = AdminDocumentTarget::User { user_id: owner };
+    let alias = |actor: &Actor, seq: u64, op: AdminDocumentOperation| {
+        realm.event(actor, seq, user.clone(), op)
+    };
+    for (actor, login) in [(&realm.owner, first), (&other_node, second)] {
+        let op = AdminDocumentOperation::UserAliasAdded { alias: login };
+        let outcome = receive(&storage, realm_id, alias(actor, 1, op)).await;
+        assert_eq!(outcome, AdminEventValidation::Accepted);
+    }
+    let stored = || async {
+        let target = DocumentTarget::User { user_id: owner };
+        let key = target.storage_key();
+        let row = storage_read_from(&storage, target.storage_keyspace().to_string(), key).await;
+        User::from_bytes(&row.unwrap().unwrap()).unwrap()
+    };
+    let linked = stored().await;
+    assert!(!linked.linked_login(&first) && !linked.linked_login(&second));
+    for login in [first, second] {
+        let key = alias_claims_key(&login).into();
+        let row = storage_read_from(&storage, FEDERATION_KEYSPACE.to_string(), key).await;
+        let claims = postcard::from_bytes::<BTreeSet<UserId>>(&row.unwrap().unwrap()).unwrap();
+        assert_eq!(alias_owner(&claims), Some(owner));
+    }
+    let op = AdminDocumentOperation::UserAliasRemoved { alias: second };
+    let outcome = receive(&storage, realm_id, alias(&other_node, 2, op)).await;
+    assert_eq!(outcome, AdminEventValidation::Accepted);
+    let resolved = stored().await;
+    assert!(resolved.linked_login(&first) && !resolved.linked_login(&second));
+}
