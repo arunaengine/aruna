@@ -1295,6 +1295,32 @@ async fn federation_preconditions() {
     assert_eq!(headers[header::ETAG], second[header::ETAG]);
 }
 
+#[tokio::test]
+async fn federation_no_config() {
+    // Without a realm config the policy check cannot load, so the answer is 503, not 403.
+    let (state, _tempdir) = setup_state().await;
+    let realm_id = state.get_realm_id();
+    let auth = admin_auth(realm_id, UserId::local(Ulid::generate(), realm_id));
+    let missing = |result: Result<_, ServerError>| match result {
+        Err(ServerError::Refused(status, code, _)) => (status, code),
+        other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+    };
+    let expected = (StatusCode::SERVICE_UNAVAILABLE, "realm_config_missing");
+
+    let read = get_realm_federation(State(state.clone()), Extension(Some(auth.clone()))).await;
+    assert_eq!(missing(read), expected);
+    let write = set_realm_federation(
+        State(state.clone()),
+        Extension(Some(auth)),
+        first_setup(),
+        Json(federation_body("Realm")),
+    )
+    .await;
+    assert_eq!(missing(write), expected);
+    let anonymous = get_realm_federation(State(state), Extension(None)).await;
+    assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
+}
+
 /// Anonymous callers keep what they need to authenticate; realm topology,
 /// discovery and quota policy need a token of this realm.
 #[tokio::test]
