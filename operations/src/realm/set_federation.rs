@@ -39,8 +39,8 @@ use crate::sync::document_outbox::{
 pub struct SetFederationConfig {
     pub actor: Actor,
     /// The caller's own token context, so a path-restricted credential stays
-    /// restricted; it is never derived from `actor`.
-    pub auth_context: AuthContext,
+    /// restricted; it is never derived from `actor`. `None` when the node itself acts.
+    pub auth_context: Option<AuthContext>,
     /// Signs the descriptor; only a management node passes the node check.
     pub node_capabilities: NodeCapabilities,
     pub name: String,
@@ -329,13 +329,19 @@ impl Operation for SetFederationOperation {
     type Error = SetFederationError;
 
     fn start(&mut self) -> Effects {
-        if self.config.auth_context.realm_id != self.config.actor.realm_id {
+        let Some(auth_context) = self.config.auth_context.clone() else {
+            self.state = SetFederationState::StartTransaction;
+            return smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })];
+        };
+        if auth_context.realm_id != self.config.actor.realm_id {
             return self.fail(SetFederationError::Unauthorized);
         }
         self.state = SetFederationState::Auth;
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.config.auth_context.clone(),
+                auth_context,
                 path: policy_admin_path(self.config.actor.realm_id),
                 required_permission: Permission::WRITE,
             }),
@@ -563,12 +569,12 @@ mod tests {
     fn request(actor: &Actor, api_url: &str) -> SetFederationConfig {
         SetFederationConfig {
             actor: actor.clone(),
-            auth_context: AuthContext {
+            auth_context: Some(AuthContext {
                 user_id: actor.user_id,
                 realm_id: actor.realm_id,
                 path_restrictions: None,
                 session: None,
-            },
+            }),
             node_capabilities: NodeCapabilities::management_node(realm_key()).unwrap(),
             name: "Realm".to_string(),
             api_url: Url::parse(api_url).unwrap(),
@@ -725,6 +731,31 @@ mod tests {
             .expect_err("a write on older settings is refused");
         assert_eq!(error, SetFederationError::SettingsChanged);
         assert_eq!(stored(&ctx, &actor).await, Some(second));
+    }
+
+    #[tokio::test]
+    async fn node_creates_once() {
+        // The node needs no token, and stored settings stay, also a cleared URL and a disabled mode.
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        let actor = actor();
+        seed(&ctx, &actor, RealmNodeKind::Management, false).await;
+        let mut config = request(&actor, "https://api.example.org");
+        config.auth_context = None;
+        config.registration = RegistrationMode::Disabled;
+        drive(SetFederationOperation::new(config.clone()), &ctx)
+            .await
+            .expect("the node stores the first settings");
+        let first = stored(&ctx, &actor).await.expect("settings stored");
+        assert_eq!(first.descriptor.verify(&actor.realm_id), Ok(()));
+
+        config.registry_url = Some(Url::parse("https://registry.example.org").unwrap());
+        config.registration = RegistrationMode::Enabled;
+        let error = drive(SetFederationOperation::new(config), &ctx)
+            .await
+            .expect_err("stored settings are never replaced");
+        assert_eq!(error, SetFederationError::SettingsChanged);
+        assert_eq!(stored(&ctx, &actor).await, Some(first));
     }
 
     #[tokio::test]
