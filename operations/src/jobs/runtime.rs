@@ -1700,6 +1700,38 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn final_panic_retry() {
+        let (_dir, storage) = temp_storage();
+        let driver = context(storage.clone());
+        let job_id = JobId::from_bytes([0x4C; 16]);
+        let token = Ulid::generate();
+        let mut record = probe_record(job_id, 1, 0, None);
+        record.state = JobState::Running;
+        record.attempts = JOB_MAX_ATTEMPTS - 1;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: token,
+            lease_expires_ms: 60_000,
+        });
+        insert_job(&storage, &record).await.unwrap();
+        let ctx = JobContext {
+            driver,
+            job_id,
+            owner_node_id: record.owner_node_id,
+            claim_token: token,
+            final_attempt: true,
+            cancel: CancellationToken::new(),
+            shutdown: CancellationToken::new(),
+            progress: ProgressReporter::from_progress(&record.progress),
+        };
+
+        let JobRunOutcome::Failed(error) = handle_panic(&ctx, &record).await else {
+            panic!("panic outcome must fail");
+        };
+        assert_eq!(error.kind, JobErrorKind::Retryable);
+    }
+
     // A zombie execution's finish must not evict the newer execution that replaced it.
     #[tokio::test]
     async fn zombie_keeps_survivor() {
