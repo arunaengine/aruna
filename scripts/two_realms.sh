@@ -213,6 +213,9 @@ start() {
   assert_free "$REGISTRY_PORT" "$((PUBLIC_PORT + 1))" "$((PUBLIC_PORT + 2))" "$((PUBLIC_PORT + 3))"
   rm -rf "$DEPLOY_ROOT"
   mkdir -p "$DEPLOY_ROOT"
+  # A failed or interrupted start stops everything it started.
+  trap stop EXIT
+  trap 'exit 1' INT TERM HUP
   log "Starting the TLS proxy on $PUBLIC_IP"
   start_proxy
   log "Starting the registry"
@@ -222,6 +225,7 @@ start() {
   start_realm b 2 "$(realm_origins "$A_PORT" 1),$public_origins"
   wait_realm a
   wait_realm b
+  trap - EXIT INT TERM HUP
   log "Both realms and the registry are up"
   write_summary
 }
