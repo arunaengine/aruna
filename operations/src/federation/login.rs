@@ -280,7 +280,7 @@ impl FederatedLoginOperation {
             Ok(Some(user))
                 if !user.is_deactivated()
                     && user.service_group().is_none()
-                    && user.alias_user_ids.contains(&foreign) =>
+                    && user.linked_login(&foreign) =>
             {
                 self.session(owner, Some(foreign))
             }
