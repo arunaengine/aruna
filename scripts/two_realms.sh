@@ -5,8 +5,8 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-DEPLOY_ROOT="${ARUNA_TWO_REALMS_ROOT:-$ROOT_DIR/target/two-realms}"
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+DEPLOY_ROOT="$(realpath -m -- "${ARUNA_TWO_REALMS_ROOT:-$ROOT_DIR/target/two-realms}")"
 PORTAL_DIR="${ARUNA_TEST_DEPLOY_PORTAL_DIR:-}"
 A_PORT="${ARUNA_TWO_REALMS_A_PORT:-47100}"
 B_PORT="${ARUNA_TWO_REALMS_B_PORT:-47200}"
