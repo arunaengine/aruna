@@ -317,6 +317,7 @@ impl Topology {
             issuer_pubkey: None,
             delegation_signature: None,
             name: None,
+            via: None,
         };
         let key_pem = self
             .signing_key

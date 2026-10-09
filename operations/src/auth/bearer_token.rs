@@ -8,8 +8,11 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{FEDERATION_KEYSPACE, USER_KEYSPACE};
+use aruna_core::link::{alias_claims_key, alias_owner};
 use aruna_core::structs::identity::auth::{AuthContext, TokenClaims};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
@@ -21,6 +24,7 @@ use jsonwebtoken::dangerous::insecure_decode;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use lru::LruCache;
 use std::array::TryFromSliceError;
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -44,6 +48,14 @@ pub trait ArunaValidationState: Sync {
         user_id: &UserId,
     ) -> Result<Option<u64>, ArunaBearerError>;
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool;
+    /// The local account a linked login of another realm resolves to in `realm_id`, if any.
+    async fn linked_owner(
+        &self,
+        _realm_id: &RealmId,
+        _via: &UserId,
+    ) -> Result<Option<UserId>, ArunaBearerError> {
+        Ok(None)
+    }
 
     /// The wall clock claim validation judges against, injectable so a test can
     /// decide expiry and issuance skew without waiting on real time.
@@ -124,6 +136,40 @@ pub async fn realm_token_revoked(
 }
 
 /// The user's cutoff in the realm's replicated revocation set, read like the token revocation.
+/// The local account `via` is linked to: exactly one claim, by an active account that still
+/// lists the link.
+pub async fn realm_linked_owner(
+    storage: &StorageHandle,
+    via: &UserId,
+) -> Result<Option<UserId>, ArunaBearerError> {
+    let read = |key_space: &str, key: Vec<u8>| {
+        storage.send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            txn_id: None,
+        })
+    };
+    let value = |event: Event| match event {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+        _ => Err(ArunaBearerError::RevocationUnavailable),
+    };
+    let claims = value(read(FEDERATION_KEYSPACE, alias_claims_key(via)).await)?
+        .map(|bytes| postcard::from_bytes::<BTreeSet<UserId>>(&bytes))
+        .transpose()
+        .map_err(|_| ArunaBearerError::RevocationUnavailable)?
+        .unwrap_or_default();
+    let Some(owner) = alias_owner(&claims) else {
+        return Ok(None);
+    };
+    let user = value(read(USER_KEYSPACE, owner.to_bytes()).await)?
+        .map(|bytes| User::from_bytes(&bytes))
+        .transpose()
+        .map_err(|_| ArunaBearerError::RevocationUnavailable)?;
+    Ok(user
+        .filter(|user| !user.is_deactivated() && user.alias_user_ids.contains(via))
+        .map(|_| owner))
+}
+
 pub async fn realm_user_cutoff(
     storage: &StorageHandle,
     realm_id: RealmId,
@@ -208,6 +254,17 @@ where
         .is_some_and(|cutoff| claims.claims.iat < cutoff)
     {
         return Err(ArunaBearerError::TokenRevoked);
+    }
+    // A linked login is cut off with either id and lives only while its link still resolves.
+    if let Some(via) = claims.claims.via.as_deref() {
+        let via = UserId::from_string(via)?;
+        let cut_off = state
+            .user_cutoff(&issuer_realm, &via)
+            .await?
+            .is_some_and(|cutoff| claims.claims.iat < cutoff);
+        if cut_off || state.linked_owner(&issuer_realm, &via).await? != Some(user_id) {
+            return Err(ArunaBearerError::TokenRevoked);
+        }
     }
 
     Ok(claims.claims)
@@ -503,6 +560,7 @@ mod tests {
             issuer_pubkey: None,
             delegation_signature: None,
             name: None,
+            via: None,
         }
     }
 
@@ -588,5 +646,95 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    /// Answers a fixed link owner and an optional cutoff for one user.
+    struct LinkedState {
+        owner: Option<UserId>,
+        cutoff: Option<(UserId, u64)>,
+    }
+
+    #[async_trait]
+    impl ArunaValidationState for LinkedState {
+        async fn is_token_revoked(
+            &self,
+            _realm_id: &RealmId,
+            _token_hash: &str,
+        ) -> Result<bool, ArunaBearerError> {
+            Ok(false)
+        }
+
+        async fn user_cutoff(
+            &self,
+            _realm_id: &RealmId,
+            user_id: &UserId,
+        ) -> Result<Option<u64>, ArunaBearerError> {
+            Ok(self
+                .cutoff
+                .filter(|(cut, _)| cut == user_id)
+                .map(|(_, cutoff)| cutoff))
+        }
+
+        async fn is_trusted_realm(&self, _realm_id: &RealmId) -> bool {
+            true
+        }
+
+        async fn linked_owner(
+            &self,
+            _realm_id: &RealmId,
+            _via: &UserId,
+        ) -> Result<Option<UserId>, ArunaBearerError> {
+            Ok(self.owner)
+        }
+    }
+
+    #[tokio::test]
+    async fn linked_login_checked() {
+        // A linked session lives only while its link resolves and neither id is cut off.
+        use crate::auth::create_token::{CreateTokenConfig, mint_token};
+        use aruna_core::structs::identity::auth::{NodeCapabilities, SessionKind, SessionRef};
+        let key = ed25519_dalek::SigningKey::from_bytes(&[13; 32]);
+        let realm_id = RealmId::from_bytes(key.verifying_key().to_bytes());
+        let local = UserId::local(ulid::Ulid::from_bytes([1; 16]), realm_id);
+        let via = UserId::new(
+            ulid::Ulid::from_bytes([2; 16]),
+            RealmId::from_bytes([14; 32]),
+        );
+        let now = unix_timestamp_secs();
+        let token = mint_token(&CreateTokenConfig {
+            time: now,
+            expiry: Some(now + 600),
+            user_id: local,
+            realm_id,
+            node_capabilities: NodeCapabilities::management_node(key).unwrap(),
+            session: Some(SessionRef {
+                sid: ulid::Ulid::from_bytes([3; 16]).to_string(),
+                kind: SessionKind::Federated,
+                name: None,
+                via: Some(via),
+            }),
+            restrictions: None,
+        })
+        .unwrap();
+        let linked = LinkedState {
+            owner: Some(local),
+            cutoff: None,
+        };
+        let claims = decode_bearer_token(&linked, &token).await.unwrap();
+        assert_eq!(claims.via, Some(via.to_string()));
+        let unlinked = LinkedState {
+            owner: None,
+            cutoff: None,
+        };
+        let refused = decode_bearer_token(&unlinked, &token).await;
+        assert!(matches!(refused, Err(ArunaBearerError::TokenRevoked)));
+        for cut in [via, local] {
+            let state = LinkedState {
+                owner: Some(local),
+                cutoff: Some((cut, now + 1)),
+            };
+            let refused = decode_bearer_token(&state, &token).await;
+            assert!(matches!(refused, Err(ArunaBearerError::TokenRevoked)));
+        }
     }
 }

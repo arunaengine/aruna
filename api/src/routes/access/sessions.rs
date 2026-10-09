@@ -235,6 +235,7 @@ pub async fn create_session(
             label: request.label,
             name: None,
             restrictions,
+            via: None,
         }),
         &state.get_ctx(),
     )
@@ -432,6 +433,7 @@ mod tests {
             sid: Ulid::generate().to_string(),
             kind: SessionKind::Assistant,
             name: None,
+            via: None,
         });
         let error = create_session(
             State(state.clone()),
@@ -632,6 +634,7 @@ mod tests {
             sid: Ulid::generate().to_string(),
             kind: SessionKind::Portal,
             name: None,
+            via: None,
         });
         let (_, Json(created)) = create_session(
             State(state.clone()),

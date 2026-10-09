@@ -64,9 +64,9 @@ fn abe_error(error: AbeError) -> ServerError {
     };
     ServerError::Refused(status, code, error.to_string())
 }
-/// Federated users of another realm cannot hold, request or unlock this realm's keys.
+/// Federated users and linked logins cannot hold, request or unlock this realm's keys.
 pub(crate) fn refuse_foreign_keys(auth: &AuthContext) -> ServerResult<()> {
-    if auth.user_id.realm_id != auth.realm_id {
+    if auth.federated() {
         return Err(foreign_keys(KeyError::Foreign.to_string()));
     }
     Ok(())

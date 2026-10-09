@@ -511,6 +511,7 @@ async fn retry_keeps_plan() {
                 sid: sid.to_string(),
                 kind: aruna_core::structs::identity::auth::SessionKind::Portal,
                 name: None,
+                via: None,
             }),
         };
         let request = SubmitImportRequest {

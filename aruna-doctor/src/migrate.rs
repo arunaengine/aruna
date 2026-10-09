@@ -17,7 +17,7 @@ use aruna_core::keyspaces::{
     JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE,
     SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SYNC_OUTBOX_KEYSPACE, UPLOAD_KEYSPACE,
-    UPLOAD_PART_KEYSPACE,
+    UPLOAD_PART_KEYSPACE, USER_SESSION_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
@@ -27,6 +27,7 @@ use aruna_core::structs::execution::job::{
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
 use aruna_core::structs::storage::blob::{BlobVersion, BucketInfo};
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
@@ -44,6 +45,7 @@ mod mappings;
 mod sessions;
 mod sizes;
 mod uploads;
+mod user_sessions;
 mod vault;
 mod versions;
 
@@ -103,6 +105,9 @@ pub struct MigrateOutput {
     /// Bucket records from before buckets carried a compression setting.
     pub buckets_scanned: usize,
     pub buckets_rewritten: usize,
+    /// Login sessions from before a session named the linked login it came through.
+    pub user_sessions_scanned: usize,
+    pub user_sessions_rewritten: usize,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -140,6 +145,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let cleanup_rows = db.keyspace(BLOB_CLEANUP_KEYSPACE, KeyspaceCreateOptions::default)?;
     let version_rows = db.keyspace(BLOB_VERSIONS_KEYSPACE, KeyspaceCreateOptions::default)?;
     let bucket_rows = db.keyspace(S3_BUCKET_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let login_rows = db.keyspace(USER_SESSION_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -171,6 +177,11 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     )?;
     let buckets =
         rewrites::<BucketInfo, buckets::LegacyBucket>(&db, &bucket_rows, S3_BUCKET_KEYSPACE)?;
+    let logins = rewrites::<UserSession, user_sessions::LegacySession>(
+        &db,
+        &login_rows,
+        USER_SESSION_KEYSPACE,
+    )?;
     let record = |target: &DocumentTarget| matches!(target, DocumentTarget::GitRecord { .. });
     let git_outbox = mappings::outbox_rows(
         &db,
@@ -223,6 +234,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         (&size_rows, &sizes.rows),
         (&version_rows, &versions.rows),
         (&bucket_rows, &buckets.rows),
+        (&login_rows, &logins.rows),
         (&index_rows, &index.writes),
         (&job_rows, &jobs.rows),
         (&state_rows, &checkpoints.rows),
@@ -307,6 +319,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         versions_rewritten: versions.rows.len(),
         buckets_scanned: buckets.scanned,
         buckets_rewritten: buckets.rows.len(),
+        user_sessions_scanned: logins.scanned,
+        user_sessions_rewritten: logins.rows.len(),
     })
 }
 

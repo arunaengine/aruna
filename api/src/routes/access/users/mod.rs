@@ -339,6 +339,7 @@ async fn issue_user_session(
             label: None,
             name: None,
             restrictions,
+            via: None,
         }),
         &state.get_ctx(),
     )

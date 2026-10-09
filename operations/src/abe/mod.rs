@@ -429,7 +429,7 @@ impl Operation for KeyOperation {
     type Output = KeyResult;
     type Error = KeyError;
     fn start(&mut self) -> Effects {
-        if self.auth.user_id.realm_id != self.auth.realm_id {
+        if self.auth.federated() {
             return self.fail(KeyError::Foreign);
         }
         if self.auth.user_id.is_nil() {

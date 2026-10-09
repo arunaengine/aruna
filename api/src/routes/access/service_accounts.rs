@@ -283,6 +283,7 @@ async fn create_token(
             label: Some(SERVICE_LABEL.to_string()),
             name: None,
             restrictions,
+            via: None,
         }),
         &state.get_ctx(),
     )

@@ -371,6 +371,7 @@ pub(crate) fn sign_token(
         issuer_pubkey: None,
         delegation_signature: None,
         name: None,
+        via: None,
     };
     let NodeCapabilities::Management {
         realm_encoding_key, ..

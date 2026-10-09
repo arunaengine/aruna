@@ -955,6 +955,7 @@ mod tests {
             issuer_pubkey: None,
             delegation_signature: None,
             name: None,
+            via: None,
         }
     }
 
