@@ -208,7 +208,7 @@ pub async fn upload_rocrate(
     let deadline = Instant::now() + UPLOAD_DEADLINE;
     // Another realm pushes an export with this realm's intent and its grant instead of a bearer.
     let push = match auth {
-        None => crate::routes::federation_import::admit_push(&state, &headers).await?,
+        None => crate::routes::federation::import::admit_push(&state, &headers).await?,
         Some(_) => None,
     };
     let owner = match &push {
@@ -220,7 +220,7 @@ pub async fn upload_rocrate(
     if let Some(push) = &push {
         limit = limit.min(push.grant.payload.artifact_size);
         if let Some(response) =
-            crate::routes::federation_import::pushed_upload(&state, push).await?
+            crate::routes::federation::import::pushed_upload(&state, push).await?
         {
             return Ok((StatusCode::CREATED, Json(response)));
         }
@@ -267,7 +267,7 @@ pub async fn upload_rocrate(
     drop(upload_slot);
     let record = match &push {
         Some(push) => {
-            let bind = crate::routes::federation_import::bind_upload;
+            let bind = crate::routes::federation::import::bind_upload;
             bind(&state, &push.intent, &push.grant, &push.key, &record).await?
         }
         None => record,

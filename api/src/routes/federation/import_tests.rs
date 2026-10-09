@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::routes::federation_export::{GRANT_HEADER, encode_header};
+use crate::routes::federation::export::{GRANT_HEADER, encode_header};
 use crate::routes::rocrate_import::{UploadRoCrateResponse, upload_rocrate};
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;

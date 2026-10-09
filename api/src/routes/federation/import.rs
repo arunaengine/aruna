@@ -5,7 +5,7 @@
 
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::federation_export::{
+use crate::routes::federation::export::{
     INTENT_HEADER, decode_header, grant_header, transfer_refused,
 };
 use crate::routes::rocrate_import::{
@@ -501,5 +501,5 @@ pub async fn create_import(
 }
 
 #[cfg(test)]
-#[path = "federation_import_tests.rs"]
+#[path = "import_tests.rs"]
 mod tests;

@@ -2,6 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod export;
+pub mod import;
+pub mod link;
+pub mod login;
+
 use crate::auth::{ensure_permission, require_realm_auth};
 use crate::error::{ServerError, ServerResult};
 use crate::routes::git::expected;

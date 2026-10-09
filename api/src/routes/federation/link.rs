@@ -5,7 +5,7 @@
 
 use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::federation_login::SECRET_LEN;
+use crate::routes::federation::login::SECRET_LEN;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::federation::Signed;
