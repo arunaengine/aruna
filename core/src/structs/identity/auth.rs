@@ -218,9 +218,6 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
-    /// The Everyone principal: unauthenticated requests are permission-checked
-    /// as the nil user, so exactly the roles that assign the realm-scoped
-    /// `UserId::nil` (public roles, `Role::is_public`) grant them access.
     /// A user of another realm, or a session opened through a login of another realm.
     pub fn federated(&self) -> bool {
         self.user_id.realm_id != self.realm_id
@@ -230,6 +227,9 @@ impl AuthContext {
                 .is_some_and(|session| session.kind == SessionKind::Federated)
     }
 
+    /// The Everyone principal: unauthenticated requests are permission-checked
+    /// as the nil user, so exactly the roles that assign the realm-scoped
+    /// `UserId::nil` (public roles, `Role::is_public`) grant them access.
     pub fn anonymous(realm_id: RealmId) -> Self {
         Self {
             user_id: UserId::nil(realm_id),

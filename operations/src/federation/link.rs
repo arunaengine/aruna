@@ -989,7 +989,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlink_cuts_off_first() {
+    async fn unlink_cuts_first() {
         // Only the owner unlinks here; the cutoff lands first and voids older confirmations.
         let (_dir, context) = context().await;
         let now = unix_timestamp_secs();

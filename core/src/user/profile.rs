@@ -93,7 +93,7 @@ mod tests {
     }
 
     #[test]
-    fn hint_needs_public_name() {
+    fn hint_needs_public() {
         // Only an active, non-service account's public name matches, whole and without case.
         let mut user = User {
             user_id: UserId::local(Ulid::from_bytes([1; 16]), RealmId::from_bytes([2; 32])),

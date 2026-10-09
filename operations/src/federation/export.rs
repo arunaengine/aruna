@@ -503,7 +503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_denial_stops_reads() {
+    async fn denial_stops_reads() {
         // A consenting user who lost READ on the document can no longer be read for.
         let (_dir, context) = context();
         let record = record();
@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_reads_without_writing() {
+    fn issue_never_writes() {
         // The issue decision never writes: a revoked record refuses, no checkpoint is unfinished.
         let record = record();
         let config = IssueGrantConfig {
