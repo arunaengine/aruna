@@ -431,7 +431,7 @@ impl Operation for CreateRoCrateOperation {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum UploadClaimError {
     #[error("upload not found")]
     NotFound,
@@ -445,6 +445,28 @@ pub enum UploadClaimError {
     Invalid(String),
     #[error("upload storage failed: {0}")]
     Storage(String),
+}
+
+/// Claims `record` for job `job_id` of `owner`. A claimed upload stays with its job, also after it
+/// expires; an unclaimed one is claimable until it expires. Returns whether the record changed.
+pub(crate) fn claim_upload(
+    record: &mut RoCrateUploadRecord,
+    owner: UserId,
+    job_id: JobId,
+    now_ms: u64,
+) -> Result<bool, UploadClaimError> {
+    if record.owner != owner {
+        return Err(UploadClaimError::WrongOwner);
+    }
+    match record.claimed_by {
+        Some(existing) if existing != job_id => Err(UploadClaimError::AlreadyClaimed),
+        Some(_) => Ok(false),
+        None if record.expires_at_ms <= now_ms => Err(UploadClaimError::Expired),
+        None => {
+            record.claimed_by = Some(job_id);
+            Ok(true)
+        }
+    }
 }
 
 pub async fn read_rocrate_upload(
@@ -592,14 +614,8 @@ async fn claim_in_txn(
     };
     let mut record: RoCrateUploadRecord = postcard::from_bytes(value.as_ref())
         .map_err(|error| UploadClaimError::Invalid(error.to_string()))?;
-    if record.owner != owner {
-        return Err(UploadClaimError::WrongOwner);
-    }
-    match record.claimed_by {
-        Some(existing) if existing != job_id => return Err(UploadClaimError::AlreadyClaimed),
-        Some(_) => return Ok(record),
-        None if record.expires_at_ms <= now_ms => return Err(UploadClaimError::Expired),
-        None => record.claimed_by = Some(job_id),
+    if !claim_upload(&mut record, owner, job_id, now_ms)? {
+        return Ok(record);
     }
     let value = postcard::to_allocvec(&record)
         .map(ByteView::from)
@@ -640,12 +656,12 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
         .await;
 }
 
-fn upload_key(upload_id: Ulid) -> ByteView {
+pub(crate) fn upload_key(upload_id: Ulid) -> ByteView {
     ByteView::from(upload_id.to_bytes().to_vec())
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use aruna_core::structs::execution::job::RoCrateMediaType;
     use aruna_core::structs::identity::realm::RealmId;
@@ -1070,7 +1086,11 @@ mod tests {
         ));
     }
 
-    fn upload_record(owner: UserId, upload_id: Ulid, expires_at_ms: u64) -> RoCrateUploadRecord {
+    pub(crate) fn upload_record(
+        owner: UserId,
+        upload_id: Ulid,
+        expires_at_ms: u64,
+    ) -> RoCrateUploadRecord {
         RoCrateUploadRecord {
             upload_id,
             owner,
