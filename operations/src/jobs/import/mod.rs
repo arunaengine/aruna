@@ -304,11 +304,7 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
                     return retryable_error(error);
                 }
             }
-            Err(ImportFailure::Retryable(error))
-                if !ctx.final_attempt || checkpoint.phase == ImportPhase::Cleanup =>
-            {
-                return retryable_error(error);
-            }
+            Err(ImportFailure::Retryable(error)) => return retryable_error(error),
             Err(ImportFailure::Cancelled) => {
                 checkpoint.cancelled = true;
                 if let Err(error) = mark_not_attempted(ctx, plan.as_ref(), &mut checkpoint).await {
@@ -333,7 +329,7 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
                     return retryable_error(error);
                 }
             }
-            Err(ImportFailure::Retryable(error) | ImportFailure::Permanent(error)) => {
+            Err(ImportFailure::Permanent(error)) => {
                 if let Err(report_error) = write_phase_error(ctx, checkpoint.phase, &error).await {
                     return retryable_error(report_error);
                 }
