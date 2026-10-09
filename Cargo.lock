@@ -575,6 +575,7 @@ dependencies = [
  "flate2",
  "hex",
  "iroh",
+ "irokle",
  "jsonwebtoken",
  "postcard",
  "rand 0.10.2",

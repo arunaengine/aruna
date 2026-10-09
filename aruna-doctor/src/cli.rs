@@ -76,11 +76,14 @@ pub enum Commands {
         #[command(subcommand)]
         command: ReclaimCommands,
     },
-    /// Rewrite legacy job, PID mapping and realm rows, rebuild the identifier index and seal
-    /// plain secrets. Writes the database and must run while the node is stopped. Current
-    /// rows stay unchanged, so repeating the migration is safe.
+    /// Rewrite legacy job, PID mapping and realm rows, rebuild the identifier index, seal
+    /// plain secrets and delete the former node info topics. Writes the database and must run
+    /// while the node is stopped. Current rows stay unchanged, so repeating it is safe.
     Migrate {
         database_path: String,
+        /// Document sync store; defaults to `<database_path>/document-sync`.
+        #[arg(long)]
+        sync_path: Option<String>,
     },
 }
 
