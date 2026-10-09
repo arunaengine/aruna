@@ -1298,23 +1298,41 @@ pub(super) fn add_references(
         .collect();
     rewrite_ids(document, &replacements);
     let keywords = JsonLdKeywords::new(document);
-    let Some(graph) = document.get_mut("@graph").and_then(JsonValue::as_array_mut) else {
-        return Ok(());
-    };
     let identifiers = references
         .into_values()
         .collect::<BTreeMap<String, String>>();
-    let local_path = ["localPath", LOCAL_PATH_IRI, PATH_HTTP_IRI];
-    let content_url = ["contentUrl", SCHEMA_CONTENT_IRI, CONTENT_HTTPS_IRI];
-    let source_local = |value: &JsonValue| value.as_str().and_then(ObjectLocation::parse).is_some();
-    for object in graph.iter_mut().filter_map(JsonValue::as_object_mut) {
-        let id = keywords.object_id(object).map(|(_, id)| id.to_string());
-        let Some(original) = id.and_then(|id| identifiers.get(&id)) else {
-            continue;
-        };
+    if let Some(graph) = keywords.graph_mut(document) {
+        for value in graph.iter_mut() {
+            clean_references(value, &identifiers, &keywords);
+        }
+    }
+    Ok(())
+}
+
+/// Gives every entity left as a reference, nested ones too, its original identifier and drops
+/// its source-local paths and content URLs.
+fn clean_references(
+    value: &mut JsonValue,
+    identifiers: &BTreeMap<String, String>,
+    keywords: &JsonLdKeywords,
+) {
+    let object = match value {
+        JsonValue::Array(values) => {
+            for value in values {
+                clean_references(value, identifiers, keywords);
+            }
+            return;
+        }
+        JsonValue::Object(object) => object,
+        _ => return,
+    };
+    let id = keywords.object_id(object).map(|(_, id)| id.to_string());
+    if let Some(original) = id.and_then(|id| identifiers.get(&id)) {
         object
             .entry("identifier")
             .or_insert_with(|| JsonValue::String(original.clone()));
+        let local_path = ["localPath", LOCAL_PATH_IRI, PATH_HTTP_IRI];
+        let content_url = ["contentUrl", SCHEMA_CONTENT_IRI, CONTENT_HTTPS_IRI];
         object.retain(|key, value| {
             if keywords.expands_to(key, &local_path) {
                 return false;
@@ -1323,13 +1341,27 @@ pub(super) fn add_references(
                 return true;
             }
             if let JsonValue::Array(values) = value {
-                values.retain(|value| !source_local(value));
+                values.retain(|value| !source_local(value, keywords));
                 return !values.is_empty();
             }
-            !source_local(value)
+            !source_local(value, keywords)
         });
     }
-    Ok(())
+    for value in object.values_mut() {
+        clean_references(value, identifiers, keywords);
+    }
+}
+
+/// A source-local location written as a string, an `@id` node or an `@value` literal.
+fn source_local(value: &JsonValue, keywords: &JsonLdKeywords) -> bool {
+    let text = match value {
+        JsonValue::Object(object) => keywords
+            .object_id(object)
+            .map(|(_, id)| id)
+            .or_else(|| object.get("@value").and_then(JsonValue::as_str)),
+        value => value.as_str(),
+    };
+    text.and_then(ObjectLocation::parse).is_some()
 }
 
 /// A data entity on the web, which a crate may name without carrying its bytes.

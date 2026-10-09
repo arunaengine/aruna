@@ -2472,6 +2472,44 @@ fn selection_keeps_references() {
 }
 
 #[test]
+fn nested_references_cleaned() {
+    // Aliased graphs, nested File entities and structured locations are cleaned as well.
+    let realm_id = RealmId::from_bytes([2; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+    let version = Ulid::from_bytes([4; 16]);
+    let left = VersionedObjectArn::new(realm_id, node_id, "bucket", "left", version).unwrap();
+    let mut document = json!({
+        "@context": [
+            "https://w3id.org/ro/crate/1.2/context",
+            {"graphItems": "@graph", "idAlias": "@id", "pathAlias": LOCAL_PATH_IRI}
+        ],
+        "graphItems": [{
+            "idAlias": "./",
+            "@type": "Dataset",
+            "hasPart": [{
+                "idAlias": left.to_string(),
+                "@type": "File",
+                "pathAlias": "data/left.csv",
+                "contentUrl": [
+                    {"@id": "s3://bucket/left"},
+                    {"@value": "s3://bucket/left"},
+                    "https://example.org/left"
+                ]
+            }]
+        }]
+    });
+    let mut entities = recognized_entities(&document, realm_id).unwrap();
+    keep_references(&mut entities, &[]);
+    add_references(&mut document, &entities).unwrap();
+
+    let nested = &document["graphItems"][0]["hasPart"][0];
+    assert_eq!(nested["idAlias"], left.to_w3id());
+    assert_eq!(nested["identifier"], left.to_string());
+    assert!(nested.get("pathAlias").is_none());
+    assert_eq!(nested["contentUrl"], json!(["https://example.org/left"]));
+}
+
+#[test]
 fn facts_need_selected_files() {
     // A grant pins only a finished export that kept every selected file.
     let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
