@@ -386,9 +386,9 @@ async fn shard_membership_exact() {
 /// end, so a newer reconcile cannot run before them and be overwritten.
 #[test]
 fn reconcile_survives_cancel() {
-    // One blocking thread, held by the test, keeps the reconcile's writes queued.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    // One blocking thread, held by the test, keeps the reconcile's writes queued. One
+    // runtime thread keeps the lock probe from racing the reconcile for the lock.
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .max_blocking_threads(1)
         .enable_all()
         .build()
