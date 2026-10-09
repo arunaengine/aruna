@@ -349,6 +349,9 @@ mod tests {
     use aruna_core::keyspaces::{FEDERATION_KEYSPACE, USER_KEYSPACE};
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::{RealmId, TokenRevocation};
+    use aruna_operations::auth::bearer_token::{
+        ArunaBearerError, ArunaValidationState, validate_bearer_claims,
+    };
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::realm::get_config::GetConfigOperation;
     use axum::response::IntoResponse;
@@ -664,5 +667,56 @@ mod tests {
             error,
             ServerError::Refused(StatusCode::FORBIDDEN, "login_cut_off", _)
         ));
+    }
+
+    /// Judges claims at a fixed instant and trusts every realm.
+    struct FixedClock(u64);
+
+    #[async_trait::async_trait]
+    impl ArunaValidationState for FixedClock {
+        async fn is_token_revoked(&self, _: &RealmId, _: &str) -> Result<bool, ArunaBearerError> {
+            Ok(false)
+        }
+
+        async fn user_cutoff(
+            &self,
+            _: &RealmId,
+            _: &UserId,
+        ) -> Result<Option<u64>, ArunaBearerError> {
+            Ok(None)
+        }
+
+        async fn is_trusted_realm(&self, _: &RealmId) -> bool {
+            true
+        }
+
+        fn now_secs(&self) -> u64 {
+            self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn session_lasts_hours() {
+        // With an injected clock a federated session ends 8 hours after the login, not later.
+        let (_dir, state, settings) = serving().await;
+        let handoff = handoff(&settings);
+        let now = handoff.payload.issued_at;
+        let config = FederatedLoginConfig {
+            realm_id: state.get_realm_id(),
+            handoff,
+            secret: SECRET.to_vec(),
+            node_capabilities: state.node_capabilities().clone(),
+            now,
+        };
+        let created = drive(FederatedLoginOperation::new(config), &state.get_ctx())
+            .await
+            .unwrap();
+        assert_eq!(created.session.expires_at, now + 8 * 3600);
+        let claims = handle_token(&state, created.token.expose()).await.unwrap();
+        assert_eq!((claims.iat, claims.exp), (now, now + 8 * 3600));
+        let last = validate_bearer_claims(&FixedClock(claims.exp), &claims).await;
+        assert!(last.is_ok());
+        let after = validate_bearer_claims(&FixedClock(claims.exp + 1), &claims).await;
+        assert!(matches!(after, Err(ArunaBearerError::Expired)));
     }
 }
