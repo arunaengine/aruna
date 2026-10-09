@@ -209,6 +209,8 @@ pub async fn create_login_handoff(
   account (`linked` true) and names the login as `via`; roles come from the account only.
 - Otherwise no user record is created for the foreign user. `account_hint` is true when an
   active local account shows the same public name, compared without case; it names nothing.
+- A login is refused while a credential cutoff of the user, or of the linked account, still
+  refuses new tokens (up to 5 minutes after the cutoff).
 
 **Limits**
 - A handoff lives at most 60 seconds and may be issued at most 30 seconds in the future.
@@ -247,7 +249,7 @@ pub async fn create_login_handoff(
                 "account_hint": true
             })),
         (status = 400, description = "A malformed secret", body = ErrorResponse),
-        (status = 403, description = "The handoff was refused, or this realm has no federation settings; code `handoff_rejected` or `federation_disabled`", body = ErrorResponse),
+        (status = 403, description = "The handoff was refused, this realm has no federation settings, or the login was cut off here moments ago; code `handoff_rejected`, `federation_disabled` or `login_cut_off`", body = ErrorResponse),
         (status = 409, description = "The user already holds 256 active sessions here", body = ErrorResponse)
     )
 )]
@@ -288,6 +290,9 @@ pub async fn create_federated_session(
                 error.to_string(),
             ),
             FederatedLoginError::Rejected(error) => rejected(error),
+            FederatedLoginError::CutOff => {
+                ServerError::Refused(StatusCode::FORBIDDEN, "login_cut_off", error.to_string())
+            }
             FederatedLoginError::Session(error) => map_create_error(error),
             error => ServerError::InternalError(error.to_string()),
         })?;
@@ -336,13 +341,14 @@ mod tests {
     use crate::routes::access::sessions::{CreateSessionRequest, create_session};
     use crate::tests::routes::{test_context, test_state, test_storage};
     use aruna_core::UserId;
+    use aruna_core::auth::{REVOCATION_GRACE_SECS, user_cutoff_expiry, user_cutoff_hash};
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMode};
     use aruna_core::handoff::secret_nonce;
     use aruna_core::keyspaces::{FEDERATION_KEYSPACE, USER_KEYSPACE};
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind, SessionRef};
-    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::identity::realm::{RealmId, TokenRevocation};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::realm::get_config::GetConfigOperation;
     use axum::response::IntoResponse;
@@ -439,6 +445,33 @@ mod tests {
         Signed::sign(payload, &home).unwrap()
     }
 
+    /// Records a credential cutoff of `user` in the serving realm, as an administrator does.
+    async fn cut_off(state: &Arc<ServerState>, user: UserId) {
+        let (realm_id, context) = (state.get_realm_id(), state.get_ctx());
+        let mut config = drive(GetConfigOperation::new(realm_id), &context)
+            .await
+            .unwrap();
+        config.revoked_tokens.push(TokenRevocation {
+            token_hash: user_cutoff_hash(&user),
+            expires_at: user_cutoff_expiry(unix_timestamp_secs() + REVOCATION_GRACE_SECS),
+        });
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        let target = DocumentTarget::RealmConfig { realm_id };
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
     async fn login(
         state: &Arc<ServerState>,
         handoff: Signed<LoginHandoff>,
@@ -496,6 +529,18 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn refuses_cut_login() {
+        // A login whose token validation would refuse at once is refused with a clear code.
+        let (_dir, state, settings) = serving().await;
+        cut_off(&state, home_user()).await;
+        let error = login(&state, handoff(&settings), SECRET).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ServerError::Refused(StatusCode::FORBIDDEN, "login_cut_off", _)
+        ));
     }
 
     #[tokio::test]
@@ -612,5 +657,12 @@ mod tests {
         let auth = AuthContext::try_from(token).unwrap();
         assert_eq!(auth.user_id, local);
         assert_eq!(auth.session.unwrap().via, Some(home_user()));
+        // A cutoff of the account refuses the next linked login.
+        cut_off(&state, local).await;
+        let error = login(&state, handoff(&settings), SECRET).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ServerError::Refused(StatusCode::FORBIDDEN, "login_cut_off", _)
+        ));
     }
 }
