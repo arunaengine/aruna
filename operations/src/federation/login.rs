@@ -15,7 +15,7 @@ use aruna_core::keyspaces::{FEDERATION_KEYSPACE, USER_KEYSPACE};
 use aruna_core::link::{alias_claims_key, alias_owner};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, SessionKind};
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::Effects;
 use byteview::ByteView;
@@ -160,6 +160,8 @@ pub enum FederatedLoginError {
     Disabled,
     #[error(transparent)]
     Rejected(#[from] HandoffError),
+    #[error("this login was cut off here a moment ago; try again in a few minutes")]
+    CutOff,
     #[error(transparent)]
     Session(#[from] CreateSessionError),
     #[error(transparent)]
@@ -188,6 +190,8 @@ enum FederatedLoginState {
 pub struct FederatedLoginOperation {
     config: FederatedLoginConfig,
     state: FederatedLoginState,
+    /// The realm config read at admission, for the cutoff checks of the session ids.
+    realm: Option<RealmConfigDocument>,
     output: Option<Result<CreatedSession, FederatedLoginError>>,
 }
 
@@ -196,24 +200,42 @@ impl FederatedLoginOperation {
         Self {
             config,
             state: FederatedLoginState::Start,
+            realm: None,
             output: None,
         }
     }
 
     fn admit(
-        &self,
-        read: Result<aruna_core::structs::identity::realm::RealmConfigDocument, GetConfigError>,
+        &mut self,
+        read: Result<RealmConfigDocument, GetConfigError>,
     ) -> Result<(), FederatedLoginError> {
-        let settings = read?.federation.ok_or(FederatedLoginError::Disabled)?;
+        let realm = read?;
+        let settings = realm
+            .federation
+            .as_ref()
+            .ok_or(FederatedLoginError::Disabled)?;
         let config = &self.config;
         check_handoff(
             &config.handoff,
             &config.realm_id,
-            &settings,
+            settings,
             &config.secret,
             config.now,
         )?;
+        self.realm = Some(realm);
+        if self.cut_off(&self.config.handoff.payload.user) {
+            return Err(FederatedLoginError::CutOff);
+        }
         Ok(())
+    }
+
+    /// Whether token validation would refuse a session of `user` issued now.
+    fn cut_off(&self, user: &UserId) -> bool {
+        let now = self.config.now;
+        self.realm
+            .as_ref()
+            .and_then(|realm| realm.user_cutoff(user, now))
+            .is_some_and(|cutoff| now < cutoff)
     }
 
     fn session(&mut self, user_id: UserId, via: Option<UserId>) -> Effects {
@@ -288,6 +310,9 @@ impl FederatedLoginOperation {
                     && user.service_group().is_none()
                     && user.linked_login(&foreign) =>
             {
+                if self.cut_off(&owner) {
+                    return self.finish(Err(FederatedLoginError::CutOff));
+                }
                 self.session(owner, Some(foreign))
             }
             Ok(_) => self.session(foreign, None),
