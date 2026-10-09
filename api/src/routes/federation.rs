@@ -34,7 +34,7 @@ pub struct FederationApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(FederationApiDoc::openapi())
-        .routes(routes!(set_realm_federation))
+        .routes(routes!(get_realm_federation, set_realm_federation))
         .routes(routes!(get_realm_descriptor))
 }
 
@@ -106,6 +106,71 @@ impl RealmFederation {
 
 fn parse_url(value: &str) -> ServerResult<Url> {
     Url::parse(value).map_err(|error| ServerError::BadRequestReason(format!("{value}: {error}")))
+}
+
+#[utoipa::path(
+    get,
+    path = "/system/realm/federation",
+    tag = "system/realm",
+    summary = "Get the realm federation settings",
+    description = r#"Returns the stored realm-wide federation settings with the descriptor signed from them.
+
+**Authentication**: realm bearer token with WRITE on the realm configuration admin path.
+
+**Behavior**
+- The body has the form the PUT route takes and returns. Load it before a change, so a save
+  keeps the settings the change does not touch."#,
+    responses(
+        (status = 200, description = "The stored settings with the signed descriptor", body = RealmFederation,
+            example = json!({
+                "name": "Example realm",
+                "api_url": "https://api.example.org/api/v1",
+                "portal_url": "https://portal.example.org/",
+                "registry_url": "https://registry.example.org/",
+                "registration": "enabled",
+                "accepted_realms": {"mode": "none"},
+                "descriptor": {
+                    "payload": {
+                        "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
+                        "name": "Example realm",
+                        "description": "",
+                        "api_url": "https://api.example.org/api/v1",
+                        "portal_url": "https://portal.example.org/",
+                        "issued_at": 1791000000
+                    },
+                    "signer": "Realm",
+                    "signature": "<hex ed25519 signature>"
+                }
+            })),
+        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
+        (status = 404, description = "The realm has no federation settings, or this node holds no configuration document for its realm", body = crate::error::ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_realm_federation(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> ServerResult<Json<RealmFederation>> {
+    let auth = require_realm_auth(&state, auth)?;
+    ensure_permission(
+        &state,
+        &auth,
+        policy_admin_path(state.get_realm_id()),
+        Permission::WRITE,
+    )
+    .await?;
+    let config = drive(
+        GetConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| match error {
+        GetConfigError::DocumentNotFound => ServerError::NotFound,
+        error => ServerError::InternalError(error.to_string()),
+    })?;
+    let settings = config.federation.ok_or(ServerError::NotFound)?;
+    Ok(Json(RealmFederation::from_settings(&settings)?))
 }
 
 #[utoipa::path(
