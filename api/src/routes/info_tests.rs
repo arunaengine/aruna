@@ -12,6 +12,10 @@ use super::{
 };
 use crate::error::ServerError;
 use crate::openapi::ApiDoc;
+use crate::routes::federation::{
+    AcceptedRealmsSetting, RealmFederation, RegistrationSetting, get_realm_federation,
+    set_realm_federation,
+};
 use crate::server::state::ServerState;
 use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
@@ -1193,6 +1197,45 @@ async fn admin_sets_quota() {
     let quota = info.quota.expect("realm token sees quota");
     assert_eq!(quota.default_quota_bytes, Some(4096));
     assert_eq!(quota.devices_per_user, Some(3));
+}
+
+#[tokio::test]
+async fn federation_admin_reads() {
+    let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+    let auth = admin_auth(realm_id, admin);
+    let read =
+        |auth: Option<AuthContext>| get_realm_federation(State(state.clone()), Extension(auth));
+    assert!(matches!(
+        read(Some(auth.clone())).await,
+        Err(ServerError::NotFound)
+    ));
+
+    let body = RealmFederation {
+        name: "Realm".to_string(),
+        api_url: "https://api.example.org/api/v1".to_string(),
+        portal_url: "https://portal.example.org/".to_string(),
+        registry_url: Some("https://registry.example.org/".to_string()),
+        registration: RegistrationSetting::Disabled,
+        accepted_realms: AcceptedRealmsSetting::Any,
+        descriptor: None,
+    };
+    let (_, Json(stored)) = set_realm_federation(
+        State(state.clone()),
+        Extension(Some(auth.clone())),
+        Json(body),
+    )
+    .await
+    .unwrap();
+    let Json(loaded) = read(Some(auth)).await.unwrap();
+    assert_eq!(loaded, stored);
+
+    // Only a realm config admin reads the settings.
+    let stranger = admin_auth(realm_id, UserId::local(Ulid::generate(), realm_id));
+    assert!(matches!(
+        read(Some(stranger)).await,
+        Err(ServerError::Forbidden)
+    ));
+    assert!(matches!(read(None).await, Err(ServerError::Unauthorized)));
 }
 
 /// Anonymous callers keep what they need to authenticate; realm topology,

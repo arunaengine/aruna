@@ -328,6 +328,7 @@ pub(crate) mod tests {
         ("GET", "/system/info"),
         ("GET", "/system/realm"),
         ("GET", "/system/realm/descriptor"),
+        ("GET", "/system/realm/federation"),
         ("GET", "/system/realm/placement"),
         ("GET", "/system/usage"),
         ("GET", "/compute/jobs"),
