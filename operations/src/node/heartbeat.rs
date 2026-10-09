@@ -26,6 +26,8 @@ use crate::node::node_info::INFO_PUBLISH_INTERVAL;
 pub(crate) const HEARTBEAT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Heartbeat sends in flight at once.
 const PARALLEL_SENDS: usize = 16;
+/// Longest one send pass over all peers may take, well inside the heartbeat interval.
+const SEND_PASS_TIMEOUT: Duration = Duration::from_secs(INFO_PUBLISH_INTERVAL.as_secs() / 2);
 /// Oldest heartbeat that still counts as current telemetry: three missed intervals.
 pub const MAX_HEARTBEAT_AGE: Duration = Duration::from_secs(3 * INFO_PUBLISH_INTERVAL.as_secs());
 
@@ -92,9 +94,16 @@ pub async fn send_heartbeat(net_handle: &NetHandle, heartbeat: NodeHeartbeat) {
             return;
         }
     };
+    let sequence = heartbeat.sequence;
     net_handle.record_own_heartbeat(heartbeat);
     let frame = [(bytes.len() as u32).to_be_bytes().as_slice(), &bytes].concat();
-    stream::iter(net_handle.realm_peers().await)
+    let mut peers = net_handle.realm_peers().await;
+    // Each pass starts at another peer, so peers that time out cannot starve the ones after them.
+    if !peers.is_empty() {
+        let start = sequence % peers.len() as u64;
+        peers.rotate_left(start as usize);
+    }
+    let pass = stream::iter(peers)
         .map(|peer| {
             let frame = &frame;
             async move {
@@ -109,8 +118,10 @@ pub async fn send_heartbeat(net_handle: &NetHandle, heartbeat: NodeHeartbeat) {
                 Ok(Err(error)) => debug!(%peer, %error, "Heartbeat send failed"),
                 Err(_) => debug!(%peer, "Heartbeat send timed out"),
             }
-        })
-        .await;
+        });
+    if timeout(SEND_PASS_TIMEOUT, pass).await.is_err() {
+        debug!("Heartbeat send pass stopped at its time limit");
+    }
 }
 
 async fn push_frame(net_handle: &NetHandle, peer: NodeId, frame: &[u8]) -> Result<(), String> {
