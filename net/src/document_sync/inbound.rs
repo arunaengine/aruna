@@ -60,7 +60,7 @@ impl DocumentSyncService {
         let handle_started = Instant::now();
         let net = self.net.clone();
         let mut handling = tokio::task::spawn_blocking(move || net.handle_messages(peer, messages));
-        // Work past the requester's timeout is wasted and otherwise invisible.
+        // Work running past the requester's timeout is otherwise invisible.
         let responses = loop {
             match timeout(PEER_SYNC_TIMEOUT, &mut handling).await {
                 Ok(joined) => break joined,
