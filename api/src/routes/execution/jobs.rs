@@ -1873,7 +1873,7 @@ async fn artifact_response(
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
     let now_ms = aruna_core::time::unix_timestamp_millis();
     // A destination realm reads with an export grant, only here on the owner node.
-    let grant = crate::routes::federation_export::grant_header(&headers)?;
+    let grant = crate::routes::federation::export::grant_header(&headers)?;
     let (user_id, auth_token) = match (auth, grant) {
         (None, Some(grant)) => {
             let context = state.get_ctx();
@@ -1881,7 +1881,7 @@ async fn artifact_response(
             let now = now_ms / 1000;
             let record = admit_grant(&context, local, job_id, &grant, now)
                 .await
-                .map_err(crate::routes::federation_export::grant_refused)?;
+                .map_err(crate::routes::federation::export::grant_refused)?;
             (record.principal, None)
         }
         (auth, _) => {

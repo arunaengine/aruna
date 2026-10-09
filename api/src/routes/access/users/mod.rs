@@ -485,7 +485,7 @@ async fn build_user_response(
     let preferences = preferences_from_attributes(&user.attributes);
     let realm_roles = collect_realm_roles(read_realm_authorization(state).await?, auth.user_id);
     let groups = collect_group_memberships(state, auth.user_id).await?;
-    let linked_logins = crate::routes::federation_link::linked_logins(&user).linked_logins;
+    let linked_logins = crate::routes::federation::link::linked_logins(&user).linked_logins;
 
     Ok(UserInfoResponse {
         linked_logins,

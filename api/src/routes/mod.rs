@@ -18,10 +18,6 @@ pub mod device;
 pub mod drs;
 pub mod execution;
 pub mod federation;
-pub mod federation_export;
-pub mod federation_import;
-pub mod federation_link;
-pub mod federation_login;
 pub mod git;
 pub mod info;
 pub mod link_routes;
@@ -55,10 +51,10 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(assistant::router())
         .merge(info::router())
         .merge(federation::router())
-        .merge(federation_export::router())
-        .merge(federation_import::router())
-        .merge(federation_link::router())
-        .merge(federation_login::router())
+        .merge(federation::export::router())
+        .merge(federation::import::router())
+        .merge(federation::link::router())
+        .merge(federation::login::router())
         .merge(onboarding::router())
         .merge(storage::blobs::router())
         .merge(storage::bucket::usage::router())
