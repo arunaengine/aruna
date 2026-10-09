@@ -11,13 +11,15 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::federation::{FederationError, Signed};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, FEDERATION_KEYSPACE, JOB_STATE_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, FEDERATION_KEYSPACE, JOB_STATE_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, ExportSelection, JobId};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
-use aruna_core::structs::storage::encryption::BucketKeyRef;
+use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRef};
 use aruna_core::transfer::{
     ExportGrant, MAX_TRANSFER_SECS, TransferError, check_issued, selection_digest,
 };
@@ -156,6 +158,20 @@ async fn unlocked(context: &DriverContext, key: BucketKeyRef) -> Result<bool, Gr
     }
 }
 
+/// The active key of `bucket`, which a plain copy in an encrypting bucket is read under.
+async fn active_key(
+    context: &DriverContext,
+    bucket: &str,
+) -> Result<Option<BucketKeyRef>, GrantError> {
+    let row = bucket.as_bytes().to_vec();
+    let row = read_row(&context.storage_handle, BUCKET_ENCRYPTION_KEYSPACE, row)
+        .await
+        .map_err(GrantError::Storage)?;
+    let settings = BucketEncryption::from_row(row.as_deref())
+        .map_err(|error| GrantError::Storage(error.to_string()))?;
+    Ok(settings.active_key())
+}
+
 /// Whether the pinned version still exists with its hash.
 async fn pinned(context: &DriverContext, source: &PinnedSource) -> Result<bool, GrantError> {
     let key = VersionKey::new(source.bucket.clone(), source.key.clone(), source.version_id);
@@ -173,7 +189,7 @@ async fn pinned(context: &DriverContext, source: &PinnedSource) -> Result<bool, 
 }
 
 /// Current READ on the document and every pinned version, the export policies, the pinned
-/// versions themselves, and for encrypted versions their unlocked key the user still holds.
+/// versions themselves, and for a copy read under a bucket key that key unlocked and held.
 async fn recheck(
     context: &DriverContext,
     auth: &AuthContext,
@@ -194,7 +210,11 @@ async fn recheck(
         if !pinned(context, source).await? {
             return Err(GrantError::Denied);
         }
-        if let Some(key) = source.key_ref {
+        let key = match source.key_ref {
+            Some(key) => Some(key),
+            None => active_key(context, &source.bucket).await?,
+        };
+        if let Some(key) = key {
             let holder = is_holder(context, auth.realm_id, &source.bucket, auth.user_id)
                 .await
                 .map_err(GrantError::Storage)?;
@@ -660,6 +680,22 @@ mod tests {
         .await;
         let admitted = admit_grant(&context, local(), job(), &record.grant, NOW).await;
         assert!(admitted.is_ok());
+        // A plain copy of an encrypting bucket needs the bucket's active key like a sealed one.
+        use aruna_core::structs::storage::encryption::EncryptionMode;
+        let mut settings = BucketEncryption {
+            mode: EncryptionMode::NodeManaged,
+            bucket_id: Some(Ulid::from_bytes([8; 16])),
+            key_generation: 1,
+            ..Default::default()
+        };
+        let sealed = b"sealed".to_vec();
+        let row = settings.to_bytes().unwrap();
+        put(&context, BUCKET_ENCRYPTION_KEYSPACE, sealed.clone(), row).await;
+        let admitted = admit_grant(&context, local(), job(), &record.grant, NOW).await;
+        assert_eq!(admitted, Err(GrantError::Denied));
+        settings.mode = EncryptionMode::Off;
+        let row = settings.to_bytes().unwrap();
+        put(&context, BUCKET_ENCRYPTION_KEYSPACE, sealed, row).await;
         record.sources[0].key_ref = Some(BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1));
         write_record(&context, job(), &record).await.unwrap();
         let admitted = admit_grant(&context, local(), job(), &record.grant, NOW).await;
