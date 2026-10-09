@@ -25,10 +25,10 @@ use ulid::Ulid;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome};
-use crate::jobs::import::load_rocrate_upload;
+use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome, StaleUpload};
+use crate::jobs::import::{load_rocrate_upload, upload_stale};
 use crate::jobs::key_wake::read_row;
-use crate::jobs::store::{find_dedup_plan, read_job_record};
+use crate::jobs::store::{dedup_index_key, find_dedup_plan, read_job_record};
 use crate::realm::get_config::GetConfigOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
@@ -204,7 +204,13 @@ pub async fn write_import(
     };
     let mut bound = drive_binding(context, bind(None)).await?;
     if bound != upload_id && stale_upload(context, principal, import_key, bound).await? {
-        bound = drive_binding(context, bind(Some(bound))).await?;
+        let dedup_key = user_dedup_key(principal, import_key);
+        let stale = StaleUpload {
+            upload_id: bound,
+            dedup_key: dedup_index_key(principal, &dedup_key).to_vec(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
+        };
+        bound = drive_binding(context, bind(Some(stale))).await?;
     }
     // A racing upload won the key: it is reused only for the same transfer.
     if bound != upload_id {
@@ -225,8 +231,8 @@ async fn drive_binding(context: &DriverContext, change: RecordChange) -> Result<
     }
 }
 
-/// Whether bound upload `upload_id` can no longer start an import: it expired unused, or it is
-/// gone and no import job of `principal` holds the import key. Both states never change back.
+/// Whether bound upload `upload_id` can no longer start an import under [`upload_stale`], with
+/// the import jobs of `principal`. The binding transaction checks it again before replacing it.
 async fn stale_upload(
     context: &DriverContext,
     principal: UserId,
@@ -236,9 +242,9 @@ async fn stale_upload(
     let upload = load_rocrate_upload(context, upload_id)
         .await
         .map_err(ImportError::Storage)?;
-    if let Some(upload) = upload {
-        let now = aruna_core::time::unix_timestamp_millis();
-        return Ok(upload.claimed_by.is_none() && upload.expires_at_ms <= now);
+    let now = aruna_core::time::unix_timestamp_millis();
+    if upload.is_some() {
+        return Ok(upload_stale(upload.as_ref(), false, now));
     }
     let storage = &context.storage_handle;
     let dedup_key = user_dedup_key(principal, import_key);
@@ -246,12 +252,12 @@ async fn stale_upload(
         .await
         .map_err(ImportError::Storage)?;
     let Some((job_id, _)) = job else {
-        return Ok(true);
+        return Ok(upload_stale(None, false, now));
     };
     let record = read_job_record(storage, job_id, None)
         .await
         .map_err(ImportError::Storage)?;
-    Ok(record.is_none())
+    Ok(upload_stale(None, record.is_some(), now))
 }
 
 /// The upload `principal`'s import key was bound to by an earlier transfer.
