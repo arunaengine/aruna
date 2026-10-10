@@ -126,7 +126,10 @@ async fn main() -> Result<(), CliError> {
             } => seed_backend(database_path, backend).await?,
             ReclaimCommands::Status { database_path } => reclaim_status(database_path).await?,
         },
-        Commands::Migrate { database_path } => migrate(database_path).await?,
+        Commands::Migrate {
+            database_path,
+            sync_path,
+        } => migrate(database_path, sync_path).await?,
     };
 
     Ok(())

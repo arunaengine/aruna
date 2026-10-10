@@ -11,8 +11,8 @@ use aruna_core::structs::storage::blob::Backend;
 use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use opendal::layers::{HttpClientLayer, LoggingLayer, RetryLayer};
-use opendal::{Builder, EntryMode, Operator, services};
+use opendal::layers::{LoggingLayer, RetryLayer};
+use opendal::{Builder, EntryMode, OperationContext, Operator, services};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -81,7 +81,7 @@ pub(crate) fn build_group_service(
     config: HashMap<String, String>,
     guard: &EgressGuard,
 ) -> Result<Operator, String> {
-    let layer = Some(guard.layer());
+    let layer = Some(guard.context());
     match kind {
         GroupBackendKind::S3 => build_service::<services::S3>(s3_operator_config(config), layer),
         GroupBackendKind::Gcs => build_service::<services::Gcs>(gcs_operator_config(config), layer),
@@ -172,7 +172,7 @@ pub(crate) async fn read_staging_source(
     }
     let (operator, path, version) = build_source_operator(guard, access).await?;
     let metadata = head_staging_source(guard, access).await?;
-    let capability = operator.info().full_capability();
+    let capability = operator.info().capability();
     let mut reader = operator.reader_with(path);
     // Pinning is preferred, not required: an unpinnable source reads unpinned
     // with a warning so any source stays integrateable (user decision 2026-08-10).
@@ -319,16 +319,16 @@ async fn build_source_operator<'access>(
         } => {
             let operator = match kind {
                 SourceConnectorKind::Http => {
-                    build_service::<services::Http>(config.clone(), Some(guard.layer()))
+                    build_service::<services::Http>(config.clone(), Some(guard.context()))
                         .map_err(staging_creation_error)?
                 }
                 SourceConnectorKind::S3 => build_service::<services::S3>(
                     s3_operator_config(config.clone()),
-                    Some(guard.layer()),
+                    Some(guard.context()),
                 )
                 .map_err(staging_creation_error)?,
                 SourceConnectorKind::Webdav => {
-                    build_service::<services::Webdav>(config.clone(), Some(guard.layer()))
+                    build_service::<services::Webdav>(config.clone(), Some(guard.context()))
                         .map_err(staging_creation_error)?
                 }
                 // opendal's ftp service cannot constrain the passive data
@@ -352,18 +352,18 @@ fn is_invenio(access: &ResolvedSourceAccess) -> bool {
 
 fn build_service<B>(
     config: HashMap<String, String>,
-    guard: Option<HttpClientLayer>,
+    guard: Option<OperationContext>,
 ) -> Result<Operator, String>
 where
     B: Builder,
 {
-    let builder = Operator::from_iter::<B>(config)
+    let operator = Operator::from_iter::<B>(config)
         .map_err(|error| error.to_string())?
         .layer(LoggingLayer::default())
         .layer(RetryLayer::new());
     Ok(match guard {
-        Some(guard) => builder.layer(guard).finish(),
-        None => builder.finish(),
+        Some(guard) => operator.with_context(guard),
+        None => operator,
     })
 }
 

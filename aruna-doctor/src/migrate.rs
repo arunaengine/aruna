@@ -1,5 +1,5 @@
-//! Re-encodes legacy rows, adds missing event size rows, seals plain secrets, moves node secrets
-//! into the node vault and deletes unreadable S3 sessions and uploads; repeats are safe.
+//! Re-encodes legacy rows, adds missing event size rows, seals plain secrets and moves node secrets
+//! to the node vault; deletes unreadable S3 sessions, uploads and old node info topics. Repeatable.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -11,15 +11,16 @@ use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, sea
 use aruna_core::document::DocumentTarget;
 use aruna_core::git::GitRecord;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, EVENT_LOG_KEYSPACE,
-    EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE,
+    APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_SECRET_KEYSPACE,
+    EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE,
     FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE,
     JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE,
-    SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SYNC_OUTBOX_KEYSPACE, UPLOAD_KEYSPACE,
-    UPLOAD_PART_KEYSPACE,
+    QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE,
+    SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
+use aruna_core::structs::QUARANTINE_USAGE_KEY;
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
 use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
@@ -39,6 +40,7 @@ use ulid::Ulid;
 
 mod buckets;
 mod git;
+mod info_topics;
 mod jobs;
 mod mappings;
 mod sessions;
@@ -103,12 +105,22 @@ pub struct MigrateOutput {
     /// Bucket records from before buckets carried a compression setting.
     pub buckets_scanned: usize,
     pub buckets_rewritten: usize,
+    /// Ops of the former node info topics, which held a heartbeat every minute.
+    pub info_ops_deleted: usize,
+    /// Queued node info publishes; each node publishes its info again on start.
+    pub info_outbox_deleted: usize,
+    pub info_quarantine_deleted: usize,
+    /// Applied and fan-out sync cursors of the former node info topics.
+    pub info_cursors_deleted: usize,
 }
 
-pub async fn migrate(database_path: String) -> Result<(), CliError> {
+pub async fn migrate(database_path: String, sync_path: Option<String>) -> Result<(), CliError> {
     let output = tokio::task::spawn_blocking({
         let database_path = database_path.clone();
-        move || migrate_output(&database_path)
+        let sync_path = sync_path
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| Path::new(&database_path).join("document-sync"));
+        move || migrate_stores(&database_path, &sync_path)
     })
     .await
     .map_err(std::io::Error::other)??;
@@ -117,7 +129,16 @@ pub async fn migrate(database_path: String) -> Result<(), CliError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
+    migrate_stores(
+        database_path,
+        &Path::new(database_path).join("document-sync"),
+    )
+}
+
+/// Migrates the node database at `database_path` and its document sync store at `sync_path`.
+fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput, ExplorerError> {
     let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
     let record_rows = db.keyspace(FAMILY_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
     let pending_rows = db.keyspace(FAMILY_PENDING_KEYSPACE, KeyspaceCreateOptions::default)?;
@@ -140,6 +161,9 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let cleanup_rows = db.keyspace(BLOB_CLEANUP_KEYSPACE, KeyspaceCreateOptions::default)?;
     let version_rows = db.keyspace(BLOB_VERSIONS_KEYSPACE, KeyspaceCreateOptions::default)?;
     let bucket_rows = db.keyspace(S3_BUCKET_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let applied_rows = db.keyspace(APPLIED_OPS_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let quarantine_rows = db.keyspace(SYNC_QUARANTINE_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let usage_rows = db.keyspace(QUARANTINE_USAGE_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -171,6 +195,16 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     )?;
     let buckets =
         rewrites::<BucketInfo, buckets::LegacyBucket>(&db, &bucket_rows, S3_BUCKET_KEYSPACE)?;
+    let info = info_topics::info_cleanup(
+        &db,
+        sync_path,
+        info_topics::InfoRows {
+            applied: &applied_rows,
+            quarantine: &quarantine_rows,
+            usage: &usage_rows,
+            outbox: &outbox_rows,
+        },
+    )?;
     let record = |target: &DocumentTarget| matches!(target, DocumentTarget::GitRecord { .. });
     let git_outbox = mappings::outbox_rows(
         &db,
@@ -253,6 +287,9 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         (&owner_rows, &stale.owner_removes),
         (&upload_rows, &old_uploads.uploads),
         (&part_rows, &old_uploads.parts),
+        (&applied_rows, &info.cursors),
+        (&quarantine_rows, &info.quarantine),
+        (&outbox_rows, &info.outbox),
     ] {
         for key in keys {
             txn.remove(keyspace.clone(), key.clone());
@@ -263,9 +300,14 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
             txn.remove(keyspace.clone(), key.clone());
         }
     }
+    if let Some(usage) = &info.usage {
+        txn.insert(usage_rows.clone(), QUARANTINE_USAGE_KEY, usage.clone());
+    }
     txn.commit()?.map_err(|_| {
         ExplorerError::Decode("migration conflicted with a running node".to_string())
     })?;
+    // The node rows go first, so an interrupted purge still finds `/node-info-v2` and resumes.
+    let (info_ops, fanout_cursors) = info_topics::purge_topics(sync_path, &info.topics)?;
 
     Ok(MigrateOutput {
         database_path: database_path.to_string(),
@@ -307,6 +349,10 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         versions_rewritten: versions.rows.len(),
         buckets_scanned: buckets.scanned,
         buckets_rewritten: buckets.rows.len(),
+        info_ops_deleted: info_ops,
+        info_outbox_deleted: info.outbox.len(),
+        info_quarantine_deleted: info.quarantine.len(),
+        info_cursors_deleted: info.cursors.len() + fanout_cursors,
     })
 }
 
@@ -843,7 +889,7 @@ mod tests {
         assert!(error.to_string().contains(&hex::encode(b"bad")));
     }
 
-    fn node_state(path: &Path) {
+    pub(super) fn node_state(path: &Path) {
         use aruna::identity::{
             BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
         };

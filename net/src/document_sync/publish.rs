@@ -260,7 +260,9 @@ impl DocumentSyncService {
         let document_count = documents.len();
         let mut fast_path = 0usize;
         let mut fallback = 0usize;
-        let oplog = Oplog::with_storage(self.node.storage().clone());
+        // The node's oplog, so a local write waits for a received batch of its topic
+        // instead of voiding that batch's commit.
+        let oplog = self.node.oplog();
         let mut outcome = PublishEventsOutcome::default();
         for (index, document) in documents.into_iter().enumerate() {
             let allow_genesis = document.allow_genesis();
@@ -330,7 +332,7 @@ impl DocumentSyncService {
             let envelope = EventEnvelope::encode_event(&event)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
             let op = match self.publish_event_op(
-                &oplog,
+                oplog,
                 topic_id,
                 actor_id,
                 envelope,
@@ -564,7 +566,7 @@ impl DocumentSyncService {
                     .collect::<Vec<_>>();
                 if !missing_peers.is_empty() {
                     let actor_id = ::irokle::actor_id_for(topic_id, self.node.peer_id());
-                    let oplog = Oplog::with_storage(self.node.storage().clone());
+                    let oplog = self.node.oplog();
                     for peer in missing_peers {
                         oplog
                             .create_control_op(
@@ -592,7 +594,7 @@ impl DocumentSyncService {
                 initial_peers: self.eligible_peers(peers.iter().copied(), Some(topic_id)),
                 replication_policy: ReplicationPolicy::all(),
             };
-            let oplog = Oplog::with_storage(self.node.storage().clone());
+            let oplog = self.node.oplog();
             match oplog.create_topic_genesis(topic_id, actor_id, genesis, self.node.signer()) {
                 Ok(_) => {
                     self.net.schedule_topic_recheck(topic_id)?;

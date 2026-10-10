@@ -5,8 +5,8 @@
 use super::{
     GroupCapOverride, InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeKindInfo,
     PeerContacts, RealmBinding, RealmBindingScope, RealmConnectionStatus, RealmPlacementOverride,
-    RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig, ServiceStatus, UsageResponse,
-    get_info, get_realm_info, get_realm_placement, get_usage, map_handle_error,
+    RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig, ServiceStatus, TelemetryState,
+    UsageResponse, get_info, get_realm_info, get_realm_placement, get_usage, map_handle_error,
     map_placement_error, map_quota_error, map_realm_nodes, mutate_realm_placement, presence_nodes,
     set_realm_quota,
 };
@@ -1461,6 +1461,8 @@ async fn realm_node_details() {
     assert_eq!(node_info.labels.get("tier"), Some(&"hot".to_string()));
     assert_eq!(node_info.urls.s3.as_deref(), Some("s3.example"));
     assert_eq!(node_info.utilization.storage_bytes_used, 4_096);
+    assert_eq!(node_info.telemetry, TelemetryState::Absent);
+    assert_eq!(node_info.telemetry_age_ms, None);
     let serialized = serde_json::to_value(node_info).unwrap();
     assert!(serialized["urls"].get("api").is_none());
     assert!(serialized["utilization"].get("documents_held").is_none());

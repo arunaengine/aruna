@@ -307,7 +307,7 @@ async fn gcs_skips_metadata() {
     let config = group_config(&[("bucket", "data"), ("endpoint", &data.endpoint)]);
 
     let unhardened =
-        build_service::<services::Gcs>(config.clone(), Some(test_guard().layer())).unwrap();
+        build_service::<services::Gcs>(config.clone(), Some(test_guard().context())).unwrap();
     let _ = unhardened.stat("probe").await;
     let ambient = metadata.hits();
 

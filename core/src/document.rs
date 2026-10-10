@@ -565,10 +565,9 @@ impl DocumentTarget {
             Self::WatchInterest { .. } | Self::WatchSubscription { .. } => {
                 bytes.extend_from_slice(b"/watch-interest")
             }
-            // Realm-shared: every node's info/heartbeat document rides one topic
+            // Realm-shared: every node's info document rides one topic
             // (no node id in the suffix) so all realm nodes receive every peer's.
-            // v2 leaves the unbounded heartbeat history behind; Irokle 0.3 admission walks it all.
-            Self::NodeInfo { .. } => bytes.extend_from_slice(b"/node-info-v2"),
+            Self::NodeInfo { .. } => bytes.extend_from_slice(b"/node-info"),
             // Realm-shared: every node subscribes so an access key created on any
             // node replicates to all, making the credential valid realm-wide.
             other => {

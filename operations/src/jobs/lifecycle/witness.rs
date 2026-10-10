@@ -24,6 +24,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::PlacementDecision;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, Key, TxnId};
+use aruna_net::NetHandle;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use tracing::{debug, info, warn};
@@ -41,7 +42,6 @@ use crate::jobs::records::{
 };
 use crate::jobs::store::{batch_delete, iter_prefix_page};
 use crate::metadata::api::load_realm_config;
-use crate::node::node_info::read_info_document;
 
 /// Domain of the stable witness order.
 pub const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";
@@ -459,9 +459,14 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
             return RoundOutcome::Retry { after_ms: base };
         }
     };
-    let silent = silent_nodes(context, family, &records, now_ms, window).await;
+    let running = running_nodes(family, &records);
+    let silent = silent_nodes(net, &running, window);
     if suppressed(family, &records, &silent) {
-        return RoundOutcome::Done;
+        // An unfinished execution suppresses only while its node reports, so look again later.
+        return match suppressed(family, &records, &running) {
+            true => RoundOutcome::Done,
+            false => RoundOutcome::Retry { after_ms: window },
+        };
     }
     let Some(spec) = stored_spec(family, &records) else {
         return RoundOutcome::Retry { after_ms: base };
@@ -718,34 +723,27 @@ pub(crate) fn suppressed(
     })
 }
 
-/// Executor nodes of an unfinished execution whose replicated heartbeat is
-/// older than the catch-up window. A node this responder holds no heartbeat
-/// document for is never called silent: a missing local copy proves nothing.
-async fn silent_nodes(
-    context: &DriverContext,
-    family: JobFamilyId,
-    records: &[JobRecordEnvelope],
-    now_ms: u64,
-    window_ms: u64,
-) -> BTreeSet<NodeId> {
-    let mut silent = BTreeSet::new();
+/// Executor nodes of the family's unfinished executions.
+fn running_nodes(family: JobFamilyId, records: &[JobRecordEnvelope]) -> BTreeSet<NodeId> {
     let Ok(Some(projection)) = reduce_family(family, records) else {
-        return silent;
+        return BTreeSet::new();
     };
-    let running: BTreeSet<NodeId> = projection
+    projection
         .executions
         .iter()
         .filter(|execution| !execution.state.is_terminal())
         .map(|execution| execution.executor_node_id)
-        .collect();
-    for node in running {
-        if let Ok(Some(document)) = read_info_document(&context.storage_handle, node).await
-            && now_ms.saturating_sub(document.utilization.heartbeat_at_ms) > window_ms
-        {
-            silent.insert(node);
-        }
-    }
-    silent
+        .collect()
+}
+
+/// The `running` nodes that sent no heartbeat within the catch-up window. Without any heartbeat
+/// the silence counts from this node's start, so a restart alone never makes a node silent early.
+fn silent_nodes(net: &NetHandle, running: &BTreeSet<NodeId>, window_ms: u64) -> BTreeSet<NodeId> {
+    running
+        .iter()
+        .copied()
+        .filter(|node| net.heartbeat_silence(*node).as_millis() > u128::from(window_ms))
+        .collect()
 }
 
 /// The stored spec of the family's canonical alias.

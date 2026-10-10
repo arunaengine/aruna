@@ -147,11 +147,13 @@ pub async fn bootstrap_onboarding_finalize(
         // so the joiner becomes a shard member without minting.
         net_handle
             .ensure_sync_topics(&onboarding_topics.shared, vec![input.node_id])
+            .await
             .map_err(|error| BootstrapFinalizeError::PeerAdmission(error.to_string()))?;
         let mut all_topics = onboarding_topics.shared;
         all_topics.extend(onboarding_topics.shard);
         net_handle
             .allow_topic_peers(&all_topics, vec![input.node_id])
+            .await
             .map_err(|error| BootstrapFinalizeError::PeerAdmission(error.to_string()))?;
     }
 

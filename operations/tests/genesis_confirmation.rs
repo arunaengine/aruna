@@ -173,7 +173,8 @@ async fn nonmember_adopts_genesis() -> Result<(), Box<dyn std::error::Error>> {
     // an empty sync-peer set).
     co_holder
         .net
-        .ensure_sync_topics(&[topic], vec![co_holder.net.node_id()])?;
+        .ensure_sync_topics(&[topic], vec![co_holder.net.node_id()])
+        .await?;
     assert!(
         co_holder.net.sync_topic_exists(topic).unwrap_or(false),
         "the co-holder must hold the genesis before the probe"

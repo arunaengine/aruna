@@ -144,8 +144,10 @@ async fn sync_skips_devices() -> Result<(), Box<dyn std::error::Error>> {
 
     let topic =
         DocumentTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
-    realm.ensure_sync_topics(&[topic], vec![device, server])?;
-    realm.allow_topic_peers(&[topic], vec![device])?;
+    realm
+        .ensure_sync_topics(&[topic], vec![device, server])
+        .await?;
+    realm.allow_topic_peers(&[topic], vec![device]).await?;
 
     let members = realm
         .document_sync_node()

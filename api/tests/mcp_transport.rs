@@ -42,7 +42,7 @@ use axum::http::{HeaderValue, header};
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
 use rmcp::model::{
-    CallToolRequestParams, ClientInfo, GetPromptRequestParams, ProtocolVersion,
+    CallToolRequestParams, ClientConfig, GetPromptRequestParams, ProtocolVersion,
     ReadResourceRequestParams, ResourceContents,
 };
 use rmcp::service::RunningService;
@@ -266,12 +266,12 @@ async fn start_server(state: Arc<ServerState>) -> (String, CancellationToken, Se
     (format!("http://{address}/mcp"), shutdown, task)
 }
 
-async fn connect(url: &str, token: &str) -> RunningService<RoleClient, ClientInfo> {
+async fn connect(url: &str, token: &str) -> RunningService<RoleClient, ClientConfig> {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(url.to_string())
             .auth_header(token.to_string()),
     );
-    ClientInfo::default()
+    ClientConfig::default()
         .serve_with_lifecycle(
             transport,
             ClientLifecycleMode::Discover {
@@ -283,7 +283,7 @@ async fn connect(url: &str, token: &str) -> RunningService<RoleClient, ClientInf
 }
 
 async fn call(
-    client: &RunningService<RoleClient, ClientInfo>,
+    client: &RunningService<RoleClient, ClientConfig>,
     tool: &str,
     args: Value,
 ) -> rmcp::model::CallToolResult {
@@ -356,7 +356,7 @@ async fn mcp_transport_contract() {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(url).auth_header(fixture.token.clone()),
     );
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve_with_lifecycle(
             transport,
             ClientLifecycleMode::Discover {

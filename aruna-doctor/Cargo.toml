@@ -32,6 +32,7 @@ ed25519-dalek = { workspace = true }
 fjall = { workspace = true }
 hex = { workspace = true }
 iroh = { workspace = true }
+irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
 postcard = { workspace = true }
 rand = { workspace = true }

@@ -862,10 +862,12 @@ impl Topology {
         .sync_topic_id(self.realm_id, &PlacementRef::NIL);
         self.nodes[0]
             .net
-            .ensure_sync_topics(&[shared_topic], vec![node_id])?;
+            .ensure_sync_topics(&[shared_topic], vec![node_id])
+            .await?;
         self.nodes[0]
             .net
-            .allow_topic_peers(&[shared_topic], vec![node_id])?;
+            .allow_topic_peers(&[shared_topic], vec![node_id])
+            .await?;
 
         // The joiner runs the startup hook and joins the realm-config topic, as
         // a freshly started node does; without it no admin event reaches it.

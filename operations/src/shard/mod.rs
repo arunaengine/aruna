@@ -286,6 +286,7 @@ mod tests {
         let net = context.net_handle.as_ref().unwrap();
         let topic = shard_topic_id(realm_id, &placement);
         net.ensure_sync_topics(&[topic], Vec::new())
+            .await
             .expect("ensure topic");
 
         let manifest = assemble_shard_manifest(&context, realm_id, placement)

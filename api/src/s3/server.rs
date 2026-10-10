@@ -45,6 +45,7 @@ use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::HttpError;
 use s3s::HttpResponse;
+use s3s::config::{S3Config, StaticConfigProvider};
 use s3s::host::SingleDomain;
 use s3s::service::S3Service;
 use s3s::service::S3ServiceBuilder;
@@ -329,7 +330,7 @@ impl PreparedRequest {
                     return self.trace.fail(
                         "unknown",
                         "Failed to query bucket CORS configuration",
-                        HttpError::new(error.into()),
+                        HttpError::from_std_error(error.into()),
                     );
                 }
             }
@@ -406,7 +407,7 @@ impl PreparedRequest {
                     Err(error) => {
                         return error
                             .to_http_response()
-                            .map_err(|error| HttpError::new(Box::new(error)));
+                            .map_err(|error| HttpError::from_std_error(Box::new(error)));
                     }
                 };
                 let handler =
@@ -622,7 +623,15 @@ fn build_s3_service(
     builder.set_auth(auth.clone());
     builder.set_access(auth);
     builder.set_validation(AwsNameValidation::new());
+    builder.set_config(sig_v2_config());
     Ok(builder.build())
+}
+
+/// Keeps Signature Version 2 requests accepted; s3s 0.17 rejects them by default.
+fn sig_v2_config() -> Arc<StaticConfigProvider> {
+    let mut config = S3Config::default();
+    config.enable_sig_v2 = true;
+    Arc::new(StaticConfigProvider::new(Arc::new(config)))
 }
 
 impl S3Server {
@@ -1144,6 +1153,7 @@ mod tests {
         let mut auth = s3s::auth::SimpleAuth::from_single("TOKENKEY", "signing-secret");
         auth.register("ASIAKEY".to_string(), "signing-secret".into());
         builder.set_auth(auth);
+        builder.set_config(sig_v2_config());
         let service = WrappingService {
             shared: builder.build(),
             cors: CorsConfig::default(),
@@ -1200,11 +1210,14 @@ mod tests {
 
     #[tokio::test]
     async fn sigv2_token_hidden() {
+        let date = chrono::Utc::now()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
         let request = |token| {
             let mut request = Request::builder()
                 .uri("/bucket/key")
                 .header(header::HOST, "localhost")
-                .header(header::DATE, "Mon, 05 Oct 2026 12:00:00 GMT")
+                .header(header::DATE, date.as_str())
                 .header(header::AUTHORIZATION, "AWS TOKENKEY:invalid")
                 .body(s3s::Body::empty())
                 .unwrap();
@@ -1349,8 +1362,15 @@ mod tests {
                         fields.push(("X-Amz-Security-Token", TOKEN_CANARY));
                     }
                 }
+                // s3s 0.17 rejects repeated POST form fields.
+                let repeated = key == "ASIAKEY" && chunk == 1;
                 let (status, logs) = request_trace(form_request(&fields, chunk)).await;
-                assert_eq!(status, http::StatusCode::NO_CONTENT, "{logs}");
+                let expected = if repeated {
+                    http::StatusCode::BAD_REQUEST
+                } else {
+                    http::StatusCode::NO_CONTENT
+                };
+                assert_eq!(status, expected, "{logs}");
                 assert!(logs.contains("checking post signature v2"), "{logs}");
                 assert!(!logs.contains(TOKEN_CANARY), "{logs}");
                 assert_eq!(
