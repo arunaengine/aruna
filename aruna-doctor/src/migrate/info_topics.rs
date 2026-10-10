@@ -1,6 +1,5 @@
-//! Deletes the node info topics whose ops carried a heartbeat every minute, with the sync cursors,
-//! quarantine rows and queued node info publishes that name them. Each node publishes its info
-//! again on start, into a fresh `/node-info` topic.
+//! Deletes the old heartbeat-carrying node info topics with their sync cursors, quarantine rows and
+//! queued publishes. Each node publishes its info again on start, into a fresh `/node-info` topic.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

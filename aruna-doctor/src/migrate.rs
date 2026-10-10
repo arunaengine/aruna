@@ -1,6 +1,5 @@
-//! Re-encodes legacy rows, adds missing event size rows, seals plain secrets, moves node secrets
-//! into the node vault, deletes unreadable S3 sessions and uploads and the former node info
-//! topics; repeats are safe.
+//! Re-encodes legacy rows, adds missing event size rows, seals plain secrets and moves node secrets
+//! to the node vault; deletes unreadable S3 sessions, uploads and old node info topics. Repeatable.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

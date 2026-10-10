@@ -1,6 +1,5 @@
-//! Pushes and receives heartbeats with live telemetry between sync peers over the heartbeat
-//! protocol. One stream carries one length-prefixed heartbeat and no response; nothing is written
-//! to disk.
+//! Pushes and receives heartbeats with live telemetry between sync peers over the heartbeat protocol.
+//! One stream carries one length-prefixed heartbeat and no response; nothing is written to disk.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
