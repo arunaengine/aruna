@@ -49,10 +49,23 @@ use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
 use ulid::Ulid;
 
+fn unsupported<T>() -> opendal::Result<T> {
+    Err(opendal::Error::new(
+        opendal::ErrorKind::Unsupported,
+        "operation is not supported",
+    ))
+}
+
 mod failing_close {
+    use super::unsupported;
     use opendal::raw::oio;
-    use opendal::raw::{Access, AccessorInfo, OpWrite, RpWrite};
-    use opendal::{Buffer, Builder, Capability, Error, ErrorKind, Metadata, Operator};
+    use opendal::raw::{
+        OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite, RpCreateDir,
+        RpPresign, RpRename, RpStat, Service, ServiceInfo,
+    };
+    use opendal::{
+        Buffer, Builder, Capability, Error, ErrorKind, Metadata, OperationContext, Operator,
+    };
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
 
@@ -65,7 +78,7 @@ mod failing_close {
     impl Builder for CloseFailsBuilder {
         type Config = ();
 
-        fn build(self) -> opendal::Result<impl Access> {
+        fn build(self) -> opendal::Result<impl Service> {
             Ok(CloseFailsBackend {
                 aborts: self.aborts,
                 sizes: self.sizes,
@@ -79,39 +92,86 @@ mod failing_close {
         sizes: Arc<Mutex<Vec<usize>>>,
     }
 
-    impl Access for CloseFailsBackend {
+    impl Service for CloseFailsBackend {
         type Reader = ();
         type Writer = CloseFailsWriter;
         type Lister = ();
         type Deleter = ();
         type Copier = ();
+        type Composer = ();
 
-        fn info(&self) -> Arc<AccessorInfo> {
-            let info = Arc::new(AccessorInfo::default());
-            info.set_scheme("close_fails")
-                .set_root("/")
-                .set_native_capability(Capability {
-                    write: true,
-                    write_can_empty: true,
-                    write_can_multi: true,
-                    write_multi_min_size: Some(5 * 1024 * 1024),
-                    ..Default::default()
-                });
-            info
+        fn info(&self) -> ServiceInfo {
+            ServiceInfo::new("close_fails", "/", "")
         }
 
-        async fn write(
+        fn capability(&self) -> Capability {
+            Capability {
+                write: true,
+                write_can_empty: true,
+                write_can_multi: true,
+                write_multi_min_size: Some(5 * 1024 * 1024),
+                ..Default::default()
+            }
+        }
+
+        fn write(
             &self,
+            _: &OperationContext,
             _path: &str,
             _args: OpWrite,
-        ) -> opendal::Result<(RpWrite, Self::Writer)> {
-            Ok((
-                RpWrite::new(),
-                CloseFailsWriter {
-                    aborts: self.aborts.clone(),
-                    sizes: self.sizes.clone(),
-                },
-            ))
+        ) -> opendal::Result<Self::Writer> {
+            Ok(CloseFailsWriter {
+                aborts: self.aborts.clone(),
+                sizes: self.sizes.clone(),
+            })
+        }
+
+        fn delete(&self, _: &OperationContext) -> opendal::Result<Self::Deleter> {
+            unsupported()
+        }
+
+        async fn create_dir(
+            &self,
+            _: &OperationContext,
+            _: &str,
+            _: OpCreateDir,
+        ) -> opendal::Result<RpCreateDir> {
+            unsupported()
+        }
+
+        async fn stat(&self, _: &OperationContext, _: &str, _: OpStat) -> opendal::Result<RpStat> {
+            unsupported()
+        }
+
+        fn read(&self, _: &OperationContext, _: &str, _: OpRead) -> opendal::Result<()> {
+            unsupported()
+        }
+
+        fn list(&self, _: &OperationContext, _: &str, _: OpList) -> opendal::Result<()> {
+            unsupported()
+        }
+
+        fn copy(&self, _: &OperationContext, _: &str, _: &str, _: OpCopy) -> opendal::Result<()> {
+            unsupported()
+        }
+
+        async fn rename(
+            &self,
+            _: &OperationContext,
+            _: &str,
+            _: &str,
+            _: OpRename,
+        ) -> opendal::Result<RpRename> {
+            unsupported()
+        }
+
+        async fn presign(
+            &self,
+            _: &OperationContext,
+            _: &str,
+            _: OpPresign,
+        ) -> opendal::Result<RpPresign> {
+            unsupported()
         }
     }
 
@@ -146,8 +206,7 @@ mod failing_close {
             aborts: aborts.clone(),
             ..Default::default()
         })
-        .unwrap()
-        .finish();
+        .unwrap();
         (operator, aborts)
     }
 
@@ -157,16 +216,21 @@ mod failing_close {
             sizes: sizes.clone(),
             ..Default::default()
         })
-        .unwrap()
-        .finish();
+        .unwrap();
         (operator, sizes)
     }
 }
 
 mod failing_cleanup {
+    use super::unsupported;
     use opendal::raw::oio;
-    use opendal::raw::{Access, AccessorInfo, OpWrite, RpWrite};
-    use opendal::{Buffer, Builder, Capability, Error, ErrorKind, Metadata, Operator};
+    use opendal::raw::{
+        OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite, RpCreateDir,
+        RpPresign, RpRename, RpStat, Service, ServiceInfo,
+    };
+    use opendal::{
+        Buffer, Builder, Capability, Error, ErrorKind, Metadata, OperationContext, Operator,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -179,7 +243,7 @@ mod failing_cleanup {
     impl Builder for CleanupBuilder {
         type Config = ();
 
-        fn build(self) -> opendal::Result<impl Access> {
+        fn build(self) -> opendal::Result<impl Service> {
             Ok(CleanupBackend {
                 delete_calls: self.delete_calls,
                 writer: self.writer,
@@ -193,36 +257,82 @@ mod failing_cleanup {
         writer: CleanupWriter,
     }
 
-    impl Access for CleanupBackend {
+    impl Service for CleanupBackend {
         type Reader = ();
         type Writer = CleanupWriter;
         type Lister = ();
         type Deleter = ();
         type Copier = ();
+        type Composer = ();
 
-        fn info(&self) -> std::sync::Arc<AccessorInfo> {
-            let info = std::sync::Arc::new(AccessorInfo::default());
-            info.set_scheme("cleanup_fails")
-                .set_root("/")
-                .set_native_capability(Capability {
-                    write: true,
-                    delete: true,
-                    ..Default::default()
-                });
-            info
+        fn info(&self) -> ServiceInfo {
+            ServiceInfo::new("cleanup_fails", "/", "")
         }
 
-        async fn write(
+        fn capability(&self) -> Capability {
+            Capability {
+                write: true,
+                delete: true,
+                ..Default::default()
+            }
+        }
+
+        fn write(
             &self,
+            _: &OperationContext,
             _path: &str,
             _args: OpWrite,
-        ) -> opendal::Result<(RpWrite, Self::Writer)> {
-            Ok((RpWrite::new(), self.writer.clone()))
+        ) -> opendal::Result<Self::Writer> {
+            Ok(self.writer.clone())
         }
 
-        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
+        fn delete(&self, _: &OperationContext) -> opendal::Result<Self::Deleter> {
             self.delete_calls.fetch_add(1, Ordering::SeqCst);
             Err(Error::new(ErrorKind::Unexpected, "injected delete failure"))
+        }
+
+        async fn create_dir(
+            &self,
+            _: &OperationContext,
+            _: &str,
+            _: OpCreateDir,
+        ) -> opendal::Result<RpCreateDir> {
+            unsupported()
+        }
+
+        async fn stat(&self, _: &OperationContext, _: &str, _: OpStat) -> opendal::Result<RpStat> {
+            unsupported()
+        }
+
+        fn read(&self, _: &OperationContext, _: &str, _: OpRead) -> opendal::Result<()> {
+            unsupported()
+        }
+
+        fn list(&self, _: &OperationContext, _: &str, _: OpList) -> opendal::Result<()> {
+            unsupported()
+        }
+
+        fn copy(&self, _: &OperationContext, _: &str, _: &str, _: OpCopy) -> opendal::Result<()> {
+            unsupported()
+        }
+
+        async fn rename(
+            &self,
+            _: &OperationContext,
+            _: &str,
+            _: &str,
+            _: OpRename,
+        ) -> opendal::Result<RpRename> {
+            unsupported()
+        }
+
+        async fn presign(
+            &self,
+            _: &OperationContext,
+            _: &str,
+            _: OpPresign,
+        ) -> opendal::Result<RpPresign> {
+            unsupported()
         }
     }
 
@@ -259,8 +369,7 @@ mod failing_cleanup {
             delete_calls: delete_calls.clone(),
             writer: CleanupWriter::default(),
         })
-        .unwrap()
-        .finish();
+        .unwrap();
         (operator, delete_calls)
     }
 
@@ -274,8 +383,7 @@ mod failing_cleanup {
             delete_calls: delete_calls.clone(),
             writer: writer.clone(),
         })
-        .unwrap()
-        .finish();
+        .unwrap();
         (operator, delete_calls, writer)
     }
 }

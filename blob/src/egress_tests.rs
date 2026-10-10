@@ -297,8 +297,7 @@ async fn blocks_literal_target() {
         "http://169.254.169.254".to_string(),
     )]))
     .unwrap()
-    .layer(guard.layer())
-    .finish();
+    .with_context(guard.context());
 
     let error = operator.stat("token").await.unwrap_err();
 

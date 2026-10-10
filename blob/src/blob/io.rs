@@ -2151,8 +2151,7 @@ mod tests {
             opendal::Operator::from_iter::<opendal::services::Fs>(std::collections::HashMap::from(
                 [("root".to_string(), dir.path().to_str().unwrap().to_string())],
             ))
-            .unwrap()
-            .finish();
+            .unwrap();
         for index in 0..HIDDEN_LIST_PAGE + 5 {
             operator
                 .write(&format!("hidden/blob-{index:04}"), Bytes::from_static(b"x"))
