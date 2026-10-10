@@ -51,7 +51,7 @@ async-compression = { version = "0.4.50", default-features = false, features = [
     "deflate",
 ] }
 async-trait = "0.1.92"
-async_zip = { package = "astral_async_zip", version = "0.0.20", features = [
+async_zip = { package = "astral_async_zip", version = "0.0.22", features = [
     "tokio",
     "deflate",
 ] }
@@ -81,8 +81,8 @@ cel-interpreter = "0.10.0"
 chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
-# Pinned to craqle 0.3.1 main with Irokle 0.3.1; it resolves the irokle below.
-craqle = { git = "https://github.com/arunaengine/craqle", rev = "bcbb8a716e93553e2c765b40625106d590e23845", features = [
+# Pinned to craqle 0.3.2 main with Irokle 0.3.2; it resolves the irokle below.
+craqle = { git = "https://github.com/arunaengine/craqle", rev = "9a21ab6fb1cf535ccf412db2ba35583f41d62ddf", features = [
     "iroh",
     "shacl-core",
 ] }
@@ -122,7 +122,7 @@ hyper-util = { version = "0.1.21", features = [
 ipnet = "2.12.2"
 iroh = "1.3.0"
 # Pinned to the exact revision craqle uses so one irokle crate is resolved.
-irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "4a35e112b4468f7bba5359cfbee14f221d05807e", features = [
+irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "209f881af3fa4b8ed16e2ca0a0315d663029329e", features = [
     "fjall",
     "iroh",
 ] }
@@ -133,7 +133,7 @@ lru = "0.18.5"
 md5 = "0.8.1"
 mime = "0.3.17"
 nix = { version = "0.31.3", features = ["time", "fs", "process", "signal"] }
-opendal = { version = "0.57.0", features = [
+opendal = { version = "0.59.4", features = [
     "services-azblob",
     "services-azdls",
     "services-b2",
@@ -143,14 +143,15 @@ opendal = { version = "0.57.0", features = [
     "services-http",
     "services-webdav",
 ] }
-opentelemetry = { version = "0.32.0", default-features = false, features = [
+opendal-http-transport-reqwest = { version = "0.59.4", default-features = false }
+opentelemetry = { version = "0.33.1", default-features = false, features = [
     "trace",
 ] }
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = [
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = [
     "trace",
     "grpc-tonic",
 ] }
-opentelemetry_sdk = { version = "0.32.1", default-features = false, features = [
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
     "trace",
     "rt-tokio",
 ] }
@@ -186,11 +187,11 @@ kube = { version = "4.2.0", default-features = false, features = [
     "ws",
 ] }
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
-s3s = "0.15.0"
+s3s = "0.17.0"
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
-serde-saphyr = "0.0.29"
+serde-saphyr = "1.3.0"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 sha2_010 = { package = "sha2", version = "0.10.9", default-features = false }
@@ -211,7 +212,7 @@ tower = { version = "0.5.3", features = ["limit"] }
 tower-http = { version = "0.7.1", features = ["compression-br", "compression-gzip", "cors", "fs", "timeout"] }
 tracing = "0.1.44"
 tracing-core = "0.1.36"
-tracing-opentelemetry = { version = "0.33.0", default-features = false }
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", features = [
     "env-filter",
     "time",
@@ -223,21 +224,21 @@ ulid = { version = "3.0.0", features = ["serde"] }
 unicode-normalization = "0.1.25"
 url = "2.5.8"
 uuid = { version = "1.28.0", features = ["v4"] }
-utoipa = { version = "5.5.0", features = [
+utoipa = { version = "6.0.0", features = [
     "chrono",
     "axum_extras",
     "ulid",
     "url",
 ] }
-utoipa-axum = "0.2.0"
-utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+utoipa-axum = "0.3.0"
+utoipa-swagger-ui = { version = "10.0.1", features = ["axum"] }
 # Exact: the portal's wasm-bindgen-cli must match this version.
 wasm-bindgen = "=0.2.127"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
 zeroize = "1.9.1"
-zip = { version = "8.6.0", default-features = false }
-zstd = "0.13.3"
+zip = { version = "9.0.1", default-features = false }
+zstd = "0.14.1"
 
 [profile.release]
 panic = "abort"
