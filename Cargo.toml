@@ -46,7 +46,7 @@ aruna-tasks = { path = "tasks" }
 aes-gcm = "0.11.1"
 aes-gcm-core = { package = "aes-gcm", version = "0.11.1", default-features = false, features = ["aes", "zeroize"] }
 ahash = "0.8.12"
-async-compression = { version = "0.4.46", default-features = false, features = [
+async-compression = { version = "0.4.50", default-features = false, features = [
     "tokio",
     "deflate",
 ] }
@@ -59,15 +59,15 @@ aws-config = { version = "1.12.0", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
 ] }
-aws-sdk-s3 = { version = "1.146.0", default-features = false, features = [
+aws-sdk-s3 = { version = "1.152.0", default-features = false, features = [
     "default-https-client",
     "http-1x",
     "rt-tokio",
 ] }
-aws-smithy-http-client = { version = "1.4.0", default-features = false, features = [
+aws-smithy-http-client = { version = "1.5.0", default-features = false, features = [
     "rustls-aws-lc",
 ] }
-aws-smithy-runtime-api = { version = "1.16.0", features = ["client"] }
+aws-smithy-runtime-api = { version = "1.19.0", features = ["client"] }
 axum = "0.8.9"
 bao-tree = "0.16.1"
 base64 = "0.23.1"
@@ -80,7 +80,7 @@ cap-std = "4.0.3"
 cel-interpreter = "0.10.0"
 chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
-clap = { version = "4.6.6", features = ["derive", "env"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 # Pinned to craqle 0.3.1 main with Irokle 0.3.1; it resolves the irokle below.
 craqle = { git = "https://github.com/arunaengine/craqle", rev = "bcbb8a716e93553e2c765b40625106d590e23845", features = [
     "iroh",
@@ -110,8 +110,8 @@ hpke = { version = "0.14.1", default-features = false, features = [
 http = "1.5.0"
 http-body = "1.1.0"
 httparse = "1.10.1"
-hyper = { version = "1.11.1", features = ["full"] }
-hyper-util = { version = "0.1.20", features = [
+hyper = { version = "1.12.0", features = ["full"] }
+hyper-util = { version = "0.1.21", features = [
     "server",
     "server-auto",
     "http1",
@@ -120,16 +120,16 @@ hyper-util = { version = "0.1.20", features = [
     "service",
 ] }
 ipnet = "2.12.2"
-iroh = "1.2.0"
+iroh = "1.3.0"
 # Pinned to the exact revision craqle uses so one irokle crate is resolved.
 irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "4a35e112b4468f7bba5359cfbee14f221d05807e", features = [
     "fjall",
     "iroh",
 ] }
 iroh-io = "0.6.2"
-jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 json-patch = "4.2.0"
-lru = "0.18.4"
+lru = "0.18.5"
 md5 = "0.8.1"
 mime = "0.3.17"
 nix = { version = "0.31.3", features = ["time", "fs", "process", "signal"] }
@@ -164,19 +164,19 @@ postcard = { version = "1.1.3", features = ["alloc"] }
 prometheus-client = "0.25"
 proptest = "1.11.0"
 quick-xml = "0.42.0"
-rand = "0.10.2"
+rand = "0.10.3"
 rand_core = { version = "0.10.1", default-features = false }
 reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
     "rustls",
     "stream",
 ] }
-rmcp = { version = "3.3.0", default-features = false, features = [
+rmcp = { version = "3.5.1", default-features = false, features = [
     "server",
     "macros",
     "transport-streamable-http-server",
 ] }
-rustix = { version = "1.1.4", features = ["fs", "process"] }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
 rustls = { version = "0.23.45", features = ["ring"] }
 kube = { version = "4.2.0", default-features = false, features = [
     "client",
@@ -202,11 +202,11 @@ sysinfo = { version = "0.39.6", default-features = false, features = [
 ] }
 tar = "0.4.46"
 tempfile = "3.27.0"
-thiserror = "2.0.20"
-thiserror-core = { package = "thiserror", version = "2.0.20", default-features = false }
-tokio = { version = "1.53.1", features = ["full", "tracing"] }
-toml = "1.1.6"
-tokio-util = { version = "0.7.19", features = ["compat", "io-util", "rt"] }
+thiserror = "2.0.21"
+thiserror-core = { package = "thiserror", version = "2.0.21", default-features = false }
+tokio = { version = "1.53.2", features = ["full", "tracing"] }
+toml = "1.1.8"
+tokio-util = { version = "0.7.20", features = ["compat", "io-util", "rt"] }
 tower = { version = "0.5.3", features = ["limit"] }
 tower-http = { version = "0.7.1", features = ["compression-br", "compression-gzip", "cors", "fs", "timeout"] }
 tracing = "0.1.44"
@@ -222,7 +222,7 @@ tracing-subscriber = { version = "0.3.23", features = [
 ulid = { version = "3.0.0", features = ["serde"] }
 unicode-normalization = "0.1.25"
 url = "2.5.8"
-uuid = { version = "1.26.1", features = ["v4"] }
+uuid = { version = "1.28.0", features = ["v4"] }
 utoipa = { version = "5.5.0", features = [
     "chrono",
     "axum_extras",
@@ -235,7 +235,7 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 wasm-bindgen = "=0.2.127"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
-zeroize = "1.9.0"
+zeroize = "1.9.1"
 zip = { version = "8.6.0", default-features = false }
 zstd = "0.13.3"
 
