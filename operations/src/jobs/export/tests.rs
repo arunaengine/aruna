@@ -639,7 +639,7 @@ async fn assert_roundtrip(handle: &BlobHandle, eln: bool, version: &str, seed: u
 
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&exported)).unwrap();
     let names = (0..archive.len())
-        .map(|index| archive.by_index(index).unwrap().name().to_string())
+        .map(|index| archive.by_index(index).unwrap().name().unwrap().to_string())
         .collect::<Vec<_>>();
     assert_eq!(
         names,
@@ -1810,7 +1810,7 @@ async fn orders_zip_entries() {
     let bytes = sample_archive().await;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
     let names = (0..archive.len())
-        .map(|index| archive.by_index(index).unwrap().name().to_string())
+        .map(|index| archive.by_index(index).unwrap().name().unwrap().to_string())
         .collect::<Vec<_>>();
 
     assert_eq!(
