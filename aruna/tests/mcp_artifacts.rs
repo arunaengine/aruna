@@ -16,7 +16,7 @@ use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
 use aruna_core::structs::execution::job::JobId;
 use aws_sdk_s3::primitives::ByteStream;
-use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo, ProtocolVersion};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig, ProtocolVersion};
 use rmcp::service::RunningService;
 use rmcp::transport::{
     StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -108,12 +108,12 @@ async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
     })
 }
 
-async fn connect(base_url: &str, token: &str) -> RunningService<RoleClient, ClientInfo> {
+async fn connect(base_url: &str, token: &str) -> RunningService<RoleClient, ClientConfig> {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("{base_url}/mcp"))
             .auth_header(token.to_string()),
     );
-    ClientInfo::default()
+    ClientConfig::default()
         .serve_with_lifecycle(
             transport,
             ClientLifecycleMode::Discover {
@@ -124,7 +124,7 @@ async fn connect(base_url: &str, token: &str) -> RunningService<RoleClient, Clie
         .expect("MCP client connects to the node")
 }
 
-async fn call(client: &RunningService<RoleClient, ClientInfo>, tool: &str, args: Value) -> Value {
+async fn call(client: &RunningService<RoleClient, ClientConfig>, tool: &str, args: Value) -> Value {
     let request = match args {
         Value::Null => CallToolRequestParams::new(tool.to_string()),
         value => CallToolRequestParams::new(tool.to_string())
@@ -146,7 +146,7 @@ fn is_error(result: &CallToolResult) -> bool {
 
 /// One `get_job` answer, or the refusal while the family cannot be served yet.
 async fn job_view(
-    client: &RunningService<RoleClient, ClientInfo>,
+    client: &RunningService<RoleClient, ClientConfig>,
     job_id: JobId,
 ) -> Result<Value, String> {
     let request = CallToolRequestParams::new("get_job".to_string()).with_arguments(
@@ -169,7 +169,7 @@ async fn job_view(
 /// pull outlasts any fixed budget while the view still moves. A family whose
 /// records are still landing answers unavailable, so a refusal is retried.
 async fn wait_view(
-    client: &RunningService<RoleClient, ClientInfo>,
+    client: &RunningService<RoleClient, ClientConfig>,
     job_id: JobId,
     idle: Duration,
 ) -> Value {
