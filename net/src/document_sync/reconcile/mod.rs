@@ -152,7 +152,7 @@ impl DocumentSyncService {
         member_peers: &BTreeSet<PeerId>,
         local_peer: PeerId,
     ) -> Result<()> {
-        let oplog = Oplog::with_storage(self.node.storage().clone());
+        let oplog = self.node.oplog();
         for (topic_id, state) in states {
             let missing_peers = member_peers
                 .iter()
