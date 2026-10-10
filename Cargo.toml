@@ -81,8 +81,8 @@ cel-interpreter = "0.10.0"
 chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }
-# Pinned to craqle 0.3.0 main with nested SHACL shapes and the search rebuild fix; it resolves the irokle below.
-craqle = { git = "https://github.com/arunaengine/craqle", rev = "4621f4e36136398bf1da8bca6961d51f46ceb767", features = [
+# Pinned to craqle 0.3.1 main with Irokle 0.3.1; it resolves the irokle below.
+craqle = { git = "https://github.com/arunaengine/craqle", rev = "bcbb8a716e93553e2c765b40625106d590e23845", features = [
     "iroh",
     "shacl-core",
 ] }
@@ -92,7 +92,7 @@ crypto_box = "0.9.1"
 dirs = "7.0.0"
 dotenvy = "0.15.7"
 ed25519-dalek = { version = "3.0.0", features = ["pem"] }
-fjall = "3.1.10"
+fjall = "3.1.12"
 flate2 = "1.1.10"
 futures = "0.3.34"
 futures-core = "0.3.34"
@@ -122,7 +122,7 @@ hyper-util = { version = "0.1.20", features = [
 ipnet = "2.12.2"
 iroh = "1.2.0"
 # Pinned to the exact revision craqle uses so one irokle crate is resolved.
-irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "f3770c5186d34603753e26912b6450d077680205", features = [
+irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "4a35e112b4468f7bba5359cfbee14f221d05807e", features = [
     "fjall",
     "iroh",
 ] }
