@@ -51,7 +51,11 @@ pub(super) async fn target(
         return Ok(None);
     }
     let (location, _) = location::effective(context, document).await?;
-    let auth = author(merge.user_id);
+    // Pushed files are stored in the realm that holds the document.
+    let auth = AuthContext {
+        realm_id: document.realm_id,
+        ..author(merge.user_id)
+    };
     let bucket = match location::writable(context, &auth, document, &location).await {
         Ok(bucket) => Some(bucket),
         Err(error) => {
@@ -140,7 +144,10 @@ impl PushTarget {
         let Some(bytes) = bytes else {
             return Ok(None);
         };
-        let auth = author(merge.user_id);
+        let auth = AuthContext {
+            realm_id: document.realm_id,
+            ..author(merge.user_id)
+        };
         let key = self.location.key(path);
         let name = self.location.bucket.as_str();
         let node = context
