@@ -236,7 +236,7 @@ pub async fn submit_execution_job(
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
     let job_id = mint_local_job(
         context,
-        created_by.realm_id,
+        context.serving_realm(created_by.realm_id),
         owner_node_id,
         dedup_key.as_deref(),
     )
@@ -392,7 +392,7 @@ pub(crate) async fn submit_mint_local(
     let dedup_key = Some(pid_dedup_key(spec.document_id));
     let job_id = mint_local_job(
         context,
-        created_by.realm_id,
+        context.serving_realm(created_by.realm_id),
         owner_node_id,
         dedup_key.as_deref(),
     )
@@ -764,7 +764,7 @@ async fn linked_push_job(
     let Some(destination) = spec.destination.as_ref().filter(|dest| dest.link.is_some()) else {
         return Ok(None);
     };
-    if record.created_by.realm_id != auth.realm_id {
+    if context.serving_realm(record.created_by.realm_id) != auth.realm_id {
         return Ok(None);
     }
     // The report lists the dataset's files, so the admin also needs READ on the dataset.
@@ -1364,7 +1364,7 @@ async fn family_cancel(
 ) -> Option<Result<RoutedCancelOutcome, JobRouteError>> {
     let auth = AuthContext {
         user_id,
-        realm_id: user_id.realm_id,
+        realm_id: context.serving_realm(user_id.realm_id),
         path_restrictions: None,
         session: None,
     };

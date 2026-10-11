@@ -1123,9 +1123,9 @@ impl JobRecordEnvelope {
         if spec.realm_id != context.realm_id {
             return Err(JobRecordError::RealmMismatch);
         }
-        // The stored submitter is the authority every later round re-checks, so
-        // it must belong to the realm the record was published in.
-        if spec.created_by.realm_id != spec.realm_id {
+        // The stored submitter is the authority every later round re-checks: a user of
+        // another realm signed in here, but never an anonymous identity of another realm.
+        if spec.created_by.realm_id != spec.realm_id && spec.created_by.is_nil() {
             return Err(JobRecordError::Unauthorized);
         }
         if spec.placement != context.placement {

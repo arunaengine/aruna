@@ -73,7 +73,7 @@ pub async fn store_outputs(
         committed_at_ms: aruna_core::time::unix_timestamp_millis(),
     };
     let envelope = JobRecordEnvelope::signed_with(
-        record.created_by.realm_id,
+        context.serving_realm(record.created_by.realm_id),
         JobFamilyRecord::Output(Box::new(output)),
         net.node_id(),
         |message| net.sign(message),

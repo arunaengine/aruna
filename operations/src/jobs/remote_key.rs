@@ -230,8 +230,7 @@ pub(crate) async fn remote_waits(
                 });
         }
     }
-    let realm_id = context.net_handle.as_ref().map(|net| *net.realm_id());
-    let auth = owner_auth(record, realm_id.unwrap_or(record.created_by.realm_id));
+    let auth = owner_auth(record, context.serving_realm(record.created_by.realm_id));
     let mut waits = Vec::new();
     for (node, targets) in by_node {
         waits.extend(ask_waits(context, &auth, record.job_id, node, &targets).await);

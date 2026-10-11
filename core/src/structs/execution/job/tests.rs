@@ -1052,6 +1052,25 @@ fn rejects_foreign_placement() {
 }
 
 #[test]
+fn keeps_foreign_submitter() {
+    // A user of another realm signed in here may submit; an anonymous one of another realm not.
+    let view = LocalView::new();
+    for (created_by, verdict) in [
+        (user(9, 2), Ok(RecordVerdict::Authentic)),
+        (
+            UserId::nil(RealmId([9u8; 32])),
+            Err(JobRecordError::Unauthorized),
+        ),
+    ] {
+        let mut spec = sample_spec();
+        spec.created_by = created_by;
+        let spec = spec.store_digest().unwrap();
+        let signed = envelope(JobFamilyRecord::Spec(Box::new(spec)), 1);
+        assert_eq!(signed.verify(&view.context()), verdict);
+    }
+}
+
+#[test]
 fn binds_receipt_launch() {
     let view = LocalView::new();
     let launch = sample_launch();

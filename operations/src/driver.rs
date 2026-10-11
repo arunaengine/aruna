@@ -42,6 +42,18 @@ pub struct DriverContext {
     pub compute_handle: Option<std::sync::Arc<ExecutorRegistry>>,
 }
 
+impl DriverContext {
+    /// The realm this node serves; `fallback` on a node without a net transport.
+    pub fn serving_realm(
+        &self,
+        fallback: aruna_core::structs::identity::realm::RealmId,
+    ) -> aruna_core::structs::identity::realm::RealmId {
+        self.net_handle
+            .as_ref()
+            .map_or(fallback, |net| *net.realm_id())
+    }
+}
+
 impl std::fmt::Debug for DriverContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DriverContext")
