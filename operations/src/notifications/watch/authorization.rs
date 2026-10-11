@@ -440,7 +440,7 @@ pub async fn authorize_notification(
 }
 
 pub fn event_permission_path(event: &WatchEvent) -> Option<String> {
-    if event.actor.is_nil() || event.actor.realm_id != event.realm_id {
+    if event.actor.is_nil() {
         return None;
     }
     match (&event.kind, &event.detail) {
@@ -506,7 +506,7 @@ fn notification_permission_path(realm_id: RealmId, kind: &NotificationKind) -> O
             group_id,
             document_id,
             actor_user_id,
-        } if !actor_user_id.is_nil() && actor_user_id.realm_id == realm_id => {
+        } if !actor_user_id.is_nil() => {
             metadata_permission_path(realm_id, path, *group_id, *document_id)
         }
         NotificationKind::DataUploaded {
@@ -517,7 +517,7 @@ fn notification_permission_path(realm_id: RealmId, kind: &NotificationKind) -> O
             key,
             actor_user_id,
             ..
-        } if !actor_user_id.is_nil() && actor_user_id.realm_id == realm_id => {
+        } if !actor_user_id.is_nil() => {
             data_permission_path(realm_id, path, *group_id, *node_id, bucket, key)
         }
         NotificationKind::SyncCompleted {
@@ -537,7 +537,7 @@ fn notification_permission_path(realm_id: RealmId, kind: &NotificationKind) -> O
             relationship_id,
             actor_user_id,
             ..
-        } if !actor_user_id.is_nil() && actor_user_id.realm_id == realm_id => sync_permission_path(
+        } if !actor_user_id.is_nil() => sync_permission_path(
             realm_id,
             path,
             *group_id,
@@ -1030,6 +1030,9 @@ mod tests {
                 document_id,
             ))
         );
+        // A federated actor keeps the same permission path, checked for the recipient.
+        metadata.actor = UserId::new(Ulid::from_bytes([5u8; 16]), RealmId([2u8; 32]));
+        assert!(event_permission_path(&metadata).is_some());
         metadata.path = format!("meta/{}/datasets/project", Ulid::from_bytes([8u8; 16]));
         assert!(event_permission_path(&metadata).is_none());
     }

@@ -85,8 +85,20 @@ fn admins_need_write() {
             &[UserId::nil(RealmId::from_bytes([1; 32]))],
             &[("/**", Permission::WRITE)],
         ),
+        // A federated group admin keeps its permissions but holds no bucket key.
+        role(
+            &[UserId::new(
+                Ulid::from_bytes([6; 16]),
+                RealmId::from_bytes([2; 32]),
+            )],
+            &[("/realm/g/group/**", Permission::WRITE)],
+        ),
     ];
-    assert_eq!(admin_users(&roles, ADMIN_PATH), BTreeSet::from([user(2)]));
+    let realm_id = RealmId::from_bytes([1; 32]);
+    assert_eq!(
+        admin_users(&roles, ADMIN_PATH, realm_id),
+        BTreeSet::from([user(2)])
+    );
 }
 
 #[test]

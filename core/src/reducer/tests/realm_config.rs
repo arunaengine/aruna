@@ -649,3 +649,45 @@ fn realm_config_target() {
     );
     assert_eq!(state, before);
 }
+
+#[test]
+fn federation_settings_materialize() {
+    use crate::federation::{
+        AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode, Signed,
+    };
+    use crate::structs::identity::realm::RealmId;
+    let key = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+    let capabilities =
+        crate::structs::identity::auth::NodeCapabilities::management_node(key.clone()).unwrap();
+    let url = |value: &str| url::Url::parse(value).unwrap();
+    let descriptor = RealmDescriptor {
+        realm_id: RealmId::from_bytes(key.verifying_key().to_bytes()),
+        name: "Realm".to_string(),
+        description: String::new(),
+        api_url: url("https://api.example.org"),
+        portal_url: url("https://portal.example.org"),
+        issued_at: 1,
+    };
+    let settings = FederationSettings {
+        name: descriptor.name.clone(),
+        api_url: descriptor.api_url.clone(),
+        portal_url: descriptor.portal_url.clone(),
+        registry_url: None,
+        registration: RegistrationMode::Disabled,
+        accepted_realms: AcceptedRealms::Only(vec![RealmId::from_bytes([8; 32])]),
+        descriptor: Signed::sign(descriptor, &capabilities).unwrap(),
+    };
+    let mut state = realm_config_state();
+    state
+        .apply(&realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::ConfigFederationSet {
+                settings: Box::new(settings.clone()),
+            },
+        ))
+        .unwrap();
+    assert_eq!(state.materialized_realm_federation(), Some(settings));
+}

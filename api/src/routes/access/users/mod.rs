@@ -19,6 +19,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_secs as now_timestamp;
+use aruna_operations::auth::bearer_token::decode_bearer_token;
 use aruna_operations::auth::token_subject::{SubjectCheckError, SubjectCheckOperation};
 use aruna_operations::device::remove_node::{
     DeviceEvictionScope, RemoveNodeConfig, RemoveNodeError, RemoveNodeOperation,
@@ -197,6 +198,8 @@ pub struct UserPreferencesResponse {
 #[schema(as = GetUserInfoResponse)]
 pub struct UserInfoResponse {
     pub user: GetUserResponse,
+    /// Logins of other realms that open sessions of this account, for removal.
+    pub linked_logins: Vec<String>,
     pub realm: UserRealmResponse,
     pub groups: Vec<UserGroupResponse>,
     pub preferences: UserPreferencesResponse,
@@ -327,6 +330,7 @@ async fn issue_user_session(
     expiry: u64,
     kind: SessionKind,
     restrictions: Option<Vec<PathRestriction>>,
+    auth_time: Option<u64>,
 ) -> ServerResult<String> {
     let created = drive(
         CreateSessionOperation::new(CreateSessionConfig {
@@ -337,7 +341,10 @@ async fn issue_user_session(
             node_capabilities: state.node_capabilities().clone(),
             kind,
             label: None,
+            name: None,
             restrictions,
+            via: None,
+            auth_time,
         }),
         &state.get_ctx(),
     )
@@ -461,12 +468,27 @@ async fn build_user_response(
     if auth.realm_id != state.get_realm_id() || auth.path_restrictions.is_some() {
         return Err(ServerError::Forbidden);
     }
-    let user = read_current_user(state, auth.user_id).await?;
+    let user = match auth.session.as_ref() {
+        // An unlinked federated user has no record here; the token's name stands in for it.
+        Some(session) if session.kind == SessionKind::Federated && session.via.is_none() => User {
+            user_id: auth.user_id,
+            name: session
+                .name
+                .clone()
+                .unwrap_or_else(|| auth.user_id.to_string()),
+            subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
+            attributes: Default::default(),
+        },
+        _ => read_current_user(state, auth.user_id).await?,
+    };
     let preferences = preferences_from_attributes(&user.attributes);
     let realm_roles = collect_realm_roles(read_realm_authorization(state).await?, auth.user_id);
     let groups = collect_group_memberships(state, auth.user_id).await?;
+    let linked_logins = crate::routes::federation::link::linked_logins(&user).linked_logins;
 
     Ok(UserInfoResponse {
+        linked_logins,
         user: user.into(),
         realm: UserRealmResponse {
             realm_id: state.get_realm_id().to_string(),
@@ -691,7 +713,9 @@ somebody else.
 
 **Behavior**
 - The token preserves a bound session's kind; an OIDC or unbound caller receives a `portal` session.
+- A federated session is refused; it ends with its lifetime and cannot be renewed.
 - The token keeps the path restrictions of the presented token, so renewal never widens access.
+- An OIDC login keeps the provider's verified `auth_time`, not the exchange time.
 - The token is returned in this response only, so a lost one has to be reissued here.
 
 **Limits**
@@ -706,7 +730,7 @@ somebody else.
             })
         ),
         (status = 401, description = "Missing or invalid bearer token, or this node knows no user for the presented OIDC subject", body = ErrorResponse),
-        (status = 403, description = "The user is deactivated, or an alias of the canonical user of that OIDC subject", body = ErrorResponse),
+        (status = 403, description = "The user is deactivated, an alias of the canonical user of that OIDC subject, or the caller holds a federated session", body = ErrorResponse),
         (status = 409, description = "The caller already holds 256 active sessions", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -716,14 +740,27 @@ async fn get_token(
     headers: HeaderMap,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<GetTokenResponse>)> {
-    let (user_id, kind, restrictions) = match auth {
+    let (user_id, kind, restrictions, auth_time) = match auth {
         Some(aruna_ctx) => {
+            if aruna_ctx
+                .session
+                .as_ref()
+                .is_some_and(|session| session.kind == SessionKind::Federated)
+            {
+                return Err(ServerError::Forbidden);
+            }
             ensure_token_subject(&state, aruna_ctx.user_id).await?;
             let kind = aruna_ctx
                 .session
                 .as_ref()
                 .map_or(SessionKind::Portal, |session| session.kind);
-            (aruna_ctx.user_id, kind, aruna_ctx.path_restrictions)
+            // Renewal keeps the primary login time, so it never makes a login look fresh.
+            let token = bearer_token(&headers).ok_or(ServerError::Unauthorized)?;
+            let claims = decode_bearer_token(state.as_ref(), token)
+                .await
+                .map_err(|_| ServerError::Unauthorized)?;
+            let restrictions = aruna_ctx.path_restrictions;
+            (aruna_ctx.user_id, kind, restrictions, claims.auth_time)
         }
         None => {
             let token = bearer_token(&headers).ok_or(ServerError::Unauthorized)?;
@@ -737,7 +774,12 @@ async fn get_token(
             )
             .await
             .map_err(|err| ServerError::InternalError(err.to_string()))?;
-            (user.user_id, SessionKind::Portal, None)
+            (
+                user.user_id,
+                SessionKind::Portal,
+                None,
+                oidc_identity.auth_time,
+            )
         }
     };
 
@@ -745,7 +787,7 @@ async fn get_token(
     let expiry = now_timestamp()
         .checked_add(TOKEN_EXPIRY_SECONDS)
         .ok_or_else(|| ServerError::InternalError("token expiry overflow".to_string()))?;
-    let token = issue_user_session(&state, user_id, expiry, kind, restrictions).await?;
+    let token = issue_user_session(&state, user_id, expiry, kind, restrictions, auth_time).await?;
 
     Ok((StatusCode::OK, Json(GetTokenResponse { token })))
 }
@@ -765,7 +807,9 @@ takes no user id.
   `ui.favourite_metadata_ids` (a comma separated list) and `ui.dashboard_scope` (`personal` or
   `realm`, absent when unset or unknown) attributes.
 - Group membership is collected from the groups this node holds, so a group that has not arrived
-  here yet is missing."#,
+  here yet is missing.
+- A federated session gets a record built from its token: the full user id, the display name
+  (or the user id when none is known), no attributes and the roles this realm assigned."#,
     responses(
         (
             status = 200,
@@ -809,6 +853,7 @@ takes no user id.
                         ]
                     }
                 ],
+                "linked_logins": [],
                 "preferences": {
                     "preferred_profile_path": "datasets/proteomics",
                     "favourite_metadata_ids": ["01JMETADATA0123456789ABCDE"],
@@ -905,6 +950,7 @@ user document and takes no user id.
                         ]
                     }
                 ],
+                "linked_logins": [],
                 "preferences": {
                     "preferred_profile_path": null,
                     "favourite_metadata_ids": [],
@@ -945,6 +991,7 @@ async fn patch_user_info(
             set_attributes: request.set_attributes,
             remove_attributes: request.remove_attributes,
             system: false,
+            alias: None,
         }),
         &state.get_ctx(),
     )
@@ -1180,6 +1227,7 @@ async fn search_users(
             query: q,
             limit,
             start_after: query.start_after,
+            exact_name: false,
         }),
         &state.get_ctx(),
     )
@@ -1490,6 +1538,7 @@ async fn update_user(
             set_attributes: request.set_attributes,
             remove_attributes: request.remove_attributes,
             system: false,
+            alias: None,
         }),
         &state.get_ctx(),
     )

@@ -108,7 +108,8 @@ pub fn parse_authority(
     let realm = RealmAuthorizationDocument::from_bytes(&realm)?;
     let group = GroupAuthorizationDocument::from_bytes(&group)?;
     let path = group_admin_path(realm_id, group_id);
-    let admins = admin_users(realm.roles.values().chain(group.roles.values()), &path);
+    let roles = realm.roles.values().chain(group.roles.values());
+    let admins = admin_users(roles, &path, realm_id);
     Ok(BucketState {
         info,
         settings,

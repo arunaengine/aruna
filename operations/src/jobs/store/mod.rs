@@ -130,7 +130,7 @@ fn job_schedule_key(record: &JobRecord) -> Option<Key> {
 /// Dedup index path. A user-scoped key is prefixed with the submitting user so a
 /// caller cannot squat another's idempotency key; a `global/` key stays
 /// unprefixed, so different users' submissions resolve to one job identity.
-pub(super) fn dedup_index_key(created_by: UserId, dedup_key: &[u8]) -> Key {
+pub(crate) fn dedup_index_key(created_by: UserId, dedup_key: &[u8]) -> Key {
     if dedup_key.starts_with(GLOBAL_DEDUP_PREFIX) {
         return ByteView::from(dedup_key.to_vec());
     }

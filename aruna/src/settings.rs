@@ -9,6 +9,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use aruna_api::s3::server::S3ServerTimeouts;
+use aruna_core::federation::valid_federation_url;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::storage::backends::{BackendsFile, NodeBackendsConfig};
@@ -25,6 +26,8 @@ use crate::config::{PortalArtifactConfig, PortalConfig, RateLimitSettings, Setup
 const OPS_SOCKET_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3002);
 const BOOTSTRAP_TIMEOUT_SECS: u64 = 120;
 const SYNC_TIMEOUT_SECS: u64 = 60;
+/// The global registry every realm uses unless `FEDERATION_REGISTRY_URL` replaces it.
+const DEFAULT_REGISTRY_URL: &str = "https://registry.aruna-engine.org";
 
 /// The operator-input source. Production reads the process environment (with
 /// any `.env` already loaded into it); tests pass an explicit map.
@@ -90,6 +93,10 @@ pub struct Settings {
     pub s3_host: Option<String>,
     pub api_public_url: Option<String>,
     pub s3_public_url: Option<String>,
+    /// Public URL of this node's portal, for the default federation settings.
+    pub portal_public_url: Option<String>,
+    /// `None` when `FEDERATION_REGISTRY_URL` is empty: no default registry.
+    pub registry_url: Option<reqwest::Url>,
     pub trusted_proxies: Vec<ipnet::IpNet>,
     pub rocrate_limits: RoCrateLimits,
     pub rate_limits: RateLimitSettings,
@@ -246,6 +253,8 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         .max(1);
     let api_public_url = optional_public_url(env, "API_PUBLIC_URL")?;
     let s3_public_url = optional_public_url(env, "S3_PUBLIC_URL")?;
+    let portal_public_url = optional_public_url(env, "PORTAL_PUBLIC_URL")?;
+    let registry_url = registry_url_env(env)?;
     let trusted_proxies = trusted_proxies_env(env)?;
     let rocrate_limits = rocrate_limits_env(env)?;
     let rate_limits = rate_limits_env(env)?;
@@ -324,6 +333,8 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         s3_host,
         api_public_url,
         s3_public_url,
+        portal_public_url,
+        registry_url,
         trusted_proxies,
         rocrate_limits,
         rate_limits,
@@ -671,6 +682,27 @@ pub(crate) fn validate_public_url(key: &'static str, value: &str) -> Result<(), 
         ));
     }
     Ok(())
+}
+
+/// An empty `FEDERATION_REGISTRY_URL` turns the registry off; unset keeps the global default.
+fn registry_url_env(env: &dyn SettingsEnv) -> Result<Option<reqwest::Url>, SetupError> {
+    const KEY: &str = "FEDERATION_REGISTRY_URL";
+    let value = env
+        .var(KEY)
+        .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string());
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    let url = reqwest::Url::parse(value.trim())
+        .map_err(|error| invalid_config_value(KEY, &value, error))?;
+    if !valid_federation_url(&url) {
+        return Err(invalid_config_value(
+            KEY,
+            value,
+            "expected an HTTPS URL, or HTTP to a loopback host",
+        ));
+    }
+    Ok(Some(url))
 }
 
 fn normalize_sha256_env(key: &'static str, value: &str) -> Result<String, SetupError> {
@@ -1052,6 +1084,29 @@ mod tests {
         ] {
             let error = parse(&[("API_PUBLIC_URL", value)]).unwrap_err();
             assert_eq!(invalid_key(error), "API_PUBLIC_URL");
+        }
+    }
+
+    #[test]
+    fn registry_url_parsing() {
+        // Unset keeps the global default, a value replaces it and an empty value turns it off.
+        let default = parse(&[]).unwrap().registry_url;
+        assert_eq!(
+            default.unwrap().as_str(),
+            "https://registry.aruna-engine.org/"
+        );
+        let custom = parse(&[("FEDERATION_REGISTRY_URL", "https://registry.example.org")]);
+        assert_eq!(
+            custom.unwrap().registry_url.unwrap().as_str(),
+            "https://registry.example.org/"
+        );
+        for value in ["", "  "] {
+            let parsed = parse(&[("FEDERATION_REGISTRY_URL", value)]).unwrap();
+            assert_eq!(parsed.registry_url, None);
+        }
+        for value in ["http://registry.example.org", "registry.example.org"] {
+            let error = parse(&[("FEDERATION_REGISTRY_URL", value)]).unwrap_err();
+            assert_eq!(invalid_key(error), "FEDERATION_REGISTRY_URL");
         }
     }
 

@@ -64,12 +64,29 @@ fn abe_error(error: AbeError) -> ServerError {
     };
     ServerError::Refused(status, code, error.to_string())
 }
+/// Federated users and linked logins cannot hold, request or unlock this realm's keys.
+pub(crate) fn refuse_foreign_keys(auth: &AuthContext) -> ServerResult<()> {
+    if auth.federated() {
+        return Err(foreign_keys(KeyError::Foreign.to_string()));
+    }
+    Ok(())
+}
+
+pub(crate) fn foreign_keys(message: String) -> ServerError {
+    ServerError::Refused(
+        StatusCode::FORBIDDEN,
+        "foreign_encryption_keys_unsupported",
+        message,
+    )
+}
+
 pub(crate) fn key_error(error: KeyError) -> ServerError {
     let message = error.to_string();
     match error {
         KeyError::Abe(e) => abe_error(e),
         KeyError::Missing => ServerError::NotFound,
         KeyError::Denied => ServerError::Forbidden,
+        KeyError::Foreign => foreign_keys(message),
         KeyError::Storage => ServerError::ServiceUnavailable,
         KeyError::Busy => ServerError::Refused(StatusCode::CONFLICT, "rekey_running", message),
         KeyError::Locked => ServerError::Refused(StatusCode::CONFLICT, "bucket_locked", message),

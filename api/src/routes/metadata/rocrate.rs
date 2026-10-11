@@ -379,6 +379,7 @@ pub async fn submit_rocrate_export(
     let result = submit_export_job(
         &state.get_ctx(),
         ExportRoCrateSpec {
+            selection: None,
             destination,
             auth_context: auth,
             document_id,

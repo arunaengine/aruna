@@ -281,7 +281,10 @@ async fn create_token(
             node_capabilities: state.node_capabilities().clone(),
             kind: SessionKind::Api,
             label: Some(SERVICE_LABEL.to_string()),
+            name: None,
             restrictions,
+            via: None,
+            auth_time: None,
         }),
         &state.get_ctx(),
     )

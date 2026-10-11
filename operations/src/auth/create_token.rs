@@ -59,6 +59,14 @@ pub enum CreateTokenError {
 }
 
 pub fn mint_token(config: &CreateTokenConfig) -> Result<String, CreateTokenError> {
+    mint_login_token(config, None)
+}
+
+/// Mints a token that carries the time of the primary login it descends from.
+pub fn mint_login_token(
+    config: &CreateTokenConfig,
+    auth_time: Option<u64>,
+) -> Result<String, CreateTokenError> {
     let iat = config.time;
     let exp = match config.expiry {
         Some(exp) if exp > iat => exp,
@@ -90,6 +98,16 @@ pub fn mint_token(config: &CreateTokenConfig) -> Result<String, CreateTokenError
         restrictions: config.restrictions.clone(),
         issuer_pubkey,
         delegation_signature,
+        name: config
+            .session
+            .as_ref()
+            .and_then(|session| session.name.clone()),
+        via: config
+            .session
+            .as_ref()
+            .and_then(|session| session.via)
+            .map(|via| via.to_string()),
+        auth_time,
     };
     let header = Header::new(Algorithm::EdDSA);
     match &config.node_capabilities {
@@ -261,6 +279,8 @@ mod test {
             session: Some(SessionRef {
                 sid: sid.clone(),
                 kind: SessionKind::Assistant,
+                name: None,
+                via: None,
             }),
             restrictions: None,
         })

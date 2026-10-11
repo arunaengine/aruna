@@ -273,6 +273,12 @@ pub(in crate::document_sync) fn overlay_realm_config(
         config.compute = compute;
     }
 
+    if !reducer_state.conflicts.contains_key(CONFIG_FEDERATION_PATH)
+        && let Some(federation) = reducer_state.materialized_realm_federation()
+    {
+        config.federation = Some(federation);
+    }
+
     config.revocation_floor = config.revocation_floor.max(reducer_state.revocation_floor);
     // Without an index, the existing set remains fail-closed until each entry's expiry.
     if let Some(revocation_index) = revocation_index {
@@ -364,6 +370,7 @@ pub(in crate::document_sync) fn materialized_realm_config(
         placement_transitions: Vec::new(),
         revoked_tokens: Vec::new(),
         revocation_floor: reducer_state.revocation_floor,
+        federation: None,
     };
     overlay_realm_config(&mut config, reducer_state, now, now_ms, revocation_index);
     Some(config)

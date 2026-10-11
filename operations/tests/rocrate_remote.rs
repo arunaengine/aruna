@@ -101,6 +101,7 @@ async fn remote_export_streams() -> TestResult {
         setup_remote(realm_id, owner, group_id, version_id).await?;
 
     let spec = ExportRoCrateSpec {
+        selection: None,
         destination: None,
         auth_context: AuthContext {
             user_id: owner,
@@ -177,6 +178,7 @@ async fn remote_denial_omits() -> TestResult {
     let metadata_path =
         MetadataRegistryRecord::permission_path_for(&realm_id, group_id, DOC_PATH, document_id);
     let spec = ExportRoCrateSpec {
+        selection: None,
         destination: None,
         auth_context: AuthContext {
             user_id: owner,

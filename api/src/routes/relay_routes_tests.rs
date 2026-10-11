@@ -18,7 +18,7 @@ use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::Router;
 use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::from_fn_with_state;
 use axum::routing::get;
 use ed25519_dalek::SigningKey;
@@ -151,6 +151,65 @@ async fn relays_to_management() {
     );
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(&body[..], b"{\"relayed\":true}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn relays_preconditions() {
+    // Precondition headers reach the management node and its `ETag` comes back.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().fallback(|headers: HeaderMap| async move {
+        let unset = headers[header::IF_NONE_MATCH].to_str().unwrap().to_string();
+        ([(header::ETAG, headers[header::IF_MATCH].clone())], unset)
+    });
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    let fixture = setup(vec![upstream]).await;
+    let request = Request::builder()
+        .method("GET")
+        .uri("/access/token")
+        .header(header::IF_MATCH, "\"abc\"")
+        .header(header::IF_NONE_MATCH, "*")
+        .body(Body::empty())
+        .unwrap();
+    let response = relay_app(fixture.state.clone())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.headers()[header::ETAG], "\"abc\"");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"*");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn keeps_api_prefix() {
+    // In production the relay runs inside the `/api/v1` nest; the target still needs the prefix.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().fallback(|uri: axum::http::Uri| async move { uri.path().to_string() });
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    let fixture = setup(vec![upstream]).await;
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/access/token")
+        .body(Body::empty())
+        .unwrap();
+    let response = Router::new()
+        .nest("/api/v1", relay_app(fixture.state.clone()))
+        .oneshot(request)
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"/api/v1/access/token");
     handle.abort();
 }
 

@@ -874,7 +874,7 @@ async fn supervise(
             .await
         {
             Ok(outcome) => outcome,
-            Err(_panic) => handle_panic(ctx, record).await,
+            Err(_panic) => handle_panic(ctx),
         }
     };
     tokio::pin!(payload);
@@ -891,14 +891,9 @@ async fn supervise(
     }
 }
 
-async fn handle_panic(ctx: &JobContext, record: &JobRecord) -> JobRunOutcome {
+fn handle_panic(ctx: &JobContext) -> JobRunOutcome {
     warn!(job_id = %ctx.job_id, "Job payload panicked; failing the attempt");
-    match &record.payload {
-        JobPayload::ImportRoCrate(spec) if ctx.final_attempt => {
-            crate::jobs::import::cleanup_after_panic(ctx, spec).await
-        }
-        _ => JobRunOutcome::Failed(JobError::retryable("job payload panicked")),
-    }
+    JobRunOutcome::Failed(JobError::retryable("job payload panicked"))
 }
 
 /// Returns only when `stop` fires (payload finished) or the claim is lost. A lost claim
@@ -950,9 +945,8 @@ mod tests {
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
     use aruna_core::structs::execution::job::{
-        AttemptIntent, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
-        ImportRoCrateSpec, ImportRoCrateTarget, JobClaim, JobPayload, JobResultPayload,
-        RoCrateLimits,
+        AttemptIntent, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
+        ImportRoCrateTarget, JobClaim, JobPayload, JobResultPayload, RoCrateLimits,
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
@@ -1656,9 +1650,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn panic_routes_cleanup() {
-        let (_dir, storage) = temp_storage();
-        let driver = context(storage.clone());
+    async fn import_panic_kept() {
+        use aruna_core::effects::BlobEffect;
+        use aruna_core::events::BlobEvent;
+        use aruna_core::stream::BackendStream;
+
+        let fixture = crate::tests::staging::setup_driver_context().await;
+        let driver = Arc::new(fixture.driver_context);
+        let storage = driver.storage_handle.clone();
         let job_id = JobId::from_bytes([0x4B; 16]);
         let token = Ulid::generate();
         let mut record = import_record(job_id);
@@ -1670,6 +1669,55 @@ mod tests {
             lease_expires_ms: 60_000,
         });
         insert_job(&storage, &record).await.unwrap();
+
+        let Event::Blob(BlobEvent::HiddenSpooled {
+            location,
+            blake3,
+            size,
+        }) = driver
+            .blob_handle
+            .as_ref()
+            .unwrap()
+            .send_blob_effect(BlobEffect::SpoolHidden {
+                namespace: job_id.as_ulid(),
+                name: "input".to_string(),
+                created_by: record.created_by,
+                max_bytes: Some(1024),
+                deadline: None,
+                blob: BackendStream::new(tokio_util::io::ReaderStream::new(std::io::Cursor::new(
+                    b"archive bytes".to_vec(),
+                ))),
+            })
+            .await
+        else {
+            panic!("input spool failed")
+        };
+        let blob_path = location.get_full_path().unwrap();
+        let blob_len = std::fs::metadata(&blob_path).unwrap().len();
+        let mut upload =
+            crate::jobs::import::upload_record(record.created_by, Ulid::from_bytes([3u8; 16]), 0);
+        upload.location = location.clone();
+        upload.blake3 = blake3;
+        upload.size = size;
+        upload.claimed_by = Some(job_id);
+        crate::jobs::import::write_rocrate_upload(&storage, &upload)
+            .await
+            .unwrap();
+        let checkpoint_value =
+            crate::jobs::import::tests::checkpoint_bytes(location, size, blake3, upload.upload_id);
+        let checkpoint_key = ByteView::from(job_id.to_bytes().to_vec());
+        let Event::Storage(aruna_core::events::StorageEvent::WriteResult { .. }) = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: JOB_STATE_KEYSPACE.to_string(),
+                key: checkpoint_key.clone(),
+                value: ByteView::from(checkpoint_value.clone()),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("checkpoint seed failed")
+        };
+
         let ctx = JobContext {
             driver,
             job_id,
@@ -1681,23 +1729,49 @@ mod tests {
             progress: ProgressReporter::from_progress(&record.progress),
         };
 
-        let JobRunOutcome::Failed(error) = handle_panic(&ctx, &record).await else {
+        let JobRunOutcome::Failed(error) = handle_panic(&ctx) else {
             panic!("panic outcome must fail");
         };
-        assert_eq!(error.kind, JobErrorKind::Permanent);
+        assert_eq!(error.kind, JobErrorKind::Retryable);
+        let outcome = requeue_job(
+            &storage,
+            job_id,
+            Some(token),
+            unix_timestamp_millis(),
+            None,
+            Some(error),
+        )
+        .await
+        .unwrap();
+        let RequeueOutcome::Exhausted(exhausted) = outcome else {
+            panic!("the last attempt must exhaust the job");
+        };
+        assert_eq!(exhausted.state, JobState::Indeterminate);
+        assert!(exhausted.locally_exhausted);
+
         let (rows, _) = list_job_entries(&storage, job_id, None, 10).await.unwrap();
-        let row: ImportReportRow = postcard::from_bytes(rows[0].1.as_ref()).unwrap();
-        assert_eq!(row.entry_key, "failure/acquire");
-        assert!(matches!(
-            storage
-                .send_storage_effect(StorageEffect::Read {
-                    key_space: JOB_STATE_KEYSPACE.to_string(),
-                    key: ByteView::from(job_id.to_bytes().to_vec()),
-                    txn_id: None,
-                })
-                .await,
-            Event::Storage(aruna_core::events::StorageEvent::ReadResult { value: Some(_), .. })
-        ));
+        assert!(rows.is_empty(), "panic must not write a failure report");
+        assert_eq!(
+            crate::jobs::import::read_rocrate_upload(&storage, upload.upload_id)
+                .await
+                .unwrap(),
+            Some(upload)
+        );
+        assert_eq!(std::fs::metadata(&blob_path).unwrap().len(), blob_len);
+        let Event::Storage(aruna_core::events::StorageEvent::ReadResult {
+            value: Some(checkpoint),
+            ..
+        }) = storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: JOB_STATE_KEYSPACE.to_string(),
+                key: checkpoint_key,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("checkpoint must survive");
+        };
+        assert_eq!(checkpoint.as_ref(), checkpoint_value.as_slice());
     }
 
     // A zombie execution's finish must not evict the newer execution that replaced it.

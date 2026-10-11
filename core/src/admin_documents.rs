@@ -357,6 +357,19 @@ pub enum AdminDocumentOperation {
     GroupLocationSet {
         location: Option<crate::structs::storage::dataset_location::DatasetLocation>,
     },
+    /// Replaces the realm federation settings with their newly signed descriptor.
+    #[serde(rename = "RealmConfigFederationSet")]
+    ConfigFederationSet {
+        settings: Box<crate::federation::FederationSettings>,
+    },
+    /// Links a login of another realm to this local account.
+    UserAliasAdded {
+        alias: UserId,
+    },
+    /// Removes a linked login of another realm from this local account.
+    UserAliasRemoved {
+        alias: UserId,
+    },
 }
 
 impl AdminDocumentOperation {

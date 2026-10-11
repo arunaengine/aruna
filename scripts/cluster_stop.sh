@@ -20,7 +20,8 @@ Usage: bash scripts/cluster_stop.sh [--help]
 Stops a local cluster started by scripts/cluster_start.sh (just local-cluster,
 just local-cluster-oidc, just preview, just preview-no-oidc), in this order:
 
-  1. a deploy script that is still monitoring the nodes, so its own cleanup runs
+  1. the deploy script named by the deployment root's cluster_start.pid that is still
+     monitoring the nodes, so its own cleanup runs; other deployments are left alone
   2. every node named by a pid file under the deployment root, by SIGTERM and,
      after the stop timeout, SIGKILL; a pid that is not an aruna process is left alone
   3. the Keycloak compose project, with its volumes
@@ -69,14 +70,16 @@ stop_pid() {
   log "Stopped $name (pid $pid)"
 }
 
-# A running deploy script tears its own nodes and Keycloak down on SIGINT.
+# The running deploy script of this deployment tears its own nodes and Keycloak down on SIGINT.
 stop_deploy_scripts() {
+  local pid_file="$DEPLOY_ROOT/cluster_start.pid"
   local pid
   local deadline
 
-  command -v pgrep >/dev/null 2>&1 || return 0
-  for pid in $(pgrep -f 'bash .*scripts/cluster_start\.sh' || true); do
-    [[ "$pid" != "$$" ]] || continue
+  [[ -f "$pid_file" ]] || return 0
+  pid="$(tr -d '[:space:]' <"$pid_file")"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && alive "$pid" \
+    && [[ "$(ps -o args= -p "$pid" 2>/dev/null || true)" == *scripts/cluster_start.sh* ]]; then
     log "Interrupting the deploy script (pid $pid) so its cleanup runs"
     kill -INT "$pid" >/dev/null 2>&1 || true
     deadline=$((SECONDS + STOP_TIMEOUT_SECS))
@@ -86,7 +89,8 @@ stop_deploy_scripts() {
     if alive "$pid"; then
       stop_pid "$pid" "deploy script"
     fi
-  done
+  fi
+  rm -f -- "$pid_file"
 }
 
 # The pid file may outlive the node and the pid may have been reused, so only a

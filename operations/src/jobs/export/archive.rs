@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::structs::storage::data_identity::ObjectLocation;
 
 pub(super) fn plan_export(
     spec: &ExportRoCrateSpec,
@@ -24,6 +25,7 @@ pub(super) fn plan_export(
         let entity = &mut checkpoint.entities[entry.entity_index];
         entity.report_source = Some(entry.report_source);
         entity.resolved_version = entry.resolved_version;
+        entity.content = Some((entry.hash, entry.size));
         let reserved = |path: &String| path == METADATA_PATH || path == REPORT_PATH;
         let explicit = entity
             .local_path
@@ -73,6 +75,9 @@ pub(super) fn plan_export(
         .collect::<BTreeMap<_, _>>();
     let unrewritten = scan_unrewritten(&document, &replacements);
     rewrite_ids(&mut document, &replacements);
+    if spec.selection.is_some() {
+        add_references(&mut document, &checkpoint.entities)?;
+    }
     checkpoint.report = build_rows(&checkpoint.entities, &unrewritten);
     let has_omissions = if spec.destination.is_some() {
         blocking_omissions(&checkpoint.report) > 0
@@ -184,7 +189,6 @@ pub(super) fn recognize_entities(
                     key: location.key.clone(),
                 })
             });
-        let external = !identity.is_aruna();
         let hash_realm = identity.hash_realm;
         let supported_exact = identity
             .exact
@@ -193,7 +197,10 @@ pub(super) fn recognize_entities(
         let supported_hash =
             identity.hash.is_some() && hash_realm.is_none_or(|hash_realm| hash_realm == realm_id);
         let located = identity.location.is_some();
-        let unsupported_realm = !external && !supported_exact && !supported_hash && !located;
+        let foreign = identity.is_aruna() && !supported_exact && !supported_hash && !located;
+        // A web identifier of another realm is a reference, as an export into a realm leaves it.
+        let external = !identity.is_aruna() || (foreign && web_entity(&entity_id));
+        let unsupported_realm = foreign && !external;
         let paths = local_paths.remove(&subject).unwrap_or_default();
         let local_path = raw_path
             .filter(|raw_path| paths.contains(raw_path))
@@ -224,6 +231,7 @@ pub(super) fn recognize_entities(
             report_source: None,
             resolved_version: None,
             path_synthesized: false,
+            content: None,
         });
     }
     if let Some(subject) = files.into_iter().next() {
@@ -566,6 +574,14 @@ pub(super) fn build_rows(
     rows
 }
 
+/// The time of the pinned snapshot revision, so exports of one snapshot are byte-identical.
+pub(super) fn snapshot_moment(checkpoint: &ExportCheckpoint) -> Result<u64, ExportFailure> {
+    checkpoint
+        .winning_event_id
+        .map(|event_id| event_id.timestamp_ms())
+        .ok_or_else(|| ExportFailure::Permanent("snapshot event cursor is missing".to_string()))
+}
+
 pub(super) fn build_report(checkpoint: &ExportCheckpoint) -> Result<JsonValue, ExportFailure> {
     let event_id = checkpoint
         .winning_event_id
@@ -837,7 +853,7 @@ pub(super) async fn assemble_export(
         .ok_or_else(|| ExportFailure::Permanent("rewritten metadata is missing".to_string()))?;
     let mut entries = Vec::with_capacity(opened.len());
     let source_spec = std::sync::Arc::new(spec.clone());
-    let job_ms = unix_timestamp_millis();
+    let snapshot_ms = snapshot_moment(checkpoint)?;
     for entry in opened {
         let entity = &checkpoint.entities[entry.entity_index];
         let path = entity
@@ -864,7 +880,7 @@ pub(super) async fn assemble_export(
             expected_blake3: entry.hash,
             modified_ms: entry
                 .resolved_version
-                .map_or(job_ms, |version| version.timestamp_ms()),
+                .map_or(snapshot_ms, |version| version.timestamp_ms()),
         });
     }
     let report = checkpoint.report_json.clone();
@@ -878,7 +894,14 @@ pub(super) async fn assemble_export(
     let cancel = ctx.cancel.clone();
     let shutdown = ctx.shutdown.clone();
     let writer_task = tokio::spawn(Box::pin(write_archive_checked(
-        writer, metadata, entries, report, policies, cancel, shutdown, job_ms,
+        writer,
+        metadata,
+        entries,
+        report,
+        policies,
+        cancel,
+        shutdown,
+        snapshot_ms,
     )));
     let event = blob_handle
         .send_blob_effect(BlobEffect::SpoolHidden {
@@ -942,12 +965,12 @@ pub(super) async fn write_archive_checked(
     policies: std::sync::Arc<BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>>,
     cancel: tokio_util::sync::CancellationToken,
     shutdown: tokio_util::sync::CancellationToken,
-    job_ms: u64,
+    snapshot_ms: u64,
 ) -> Result<(), ExportFailure> {
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     let mut archive = async_zip::base::write::ZipFileWriter::with_tokio(writer);
     archive
-        .write_entry_whole(zip_entry(METADATA_PATH, job_ms), &metadata)
+        .write_entry_whole(zip_entry(METADATA_PATH, snapshot_ms), &metadata)
         .await
         .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
     for entry in entries {
@@ -1054,7 +1077,7 @@ pub(super) async fn write_archive_checked(
     }
     if let Some(report) = report {
         archive
-            .write_entry_whole(zip_entry(REPORT_PATH, job_ms), &report)
+            .write_entry_whole(zip_entry(REPORT_PATH, snapshot_ms), &report)
             .await
             .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
     }
@@ -1165,6 +1188,182 @@ pub(crate) fn blocking_omissions(rows: &[ExportReportRow]) -> usize {
             _ => false,
         })
         .count()
+}
+
+/// What a grant for a finished export into another realm pins.
+#[derive(Debug)]
+pub(crate) struct ExportFacts {
+    pub(crate) revision: Ulid,
+    pub(crate) dataset_digest: [u8; 32],
+    pub(crate) versions: Vec<aruna_core::transfer::SelectedVersion>,
+    pub(crate) sources: Vec<crate::federation::export::PinnedSource>,
+    pub(crate) artifact: ArtifactRef,
+}
+
+impl ExportCheckpoint {
+    /// The facts of a finished export, unless a selected file was left out or not read here.
+    pub(crate) fn export_facts(&self, files: &[String]) -> Option<ExportFacts> {
+        let mut versions = Vec::new();
+        let mut sources = Vec::new();
+        for file in files {
+            let entity = self
+                .entities
+                .iter()
+                .find(|entity| &entity.entity_id == file)?;
+            let (blake3, size) = entity.content.filter(|_| entity.omission.is_none())?;
+            let version_id = entity.resolved_version?;
+            versions.push(aruna_core::transfer::SelectedVersion {
+                version_id,
+                blake3,
+                size,
+            });
+            let source = entity.candidates.iter().find_map(|candidate| {
+                let CandidateSource::Local {
+                    location,
+                    permission_path,
+                    bucket,
+                    key,
+                    ..
+                } = &candidate.source
+                else {
+                    return None;
+                };
+                (candidate.resolved_version == Some(version_id)).then(|| {
+                    crate::federation::export::PinnedSource {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        path: permission_path.clone(),
+                        version_id,
+                        blake3,
+                        size,
+                        key_ref: location.format.bucket_key(),
+                    }
+                })
+            });
+            sources.push(source?);
+        }
+        Some(ExportFacts {
+            revision: self.winning_event_id?,
+            dataset_digest: self.dataset_digest?,
+            versions,
+            sources,
+            artifact: self.artifact.clone()?,
+        })
+    }
+}
+
+/// Leaves every File entity outside `files` as a reference to this realm.
+pub(super) fn keep_references(entities: &mut [ExportEntity], files: &[String]) {
+    for entity in entities.iter_mut() {
+        if entity.omission.is_none() && !files.contains(&entity.entity_id) {
+            entity.omission = Some(ReasonCode::External);
+            entity.message = Some("left as a reference to the source realm".to_string());
+        }
+    }
+}
+
+/// The web identifier and the original identifier of an entity left as a reference.
+fn reference_ids(entity: &ExportEntity) -> Option<(String, String)> {
+    let id = match (&entity.exact, entity.hash) {
+        (Some(exact), _) => (exact.to_w3id(), exact.to_string()),
+        (None, Some(hash)) => (content_id(hash), entity.entity_id.clone()),
+        (None, None) => return None,
+    };
+    Some(id)
+}
+
+/// Names each Aruna entity left out of an export into a realm by its web identifier, keeps the
+/// original identifier as `identifier` and drops its source-local locations, so the receiving
+/// realm keeps it as an external reference. A source location without a version fails.
+pub(super) fn add_references(
+    document: &mut JsonValue,
+    entities: &[ExportEntity],
+) -> Result<(), ExportFailure> {
+    let mut references = BTreeMap::new();
+    for entity in entities.iter().filter(|entity| entity.omission.is_some()) {
+        match reference_ids(entity) {
+            Some(ids) => references.insert(entity.entity_id.clone(), ids),
+            None if entity.storage_key.is_some() => {
+                return Err(ExportFailure::Permanent(format!(
+                    "File entity `{}` names a source location without a current version",
+                    entity.entity_id
+                )));
+            }
+            None => continue,
+        };
+    }
+    let replacements = references
+        .iter()
+        .map(|(id, (web, _))| (id.clone(), web.clone()))
+        .collect();
+    rewrite_ids(document, &replacements);
+    let keywords = JsonLdKeywords::new(document);
+    let identifiers = references
+        .into_values()
+        .collect::<BTreeMap<String, String>>();
+    if let Some(graph) = keywords.graph_mut(document) {
+        for value in graph.iter_mut() {
+            clean_references(value, &identifiers, &keywords);
+        }
+    }
+    Ok(())
+}
+
+/// Gives every entity left as a reference, nested ones too, its original identifier and drops
+/// its source-local paths and content URLs.
+fn clean_references(
+    value: &mut JsonValue,
+    identifiers: &BTreeMap<String, String>,
+    keywords: &JsonLdKeywords,
+) {
+    let object = match value {
+        JsonValue::Array(values) => {
+            for value in values {
+                clean_references(value, identifiers, keywords);
+            }
+            return;
+        }
+        JsonValue::Object(object) => object,
+        _ => return,
+    };
+    let id = keywords.object_id(object).map(|(_, id)| id.to_string());
+    // A bare link holds only its id; a property would make it a second definition.
+    let defines = object.len() > 1;
+    if let Some(original) = id.filter(|_| defines).and_then(|id| identifiers.get(&id)) {
+        object
+            .entry("identifier")
+            .or_insert_with(|| JsonValue::String(original.clone()));
+        let local_path = ["localPath", LOCAL_PATH_IRI, PATH_HTTP_IRI];
+        let content_url = ["contentUrl", SCHEMA_CONTENT_IRI, CONTENT_HTTPS_IRI];
+        object.retain(|key, value| {
+            if keywords.expands_to(key, &local_path) {
+                return false;
+            }
+            if !keywords.expands_to(key, &content_url) {
+                return true;
+            }
+            if let JsonValue::Array(values) = value {
+                values.retain(|value| !source_local(value, keywords));
+                return !values.is_empty();
+            }
+            !source_local(value, keywords)
+        });
+    }
+    for value in object.values_mut() {
+        clean_references(value, identifiers, keywords);
+    }
+}
+
+/// A source-local location written as a string, an `@id` node or an `@value` literal.
+fn source_local(value: &JsonValue, keywords: &JsonLdKeywords) -> bool {
+    let text = match value {
+        JsonValue::Object(object) => keywords
+            .object_id(object)
+            .map(|(_, id)| id)
+            .or_else(|| object.get("@value").and_then(JsonValue::as_str)),
+        value => value.as_str(),
+    };
+    text.and_then(ObjectLocation::parse).is_some()
 }
 
 /// A data entity on the web, which a crate may name without carrying its bytes.

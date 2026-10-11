@@ -18,6 +18,7 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::execution::job::{JobExecutionClass, RoCrateLimits};
 use aruna_core::structs::execution::notification::NotificationRecord;
+use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -213,6 +214,8 @@ pub(crate) struct OperationsTaskHandler {
     realm_documents: std::sync::Mutex<(u32, u64)>,
     // Sequence of the last heartbeat this process sent; the startup revision orders restarts.
     heartbeat_sequence: std::sync::atomic::AtomicU64,
+    // Signs registry publications; `None` where no node identity was supplied.
+    node_capabilities: Option<NodeCapabilities>,
 }
 
 /// Outcome counts accumulated across the invocations of one rotation.
@@ -348,7 +351,13 @@ impl OperationsTaskHandler {
             outbox_limits: OutboxLimits::default(),
             realm_documents: std::sync::Mutex::new((0, 0)),
             heartbeat_sequence: std::sync::atomic::AtomicU64::new(0),
+            node_capabilities: None,
         }
+    }
+
+    fn with_node_capabilities(mut self, capabilities: Option<NodeCapabilities>) -> Self {
+        self.node_capabilities = capabilities;
+        self
     }
 
     fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
@@ -906,6 +915,9 @@ impl OperationsTaskHandler {
                     };
                     self.reschedule_timer(TaskKey::DeliverKeyWakes, after).await;
                 }
+            }),
+            TaskKey::PublishRegistration => Box::pin(async move {
+                self.publish_registration().await;
             }),
             TaskKey::DrainFamilyOutbox => Box::pin(async move {
                 self.drain_family_outbox().await;

@@ -27,6 +27,11 @@ KEYCLOAK_CLIENT_ID="${ARUNA_TEST_DEPLOY_KEYCLOAK_CLIENT_ID:-aruna-api}"
 KEYCLOAK_OIDC_USERNAME="${ARUNA_TEST_DEPLOY_OIDC_USERNAME:-aruna-admin}"
 KEYCLOAK_OIDC_PASSWORD="${ARUNA_TEST_DEPLOY_OIDC_PASSWORD:-aruna-admin}"
 PORTAL_DIR="${ARUNA_TEST_DEPLOY_PORTAL_DIR:-}"
+EXTRA_ORIGINS="${ARUNA_TEST_DEPLOY_EXTRA_ORIGINS:-}"
+CA_FILE="${ARUNA_TEST_DEPLOY_CA_FILE:-}"
+API_PUBLIC_URLS="${ARUNA_TEST_DEPLOY_API_PUBLIC_URLS:-}"
+# Empty by default, so local nodes never register with the global registry.
+REGISTRY_URL="${ARUNA_TEST_DEPLOY_REGISTRY_URL:-}"
 PORTAL_CORS_ORIGINS=""
 COMPUTE_EXECUTOR="${ARUNA_TEST_DEPLOY_COMPUTE_EXECUTOR:-docker}"
 # Containers must reach the host's S3 listener; loopback endpoints are rejected
@@ -107,6 +112,10 @@ Environment overrides:
   ARUNA_TEST_DEPLOY_OIDC_USERNAME
   ARUNA_TEST_DEPLOY_OIDC_PASSWORD
   ARUNA_TEST_DEPLOY_PORTAL_DIR
+  ARUNA_TEST_DEPLOY_EXTRA_ORIGINS      more comma-separated origins for CORS and the portal CSP
+  ARUNA_TEST_DEPLOY_CA_FILE            PEM bundle the nodes trust for outgoing TLS
+  ARUNA_TEST_DEPLOY_API_PUBLIC_URLS    comma-separated published API URLs in node order
+  ARUNA_TEST_DEPLOY_REGISTRY_URL       registry of the nodes; empty by default, so none registers
   ARUNA_TEST_DEPLOY_COMPUTE_EXECUTOR   docker (default) | apptainer | kubernetes | none
                                        docker and none are turnkey; apptainer and
                                        kubernetes need the vars below.
@@ -284,6 +293,14 @@ json_string_field() {
   printf '%s\n' "${json%%\"*}"
 }
 
+# The published API URL of the node at index $1: its ARUNA_TEST_DEPLOY_API_PUBLIC_URLS entry.
+public_api_url() {
+  local api_urls=()
+
+  IFS=, read -ra api_urls <<<"$API_PUBLIC_URLS"
+  printf '%s\n' "${api_urls[$1]:-${NODE_BASE_URLS[$1]}}"
+}
+
 write_node_env() {
   local node_dir=$1
   local http_port=$2
@@ -295,7 +312,12 @@ write_node_env() {
   local max_concurrent_uni_streams="${MAX_CONCURRENT_UNI_STREAMS:-}"
   local max_concurrent_bidi_streams="${MAX_CONCURRENT_BIDI_STREAMS:-}"
   local compute_var
+  local api_url="http://127.0.0.1:$http_port"
+  local index
 
+  for index in "${!NODE_HTTP_PORTS[@]}"; do
+    [[ "${NODE_HTTP_PORTS[$index]}" != "$http_port" ]] || api_url="$(public_api_url "$index")"
+  done
   mkdir -p "$node_dir/storage" "$node_dir/blob"
   {
     printf 'STORAGE_PATH=%s\n' "$(env_quote "$node_dir/storage")"
@@ -305,7 +327,7 @@ write_node_env() {
     printf 'SOCKET_ADDRESS=127.0.0.1:%s\n' "$http_port"
     printf 'P2P_SOCKET_ADDRESS=127.0.0.1:%s\n' "$p2p_port"
     printf 'OPS_SOCKET_ADDRESS=127.0.0.1:%s\n' "$ops_port"
-    printf 'API_PUBLIC_URL=http://127.0.0.1:%s\n' "$http_port"
+    printf 'API_PUBLIC_URL=%s\n' "$api_url"
     printf 'S3_HOST=127.0.0.1:%s\n' "$s3_port"
     printf 'S3_PUBLIC_URL=http://127.0.0.1:%s\n' "$s3_port"
     if [[ "$COMPUTE_EXECUTOR" != "none" ]]; then
@@ -329,6 +351,7 @@ write_node_env() {
       printf 'S3_ADDRESS=127.0.0.1:%s\n' "$s3_port"
     fi
     printf 'REALM_DESCRIPTION=Test_Deploy_Realm\n'
+    printf 'FEDERATION_REGISTRY_URL=%s\n' "$(env_quote "$REGISTRY_URL")"
     printf 'METADATA_REPLICATION_FACTOR=3\n'
     if [[ -n "$PORTAL_DIR" ]]; then
       printf 'PORTAL_MODE=artifact\n'
@@ -345,6 +368,9 @@ write_node_env() {
     fi
     if [[ -n "$onboarding_secret" ]]; then
       printf 'ONBOARDING_SECRET=%s\n' "$onboarding_secret"
+    fi
+    if [[ -n "$CA_FILE" ]]; then
+      printf 'SSL_CERT_FILE=%s\n' "$(env_quote "$CA_FILE")"
     fi
 
     if [[ -n "$max_concurrent_uni_streams" ]]; then
@@ -791,6 +817,7 @@ require_commands() {
 prepare_deployment() {
   rm -rf "$DEPLOY_ROOT"
   mkdir -p "$DEPLOY_ROOT"
+  printf '%s\n' "$$" >"$DEPLOY_ROOT/cluster_start.pid"
 
   prepare_nodes
 
@@ -798,6 +825,7 @@ prepare_deployment() {
     # The browser now loads the SPA from the portal origins, so those are the
     # origins the REST and S3 listeners have to admit.
     PORTAL_CORS_ORIGINS="$(IFS=,; printf '%s' "${NODE_PORTAL_URLS[*]}"),$(IFS=,; printf '%s' "${NODE_BASE_URLS[*]}"),$(printf 'http://127.0.0.1:%s,' "${NODE_S3_PORTS[@]}")http://localhost:5173"
+    [[ -z "$EXTRA_ORIGINS" ]] || PORTAL_CORS_ORIGINS="$PORTAL_CORS_ORIGINS,$EXTRA_ORIGINS"
   fi
 
   assert_node_ports
@@ -895,7 +923,7 @@ verify_deployment() {
       verify_portal_route \
         "${NODE_NAMES[$node_index]}" \
         "${NODE_PORTAL_URLS[$node_index]}" \
-        "${NODE_BASE_URLS[$node_index]}"
+        "$(public_api_url "$node_index")"
     done
   fi
 

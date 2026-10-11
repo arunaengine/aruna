@@ -133,6 +133,9 @@ pub(super) fn token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
         restrictions: None,
         issuer_pubkey: None,
         delegation_signature: None,
+        name: None,
+        via: None,
+        auth_time: None,
     }
 }
 

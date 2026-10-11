@@ -12,7 +12,7 @@ use aruna_core::document::{
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::keyspaces::{FEDERATION_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
@@ -33,7 +33,7 @@ use aruna_core::user::validation::{
 use aruna_core::{DOCUMENT_STATE_KEYSPACE, SYNC_REVISION_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -57,6 +57,28 @@ pub struct UpdateUserInput {
     pub remove_attributes: Vec<String>,
     /// Set by operations that authorized the change themselves; only they may touch reserved keys.
     pub system: bool,
+    /// Links or unlinks a login of another realm, with its ownership claims in the same commit.
+    pub alias: Option<AliasChange>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AliasChange {
+    /// Links a login confirmed for its session issued at `issued_at`; every transaction attempt
+    /// rechecks the account, the realm's admission and cutoffs at `now`.
+    Add {
+        alias: UserId,
+        issued_at: u64,
+        now: u64,
+    },
+    Remove(UserId),
+}
+
+impl AliasChange {
+    fn alias(&self) -> UserId {
+        match self {
+            Self::Add { alias, .. } | Self::Remove(alias) => *alias,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -125,6 +147,20 @@ pub enum UpdateUserError {
     InvalidAttributeValue(String),
     #[error("too many user attributes")]
     TooManyAttributes,
+    #[error("the linked login is not a login of another realm")]
+    InvalidAlias,
+    #[error("the login is already linked to another account")]
+    AliasClaimed,
+    #[error("the account already links a login of that realm")]
+    AliasRealmTaken,
+    #[error("the account has no such linked login")]
+    AliasMissing,
+    #[error("the account is inactive or a service account")]
+    AliasInactive,
+    #[error("the login's realm is no longer admitted")]
+    AliasNotAdmitted,
+    #[error("the login was cut off after it was confirmed")]
+    AliasCutOff,
     #[error(transparent)]
     AuthorizationError(#[from] AuthorizationError),
     #[error(transparent)]
@@ -286,7 +322,13 @@ impl UpdateUserOperation {
                     REALM_CONFIG_KEYSPACE.to_string(),
                     ByteView::from(*self.input.actor.realm_id.as_bytes()),
                 ),
-            ],
+            ]
+            .into_iter()
+            .chain(self.input.alias.map(|change| {
+                let key = aruna_core::link::alias_claims_key(&change.alias());
+                (FEDERATION_KEYSPACE.to_string(), ByteView::from(key))
+            }))
+            .collect(),
             txn_id: Some(txn_id),
         })]
     }
@@ -301,6 +343,7 @@ impl UpdateUserOperation {
             (_, reducer_state_value),
             (_, revision_value),
             (_, realm_config_value),
+            claims @ ..,
         ] = values.as_slice()
         else {
             return self.unexpected_event(
@@ -309,12 +352,14 @@ impl UpdateUserOperation {
             );
         };
 
+        let claims = claims.first().and_then(|(_, value)| value.clone());
         match self.emit_write_user(
             txn_id,
             user_value.clone(),
             reducer_state_value.clone(),
             revision_value.clone(),
             realm_config_value.clone(),
+            claims,
         ) {
             Ok(effects) => effects,
             Err(error) => self.fail(error),
@@ -328,6 +373,7 @@ impl UpdateUserOperation {
         reducer_state_value: Option<ByteView>,
         revision_value: Option<ByteView>,
         realm_config_value: Option<ByteView>,
+        claims_value: Option<ByteView>,
     ) -> Result<Effects, UpdateUserError> {
         let current = user_value.ok_or(UpdateUserError::UserNotFound)?;
         let mut user = User::from_bytes(&current)?;
@@ -335,8 +381,25 @@ impl UpdateUserOperation {
             return Err(UpdateUserError::UserIdMismatch);
         }
 
+        let realm_config = realm_config_value
+            .as_deref()
+            .map(RealmConfigDocument::from_bytes)
+            .transpose()?;
+        if let Some(AliasChange::Add {
+            alias,
+            issued_at,
+            now,
+        }) = self.input.alias
+        {
+            check_link(&user, realm_config.as_ref(), &alias, issued_at, now)?;
+        }
         let was_deactivated = user.is_deactivated();
         apply_updates(&mut user, &self.input)?;
+        let claims = self
+            .input
+            .alias
+            .map(|change| apply_alias(&mut user, change, claims_value.as_deref()))
+            .transpose()?;
         // An active user turning inactive ends READ; a repeat leaves the status unchanged.
         self.deactivating = !was_deactivated && user.is_deactivated();
         let admin_target = AdminDocumentTarget::User {
@@ -369,10 +432,6 @@ impl UpdateUserOperation {
         let document_target = DocumentTarget::User {
             user_id: user.user_id,
         };
-        let realm_config = realm_config_value
-            .as_deref()
-            .map(RealmConfigDocument::from_bytes)
-            .transpose()?;
         let placement = realm_config
             .as_ref()
             .map(|config| target_placement_ref(config, &document_target, Default::default()))
@@ -389,7 +448,7 @@ impl UpdateUserOperation {
         );
 
         let bytes = user.reconcile_bytes(Some(&current), &self.input.actor)?;
-        let stale_conflict_deletes =
+        let mut stale_conflict_deletes =
             stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
         let mut writes = vec![
             (
@@ -414,6 +473,15 @@ impl UpdateUserOperation {
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
+        if let (Some(change), Some(claims)) = (self.input.alias, claims) {
+            let key = ByteView::from(aruna_core::link::alias_claims_key(&change.alias()));
+            if claims.is_empty() {
+                stale_conflict_deletes.push((FEDERATION_KEYSPACE.to_string(), key));
+            } else {
+                let value = postcard::to_allocvec(&claims).map_err(ConversionError::from)?;
+                writes.push((FEDERATION_KEYSPACE.to_string(), key, ByteView::from(value)));
+            }
+        }
 
         self.state = UpdateUserState::WriteStateRevision {
             txn_id,
@@ -734,7 +802,85 @@ fn admin_document_operations(input: &UpdateUserInput) -> Vec<AdminDocumentOperat
         });
     }
 
+    match input.alias {
+        Some(AliasChange::Add { alias, .. }) => {
+            operations.push(AdminDocumentOperation::UserAliasAdded { alias });
+        }
+        Some(AliasChange::Remove(alias)) => {
+            operations.push(AdminDocumentOperation::UserAliasRemoved { alias });
+        }
+        None => {}
+    }
+
     operations
+}
+
+/// Refuses a link when the account turned inactive, the login's realm is no longer admitted,
+/// or the login was cut off after the confirmed session.
+fn check_link(
+    user: &User,
+    config: Option<&RealmConfigDocument>,
+    alias: &UserId,
+    issued_at: u64,
+    now: u64,
+) -> Result<(), UpdateUserError> {
+    if user.is_deactivated() || user.service_group().is_some() {
+        return Err(UpdateUserError::AliasInactive);
+    }
+    let admitted = config
+        .and_then(|config| config.federation.as_ref())
+        .is_some_and(|settings| settings.accepted_realms.admits(&alias.realm_id));
+    if !admitted {
+        return Err(UpdateUserError::AliasNotAdmitted);
+    }
+    if config
+        .and_then(|config| config.user_cutoff(alias, now))
+        .is_some_and(|cutoff| issued_at < cutoff)
+    {
+        return Err(UpdateUserError::AliasCutOff);
+    }
+    Ok(())
+}
+
+/// Applies a link or unlink to the account and returns the login's new ownership claims. A
+/// login another account claims, or a second login of the same realm, is refused.
+fn apply_alias(
+    user: &mut User,
+    change: AliasChange,
+    claims: Option<&[u8]>,
+) -> Result<BTreeSet<UserId>, UpdateUserError> {
+    let alias = change.alias();
+    if alias.realm_id == user.user_id.realm_id || alias.is_nil() {
+        return Err(UpdateUserError::InvalidAlias);
+    }
+    let mut claims = claims
+        .map(postcard::from_bytes::<BTreeSet<UserId>>)
+        .transpose()
+        .map_err(ConversionError::from)?
+        .unwrap_or_default();
+    match change {
+        AliasChange::Add { .. } => {
+            if claims.iter().any(|owner| *owner != user.user_id) {
+                return Err(UpdateUserError::AliasClaimed);
+            }
+            let same_realm = user
+                .alias_user_ids
+                .iter()
+                .any(|linked| *linked != alias && linked.realm_id == alias.realm_id);
+            if same_realm {
+                return Err(UpdateUserError::AliasRealmTaken);
+            }
+            user.alias_user_ids.insert(alias);
+            claims.insert(user.user_id);
+        }
+        AliasChange::Remove(_) => {
+            if !user.alias_user_ids.remove(&alias) {
+                return Err(UpdateUserError::AliasMissing);
+            }
+            claims.remove(&user.user_id);
+        }
+    }
+    Ok(claims)
 }
 
 fn apply_updates(user: &mut User, input: &UpdateUserInput) -> Result<(), UpdateUserError> {
@@ -835,6 +981,7 @@ mod pure_tests {
             ]),
             remove_attributes: vec!["old".to_string()],
             system: false,
+            alias: None,
         }
     }
 

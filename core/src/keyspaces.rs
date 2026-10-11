@@ -330,6 +330,8 @@ pub const BUCKET_STATS_DB: &str = "bucket_stats";
 
 pub const API_STATE_KEYSPACE: &str = "api_state";
 pub const NODE_STATE_KEYSPACE: &str = "node_state";
+/// Node-local registry publication state: the withdrawals sent since registration was disabled.
+pub const FEDERATION_KEYSPACE: &str = "federation_publication";
 /// Secrets this node opens by itself, sealed with its node vault key. Never replicated.
 pub const NODE_VAULT_KEYSPACE: &str = "node_vault";
 /// The one row of `NODE_STATE_KEYSPACE` that holds the node's identity.
@@ -515,6 +517,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BUCKET_STATS_DB,
     API_STATE_KEYSPACE,
     NODE_STATE_KEYSPACE,
+    FEDERATION_KEYSPACE,
     NODE_VAULT_KEYSPACE,
     ONBOARDING_KEYSPACE,
     DHT_KEYSPACE,

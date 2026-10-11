@@ -56,6 +56,7 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
         .await?,
     );
     let mut spec = ExportRoCrateSpec {
+        selection: None,
         auth_context: imported.auth_context.clone(),
         document_id: doc_id(1),
         limits: RoCrateLimits::default(),
@@ -762,6 +763,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     destination.credential =
         Some(seal_credential(&fixture.context, &auth, &destination, token).await?);
     let mut spec = ExportRoCrateSpec {
+        selection: None,
         auth_context: auth.clone(),
         document_id: doc_id(1),
         limits: RoCrateLimits::default(),

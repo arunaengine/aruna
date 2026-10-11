@@ -263,7 +263,7 @@ pub(crate) async fn plaintext_holder(
     if !encrypted {
         return Ok(false);
     }
-    match is_holder(&context, bucket, user).await {
+    match is_holder(&context, state.get_realm_id(), bucket, user).await {
         Ok(true) => Ok(true),
         Ok(false) => Err(ServerError::Refused(
             StatusCode::FORBIDDEN,

@@ -69,6 +69,7 @@ fn binds_repository_login() {
     );
     let payload = |token| {
         JobPayload::ExportRoCrate(ExportRoCrateSpec {
+            selection: None,
             auth_context: AuthContext {
                 user_id: user,
                 realm_id: user.realm_id,
