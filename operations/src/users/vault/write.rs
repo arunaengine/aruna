@@ -145,13 +145,13 @@ struct Unsigned {
     heads: Vec<VaultRevision>,
 }
 
-/// Whether `signed` is `unsigned` with signatures added.
+/// Whether `signed` is `unsigned` with valid origin signatures added.
 fn same_records(unsigned: &VaultRecords, signed: &VaultRecords) -> bool {
     match (unsigned, signed) {
         (VaultRecords::Heads(left), VaultRecords::Heads(right)) => {
             left.len() == right.len()
                 && left.iter().zip(right).all(|(left, right)| {
-                    right.signature.is_some()
+                    right.origin_signed()
                         && *left
                             == VaultRevision {
                                 signature: None,
@@ -162,7 +162,7 @@ fn same_records(unsigned: &VaultRecords, signed: &VaultRecords) -> bool {
         (VaultRecords::Keys(left), VaultRecords::Keys(right)) => {
             left.len() == right.len()
                 && left.iter().zip(right).all(|(left, right)| {
-                    right.signature.is_some()
+                    right.origin_signed()
                         && *left
                             == UserKeyRecord {
                                 signature: None,
@@ -876,14 +876,14 @@ mod tests {
 
     #[test]
     fn refuses_unsigned_records() {
-        // Changed records or a refused signature abort the transaction without a write.
+        // Changed records, a forged signature or a refusal abort the transaction unwritten.
         let (config, holders) = config_bytes();
         let change = VaultChange::PublishKey {
             key_id: "key-1".to_string(),
             public_key: [4; 32],
             has_recovery: false,
         };
-        for altered in [true, false] {
+        for altered in [Some(true), Some(false), None] {
             let mut operation = operation(holders[0], change.clone());
             read_rows(&mut operation, config.clone()).unwrap();
             let effects = rows(&mut operation, Vec::new());
@@ -893,12 +893,13 @@ mod tests {
             let VaultRecords::Keys(mut keys) = (**records).clone() else {
                 panic!("expected a key record");
             };
-            keys[0].user_id = UserId::local(Ulid::from_bytes([8; 16]), keys[0].realm_id);
+            if altered == Some(true) {
+                keys[0].user_id = UserId::local(Ulid::from_bytes([8; 16]), keys[0].realm_id);
+            }
             keys[0].signature = Some(iroh::SecretKey::from_bytes(&[1; 32]).sign(b"x"));
-            let event = if altered {
-                VaultSignEvent::Signed(Box::new(VaultRecords::Keys(keys)))
-            } else {
-                VaultSignEvent::Unavailable("no key".to_string())
+            let event = match altered {
+                Some(_) => VaultSignEvent::Signed(Box::new(VaultRecords::Keys(keys))),
+                None => VaultSignEvent::Unavailable("no key".to_string()),
             };
             let effects = operation.step(Event::Net(NetEvent::VaultSign(event)));
             assert!(matches!(
