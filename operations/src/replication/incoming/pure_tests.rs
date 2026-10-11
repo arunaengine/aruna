@@ -1426,14 +1426,17 @@ fn rejects_manifest_size() {
 
 #[test]
 fn checks_serving_realm() {
-    // A user of another realm is served here; a session of another realm is refused.
+    // A user of another realm is served here; a session of another realm, or an anonymous
+    // identity of another realm, is refused.
     let foreign = RealmId::from_bytes([8u8; 32]);
-    for (user_realm, serving_realm, accepted) in [
-        (foreign, test_realm_id(), true),
-        (test_realm_id(), foreign, false),
+    let user = |realm_id| UserId::local(Ulid::from_parts(25, 25), realm_id);
+    for (user_id, serving_realm, accepted) in [
+        (user(foreign), test_realm_id(), true),
+        (user(test_realm_id()), foreign, false),
+        (UserId::nil(foreign), test_realm_id(), false),
     ] {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-        manifest.auth_context.user_id = UserId::local(Ulid::from_parts(25, 25), user_realm);
+        manifest.auth_context.user_id = user_id;
         manifest.auth_context.realm_id = serving_realm;
         if let Some(writer) = manifest.writer_auth_context.as_mut() {
             writer.user_id = manifest.auth_context.user_id;

@@ -701,7 +701,10 @@ impl Operation for LocationSummaryOperation {
     type Error = LocationSummaryError;
 
     fn start(&mut self) -> Effects {
-        if self.request.auth_context.realm_id != self.request.realm_id {
+        let user_id = self.request.auth_context.user_id;
+        if self.request.auth_context.realm_id != self.request.realm_id
+            || (user_id.is_nil() && user_id.realm_id != self.request.realm_id)
+        {
             return self.deny();
         }
         match self.peer {
@@ -1163,13 +1166,16 @@ mod pure_tests {
 
     #[test]
     fn checks_serving_realm() {
-        // A user of another realm is answered here; a session of another realm is denied.
+        // A user of another realm is answered here; a session of another realm, or an
+        // anonymous identity of another realm, is denied.
         let foreign = aruna_core::structs::identity::realm::RealmId::from_bytes([8u8; 32]);
-        for (user_realm, serving_realm, accepted) in
-            [(foreign, realm_id(), true), (realm_id(), foreign, false)]
-        {
+        for (user_id, serving_realm, accepted) in [
+            (UserId::local(Ulid::from(5u128), foreign), realm_id(), true),
+            (UserId::local(Ulid::from(5u128), realm_id()), foreign, false),
+            (UserId::nil(foreign), realm_id(), false),
+        ] {
             let mut request = request(None);
-            request.auth_context.user_id = UserId::local(Ulid::from(5u128), user_realm);
+            request.auth_context.user_id = user_id;
             request.auth_context.realm_id = serving_realm;
             let mut operation = LocationSummaryOperation::new_local(node_id(5), request);
             let effects = operation.start();
