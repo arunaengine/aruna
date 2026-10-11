@@ -1162,6 +1162,27 @@ mod pure_tests {
     }
 
     #[test]
+    fn checks_serving_realm() {
+        // A user of another realm is answered here; a session of another realm is denied.
+        let foreign = aruna_core::structs::identity::realm::RealmId::from_bytes([8u8; 32]);
+        for (user_realm, serving_realm, accepted) in
+            [(foreign, realm_id(), true), (realm_id(), foreign, false)]
+        {
+            let mut request = request(None);
+            request.auth_context.user_id = UserId::local(Ulid::from(5u128), user_realm);
+            request.auth_context.realm_id = serving_realm;
+            let mut operation = LocationSummaryOperation::new_local(node_id(5), request);
+            let effects = operation.start();
+            assert_eq!(operation.is_complete(), !accepted);
+            if accepted {
+                assert!(!effects.is_empty());
+            } else {
+                assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+            }
+        }
+    }
+
+    #[test]
     fn replaced_bucket_denied() {
         // A bucket deleted and recreated under another group must not answer to
         // a caller authorized against the generation the read started on.

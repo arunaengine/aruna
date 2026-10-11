@@ -2235,6 +2235,33 @@ mod pure_tests {
     }
 
     #[test]
+    fn checks_serving_realm() {
+        // A user of another realm reads through this realm; a session of another realm is refused.
+        let (local_node, peer) = (node_from_seed(1), node_from_seed(2));
+        let foreign = RealmId::from_bytes([8u8; 32]);
+        for (user_realm, serving_realm, accepted) in [
+            (foreign, test_realm(), true),
+            (test_realm(), foreign, false),
+        ] {
+            let mut request = read_request(local_node, [4u8; 32]);
+            request.auth_context.user_id = UserId::local(Ulid::from(5u128), user_realm);
+            request.auth_context.realm_id = serving_realm;
+            let stream_id = Ulid::from(9u128);
+            let mut operation =
+                IncomingBaoOperation::new(peer, local_node, test_realm(), stream_id, request);
+            let effects = operation.start();
+            if accepted {
+                assert!(matches!(
+                    effects.as_slice(),
+                    [Effect::Storage(StorageEffect::Read { .. })]
+                ));
+            } else {
+                assert_eq!(refusal_from(&effects), BaoReadRefusal::RealmPeerDenied);
+            }
+        }
+    }
+
+    #[test]
     fn denies_wire_read() {
         let local_node = node_from_seed(1);
         let peer = node_from_seed(2);

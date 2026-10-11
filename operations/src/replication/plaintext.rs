@@ -346,5 +346,22 @@ pub(crate) mod tests {
                 Ok(holder)
             );
         }
+
+        // Plaintext still needs the consent of that holder; a non-holder's consent never counts.
+        let row = relationship_consent(Ulid::from_bytes([6; 16]));
+        let allowed = async |user| {
+            plaintext_allowed(&context, local, "sealed", user, row.clone())
+                .await
+                .unwrap()
+        };
+        assert!(!allowed(foreign(7)).await);
+        store_consent(&context, consent_write(row.clone(), foreign(1)).unwrap())
+            .await
+            .unwrap();
+        assert!(!allowed(foreign(1)).await && !allowed(foreign(7)).await);
+        store_consent(&context, consent_write(row.clone(), foreign(7)).unwrap())
+            .await
+            .unwrap();
+        assert!(allowed(foreign(7)).await);
     }
 }
