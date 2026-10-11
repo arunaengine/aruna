@@ -34,6 +34,7 @@ use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::holders::GetHoldersOperation;
 use crate::driver::{DriverContext, drive};
+use crate::node::heartbeat::{fresh_heartbeats, live_telemetry};
 use crate::node::node_info::read_info_document;
 use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 
@@ -71,7 +72,9 @@ pub async fn build_plan(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or_else(|| PlanBuildError::Unavailable("network handle unavailable".to_string()))?;
-    let (documents, unread) = advertisements(context, config).await;
+    let (mut documents, unread) = advertisements(context, config).await;
+    let fresh = fresh_heartbeats(context.net_handle.as_ref());
+    live_telemetry(&fresh, &mut documents, now_ms);
     let inputs = resolve_inputs(context, config, spec, local).await?;
     let mut output_policies = inputs
         .iter()

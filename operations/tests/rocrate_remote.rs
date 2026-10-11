@@ -647,7 +647,7 @@ fn archive_names<R: Read + std::io::Seek>(
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut names = Vec::with_capacity(archive.len());
     for index in 0..archive.len() {
-        names.push(archive.by_index(index)?.name().to_string());
+        names.push(archive.by_index(index)?.name()?.to_string());
     }
     Ok(names)
 }

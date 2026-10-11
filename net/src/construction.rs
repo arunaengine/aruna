@@ -71,6 +71,7 @@ impl NetHandle {
                 realm_peers: peers.realm_peers,
                 inbound_admission: peers.inbound_admission,
                 watch_interest: handle_state.watch_interest,
+                heartbeats: Arc::default(),
                 notification_watch_metrics: NotificationWatchMetrics::default(),
                 notification_wakes: handle_state.notification_wakes,
                 dashboard_epoch: handle_state.dashboard_epoch,
@@ -146,6 +147,7 @@ impl NetworkEndpoint {
             Alpn::Notification.as_bytes().to_vec(),
             Alpn::Shard.as_bytes().to_vec(),
             Alpn::JobControl.as_bytes().to_vec(),
+            Alpn::Heartbeat.as_bytes().to_vec(),
         ];
 
         let mut endpoint_builder = Endpoint::builder(presets::Minimal)

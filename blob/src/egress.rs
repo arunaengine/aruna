@@ -8,9 +8,10 @@ use aruna_core::egress::{EgressError, EgressPolicy};
 use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
 use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns, ResolveDnsError};
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
-use opendal::layers::HttpClientLayer;
-use opendal::raw::{HttpBody, HttpClient, HttpFetch};
-use opendal::{Buffer, ErrorKind};
+use opendal::{
+    Buffer, ErrorKind, HttpBody, HttpRedirect, HttpTransport, HttpTransporter, OperationContext,
+};
+use opendal_http_transport_reqwest::ReqwestTransport;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Url, redirect};
 use std::fmt;
@@ -121,7 +122,7 @@ impl ResolveDns for ScreenedDns {
 /// endpoints that hyper connects to without consulting the DNS resolver.
 #[derive(Clone)]
 struct ScreenedFetch {
-    client: reqwest::Client,
+    client: ReqwestTransport,
     policy: EgressPolicy,
 }
 
@@ -133,14 +134,18 @@ fn denied(error: EgressError) -> opendal::Error {
     .set_source(error)
 }
 
-impl HttpFetch for ScreenedFetch {
+impl HttpTransport for ScreenedFetch {
     async fn fetch(
         &self,
         request: http::Request<Buffer>,
     ) -> opendal::Result<http::Response<HttpBody>> {
         // reqwest's URL parser reads `2852039166` and `127.1` as addresses the
         // raw substring never shows, so the screen runs on the parsed host.
-        let uri = request.uri().to_string();
+        // A reused redirect is sent to its destination, not to the request URI.
+        let uri = request.extensions().get::<HttpRedirect>().map_or_else(
+            || request.uri().to_string(),
+            |redirect| redirect.uri().original_uri().to_string(),
+        );
         let Some(host) = Url::parse(&uri)
             .ok()
             .and_then(|url| url.host_str().map(str::to_string))
@@ -205,11 +210,11 @@ impl EgressGuard {
             }))
     }
 
-    /// Replaces the client opendal uses for data-plane requests *and* for the
-    /// credential fetches every builder threads through `AccessorInfoHttpSend`.
-    pub fn layer(&self) -> HttpClientLayer {
-        HttpClientLayer::new(HttpClient::with(ScreenedFetch {
-            client: self.opendal.clone(),
+    /// Replaces the transport opendal uses for data-plane requests *and* for the
+    /// credential fetches every service signs through the operation context.
+    pub fn context(&self) -> OperationContext {
+        OperationContext::new().with_http_transport(HttpTransporter::new(ScreenedFetch {
+            client: ReqwestTransport::new(self.opendal.clone()),
             policy: self.policy.clone(),
         }))
     }

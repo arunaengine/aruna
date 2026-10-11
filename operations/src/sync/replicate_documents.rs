@@ -44,6 +44,8 @@ pub struct ReplicateDocumentsOperation {
     realm_config: Option<RealmConfigDocument>,
     placement_action: Option<PlacementAction>,
     retry_needed: bool,
+    /// Fail when a document was not handed to the outbox instead of deferring it.
+    strict: bool,
     output: Option<Result<(), ReplicateDocumentsError>>,
 }
 
@@ -116,8 +118,16 @@ impl ReplicateDocumentsOperation {
             realm_config: None,
             placement_action: None,
             retry_needed: false,
+            strict: false,
             output: None,
         }
+    }
+
+    /// A failed or deferred announce fails the operation, so the caller keeps its own retry: a
+    /// placement retry repairs topic membership but never queues the document again.
+    pub fn strict(mut self) -> Self {
+        self.strict = true;
+        self
     }
 
     fn fail(&mut self, error: ReplicateDocumentsError) -> Effects {
@@ -170,6 +180,9 @@ impl ReplicateDocumentsOperation {
         let plan = match plan_target_placement(realm_config, &document, Default::default()) {
             Ok(Some(plan)) => plan,
             Ok(None) => return self.emit_next_publish(),
+            Err(error) if self.strict => {
+                return self.fail(ReplicateDocumentsError::DocumentSync(error.to_string()));
+            }
             Err(_) => {
                 // Unresolvable bucket: keep a durable pending record so the
                 // reconciler retries, and announce nothing to nonholders.
@@ -330,6 +343,9 @@ impl Operation for ReplicateDocumentsOperation {
                             Ok(effects) => effects,
                             Err(error) => self.fail(error),
                         },
+                        Err(error) if self.strict => {
+                            self.fail(ReplicateDocumentsError::DocumentSync(error))
+                        }
                         Err(error) => self.retry_failed_publish(error),
                     }
                 }
@@ -648,6 +664,38 @@ mod pure_tests {
             .expect("placement decodes");
         assert_eq!(record.authoritative_node_id, local_node_id);
         assert!(record.selected_peers.is_empty());
+    }
+
+    #[test]
+    fn strict_fails_publish() {
+        // A strict caller keeps its own retry, so a failed announce fails instead of deferring.
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let local_node_id = node(1);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![node_info_target(realm_id, local_node_id)],
+            allow_genesis: false,
+        })
+        .strict();
+        operation.realm_config = Some(config_with(&[local_node_id, node(2)], Some(3)));
+        operation.state = ReplicateDocumentsState::Publish;
+        operation.placement_action = Some(PlacementAction::Delete(PlacementRef {
+            strategy_id: ulid::Ulid::from_bytes([9u8; 16]),
+            shard: 1,
+        }));
+
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
+            result: Err("outbox write failed".to_string()),
+        }));
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(ReplicateDocumentsError::DocumentSync(_))
+        ));
     }
 
     #[test]

@@ -749,7 +749,7 @@ async fn token_opens_scope() -> TestResult<()> {
             let read = get().customize().interceptor(tamper).send().await;
             assert_eq!(
                 service_error_code(&read).as_deref(),
-                Some("AccessDenied"),
+                Some("SignatureDoesNotMatch"),
                 "{listed:?}"
             );
         }

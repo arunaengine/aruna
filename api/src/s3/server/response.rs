@@ -17,7 +17,7 @@ use s3s::s3_error;
 use std::io;
 
 pub(super) fn connection_error() -> HttpError {
-    HttpError::new(Box::new(io::Error::new(
+    HttpError::from_std_error(Box::new(io::Error::new(
         io::ErrorKind::ConnectionAborted,
         "S3 connection became idle",
     )))
@@ -26,7 +26,7 @@ pub(super) fn connection_error() -> HttpError {
 pub(super) fn stream_timeout_response() -> Result<HttpResponse, HttpError> {
     s3_error!(RequestTimeout, "S3 request made no progress")
         .to_http_response()
-        .map_err(|error| HttpError::new(Box::new(error)))
+        .map_err(|error| HttpError::from_std_error(Box::new(error)))
 }
 
 pub(super) fn oversized_delete_response() -> Result<HttpResponse, HttpError> {
@@ -35,13 +35,13 @@ pub(super) fn oversized_delete_response() -> Result<HttpResponse, HttpError> {
         "DeleteObjects request body exceeds 2 MiB"
     )
     .to_http_response()
-    .map_err(|error| HttpError::new(Box::new(error)))
+    .map_err(|error| HttpError::from_std_error(Box::new(error)))
 }
 
 pub(super) fn invalid_bucket_response(reason: &'static str) -> Result<HttpResponse, HttpError> {
     s3_error!(InvalidBucketName, "{}", reason)
         .to_http_response()
-        .map_err(|error| HttpError::new(Box::new(error)))
+        .map_err(|error| HttpError::from_std_error(Box::new(error)))
 }
 
 /// A security token in the query of a long-lived key; token credentials cannot be presigned.
@@ -51,7 +51,7 @@ pub(super) fn invalid_token_response() -> Result<HttpResponse, HttpError> {
         "Token credentials accept the security token only as a header"
     )
     .to_http_response()
-    .map_err(|error| HttpError::new(Box::new(error)))
+    .map_err(|error| HttpError::from_std_error(Box::new(error)))
 }
 
 pub(super) fn slow_down_response(retry_after: u64) -> HttpResponse {

@@ -18,6 +18,8 @@ pub(super) enum ExplorerError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Fjall(#[from] fjall::Error),
+    #[error(transparent)]
+    Irokle(#[from] irokle::Error),
     #[error("keyspace not found: {0}")]
     KeyspaceNotFound(String),
     #[error("decode failed: {0}")]

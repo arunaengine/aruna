@@ -1045,7 +1045,8 @@ async fn run_connection(
         | Alpn::NativeReference
         | Alpn::Notification
         | Alpn::Shard
-        | Alpn::JobControl) => {
+        | Alpn::JobControl
+        | Alpn::Heartbeat) => {
             if alpn == Alpn::DocumentSync {
                 document_sync.register_inbound_connection(&conn);
             }

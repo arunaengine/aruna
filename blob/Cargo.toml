@@ -36,6 +36,7 @@ http-body = { workspace = true }
 iroh-io = { workspace = true }
 md5 = { workspace = true }
 opendal = { workspace = true }
+opendal-http-transport-reqwest = { workspace = true }
 percent-encoding = { workspace = true }
 pithos_lib = { workspace = true }
 postcard = { workspace = true }

@@ -487,6 +487,7 @@ impl S3 for ArunaS3Service {
                 .await?
             {
                 buckets.push(Bucket {
+                    bucket_arn: None,
                     bucket_region: None,
                     creation_date: Some(bucket_info.created_at.into()),
                     name: Some(bucket),

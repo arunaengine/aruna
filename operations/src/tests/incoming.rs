@@ -155,6 +155,7 @@ pub(crate) async fn installed_setup() -> InstalledHarness {
         &aruna_core::structs::placement::record::PlacementRef::NIL,
     );
     net.ensure_sync_topics(&[topic], Vec::new())
+        .await
         .expect("shared topic genesis");
     for index in 1..=2u128 {
         let record = crate::sync::document_outbox::new_identified_record(

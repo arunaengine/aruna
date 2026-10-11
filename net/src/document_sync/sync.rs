@@ -68,7 +68,7 @@ impl DocumentSyncService {
             }
 
             let actor_id = ::irokle::actor_id_for(topic_id, self.node.peer_id());
-            let oplog = Oplog::with_storage(self.node.storage().clone());
+            let oplog = self.node.oplog();
             for peer in missing_peers {
                 oplog
                     .create_control_op(

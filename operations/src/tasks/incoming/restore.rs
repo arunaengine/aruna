@@ -313,9 +313,17 @@ impl OperationsTaskHandler {
         if let Some(net_handle) = self.context.net_handle.as_ref() {
             let node_id = net_handle.node_id();
             let realm_id = *net_handle.realm_id();
-            if let Err(error) =
-                crate::node::node_info::refresh_info_heartbeat(&self.context, node_id, realm_id)
-                    .await
+            let sequence = self
+                .heartbeat_sequence
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if let Err(error) = crate::node::node_info::refresh_info_heartbeat(
+                &self.context,
+                node_id,
+                realm_id,
+                sequence,
+            )
+            .await
             {
                 warn!(task_id = ?TaskKey::PublishNodeInfo, error = %error, "Failed to publish node info heartbeat");
             }

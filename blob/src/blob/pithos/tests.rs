@@ -67,9 +67,8 @@ fn sealed_archive(bucket: &PrivateKey, data: &[u8]) -> (Vec<u8>, PithosLayout) {
 fn empty_store() -> (tempfile::TempDir, Operator) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap().to_string();
-    let operator = Operator::from_iter::<opendal::services::Fs>([("root".to_string(), root)])
-        .unwrap()
-        .finish();
+    let operator =
+        Operator::from_iter::<opendal::services::Fs>([("root".to_string(), root)]).unwrap();
     (dir, operator)
 }
 

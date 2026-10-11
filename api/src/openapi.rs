@@ -110,7 +110,7 @@ fn add_transport_responses(openapi: &mut utoipa::openapi::OpenApi) {
                 {
                     response
                         .content
-                        .insert("text/plain".to_string(), body_limit_content());
+                        .insert("text/plain".to_string(), body_limit_content().into());
                 }
             }
             if needs_internal(path, method, operation) {
@@ -144,8 +144,8 @@ fn needs_internal(path: &str, method: &str, operation: &utoipa::openapi::path::O
         };
         response.content.values().any(|content| {
             matches!(
-                content.schema.as_ref(),
-                Some(RefOr::Ref(reference))
+                content,
+                RefOr::T(Content { schema: Some(RefOr::Ref(reference)), .. })
                     if reference.ref_location.ends_with("/ErrorResponse")
             )
         })

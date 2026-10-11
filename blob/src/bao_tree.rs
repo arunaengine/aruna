@@ -540,8 +540,7 @@ mod tests {
         let operator = opendal::Operator::from_iter::<opendal::services::Fs>(
             [("root".to_string(), dir.path().to_str().unwrap().to_string())].into_iter(),
         )
-        .unwrap()
-        .finish();
+        .unwrap();
         let mut writer = OpenDalWriter::new(
             &operator,
             "blob.bin",
@@ -568,8 +567,7 @@ mod tests {
         let operator = opendal::Operator::from_iter::<opendal::services::Fs>(
             [("root".to_string(), dir.path().to_str().unwrap().to_string())].into_iter(),
         )
-        .unwrap()
-        .finish();
+        .unwrap();
         let mut writer = OpenDalWriter::new(
             &operator,
             "blob.bin",

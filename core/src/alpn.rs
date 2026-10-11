@@ -46,11 +46,13 @@ pub enum Alpn {
     Shard,
     /// Placement-routed durable job control protocol
     JobControl,
+    /// Heartbeats with live telemetry, held in memory only
+    Heartbeat,
 }
 
 impl Alpn {
     /// Every protocol, so a matrix or dispatch review can iterate all of them.
-    pub const ALL: [Alpn; 8] = [
+    pub const ALL: [Alpn; 9] = [
         Alpn::Dht,
         Alpn::Bao,
         Alpn::DocumentSync,
@@ -59,6 +61,7 @@ impl Alpn {
         Alpn::Notification,
         Alpn::Shard,
         Alpn::JobControl,
+        Alpn::Heartbeat,
     ];
 
     /// ALPN and node-kind allow matrix enforced at both connection ends. Unknown kinds retain provisional
@@ -72,7 +75,7 @@ impl Alpn {
                 | Alpn::Metadata
                 | Alpn::NativeReference
                 | Alpn::Notification => true,
-                Alpn::DocumentSync | Alpn::Shard => false,
+                Alpn::DocumentSync | Alpn::Shard | Alpn::Heartbeat => false,
                 Alpn::JobControl => match role {
                     AlpnRole::PeerInbound | AlpnRole::LocalDial => true,
                     AlpnRole::LocalServe => false,
@@ -91,6 +94,7 @@ impl Alpn {
             Alpn::Notification => b"aruna/notification/1",
             Alpn::Shard => b"aruna/shard/1",
             Alpn::JobControl => b"aruna/job-control/2",
+            Alpn::Heartbeat => b"aruna/heartbeat/1",
         }
     }
 
@@ -104,6 +108,7 @@ impl Alpn {
             b"aruna/notification/1" => Some(Alpn::Notification),
             b"aruna/shard/1" => Some(Alpn::Shard),
             b"aruna/job-control/2" => Some(Alpn::JobControl),
+            b"aruna/heartbeat/1" => Some(Alpn::Heartbeat),
             _ => None,
         }
     }
@@ -123,6 +128,7 @@ impl std::fmt::Display for Alpn {
             Alpn::Notification => write!(f, "aruna/notification/1"),
             Alpn::Shard => write!(f, "aruna/shard/1"),
             Alpn::JobControl => write!(f, "aruna/job-control/2"),
+            Alpn::Heartbeat => write!(f, "aruna/heartbeat/1"),
         }
     }
 }

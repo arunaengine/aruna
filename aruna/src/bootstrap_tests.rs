@@ -359,7 +359,7 @@ async fn restart_stays_quiet() {
     )
     .await;
     let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-    net.ensure_sync_topics(&[topic], Vec::new()).unwrap();
+    net.ensure_sync_topics(&[topic], Vec::new()).await.unwrap();
 
     for _ in 0..2 {
         let targets = prepare_core_documents(&context, node_id, realm_id, true, false)

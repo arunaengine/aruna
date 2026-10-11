@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -17,6 +17,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat};
 use aruna_core::keyspaces::{
     COMPUTE_DEPARTURE_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
     JOB_RESERVATION_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE,
@@ -55,8 +56,8 @@ use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocume
 /// Rows one snapshot scan reads per page.
 const SNAPSHOT_PAGE_SIZE: usize = 128;
 
-/// Interval between node-info heartbeat republishes. Peers treat a node's
-/// `heartbeat_at_ms` staleness against this cadence when scoring liveness.
+/// Interval between two heartbeats. Peers treat a heartbeat older than three
+/// intervals as stale telemetry.
 pub const INFO_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Arms (or shortens toward) the periodic node-info heartbeat publish task.
@@ -69,7 +70,7 @@ pub fn schedule_info_publish(after: Duration) -> Effect {
 
 /// Assembles this node's info document from its executors, current
 /// placement-view labels, given urls, and local usage, then persists it under the
-/// single-writer node-info key without queuing replication.
+/// single-writer node-info key as owed to replication, which the next tick performs.
 pub async fn seed_info_document(
     ctx: &DriverContext,
     node_id: NodeId,
@@ -103,7 +104,19 @@ pub async fn seed_info_document(
         demand: demand_snapshot(ctx, epoch).await?,
         reservation,
     };
-    write_info_document(&ctx.storage_handle, &document).await
+    let txn_id = begin_write(&ctx.storage_handle).await?;
+    let written = match write_info_row(&ctx.storage_handle, &document, Some(txn_id)).await {
+        Ok(()) => write_owed(ctx, epoch.publisher_generation, txn_id).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = written {
+        abort_txn(&ctx.storage_handle, txn_id).await;
+        return Err(error);
+    }
+    match commit_txn(&ctx.storage_handle, txn_id).await? {
+        true => Ok(()),
+        false => Err("node info seed conflicted with another revision".to_string()),
+    }
 }
 
 /// Seeds this node's current info document and replicates it over the shared
@@ -421,13 +434,14 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
     }
 }
 
-/// Heartbeat: refreshes the persisted node-info document's placement-view labels,
-/// utilization and timestamps, then republishes it; URLs stay startup-seeded. Scans
-/// run outside the revision, so [`revise_node_info`] never carries stale drain backwards.
+/// Heartbeat: revises the persisted node-info document, publishes it while a committed revision
+/// is still owed to replication, then pushes live telemetry to the sync peers. Scans run
+/// outside the revision, so [`revise_node_info`] never carries stale drain backwards.
 pub async fn refresh_info_heartbeat(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
+    sequence: u64,
 ) -> Result<(), String> {
     let Some(document) = read_info_document(&ctx.storage_handle, node_id).await? else {
         return Ok(());
@@ -440,33 +454,84 @@ pub async fn refresh_info_heartbeat(
     let executors = advertised_executors(ctx, &config, node_id, &reservation.reserved, now).await?;
     let labels = node_labels(ctx, &config, node_id)?;
     let storage_bytes_used = local_storage_bytes(ctx).await?;
-    let documents_held = held_documents(ctx, node_id, &config).await;
-    let load_permille = read_load_permille();
-    let revised = revise_node_info(ctx, node_id, realm_id, |document| {
+    let utilization = NodeUtilization {
+        storage_bytes_used,
+        documents_held: held_documents(ctx, node_id, &config).await,
+        load_permille: read_load_permille(),
+        heartbeat_at_ms: now,
+    };
+    revise_node_info(ctx, node_id, realm_id, |document| {
         document.executors = executors.clone();
         document.labels = labels.clone();
         document.reservation = reservation;
         document.demand = demand.clone();
-        document.utilization = NodeUtilization {
-            storage_bytes_used,
-            documents_held,
-            load_permille,
-            heartbeat_at_ms: now,
-        };
+        document.utilization = utilization;
     })
     .await?;
-    match revised {
-        true => replicate_node_info(ctx, node_id, realm_id).await,
-        false => Ok(()),
+    if read_owed(ctx, None).await?.is_some() {
+        replicate_node_info(ctx, node_id, realm_id).await?;
     }
+    let (Some(net_handle), Some(stored)) = (
+        ctx.net_handle.as_ref(),
+        read_info_document(&ctx.storage_handle, node_id).await?,
+    ) else {
+        return Ok(());
+    };
+    if !node_kind(&config, node_id).is_some_and(|kind| kind.is_sync_eligible()) {
+        return Ok(());
+    }
+    let mut availability: Vec<_> = executors
+        .iter()
+        .filter_map(|executor| Some((executor.kind.clone(), executor.availability?)))
+        .collect();
+    availability.sort_by(|left, right| left.0.cmp(&right.0));
+    // The heartbeat names the committed advertisement, so peers match it to the row they hold.
+    let epoch = AdvertisementEpoch {
+        observed_at_ms: now,
+        ..stored.epoch
+    };
+    let heartbeat = NodeHeartbeat {
+        realm_id,
+        epoch,
+        sequence,
+        utilization,
+        availability,
+        reservation: ComputeReservationSnapshot {
+            epoch,
+            ..reservation
+        },
+        demand: ComputeDemandSnapshot { epoch, ..demand },
+    };
+    crate::node::heartbeat::send_heartbeat(net_handle, heartbeat).await;
+    Ok(())
+}
+
+/// The advertisement without telemetry and publication stamps; only a change here publishes.
+fn durable_view(document: &NodeInfoDocument) -> NodeInfoDocument {
+    let mut view = document.clone();
+    for executor in &mut view.executors {
+        executor.availability = None;
+    }
+    view.utilization = NodeUtilization {
+        storage_bytes_used: 0,
+        documents_held: None,
+        load_permille: None,
+        heartbeat_at_ms: 0,
+    };
+    view.demand = ComputeDemandSnapshot::default();
+    view.reservation = ComputeReservationSnapshot::default();
+    view.updated_at_ms = 0;
+    view.epoch.publisher_generation = 0;
+    view.epoch.observed_at_ms = 0;
+    view
 }
 
 /// Node-info revisions one publisher retries after another committed first.
 const NODE_INFO_ATTEMPTS: usize = 3;
 
 /// Applies `revise` to the current node-info row inside one write transaction,
-/// also stamping the next epoch and re-reading published drain/departure state. All
-/// publishers use it, so concurrent rounds cannot overwrite; `Ok(false)` means no row.
+/// also stamping the next epoch and re-reading published drain/departure state. All publishers
+/// use it, so concurrent rounds cannot overwrite; `Ok(false)` means no row or no durable change.
 async fn revise_node_info(
     ctx: &DriverContext,
     node_id: NodeId,
@@ -507,7 +572,15 @@ async fn write_revision(
     else {
         return Ok(false);
     };
+    let stored = durable_view(&document);
     revise(&mut document);
+    // The published drain is exactly the operator's durable flag or a departure,
+    // both read here, so no publisher carries a stale copy of them forward.
+    document.compute_draining = operator_drain(ctx, Some(txn_id)).await? || document.leaving;
+    document.epoch.membership_generation = generation;
+    if durable_view(&document) == stored {
+        return Ok(false);
+    }
     let now = unix_timestamp_millis();
     document.epoch = AdvertisementEpoch {
         membership_generation: generation,
@@ -516,11 +589,9 @@ async fn write_revision(
     };
     document.demand.epoch = document.epoch;
     document.reservation.epoch = document.epoch;
-    // The published drain is exactly the operator's durable flag or a departure,
-    // both read here, so no publisher carries a stale copy of them forward.
-    document.compute_draining = operator_drain(ctx, Some(txn_id)).await? || document.leaving;
     document.updated_at_ms = now;
     write_info_row(&ctx.storage_handle, &document, Some(txn_id)).await?;
+    write_owed(ctx, document.epoch.publisher_generation, txn_id).await?;
     Ok(true)
 }
 
@@ -559,8 +630,8 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
     }
 }
 
-/// Local nonterminal demand merged with current member advertisements.
-/// The bool flags an understated publisher; remote demand is partition-tolerant.
+/// Local nonterminal demand merged with the fresh heartbeats of the other sync-eligible members.
+/// The bool flags an understated view: a truncated snapshot or a member without a fresh heartbeat.
 pub async fn group_demand(
     ctx: &DriverContext,
     realm_id: RealmId,
@@ -568,40 +639,31 @@ pub async fn group_demand(
     group_id: &aruna_core::types::GroupId,
 ) -> Result<(ResourceTotals, bool), String> {
     let config = load_realm_config(ctx, realm_id).await?;
-    let members: BTreeSet<NodeId> = config
-        .node_ids()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .collect();
+    let members = config
+        .sync_eligible_nodes()
+        .map_err(|error| error.to_string())?;
     let local = demand_snapshot(ctx, AdvertisementEpoch::default()).await?;
+    let fresh = crate::node::heartbeat::fresh_heartbeats(ctx.net_handle.as_ref());
+    Ok(merge_view(local, &members, node_id, &fresh, group_id))
+}
+
+fn merge_view(
+    local: ComputeDemandSnapshot,
+    members: &[NodeId],
+    node_id: NodeId,
+    fresh: &BTreeMap<NodeId, HeldHeartbeat>,
+    group_id: &aruna_core::types::GroupId,
+) -> (ResourceTotals, bool) {
+    let mut missing = false;
     let mut snapshots = vec![local];
-    let mut start: Option<Key> = None;
-    loop {
-        let (page, next) = iter_page(ctx, NODE_INFO_KEYSPACE, None, start).await?;
-        for (_, value) in &page {
-            match postcard::from_bytes::<NodeInfoDocument>(value.as_ref()) {
-                Ok(document)
-                    if document.node_id != node_id && members.contains(&document.node_id) =>
-                {
-                    snapshots.push(document.demand)
-                }
-                Ok(_) => {}
-                // An unreadable advertisement is an unobserved publisher, the
-                // same approximation a partition already leaves in this view.
-                Err(error) => {
-                    warn!(%error, "Skipping an undecodable node info row in the demand view")
-                }
-            }
-        }
-        match next {
-            Some(cursor) => start = Some(cursor),
-            None => break,
+    for member in members.iter().filter(|member| **member != node_id) {
+        match fresh.get(member) {
+            Some(held) => snapshots.push(held.heartbeat.demand.clone()),
+            None => missing = true,
         }
     }
-    Ok(aruna_core::compute::quota::merge_demand(
-        snapshots.iter(),
-        group_id,
-    ))
+    let (totals, truncated) = aruna_core::compute::quota::merge_demand(snapshots.iter(), group_id);
+    (totals, truncated || missing)
 }
 
 /// The single durable departure-report row of this node.
@@ -609,6 +671,9 @@ const DEPARTURE_KEY: &[u8] = b"departure";
 /// The operator's own compute drain, kept apart from an observed departure so
 /// returning to placement can never silently undrain a node an operator drained.
 const OPERATOR_DRAIN_KEY: &[u8] = b"operator_drain";
+/// The newest advertisement revision not yet handed to replication. It is written in the same
+/// transaction as that revision, so a failure after the commit only delays the publish.
+const PUBLISH_OWED_KEY: &[u8] = b"publish_owed";
 
 /// Applies an observed departure, or a return, to this node's compute plane. Departing
 /// stops offers/admissions, records reserved executions as unresolved without blocking
@@ -960,26 +1025,97 @@ async fn replicate_node_info(
     node_id: NodeId,
     realm_id: RealmId,
 ) -> Result<(), String> {
+    let owed = read_owed(ctx, None).await?;
     // A device belongs to no sync topic, so its info document stays local:
     // an outbox row for it could never be published, only retried forever.
     let config = load_realm_config(ctx, realm_id).await?;
-    if node_kind(&config, node_id).is_some_and(|kind| !kind.is_sync_eligible()) {
-        return Ok(());
+    if node_kind(&config, node_id).is_none_or(|kind| kind.is_sync_eligible()) {
+        drive(
+            ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+                realm_id,
+                local_node_id: node_id,
+                excluded_peers: Vec::new(),
+                documents: vec![DocumentTarget::NodeInfo { realm_id, node_id }],
+                // Shared-topic genesis is bootstrapped by publish_core_documents;
+                // explicit publishes and periodic heartbeats only publish into it.
+                allow_genesis: false,
+            })
+            .strict(),
+            ctx,
+        )
+        .await
+        .map_err(|error| format!("node info replication failed: {error}"))?;
     }
-    drive(
-        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
-            realm_id,
-            local_node_id: node_id,
-            excluded_peers: Vec::new(),
-            documents: vec![DocumentTarget::NodeInfo { realm_id, node_id }],
-            // Shared-topic genesis is bootstrapped by publish_core_documents;
-            // explicit publishes and periodic heartbeats only publish into it.
-            allow_genesis: false,
-        }),
-        ctx,
-    )
-    .await
-    .map_err(|error| format!("node info replication failed: {error}"))
+    match owed {
+        Some(owed) => settle_owed(ctx, owed).await,
+        None => Ok(()),
+    }
+}
+
+/// The owed advertisement revision; an unreadable value counts as owed.
+async fn read_owed(ctx: &DriverContext, txn_id: Option<TxnId>) -> Result<Option<u64>, String> {
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            key: Key::from(PUBLISH_OWED_KEY.to_vec()),
+            txn_id,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(
+            value.map(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).map_or(0, u64::from_be_bytes))
+        ),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("owed publish read failed: {other:?}")),
+    }
+}
+
+async fn write_owed(ctx: &DriverContext, generation: u64, txn_id: TxnId) -> Result<(), String> {
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            key: Key::from(PUBLISH_OWED_KEY.to_vec()),
+            value: Value::from(generation.to_be_bytes().to_vec()),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("owed publish write failed: {other:?}")),
+    }
+}
+
+/// Clears the owed revision once replication took it; a revision committed meanwhile stays owed.
+async fn settle_owed(ctx: &DriverContext, published: u64) -> Result<(), String> {
+    let txn_id = begin_write(&ctx.storage_handle).await?;
+    let cleared = match read_owed(ctx, Some(txn_id)).await {
+        Ok(Some(owed)) if owed <= published => {
+            match ctx
+                .storage_handle
+                .send_storage_effect(StorageEffect::Delete {
+                    key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+                    key: Key::from(PUBLISH_OWED_KEY.to_vec()),
+                    txn_id: Some(txn_id),
+                })
+                .await
+            {
+                Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+                Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+                other => Err(format!("owed publish delete failed: {other:?}")),
+            }
+        }
+        Ok(_) => Ok(()),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = cleared {
+        abort_txn(&ctx.storage_handle, txn_id).await;
+        return Err(error);
+    }
+    // A conflict means another revision was committed; it stays owed for the next tick.
+    commit_txn(&ctx.storage_handle, txn_id).await.map(|_| ())
 }
 
 pub(crate) async fn write_info_document(
@@ -1100,7 +1236,8 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
-            task_handle: None,
+            // Node info replication is strict, so its drain scheduling must succeed.
+            task_handle: Some(TaskHandle::new()),
             compute_handle: None,
         }
     }
@@ -1264,7 +1401,9 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+            .await
+            .unwrap();
 
         assert!(
             read_info_document(&ctx.storage_handle, local)
@@ -1419,7 +1558,9 @@ mod tests {
         let expected_labels = build_view(&config).nodes[0].labels.clone();
         write_realm_config(&ctx, &config).await;
 
-        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+            .await
+            .unwrap();
         let second = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
@@ -1459,7 +1600,9 @@ mod tests {
         let local = node(1);
         write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
 
-        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+            .await
+            .unwrap();
         assert!(
             read_info_document(&ctx.storage_handle, local)
                 .await
@@ -1787,21 +1930,53 @@ mod tests {
         assert!(stored.validate().is_ok());
     }
 
+    fn held_demand(node_id: NodeId, group_id: Ulid, families: Vec<DemandFamily>) -> HeldHeartbeat {
+        let epoch = AdvertisementEpoch::default();
+        HeldHeartbeat {
+            node_id,
+            heartbeat: NodeHeartbeat {
+                realm_id: RealmId::from_bytes([12u8; 32]),
+                epoch,
+                sequence: 1,
+                utilization: NodeUtilization {
+                    storage_bytes_used: 0,
+                    documents_held: None,
+                    load_permille: None,
+                    heartbeat_at_ms: 1,
+                },
+                availability: Vec::new(),
+                reservation: ComputeReservationSnapshot::default(),
+                demand: ComputeDemandSnapshot {
+                    epoch,
+                    groups: vec![DemandGroup {
+                        group_id,
+                        families,
+                        truncated: false,
+                    }],
+                    truncated: false,
+                },
+            },
+            age_ms: 0,
+            received_at_ms: 1,
+        }
+    }
+
     #[tokio::test]
     async fn merges_group_demand() {
-        // Shared families count once, removed publishers stop counting,
-        // and the local view supersedes the last heartbeat.
+        // Shared families count once, non-members stop counting, and a member
+        // without a fresh heartbeat leaves the view understated.
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([12u8; 32]);
         let local = node(1);
         let peer = node(2);
         let removed = node(3);
-        write_realm_config(&ctx, &realm_config(realm_id, &[local, peer])).await;
         let group_id = Ulid::from_bytes([2u8; 16]);
         write_family(&ctx, realm_id, family(1), group_id, LogicalJobState::Queued).await;
+        let snapshot = demand_snapshot(&ctx, AdvertisementEpoch::default())
+            .await
+            .unwrap();
 
-        let epoch = AdvertisementEpoch::default();
         let shared = DemandFamily {
             submission_id: family(1).submission_id,
             request_digest: family(1).request_digest,
@@ -1818,54 +1993,51 @@ mod tests {
             request_digest: family(4).request_digest,
             ..shared
         };
-        for (node_id, families) in [(peer, vec![shared]), (removed, vec![own])] {
-            let mut document = NodeInfoDocument {
-                node_id,
-                executors: Vec::new(),
-                labels: BTreeMap::new(),
-                urls: NodeUrls {
-                    api: None,
-                    s3: None,
-                },
-                utilization: NodeUtilization {
-                    storage_bytes_used: 0,
-                    documents_held: None,
-                    load_permille: None,
-                    heartbeat_at_ms: 1,
-                },
-                updated_at_ms: 1,
-                epoch,
-                compute_draining: false,
-                leaving: false,
-                demand: ComputeDemandSnapshot::default(),
-                reservation: ComputeReservationSnapshot::default(),
-            };
-            document.demand.groups = vec![DemandGroup {
-                group_id,
-                families,
-                truncated: false,
-            }];
-            write_info_document(&ctx.storage_handle, &document)
-                .await
-                .unwrap();
-        }
+        let fresh = BTreeMap::from([
+            (peer, held_demand(peer, group_id, vec![shared])),
+            (removed, held_demand(removed, group_id, vec![own])),
+        ]);
+
+        // The peer reports the family this node already holds locally.
+        let (totals, truncated) =
+            merge_view(snapshot.clone(), &[local, peer], local, &fresh, &group_id);
+        assert_eq!(totals.count, 1);
+        assert_eq!(totals.cpu_cores, 2);
+        assert!(!truncated);
+        let other = Ulid::from_bytes([9u8; 16]);
+        let (totals, _) = merge_view(snapshot.clone(), &[local, peer], local, &fresh, &other);
+        assert_eq!(totals.count, 0);
+
+        let (totals, truncated) =
+            merge_view(snapshot, &[local, peer, node(4)], local, &fresh, &group_id);
+        assert_eq!(totals.count, 1);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn ignores_user_devices() {
+        // A user device sends no heartbeat, so it must not leave the view understated.
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([15u8; 32]);
+        let local = node(1);
+        let mut config = realm_config(realm_id, &[local]);
+        config.ensure_node(
+            node(2),
+            RealmNodeKind::User {
+                owner: aruna_core::UserId::nil(realm_id),
+            },
+        );
+        write_realm_config(&ctx, &config).await;
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        write_family(&ctx, realm_id, family(1), group_id, LogicalJobState::Queued).await;
 
         let (totals, truncated) = group_demand(&ctx, realm_id, local, &group_id)
             .await
             .unwrap();
 
-        // The peer republishes the family this node already holds locally.
         assert_eq!(totals.count, 1);
-        assert_eq!(totals.cpu_cores, 2);
         assert!(!truncated);
-        assert_eq!(
-            group_demand(&ctx, realm_id, local, &Ulid::from_bytes([9u8; 16]))
-                .await
-                .unwrap()
-                .0
-                .count,
-            0
-        );
     }
 
     #[tokio::test]
@@ -2131,34 +2303,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_unreadable_row() {
-        // An advertisement that does not decode is an unobserved publisher, not
-        // a reason to refuse every admission on this node.
-        let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
-        let realm_id = RealmId::from_bytes([15u8; 32]);
-        let local = node(1);
-        let peer = node(2);
-        write_realm_config(&ctx, &realm_config(realm_id, &[local, peer])).await;
-        let group_id = Ulid::from_bytes([2u8; 16]);
-        write_family(&ctx, realm_id, family(1), group_id, LogicalJobState::Queued).await;
-        write_row(
-            &ctx,
-            NODE_INFO_KEYSPACE,
-            Key::from(node_info_key(peer)),
-            vec![0xFFu8; 4],
-        )
-        .await;
-
-        let (totals, truncated) = group_demand(&ctx, realm_id, local, &group_id)
-            .await
-            .unwrap();
-
-        assert_eq!(totals.count, 1);
-        assert!(!truncated);
-    }
-
-    #[tokio::test]
     async fn heartbeat_keeps_drain() {
         // A drain recorded while the heartbeat scans must survive its write, and
         // the heartbeat must never undrain a node on its own.
@@ -2180,7 +2324,9 @@ mod tests {
         .unwrap();
 
         write_operator_drain(&ctx, true).await.unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+            .await
+            .unwrap();
         let drained = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
@@ -2188,7 +2334,9 @@ mod tests {
         assert!(drained.compute_draining && !drained.leaving);
 
         write_operator_drain(&ctx, false).await.unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+            .await
+            .unwrap();
         let released = read_info_document(&ctx.storage_handle, local)
             .await
             .unwrap()
@@ -2219,7 +2367,9 @@ mod tests {
             .await
             .unwrap();
 
-        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+            .await
+            .unwrap();
 
         let stored = read_info_document(&ctx.storage_handle, local)
             .await
@@ -2248,7 +2398,9 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id).await.unwrap();
+        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+            .await
+            .unwrap();
 
         let stored = read_info_document(&ctx.storage_handle, local)
             .await
@@ -2256,5 +2408,62 @@ mod tests {
             .unwrap();
         assert_eq!(stored.utilization.documents_held, Some(0));
         assert!(stored.utilization.load_permille.is_some());
+    }
+
+    /// Ticks with unchanged durable fields write no revision and queue no publish; an owed
+    /// revision is published by the next tick without a new revision, then cleared.
+    #[tokio::test]
+    async fn unchanged_skips_publish() {
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([18u8; 32]);
+        let local = node(1);
+        write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
+        publish_node_info(
+            &ctx,
+            local,
+            realm_id,
+            NodeUrls {
+                api: None,
+                s3: None,
+            },
+        )
+        .await
+        .unwrap();
+        let seeded = read_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        let queued = read_outbox(&ctx).await.len();
+
+        assert_eq!(read_owed(&ctx, None).await.unwrap(), None);
+        for sequence in 1..=3 {
+            refresh_info_heartbeat(&ctx, local, realm_id, sequence)
+                .await
+                .unwrap();
+        }
+        let stored = read_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, seeded);
+        assert_eq!(read_outbox(&ctx).await.len(), queued);
+
+        // A publish that failed after its revision committed leaves the revision owed.
+        let txn_id = begin_write(&ctx.storage_handle).await.unwrap();
+        write_owed(&ctx, seeded.epoch.publisher_generation, txn_id)
+            .await
+            .unwrap();
+        assert!(commit_txn(&ctx.storage_handle, txn_id).await.unwrap());
+        refresh_info_heartbeat(&ctx, local, realm_id, 4)
+            .await
+            .unwrap();
+        let stored = read_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, seeded);
+        assert_eq!(read_outbox(&ctx).await.len(), queued + 1);
+        assert_eq!(read_owed(&ctx, None).await.unwrap(), None);
     }
 }

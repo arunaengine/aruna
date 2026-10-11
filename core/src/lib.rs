@@ -18,6 +18,7 @@ pub mod errors;
 pub mod events;
 pub mod git;
 pub mod handle;
+pub mod heartbeat;
 pub mod id;
 pub mod jobs;
 pub mod join_request;

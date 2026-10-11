@@ -59,10 +59,24 @@ impl DocumentSyncService {
         let message_count = messages.len();
         let handle_started = Instant::now();
         let net = self.net.clone();
-        let responses = tokio::task::spawn_blocking(move || net.handle_messages(peer, messages))
-            .await
-            .map_err(|error| NetError::Stream(error.to_string()))?
-            .map_err(|error| NetError::Stream(error.to_string()))?;
+        let mut handling = tokio::task::spawn_blocking(move || net.handle_messages(peer, messages));
+        // Work running past the requester's timeout is otherwise invisible.
+        let responses = loop {
+            match timeout(PEER_SYNC_TIMEOUT, &mut handling).await {
+                Ok(joined) => break joined,
+                Err(_) => warn!(
+                    event = "pipeline.inbound_sync.slow",
+                    peer = %node_to_peer(&peer),
+                    messages = message_count,
+                    topics = touched_topics.len(),
+                    first_topic = ?touched_topics.first(),
+                    elapsed_ms = duration_ms(handle_started.elapsed()),
+                    "Inbound document sync handling is still running after the requester timeout"
+                ),
+            }
+        }
+        .map_err(|error| NetError::Stream(error.to_string()))?
+        .map_err(|error| NetError::Stream(error.to_string()))?;
         let handle_elapsed = handle_started.elapsed();
         let write_started = Instant::now();
         write_sync_messages(&mut send, responses.messages()).await?;

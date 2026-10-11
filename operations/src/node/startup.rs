@@ -1397,13 +1397,16 @@ async fn restore_shared(
     // A unit without peers holds topics this node is alone on: they are minted
     // here and no peer joins their membership.
     if unit.peers.is_empty() {
-        if let Err(error) = net_handle.ensure_local_topics(&to_ensure) {
+        if let Err(error) = net_handle.ensure_local_topics(&to_ensure).await {
             warn!(error = %error, "Failed to mint this node's own shared topics");
             outcome.fail_topics(to_ensure.iter().copied());
         }
         return outcome;
     }
-    if let Err(error) = net_handle.ensure_sync_topics(&to_ensure, unit.peers.clone()) {
+    if let Err(error) = net_handle
+        .ensure_sync_topics(&to_ensure, unit.peers.clone())
+        .await
+    {
         warn!(error = %error, "Failed to ensure shared realm topics on restart");
         outcome.fail_topics(to_ensure.iter().copied());
     }
@@ -2054,9 +2057,10 @@ mod tests {
         second.net.add_peer_addr(first.net.endpoint_addr()).await;
     }
 
-    fn seed_topic(node: &RecoveryNode, topic: ::irokle::TopicId, peers: &[NodeId]) {
+    async fn seed_topic(node: &RecoveryNode, topic: ::irokle::TopicId, peers: &[NodeId]) {
         node.net
             .ensure_sync_topics(&[topic], peers.to_vec())
+            .await
             .expect("blocked peer topic creates");
     }
 
@@ -2256,8 +2260,8 @@ mod tests {
 
         let blocked_topic = shard_topic_id(realm_id, &placements[0]);
         let healthy_topic = shard_topic_id(realm_id, &placements[1]);
-        seed_topic(&blocked, blocked_topic, &[blocked.net.node_id()]);
-        seed_topic(&healthy, healthy_topic, &[local.net.node_id()]);
+        seed_topic(&blocked, blocked_topic, &[blocked.net.node_id()]).await;
+        seed_topic(&healthy, healthy_topic, &[local.net.node_id()]).await;
         let pass = restore_shard_pass(
             &local.context,
             local.net.node_id(),
@@ -2293,7 +2297,7 @@ mod tests {
         save_config(&local, &config).await;
         save_config(&blocked, &config).await;
         let topic = shard_topic_id(realm_id, &placements[0]);
-        seed_topic(&blocked, topic, &[blocked.net.node_id()]);
+        seed_topic(&blocked, topic, &[blocked.net.node_id()]).await;
 
         tokio::time::pause();
         let (status, cancelled, driver) = spawn_driver(&local, realm_id, false);
@@ -2651,7 +2655,7 @@ mod tests {
         save_config(&local, &config).await;
         save_config(&blocked, &config).await;
         let topic = shard_topic_id(realm_id, &placements[0]);
-        seed_topic(&blocked, topic, &[blocked.net.node_id()]);
+        seed_topic(&blocked, topic, &[blocked.net.node_id()]).await;
 
         tokio::time::pause();
         let (status, cancelled, driver) = spawn_driver(&local, realm_id, false);

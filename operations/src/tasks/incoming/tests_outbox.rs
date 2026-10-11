@@ -219,6 +219,7 @@ async fn topic_page_blocks() {
     let blocked_topic = blocked_target.sync_topic_id(realm_id, &blocked_change.placement);
     let healthy_topic = healthy_target.sync_topic_id(realm_id, &healthy_change.placement);
     net.ensure_sync_topics(&[healthy_topic], Vec::new())
+        .await
         .expect("healthy topic genesis");
     let blocked = crate::sync::document_outbox::new_identified_record(
         Ulid::from_parts(1, 1),
@@ -271,6 +272,7 @@ async fn topic_page_blocks() {
         "a later page may progress while the blocked topic is retained"
     );
     net.ensure_sync_topics(&[blocked_topic], Vec::new())
+        .await
         .expect("blocked topic genesis");
     for _ in 0..3 {
         handler.drain_sync_outbox().await;
@@ -317,6 +319,7 @@ async fn admin_page_blocks() {
     let blocked_topic = blocked_target.sync_topic_id(realm_id, &blocked_placement);
     let healthy_topic = healthy_target.sync_topic_id(realm_id, &healthy_placement);
     net.ensure_sync_topics(&[healthy_topic], Vec::new())
+        .await
         .expect("healthy topic genesis");
     let blocked = admin_outbox(realm_id, origin, 1, blocked_target, blocked_placement);
     let healthy = admin_outbox(realm_id, origin, 2, healthy_target, healthy_placement);
@@ -341,6 +344,7 @@ async fn admin_page_blocks() {
         "a later origin sequence must remain blocked across pages"
     );
     net.ensure_sync_topics(&[blocked_topic], Vec::new())
+        .await
         .expect("blocked topic genesis");
     for _ in 0..3 {
         handler.drain_sync_outbox().await;
@@ -632,6 +636,7 @@ async fn config_reloads_between() {
     write_realm_config(&storage, realm_id, &config, net.node_id()).await;
     let shard_topic = shard_target.sync_topic_id(realm_id, &placement);
     net.ensure_sync_topics(&[shard_topic], Vec::new())
+        .await
         .expect("updated holder topic genesis");
 
     handler.drain_sync_outbox().await;
@@ -963,6 +968,7 @@ async fn rotation_streak() {
         &aruna_core::structs::placement::record::PlacementRef::NIL,
     );
     net.ensure_sync_topics(&[topic], Vec::new())
+        .await
         .expect("shared topic genesis");
     let task_handle = TaskHandle::new();
     let context = Arc::new(DriverContext {
@@ -1142,6 +1148,75 @@ async fn draining_a_topics() {
     net.shutdown().await;
 }
 
+/// A record whose sync keeps failing is published once: later drains only sync it, so
+/// retries add no new op to its topic.
+#[tokio::test]
+async fn retry_publishes_once() {
+    use ::irokle::Storage as _;
+
+    let realm_id = RealmId::from_bytes([62u8; 32]);
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let net = make_net_handle(realm_id, &storage, [62u8; 32]).await;
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: Some(net.clone()),
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
+    });
+    // An unreachable server peer makes every sync of the realm topic fail.
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.ensure_node(net.node_id(), RealmNodeKind::Management);
+    config.ensure_node(node(63), RealmNodeKind::Server);
+    net.refresh_document_peers(&config)
+        .await
+        .expect("refresh peers");
+    let record = crate::sync::document_outbox::new_outbox_record(
+        net.node_id(),
+        DocumentTarget::RealmConfig { realm_id },
+        Vec::new(),
+        DocumentOutboxEvent::Upsert {
+            bytes: b"config".to_vec(),
+            change: change(),
+        },
+        aruna_core::structs::placement::record::PlacementRef::NIL,
+        true,
+    );
+    let key = outbox_key(&record).to_vec();
+    write_outbox_record(&storage, &record).await;
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+    let topic = DocumentTarget::RealmConfig { realm_id }.sync_topic_id(
+        realm_id,
+        &aruna_core::structs::placement::record::PlacementRef::NIL,
+    );
+    let ops = || {
+        net.document_sync_node()
+            .storage()
+            .list_op_ids(&topic)
+            .expect("topic ops read")
+            .len()
+    };
+
+    handler.drain_sync_outbox().await;
+    let published = ops();
+    assert!(published > 0, "the first drain publishes the record");
+    for _ in 0..2 {
+        handler.drain_sync_outbox().await;
+    }
+    assert!(
+        read_outbox_record(&storage, &key)
+            .await
+            .expect("read retried record")
+            .is_some(),
+        "the unsynced record stays"
+    );
+    assert_eq!(ops(), published, "a retry created another op");
+    net.shutdown().await;
+}
+
 struct ConfigHarness {
     _dir: tempfile::TempDir,
     storage: aruna_storage::StorageHandle,
@@ -1176,6 +1251,7 @@ async fn config_setup() -> ConfigHarness {
         &aruna_core::structs::placement::record::PlacementRef::NIL,
     );
     net.ensure_sync_topics(&[shared_topic], Vec::new())
+        .await
         .expect("shared topic genesis");
     let mut shard_change = change();
     shard_change.placement = placement;
@@ -1320,6 +1396,7 @@ async fn pull_reaches_holder() {
     // as the pre-rebalance membership reconciliation would have left it).
     ex_holder
         .ensure_sync_topics(&[topic], vec![net.node_id()])
+        .await
         .expect("genesis on the ex-holder");
     assert!(!net.sync_topic_exists(topic).unwrap_or(true));
 
@@ -1546,6 +1623,7 @@ impl BoundaryHarness {
         );
         self.net
             .ensure_sync_topics(&[topic], Vec::new())
+            .await
             .expect("appended topic genesis");
         let records = [
             self.record(4, shared, DocumentOutboxEvent::Delete { change: change() }),
@@ -1603,6 +1681,7 @@ impl BoundaryHarness {
         let shard_topic = target().sync_topic_id(self.realm_id, &self.placed_change().placement);
         self.net
             .ensure_sync_topics(&[shard_topic], Vec::new())
+            .await
             .expect("blocked head topic genesis");
         for _ in 0..6 {
             self.handler.drain_sync_outbox().await;
