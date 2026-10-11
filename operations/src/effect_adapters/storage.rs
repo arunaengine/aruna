@@ -340,6 +340,7 @@ mod tests {
             aruna_net::NetConfig {
                 discovery_method: aruna_net::DiscoveryMethod::None,
                 relay_method: aruna_net::RelayMethod::None,
+                sync_storage_path: Some(directory.path().join("sync")),
                 ..aruna_net::NetConfig::default()
             },
             storage_handle.clone(),
