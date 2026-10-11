@@ -16,6 +16,7 @@ use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::execution::job::{JobId, JobRecord, JobState, KeyWait};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, VersionKey, object_permission_path};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -229,7 +230,8 @@ pub(crate) async fn remote_waits(
                 });
         }
     }
-    let auth = owner_auth(record);
+    let realm_id = context.net_handle.as_ref().map(|net| *net.realm_id());
+    let auth = owner_auth(record, realm_id.unwrap_or(record.created_by.realm_id));
     let mut waits = Vec::new();
     for (node, targets) in by_node {
         waits.extend(ask_waits(context, &auth, record.job_id, node, &targets).await);
@@ -267,11 +269,11 @@ pub(crate) async fn ask_waits(
     waits
 }
 
-/// The job owner this node vouches for in key wait requests.
-fn owner_auth(record: &JobRecord) -> AuthContext {
+/// The job owner this node vouches for in key wait requests, signed in to `realm_id`.
+fn owner_auth(record: &JobRecord, realm_id: RealmId) -> AuthContext {
     AuthContext {
         user_id: record.created_by,
-        realm_id: record.created_by.realm_id,
+        realm_id,
         path_restrictions: None,
         session: None,
     }
@@ -426,7 +428,7 @@ mod tests {
         else {
             panic!("job must be claimed")
         };
-        let auth = owner_auth(&claimed);
+        let auth = owner_auth(&claimed, RealmId([1; 32]));
         let key = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1);
 
         // A wake that overtakes the parking is delivered again later.
@@ -720,7 +722,7 @@ mod tests {
         else {
             panic!("job must be claimed")
         };
-        let auth = owner_auth(&claimed);
+        let auth = owner_auth(&claimed, RealmId([1; 32]));
         let key = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1);
         let wait = KeyWait {
             node_id: source,

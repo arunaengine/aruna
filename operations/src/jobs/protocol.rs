@@ -362,8 +362,9 @@ async fn owner_gate(
     }
 }
 
+/// A user of another realm signed in here matches; an anonymous identity only in its own realm.
 fn auth_realm_matches(auth: &AuthContext, realm_id: RealmId) -> bool {
-    auth.realm_id == realm_id && auth.user_id.realm_id == realm_id
+    auth.realm_id == realm_id && (auth.user_id.realm_id == realm_id || !auth.user_id.is_nil())
 }
 
 async fn prepare_status(
@@ -724,8 +725,11 @@ mod pure_tests {
         assert!(auth_realm_matches(&auth, local));
         auth.realm_id = foreign;
         assert!(!auth_realm_matches(&auth, local));
+        // A user of another realm signed in here matches; an anonymous one does not.
         auth.realm_id = local;
         auth.user_id = user(foreign);
+        assert!(auth_realm_matches(&auth, local));
+        auth.user_id = UserId::nil(foreign);
         assert!(!auth_realm_matches(&auth, local));
     }
 
