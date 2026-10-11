@@ -342,19 +342,45 @@ pub async fn delete_vault(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::tests::routes::write_doc;
+    use crate::tests::routes::{test_context, test_state, test_storage, write_doc};
     use crate::tests::users::{realm_auth, setup_state};
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::structs::identity::auth::Actor;
-    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+    use aruna_core::structs::identity::auth::NodeCapabilities;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use axum::response::IntoResponse;
     use tempfile::TempDir;
+
+    /// A node whose net handle signs the vault records it writes.
+    async fn signing_state() -> (Arc<ServerState>, TempDir) {
+        let (dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes(generate_signing_key().verifying_key().to_bytes());
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            realm_id,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        };
+        let net = NetHandle::new(config, storage.clone()).await.unwrap();
+        let node_id = net.node_id();
+        let mut context = test_context(storage);
+        context.net_handle = Some(net);
+        let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
+        let state = test_state(Arc::new(context), realm_id, node_id, capabilities).await;
+        (Arc::new(state), dir)
+    }
 
     /// A realm with one server node: this node when `holds`, otherwise one it cannot reach.
     pub(in crate::routes::access::users) async fn vault_realm(
         holds: bool,
     ) -> (Arc<ServerState>, TempDir, AuthContext) {
-        let (state, dir) = setup_state().await;
+        let (state, dir) = match holds {
+            true => signing_state().await,
+            false => setup_state().await,
+        };
         let auth = realm_auth(state.get_realm_id());
         let server = if holds {
             state.get_node_id()
