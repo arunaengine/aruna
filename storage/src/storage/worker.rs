@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use aruna_core::effects::{IterStart, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
-use aruna_core::keyspaces::{NODE_VAULT_KEYSPACE, prefix_upper_bound};
+use aruna_core::keyspaces::{NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, prefix_upper_bound};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::telemetry::duration_ms;
 use byteview::ByteView;
@@ -37,6 +37,22 @@ pub(super) enum Txn {
     Write(Box<fjall::OptimisticWriteTx>),
 }
 type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);
+/// True when the effect writes or deletes a realm config row.
+pub(super) fn touches_config(effect: &StorageEffect) -> bool {
+    let is_config = |key_space: &str| key_space == REALM_CONFIG_KEYSPACE;
+    match effect {
+        StorageEffect::Write { key_space, .. } | StorageEffect::Delete { key_space, .. } => {
+            is_config(key_space)
+        }
+        StorageEffect::BatchWrite { writes, .. } => {
+            writes.iter().any(|(key_space, _, _)| is_config(key_space))
+        }
+        StorageEffect::BatchDelete { deletes, .. } => {
+            deletes.iter().any(|(key_space, _)| is_config(key_space))
+        }
+        _ => false,
+    }
+}
 pub(super) fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
     match effect {
         StorageEffect::Read { key_space, .. }
@@ -129,6 +145,8 @@ pub struct FjallStorage {
     pub(super) deletes: HashMap<String, u64>,
     pub(super) txn_deletes: HashMap<Ulid, HashMap<String, u64>>,
     pub(super) txn_usage: HashMap<Ulid, Vec<(String, ByteView, UsageDelta)>>,
+    /// Open write transactions that wrote or deleted realm config rows.
+    pub(super) config_txns: HashSet<Ulid>,
 }
 
 impl FjallStorage {
@@ -157,9 +175,10 @@ impl FjallStorage {
 
     /// Rolls a fenced transaction back and retires its cleanup entry through the
     /// terminal `Aborted` state, whether it was open or had a commit queued.
-    fn retire_fenced_txn(&mut self, txn_id: Ulid) {
+    pub(super) fn retire_fenced_txn(&mut self, txn_id: Ulid) {
         self.take_txn_deletes(txn_id, false);
         self.txn_usage.remove(&txn_id);
+        self.config_txns.remove(&txn_id);
         if let Some(Txn::Write(txn)) = self.txns.remove(&txn_id) {
             txn.rollback();
         }
@@ -177,7 +196,8 @@ impl FjallStorage {
     }
 
     pub(super) fn process_effect(&mut self, effect: StorageEffect) -> StorageEvent {
-        match effect {
+        let config_txn = touches_config(&effect).then(|| effect_txn_id(&effect));
+        let event = match effect {
             StorageEffect::StartTransaction { read } => self.start_transaction(read),
             StorageEffect::AbortTransaction { txn_id } => self.abort_transaction(txn_id),
             StorageEffect::SyncAll => self.sync_all(),
@@ -224,7 +244,21 @@ impl FjallStorage {
             | StorageEffect::VaultDelete { .. } => StorageEvent::Error {
                 error: StorageError::InvalidEffect,
             },
+        };
+        match config_txn {
+            Some(Some(txn_id)) if self.txns.contains_key(&txn_id) => {
+                self.config_txns.insert(txn_id);
+            }
+            Some(Some(_)) => {}
+            // Even a failed write may have committed before its journal persist failed.
+            Some(None) => self.note_config_change(),
+            None => {}
         }
+        event
+    }
+
+    pub(super) fn note_config_change(&self) {
+        self.metrics.config_changes.fetch_add(1, Ordering::Release);
     }
 
     pub(super) fn observe_cleanup(
@@ -447,7 +481,7 @@ impl FjallStorage {
         }
     }
 
-    fn flush_write_group(
+    pub(super) fn flush_write_group(
         &mut self,
         group: &mut Vec<EffectHandle>,
         slow_queue: &mut SlowQueueAggregator,
@@ -522,6 +556,12 @@ impl FjallStorage {
             }
             Err(error) => Some(error),
         };
+        if prepared
+            .iter()
+            .any(|((effect, ..), _)| touches_config(effect))
+        {
+            self.note_config_change();
+        }
 
         if group_error.is_none() {
             for ((effect, ..), outcome) in &prepared {

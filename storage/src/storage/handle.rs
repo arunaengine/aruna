@@ -153,6 +153,15 @@ impl StorageHandle {
         )
     }
 
+    /// New channels sharing this handle's metrics, for test proxies that forward effects to
+    /// this handle and must report its realm config change count.
+    #[doc(hidden)]
+    pub fn proxy_channels(&self) -> (StorageHandle, StorageReceivers) {
+        let (mut handle, receivers) = StorageHandle::new();
+        handle.metrics = self.metrics.clone();
+        (handle, receivers)
+    }
+
     /// Seals repository connector secret rows with `key` from now on, for this
     /// handle and all its clones. Set once at startup; a later key is ignored.
     pub fn seal_secrets(&self, key: CredentialEncryptionKey) {
@@ -207,6 +216,12 @@ impl StorageHandle {
     /// Number of storage effects currently enqueued or being processed.
     pub fn in_flight(&self) -> u64 {
         self.metrics.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Count of commit attempts that may have changed a realm config row. A reader that sees a
+    /// new count also sees the committed row.
+    pub fn config_changes(&self) -> u64 {
+        self.metrics.config_changes.load(Ordering::Acquire)
     }
 
     pub fn snapshot_metrics(&self) -> StorageMetricsSnapshot {

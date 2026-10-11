@@ -170,6 +170,7 @@ impl FjallStorage {
         }
         self.take_txn_deletes(txn_id, false);
         self.txn_usage.remove(&txn_id);
+        self.config_txns.remove(&txn_id);
         match self.txns.remove(&txn_id) {
             Some(Txn::Write(txn)) => {
                 txn.rollback();
@@ -219,6 +220,7 @@ impl FjallStorage {
             None => {}
         }
 
+        let config_txn = self.config_txns.remove(&txn_id);
         match self.txns.remove(&txn_id) {
             Some(Txn::Read(_)) => StorageEvent::TransactionCommitted { txn_id },
             Some(Txn::Write(mut txn)) => {
@@ -229,6 +231,10 @@ impl FjallStorage {
                 }
                 let committed = txn.commit();
                 self.take_txn_deletes(txn_id, matches!(committed, Ok(Ok(()))));
+                // An unknown outcome may still have committed.
+                if config_txn && !matches!(committed, Ok(Err(_))) {
+                    self.note_config_change();
+                }
                 match committed {
                     Ok(Ok(())) => StorageEvent::TransactionCommitted { txn_id },
                     Ok(Err(_)) => StorageEvent::Error {

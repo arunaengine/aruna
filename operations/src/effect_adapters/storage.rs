@@ -1,5 +1,5 @@
-//! Runs one storage effect and refreshes realm peers after a config write or a commit.
-//! A failed refresh only warns; it never replaces the storage event.
+//! Runs one storage effect and refreshes realm peers after a config write, or after a commit once
+//! storage reports a realm config change. A failed refresh only warns; it keeps the storage event.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -49,7 +49,7 @@ pub(super) async fn dispatch_storage(effect: StorageEffect, context: &DriverCont
             (Event::Storage(StorageEvent::TransactionCommitted { .. }), _)
                 if refresh_after_commit =>
             {
-                match tokio::time::timeout(PEER_REFRESH_TIMEOUT, net_handle.reload_realm_peers())
+                match tokio::time::timeout(PEER_REFRESH_TIMEOUT, net_handle.reload_if_changed())
                     .await
                 {
                     Ok(Ok(_)) => {}
@@ -78,6 +78,8 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::operation::Operation;
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::types::TxnId;
     use aruna_storage::storage;
     use byteview::ByteView;
@@ -300,6 +302,95 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("storage proxy did not stop");
         actor.join().unwrap();
+    }
+
+    async fn commit_write(context: &DriverContext, key_space: &str, value: Vec<u8>) {
+        let txn_id = match dispatch_storage(
+            StorageEffect::StartTransaction { read: false },
+            context,
+        )
+        .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            other => panic!("unexpected transaction start: {other:?}"),
+        };
+        let realm_id = *context.net_handle.as_ref().unwrap().realm_id();
+        let write = StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: ByteView::from(realm_id.as_bytes().to_vec()),
+            value: value.into(),
+            txn_id: Some(txn_id),
+        };
+        assert!(matches!(
+            dispatch_storage(write, context).await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        assert!(matches!(
+            dispatch_storage(StorageEffect::CommitTransaction { txn_id }, context).await,
+            Event::Storage(StorageEvent::TransactionCommitted { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn config_commit_reloads() {
+        let directory = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let net_handle = aruna_net::NetHandle::new(
+            aruna_net::NetConfig {
+                discovery_method: aruna_net::DiscoveryMethod::None,
+                relay_method: aruna_net::RelayMethod::None,
+                sync_storage_path: Some(directory.path().join("sync")),
+                ..aruna_net::NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let context = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: Some(net_handle.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = *net_handle.realm_id();
+        let actor = Actor {
+            node_id: net_handle.node_id(),
+            user_id: aruna_core::UserId::nil(realm_id),
+            realm_id,
+        };
+        let config = |seed: u8| {
+            let peer = iroh::SecretKey::from_bytes(&[seed; 32]).public();
+            let mut document = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+            document.ensure_node(net_handle.node_id(), RealmNodeKind::Management);
+            document.ensure_node(peer, RealmNodeKind::Server);
+            (peer, document.to_bytes(&actor).unwrap())
+        };
+
+        let (peer_a, bytes) = config(1);
+        commit_write(&context, REALM_CONFIG_KEYSPACE, bytes).await;
+        assert_eq!(net_handle.realm_peers().await, vec![peer_a]);
+
+        // A row written past the adapter is still picked up after the next commit.
+        let (peer_b, bytes) = config(2);
+        assert!(matches!(
+            storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                    key: ByteView::from(realm_id.as_bytes().to_vec()),
+                    value: bytes.into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        assert_eq!(net_handle.realm_peers().await, vec![peer_a]);
+        commit_write(&context, "default", b"unrelated".to_vec()).await;
+        assert_eq!(net_handle.realm_peers().await, vec![peer_b]);
+
+        net_handle.shutdown().await;
     }
 
     #[tokio::test]

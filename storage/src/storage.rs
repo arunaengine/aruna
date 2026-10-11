@@ -14,6 +14,8 @@ mod telemetry;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_config;
+#[cfg(test)]
 mod tests_persistence;
 mod transactions;
 mod vault;

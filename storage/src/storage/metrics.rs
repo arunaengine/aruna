@@ -48,6 +48,8 @@ pub(super) struct StorageMetrics {
     /// before the final `SyncAll` or rejected after the close.
     pub(super) close_lock: RwLock<()>,
     pub(super) rejected_writes: AtomicU64,
+    /// Raised after each commit attempt that may have changed a realm config row.
+    pub(super) config_changes: AtomicU64,
     pub(super) last_error: Mutex<Option<String>>,
     /// Woken when `in_flight` falls to zero, so the shutdown barrier does not poll.
     pub(super) drained: Notify,
