@@ -1004,7 +1004,7 @@ fn relationship_job(
                 target_node_id: relationship.target.node_id,
                 auth_context: AuthContext {
                     user_id: relationship.created_by,
-                    realm_id: relationship.created_by.realm_id,
+                    realm_id: relationship.source.realm_id,
                     path_restrictions: None,
                     session: None,
                 },
@@ -1452,7 +1452,7 @@ async fn process_blob_job(
         };
         let creator = AuthContext {
             user_id: relationship.created_by,
-            realm_id: relationship.created_by.realm_id,
+            realm_id: relationship.source.realm_id,
             path_restrictions: None,
             session: None,
         };
@@ -3681,6 +3681,23 @@ mod tests {
             .unwrap();
         truncated.pop().unwrap();
         assert!(LiveObligationRecord::from_bytes(&truncated).is_err());
+    }
+
+    #[test]
+    fn serves_source_realm() {
+        // A link created by a user of another realm replicates in the realm it lives in.
+        let foreign = RealmId::from_bytes([9; 32]);
+        let mut link = relationship(10, 2, None, true);
+        link.created_by = UserId::local(Ulid::from(30u128), foreign);
+        let target = RelationshipJobTarget {
+            bucket: "bucket",
+            key: "key",
+            version_id: Ulid::from(8u128),
+            delete_marker: false,
+        };
+        let job = relationship_job(node(1), target, link, None, &[]).unwrap();
+        assert_eq!(job.input.auth_context.realm_id, realm());
+        assert_eq!(job.input.auth_context.user_id.realm_id, foreign);
     }
 
     #[test]
