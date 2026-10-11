@@ -1331,7 +1331,8 @@ impl JobRecordEnvelope {
         if cancel.spec_digest != spec.spec_digest || cancel.job_id != spec.job_id {
             return Err(JobRecordError::EvidenceMismatch(JobRecordKind::Spec));
         }
-        if cancel.requested_by.is_nil() || cancel.requested_by.realm_id != spec.realm_id {
+        // The requester may belong to another realm, but is never anonymous.
+        if cancel.requested_by.is_nil() {
             return Err(JobRecordError::Unauthorized);
         }
         match cancel.authority {
