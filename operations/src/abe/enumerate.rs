@@ -371,6 +371,7 @@ mod tests {
         });
         let user = operation.auth.user_id;
         let record = UserKeyRecord {
+            realm_id: user.realm_id,
             user_id: user,
             record_id: Ulid::from_bytes([14; 16]),
             key_id: "slot".into(),
@@ -380,6 +381,7 @@ mod tests {
             node_id: operation.node,
             placement: aruna_core::structs::placement::record::PlacementRef::NIL,
             created_at_ms: 1,
+            signature: None,
         };
         let request = KeyRequest {
             request_id: Ulid::from_bytes([1; 16]),

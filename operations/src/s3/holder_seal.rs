@@ -143,6 +143,7 @@ mod tests {
     fn key_record(user_id: UserId, seed: u8, node_id: NodeId) -> UserKeyRecord {
         let public_key = public_key_of(&SecretBytes::new(vec![seed; 32])).unwrap();
         UserKeyRecord {
+            realm_id: user_id.realm_id,
             user_id,
             record_id: Ulid::from_bytes([seed; 16]),
             key_id: format!("slot-{seed}"),
@@ -152,6 +153,7 @@ mod tests {
             node_id,
             placement: PlacementRef::NIL,
             created_at_ms: 1,
+            signature: None,
         }
     }
 

@@ -451,6 +451,7 @@ async fn acquire_source(
                     range: None,
                     group_id: bucket_info.group_id,
                     user_identity: spec.auth_context.user_id,
+                    realm_id: spec.auth_context.realm_id,
                     node_id: ctx.owner_node_id,
                 })
                 .with_restrictions(spec.auth_context.path_restrictions.clone()),

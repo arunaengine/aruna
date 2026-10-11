@@ -10,7 +10,7 @@ use crate::replication::queue::LiveObligationRecord;
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, HolderFailures,
     MAX_AUTO_ADVANCES, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest, RoutedRead,
-    get_object_routed, routed_info,
+    get_object_routed, promote_leased, routed_info,
 };
 use aruna_blob::blob::BlobHandler;
 use aruna_blob::hash::Hasher;
@@ -182,6 +182,7 @@ fn routed_facts_preserved() {
     let version_created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(12);
     let read = RoutedRead {
         user_id: UserId::nil(RealmId::from_bytes([3u8; 32])),
+        realm_id: RealmId::from_bytes([3u8; 32]),
         blake3: [9u8; 32],
         version_id: Some(Ulid::from(7u128)),
         metadata: HashMap::new(),
@@ -216,6 +217,7 @@ fn routed_facts_preserved() {
 fn routed_empty_preserved() {
     let read = RoutedRead {
         user_id: UserId::nil(RealmId::from_bytes([3u8; 32])),
+        realm_id: RealmId::from_bytes([3u8; 32]),
         blake3: [9u8; 32],
         version_id: Some(Ulid::from(7u128)),
         metadata: HashMap::new(),
@@ -248,6 +250,7 @@ fn reports_missing_blob() {
         range: None,
         group_id: Ulid::generate(),
         user_identity: UserId::nil(RealmId::from_bytes([3u8; 32])),
+        realm_id: RealmId::from_bytes([3u8; 32]),
         node_id: test_node_id(),
     });
     operation.txn_id = Some(Ulid::generate());
@@ -287,6 +290,7 @@ fn pending_content_refused() {
         range: None,
         group_id: Ulid::generate(),
         user_identity: UserId::nil(RealmId::from_bytes([3u8; 32])),
+        realm_id: RealmId::from_bytes([3u8; 32]),
         node_id: test_node_id(),
     });
     operation.txn_id = Some(Ulid::generate());
@@ -369,6 +373,7 @@ fn materialized_range_reads() {
         range: Some(ObjectRangeRequest::StartEnd { start: 2, end: 4 }),
         group_id: Ulid::generate(),
         user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+        realm_id: RealmId([0u8; 32]),
         node_id: test_node_id(),
     });
     let txn_id = Ulid::generate();
@@ -415,6 +420,7 @@ fn reference_range_reads() {
         range: Some(ObjectRangeRequest::Suffix { length: 4 }),
         group_id: Ulid::generate(),
         user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+        realm_id: RealmId([0u8; 32]),
         node_id: test_node_id(),
     });
     let txn_id = Ulid::generate();
@@ -490,6 +496,7 @@ fn range_drift_restarts() {
         range: Some(ObjectRangeRequest::StartEnd { start: 1, end: 3 }),
         group_id: Ulid::generate(),
         user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+        realm_id: RealmId([0u8; 32]),
         node_id: test_node_id(),
     });
     operation.source_metadata = Some(SourceMetadata {
@@ -662,6 +669,7 @@ pub async fn test_get_object() {
         range: None,
         group_id: Ulid::generate(),
         user_identity: Default::default(),
+        realm_id: UserId::default().realm_id,
         node_id: test_node_id(),
     });
 
@@ -764,6 +772,7 @@ async fn routed_missing_blob() {
             range: None,
             group_id: Ulid::generate(),
             user_identity,
+            realm_id: user_identity.realm_id,
             node_id: test_node_id(),
         },
         None,
@@ -780,6 +789,7 @@ async fn routed_missing_blob() {
             range: Some(ObjectRangeRequest::StartEnd { start: 0, end: 1 }),
             group_id: Ulid::generate(),
             user_identity,
+            realm_id: user_identity.realm_id,
             node_id: test_node_id(),
         },
         None,
@@ -921,6 +931,7 @@ pub async fn hash_mismatch_rejected() {
         range: None,
         group_id: Ulid::generate(),
         user_identity: Default::default(),
+        realm_id: UserId::default().realm_id,
         node_id: test_node_id(),
     });
 
@@ -1054,6 +1065,7 @@ async fn bound_connector_used() {
             range: None,
             group_id: Ulid::generate(),
             user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            realm_id: RealmId([0u8; 32]),
             node_id: test_node_id(),
         }),
         &driver_ctx,
@@ -1228,6 +1240,7 @@ async fn drift_creates_successor() {
             range: None,
             group_id,
             user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            realm_id: RealmId([0u8; 32]),
             node_id: test_node_id(),
         }),
         &driver_ctx,
@@ -1361,6 +1374,7 @@ fn drifted_operation() -> GetObjectOperation {
         range: None,
         group_id: Ulid::generate(),
         user_identity: UserId::local(Ulid::from_parts(2, 2), RealmId([0u8; 32])),
+        realm_id: RealmId([0u8; 32]),
         node_id: test_node_id(),
     });
     let version = BlobVersion::reference(
@@ -1901,6 +1915,7 @@ async fn historical_drift_fails() {
             range: None,
             group_id: Ulid::generate(),
             user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            realm_id: RealmId([0u8; 32]),
             node_id: test_node_id(),
         }),
         &driver_ctx,
@@ -1945,6 +1960,7 @@ mod sealed {
             range: None,
             group_id: Ulid::generate(),
             user_identity: UserId::nil(RealmId::from_bytes([3u8; 32])),
+            realm_id: RealmId::from_bytes([3u8; 32]),
             node_id: test_node_id(),
         });
         operation.txn_id = Some(Ulid::generate());
@@ -2230,5 +2246,68 @@ mod sealed {
             operation.finalize().err(),
             Some(GetObjectError::PendingContent(archive))
         );
+    }
+}
+
+#[tokio::test]
+async fn promotes_serving_realm() {
+    // A user of another realm promotes pending content into the serving realm's hash index.
+    use crate::blob::promote::tests::received::{fixture, pending};
+    use aruna_core::events::BlobEvent;
+    use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
+    use aruna_core::structs::execution::job::RoCrateLimits;
+    use aruna_core::structs::storage::blob::{ArchiveKey, HashIndex};
+
+    let (_temp, context, plan, _) = fixture().await;
+    let (serving, group_id) = (RealmId([1; 32]), Ulid::from_bytes([8; 16]));
+    let foreign = UserId::local(Ulid::generate(), RealmId([9; 32]));
+    let data = b"foreign content".to_vec();
+    let hash = *blake3::hash(&data).as_bytes();
+    let (location, version) = pending(&context, plan, foreign, "foreign", data, hash, false).await;
+    let archive = ArchiveKey::of(&location);
+    let admit = BlobEffect::AdmitRead {
+        key: plan.key,
+        archive: archive.clone(),
+    };
+    let blob = context.blob_handle.as_ref().unwrap();
+    let Event::Blob(BlobEvent::ReadAdmitted { lease }) = blob.send_blob_effect(admit).await else {
+        panic!("read not admitted");
+    };
+    let node_id = context.net_handle.as_ref().unwrap().node_id();
+    let input = GetObjectInput {
+        bucket: "bucket".to_string(),
+        key: "foreign".to_string(),
+        version_id: None,
+        range: None,
+        group_id,
+        user_identity: foreign,
+        realm_id: serving,
+        node_id,
+    };
+    let limits = RoCrateLimits::default();
+    promote_leased(&context, &input, archive, lease, &limits)
+        .await
+        .unwrap();
+
+    for (realm_id, indexed) in [(serving, true), (foreign.realm_id, false)] {
+        let alias = HashIndex::new(
+            hash,
+            version.version_id,
+            realm_id,
+            group_id,
+            node_id,
+            "bucket".to_string(),
+            "foreign".to_string(),
+        );
+        let read = StorageEffect::Read {
+            key_space: PATHS_INDEX_KEYSPACE.to_string(),
+            key: alias.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        let event = context.storage_handle.send_storage_effect(read).await;
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            panic!("index read failed: {event:?}");
+        };
+        assert_eq!(value.is_some(), indexed);
     }
 }

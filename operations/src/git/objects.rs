@@ -287,6 +287,7 @@ pub async fn open(
             range: None,
             group_id: own.group_id.ok_or(GitError::Unavailable)?,
             user_identity: auth.user_id,
+            realm_id: auth.realm_id,
             node_id: node,
         };
         return get_object_routed(context, input, auth.path_restrictions.clone())

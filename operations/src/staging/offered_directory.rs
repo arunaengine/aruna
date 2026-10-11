@@ -880,6 +880,7 @@ mod tests {
                 range: None,
                 group_id: offer.group_id,
                 user_identity: offer.user_id,
+                realm_id: offer.user_id.realm_id,
                 node_id: offer.node_id,
             }),
             context,

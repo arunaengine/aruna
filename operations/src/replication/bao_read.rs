@@ -1417,9 +1417,10 @@ impl Operation for IncomingBaoOperation {
     type Error = BaoReadError;
 
     fn start(&mut self) -> Effects {
+        let user_id = self.request.auth_context.user_id;
         if self.request.realm_id != self.local_realm
             || self.request.auth_context.realm_id != self.request.realm_id
-            || self.request.auth_context.user_id.realm_id != self.request.realm_id
+            || (user_id.is_nil() && user_id.realm_id != self.request.realm_id)
         {
             return self.send_refusal(BaoReadRefusal::RealmPeerDenied);
         }
@@ -2233,6 +2234,43 @@ mod pure_tests {
                 ..
             })] if *read_txn == txn_id
         ));
+    }
+
+    #[test]
+    fn checks_serving_realm() {
+        // A user of another realm reads through this realm; a session of another realm, or an
+        // anonymous identity of another realm, is refused.
+        let (local_node, peer) = (node_from_seed(1), node_from_seed(2));
+        let foreign = RealmId::from_bytes([8u8; 32]);
+        for (user_id, serving_realm, accepted) in [
+            (
+                UserId::local(Ulid::from(5u128), foreign),
+                test_realm(),
+                true,
+            ),
+            (
+                UserId::local(Ulid::from(5u128), test_realm()),
+                foreign,
+                false,
+            ),
+            (UserId::nil(foreign), test_realm(), false),
+        ] {
+            let mut request = read_request(local_node, [4u8; 32]);
+            request.auth_context.user_id = user_id;
+            request.auth_context.realm_id = serving_realm;
+            let stream_id = Ulid::from(9u128);
+            let mut operation =
+                IncomingBaoOperation::new(peer, local_node, test_realm(), stream_id, request);
+            let effects = operation.start();
+            if accepted {
+                assert!(matches!(
+                    effects.as_slice(),
+                    [Effect::Storage(StorageEffect::Read { .. })]
+                ));
+            } else {
+                assert_eq!(refusal_from(&effects), BaoReadRefusal::RealmPeerDenied);
+            }
+        }
     }
 
     #[test]

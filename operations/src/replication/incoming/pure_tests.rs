@@ -1425,24 +1425,40 @@ fn rejects_manifest_size() {
 }
 
 #[test]
-fn rejects_user_realm() {
-    let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-    manifest.auth_context.user_id =
-        UserId::local(Ulid::from_parts(25, 25), RealmId::from_bytes([8u8; 32]));
-    let mut op = IncomingVersionOperation::new(
-        Ulid::from_parts(26, 26),
-        iroh::SecretKey::from_bytes(&[77; 32]).public(),
-        test_realm_id(),
-        manifest,
-    );
+fn checks_serving_realm() {
+    // A user of another realm is served here; a session of another realm, or an anonymous
+    // identity of another realm, is refused.
+    let foreign = RealmId::from_bytes([8u8; 32]);
+    let user = |realm_id| UserId::local(Ulid::from_parts(25, 25), realm_id);
+    for (user_id, serving_realm, accepted) in [
+        (user(foreign), test_realm_id(), true),
+        (user(test_realm_id()), foreign, false),
+        (UserId::nil(foreign), test_realm_id(), false),
+    ] {
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.auth_context.user_id = user_id;
+        manifest.auth_context.realm_id = serving_realm;
+        if let Some(writer) = manifest.writer_auth_context.as_mut() {
+            writer.user_id = manifest.auth_context.user_id;
+        }
+        let mut op = IncomingVersionOperation::new(
+            Ulid::from_parts(26, 26),
+            iroh::SecretKey::from_bytes(&[77; 32]).public(),
+            test_realm_id(),
+            manifest,
+        );
 
-    let effects = op.start();
+        let effects = op.start();
 
-    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
-    expect_rejected_negotiation(
-        &effects[0],
-        IncomingVersionError::RealmMismatch.to_string().as_str(),
-    );
+        if accepted {
+            assert_ne!(op.state, IncomingVersionState::SendNegotiation);
+        } else {
+            expect_rejected_negotiation(
+                &effects[0],
+                IncomingVersionError::RealmMismatch.to_string().as_str(),
+            );
+        }
+    }
 }
 
 #[test]

@@ -154,11 +154,14 @@ pub(super) async fn record_draft(
     }
 }
 
-/// The identity pushes of a link run as: its creator.
-pub(crate) fn creator_auth(link: &RepositoryLink) -> AuthContext {
+/// The identity pushes of a link run as: its creator, signed in to the realm this node serves.
+pub(crate) fn creator_auth(
+    context: &crate::driver::DriverContext,
+    link: &RepositoryLink,
+) -> AuthContext {
     AuthContext {
         user_id: link.created_by,
-        realm_id: link.created_by.realm_id,
+        realm_id: context.serving_realm(link.created_by.realm_id),
         path_restrictions: None,
         session: None,
     }

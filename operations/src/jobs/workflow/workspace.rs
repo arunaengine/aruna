@@ -85,11 +85,15 @@ pub async fn ensure_group_write(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: AuthContext {
                 user_id: record.created_by,
-                realm_id: record.created_by.realm_id,
+                realm_id: context.serving_realm(record.created_by.realm_id),
                 path_restrictions: None,
                 session: None,
             },
-            path: group_permission_path(record.created_by.realm_id, spec.group_id, node_id),
+            path: group_permission_path(
+                context.serving_realm(record.created_by.realm_id),
+                spec.group_id,
+                node_id,
+            ),
             required_permission: Permission::WRITE,
         }),
         context,
@@ -130,12 +134,12 @@ pub async fn check_workspace_bucket(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: AuthContext {
                 user_id: record.created_by,
-                realm_id: record.created_by.realm_id,
+                realm_id: context.serving_realm(record.created_by.realm_id),
                 path_restrictions: None,
                 session: None,
             },
             path: bucket_permission_path(
-                record.created_by.realm_id,
+                context.serving_realm(record.created_by.realm_id),
                 spec.group_id,
                 node_id,
                 bucket,
@@ -163,7 +167,7 @@ pub async fn mint_workspace_credential(
     bucket: &str,
 ) -> Result<WorkspaceCredential, JobError> {
     ensure_group_write(context, spec, record, node_id).await?;
-    let realm_id = record.created_by.realm_id;
+    let realm_id = context.serving_realm(record.created_by.realm_id);
     // WRITE on the bucket and its subtree also satisfies READ without matching siblings.
     let bucket_path = bucket_permission_path(realm_id, spec.group_id, node_id, bucket);
     let restrictions = vec![
@@ -187,7 +191,7 @@ pub async fn mint_input_credential(
     node_id: NodeId,
     buckets: &BTreeSet<String>,
 ) -> Result<WorkspaceCredential, JobError> {
-    let realm_id = record.created_by.realm_id;
+    let realm_id = context.serving_realm(record.created_by.realm_id);
     let restrictions = buckets
         .iter()
         .flat_map(|bucket| {
@@ -384,12 +388,12 @@ async fn authorize_source(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: AuthContext {
                 user_id: record.created_by,
-                realm_id: record.created_by.realm_id,
+                realm_id: context.serving_realm(record.created_by.realm_id),
                 path_restrictions: None,
                 session: None,
             },
             path: object_permission_path(
-                record.created_by.realm_id,
+                context.serving_realm(record.created_by.realm_id),
                 spec.group_id,
                 node_id,
                 &source.bucket,
@@ -517,7 +521,9 @@ async fn input_bytes(
     if let Some(remote) = input.source_node_id.filter(|remote| *remote != node_id) {
         return match captured() {
             Some(input_pin) => Box::pin(remote_source(context, record, input, input_pin)).await,
-            None if local_is_user(context, record.created_by.realm_id).await => {
+            None if local_is_user(context, context.serving_realm(record.created_by.realm_id))
+                .await =>
+            {
                 Box::pin(device_source(context, record, input, remote)).await
             }
             None => Err(JobError::permanent("captured inputs are missing")),
@@ -532,6 +538,7 @@ async fn input_bytes(
             range: None,
             group_id: spec.group_id,
             user_identity: record.created_by,
+            realm_id: context.serving_realm(record.created_by.realm_id),
             node_id,
         }),
         context,
@@ -598,7 +605,11 @@ async fn local_copy_source(
     let candidates = Box::pin(drive(ResolvePathsOperation::new(captured.blake3), context))
         .await
         .ok()?;
-    for candidate in local_copies(candidates, record.created_by.realm_id, node_id) {
+    for candidate in local_copies(
+        candidates,
+        context.serving_realm(record.created_by.realm_id),
+        node_id,
+    ) {
         let copy = SourceObject {
             path: source.path.clone(),
             bucket: candidate.bucket,
@@ -619,6 +630,7 @@ async fn local_copy_source(
                 range: None,
                 group_id: spec.group_id,
                 user_identity: record.created_by,
+                realm_id: context.serving_realm(record.created_by.realm_id),
                 node_id,
             }),
             context,
@@ -720,7 +732,8 @@ async fn input_policies(
             Some(captured) => refs.extend(captured.policies.iter().copied()),
             // A device captures no inputs and may never read governed content, so
             // its inputs carry none; a realm node must not guess them.
-            None if local_is_user(context, record.created_by.realm_id).await => {}
+            None if local_is_user(context, context.serving_realm(record.created_by.realm_id))
+                .await => {}
             None => {
                 return Err(JobError::permanent(format!(
                     "input `{}` has no captured inputs to inherit refs from",
@@ -844,12 +857,12 @@ async fn put_file_output(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: AuthContext {
                     user_id: record.created_by,
-                    realm_id: record.created_by.realm_id,
+                    realm_id: context.serving_realm(record.created_by.realm_id),
                     path_restrictions: None,
                     session: None,
                 },
                 path: object_permission_path(
-                    record.created_by.realm_id,
+                    context.serving_realm(record.created_by.realm_id),
                     spec.group_id,
                     node_id,
                     bucket,
@@ -870,7 +883,7 @@ async fn put_file_output(
     };
 
     let realm_config = Box::pin(drive(
-        GetConfigOperation::new(record.created_by.realm_id),
+        GetConfigOperation::new(context.serving_realm(record.created_by.realm_id)),
         context,
     ))
     .await
@@ -895,16 +908,20 @@ async fn put_file_output(
     let routing = routing_snapshot(context, spec.group_id, &write_bucket)
         .await
         .map_err(|error| routing_error("output write", error))?;
-    let gate = gate_context(context, record.created_by.realm_id, now_ms())
-        .await
-        .map_err(|error| gate_error("output write", error))?;
+    let gate = gate_context(
+        context,
+        context.serving_realm(record.created_by.realm_id),
+        now_ms(),
+    )
+    .await
+    .map_err(|error| gate_error("output write", error))?;
     if gate.as_ref().is_some_and(|gate| !gate.admitting) {
         return Err(gate_stopped("output write"));
     }
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: record.created_by,
         group_id: spec.group_id,
-        realm_id: record.created_by.realm_id,
+        realm_id: context.serving_realm(record.created_by.realm_id),
         node_id,
         request: PutObjectInput {
             bucket: write_bucket.clone(),
@@ -1014,7 +1031,7 @@ async fn replicate_output(
     let OutputDestination::S3 { bucket, key } = &output.destination;
     let auth = AuthContext {
         user_id: record.created_by,
-        realm_id: record.created_by.realm_id,
+        realm_id: context.serving_realm(record.created_by.realm_id),
         path_restrictions: None,
         session: None,
     };
@@ -1074,7 +1091,7 @@ async fn cleanup_output_stage(
             key: key.to_string(),
             version_id: Some(version_id),
             group_id: spec.group_id,
-            realm_id: record.created_by.realm_id,
+            realm_id: context.serving_realm(record.created_by.realm_id),
             node_id: record.owner_node_id,
             deleted_by: record.created_by,
         }),
@@ -1234,7 +1251,7 @@ async fn device_source(
         .ok_or_else(|| {
             JobError::permanent(format!("realm input {bucket}/{key} names no exact version"))
         })?;
-    let realm_id = record.created_by.realm_id;
+    let realm_id = context.serving_realm(record.created_by.realm_id);
     let request = BaoReadRequest {
         auth_context: AuthContext {
             user_id: record.created_by,

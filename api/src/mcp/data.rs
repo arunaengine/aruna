@@ -915,6 +915,7 @@ pub(crate) async fn read_text(
             range,
             group_id: bucket_info.group_id,
             user_identity: auth.user_id,
+            realm_id: auth.realm_id,
             node_id: server.state.get_node_id(),
         },
         auth.path_restrictions.clone(),

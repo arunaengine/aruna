@@ -1155,6 +1155,36 @@ async fn management_state() -> (TempDir, Arc<ServerState>) {
     (dir, Arc::new(state))
 }
 
+/// Writes a live user cutoff for `user` into this realm's config.
+async fn deactivate(state: &ServerState, user: UserId) {
+    use aruna_core::structs::identity::realm::TokenRevocation;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
+    config.revoked_tokens.push(TokenRevocation {
+        token_hash: aruna_core::auth::user_cutoff_hash(&user),
+        expires_at: aruna_core::auth::user_cutoff_expiry(now),
+    });
+    let actor = Actor {
+        node_id: node_id(),
+        user_id: UserId::nil(realm()),
+        realm_id: realm(),
+    };
+    let write = StorageEffect::Write {
+        key_space: REALM_CONFIG_KEYSPACE.to_string(),
+        key: realm().as_bytes().to_vec().into(),
+        value: config.to_bytes(&actor).unwrap().into(),
+        txn_id: None,
+    };
+    state
+        .get_ctx()
+        .storage_handle
+        .send_storage_effect(write)
+        .await;
+}
+
 async fn enroll_device(state: &ServerState, owner: UserId) {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
@@ -1330,6 +1360,40 @@ async fn rejects_basic() {
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
+async fn basic_foreign_owner() {
+    // A credential this node issued to a user of another realm signs in here; a nil owner never.
+    let (_dir, state) = build_state().await;
+    let foreign = RealmId([9u8; 32]);
+    let owners = [
+        (UserId::new(Ulid::from_bytes([6u8; 16]), foreign), true),
+        (UserId::nil(foreign), false),
+    ];
+    for (owner, accepted) in owners {
+        let mut access = credential(Ulid::from_bytes([5u8; 16]));
+        access.user_identity = owner;
+        access
+            .encrypt_secret(state.credential_encryption_key(), TES_SECRET)
+            .unwrap();
+        write_credential(&state, &access).await;
+        let result = authenticate_tes(&state, None, &basic_headers(&access, TES_SECRET)).await;
+        match accepted {
+            true => {
+                let caller = result.unwrap();
+                assert_eq!(caller.auth.user_id, owner);
+                assert_eq!(caller.auth.realm_id, state.get_realm_id());
+                // Deactivating the owner in this realm revokes the older credential.
+                deactivate(&state, owner).await;
+                let error = authenticate_tes(&state, None, &basic_headers(&access, TES_SECRET))
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+            }
+            false => assert_eq!(result.unwrap_err().status, StatusCode::UNAUTHORIZED),
+        }
     }
 }
 

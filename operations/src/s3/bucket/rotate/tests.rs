@@ -285,6 +285,7 @@ fn combined_change_reencodes() {
             block_keys,
         });
         let holder = UserKeyRecord {
+            realm_id: admin().realm_id,
             user_id: admin(),
             record_id: Ulid::from_bytes([8; 16]),
             key_id: "slot".to_string(),
@@ -294,6 +295,7 @@ fn combined_change_reencodes() {
             node_id: operation.input.node_id,
             placement: PlacementRef::NIL,
             created_at_ms: 1,
+            signature: None,
         };
         operation
             .input

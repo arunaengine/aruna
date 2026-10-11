@@ -8,7 +8,7 @@ use std::sync::Arc;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::effects::{VaultFetchEffect, VaultQuery};
-use aruna_core::events::VaultFetchEvent;
+use aruna_core::events::{VaultFetchEvent, VaultSignEvent};
 use aruna_core::keyspaces::{USER_KEY_KEYSPACE, VAULT_REVISION_KEYSPACE};
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::user::vault::{
@@ -133,6 +133,7 @@ pub(crate) async fn apply_forwarded_vault(
     };
     let config = AppendVaultConfig {
         node_id: net_handle.node_id(),
+        realm_id: *net_handle.realm_id(),
         user_id,
         record_id,
         change: *change,
@@ -185,6 +186,31 @@ async fn vault_caller(
         return Err(MetadataReadError::Forbidden);
     }
     Ok(auth.user_id)
+}
+
+/// Signs records this node publishes. A record naming another node stays unsigned and fails
+/// the whole batch, so no operation can sign for another origin.
+pub(crate) fn sign_records(context: &DriverContext, mut records: VaultRecords) -> VaultSignEvent {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return VaultSignEvent::Unavailable("net transport unavailable".to_string());
+    };
+    let node_id = net_handle.node_id();
+    let signed = match &mut records {
+        VaultRecords::Heads(heads) => heads.iter_mut().try_for_each(|head| {
+            (head.node_id == node_id).then_some(())?;
+            head.signature = Some(net_handle.sign(&head.signing_bytes().ok()?));
+            Some(())
+        }),
+        VaultRecords::Keys(keys) => keys.iter_mut().try_for_each(|key| {
+            (key.node_id == node_id).then_some(())?;
+            key.signature = Some(net_handle.sign(&key.signing_bytes().ok()?));
+            Some(())
+        }),
+    };
+    match signed {
+        Some(()) => VaultSignEvent::Signed(Box::new(records)),
+        None => VaultSignEvent::Unavailable("record names another publisher".to_string()),
+    }
 }
 
 /// Asks each holder in turn. A holder answering without records is a miss;
@@ -289,6 +315,7 @@ async fn local_records(
                 return Err(MetadataReadError::Forbidden);
             }
             let target = aruna_core::document::DocumentTarget::VaultRevision {
+                realm_id: *net_handle.realm_id(),
                 user_id,
                 revision_id: Ulid::nil(),
             };
@@ -299,6 +326,7 @@ async fn local_records(
                 return Err(MetadataReadError::Forbidden);
             }
             let target = aruna_core::document::DocumentTarget::UserKey {
+                realm_id: *net_handle.realm_id(),
                 user_id,
                 record_id: Ulid::nil(),
             };
@@ -395,6 +423,7 @@ mod tests {
         let writes = (1..=65)
             .map(|id| {
                 let record = UserKeyRecord {
+                    realm_id: user_id.realm_id,
                     user_id,
                     record_id: Ulid::from_bytes([id; 16]),
                     key_id: format!("key-{id}"),
@@ -404,6 +433,7 @@ mod tests {
                     node_id: node(1),
                     placement: PlacementRef::NIL,
                     created_at_ms: if id == 1 || id == 65 { 2 } else { 1 },
+                    signature: None,
                 };
                 (
                     USER_KEY_KEYSPACE.to_string(),
@@ -444,6 +474,7 @@ mod tests {
     async fn tries_later_holder() {
         let effect = fetch_effect();
         let record = UserKeyRecord {
+            realm_id: effect.user_id.realm_id,
             user_id: effect.user_id,
             record_id: Ulid::from_bytes([1; 16]),
             key_id: "key-1".to_string(),
@@ -453,6 +484,7 @@ mod tests {
             node_id: node(2),
             placement: PlacementRef::NIL,
             created_at_ms: 1,
+            signature: None,
         };
         let expected = VaultRecords::Keys(vec![record]);
         let mut attempts = Vec::new();

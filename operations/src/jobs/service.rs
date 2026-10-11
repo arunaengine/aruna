@@ -236,7 +236,7 @@ pub async fn submit_execution_job(
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
     let job_id = mint_local_job(
         context,
-        created_by.realm_id,
+        context.serving_realm(created_by.realm_id),
         owner_node_id,
         dedup_key.as_deref(),
     )
@@ -266,7 +266,7 @@ pub async fn submit_staging_job(
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     let created_by = spec.auth_context.user_id;
-    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id, None).await?;
+    let job_id = mint_local_job(context, spec.auth_context.realm_id, owner_node_id, None).await?;
     submit_local_job(
         context,
         SubmitJobSpec {
@@ -293,7 +293,7 @@ pub async fn submit_copy_job(
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     let created_by = spec.auth_context.user_id;
-    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id, None).await?;
+    let job_id = mint_local_job(context, spec.auth_context.realm_id, owner_node_id, None).await?;
     submit_local_job(
         context,
         SubmitJobSpec {
@@ -323,7 +323,7 @@ pub async fn submit_purge_job(
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
     let job_id = mint_local_job(
         context,
-        created_by.realm_id,
+        spec.auth_context.realm_id,
         owner_node_id,
         dedup_key.as_deref(),
     )
@@ -392,7 +392,7 @@ pub(crate) async fn submit_mint_local(
     let dedup_key = Some(pid_dedup_key(spec.document_id));
     let job_id = mint_local_job(
         context,
-        created_by.realm_id,
+        context.serving_realm(created_by.realm_id),
         owner_node_id,
         dedup_key.as_deref(),
     )
@@ -427,7 +427,7 @@ pub(crate) async fn submit_identifiers(
     let dedup_key = Some(key.into_bytes());
     let job_id = mint_local_job(
         context,
-        created_by.realm_id,
+        spec.auth_context.realm_id,
         owner_node_id,
         dedup_key.as_deref(),
     )
@@ -461,7 +461,7 @@ pub async fn submit_rocrate_import(
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
     let job_id = mint_local_job(
         context,
-        created_by.realm_id,
+        spec.auth_context.realm_id,
         owner_node_id,
         dedup_key.as_deref(),
     )
@@ -527,7 +527,7 @@ pub async fn submit_export_job(
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
     let job_id = mint_local_job(
         context,
-        created_by.realm_id,
+        spec.auth_context.realm_id,
         owner_node_id,
         dedup_key.as_deref(),
     )
@@ -764,7 +764,7 @@ async fn linked_push_job(
     let Some(destination) = spec.destination.as_ref().filter(|dest| dest.link.is_some()) else {
         return Ok(None);
     };
-    if record.created_by.realm_id != auth.realm_id {
+    if context.serving_realm(record.created_by.realm_id) != auth.realm_id {
         return Ok(None);
     }
     // The report lists the dataset's files, so the admin also needs READ on the dataset.
@@ -1364,7 +1364,7 @@ async fn family_cancel(
 ) -> Option<Result<RoutedCancelOutcome, JobRouteError>> {
     let auth = AuthContext {
         user_id,
-        realm_id: user_id.realm_id,
+        realm_id: context.serving_realm(user_id.realm_id),
         path_restrictions: None,
         session: None,
     };

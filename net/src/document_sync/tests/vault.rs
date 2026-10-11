@@ -6,6 +6,19 @@ use super::*;
 use aruna_core::keyspaces::{VAULT_RETIRED_KEYSPACE, VAULT_REVISION_KEYSPACE};
 use aruna_core::structs::identity::user::vault::{VaultRevision, record_rows, user_record_key};
 
+trait Signed {
+    /// Signs the record as its holder's endpoint, seed 82, would.
+    fn signed(self) -> Self;
+}
+
+impl Signed for VaultRevision {
+    fn signed(mut self) -> Self {
+        let bytes = self.signing_bytes().expect("revision signs");
+        self.signature = Some(iroh::SecretKey::from_bytes(&[82; 32]).sign(&bytes));
+        self
+    }
+}
+
 struct Holder {
     _storage_dir: TempDir,
     _doc_dir: TempDir,
@@ -49,6 +62,7 @@ impl Holder {
 
     fn revision(&self, id: u64, predecessors: &[u64]) -> VaultRevision {
         VaultRevision {
+            realm_id: self.user_id.realm_id,
             user_id: self.user_id,
             revision_id: Ulid::from_parts(id, 1),
             predecessors: predecessors
@@ -59,7 +73,9 @@ impl Holder {
             node_id: self.owner,
             placement: self.placement,
             created_at_ms: id,
+            signature: None,
         }
+        .signed()
     }
 
     /// Publishes the records on the user's shard topic and applies them like a holder.
@@ -94,7 +110,11 @@ impl Holder {
     }
 
     async fn stored(&self, id: u64) -> bool {
-        let key = user_record_key(self.user_id, Ulid::from_parts(id, 1));
+        self.stored_for(self.user_id, id).await
+    }
+
+    async fn stored_for(&self, user_id: UserId, id: u64) -> bool {
+        let key = user_record_key(user_id, Ulid::from_parts(id, 1));
         read_storage_value(&self.storage, VAULT_REVISION_KEYSPACE, key)
             .await
             .is_some()
@@ -129,13 +149,34 @@ async fn keeps_concurrent_heads() {
     }
     assert!(holder.stored(4).await);
 
-    // A record must come from the node that admitted it.
+    // A record must carry the signature of the node that admitted it.
     let mut forged = holder.revision(5, &[4]);
     forged.node_id = iroh::SecretKey::from_bytes(&[9; 32]).public();
+    let forged = forged.signed();
     holder.apply(&[forged], 7_020).await;
     assert!(!holder.stored(5).await, "a relayed author is refused");
     assert!(holder.stored(4).await);
 
+    holder.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn admits_signed_origins() {
+    let holder = Holder::open().await;
+    // A user of another realm keeps a vault in this realm.
+    let foreign = UserId::new(Ulid::from_parts(6_003, 1), RealmId::from_bytes([9; 32]));
+    let mut record = holder.revision(1, &[]);
+    record.user_id = foreign;
+    holder.apply(&[record.signed()], 9_000).await;
+    assert!(holder.stored_for(foreign, 1).await);
+
+    // An unsigned record, or one stored by another realm, is refused.
+    let mut unsigned = holder.revision(2, &[]);
+    unsigned.signature = None;
+    let mut moved = holder.revision(3, &[]);
+    moved.realm_id = RealmId::from_bytes([9; 32]);
+    holder.apply(&[unsigned, moved.signed()], 9_010).await;
+    assert!(!holder.stored(2).await && !holder.stored(3).await);
     holder.service.shutdown().await;
 }
 
@@ -150,6 +191,7 @@ async fn shuffled_retirement_replays() {
                 holder.revision(3, &[2]),
             ];
             records[deleted - 1].payload = None;
+            records[deleted - 1] = records[deleted - 1].clone().signed();
             for replay in [false, true] {
                 let sequence = if replay { [2, 1, 3] } else { order };
                 for (event, id) in sequence.into_iter().enumerate() {

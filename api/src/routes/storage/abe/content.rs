@@ -66,6 +66,7 @@ pub async fn content(
         range,
         group_id: info.group_id,
         user_identity: auth.user_id,
+        realm_id: auth.realm_id,
         node_id: state.get_node_id(),
     };
     let restrictions = auth.path_restrictions.clone();

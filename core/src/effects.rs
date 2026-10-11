@@ -549,6 +549,8 @@ pub enum NetEffect {
     /// operation checked the authorizing user's realm-admin permission.
     PolicySign(Box<PolicyPublicationClaim>),
     VaultFetch(Box<VaultFetchEffect>),
+    /// Signs vault or key records with this node's key; each must name this node.
+    VaultSign(Box<crate::structs::identity::user::vault::VaultRecords>),
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its

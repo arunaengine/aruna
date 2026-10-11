@@ -517,8 +517,10 @@ impl Operation for IncomingVersionOperation {
         {
             return self.reject_negotiation(IncomingVersionError::HopLimitExceeded);
         }
+        // The user may belong to another realm, but not anonymously; the serving realm is this one.
+        let user_id = self.manifest.auth_context.user_id;
         if self.manifest.auth_context.realm_id != self.local_realm_id
-            || self.manifest.auth_context.user_id.realm_id != self.local_realm_id
+            || (user_id.is_nil() && user_id.realm_id != self.local_realm_id)
         {
             return self.reject_negotiation(IncomingVersionError::RealmMismatch);
         }
@@ -530,9 +532,7 @@ impl Operation for IncomingVersionOperation {
             .manifest
             .writer_auth_context
             .as_ref()
-            .is_some_and(|auth| {
-                auth.realm_id != self.local_realm_id || auth.user_id.realm_id != self.local_realm_id
-            })
+            .is_some_and(|auth| auth.realm_id != self.local_realm_id)
         {
             return self.reject_negotiation(IncomingVersionError::RealmMismatch);
         }

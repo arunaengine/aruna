@@ -78,8 +78,6 @@ pub enum KeyError {
     Missing,
     #[error("access to the encryption record is denied")]
     Denied,
-    #[error("users of another realm cannot hold this realm's encryption keys")]
-    Foreign,
     #[error("encryption storage is unavailable")]
     Storage,
     #[error("a re-key of another prefix is unfinished in this bucket")]
@@ -304,6 +302,7 @@ impl KeyOperation {
     fn read_keys(&mut self) -> Effects {
         let mut keys = ReadVaultOperation::new(ReadVaultConfig {
             node_id: self.node,
+            realm_id: self.auth.realm_id,
             user_id: self.recipient(),
             query: VaultQuery::Keys,
             deadline: std::time::Duration::from_secs(10),
@@ -429,9 +428,6 @@ impl Operation for KeyOperation {
     type Output = KeyResult;
     type Error = KeyError;
     fn start(&mut self) -> Effects {
-        if self.auth.federated() {
-            return self.fail(KeyError::Foreign);
-        }
         if self.auth.user_id.is_nil() {
             return self.fail(KeyError::Denied);
         }
@@ -451,9 +447,6 @@ impl Operation for KeyOperation {
                 let Some(info) = value.as_ref().and_then(|v| BucketInfo::from_bytes(v).ok()) else {
                     return self.fail(KeyError::Missing);
                 };
-                if info.created_by.realm_id != self.auth.realm_id {
-                    return self.fail(KeyError::Denied);
-                }
                 self.info = Some(info);
                 self.state = State::Settings;
                 self.read(BUCKET_ENCRYPTION_KEYSPACE, self.bucket.as_bytes().to_vec())
@@ -580,8 +573,8 @@ mod tests {
     use aruna_core::structs::storage::encryption::BucketKeyRef;
 
     #[test]
-    fn refuses_foreign_user() {
-        // A federated user served by realm 1 cannot request keys there.
+    fn foreign_user_starts() {
+        // A federated user served by realm 1 requests keys there under the ordinary checks.
         let foreign = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
         let auth = AuthContext {
             user_id: foreign,
@@ -592,8 +585,10 @@ mod tests {
         let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let action = KeyAction::Request(KeyScope::Subtree("foo/".into()));
         let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
-        assert!(operation.start().is_empty());
-        assert_eq!(operation.finalize(), Err(KeyError::Foreign));
+        assert!(matches!(
+            operation.start().as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
     }
 
     #[test]
@@ -872,6 +867,7 @@ mod tests {
     #[test]
     fn fences_inactive_recipients() {
         // A deactivated user or a credential issued before the user cutoff gets no new grant.
+        // Only a user of another realm may lack a local user row.
         use aruna_core::structs::identity::group::GroupAuthorizationDocument;
         use aruna_core::structs::identity::realm::{
             RealmAuthorizationDocument, RealmConfigDocument, TokenRevocation,
@@ -891,36 +887,40 @@ mod tests {
         let parameters =
             aruna_core::structs::storage::abe::create_parameters(&secret, realm_id, node, key)
                 .unwrap();
-        let values = |account: &User, config: &RealmConfigDocument| -> Vec<(Key, Option<Value>)> {
-            let rows: [Option<Vec<u8>>; 8] = [
-                Some(
-                    RealmAuthorizationDocument::default_realm_doc(realm_id)
-                        .to_bytes(&actor)
-                        .unwrap(),
-                ),
-                Some(
-                    GroupAuthorizationDocument::default_group_doc(user, realm_id, group_id)
-                        .to_bytes(&actor)
-                        .unwrap(),
-                ),
-                Some(config.to_bytes(&actor).unwrap()),
-                Some(parameters.to_bytes().unwrap()),
-                Some(1u64.to_be_bytes().to_vec()),
-                Some(
-                    BucketKeyRecord::new(key, Ulid::from_bytes([3; 16]), [0; 32], 1)
-                        .to_bytes()
-                        .unwrap(),
-                ),
-                None,
-                Some(account.to_bytes(&actor).unwrap()),
-            ];
-            rows.into_iter()
-                .map(|v| (Key::from(Vec::new()), v.map(Value::from)))
-                .collect()
-        };
-        let snapshot = |action: KeyAction, account: &User, config: &RealmConfigDocument| {
+        let values =
+            |account: Option<&User>, config: &RealmConfigDocument| -> Vec<(Key, Option<Value>)> {
+                let rows: [Option<Vec<u8>>; 8] = [
+                    Some(
+                        RealmAuthorizationDocument::default_realm_doc(realm_id)
+                            .to_bytes(&actor)
+                            .unwrap(),
+                    ),
+                    Some(
+                        GroupAuthorizationDocument::default_group_doc(user, realm_id, group_id)
+                            .to_bytes(&actor)
+                            .unwrap(),
+                    ),
+                    Some(config.to_bytes(&actor).unwrap()),
+                    Some(parameters.to_bytes().unwrap()),
+                    Some(1u64.to_be_bytes().to_vec()),
+                    Some(
+                        BucketKeyRecord::new(key, Ulid::from_bytes([3; 16]), [0; 32], 1)
+                            .to_bytes()
+                            .unwrap(),
+                    ),
+                    None,
+                    account.map(|account| account.to_bytes(&actor).unwrap()),
+                ];
+                rows.into_iter()
+                    .map(|v| (Key::from(Vec::new()), v.map(Value::from)))
+                    .collect()
+            };
+        let snapshot = |action: KeyAction,
+                        caller: aruna_core::UserId,
+                        account: Option<&User>,
+                        config: &RealmConfigDocument| {
             let auth = AuthContext {
-                user_id: user,
+                user_id: caller,
                 realm_id,
                 path_restrictions: None,
                 session: None,
@@ -951,21 +951,52 @@ mod tests {
             restrictions: None,
         };
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        assert_eq!(snapshot(token.clone(), &account, &config), Ok(()));
+        assert_eq!(
+            snapshot(token.clone(), user, Some(&account), &config),
+            Ok(())
+        );
 
         config.revoked_tokens.push(TokenRevocation {
             token_hash: aruna_core::auth::user_cutoff_hash(&user),
             expires_at: aruna_core::auth::user_cutoff_expiry(2_000),
         });
-        assert_eq!(snapshot(token, &account, &config), Err(KeyError::Denied));
+        assert_eq!(
+            snapshot(token, user, Some(&account), &config),
+            Err(KeyError::Denied)
+        );
 
         let request = KeyAction::Request(KeyScope::Subtree("foo/".into()));
         let config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        assert_eq!(snapshot(request.clone(), &account, &config), Ok(()));
+        assert_eq!(
+            snapshot(request.clone(), user, Some(&account), &config),
+            Ok(())
+        );
         account.attributes.insert(
             aruna_core::user::validation::DEACTIVATED_ATTRIBUTE.to_string(),
             "true".into(),
         );
-        assert_eq!(snapshot(request, &account, &config), Err(KeyError::Denied));
+        assert_eq!(
+            snapshot(request.clone(), user, Some(&account), &config),
+            Err(KeyError::Denied)
+        );
+
+        let foreign = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        assert_eq!(snapshot(request.clone(), foreign, None, &config), Ok(()));
+        let missing = snapshot(request.clone(), user, None, &config);
+        assert_eq!(missing, Err(KeyError::Storage));
+        config.revoked_tokens.push(TokenRevocation {
+            token_hash: aruna_core::auth::user_cutoff_hash(&foreign),
+            expires_at: aruna_core::auth::user_cutoff_expiry(2_000),
+        });
+        let token = KeyAction::Token {
+            access_key: Ulid::from_parts(1_000_000, 1).to_string(),
+            public_key: [1; 32],
+            restrictions: None,
+        };
+        assert_eq!(
+            snapshot(token, foreign, None, &config),
+            Err(KeyError::Denied)
+        );
     }
 }

@@ -694,6 +694,7 @@ pub async fn download_object(
             range: None,
             group_id: resolved.group_id,
             user_identity: auth.user_id,
+            realm_id: auth.realm_id,
             node_id: state.get_node_id(),
         }),
         &state.get_ctx(),

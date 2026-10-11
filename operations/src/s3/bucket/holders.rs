@@ -47,7 +47,6 @@ pub async fn read_admins(
     Ok(admin_users(
         realm.roles.values().chain(group.roles.values()),
         &path,
-        realm_id,
     ))
 }
 
@@ -55,6 +54,7 @@ pub async fn read_admins(
 /// a user without keys.
 pub async fn lookup_keys(
     context: &DriverContext,
+    realm_id: RealmId,
     node_id: NodeId,
     users: impl IntoIterator<Item = UserId>,
 ) -> BTreeMap<UserId, KeyLookup> {
@@ -62,6 +62,7 @@ pub async fn lookup_keys(
     for user_id in users {
         let config = ReadVaultConfig {
             node_id,
+            realm_id,
             user_id,
             query: VaultQuery::Keys,
             deadline: KEY_LOOKUP_DEADLINE,
@@ -156,7 +157,7 @@ mod tests {
             RealmId::from_bytes([3; 32]),
         );
 
-        let lookups = lookup_keys(&context, node_id, [user]).await;
+        let lookups = lookup_keys(&context, user.realm_id, node_id, [user]).await;
         assert_eq!(lookups.get(&user), Some(&KeyLookup::Unavailable));
     }
 }

@@ -1,4 +1,4 @@
-//! Stores replicated vault revisions and user key records after checking shape, realm and author.
+//! Stores replicated vault revisions and user key records after checking shape, realm and origin.
 //! A holder keeps only the current heads; a replaced revision never becomes a head again.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
@@ -9,9 +9,11 @@ use aruna_core::structs::identity::user::vault::{
 };
 
 use super::metadata::MetadataOutcome;
+use super::validate::relay_publisher_allowed;
 use super::*;
 
-/// Both records are immutable and published by the node that admitted the user's own request.
+/// Both records are immutable and signed by the node that admitted the user's own request; a
+/// realm node may relay them unchanged.
 pub(super) async fn apply_vault_event(
     service: &DocumentSyncService,
     topic_id: ::irokle::TopicId,
@@ -40,27 +42,38 @@ pub(super) async fn apply_vault_event(
         DocumentTarget::VaultRevision { .. } => VaultRevision::from_bytes(bytes)
             .ok()
             .filter(|record| record.validate().is_ok())
-            .map(|record| (record.target(), record.sync_change(), Some(record))),
+            .map(|record| {
+                let signed = record.origin_signed();
+                (record.target(), record.sync_change(), signed, Some(record))
+            }),
         DocumentTarget::UserKey { .. } => UserKeyRecord::from_bytes(bytes)
             .ok()
             .filter(|record| record.validate().is_ok())
-            .map(|record| (record.target(), record.sync_change(), None)),
+            .map(|record| {
+                let signed = record.origin_signed();
+                (record.target(), record.sync_change(), signed, None)
+            }),
         _ => None,
     };
-    let Some((expected, expected_change, revision)) = checked else {
+    let Some((expected, expected_change, signed, revision)) = checked else {
         return reject("vault record is malformed or out of bounds");
     };
-    let user_id = match target {
-        DocumentTarget::VaultRevision { user_id, .. } | DocumentTarget::UserKey { user_id, .. } => {
-            *user_id
-        }
+    let realm_id = match target {
+        DocumentTarget::VaultRevision { realm_id, .. }
+        | DocumentTarget::UserKey { realm_id, .. } => *realm_id,
         _ => return reject("vault record has another target"),
     };
-    if expected != *target || expected_change != *change || user_id.realm_id != service.realm_id {
+    if expected != *target || expected_change != *change || realm_id != service.realm_id {
         return reject("vault record does not match its target, change or realm");
     }
-    if actor_id != ::irokle::actor_id_for(topic_id, node_to_peer(&change.current.actor)) {
-        return reject("vault record actor is not its publisher");
+    if !signed {
+        return reject("vault record lacks its origin signature");
+    }
+    let origin = ::irokle::actor_id_for(topic_id, node_to_peer(&change.current.actor));
+    if actor_id != origin
+        && !relay_publisher_allowed(&service.storage, topic_id, actor_id, realm_id).await?
+    {
+        return reject("vault record publisher is neither its origin nor a realm relay");
     }
     let bootstrap =
         |error: aruna_core::errors::ConversionError| NetError::Bootstrap(error.to_string());

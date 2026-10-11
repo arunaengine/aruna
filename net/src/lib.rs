@@ -1040,6 +1040,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::LaunchOffer(_)) => "launch_offer",
         Effect::Net(NetEffect::PolicySign(_)) => "policy_sign",
         Effect::Net(NetEffect::VaultFetch(_)) => "vault_fetch",
+        Effect::Net(NetEffect::VaultSign(_)) => "vault_sign",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::LocalFile(_) => "local_file",

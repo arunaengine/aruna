@@ -241,21 +241,31 @@ async fn lists_then_removes() {
 }
 
 #[tokio::test]
-async fn federated_keys_refused() {
-    // Federated users neither receive a grant nor extend an unlock, whatever roles they hold.
+async fn federated_keys_checked() {
+    // Users of another realm get a grant and are refused an extension only as non-holders.
     let fixture = fixture().await;
     let foreign = UserId::new(Ulid::generate(), RealmId([9; 32]));
-    let refused = |error: ServerError| {
-        matches!(
-            error,
-            ServerError::Refused(
-                StatusCode::FORBIDDEN,
-                "foreign_encryption_keys_unsupported",
-                _
-            )
-        )
+    let settings = BucketEncryption {
+        mode: EncryptionMode::VaultLocked,
+        bucket_id: Some(BUCKET_ID),
+        key_generation: 1,
+        storage_generation: 1,
+        ..Default::default()
     };
-    let grant = grant_holder(
+    let key = BucketKeyRef::new(BUCKET_ID, 1);
+    let record = BucketKeyRecord::new(key, Ulid::from_bytes([8; 16]), [7; 32], 1);
+    let rows = [
+        (
+            BUCKET_ENCRYPTION_KEYSPACE,
+            BUCKET.as_bytes().to_vec(),
+            settings.to_bytes().unwrap(),
+        ),
+        (BUCKET_KEY_KEYSPACE, key.key(), record.to_bytes().unwrap()),
+    ];
+    for (key_space, key, value) in rows {
+        write_row(&fixture.state, key_space, key, value).await;
+    }
+    let Json(grant) = grant_holder(
         State(fixture.state.clone()),
         Extension(Some(fixture.owner.clone())),
         Path(BUCKET.to_string()),
@@ -263,15 +273,26 @@ async fn federated_keys_refused() {
             user_id: foreign.to_string(),
         }),
     )
+    .await
+    .unwrap();
+    assert_eq!(grant.user_id, foreign.to_string());
+    let anonymous = grant_holder(
+        State(fixture.state.clone()),
+        Extension(Some(fixture.owner.clone())),
+        Path(BUCKET.to_string()),
+        Json(GrantRequest {
+            user_id: UserId::nil(RealmId([9; 32])).to_string(),
+        }),
+    )
     .await;
-    assert!(refused(grant.unwrap_err()));
-    let caller = AuthContext {
-        user_id: foreign,
+    assert!(matches!(anonymous, Err(ServerError::BadRequestReason(_))));
+    let stranger = AuthContext {
+        user_id: UserId::new(Ulid::generate(), RealmId([9; 32])),
         ..fixture.owner.clone()
     };
     let extend = extend_unlock(
         State(fixture.state.clone()),
-        Extension(Some(caller)),
+        Extension(Some(stranger)),
         Path(BUCKET.to_string()),
         Json(ExtendRequest {
             generation: 1,
@@ -279,6 +300,10 @@ async fn federated_keys_refused() {
             duration_ms: None,
         }),
     )
-    .await;
-    assert!(refused(extend.unwrap_err()));
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        extend,
+        ServerError::Refused(StatusCode::FORBIDDEN, "not_holder", _)
+    ));
 }

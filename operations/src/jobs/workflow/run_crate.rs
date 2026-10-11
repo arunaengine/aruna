@@ -93,7 +93,7 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
     let actor = Actor {
         node_id,
         user_id: parent.created_by,
-        realm_id: parent.created_by.realm_id,
+        realm_id: ctx.driver.serving_realm(parent.created_by.realm_id),
     };
     // Persist the first minted id before create so retries survive policy changes.
     let document_id = match saved_id {
@@ -119,12 +119,12 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: AuthContext {
                 user_id: parent.created_by,
-                realm_id: parent.created_by.realm_id,
+                realm_id: ctx.driver.serving_realm(parent.created_by.realm_id),
                 path_restrictions: None,
                 session: None,
             },
             path: MetadataRegistryRecord::permission_path_for(
-                &parent.created_by.realm_id,
+                &ctx.driver.serving_realm(parent.created_by.realm_id),
                 spec.group_id,
                 &document_path,
                 document_id,
@@ -176,7 +176,7 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
         ctx.driver.clone(),
         Some(AuthToken::internal(AuthContext {
             user_id: parent.created_by,
-            realm_id: parent.created_by.realm_id,
+            realm_id: ctx.driver.serving_realm(parent.created_by.realm_id),
             path_restrictions: None,
             session: None,
         })),
@@ -187,7 +187,7 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
             let resource = result.record.document_id.to_string();
             emit_metadata_created(
                 &ctx.driver,
-                parent.created_by.realm_id,
+                ctx.driver.serving_realm(parent.created_by.realm_id),
                 parent.created_by,
                 result.record.group_id,
                 result.record.document_id,

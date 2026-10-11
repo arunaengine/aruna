@@ -34,6 +34,7 @@ fn input(lookup: KeyLookup) -> GrantInput {
 
 fn keys() -> KeyLookup {
     KeyLookup::Keys(vec![UserKeyRecord {
+        realm_id: user(7).realm_id,
         user_id: user(7),
         record_id: Ulid::from_bytes([8; 16]),
         key_id: "slot".to_string(),
@@ -43,6 +44,7 @@ fn keys() -> KeyLookup {
         node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
         placement: PlacementRef::NIL,
         created_at_ms: 1,
+        signature: None,
     }])
 }
 

@@ -20,7 +20,7 @@ use crate::jobs::executor::{JobContext, JobRunOutcome};
 /// document's authority, so a lost race or post-withdrawal run reports the
 /// authoritative mapping with `newly_minted: false`; routing never mints locally.
 pub async fn run_mint_pid(ctx: &JobContext, spec: &MintPersistentSpec) -> JobRunOutcome {
-    let realm_id = spec.minted_by.realm_id;
+    let realm_id = ctx.driver.serving_realm(spec.minted_by.realm_id);
     // The submitting route requires an unrestricted realm token, so the internal
     // principal the authority re-checks carries no path restrictions to drop.
     let auth_token = AuthToken::internal(AuthContext {
@@ -114,7 +114,7 @@ async fn record_failure(
 ) {
     let _ = fail_pid_routed(
         &ctx.driver,
-        spec.minted_by.realm_id,
+        ctx.driver.serving_realm(spec.minted_by.realm_id),
         spec.document_id,
         PersistentIdFailure {
             message,

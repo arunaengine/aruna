@@ -639,7 +639,7 @@ async fn register_accepted(
     let spec = RegisterIdentifiersSpec {
         document_id: link.document_id,
         identifiers,
-        auth_context: super::push::creator_auth(link),
+        auth_context: super::push::creator_auth(context, link),
     };
     let key = format!("identifiers/{}/{}", link.link_id, record.id);
     crate::jobs::service::submit_identifiers(context, spec, owner, key)

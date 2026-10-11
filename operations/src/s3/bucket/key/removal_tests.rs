@@ -21,6 +21,7 @@ fn user(seed: u8) -> UserId {
 
 fn keys(user_id: UserId) -> KeyLookup {
     KeyLookup::Keys(vec![UserKeyRecord {
+        realm_id: user_id.realm_id,
         user_id,
         record_id: Ulid::generate(),
         key_id: "slot".to_string(),
@@ -30,6 +31,7 @@ fn keys(user_id: UserId) -> KeyLookup {
         node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
         placement: PlacementRef::NIL,
         created_at_ms: 1,
+        signature: None,
     }])
 }
 

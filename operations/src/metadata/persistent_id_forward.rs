@@ -133,7 +133,7 @@ pub async fn submit_pid_routed(
     retention_ms: u64,
     auth_token: Option<AuthToken>,
 ) -> Result<(JobId, bool), MetadataApiError> {
-    let realm_id = minted_by.realm_id;
+    let realm_id = context.serving_realm(minted_by.realm_id);
     if let Some(job_id) = read_pid_routed(context, realm_id, document_id)
         .await?
         .and_then(|mapping| mapping.job_id)

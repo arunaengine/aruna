@@ -145,6 +145,7 @@ async fn read_object(
             range: None,
             group_id,
             user_identity: realm.user_id,
+            realm_id: realm.user_id.realm_id,
             node_id,
         }),
         context,

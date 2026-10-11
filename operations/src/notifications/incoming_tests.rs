@@ -576,6 +576,21 @@ fn join_payload_validates() {
 }
 
 #[test]
+fn pending_member_validates() {
+    // A local holder hears about a waiting member of any realm, but never about the nil user.
+    let realm_id = RealmId::from_bytes([7; 32]);
+    let pending = |member_user_id| NotificationKind::BucketKeyPending {
+        bucket: "sealed".to_string(),
+        node_id: data_node_id(),
+        group_id: data_group_id(),
+        member_user_id,
+    };
+    let foreign = UserId::new(Ulid::from_bytes([1; 16]), RealmId::from_bytes([8; 32]));
+    assert!(validate_inbound_kind(&pending(foreign), realm_id).is_ok());
+    assert!(validate_inbound_kind(&pending(UserId::nil(realm_id)), realm_id).is_err());
+}
+
+#[test]
 fn transient_batch_cap() {
     let realm_id = RealmId::from_bytes([75u8; 32]);
     let recipient = UserId::new(Ulid::generate(), realm_id);

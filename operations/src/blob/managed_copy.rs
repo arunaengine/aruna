@@ -1066,6 +1066,7 @@ mod driver_tests {
                 range: None,
                 group_id: fixture.group_id,
                 user_identity: fixture.user_id,
+                realm_id: fixture.user_id.realm_id,
                 node_id: fixture.node_id,
             }),
             context,

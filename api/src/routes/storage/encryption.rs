@@ -470,7 +470,13 @@ pub(crate) async fn holder_report(
         .chain(snapshot.admins.iter().copied())
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(&state.get_ctx(), state.get_node_id(), users).await;
+    let lookups = lookup_keys(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        users,
+    )
+    .await;
     let copies: Vec<_> = snapshot
         .copies
         .iter()
@@ -917,7 +923,7 @@ pub(crate) async fn change_bucket(
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
     let context = state.get_ctx();
-    let lookups = lookup_keys(&context, state.get_node_id(), users).await;
+    let lookups = lookup_keys(&context, state.get_realm_id(), state.get_node_id(), users).await;
     let input = ChangeInput {
         bucket: bucket.to_string(),
         group_id,
@@ -997,7 +1003,7 @@ pub(crate) async fn enable_bucket(
         .into_iter()
         .chain(snapshot.admins.iter().copied())
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(context, node_id, users).await;
+    let lookups = lookup_keys(context, realm_id, node_id, users).await;
     let input = EnableInput {
         bucket: bucket.to_string(),
         group_id,

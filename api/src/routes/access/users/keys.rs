@@ -116,7 +116,7 @@ refused. A caller publishes only their own keys.
             })),
         (status = 400, description = "The key id or public key is malformed", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm or carries path restrictions, or the caller is a federated user (code `foreign_encryption_keys_unsupported`)", body = ErrorResponse),
+        (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 409, description = "The user has published the most key records allowed", body = ErrorResponse),
         (status = 503, description = "No vault holder accepted the record", body = ErrorResponse)
     ),
@@ -129,7 +129,6 @@ pub async fn publish_key(
     Json(request): Json<PublishKeyRequest>,
 ) -> ServerResult<(StatusCode, Json<UserKeyResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    crate::routes::storage::abe::refuse_foreign_keys(&auth)?;
     if request.key_id.is_empty() || request.key_id.len() > KEY_ID_BYTES {
         return Err(ServerError::BadRequestReason(
             "key_id must hold 1 to 128 bytes".to_string(),
@@ -174,6 +173,7 @@ pub async fn publish_key(
 
 **Behavior**
 - The records are read from the holders of the user's vault placement.
+- A user of another realm has keys here only when they published them in this realm.
 - An empty list means the user has published no key.
 - 503 means no holder answered; it never means the user has no key."#,
     params(("id" = String, Path, description = "User id in the form `<ulid>@<realm>`")),
@@ -191,7 +191,6 @@ pub async fn publish_key(
             })),
         (status = 400, description = "The user id is malformed", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The user belongs to another realm; code `foreign_encryption_keys_unsupported`", body = ErrorResponse),
         (status = 503, description = "No vault holder answered", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -201,9 +200,8 @@ pub async fn list_keys(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<UserKeysResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    require_realm_auth(&state, auth)?;
     let user_id = UserId::from_str(&id).map_err(|_| ServerError::BadRequest)?;
-    crate::routes::storage::abe::refuse_foreign_keys(&AuthContext { user_id, ..auth })?;
     let mut keys = match read(&state, user_id, VaultQuery::Keys).await? {
         VaultRecords::Keys(keys) => keys,
         VaultRecords::Heads(_) => {

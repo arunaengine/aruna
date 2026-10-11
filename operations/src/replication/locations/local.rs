@@ -701,8 +701,9 @@ impl Operation for LocationSummaryOperation {
     type Error = LocationSummaryError;
 
     fn start(&mut self) -> Effects {
+        let user_id = self.request.auth_context.user_id;
         if self.request.auth_context.realm_id != self.request.realm_id
-            || self.request.auth_context.user_id.realm_id != self.request.realm_id
+            || (user_id.is_nil() && user_id.realm_id != self.request.realm_id)
         {
             return self.deny();
         }
@@ -1161,6 +1162,30 @@ mod pure_tests {
         verify(&mut operation);
 
         assert_eq!(operation.finalize().unwrap().bucket, Some(bucket_info()));
+    }
+
+    #[test]
+    fn checks_serving_realm() {
+        // A user of another realm is answered here; a session of another realm, or an
+        // anonymous identity of another realm, is denied.
+        let foreign = aruna_core::structs::identity::realm::RealmId::from_bytes([8u8; 32]);
+        for (user_id, serving_realm, accepted) in [
+            (UserId::local(Ulid::from(5u128), foreign), realm_id(), true),
+            (UserId::local(Ulid::from(5u128), realm_id()), foreign, false),
+            (UserId::nil(foreign), realm_id(), false),
+        ] {
+            let mut request = request(None);
+            request.auth_context.user_id = user_id;
+            request.auth_context.realm_id = serving_realm;
+            let mut operation = LocationSummaryOperation::new_local(node_id(5), request);
+            let effects = operation.start();
+            assert_eq!(operation.is_complete(), !accepted);
+            if accepted {
+                assert!(!effects.is_empty());
+            } else {
+                assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+            }
+        }
     }
 
     #[test]

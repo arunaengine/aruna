@@ -208,6 +208,30 @@ async fn internal_auth_preserves() {
 }
 
 #[tokio::test]
+async fn internal_foreign_user() {
+    // A vouched user of another realm is kept; an anonymous one of another realm is refused.
+    let realm_id = RealmId([13; 32]);
+    let peer = node_id_seed(14);
+    let (_dir, storage) = auth_storage();
+    persist_realm_config(&storage, realm_id, &[peer]).await;
+    let state = AuthValidationState::new(storage.clone(), Some(realm_id));
+    for (ulid, accepted) in [(Ulid::from_bytes([15; 16]), true), (Ulid::nil(), false)] {
+        let auth = AuthContext {
+            user_id: UserId::new(ulid, RealmId([16; 32])),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let token = Some(AuthToken::internal(auth.clone()));
+        let result = authorize_peer(&state, &storage, peer, Some(realm_id), token, true).await;
+        match accepted {
+            true => assert_eq!(result.unwrap(), Some(auth)),
+            false => assert!(result.is_err()),
+        }
+    }
+}
+
+#[tokio::test]
 async fn bad_bucket_token() {
     let (_dir, storage) = auth_storage();
     let realm_id = RealmId([17u8; 32]);

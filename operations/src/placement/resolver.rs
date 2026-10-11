@@ -1272,6 +1272,7 @@ mod pure_tests {
             ),
             (
                 DocumentTarget::VaultRevision {
+                    realm_id: user_id.realm_id,
                     user_id,
                     revision_id: sid(6),
                 },
@@ -1279,6 +1280,7 @@ mod pure_tests {
             ),
             (
                 DocumentTarget::UserKey {
+                    realm_id: user_id.realm_id,
                     user_id,
                     record_id: sid(7),
                 },
@@ -1303,10 +1305,12 @@ mod pure_tests {
         // Every vault and key record of a user rides one shard, so one holder set serves them.
         let user_id = UserId::local(sid(8), RealmId::from_bytes([4; 32]));
         let revision = DocumentTarget::VaultRevision {
+            realm_id: user_id.realm_id,
             user_id,
             revision_id: sid(1),
         };
         let key = DocumentTarget::UserKey {
+            realm_id: user_id.realm_id,
             user_id,
             record_id: sid(2),
         };

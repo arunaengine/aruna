@@ -43,8 +43,10 @@ impl KeyOperation {
                 | KeyAction::Publish(_)
                 | KeyAction::Writes(_)
         );
-        // Without the user row the account status is unknown, so the grant waits and retries.
-        if issues && values[7].1.is_none() {
+        // Without a local user row the account status is unknown, so the grant waits and retries.
+        // Users of another realm have no row here; their cutoff below still applies.
+        let local = self.recipient().realm_id == self.auth.realm_id;
+        if issues && local && values[7].1.is_none() {
             return Err(KeyError::Storage);
         }
         let bytes = |index: usize| values[index].1.as_deref().ok_or(KeyError::Missing);
@@ -68,7 +70,6 @@ impl KeyOperation {
         let mut holders = admin_users(
             realm.roles.values().chain(group.roles.values()),
             &group_admin_path(self.auth.realm_id, info.group_id),
-            self.auth.realm_id,
         );
         let admin = holders.contains(&self.auth.user_id);
         holders.insert(info.created_by);

@@ -448,7 +448,11 @@ impl RestartScanOperation {
         let report = resolve_holders(creator, &self.admins, &self.grants, &lookups, &self.copies);
         let mut bucket = self.current.take();
         if let Some(bucket) = bucket.as_mut() {
-            bucket.holders = report.holders.iter().map(|holder| holder.user_id).collect();
+            // Only local holders have an inbox to tell.
+            let holders = report.holders.iter().map(|holder| holder.user_id);
+            bucket.holders = holders
+                .filter(|user| user.realm_id == self.realm_id)
+                .collect();
         }
         self.found.extend(bucket);
         self.next_bucket()

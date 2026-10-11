@@ -676,7 +676,7 @@ fn claim_mismatch_unregistered() {
     ));
 }
 
-mod received {
+pub(crate) mod received {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::s3::object::copy::sealed::{SealedCopyInput, SealedCopyOperation};
@@ -706,7 +706,7 @@ mod received {
         ));
     }
 
-    async fn fixture() -> (tempfile::TempDir, DriverContext, SealPlan, UserId) {
+    pub(crate) async fn fixture() -> (tempfile::TempDir, DriverContext, SealPlan, UserId) {
         let (temp, context) = full_context().await;
         let realm = RealmId([1; 32]);
         let user = UserId::local(Ulid::generate(), realm);
@@ -749,7 +749,7 @@ mod received {
         (temp, context, plan, user)
     }
 
-    async fn pending(
+    pub(crate) async fn pending(
         context: &DriverContext,
         plan: SealPlan,
         user: UserId,

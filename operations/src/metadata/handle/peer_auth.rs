@@ -226,7 +226,8 @@ where
                     auth.realm_id
                 )));
             }
-            if auth.user_id.realm_id != auth.realm_id {
+            // A user of another realm may sign in here; an anonymous one never.
+            if auth.user_id.realm_id != auth.realm_id && auth.user_id.is_nil() {
                 return Err(MetadataError::InvalidInput(format!(
                     "internal metadata auth user realm `{}` does not match token realm `{}`",
                     auth.user_id.realm_id, auth.realm_id

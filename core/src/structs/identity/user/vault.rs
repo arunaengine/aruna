@@ -7,6 +7,7 @@ use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, 
 use crate::errors::ConversionError;
 use crate::keyspaces::{VAULT_RETIRED_KEYSPACE, VAULT_REVISION_KEYSPACE};
 use crate::storage_entries::{shard_manifest_entry, sync_revision_entry};
+use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::PlacementRef;
 use crate::types::{Key, KeySpace, Value};
 use crate::vault_format::key_fingerprint;
@@ -26,6 +27,8 @@ pub const MAX_VAULT_HEADS: usize = 32;
 pub const MAX_KEY_RECORDS: usize = 64;
 /// Bytes a key id may hold.
 pub const KEY_ID_BYTES: usize = 128;
+/// Domain of the origin signature over a vault or key record.
+pub const VAULT_RECORD_DOMAIN: &str = "aruna-vault-record-v1";
 
 /// Why a vault or key record is not admissible.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -38,11 +41,20 @@ pub enum VaultRecordError {
     Fingerprint,
     #[error("a key id holds 1 to {KEY_ID_BYTES} bytes")]
     KeyId,
+    #[error("an anonymous user of another realm holds no vault")]
+    Owner,
+}
+
+/// Whether `user_id` is an anonymous identity of a realm other than `realm_id`.
+fn foreign_anonymous(user_id: UserId, realm_id: RealmId) -> bool {
+    user_id.is_nil() && user_id.realm_id != realm_id
 }
 
 /// One immutable save of a user's vault. `None` as payload records a delete.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultRevision {
+    /// The realm that stores the record; a user of another realm keeps a vault here too.
+    pub realm_id: RealmId,
     pub user_id: UserId,
     pub revision_id: Ulid,
     /// The heads this save replaces; a merge names every head it read.
@@ -52,11 +64,14 @@ pub struct VaultRevision {
     pub node_id: NodeId,
     pub placement: PlacementRef,
     pub created_at_ms: u64,
+    /// The publishing node's signature over [`VaultRevision::signing_bytes`].
+    pub signature: Option<iroh::Signature>,
 }
 
 /// One published public key of a user, readable by every realm node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserKeyRecord {
+    pub realm_id: RealmId,
     pub user_id: UserId,
     pub record_id: Ulid,
     /// The id of the keypair in the vault `keys` slot.
@@ -68,6 +83,8 @@ pub struct UserKeyRecord {
     pub node_id: NodeId,
     pub placement: PlacementRef,
     pub created_at_ms: u64,
+    /// The publishing node's signature over [`UserKeyRecord::signing_bytes`].
+    pub signature: Option<iroh::Signature>,
 }
 
 /// Shows the payload size only, so no formatted message carries vault ciphertext.
@@ -75,6 +92,7 @@ impl std::fmt::Debug for VaultRevision {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("VaultRevision")
+            .field("realm_id", &self.realm_id)
             .field("user_id", &self.user_id)
             .field("revision_id", &self.revision_id)
             .field("predecessors", &self.predecessors)
@@ -87,6 +105,7 @@ impl std::fmt::Debug for VaultRevision {
 impl VaultRevision {
     pub fn target(&self) -> DocumentTarget {
         DocumentTarget::VaultRevision {
+            realm_id: self.realm_id,
             user_id: self.user_id,
             revision_id: self.revision_id,
         }
@@ -99,6 +118,9 @@ impl VaultRevision {
             .is_some_and(|payload| payload.len() > MAX_VAULT_BYTES)
         {
             return Err(VaultRecordError::TooLarge);
+        }
+        if foreign_anonymous(self.user_id, self.realm_id) {
+            return Err(VaultRecordError::Owner);
         }
         let mut seen = self.predecessors.clone();
         seen.sort_unstable();
@@ -121,6 +143,23 @@ impl VaultRevision {
         )
     }
 
+    /// Bytes the publishing node signs: the whole record without its signature.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        let unsigned = Self {
+            signature: None,
+            ..self.clone()
+        };
+        Ok(postcard::to_allocvec(&(VAULT_RECORD_DOMAIN, unsigned))?)
+    }
+
+    /// Whether the node named in the record signed it.
+    pub fn origin_signed(&self) -> bool {
+        self.signature.is_some_and(|signature| {
+            self.signing_bytes()
+                .is_ok_and(|bytes| self.node_id.verify(&bytes, &signature).is_ok())
+        })
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
@@ -133,6 +172,7 @@ impl VaultRevision {
 impl UserKeyRecord {
     pub fn target(&self) -> DocumentTarget {
         DocumentTarget::UserKey {
+            realm_id: self.realm_id,
             user_id: self.user_id,
             record_id: self.record_id,
         }
@@ -141,6 +181,9 @@ impl UserKeyRecord {
     pub fn validate(&self) -> Result<(), VaultRecordError> {
         if key_fingerprint(&self.public_key) != self.fingerprint {
             return Err(VaultRecordError::Fingerprint);
+        }
+        if foreign_anonymous(self.user_id, self.realm_id) {
+            return Err(VaultRecordError::Owner);
         }
         if self.key_id.is_empty() || self.key_id.len() > KEY_ID_BYTES {
             return Err(VaultRecordError::KeyId);
@@ -155,6 +198,23 @@ impl UserKeyRecord {
             self.created_at_ms,
             self.placement,
         )
+    }
+
+    /// Bytes the publishing node signs: the whole record without its signature.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        let unsigned = Self {
+            signature: None,
+            ..self.clone()
+        };
+        Ok(postcard::to_allocvec(&(VAULT_RECORD_DOMAIN, unsigned))?)
+    }
+
+    /// Whether the node named in the record signed it.
+    pub fn origin_signed(&self) -> bool {
+        self.signature.is_some_and(|signature| {
+            self.signing_bytes()
+                .is_ok_and(|bytes| self.node_id.verify(&bytes, &signature).is_ok())
+        })
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -277,6 +337,7 @@ mod tests {
 
     fn revision(id: u8, predecessors: &[u8]) -> VaultRevision {
         VaultRevision {
+            realm_id: user().realm_id,
             user_id: user(),
             revision_id: Ulid::from_bytes([id; 16]),
             predecessors: predecessors
@@ -287,6 +348,7 @@ mod tests {
             node_id: node(),
             placement: PlacementRef::NIL,
             created_at_ms: 1,
+            signature: None,
         }
     }
 
@@ -344,9 +406,39 @@ mod tests {
     }
 
     #[test]
+    fn checks_origin_signature() {
+        // Only the named node's signature over the unchanged record verifies.
+        let mut record = revision(1, &[]);
+        assert!(!record.origin_signed());
+        let bytes = record.signing_bytes().unwrap();
+        record.signature = Some(iroh::SecretKey::from_bytes(&[5; 32]).sign(&bytes));
+        assert!(record.origin_signed());
+        let mut moved = record.clone();
+        moved.realm_id = RealmId::from_bytes([4; 32]);
+        assert!(!moved.origin_signed());
+        let mut forged = record.clone();
+        forged.signature = Some(iroh::SecretKey::from_bytes(&[6; 32]).sign(&bytes));
+        assert!(!forged.origin_signed());
+        let decoded = VaultRevision::from_bytes(&record.to_bytes().unwrap()).unwrap();
+        assert!(decoded.origin_signed());
+    }
+
+    #[test]
+    fn refuses_foreign_anonymous() {
+        // A user of another realm keeps a vault here; an anonymous one of another realm does not.
+        let foreign = RealmId::from_bytes([4; 32]);
+        let mut record = revision(1, &[]);
+        record.user_id = UserId::new(Ulid::from_bytes([3; 16]), foreign);
+        assert_eq!(record.validate(), Ok(()));
+        record.user_id = UserId::nil(foreign);
+        assert_eq!(record.validate(), Err(VaultRecordError::Owner));
+    }
+
+    #[test]
     fn checks_key_fingerprint() {
         let public_key = [9u8; 32];
         let mut record = UserKeyRecord {
+            realm_id: user().realm_id,
             user_id: user(),
             record_id: Ulid::from_bytes([1; 16]),
             key_id: "key-1".to_string(),
@@ -356,6 +448,7 @@ mod tests {
             node_id: node(),
             placement: PlacementRef::NIL,
             created_at_ms: 1,
+            signature: None,
         };
         assert_eq!(record.validate(), Ok(()));
         record.fingerprint[0] ^= 1;

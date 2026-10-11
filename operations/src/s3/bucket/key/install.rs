@@ -730,6 +730,7 @@ mod tests {
         .unwrap();
         let holder = SecretBytes::new(vec![6; 32]);
         let record = aruna_core::structs::identity::user::vault::UserKeyRecord {
+            realm_id: creator.realm_id,
             user_id: creator,
             record_id: Ulid::from_bytes([7; 16]),
             key_id: "slot".to_string(),
@@ -741,6 +742,7 @@ mod tests {
             node_id: net.node_id(),
             placement: aruna_core::structs::placement::record::PlacementRef::NIL,
             created_at_ms: 1,
+            signature: None,
         };
         let enabled = drive(
             EnableEncryptionOperation::new(EnableInput {

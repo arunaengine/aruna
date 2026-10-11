@@ -1052,6 +1052,51 @@ fn rejects_foreign_placement() {
 }
 
 #[test]
+fn foreign_submitter_cancels() {
+    // A submitter of another realm cancels its own job; an anonymous identity never.
+    let view = LocalView::new();
+    let mut spec = sample_spec();
+    spec.created_by = user(9, 2);
+    let spec = spec.store_digest().unwrap();
+    let checked = JobRecordContext {
+        spec: Some(&spec),
+        ..view.context()
+    };
+    let mut cancel = sample_cancel();
+    cancel.spec_digest = spec.spec_digest;
+    cancel.requested_by = user(9, 2);
+    assert_eq!(
+        envelope(JobFamilyRecord::Cancel(cancel), 1).verify(&checked),
+        Ok(RecordVerdict::Authentic)
+    );
+    cancel.requested_by = UserId::nil(RealmId([9u8; 32]));
+    cancel.authority = CancelAuthority::GroupAdmin;
+    assert_eq!(
+        envelope(JobFamilyRecord::Cancel(cancel), 1).verify(&checked),
+        Err(JobRecordError::Unauthorized)
+    );
+}
+
+#[test]
+fn keeps_foreign_submitter() {
+    // A user of another realm signed in here may submit; an anonymous one of another realm not.
+    let view = LocalView::new();
+    for (created_by, verdict) in [
+        (user(9, 2), Ok(RecordVerdict::Authentic)),
+        (
+            UserId::nil(RealmId([9u8; 32])),
+            Err(JobRecordError::Unauthorized),
+        ),
+    ] {
+        let mut spec = sample_spec();
+        spec.created_by = created_by;
+        let spec = spec.store_digest().unwrap();
+        let signed = envelope(JobFamilyRecord::Spec(Box::new(spec)), 1);
+        assert_eq!(signed.verify(&view.context()), verdict);
+    }
+}
+
+#[test]
 fn binds_receipt_launch() {
     let view = LocalView::new();
     let launch = sample_launch();
@@ -1126,10 +1171,11 @@ fn cancel_needs_spec() {
         envelope(JobFamilyRecord::Cancel(stranger), 1).verify(&checked),
         Ok(RecordVerdict::Authentic)
     );
+    // The holder's signature vouches for a group admin of another realm as well.
     stranger.requested_by = user(9, 5);
     assert_eq!(
         envelope(JobFamilyRecord::Cancel(stranger), 1).verify(&checked),
-        Err(JobRecordError::Unauthorized)
+        Ok(RecordVerdict::Authentic)
     );
     let mut replayed = sample_cancel();
     replayed.spec_digest = [1u8; 32];

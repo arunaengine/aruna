@@ -400,7 +400,7 @@ async fn admit_here(
         .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
     let job_id = mint_local_job(
         context,
-        request.created_by.realm_id,
+        config.realm_id,
         local,
         Some(&identity.submission_id.0),
     )
@@ -735,12 +735,16 @@ async fn admit_forwarded(
         })?;
     // The forwarded request keeps its own submitter: a relay may not re-attribute
     // a plan to another caller, and the identity is recomputed from that caller.
-    if auth.user_id != request.created_by || auth.realm_id != request.created_by.realm_id {
+    if auth.user_id != request.created_by {
         return Err(SubmissionRefusal::Unauthorized);
     }
     let (config, local) = local_view(context)
         .await
         .map_err(|_| SubmissionRefusal::Unavailable)?;
+    // The submitter may belong to another realm, but must be signed in to this one.
+    if auth.realm_id != config.realm_id {
+        return Err(SubmissionRefusal::Unauthorized);
+    }
     // A user device is owner-bound: whatever token it presents, the submission it
     // forwards must be its owner's own.
     if !peer_acts_for(&config, peer, auth.user_id) {

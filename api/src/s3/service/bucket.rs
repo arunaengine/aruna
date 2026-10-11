@@ -56,7 +56,7 @@ impl ArunaS3Service {
             self.realm_id,
             &AuthContext {
                 user_id: user_access.user_identity,
-                realm_id: user_access.user_identity.realm_id,
+                realm_id: self.realm_id,
                 path_restrictions: None,
                 session: None,
             },
@@ -74,9 +74,11 @@ impl ArunaS3Service {
             // A member whose roles reach only a folder inside this bucket still
             // owns the bucket holding it, so it stays visible.
             Err(AuthorizeError::PermissionDenied) => {
-                Ok(!resolve_scope(&self.state, user_access, &bucket_path)
-                    .await?
-                    .is_empty())
+                Ok(
+                    !resolve_scope(&self.state, self.realm_id, user_access, &bucket_path)
+                        .await?
+                        .is_empty(),
+                )
             }
             Err(_) => Ok(false),
         }
@@ -311,7 +313,7 @@ impl ArunaS3Service {
                 self.realm_id,
                 &AuthContext {
                     user_id: user_access.user_identity,
-                    realm_id: user_access.user_identity.realm_id,
+                    realm_id: self.realm_id,
                     path_restrictions: user_access.path_restrictions.clone(),
                     session: None,
                 },

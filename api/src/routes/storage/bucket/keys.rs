@@ -284,7 +284,7 @@ fn status_view(status: &UnlockStatus) -> UnlockView {
         (status = 200, description = "The unlock state", body = UnlockView, example = json!({ "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": 1790003600000_u64, "max_deadline_ms": 1790007200000_u64 })),
         (status = 400, description = "`wrong_key` or `invalid_duration`", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller holds no key of this bucket, or is a federated user (code `foreign_encryption_keys_unsupported`)", body = ErrorResponse),
+        (status = 403, description = "The caller holds no key of this bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "`stale_generation`, `not_encrypted`, or `no_copy` when the caller has no sealed copy of the generation", body = ErrorResponse),
         (status = 503, description = "`unlock_capacity`: no room for another unlocked key", body = ErrorResponse)
@@ -300,7 +300,6 @@ pub async fn unlock_bucket(
 ) -> ServerResult<Json<UnlockView>> {
     let private_key = unlock_key(body)?;
     let auth = require_unrestricted_auth(&state, auth)?;
-    crate::routes::storage::abe::refuse_foreign_keys(&auth)?;
     let bucket_id = parse_ulid(&query.bucket_id, "bucket_id")?;
     let group_id = bucket_group(&state, &bucket).await?;
     let input = UnlockInput {
@@ -356,7 +355,13 @@ async fn seal_missing(state: &ServerState, bucket: &str, group_id: GroupId, key:
         .chain(snapshot.admins.iter().copied())
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(&state.get_ctx(), state.get_node_id(), users).await;
+    let lookups = lookup_keys(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        users,
+    )
+    .await;
     let input = SealMissingInput {
         bucket: bucket.to_string(),
         group_id,
@@ -391,7 +396,7 @@ async fn seal_missing(state: &ServerState, bucket: &str, group_id: GroupId, key:
         (status = 200, description = "The unlock state", body = UnlockView, example = json!({ "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": 1790003600000_u64, "max_deadline_ms": 1790007200000_u64 })),
         (status = 400, description = "`invalid_duration` or an invalid session id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller holds no key of this bucket, or is a federated user (code `foreign_encryption_keys_unsupported`)", body = ErrorResponse),
+        (status = 403, description = "The caller holds no key of this bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "`session_mismatch`, `bucket_locked` or `not_encrypted`", body = ErrorResponse)
     ),
@@ -404,7 +409,6 @@ pub async fn extend_unlock(
     Json(request): Json<ExtendRequest>,
 ) -> ServerResult<Json<UnlockView>> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    crate::routes::storage::abe::refuse_foreign_keys(&auth)?;
     let session_id = parse_ulid(&request.session_id, "session_id")?;
     let group_id = bucket_group(&state, &bucket).await?;
     let input = ExtendInput {
@@ -554,7 +558,7 @@ group's admin path.
         (status = 200, description = "The new holder", body = HolderView, example = json!({ "user_id": "01JAMXS1P3T9V6Q8W2Y4Z7B5CD@realm", "name": null, "origin": "explicit", "state": "ready", "has_recovery": true, "granted_by": "01JAMXS1P3T9V6Q8W2Y4Z7B5CE@realm", "granted_at_ms": 1790000000000_u64 })),
         (status = 400, description = "Invalid user id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "No WRITE on the group admin path, or the user belongs to another realm (code `foreign_encryption_keys_unsupported`)", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "`not_encrypted`", body = ErrorResponse)
     ),
@@ -568,14 +572,19 @@ pub async fn grant_holder(
 ) -> ServerResult<Json<HolderView>> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let user_id = parse_user(&request.user_id)?;
-    if user_id.realm_id != state.get_realm_id() {
-        return Err(crate::routes::storage::abe::foreign_keys(
-            aruna_operations::abe::KeyError::Foreign.to_string(),
-        ));
+    // Anonymous identities of any realm never hold a key.
+    if user_id.is_nil() {
+        return Err(ServerError::BadRequestReason("invalid user".into()));
     }
     let group_id = bucket_group(&state, &bucket).await?;
     ensure_group_admin(&state, &auth, group_id).await?;
-    let mut lookups = lookup_keys(&state.get_ctx(), state.get_node_id(), [user_id]).await;
+    let mut lookups = lookup_keys(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        [user_id],
+    )
+    .await;
     let lookup = lookups.remove(&user_id).unwrap_or(KeyLookup::Unavailable);
     let has_recovery = match &lookup {
         KeyLookup::Keys(keys) => Some(keys.iter().any(|key| key.has_recovery)),
@@ -664,7 +673,13 @@ pub async fn remove_holder(
         .chain(snapshot.admins.iter().copied())
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(&state.get_ctx(), state.get_node_id(), users).await;
+    let lookups = lookup_keys(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        users,
+    )
+    .await;
     let input = RemovalInput {
         bucket,
         group_id,
