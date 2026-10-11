@@ -107,11 +107,14 @@ pub enum DocumentTarget {
     },
     /// One immutable save of a user's vault, placed by the user id.
     VaultRevision {
+        /// The realm that stores the record, which may differ from the user's home realm.
+        realm_id: RealmId,
         user_id: UserId,
         revision_id: Ulid,
     },
     /// One public key record of a user, placed with the user's vault.
     UserKey {
+        realm_id: RealmId,
         user_id: UserId,
         record_id: Ulid,
     },
@@ -402,9 +405,10 @@ impl DocumentTarget {
             Self::RealmAuthorization { realm_id } | Self::RealmConfig { realm_id } => {
                 TopicId::realm(*realm_id)
             }
-            Self::User { user_id }
-            | Self::VaultRevision { user_id, .. }
-            | Self::UserKey { user_id, .. } => TopicId::users(user_id.realm_id),
+            Self::User { user_id } => TopicId::users(user_id.realm_id),
+            Self::VaultRevision { realm_id, .. } | Self::UserKey { realm_id, .. } => {
+                TopicId::users(*realm_id)
+            }
             Self::MetadataRegistry { document_id, .. }
             | Self::MetadataCreateEvent { document_id, .. }
             | Self::GitRecord { document_id, .. }
@@ -503,8 +507,11 @@ impl DocumentTarget {
             Self::VaultRevision {
                 user_id,
                 revision_id,
+                ..
             } => user_record_key(*user_id, *revision_id),
-            Self::UserKey { user_id, record_id } => user_record_key(*user_id, *record_id),
+            Self::UserKey {
+                user_id, record_id, ..
+            } => user_record_key(*user_id, *record_id),
         }
     }
 

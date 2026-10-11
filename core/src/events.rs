@@ -369,6 +369,7 @@ pub enum NetEvent {
     LaunchOffer(LaunchOfferEvent),
     PolicySign(PolicySignEvent),
     VaultFetch(VaultFetchEvent),
+    VaultSign(VaultSignEvent),
     Error(NetError),
 }
 
@@ -392,6 +393,14 @@ pub enum PolicyFetchEvent {
     /// Every reached holder answered without the document.
     NotFound,
     /// No holder answered, so the miss is an availability hint, never a denial.
+    Unavailable(String),
+}
+
+/// Reply to a [`crate::effects::NetEffect::VaultSign`]: the same records, signed. The
+/// adapter signs only records naming this node, so no operation can mint another origin.
+#[derive(Debug, PartialEq)]
+pub enum VaultSignEvent {
+    Signed(Box<VaultRecords>),
     Unavailable(String),
 }
 

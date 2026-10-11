@@ -364,7 +364,7 @@ pub async fn check_recovery(
         .chain(snapshot.admins.iter().copied())
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect();
-    let lookups = lookup_keys(context, node_id, users).await;
+    let lookups = lookup_keys(context, realm_id, node_id, users).await;
     let input = RecoveryInput {
         bucket: bucket.to_string(),
         group_id,

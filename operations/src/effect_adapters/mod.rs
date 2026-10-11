@@ -80,6 +80,9 @@ pub(crate) async fn dispatch_effect_until(
         Effect::Net(NetEffect::VaultFetch(fetch)) => Event::Net(NetEvent::VaultFetch(
             Box::pin(crate::users::vault_route::fetch_vault(context, *fetch)).await,
         )),
+        Effect::Net(NetEffect::VaultSign(records)) => Event::Net(NetEvent::VaultSign(
+            crate::users::vault_route::sign_records(context, *records),
+        )),
         // Job-record replication and launch offers resolve their holders in the
         // operation and run only the holder round-trips here.
         Effect::Net(NetEffect::JobRecord(record)) => Event::Net(NetEvent::JobRecord(

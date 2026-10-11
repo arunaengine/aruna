@@ -7,6 +7,7 @@ use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, 
 use crate::errors::ConversionError;
 use crate::keyspaces::{VAULT_RETIRED_KEYSPACE, VAULT_REVISION_KEYSPACE};
 use crate::storage_entries::{shard_manifest_entry, sync_revision_entry};
+use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::PlacementRef;
 use crate::types::{Key, KeySpace, Value};
 use crate::vault_format::key_fingerprint;
@@ -26,6 +27,8 @@ pub const MAX_VAULT_HEADS: usize = 32;
 pub const MAX_KEY_RECORDS: usize = 64;
 /// Bytes a key id may hold.
 pub const KEY_ID_BYTES: usize = 128;
+/// Domain of the origin signature over a vault or key record.
+pub const VAULT_RECORD_DOMAIN: &str = "aruna-vault-record-v1";
 
 /// Why a vault or key record is not admissible.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -43,6 +46,8 @@ pub enum VaultRecordError {
 /// One immutable save of a user's vault. `None` as payload records a delete.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultRevision {
+    /// The realm that stores the record; a user of another realm keeps a vault here too.
+    pub realm_id: RealmId,
     pub user_id: UserId,
     pub revision_id: Ulid,
     /// The heads this save replaces; a merge names every head it read.
@@ -52,11 +57,14 @@ pub struct VaultRevision {
     pub node_id: NodeId,
     pub placement: PlacementRef,
     pub created_at_ms: u64,
+    /// The publishing node's signature over [`VaultRevision::signing_bytes`].
+    pub signature: Option<iroh::Signature>,
 }
 
 /// One published public key of a user, readable by every realm node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserKeyRecord {
+    pub realm_id: RealmId,
     pub user_id: UserId,
     pub record_id: Ulid,
     /// The id of the keypair in the vault `keys` slot.
@@ -68,6 +76,8 @@ pub struct UserKeyRecord {
     pub node_id: NodeId,
     pub placement: PlacementRef,
     pub created_at_ms: u64,
+    /// The publishing node's signature over [`UserKeyRecord::signing_bytes`].
+    pub signature: Option<iroh::Signature>,
 }
 
 /// Shows the payload size only, so no formatted message carries vault ciphertext.
@@ -75,6 +85,7 @@ impl std::fmt::Debug for VaultRevision {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("VaultRevision")
+            .field("realm_id", &self.realm_id)
             .field("user_id", &self.user_id)
             .field("revision_id", &self.revision_id)
             .field("predecessors", &self.predecessors)
@@ -87,6 +98,7 @@ impl std::fmt::Debug for VaultRevision {
 impl VaultRevision {
     pub fn target(&self) -> DocumentTarget {
         DocumentTarget::VaultRevision {
+            realm_id: self.realm_id,
             user_id: self.user_id,
             revision_id: self.revision_id,
         }
@@ -121,6 +133,23 @@ impl VaultRevision {
         )
     }
 
+    /// Bytes the publishing node signs: the whole record without its signature.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        let unsigned = Self {
+            signature: None,
+            ..self.clone()
+        };
+        Ok(postcard::to_allocvec(&(VAULT_RECORD_DOMAIN, unsigned))?)
+    }
+
+    /// Whether the node named in the record signed it.
+    pub fn origin_signed(&self) -> bool {
+        self.signature.is_some_and(|signature| {
+            self.signing_bytes()
+                .is_ok_and(|bytes| self.node_id.verify(&bytes, &signature).is_ok())
+        })
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
@@ -133,6 +162,7 @@ impl VaultRevision {
 impl UserKeyRecord {
     pub fn target(&self) -> DocumentTarget {
         DocumentTarget::UserKey {
+            realm_id: self.realm_id,
             user_id: self.user_id,
             record_id: self.record_id,
         }
@@ -155,6 +185,23 @@ impl UserKeyRecord {
             self.created_at_ms,
             self.placement,
         )
+    }
+
+    /// Bytes the publishing node signs: the whole record without its signature.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        let unsigned = Self {
+            signature: None,
+            ..self.clone()
+        };
+        Ok(postcard::to_allocvec(&(VAULT_RECORD_DOMAIN, unsigned))?)
+    }
+
+    /// Whether the node named in the record signed it.
+    pub fn origin_signed(&self) -> bool {
+        self.signature.is_some_and(|signature| {
+            self.signing_bytes()
+                .is_ok_and(|bytes| self.node_id.verify(&bytes, &signature).is_ok())
+        })
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {

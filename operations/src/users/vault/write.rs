@@ -4,14 +4,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{Event, NetEvent, StorageEvent, VaultSignEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::vault::{
     MAX_KEY_RECORDS, MAX_PREDECESSORS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecordError,
-    VaultRevision, head_rows, record_rows, user_record_prefix,
+    VaultRecords, VaultRevision, head_rows, record_rows, user_record_prefix,
 };
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::TaskEvent;
@@ -80,6 +80,8 @@ pub(super) fn event_label(event: &Event) -> &'static str {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppendVaultConfig {
     pub node_id: NodeId,
+    /// The realm that stores the vault: the serving realm, also for a user of another realm.
+    pub realm_id: RealmId,
     pub user_id: UserId,
     /// Chosen where the request arrived, so a forwarded change keeps its id.
     pub record_id: Ulid,
@@ -115,6 +117,8 @@ pub enum AppendVaultError {
     PlacementFenced,
     #[error("the user has published the most key records allowed")]
     TooManyKeys,
+    #[error("vault record not signed: {0}")]
+    Unsigned(String),
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: expected {expected}, got {got}")]
@@ -132,6 +136,44 @@ struct Planned {
     generation: u64,
 }
 
+/// Records built in the transaction, waiting for this node's signature. `heads` are the
+/// other current heads a save keeps.
+#[derive(Debug, Clone, PartialEq)]
+struct Unsigned {
+    planned: Box<Planned>,
+    records: VaultRecords,
+    heads: Vec<VaultRevision>,
+}
+
+/// Whether `signed` is `unsigned` with signatures added.
+fn same_records(unsigned: &VaultRecords, signed: &VaultRecords) -> bool {
+    match (unsigned, signed) {
+        (VaultRecords::Heads(left), VaultRecords::Heads(right)) => {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(left, right)| {
+                    right.signature.is_some()
+                        && *left
+                            == VaultRevision {
+                                signature: None,
+                                ..right.clone()
+                            }
+                })
+        }
+        (VaultRecords::Keys(left), VaultRecords::Keys(right)) => {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(left, right)| {
+                    right.signature.is_some()
+                        && *left
+                            == UserKeyRecord {
+                                signature: None,
+                                ..right.clone()
+                            }
+                })
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum AppendState {
     Init,
@@ -139,6 +181,7 @@ enum AppendState {
     ReadConfig,
     ReadFence(Box<Planned>),
     ReadRows(Box<Planned>),
+    Sign(Box<Unsigned>),
     Delete(Vec<(KeySpace, Key, Value)>),
     Write,
     Commit,
@@ -155,6 +198,7 @@ impl AppendState {
             Self::ReadConfig => "read config",
             Self::ReadFence(_) => "read fence",
             Self::ReadRows(_) => "read rows",
+            Self::Sign(_) => "sign",
             Self::Delete(_) => "delete retired heads",
             Self::Write => "write",
             Self::Commit => "commit",
@@ -193,11 +237,19 @@ impl AppendVaultOperation {
 
     fn target(&self) -> DocumentTarget {
         let AppendVaultConfig {
-            user_id, record_id, ..
+            realm_id,
+            user_id,
+            record_id,
+            ..
         } = self.config;
         match self.config.change {
-            VaultChange::PublishKey { .. } => DocumentTarget::UserKey { user_id, record_id },
+            VaultChange::PublishKey { .. } => DocumentTarget::UserKey {
+                realm_id,
+                user_id,
+                record_id,
+            },
             VaultChange::Save { .. } | VaultChange::Delete => DocumentTarget::VaultRevision {
+                realm_id,
                 user_id,
                 revision_id: record_id,
             },
@@ -228,7 +280,7 @@ impl AppendVaultOperation {
         if planned.generation == 0 {
             return self.read_rows(planned, None);
         }
-        let (key_space, key) = fence::fence_read(&self.config.user_id.realm_id, &planned.placement);
+        let (key_space, key) = fence::fence_read(&self.config.realm_id, &planned.placement);
         let txn_id = Some(self.txn()?);
         self.state = AppendState::ReadFence(planned);
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
@@ -258,20 +310,21 @@ impl AppendVaultOperation {
         })])
     }
 
-    /// Builds the record from the rows read in this transaction and emits its writes.
+    /// Builds the record from the rows read in this transaction and asks for its signature.
     fn append(
         &mut self,
-        planned: &Planned,
+        planned: Box<Planned>,
         rows: Vec<(Key, Value)>,
     ) -> Result<Effects, AppendVaultError> {
         let AppendVaultConfig {
             node_id,
+            realm_id,
             user_id,
             record_id,
             now_ms,
             ..
         } = self.config;
-        let (rows, deletes, output, bytes, change) = match self.config.change.clone() {
+        match self.config.change.clone() {
             VaultChange::PublishKey {
                 key_id,
                 public_key,
@@ -281,6 +334,7 @@ impl AppendVaultOperation {
                     return Err(AppendVaultError::TooManyKeys);
                 }
                 let record = UserKeyRecord {
+                    realm_id,
                     user_id,
                     record_id,
                     key_id,
@@ -290,12 +344,10 @@ impl AppendVaultOperation {
                     node_id,
                     placement: planned.placement,
                     created_at_ms: now_ms,
+                    signature: None,
                 };
                 record.validate()?;
-                let (bytes, change) = (record.to_bytes()?, record.sync_change());
-                let rows = record_rows(&record.target(), &bytes, &change)?;
-                let output = VaultAppended::Key(Box::new(record));
-                (rows, Vec::new(), output, bytes, change)
+                self.sign(planned, VaultRecords::Keys(vec![record]), Vec::new())
             }
             VaultChange::Save {
                 payload,
@@ -306,6 +358,7 @@ impl AppendVaultOperation {
                     .map(|(_, value)| VaultRevision::from_bytes(value))
                     .collect::<Result<Vec<_>, _>>()?;
                 let record = VaultRevision {
+                    realm_id,
                     user_id,
                     revision_id: record_id,
                     predecessors,
@@ -313,34 +366,18 @@ impl AppendVaultOperation {
                     node_id,
                     placement: planned.placement,
                     created_at_ms: now_ms,
+                    signature: None,
                 };
                 record.validate()?;
-                let (bytes, change) = (record.to_bytes()?, record.sync_change());
-                let (rows, deletes) = head_rows(&record, &bytes)?;
                 heads.retain(|head| !record.predecessors.contains(&head.revision_id));
-                heads.push(record);
-                heads.sort_by_key(|head| head.revision_id);
-                (rows, deletes, VaultAppended::Heads(heads), bytes, change)
+                self.sign(planned, VaultRecords::Heads(vec![record]), heads)
             }
-            VaultChange::Delete => return self.delete_heads(planned),
-        };
-        let mut writes = rows;
-        let target = self.target();
-        let outbox = new_outbox_record(
-            node_id,
-            target,
-            planned.holders.clone(),
-            DocumentOutboxEvent::Upsert { bytes, change },
-            planned.placement,
-            false,
-        )
-        .fenced_at(planned.generation);
-        writes.push(outbox_write_entry(&outbox).map_err(ConversionError::from)?);
-        self.output = Some(Ok(output));
-        self.write_rows(writes, deletes)
+            VaultChange::Delete => self.delete_heads(planned),
+        }
     }
 
-    fn delete_heads(&mut self, planned: &Planned) -> Result<Effects, AppendVaultError> {
+    /// Chains delete markers so each names at most `MAX_PREDECESSORS` heads.
+    fn delete_heads(&mut self, planned: Box<Planned>) -> Result<Effects, AppendVaultError> {
         if !self.delete_live {
             self.output = Some(Ok(VaultAppended::Heads(std::mem::take(
                 &mut self.delete_markers,
@@ -352,13 +389,13 @@ impl AppendVaultOperation {
             .into_iter()
             .peekable();
         let mut previous = None;
-        let mut writes = Vec::new();
-        let mut deletes = Vec::new();
+        let mut records = Vec::new();
         loop {
             let mut predecessors: Vec<_> = previous.into_iter().collect();
             predecessors.extend(heads.by_ref().take(MAX_PREDECESSORS - predecessors.len()));
             let final_head = heads.peek().is_none();
             let record = VaultRevision {
+                realm_id: self.config.realm_id,
                 user_id: self.config.user_id,
                 revision_id: if final_head {
                     self.config.record_id
@@ -370,34 +407,102 @@ impl AppendVaultOperation {
                 node_id: self.config.node_id,
                 placement: planned.placement,
                 created_at_ms: self.config.now_ms,
+                signature: None,
             };
             record.validate()?;
-            let bytes = record.to_bytes()?;
-            let change = record.sync_change();
-            let (mut rows, retired) = head_rows(&record, &bytes)?;
-            if !final_head {
-                rows.retain(|(key_space, _, _)| {
-                    key_space != aruna_core::keyspaces::VAULT_REVISION_KEYSPACE
-                });
+            previous = Some(record.revision_id);
+            records.push(record);
+            if final_head {
+                return self.sign(planned, VaultRecords::Heads(records), Vec::new());
             }
-            writes.extend(rows);
-            deletes.extend(retired);
-            let outbox = new_outbox_record(
+        }
+    }
+
+    fn sign(
+        &mut self,
+        planned: Box<Planned>,
+        records: VaultRecords,
+        heads: Vec<VaultRevision>,
+    ) -> Result<Effects, AppendVaultError> {
+        let effect = Effect::Net(NetEffect::VaultSign(Box::new(records.clone())));
+        self.state = AppendState::Sign(Box::new(Unsigned {
+            planned,
+            records,
+            heads,
+        }));
+        Ok(smallvec![effect])
+    }
+
+    /// Emits the rows and outbox entries of the signed records. The adapter may only add
+    /// signatures, so any other difference fails the write.
+    fn write_signed(
+        &mut self,
+        unsigned: Unsigned,
+        signed: VaultRecords,
+    ) -> Result<Effects, AppendVaultError> {
+        let Unsigned {
+            planned,
+            records,
+            mut heads,
+        } = unsigned;
+        if !same_records(&records, &signed) {
+            return Err(AppendVaultError::Unsigned(
+                "the signed records differ".to_string(),
+            ));
+        }
+        let mut writes = Vec::new();
+        let mut deletes = Vec::new();
+        let outbox = |target, bytes, change| -> Result<(KeySpace, Key, Value), AppendVaultError> {
+            let record = new_outbox_record(
                 self.config.node_id,
-                record.target(),
+                target,
                 planned.holders.clone(),
                 DocumentOutboxEvent::Upsert { bytes, change },
                 planned.placement,
                 false,
             )
             .fenced_at(planned.generation);
-            writes.push(outbox_write_entry(&outbox).map_err(ConversionError::from)?);
-            if final_head {
-                self.output = Some(Ok(VaultAppended::Heads(vec![record])));
-                return self.write_rows(writes, deletes);
+            Ok(outbox_write_entry(&record).map_err(ConversionError::from)?)
+        };
+        let output = match signed {
+            VaultRecords::Keys(keys) => {
+                let [record] = <[UserKeyRecord; 1]>::try_from(keys)
+                    .map_err(|_| AppendVaultError::Unsigned("one key record".to_string()))?;
+                let (bytes, change) = (record.to_bytes()?, record.sync_change());
+                let rows = record_rows(&record.target(), &bytes, &change)?;
+                writes.extend(rows);
+                writes.push(outbox(record.target(), bytes, change)?);
+                VaultAppended::Key(Box::new(record))
             }
-            previous = Some(record.revision_id);
-        }
+            VaultRecords::Heads(records) => {
+                let last = records.len().saturating_sub(1);
+                let mut newest = None;
+                for (index, record) in records.into_iter().enumerate() {
+                    let (bytes, change) = (record.to_bytes()?, record.sync_change());
+                    let (mut rows, retired) = head_rows(&record, &bytes)?;
+                    // A delete chain keeps only its final marker as a head.
+                    if index != last {
+                        rows.retain(|(key_space, _, _)| {
+                            key_space != aruna_core::keyspaces::VAULT_REVISION_KEYSPACE
+                        });
+                    }
+                    writes.extend(rows);
+                    writes.push(outbox(record.target(), bytes, change)?);
+                    deletes.extend(retired);
+                    newest = Some(record);
+                }
+                let record = newest.ok_or(AppendVaultError::Unsigned("no record".to_string()))?;
+                if matches!(self.config.change, VaultChange::Delete) {
+                    VaultAppended::Heads(vec![record])
+                } else {
+                    heads.push(record);
+                    heads.sort_by_key(|head| head.revision_id);
+                    VaultAppended::Heads(heads)
+                }
+            }
+        };
+        self.output = Some(Ok(output));
+        self.write_rows(writes, deletes)
     }
 
     fn write_rows(
@@ -435,7 +540,7 @@ impl AppendVaultOperation {
                 self.txn_id = Some(txn_id);
                 self.state = AppendState::ReadConfig;
                 let target = DocumentTarget::RealmConfig {
-                    realm_id: self.config.user_id.realm_id,
+                    realm_id: self.config.realm_id,
                 };
                 Ok(smallvec![Effect::Storage(StorageEffect::Read {
                     key_space: target.storage_keyspace().to_string(),
@@ -475,8 +580,12 @@ impl AppendVaultOperation {
                         return self.read_rows(planned, Some(start));
                     }
                 }
-                self.append(&planned, values)
+                self.append(planned, values)
             }
+            (AppendState::Sign(unsigned), Event::Net(NetEvent::VaultSign(event))) => match event {
+                VaultSignEvent::Signed(signed) => self.write_signed(*unsigned, *signed),
+                VaultSignEvent::Unavailable(reason) => Err(AppendVaultError::Unsigned(reason)),
+            },
             (
                 AppendState::Delete(writes),
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }),

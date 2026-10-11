@@ -54,6 +54,7 @@ pub async fn read_admins(
 /// a user without keys.
 pub async fn lookup_keys(
     context: &DriverContext,
+    realm_id: RealmId,
     node_id: NodeId,
     users: impl IntoIterator<Item = UserId>,
 ) -> BTreeMap<UserId, KeyLookup> {
@@ -61,6 +62,7 @@ pub async fn lookup_keys(
     for user_id in users {
         let config = ReadVaultConfig {
             node_id,
+            realm_id,
             user_id,
             query: VaultQuery::Keys,
             deadline: KEY_LOOKUP_DEADLINE,

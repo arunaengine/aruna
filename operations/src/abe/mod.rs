@@ -302,6 +302,7 @@ impl KeyOperation {
     fn read_keys(&mut self) -> Effects {
         let mut keys = ReadVaultOperation::new(ReadVaultConfig {
             node_id: self.node,
+            realm_id: self.auth.realm_id,
             user_id: self.recipient(),
             query: VaultQuery::Keys,
             deadline: std::time::Duration::from_secs(10),

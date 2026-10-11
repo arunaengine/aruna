@@ -13,7 +13,7 @@ use aruna_core::effects::{
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, StorageEvent, VaultFetchEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::vault::{
     MAX_KEY_RECORDS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecords, retain_newest_keys,
     user_record_prefix,
@@ -31,6 +31,8 @@ use crate::placement::{
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadVaultConfig {
     pub node_id: NodeId,
+    /// The realm that stores the vault: the serving realm, also for a user of another realm.
+    pub realm_id: RealmId,
     pub user_id: UserId,
     pub query: VaultQuery,
     pub deadline: Duration,
@@ -103,14 +105,18 @@ impl ReadVaultOperation {
     fn route(&mut self, value: Option<Value>) -> Result<Effects, ReadVaultError> {
         let config =
             RealmConfigDocument::from_bytes(&value.ok_or(ReadVaultError::RealmConfigMissing)?)?;
-        let user_id = self.config.user_id;
+        let ReadVaultConfig {
+            realm_id, user_id, ..
+        } = self.config;
         let target = if self.reads_heads() {
             DocumentTarget::VaultRevision {
+                realm_id,
                 user_id,
                 revision_id: Ulid::nil(),
             }
         } else {
             DocumentTarget::UserKey {
+                realm_id,
                 user_id,
                 record_id: Ulid::nil(),
             }
@@ -166,18 +172,26 @@ impl ReadVaultOperation {
         Ok(records)
     }
 
-    /// A fetched answer is accepted only for this user and this query.
+    /// A fetched answer is accepted only for this user, realm and query, signed by its origin.
     fn fetched(&self, event: VaultFetchEvent) -> Result<VaultRecords, ReadVaultError> {
-        let user_id = self.config.user_id;
+        let ReadVaultConfig {
+            realm_id, user_id, ..
+        } = self.config;
         match event {
             VaultFetchEvent::Fetched { records, .. } => {
                 let fits = match (&records, self.reads_heads()) {
-                    (VaultRecords::Heads(heads), true) => heads
-                        .iter()
-                        .all(|head| head.user_id == user_id && head.validate().is_ok()),
-                    (VaultRecords::Keys(keys), false) => keys
-                        .iter()
-                        .all(|key| key.user_id == user_id && key.validate().is_ok()),
+                    (VaultRecords::Heads(heads), true) => heads.iter().all(|head| {
+                        head.user_id == user_id
+                            && head.realm_id == realm_id
+                            && head.validate().is_ok()
+                            && head.origin_signed()
+                    }),
+                    (VaultRecords::Keys(keys), false) => keys.iter().all(|key| {
+                        key.user_id == user_id
+                            && key.realm_id == realm_id
+                            && key.validate().is_ok()
+                            && key.origin_signed()
+                    }),
                     _ => false,
                 };
                 if !fits || records.len() > MAX_KEY_RECORDS.max(MAX_VAULT_HEADS) {
@@ -210,7 +224,7 @@ impl Operation for ReadVaultOperation {
     fn start(&mut self) -> Effects {
         self.state = ReadState::ReadConfig;
         let target = DocumentTarget::RealmConfig {
-            realm_id: self.config.user_id.realm_id,
+            realm_id: self.config.realm_id,
         };
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: target.storage_keyspace().to_string(),

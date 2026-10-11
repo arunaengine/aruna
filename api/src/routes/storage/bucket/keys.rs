@@ -355,7 +355,13 @@ async fn seal_missing(state: &ServerState, bucket: &str, group_id: GroupId, key:
         .chain(snapshot.admins.iter().copied())
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(&state.get_ctx(), state.get_node_id(), users).await;
+    let lookups = lookup_keys(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        users,
+    )
+    .await;
     let input = SealMissingInput {
         bucket: bucket.to_string(),
         group_id,
@@ -568,7 +574,13 @@ pub async fn grant_holder(
     let user_id = parse_user(&request.user_id)?;
     let group_id = bucket_group(&state, &bucket).await?;
     ensure_group_admin(&state, &auth, group_id).await?;
-    let mut lookups = lookup_keys(&state.get_ctx(), state.get_node_id(), [user_id]).await;
+    let mut lookups = lookup_keys(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        [user_id],
+    )
+    .await;
     let lookup = lookups.remove(&user_id).unwrap_or(KeyLookup::Unavailable);
     let has_recovery = match &lookup {
         KeyLookup::Keys(keys) => Some(keys.iter().any(|key| key.has_recovery)),
@@ -657,7 +669,13 @@ pub async fn remove_holder(
         .chain(snapshot.admins.iter().copied())
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(&state.get_ctx(), state.get_node_id(), users).await;
+    let lookups = lookup_keys(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        users,
+    )
+    .await;
     let input = RemovalInput {
         bucket,
         group_id,

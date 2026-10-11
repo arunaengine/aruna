@@ -146,6 +146,7 @@ pub(super) async fn append(
 ) -> ServerResult<VaultAppended> {
     let config = AppendVaultConfig {
         node_id: state.get_node_id(),
+        realm_id: state.get_realm_id(),
         user_id: auth.user_id,
         record_id: Ulid::generate(),
         change,
@@ -163,6 +164,7 @@ pub(super) async fn read(
 ) -> ServerResult<VaultRecords> {
     let config = ReadVaultConfig {
         node_id: state.get_node_id(),
+        realm_id: state.get_realm_id(),
         user_id,
         query,
         deadline: FETCH_DEADLINE,
