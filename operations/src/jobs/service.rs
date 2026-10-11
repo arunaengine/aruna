@@ -266,7 +266,7 @@ pub async fn submit_staging_job(
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     let created_by = spec.auth_context.user_id;
-    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id, None).await?;
+    let job_id = mint_local_job(context, spec.auth_context.realm_id, owner_node_id, None).await?;
     submit_local_job(
         context,
         SubmitJobSpec {
@@ -293,7 +293,7 @@ pub async fn submit_copy_job(
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     let created_by = spec.auth_context.user_id;
-    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id, None).await?;
+    let job_id = mint_local_job(context, spec.auth_context.realm_id, owner_node_id, None).await?;
     submit_local_job(
         context,
         SubmitJobSpec {
@@ -323,7 +323,7 @@ pub async fn submit_purge_job(
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
     let job_id = mint_local_job(
         context,
-        created_by.realm_id,
+        spec.auth_context.realm_id,
         owner_node_id,
         dedup_key.as_deref(),
     )
@@ -427,7 +427,7 @@ pub(crate) async fn submit_identifiers(
     let dedup_key = Some(key.into_bytes());
     let job_id = mint_local_job(
         context,
-        created_by.realm_id,
+        spec.auth_context.realm_id,
         owner_node_id,
         dedup_key.as_deref(),
     )
@@ -461,7 +461,7 @@ pub async fn submit_rocrate_import(
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
     let job_id = mint_local_job(
         context,
-        created_by.realm_id,
+        spec.auth_context.realm_id,
         owner_node_id,
         dedup_key.as_deref(),
     )
@@ -527,7 +527,7 @@ pub async fn submit_export_job(
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
     let job_id = mint_local_job(
         context,
-        created_by.realm_id,
+        spec.auth_context.realm_id,
         owner_node_id,
         dedup_key.as_deref(),
     )
