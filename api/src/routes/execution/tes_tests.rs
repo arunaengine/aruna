@@ -1334,6 +1334,34 @@ async fn rejects_basic() {
 }
 
 #[tokio::test]
+async fn basic_foreign_owner() {
+    // A credential this node issued to a user of another realm signs in here; a nil owner never.
+    let (_dir, state) = build_state().await;
+    let foreign = RealmId([9u8; 32]);
+    let owners = [
+        (UserId::new(Ulid::from_bytes([6u8; 16]), foreign), true),
+        (UserId::nil(foreign), false),
+    ];
+    for (owner, accepted) in owners {
+        let mut access = credential(Ulid::from_bytes([5u8; 16]));
+        access.user_identity = owner;
+        access
+            .encrypt_secret(state.credential_encryption_key(), TES_SECRET)
+            .unwrap();
+        write_credential(&state, &access).await;
+        let result = authenticate_tes(&state, None, &basic_headers(&access, TES_SECRET)).await;
+        match accepted {
+            true => {
+                let caller = result.unwrap();
+                assert_eq!(caller.auth.user_id, owner);
+                assert_eq!(caller.auth.realm_id, state.get_realm_id());
+            }
+            false => assert_eq!(result.unwrap_err().status, StatusCode::UNAUTHORIZED),
+        }
+    }
+}
+
+#[tokio::test]
 async fn rejects_restricted_basic() {
     let (_dir, state) = build_state().await;
     let mut access = issued_access(&state, Ulid::from_bytes([5u8; 16]));

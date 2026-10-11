@@ -1952,8 +1952,11 @@ async fn authenticate_tes(
         .is_ok_and(|plaintext| {
             blake3::hash(provided_secret.as_slice()) == blake3::hash(plaintext.as_bytes())
         });
+    // The owner may belong to another realm, but an anonymous one of another realm never signs in.
+    let anonymous =
+        access.user_identity.is_nil() && access.user_identity.realm_id != state.get_realm_id();
     if access.access_key != access_key
-        || access.user_identity.realm_id != state.get_realm_id()
+        || anonymous
         || access.issued_by != *state.get_node_id().as_bytes()
         || access.is_revoked()
         || access.is_expired(SystemTime::now())
@@ -1967,7 +1970,7 @@ async fn authenticate_tes(
         state,
         Some(AuthContext {
             user_id: access.user_identity,
-            realm_id: access.user_identity.realm_id,
+            realm_id: state.get_realm_id(),
             path_restrictions: access.path_restrictions,
             session: None,
         }),
