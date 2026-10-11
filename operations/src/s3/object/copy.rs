@@ -299,6 +299,7 @@ async fn copy_inner(
         range: None,
         group_id: input.source_group_id,
         user_identity: input.source_auth_context.user_id,
+        realm_id: input.source_auth_context.realm_id,
         node_id: input.node_id,
     };
     let restrictions = input.source_auth_context.path_restrictions.clone();
@@ -974,6 +975,7 @@ pub(crate) mod test {
                 range: None,
                 group_id,
                 user_identity: UserId::local(Ulid::generate(), realm_id),
+                realm_id,
                 node_id: test_node_id(),
             }),
             &context,

@@ -1553,6 +1553,7 @@ impl S3 for ArunaS3Service {
                 .map(|bucket_info| bucket_info.group_id)
                 .unwrap_or(user_access.group_id),
             user_identity: user_access.user_identity,
+            realm_id: self.realm_id,
             node_id: self.node_id,
         };
 
@@ -1689,6 +1690,7 @@ impl S3 for ArunaS3Service {
                         range: None,
                         group_id,
                         user_identity: user_access.user_identity,
+                        realm_id: self.realm_id,
                         node_id: self.node_id,
                     },
                     user_access.path_restrictions.clone(),
@@ -1785,6 +1787,7 @@ impl S3 for ArunaS3Service {
                         range: None,
                         group_id,
                         user_identity: user_access.user_identity,
+                        realm_id: self.realm_id,
                         node_id: self.node_id,
                     },
                     user_access.path_restrictions.clone(),

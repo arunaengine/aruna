@@ -150,6 +150,7 @@ async fn resolve(
             range: None,
             group_id: bucket.group_id,
             user_identity: user,
+            realm_id: user.realm_id,
             node_id: node,
         };
         let info = get_object_info(context, input, None)

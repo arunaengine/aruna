@@ -41,6 +41,7 @@ use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::abe::AbeEffect;
 use aruna_core::structs::storage::abe::AbeError;
@@ -250,6 +251,8 @@ pub struct GetObjectInput {
     pub range: Option<ObjectRangeRequest>,
     pub group_id: Ulid,
     pub user_identity: UserId,
+    /// Realm serving the read; the user may belong to another realm.
+    pub realm_id: RealmId,
     /// Local node recorded on the replication obligation of a drift successor.
     pub node_id: NodeId,
 }
@@ -413,7 +416,7 @@ impl GetObjectOperation {
     fn auth_context(&self) -> AuthContext {
         AuthContext {
             user_id: self.input.user_identity,
-            realm_id: self.input.user_identity.realm_id,
+            realm_id: self.input.realm_id,
             path_restrictions: self.restrictions.clone(),
             session: None,
         }
@@ -1672,7 +1675,7 @@ pub async fn get_object_token(
     token: Option<TokenRead>,
 ) -> Result<GetObjectResult, GetObjectError> {
     let ranged = input.range.is_some();
-    let user_id = input.user_identity;
+    let (user_id, realm_id) = (input.user_identity, input.realm_id);
     let result = read_local(context, input, restrictions.clone(), token.as_ref()).await;
     let Err(GetObjectError::BlobNotLocal {
         blake3,
@@ -1684,11 +1687,12 @@ pub async fn get_object_token(
     else {
         return result;
     };
-    if ranged || !local_is_user(context, user_id.realm_id).await {
+    if ranged || !local_is_user(context, realm_id).await {
         return Err(GetObjectError::GetObjectFailed);
     }
     let read = RoutedRead {
         user_id,
+        realm_id,
         blake3,
         version_id,
         metadata,
@@ -1864,7 +1868,7 @@ async fn promote_leased(
     lease: ReadLease,
     limits: &RoCrateLimits,
 ) -> Result<(), GetObjectError> {
-    let (realm_id, node_id) = (input.user_identity.realm_id, input.node_id);
+    let (realm_id, node_id) = (input.realm_id, input.node_id);
     let promote = PromotePendingOperation::new(archive.clone(), realm_id, node_id, limits.clone());
     let outcome = match drive(promote.with_lease(lease), context).await {
         Err(PromoteError::Blob(BlobError::IntegrityCheckFailed(reason))) => {
@@ -1899,7 +1903,7 @@ pub async fn get_object_info(
     if input.range.is_some() {
         return Err(GetObjectError::InvalidRange);
     }
-    let user_id = input.user_identity;
+    let (user_id, realm_id) = (input.user_identity, input.realm_id);
     let operation = GetObjectOperation::new(input).with_restrictions(restrictions.clone());
     match drive(operation, context).await {
         Ok(result) => Ok(result.info),
@@ -1909,9 +1913,10 @@ pub async fn get_object_info(
             metadata,
             version_created_at,
             source_policies,
-        }) if local_is_user(context, user_id.realm_id).await => {
+        }) if local_is_user(context, realm_id).await => {
             let read = RoutedRead {
                 user_id,
+                realm_id,
                 blake3,
                 version_id,
                 metadata,
@@ -1929,6 +1934,7 @@ pub async fn get_object_info(
 /// credential, so the routed result is never less constrained than the record.
 struct RoutedRead {
     user_id: UserId,
+    realm_id: RealmId,
     blake3: [u8; 32],
     version_id: Option<Ulid>,
     metadata: HashMap<String, String>,
@@ -2023,7 +2029,7 @@ async fn routed_blob(
         .net_handle
         .as_ref()
         .ok_or(GetObjectError::GetObjectFailed)?;
-    let realm_id = read.user_id.realm_id;
+    let realm_id = read.realm_id;
     let holders = drive(
         GetHoldersOperation::new(read.blake3, realm_id, net_handle.node_id()),
         context,
@@ -2073,7 +2079,7 @@ async fn routed_metadata(
         .net_handle
         .as_ref()
         .ok_or(GetObjectError::GetObjectFailed)?;
-    let realm_id = read.user_id.realm_id;
+    let realm_id = read.realm_id;
     let holders = drive(
         GetHoldersOperation::new(read.blake3, realm_id, net_handle.node_id()),
         context,

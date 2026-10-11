@@ -88,6 +88,7 @@ pub async fn upload_part_token(
         range: input.range,
         group_id: input.source_group_id,
         user_identity: input.source_auth_context.user_id,
+        realm_id: input.source_auth_context.realm_id,
         node_id: input.node_id,
     };
     let restrictions = input.source_auth_context.path_restrictions.clone();

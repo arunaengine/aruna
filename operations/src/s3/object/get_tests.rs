@@ -182,6 +182,7 @@ fn routed_facts_preserved() {
     let version_created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(12);
     let read = RoutedRead {
         user_id: UserId::nil(RealmId::from_bytes([3u8; 32])),
+        realm_id: RealmId::from_bytes([3u8; 32]),
         blake3: [9u8; 32],
         version_id: Some(Ulid::from(7u128)),
         metadata: HashMap::new(),
@@ -216,6 +217,7 @@ fn routed_facts_preserved() {
 fn routed_empty_preserved() {
     let read = RoutedRead {
         user_id: UserId::nil(RealmId::from_bytes([3u8; 32])),
+        realm_id: RealmId::from_bytes([3u8; 32]),
         blake3: [9u8; 32],
         version_id: Some(Ulid::from(7u128)),
         metadata: HashMap::new(),
@@ -248,6 +250,7 @@ fn reports_missing_blob() {
         range: None,
         group_id: Ulid::generate(),
         user_identity: UserId::nil(RealmId::from_bytes([3u8; 32])),
+        realm_id: RealmId::from_bytes([3u8; 32]),
         node_id: test_node_id(),
     });
     operation.txn_id = Some(Ulid::generate());
@@ -287,6 +290,7 @@ fn pending_content_refused() {
         range: None,
         group_id: Ulid::generate(),
         user_identity: UserId::nil(RealmId::from_bytes([3u8; 32])),
+        realm_id: RealmId::from_bytes([3u8; 32]),
         node_id: test_node_id(),
     });
     operation.txn_id = Some(Ulid::generate());
@@ -369,6 +373,7 @@ fn materialized_range_reads() {
         range: Some(ObjectRangeRequest::StartEnd { start: 2, end: 4 }),
         group_id: Ulid::generate(),
         user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+        realm_id: RealmId([0u8; 32]),
         node_id: test_node_id(),
     });
     let txn_id = Ulid::generate();
@@ -415,6 +420,7 @@ fn reference_range_reads() {
         range: Some(ObjectRangeRequest::Suffix { length: 4 }),
         group_id: Ulid::generate(),
         user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+        realm_id: RealmId([0u8; 32]),
         node_id: test_node_id(),
     });
     let txn_id = Ulid::generate();
@@ -490,6 +496,7 @@ fn range_drift_restarts() {
         range: Some(ObjectRangeRequest::StartEnd { start: 1, end: 3 }),
         group_id: Ulid::generate(),
         user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+        realm_id: RealmId([0u8; 32]),
         node_id: test_node_id(),
     });
     operation.source_metadata = Some(SourceMetadata {
@@ -662,6 +669,7 @@ pub async fn test_get_object() {
         range: None,
         group_id: Ulid::generate(),
         user_identity: Default::default(),
+        realm_id: UserId::default().realm_id,
         node_id: test_node_id(),
     });
 
@@ -764,6 +772,7 @@ async fn routed_missing_blob() {
             range: None,
             group_id: Ulid::generate(),
             user_identity,
+            realm_id: user_identity.realm_id,
             node_id: test_node_id(),
         },
         None,
@@ -780,6 +789,7 @@ async fn routed_missing_blob() {
             range: Some(ObjectRangeRequest::StartEnd { start: 0, end: 1 }),
             group_id: Ulid::generate(),
             user_identity,
+            realm_id: user_identity.realm_id,
             node_id: test_node_id(),
         },
         None,
@@ -921,6 +931,7 @@ pub async fn hash_mismatch_rejected() {
         range: None,
         group_id: Ulid::generate(),
         user_identity: Default::default(),
+        realm_id: UserId::default().realm_id,
         node_id: test_node_id(),
     });
 
@@ -1054,6 +1065,7 @@ async fn bound_connector_used() {
             range: None,
             group_id: Ulid::generate(),
             user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            realm_id: RealmId([0u8; 32]),
             node_id: test_node_id(),
         }),
         &driver_ctx,
@@ -1228,6 +1240,7 @@ async fn drift_creates_successor() {
             range: None,
             group_id,
             user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            realm_id: RealmId([0u8; 32]),
             node_id: test_node_id(),
         }),
         &driver_ctx,
@@ -1361,6 +1374,7 @@ fn drifted_operation() -> GetObjectOperation {
         range: None,
         group_id: Ulid::generate(),
         user_identity: UserId::local(Ulid::from_parts(2, 2), RealmId([0u8; 32])),
+        realm_id: RealmId([0u8; 32]),
         node_id: test_node_id(),
     });
     let version = BlobVersion::reference(
@@ -1901,6 +1915,7 @@ async fn historical_drift_fails() {
             range: None,
             group_id: Ulid::generate(),
             user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            realm_id: RealmId([0u8; 32]),
             node_id: test_node_id(),
         }),
         &driver_ctx,
@@ -1945,6 +1960,7 @@ mod sealed {
             range: None,
             group_id: Ulid::generate(),
             user_identity: UserId::nil(RealmId::from_bytes([3u8; 32])),
+            realm_id: RealmId::from_bytes([3u8; 32]),
             node_id: test_node_id(),
         });
         operation.txn_id = Some(Ulid::generate());
