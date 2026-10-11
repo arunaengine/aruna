@@ -10,7 +10,7 @@ use crate::replication::queue::LiveObligationRecord;
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, HolderFailures,
     MAX_AUTO_ADVANCES, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest, RoutedRead,
-    get_object_routed, routed_info,
+    get_object_routed, promote_leased, routed_info,
 };
 use aruna_blob::blob::BlobHandler;
 use aruna_blob::hash::Hasher;
@@ -2246,5 +2246,68 @@ mod sealed {
             operation.finalize().err(),
             Some(GetObjectError::PendingContent(archive))
         );
+    }
+}
+
+#[tokio::test]
+async fn promotes_serving_realm() {
+    // A user of another realm promotes pending content into the serving realm's hash index.
+    use crate::blob::promote::tests::received::{fixture, pending};
+    use aruna_core::events::BlobEvent;
+    use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
+    use aruna_core::structs::execution::job::RoCrateLimits;
+    use aruna_core::structs::storage::blob::{ArchiveKey, HashIndex};
+
+    let (_temp, context, plan, _) = fixture().await;
+    let (serving, group_id) = (RealmId([1; 32]), Ulid::from_bytes([8; 16]));
+    let foreign = UserId::local(Ulid::generate(), RealmId([9; 32]));
+    let data = b"foreign content".to_vec();
+    let hash = *blake3::hash(&data).as_bytes();
+    let (location, version) = pending(&context, plan, foreign, "foreign", data, hash, false).await;
+    let archive = ArchiveKey::of(&location);
+    let admit = BlobEffect::AdmitRead {
+        key: plan.key,
+        archive: archive.clone(),
+    };
+    let blob = context.blob_handle.as_ref().unwrap();
+    let Event::Blob(BlobEvent::ReadAdmitted { lease }) = blob.send_blob_effect(admit).await else {
+        panic!("read not admitted");
+    };
+    let node_id = context.net_handle.as_ref().unwrap().node_id();
+    let input = GetObjectInput {
+        bucket: "bucket".to_string(),
+        key: "foreign".to_string(),
+        version_id: None,
+        range: None,
+        group_id,
+        user_identity: foreign,
+        realm_id: serving,
+        node_id,
+    };
+    let limits = RoCrateLimits::default();
+    promote_leased(&context, &input, archive, lease, &limits)
+        .await
+        .unwrap();
+
+    for (realm_id, indexed) in [(serving, true), (foreign.realm_id, false)] {
+        let alias = HashIndex::new(
+            hash,
+            version.version_id,
+            realm_id,
+            group_id,
+            node_id,
+            "bucket".to_string(),
+            "foreign".to_string(),
+        );
+        let read = StorageEffect::Read {
+            key_space: PATHS_INDEX_KEYSPACE.to_string(),
+            key: alias.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        let event = context.storage_handle.send_storage_effect(read).await;
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            panic!("index read failed: {event:?}");
+        };
+        assert_eq!(value.is_some(), indexed);
     }
 }

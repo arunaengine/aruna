@@ -1056,4 +1056,4 @@ async fn read_value(
 
 #[cfg(test)]
 #[path = "promote_tests.rs"]
-mod tests;
+pub(crate) mod tests;
