@@ -85,20 +85,21 @@ fn admins_need_write() {
             &[UserId::nil(RealmId::from_bytes([1; 32]))],
             &[("/**", Permission::WRITE)],
         ),
-        // A federated group admin keeps its permissions but holds no bucket key.
-        role(
-            &[UserId::new(
-                Ulid::from_bytes([6; 16]),
-                RealmId::from_bytes([2; 32]),
-            )],
-            &[("/realm/g/group/**", Permission::WRITE)],
-        ),
+        // A federated group admin holds the bucket key like a local one.
+        role(&[foreign(6)], &[("/realm/g/group/**", Permission::WRITE)]),
+        // The same ULID of another realm is another user, so its deny leaves user 2 an admin.
+        role(&[foreign(2)], &[("/realm/g/group/admin", Permission::DENY)]),
+        role(&[foreign(7)], &[("/realm/g/group/**", Permission::WRITE)]),
+        role(&[foreign(7)], &[("/realm/g/group/admin", Permission::DENY)]),
     ];
-    let realm_id = RealmId::from_bytes([1; 32]);
     assert_eq!(
-        admin_users(&roles, ADMIN_PATH, realm_id),
-        BTreeSet::from([user(2)])
+        admin_users(&roles, ADMIN_PATH),
+        BTreeSet::from([user(2), foreign(6)])
     );
+}
+
+fn foreign(seed: u8) -> UserId {
+    UserId::new(Ulid::from_bytes([seed; 16]), RealmId::from_bytes([2; 32]))
 }
 
 #[test]

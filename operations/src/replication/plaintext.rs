@@ -119,17 +119,13 @@ pub async fn consent_required(context: &DriverContext, bucket: &str) -> Result<b
 }
 
 /// Whether `user` holds the key of `bucket` in realm `realm_id` now: its creator, a current group
-/// admin, or an explicit holder. Losing the admin role ends it at once (D30). A user of another
-/// realm never holds one.
+/// admin, or an explicit holder, of any home realm. Losing the admin role ends it at once (D30).
 pub async fn is_holder(
     context: &DriverContext,
     realm_id: RealmId,
     bucket: &str,
     user: UserId,
 ) -> Result<bool, String> {
-    if user.realm_id != realm_id {
-        return Ok(false);
-    }
     let info = drive(GetBucketOperation::new(bucket.to_string()), context)
         .await
         .map_err(|error| error.to_string())?;
@@ -321,16 +317,34 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn foreign_never_holds() {
-        // A user of another realm holds no key here, even with the ULID of the bucket's creator.
+    async fn foreign_explicit_holds() {
+        // An explicit grant makes a user of another realm a holder; the creator's ULID does not.
         let (_dir, storage) = crate::tests::s3::test_storage();
         let context = crate::tests::s3::test_context(storage);
         bucket(&context).await;
         let local = RealmId::from_bytes([3; 32]);
-        let foreign = UserId::new(Ulid::from_bytes([1; 16]), RealmId::from_bytes([9; 32]));
-        assert_eq!(
-            is_holder(&context, local, "sealed", foreign).await,
-            Ok(false)
-        );
+        let foreign =
+            |seed| UserId::new(Ulid::from_bytes([seed; 16]), RealmId::from_bytes([9; 32]));
+        let grant = BucketHolder {
+            bucket_id: Ulid::from_bytes([5; 16]),
+            user_id: foreign(7),
+            origin: HolderOrigin::Explicit,
+            state: GrantState::Ready,
+            granted_by: user(1),
+            granted_at_ms: 0,
+        };
+        let write = StorageEffect::Write {
+            key_space: BUCKET_HOLDER_KEYSPACE.to_string(),
+            key: grant.key().into(),
+            value: grant.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(write).await;
+        for (seed, holder) in [(1, false), (7, true)] {
+            assert_eq!(
+                is_holder(&context, local, "sealed", foreign(seed)).await,
+                Ok(holder)
+            );
+        }
     }
 }

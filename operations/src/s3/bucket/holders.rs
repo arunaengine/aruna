@@ -47,7 +47,6 @@ pub async fn read_admins(
     Ok(admin_users(
         realm.roles.values().chain(group.roles.values()),
         &path,
-        realm_id,
     ))
 }
 
