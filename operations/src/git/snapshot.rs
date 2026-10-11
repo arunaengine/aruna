@@ -150,7 +150,7 @@ async fn resolve(
             range: None,
             group_id: bucket.group_id,
             user_identity: user,
-            realm_id: user.realm_id,
+            realm_id: auth.realm_id,
             node_id: node,
         };
         let info = get_object_info(context, input, None)
@@ -488,7 +488,11 @@ async fn generate(
             .await
         }
     };
-    let linker = author(user);
+    // Linked objects are read in the realm that holds the document, not the author's home realm.
+    let linker = AuthContext {
+        realm_id: document.realm_id,
+        ..author(user)
+    };
     let linking = linked(context, document, &jsonld, &linker);
     let objects = time_stage("git_linked", linking).await;
     let lfs: Vec<StoredObject> = objects.iter().map(|linked| linked.object.clone()).collect();
