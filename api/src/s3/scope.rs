@@ -7,6 +7,7 @@
 use aruna_core::errors::AuthorizationError;
 use aruna_core::permission_path::readable_roots;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_operations::auth::permission_rules::{PermissionRules, permission_rules};
 use aruna_operations::driver::DriverContext;
@@ -80,12 +81,13 @@ impl SubpathScope {
 /// missing realm or group document grants nothing instead of failing.
 pub(super) async fn resolve_scope(
     context: &DriverContext,
+    realm_id: RealmId,
     user_access: &UserAccess,
     root: &str,
 ) -> S3Result<SubpathScope> {
     let auth_context = AuthContext {
         user_id: user_access.user_identity,
-        realm_id: user_access.user_identity.realm_id,
+        realm_id,
         path_restrictions: user_access.path_restrictions.clone(),
         session: None,
     };

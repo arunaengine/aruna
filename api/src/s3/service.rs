@@ -875,7 +875,7 @@ impl S3 for ArunaS3Service {
         let trailing_headers = req.trailing_headers.clone();
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
-            realm_id: user_access.user_identity.realm_id,
+            realm_id: self.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
             session: None,
         };
@@ -1037,7 +1037,7 @@ impl S3 for ArunaS3Service {
         let quota_ceiling = self.resolve_quota_ceiling(dest_group_id).await?;
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
-            realm_id: user_access.user_identity.realm_id,
+            realm_id: self.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
             session: None,
         };
@@ -1367,7 +1367,7 @@ impl S3 for ArunaS3Service {
         let upload_id = parse_upload_id(&req.input.upload_id)?;
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
-            realm_id: user_access.user_identity.realm_id,
+            realm_id: self.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
             session: None,
         };
@@ -2014,7 +2014,7 @@ impl S3 for ArunaS3Service {
         let version_id = parse_version_id(req.input.version_id)?;
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
-            realm_id: user_access.user_identity.realm_id,
+            realm_id: self.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
             session: None,
         };
@@ -2096,7 +2096,7 @@ impl S3 for ArunaS3Service {
         let quiet = req.input.delete.quiet.unwrap_or(false);
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
-            realm_id: user_access.user_identity.realm_id,
+            realm_id: self.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
             session: None,
         };

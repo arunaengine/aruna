@@ -59,7 +59,7 @@ impl ArunaS3Service {
             .map_err(IntoS3Error::into_s3_error)?;
         let auth = AuthContext {
             user_id: user_access.user_identity,
-            realm_id: user_access.user_identity.realm_id,
+            realm_id: self.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
             session: None,
         };

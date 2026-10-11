@@ -1335,6 +1335,7 @@ async fn subpath_request(
 ) -> S3Request<ListObjectsV2Input> {
     let scope = resolve_scope(
         &service.state,
+        service.realm_id,
         user_access,
         &bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
     )
@@ -1457,6 +1458,7 @@ async fn deny_hides_subpath() {
 
     let scope = resolve_scope(
         &service.state,
+        service.realm_id,
         &user_access,
         &bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
     )
@@ -1536,6 +1538,7 @@ async fn paged_request(
 ) -> S3Request<ListObjectsV2Input> {
     let scope = resolve_scope(
         &service.state,
+        service.realm_id,
         user_access,
         &bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
     )

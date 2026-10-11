@@ -40,7 +40,7 @@ impl ArunaS3Service {
         let source_auth_context = if source_bucket_info.group_id == user_access.group_id {
             AuthContext {
                 user_id: user_access.user_identity,
-                realm_id: user_access.user_identity.realm_id,
+                realm_id: self.realm_id,
                 path_restrictions: user_access.path_restrictions.clone(),
                 session: None,
             }

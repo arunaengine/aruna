@@ -824,7 +824,7 @@ impl AuthProvider {
     ) -> S3Result<(String, AuthContext)> {
         let mut auth_context = AuthContext {
             user_id: user_access.user_identity,
-            realm_id: user_access.user_identity.realm_id,
+            realm_id: self.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
             session: None,
         };
@@ -882,7 +882,8 @@ impl AuthProvider {
         extras: PolicyRequestExtras,
     ) -> S3Result<()> {
         let has_bucket = cx.s3_path().get_bucket_name().is_some();
-        let scope = resolve_scope(self.driver_ctx.as_ref(), user_access, path).await?;
+        let scope =
+            resolve_scope(self.driver_ctx.as_ref(), self.realm_id, user_access, path).await?;
         if scope.is_empty() {
             return Err(map_authorize_error(AuthorizeError::PermissionDenied));
         }
