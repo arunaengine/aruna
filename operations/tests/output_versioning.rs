@@ -81,7 +81,12 @@ async fn setup() -> Harness {
     std::fs::create_dir_all(&blob_root).unwrap();
 
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let realm_id = RealmId::from_bytes([7u8; 32]);
+    let config = NetConfig {
+        realm_id,
+        ..NetConfig::default()
+    };
+    let net_handle = NetHandle::new(config, storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(
@@ -100,7 +105,6 @@ async fn setup() -> Harness {
     .await
     .unwrap();
 
-    let realm_id = RealmId::from_bytes([7u8; 32]);
     let node_id = net_handle.node_id();
     let harness = Harness {
         _temp_dir: temp_dir,
