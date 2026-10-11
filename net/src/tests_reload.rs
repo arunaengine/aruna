@@ -164,6 +164,7 @@ async fn stale_read_repaired() -> Result<()> {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,
+            sync_storage_path: Some(dir.path().join("sync")),
             ..NetConfig::default()
         },
         proxy,
