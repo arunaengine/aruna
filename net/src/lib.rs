@@ -25,6 +25,8 @@ mod telemetry;
 mod test_support;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_reload;
 
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
@@ -116,6 +118,8 @@ struct NetInner {
     discovery_method: DiscoveryMethod,
     relay_method: RelayMethod,
     realm_peers: Arc<RwLock<Vec<NodeId>>>,
+    /// Storage change count of the last realm config reload; `None` forces the next reload.
+    config_applied: tokio::sync::Mutex<Option<u64>>,
     inbound_admission: streams::InboundAdmission,
     watch_interest: Arc<RwLock<WatchInterestTable>>,
     heartbeats: Arc<heartbeat::HeartbeatTable>,
@@ -407,6 +411,14 @@ impl NetHandle {
         &self,
         document: &RealmConfigDocument,
     ) -> Result<Vec<NodeId>> {
+        let mut applied = self.inner.config_applied.lock().await;
+        // A supplied document may be older than storage, so the next check reloads.
+        *applied = None;
+        self.apply_document(document).await
+    }
+
+    /// Applies a realm config to peer admission and sync. Callers hold `config_applied`.
+    async fn apply_document(&self, document: &RealmConfigDocument) -> Result<Vec<NodeId>> {
         if document.realm_id != self.inner.realm_id {
             return Err(NetError::Bootstrap(format!(
                 "realm config {} does not match net realm {}",
@@ -465,6 +477,24 @@ impl NetHandle {
     }
 
     pub async fn reload_realm_peers(&self) -> Result<Option<Vec<NodeId>>> {
+        let mut applied = self.inner.config_applied.lock().await;
+        self.reload_locked(&mut applied).await
+    }
+
+    /// Reloads realm peers only when storage reports a realm config change since the last
+    /// successful reload, or when peers came from a supplied document since then.
+    pub async fn reload_if_changed(&self) -> Result<Option<Vec<NodeId>>> {
+        let mut applied = self.inner.config_applied.lock().await;
+        if *applied == Some(self.inner.storage.config_changes()) {
+            return Ok(None);
+        }
+        self.reload_locked(&mut applied).await
+    }
+
+    async fn reload_locked(&self, applied: &mut Option<u64>) -> Result<Option<Vec<NodeId>>> {
+        // Read before the row, so a change during this reload moves the count past it.
+        let seen = self.inner.storage.config_changes();
+        *applied = None;
         let target = DocumentTarget::RealmConfig {
             realm_id: self.inner.realm_id,
         };
@@ -472,9 +502,14 @@ impl NetHandle {
             .read_storage(target.storage_keyspace().to_string(), target.storage_key())
             .await?
         else {
+            *applied = Some(seen);
             return Ok(None);
         };
-        self.refresh_encoded_peers(&bytes).await.map(Some)
+        let document = RealmConfigDocument::from_bytes(&bytes)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let peers = self.apply_document(&document).await?;
+        *applied = Some(seen);
+        Ok(Some(peers))
     }
 
     pub async fn realm_peers(&self) -> Vec<NodeId> {

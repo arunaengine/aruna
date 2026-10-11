@@ -665,7 +665,7 @@ impl InboundEventHandler for HoldingInboundHandler {
     }
 }
 
-async fn test_net_handle() -> Result<(NetHandle, TempDir)> {
+pub(crate) async fn test_net_handle() -> Result<(NetHandle, TempDir)> {
     let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
     let storage = aruna_storage::FjallStorage::open(
         temp_dir

@@ -69,6 +69,7 @@ impl NetHandle {
                 discovery_method: runtime.discovery_method,
                 relay_method: runtime.relay_method,
                 realm_peers: peers.realm_peers,
+                config_applied: tokio::sync::Mutex::new(None),
                 inbound_admission: peers.inbound_admission,
                 watch_interest: handle_state.watch_interest,
                 heartbeats: Arc::default(),
