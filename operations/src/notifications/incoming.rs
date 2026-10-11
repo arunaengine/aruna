@@ -600,7 +600,10 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             if bucket.is_empty() || group_id.is_nil() {
                 return Err("bucket key notification has empty bucket or group".to_string());
             }
-            validate_kind_user("member_user_id", member_user_id, recipient_realm)?;
+            // The waiting member may be a user of another realm; the recipient stays local.
+            if member_user_id.is_nil() {
+                return Err("notification record has empty member_user_id".to_string());
+            }
         }
     }
     Ok(())

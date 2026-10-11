@@ -550,6 +550,8 @@ impl KeyOperation {
         }
         let member = self.recipient();
         holders.remove(&member);
+        // Users of another realm have no inbox here; they see requests on the bucket page.
+        holders.retain(|holder| holder.realm_id == self.auth.realm_id);
         let kind = NotificationKind::BucketKeyPending {
             bucket: self.bucket.clone(),
             node_id: self.node,

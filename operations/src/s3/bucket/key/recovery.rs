@@ -188,8 +188,15 @@ impl RecoveryNoticeOperation {
                     marker_key,
                     marker(ready).into(),
                 )];
+                // Users of another realm have no inbox here.
+                let realm_id = self.input.realm_id;
                 let told: Vec<_> = match weakened {
-                    true => report.holders.iter().map(|holder| holder.user_id).collect(),
+                    true => report
+                        .holders
+                        .iter()
+                        .map(|holder| holder.user_id)
+                        .filter(|user| user.realm_id == realm_id)
+                        .collect(),
                     false => Vec::new(),
                 };
                 for holder in &told {
