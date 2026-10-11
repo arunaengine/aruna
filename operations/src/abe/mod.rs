@@ -867,6 +867,7 @@ mod tests {
     fn fences_inactive_recipients() {
         // A deactivated user or a credential issued before the user cutoff gets no new grant.
         use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+        // Only a user of another realm may lack a local user row.
         use aruna_core::structs::identity::realm::{
             RealmAuthorizationDocument, RealmConfigDocument, TokenRevocation,
         };
@@ -885,36 +886,40 @@ mod tests {
         let parameters =
             aruna_core::structs::storage::abe::create_parameters(&secret, realm_id, node, key)
                 .unwrap();
-        let values = |account: &User, config: &RealmConfigDocument| -> Vec<(Key, Option<Value>)> {
-            let rows: [Option<Vec<u8>>; 8] = [
-                Some(
-                    RealmAuthorizationDocument::default_realm_doc(realm_id)
-                        .to_bytes(&actor)
-                        .unwrap(),
-                ),
-                Some(
-                    GroupAuthorizationDocument::default_group_doc(user, realm_id, group_id)
-                        .to_bytes(&actor)
-                        .unwrap(),
-                ),
-                Some(config.to_bytes(&actor).unwrap()),
-                Some(parameters.to_bytes().unwrap()),
-                Some(1u64.to_be_bytes().to_vec()),
-                Some(
-                    BucketKeyRecord::new(key, Ulid::from_bytes([3; 16]), [0; 32], 1)
-                        .to_bytes()
-                        .unwrap(),
-                ),
-                None,
-                Some(account.to_bytes(&actor).unwrap()),
-            ];
-            rows.into_iter()
-                .map(|v| (Key::from(Vec::new()), v.map(Value::from)))
-                .collect()
-        };
-        let snapshot = |action: KeyAction, account: &User, config: &RealmConfigDocument| {
+        let values =
+            |account: Option<&User>, config: &RealmConfigDocument| -> Vec<(Key, Option<Value>)> {
+                let rows: [Option<Vec<u8>>; 8] = [
+                    Some(
+                        RealmAuthorizationDocument::default_realm_doc(realm_id)
+                            .to_bytes(&actor)
+                            .unwrap(),
+                    ),
+                    Some(
+                        GroupAuthorizationDocument::default_group_doc(user, realm_id, group_id)
+                            .to_bytes(&actor)
+                            .unwrap(),
+                    ),
+                    Some(config.to_bytes(&actor).unwrap()),
+                    Some(parameters.to_bytes().unwrap()),
+                    Some(1u64.to_be_bytes().to_vec()),
+                    Some(
+                        BucketKeyRecord::new(key, Ulid::from_bytes([3; 16]), [0; 32], 1)
+                            .to_bytes()
+                            .unwrap(),
+                    ),
+                    None,
+                    account.map(|account| account.to_bytes(&actor).unwrap()),
+                ];
+                rows.into_iter()
+                    .map(|v| (Key::from(Vec::new()), v.map(Value::from)))
+                    .collect()
+            };
+        let snapshot = |action: KeyAction,
+                        caller: aruna_core::UserId,
+                        account: Option<&User>,
+                        config: &RealmConfigDocument| {
             let auth = AuthContext {
-                user_id: user,
+                user_id: caller,
                 realm_id,
                 path_restrictions: None,
                 session: None,
@@ -945,21 +950,52 @@ mod tests {
             restrictions: None,
         };
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        assert_eq!(snapshot(token.clone(), &account, &config), Ok(()));
+        assert_eq!(
+            snapshot(token.clone(), user, Some(&account), &config),
+            Ok(())
+        );
 
         config.revoked_tokens.push(TokenRevocation {
             token_hash: aruna_core::auth::user_cutoff_hash(&user),
             expires_at: aruna_core::auth::user_cutoff_expiry(2_000),
         });
-        assert_eq!(snapshot(token, &account, &config), Err(KeyError::Denied));
+        assert_eq!(
+            snapshot(token, user, Some(&account), &config),
+            Err(KeyError::Denied)
+        );
 
         let request = KeyAction::Request(KeyScope::Subtree("foo/".into()));
         let config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        assert_eq!(snapshot(request.clone(), &account, &config), Ok(()));
+        assert_eq!(
+            snapshot(request.clone(), user, Some(&account), &config),
+            Ok(())
+        );
         account.attributes.insert(
             aruna_core::user::validation::DEACTIVATED_ATTRIBUTE.to_string(),
             "true".into(),
         );
-        assert_eq!(snapshot(request, &account, &config), Err(KeyError::Denied));
+        assert_eq!(
+            snapshot(request.clone(), user, Some(&account), &config),
+            Err(KeyError::Denied)
+        );
+
+        let foreign = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        assert_eq!(snapshot(request.clone(), foreign, None, &config), Ok(()));
+        let missing = snapshot(request.clone(), user, None, &config);
+        assert_eq!(missing, Err(KeyError::Storage));
+        config.revoked_tokens.push(TokenRevocation {
+            token_hash: aruna_core::auth::user_cutoff_hash(&foreign),
+            expires_at: aruna_core::auth::user_cutoff_expiry(2_000),
+        });
+        let token = KeyAction::Token {
+            access_key: Ulid::from_parts(1_000_000, 1).to_string(),
+            public_key: [1; 32],
+            restrictions: None,
+        };
+        assert_eq!(
+            snapshot(token, foreign, None, &config),
+            Err(KeyError::Denied)
+        );
     }
 }
