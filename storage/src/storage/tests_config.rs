@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::tests::{poll_queued, worker};
-use super::{FjallStorage, SlowQueueAggregator, StorageHandle};
+use super::{CleanupEntry, CleanupKind, FjallStorage, SlowQueueAggregator, StorageHandle};
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -86,10 +86,42 @@ fn commits_count_changes() {
         key: b"realm".to_vec().into(),
         txn_id: None,
     });
-    assert_eq!(handle.config_changes(), 4);
+    let deleted = storage.process_effect(StorageEffect::BatchDelete {
+        deletes: vec![
+            ("other".to_string(), b"a".to_vec().into()),
+            (REALM_CONFIG_KEYSPACE.to_string(), b"realm".to_vec().into()),
+        ],
+        txn_id: None,
+    });
+    assert!(matches!(deleted, StorageEvent::BatchDeleteResult { .. }));
+    assert_eq!(handle.config_changes(), 5);
     storage.process_effect(write("other", None));
-    assert_eq!(handle.config_changes(), 4);
+    assert_eq!(handle.config_changes(), 5);
     assert!(storage.config_txns.is_empty());
+}
+
+#[test]
+fn unknown_commit_counts() {
+    // The worker re-commits an unknown outcome itself; that commit must still count.
+    let dir = tempdir().unwrap();
+    let (handle, _receivers) = StorageHandle::new();
+    let mut storage = worker(&dir, &handle);
+    let txn_id = start(&mut storage);
+    storage.process_effect(write(REALM_CONFIG_KEYSPACE, Some(txn_id)));
+    storage.transaction_cleanup.lock().unwrap().insert(
+        txn_id,
+        CleanupEntry {
+            kind: CleanupKind::CommitUnknown,
+            attempts: 0,
+            queued: false,
+        },
+    );
+
+    storage.retry_cleanup();
+
+    assert_eq!(handle.config_changes(), 1);
+    assert!(storage.config_txns.is_empty());
+    assert!(!storage.txns.contains_key(&txn_id));
 }
 
 #[test]
