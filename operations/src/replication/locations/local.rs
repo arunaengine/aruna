@@ -701,9 +701,7 @@ impl Operation for LocationSummaryOperation {
     type Error = LocationSummaryError;
 
     fn start(&mut self) -> Effects {
-        if self.request.auth_context.realm_id != self.request.realm_id
-            || self.request.auth_context.user_id.realm_id != self.request.realm_id
-        {
+        if self.request.auth_context.realm_id != self.request.realm_id {
             return self.deny();
         }
         match self.peer {

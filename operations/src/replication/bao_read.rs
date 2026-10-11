@@ -1419,7 +1419,6 @@ impl Operation for IncomingBaoOperation {
     fn start(&mut self) -> Effects {
         if self.request.realm_id != self.local_realm
             || self.request.auth_context.realm_id != self.request.realm_id
-            || self.request.auth_context.user_id.realm_id != self.request.realm_id
         {
             return self.send_refusal(BaoReadRefusal::RealmPeerDenied);
         }
