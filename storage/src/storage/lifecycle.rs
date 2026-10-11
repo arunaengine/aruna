@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::thread;
 
 use fjall::OptimisticTxDatabase;
@@ -102,6 +102,7 @@ impl FjallStorage {
             deletes: HashMap::new(),
             txn_deletes: HashMap::new(),
             txn_usage: HashMap::new(),
+            config_txns: HashSet::new(),
         }
     }
 }

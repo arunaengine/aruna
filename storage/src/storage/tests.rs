@@ -334,6 +334,7 @@ fn bulk_full_rejects() {
         deletes: std::collections::HashMap::new(),
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
+        config_txns: std::collections::HashSet::new(),
     };
     let metrics = std::sync::Arc::new(super::StorageMetrics::default());
     let read_effect = || StorageEffect::Read {
@@ -679,7 +680,7 @@ async fn write_txn_rejected() {
 
 /// Worker sharing the handle's channels, cleanup map and fence, driven by
 /// the test thread so effect order is exact.
-fn worker(dir: &tempfile::TempDir, handle: &StorageHandle) -> FjallStorage {
+pub(super) fn worker(dir: &tempfile::TempDir, handle: &StorageHandle) -> FjallStorage {
     let db = fjall::OptimisticTxDatabase::builder(dir.path().to_str().expect("utf-8 path"))
         .manual_journal_persist(true)
         .open()
@@ -716,7 +717,7 @@ fn serve_next(storage: &mut FjallStorage, receiver: &super::EffectReceiver) {
 }
 
 /// Polls a dispatch once: the effect is enqueued and still awaiting a reply.
-async fn poll_queued<F: Future>(future: &mut std::pin::Pin<Box<F>>) {
+pub(super) async fn poll_queued<F: Future>(future: &mut std::pin::Pin<Box<F>>) {
     assert!(
         poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx)))
             .await
@@ -1316,6 +1317,7 @@ fn unknown_commit_runs() {
         deletes: std::collections::HashMap::new(),
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
+        config_txns: std::collections::HashSet::new(),
     };
 
     let event = storage.commit_transaction(txn_id);
@@ -1364,6 +1366,7 @@ fn unknown_commit_retires() {
         deletes: std::collections::HashMap::new(),
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
+        config_txns: std::collections::HashSet::new(),
     };
 
     for _ in 0..=super::MAX_CLEANUP_ATTEMPTS {
@@ -1409,6 +1412,7 @@ fn retry_skips_queued() {
         deletes: std::collections::HashMap::new(),
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
+        config_txns: std::collections::HashSet::new(),
     };
 
     storage.retry_cleanup();

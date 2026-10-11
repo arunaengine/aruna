@@ -209,6 +209,12 @@ impl StorageHandle {
         self.metrics.in_flight.load(Ordering::Acquire)
     }
 
+    /// Count of commit attempts that may have changed a realm config row. A reader that sees a
+    /// new count also sees the committed row.
+    pub fn config_changes(&self) -> u64 {
+        self.metrics.config_changes.load(Ordering::Acquire)
+    }
+
     pub fn snapshot_metrics(&self) -> StorageMetricsSnapshot {
         StorageMetricsSnapshot {
             requests_total: self.metrics.requests_total.load(Ordering::Relaxed),
