@@ -19,6 +19,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::storage::blob::group_permission_path;
+use aruna_operations::auth::bearer_token::realm_user_cutoff;
 use aruna_operations::device::compute::{LocalExecutionConfig, submit_local_execution};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JobRouteError;
@@ -1962,6 +1963,24 @@ async fn authenticate_tes(
         || access.is_expired(SystemTime::now())
         || !secret_matches
     {
+        return Err(TesError::unauthorized());
+    }
+    // A user deactivated in this realm loses every credential issued before the cutoff.
+    let issued = Ulid::from_string(&access.access_key).map_or(0, |id| id.timestamp_ms() / 1000);
+    let cutoff = realm_user_cutoff(
+        &state.get_ctx().storage_handle,
+        state.get_realm_id(),
+        &access.user_identity,
+    )
+    .await
+    .map_err(|_| {
+        TesError::coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Revocation state is unavailable",
+            "revocation_unavailable",
+        )
+    })?;
+    if cutoff.is_some_and(|cutoff| issued < cutoff) {
         return Err(TesError::unauthorized());
     }
 
