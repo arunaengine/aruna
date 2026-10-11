@@ -316,6 +316,7 @@ mod tests {
             config.ensure_node(node(seed), RealmNodeKind::Server);
         }
         let target = DocumentTarget::UserKey {
+            realm_id: user(7).realm_id,
             user_id: user(7),
             record_id: Ulid::nil(),
         };
@@ -344,6 +345,7 @@ mod tests {
         };
         let mut operation = ReadVaultOperation::new(ReadVaultConfig {
             node_id,
+            realm_id: user(7).realm_id,
             user_id: user(7),
             query,
             deadline: Duration::from_secs(10),
@@ -389,6 +391,7 @@ mod tests {
         let rows: Vec<_> = (1..=65)
             .map(|id| {
                 let record = UserKeyRecord {
+                    realm_id: user(7).realm_id,
                     user_id: user(7),
                     record_id: Ulid::from_bytes([id; 16]),
                     key_id: format!("key-{id}"),
@@ -398,6 +401,7 @@ mod tests {
                     node_id: node(1),
                     placement: PlacementRef::NIL,
                     created_at_ms: if id == 1 || id == 65 { 2 } else { 1 },
+                    signature: None,
                 };
                 (
                     record.target().storage_key(),
@@ -454,6 +458,7 @@ mod tests {
     #[test]
     fn rejects_foreign_records() {
         let foreign = VaultRevision {
+            realm_id: user(8).realm_id,
             user_id: user(8),
             revision_id: Ulid::from_bytes([1; 16]),
             predecessors: Vec::new(),
@@ -461,6 +466,7 @@ mod tests {
             node_id: node(1),
             placement: PlacementRef::NIL,
             created_at_ms: 1,
+            signature: None,
         };
         let query = VaultQuery::Heads { auth_token: None };
         let (mut operation, _, _) = started(false, query);

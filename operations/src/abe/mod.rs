@@ -867,8 +867,8 @@ mod tests {
     #[test]
     fn fences_inactive_recipients() {
         // A deactivated user or a credential issued before the user cutoff gets no new grant.
-        use aruna_core::structs::identity::group::GroupAuthorizationDocument;
         // Only a user of another realm may lack a local user row.
+        use aruna_core::structs::identity::group::GroupAuthorizationDocument;
         use aruna_core::structs::identity::realm::{
             RealmAuthorizationDocument, RealmConfigDocument, TokenRevocation,
         };

@@ -324,6 +324,7 @@ mod tests {
 
     fn revision(id: u8, predecessors: &[u8]) -> VaultRevision {
         VaultRevision {
+            realm_id: user().realm_id,
             user_id: user(),
             revision_id: Ulid::from_bytes([id; 16]),
             predecessors: predecessors
@@ -334,6 +335,7 @@ mod tests {
             node_id: node(),
             placement: PlacementRef::NIL,
             created_at_ms: 1,
+            signature: None,
         }
     }
 
@@ -391,9 +393,28 @@ mod tests {
     }
 
     #[test]
+    fn checks_origin_signature() {
+        // Only the named node's signature over the unchanged record verifies.
+        let mut record = revision(1, &[]);
+        assert!(!record.origin_signed());
+        let bytes = record.signing_bytes().unwrap();
+        record.signature = Some(iroh::SecretKey::from_bytes(&[5; 32]).sign(&bytes));
+        assert!(record.origin_signed());
+        let mut moved = record.clone();
+        moved.realm_id = RealmId::from_bytes([4; 32]);
+        assert!(!moved.origin_signed());
+        let mut forged = record.clone();
+        forged.signature = Some(iroh::SecretKey::from_bytes(&[6; 32]).sign(&bytes));
+        assert!(!forged.origin_signed());
+        let decoded = VaultRevision::from_bytes(&record.to_bytes().unwrap()).unwrap();
+        assert!(decoded.origin_signed());
+    }
+
+    #[test]
     fn checks_key_fingerprint() {
         let public_key = [9u8; 32];
         let mut record = UserKeyRecord {
+            realm_id: user().realm_id,
             user_id: user(),
             record_id: Ulid::from_bytes([1; 16]),
             key_id: "key-1".to_string(),
@@ -403,6 +424,7 @@ mod tests {
             node_id: node(),
             placement: PlacementRef::NIL,
             created_at_ms: 1,
+            signature: None,
         };
         assert_eq!(record.validate(), Ok(()));
         record.fingerprint[0] ^= 1;

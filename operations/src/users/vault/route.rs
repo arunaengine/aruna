@@ -423,6 +423,7 @@ mod tests {
         let writes = (1..=65)
             .map(|id| {
                 let record = UserKeyRecord {
+                    realm_id: user_id.realm_id,
                     user_id,
                     record_id: Ulid::from_bytes([id; 16]),
                     key_id: format!("key-{id}"),
@@ -432,6 +433,7 @@ mod tests {
                     node_id: node(1),
                     placement: PlacementRef::NIL,
                     created_at_ms: if id == 1 || id == 65 { 2 } else { 1 },
+                    signature: None,
                 };
                 (
                     USER_KEY_KEYSPACE.to_string(),
@@ -472,6 +474,7 @@ mod tests {
     async fn tries_later_holder() {
         let effect = fetch_effect();
         let record = UserKeyRecord {
+            realm_id: effect.user_id.realm_id,
             user_id: effect.user_id,
             record_id: Ulid::from_bytes([1; 16]),
             key_id: "key-1".to_string(),
@@ -481,6 +484,7 @@ mod tests {
             node_id: node(2),
             placement: PlacementRef::NIL,
             created_at_ms: 1,
+            signature: None,
         };
         let expected = VaultRecords::Keys(vec![record]);
         let mut attempts = Vec::new();

@@ -715,6 +715,7 @@ mod tests {
             config.ensure_node(node(seed), RealmNodeKind::Server);
         }
         let target = DocumentTarget::VaultRevision {
+            realm_id: user().realm_id,
             user_id: user(),
             revision_id: Ulid::nil(),
         };
@@ -733,6 +734,7 @@ mod tests {
     fn operation(node_id: NodeId, change: VaultChange) -> AppendVaultOperation {
         AppendVaultOperation::new(AppendVaultConfig {
             node_id,
+            realm_id: user().realm_id,
             user_id: user(),
             record_id: Ulid::from_bytes([9; 16]),
             change,
@@ -759,6 +761,7 @@ mod tests {
 
     fn head(seed: u8, payload: Option<&str>) -> (Key, Value) {
         let revision = VaultRevision {
+            realm_id: user().realm_id,
             user_id: user(),
             revision_id: Ulid::from_bytes([seed; 16]),
             predecessors: Vec::new(),
@@ -766,6 +769,7 @@ mod tests {
             node_id: node(1),
             placement: PlacementRef::NIL,
             created_at_ms: 1,
+            signature: None,
         };
         (
             revision.target().storage_key(),
@@ -778,6 +782,31 @@ mod tests {
             values,
             next_start_after: None,
         }))
+    }
+
+    /// Answers the signing request as the adapter of the named node would.
+    fn signed(operation: &mut AppendVaultOperation, effects: Effects) -> Effects {
+        let Some(Effect::Net(NetEffect::VaultSign(records))) = effects.first() else {
+            panic!("expected a signing request, got {effects:?}");
+        };
+        let mut records = (**records).clone();
+        let sign = |node_id: NodeId, bytes: Vec<u8>| {
+            (1..=4)
+                .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]))
+                .find(|secret| secret.public() == node_id)
+                .unwrap()
+                .sign(&bytes)
+        };
+        match &mut records {
+            VaultRecords::Heads(heads) => heads.iter_mut().for_each(|head| {
+                head.signature = Some(sign(head.node_id, head.signing_bytes().unwrap()));
+            }),
+            VaultRecords::Keys(keys) => keys.iter_mut().for_each(|key| {
+                key.signature = Some(sign(key.node_id, key.signing_bytes().unwrap()));
+            }),
+        }
+        let event = VaultSignEvent::Signed(Box::new(records));
+        operation.step(Event::Net(NetEvent::VaultSign(event)))
     }
 
     fn written(effects: &Effects) -> Vec<(KeySpace, Key)> {
@@ -806,6 +835,7 @@ mod tests {
             &mut operation,
             vec![head(1, Some("old")), head(2, Some("other"))],
         );
+        let effects = signed(&mut operation, effects);
         let previous_row = user_record_key(user(), previous);
         assert!(matches!(
             effects.first(),
@@ -841,6 +871,45 @@ mod tests {
         };
         let ids: Vec<_> = heads.iter().map(|head| head.revision_id).collect();
         assert_eq!(ids, [Ulid::from_bytes([2; 16]), Ulid::from_bytes([9; 16])]);
+        assert!(heads[1].origin_signed());
+    }
+
+    #[test]
+    fn refuses_unsigned_records() {
+        // Changed records or a refused signature abort the transaction without a write.
+        let (config, holders) = config_bytes();
+        let change = VaultChange::PublishKey {
+            key_id: "key-1".to_string(),
+            public_key: [4; 32],
+            has_recovery: false,
+        };
+        for altered in [true, false] {
+            let mut operation = operation(holders[0], change.clone());
+            read_rows(&mut operation, config.clone()).unwrap();
+            let effects = rows(&mut operation, Vec::new());
+            let Some(Effect::Net(NetEffect::VaultSign(records))) = effects.first() else {
+                panic!("expected a signing request");
+            };
+            let VaultRecords::Keys(mut keys) = (**records).clone() else {
+                panic!("expected a key record");
+            };
+            keys[0].user_id = UserId::local(Ulid::from_bytes([8; 16]), keys[0].realm_id);
+            keys[0].signature = Some(iroh::SecretKey::from_bytes(&[1; 32]).sign(b"x"));
+            let event = if altered {
+                VaultSignEvent::Signed(Box::new(VaultRecords::Keys(keys)))
+            } else {
+                VaultSignEvent::Unavailable("no key".to_string())
+            };
+            let effects = operation.step(Event::Net(NetEvent::VaultSign(event)));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+            ));
+            assert!(matches!(
+                operation.finalize(),
+                Err(AppendVaultError::Unsigned(_))
+            ));
+        }
     }
 
     #[test]
@@ -877,6 +946,7 @@ mod tests {
         let mut operation = self::operation(holders[0], VaultChange::Delete);
         read_rows(&mut operation, config).unwrap();
         let effects = rows(&mut operation, vec![head(1, None), head(2, Some("sealed"))]);
+        let effects = signed(&mut operation, effects);
         assert!(matches!(
             effects.first(),
             Some(Effect::Storage(StorageEffect::BatchDelete { deletes, .. })) if deletes.len() == 2
@@ -916,6 +986,7 @@ mod tests {
                         })) if start == &next && *limit == MAX_VAULT_HEADS && *txn_id == Some(txn())));
                 }
             }
+            let effects = signed(&mut operation, effects);
             let Some(Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id })) =
                 effects.first()
             else {
@@ -950,6 +1021,7 @@ mod tests {
                 };
                 let marker = VaultRevision::from_bytes(bytes).unwrap();
                 assert_eq!(marker.validate(), Ok(()));
+                assert!(marker.origin_signed());
                 assert!(marker.payload.is_none());
                 assert_eq!(entry.target, marker.target());
                 assert_eq!(*change, marker.sync_change());

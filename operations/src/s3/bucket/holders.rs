@@ -157,7 +157,7 @@ mod tests {
             RealmId::from_bytes([3; 32]),
         );
 
-        let lookups = lookup_keys(&context, node_id, [user]).await;
+        let lookups = lookup_keys(&context, user.realm_id, node_id, [user]).await;
         assert_eq!(lookups.get(&user), Some(&KeyLookup::Unavailable));
     }
 }

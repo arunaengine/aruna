@@ -275,6 +275,7 @@ mod tests {
 
     fn key(user_id: UserId, seed: u8) -> UserKeyRecord {
         UserKeyRecord {
+            realm_id: user_id.realm_id,
             user_id,
             record_id: Ulid::from_bytes([seed; 16]),
             key_id: format!("slot-{seed}"),
@@ -284,6 +285,7 @@ mod tests {
             node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
             placement: PlacementRef::NIL,
             created_at_ms: 1,
+            signature: None,
         }
     }
 

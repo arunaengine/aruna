@@ -35,6 +35,7 @@ fn record(user_id: UserId) -> Ulid {
 
 fn keys(user_id: UserId, recovery: bool) -> KeyLookup {
     KeyLookup::Keys(vec![UserKeyRecord {
+        realm_id: user_id.realm_id,
         user_id,
         record_id: record(user_id),
         key_id: "slot".to_string(),
@@ -44,6 +45,7 @@ fn keys(user_id: UserId, recovery: bool) -> KeyLookup {
         node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
         placement: PlacementRef::NIL,
         created_at_ms: 1,
+        signature: None,
     }])
 }
 
