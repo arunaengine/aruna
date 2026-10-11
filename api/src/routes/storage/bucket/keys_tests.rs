@@ -276,6 +276,16 @@ async fn federated_keys_checked() {
     .await
     .unwrap();
     assert_eq!(grant.user_id, foreign.to_string());
+    let anonymous = grant_holder(
+        State(fixture.state.clone()),
+        Extension(Some(fixture.owner.clone())),
+        Path(BUCKET.to_string()),
+        Json(GrantRequest {
+            user_id: UserId::nil(RealmId([9; 32])).to_string(),
+        }),
+    )
+    .await;
+    assert!(matches!(anonymous, Err(ServerError::BadRequestReason(_))));
     let stranger = AuthContext {
         user_id: UserId::new(Ulid::generate(), RealmId([9; 32])),
         ..fixture.owner.clone()

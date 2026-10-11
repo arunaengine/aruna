@@ -572,6 +572,10 @@ pub async fn grant_holder(
 ) -> ServerResult<Json<HolderView>> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let user_id = parse_user(&request.user_id)?;
+    // Anonymous identities of any realm never hold a key.
+    if user_id.is_nil() {
+        return Err(ServerError::BadRequestReason("invalid user".into()));
+    }
     let group_id = bucket_group(&state, &bucket).await?;
     ensure_group_admin(&state, &auth, group_id).await?;
     let mut lookups = lookup_keys(
