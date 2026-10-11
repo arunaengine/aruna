@@ -550,8 +550,9 @@ async fn allow_policy(
     }
 }
 
+/// A user of another realm signed in here matches; an anonymous identity only in its own realm.
 fn auth_matches(auth: &AuthContext, realm_id: RealmId) -> bool {
-    auth.realm_id == realm_id && auth.user_id.realm_id == realm_id
+    auth.realm_id == realm_id && (auth.user_id.realm_id == realm_id || !auth.user_id.is_nil())
 }
 
 async fn manifest_policy(
@@ -1459,6 +1460,15 @@ mod tests {
         );
 
         manifest.auth_context = AuthContext::anonymous(realm_id);
+        assert_eq!(
+            manifest_policy(&context, realm_id, node_id, &manifest)
+                .await
+                .unwrap(),
+            (Some(path.clone()), None)
+        );
+
+        // A user of another realm signed in here is served like a local user.
+        manifest.auth_context.user_id = UserId::local(Ulid::generate(), foreign_realm);
         assert_eq!(
             manifest_policy(&context, realm_id, node_id, &manifest)
                 .await
