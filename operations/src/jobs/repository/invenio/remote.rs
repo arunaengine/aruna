@@ -96,7 +96,7 @@ async fn link_client<'a>(
         .map_err(|error| TransferError::Retryable(error.to_string()))?
         .filter(|secret| secret.link_id == Some(link.link_id) && secret.endpoint == link.endpoint)
         .ok_or_else(|| TransferError::Permanent("the link token was removed".into()))?;
-    let auth = creator_auth(link);
+    let auth = creator_auth(context, link);
     connect(
         context,
         &auth,
@@ -234,7 +234,7 @@ pub(crate) async fn latest_version(
         .ok_or_else(|| TransferError::Permanent("the link holds no record".into()))?;
     aruna_core::repository::invenio::validate_id(held)?;
     let local = current_event(context, link.document_id).await.ok();
-    let auth = creator_auth(link);
+    let auth = creator_auth(context, link);
     let client = connect(
         context,
         &auth,

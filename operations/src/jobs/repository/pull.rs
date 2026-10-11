@@ -123,7 +123,7 @@ pub async fn start_pull(
         .map_err(|error| LinkError::Unexpected(format!("{error:?}")))?
         .ok_or(LinkError::NotHolder)?;
     let spec = ImportRoCrateSpec {
-        auth_context: creator_auth(link),
+        auth_context: creator_auth(context, link),
         source: ImportRoCrateSource::Repository {
             group_id: link.group_id,
             connector_id: link.connector_id,

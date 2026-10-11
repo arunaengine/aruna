@@ -15,7 +15,6 @@ use aruna_core::repository::{
     RepositoryLink,
 };
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, JobState};
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
@@ -309,12 +308,7 @@ pub async fn start_push(
     let spec = ExportRoCrateSpec {
         selection: None,
         destination: Some(link.destination(publish)),
-        auth_context: AuthContext {
-            user_id: link.created_by,
-            realm_id: link.created_by.realm_id,
-            path_restrictions: None,
-            session: None,
-        },
+        auth_context: super::push::creator_auth(context, link),
         document_id: link.document_id,
         limits: link.limits.clone(),
     };
@@ -341,7 +335,7 @@ pub async fn start_push(
 
 /// Whether the link's owner still holds the dataset; an unknown placement counts as held.
 pub async fn owner_holds(context: &DriverContext, link: &RepositoryLink) -> bool {
-    let realm_id = link.created_by.realm_id;
+    let realm_id = context.serving_realm(link.created_by.realm_id);
     let Some(config) = load_realm_config(context, realm_id).await else {
         return true;
     };
