@@ -41,6 +41,13 @@ pub enum VaultRecordError {
     Fingerprint,
     #[error("a key id holds 1 to {KEY_ID_BYTES} bytes")]
     KeyId,
+    #[error("an anonymous user of another realm holds no vault")]
+    Owner,
+}
+
+/// Whether `user_id` is an anonymous identity of a realm other than `realm_id`.
+fn foreign_anonymous(user_id: UserId, realm_id: RealmId) -> bool {
+    user_id.is_nil() && user_id.realm_id != realm_id
 }
 
 /// One immutable save of a user's vault. `None` as payload records a delete.
@@ -112,6 +119,9 @@ impl VaultRevision {
         {
             return Err(VaultRecordError::TooLarge);
         }
+        if foreign_anonymous(self.user_id, self.realm_id) {
+            return Err(VaultRecordError::Owner);
+        }
         let mut seen = self.predecessors.clone();
         seen.sort_unstable();
         seen.dedup();
@@ -171,6 +181,9 @@ impl UserKeyRecord {
     pub fn validate(&self) -> Result<(), VaultRecordError> {
         if key_fingerprint(&self.public_key) != self.fingerprint {
             return Err(VaultRecordError::Fingerprint);
+        }
+        if foreign_anonymous(self.user_id, self.realm_id) {
+            return Err(VaultRecordError::Owner);
         }
         if self.key_id.is_empty() || self.key_id.len() > KEY_ID_BYTES {
             return Err(VaultRecordError::KeyId);
@@ -408,6 +421,17 @@ mod tests {
         assert!(!forged.origin_signed());
         let decoded = VaultRevision::from_bytes(&record.to_bytes().unwrap()).unwrap();
         assert!(decoded.origin_signed());
+    }
+
+    #[test]
+    fn refuses_foreign_anonymous() {
+        // A user of another realm keeps a vault here; an anonymous one of another realm does not.
+        let foreign = RealmId::from_bytes([4; 32]);
+        let mut record = revision(1, &[]);
+        record.user_id = UserId::new(Ulid::from_bytes([3; 16]), foreign);
+        assert_eq!(record.validate(), Ok(()));
+        record.user_id = UserId::nil(foreign);
+        assert_eq!(record.validate(), Err(VaultRecordError::Owner));
     }
 
     #[test]
