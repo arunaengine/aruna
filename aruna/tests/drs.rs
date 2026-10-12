@@ -8,9 +8,11 @@
 mod shared;
 
 use aruna_core::structs::storage::blob::HashIndex;
+use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::driver::drive;
+use aruna_operations::node::node_info::publish_node_info;
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aws_sdk_s3::primitives::ByteStream;
 use reqwest::StatusCode;
@@ -292,7 +294,8 @@ async fn historical_hash_resolves() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn remote_version_downloads() -> TestResult<()> {
-    let seed = spawn_seed_node().await?;
+    // Probing the owner opens a blob stream, which only a full node has.
+    let seed = spawn_complete_seed().await?;
     let onboarding_secret =
         create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server).await?;
     let joiner = spawn_complete_joiner(&seed, onboarding_secret).await?;
@@ -344,6 +347,19 @@ async fn remote_version_downloads() -> TestResult<()> {
             .send()
             .await?;
 
+        // The fixture only seeds the joiner's document locally; the seed needs its published url.
+        publish_node_info(
+            joiner.context.as_ref(),
+            joiner.config.node_id,
+            joiner.config.realm_id,
+            NodeUrls {
+                api: joiner.config.api_public_url.clone(),
+                s3: joiner.config.s3_public_url.clone(),
+            },
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+
         let object_id = VersionedObjectArn::new(
             seed.realm_id,
             joiner.config.node_id,
@@ -353,7 +369,7 @@ async fn remote_version_downloads() -> TestResult<()> {
         )?
         .to_string();
         let object_url = format!("{}/api/v1/ga4gh/drs/v1/objects/{object_id}", seed.base_url);
-        // The seed answers 503 until the joiner's info document reaches it.
+        // The seed answers 503 until the published document reaches it.
         wait_until(
             "routed DRS lookup",
             shared::WAIT_CAP,
