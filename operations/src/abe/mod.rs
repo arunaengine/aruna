@@ -12,10 +12,12 @@ pub mod rekey;
 mod requests;
 mod snapshot;
 
+use crate::driver::{DriverContext, drive};
+use crate::tasks::queue_backoff::conflict_backoff;
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect, VaultQuery};
-use aruna_core::errors::BlobError;
+use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::*;
 use aruna_core::operation::Operation;
@@ -80,6 +82,8 @@ pub enum KeyError {
     Denied,
     #[error("encryption storage is unavailable")]
     Storage,
+    #[error("a concurrent change conflicted with this key request")]
+    Conflict,
     #[error("a re-key of another prefix is unfinished in this bucket")]
     Busy,
     #[error("the bucket key is locked on this node")]
@@ -424,6 +428,29 @@ impl KeyOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 }
+const CONFLICT_RETRIES: usize = 3;
+/// Runs a key action, rerunning it from the start after a transaction conflict.
+pub async fn drive_key(
+    bucket: String,
+    auth: AuthContext,
+    node: NodeId,
+    action: KeyAction,
+    context: &DriverContext,
+) -> Result<KeyResult, KeyError> {
+    let seed = Ulid::generate().to_bytes();
+    let mut attempt = 0;
+    loop {
+        let now = aruna_core::time::unix_timestamp_millis();
+        let operation = KeyOperation::new(bucket.clone(), auth.clone(), node, action.clone(), now);
+        match drive(operation, context).await {
+            Err(KeyError::Conflict) if attempt < CONFLICT_RETRIES => {
+                tokio::time::sleep(conflict_backoff(attempt, &seed)).await;
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
 impl Operation for KeyOperation {
     type Output = KeyResult;
     type Error = KeyError;
@@ -547,6 +574,12 @@ impl Operation for KeyOperation {
             (State::Envelopes, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.envelopes_read(values)
             }
+            (
+                _,
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }),
+            ) => self.fail(KeyError::Conflict),
             (_, Event::Storage(StorageEvent::Error { .. })) => self.fail(KeyError::Storage),
             _ => self.fail(AbeError::Context),
         }
@@ -589,6 +622,32 @@ mod tests {
             operation.start().as_slice(),
             [Effect::Storage(StorageEffect::StartTransaction { .. })]
         ));
+    }
+
+    #[test]
+    fn reports_conflicts() {
+        // Only a transaction conflict is rerun by `drive_key`; other storage faults stay final.
+        let realm_id = RealmId([1; 32]);
+        let auth = AuthContext {
+            user_id: aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        for (error, expected) in [
+            (StorageError::TransactionConflict, KeyError::Conflict),
+            (StorageError::Timeout, KeyError::Storage),
+        ] {
+            let action = KeyAction::Request(KeyScope::Subtree("foo/".into()));
+            let mut operation = KeyOperation::new("bucket".into(), auth.clone(), node, action, 1);
+            operation.start();
+            let txn_id = Ulid::from_bytes([3; 16]);
+            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+            operation.step(Event::Storage(StorageEvent::Error { error }));
+            assert!(operation.is_complete());
+            assert_eq!(operation.finalize(), Err(expected));
+        }
     }
 
     #[test]

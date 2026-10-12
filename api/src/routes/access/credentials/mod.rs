@@ -8,7 +8,7 @@ use crate::server::state::ServerState;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{UserAccess, group_permission_path};
-use aruna_operations::abe::{KeyAction, KeyOperation, KeyResult};
+use aruna_operations::abe::{KeyAction, KeyResult, drive_key};
 use aruna_operations::driver::drive;
 use aruna_operations::driver::now_ms;
 use aruna_operations::s3::access::create::{
@@ -479,8 +479,7 @@ pub async fn create_s3_credentials(
                 public_key,
                 restrictions: access.path_restrictions.clone(),
             };
-            let operation = KeyOperation::new(bucket, auth.clone(), node_id, action, now_ms());
-            match drive(operation, &state.get_ctx()).await {
+            match drive_key(bucket, auth.clone(), node_id, action, &state.get_ctx()).await {
                 Ok(KeyResult::Opened(ids)) => key_requests.extend(ids.iter().map(Ulid::to_string)),
                 Ok(_) => {}
                 Err(error) => {

@@ -852,7 +852,7 @@ async fn abe_holders() -> TestResult<()> {
                 effects.extend(operation.step(event));
             }
         }
-        assert_eq!(operation.finalize(), Err(KeyError::Storage));
+        assert_eq!(operation.finalize(), Err(KeyError::Conflict));
         let record = json!(STANDARD.encode(postcard::to_allocvec(&context)?));
         let route = format!("{requests}/{}/grant", context.request.request_id);
         let (status, _) = send(http.post(&route).bearer_auth(&owner).json(&submission(&record, [1; 32], &[1; 16]))).await?;
@@ -2166,7 +2166,7 @@ async fn abe_epochs() -> TestResult<()> {
                 effects.extend(operation.step(event));
             }
         }
-        assert_eq!(operation.finalize(), Err(KeyError::Storage));
+        assert_eq!(operation.finalize(), Err(KeyError::Conflict));
         assert_eq!(epoch_row().await, Some(2u64.to_be_bytes().to_vec()));
         assert!(due_row().await.is_some());
 
@@ -2632,7 +2632,7 @@ async fn abe_merge_races() -> TestResult<()> {
         };
         let grant = grant_of(&listed().await?, leaver_id);
         let published = publish_racing(&seed, grant, removal).await?;
-        assert_eq!(published, Err(KeyError::Storage));
+        assert_eq!(published, Err(KeyError::Conflict));
         assert_eq!(
             grant_epochs(&seed, bucket_id, leaver_id).await,
             vec![vec![1]]
@@ -2650,7 +2650,7 @@ async fn abe_merge_races() -> TestResult<()> {
             Ok(())
         };
         let published = publish_racing(&seed, grant, reissue).await?;
-        assert_eq!(published, Err(KeyError::Storage));
+        assert_eq!(published, Err(KeyError::Conflict));
         assert_eq!(
             grant_epochs(&seed, bucket_id, reader_id).await,
             vec![vec![1]]

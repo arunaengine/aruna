@@ -70,7 +70,7 @@ pub(crate) fn key_error(error: KeyError) -> ServerError {
         KeyError::Abe(e) => abe_error(e),
         KeyError::Missing => ServerError::NotFound,
         KeyError::Denied => ServerError::Forbidden,
-        KeyError::Storage => ServerError::ServiceUnavailable,
+        KeyError::Storage | KeyError::Conflict => ServerError::ServiceUnavailable,
         KeyError::Busy => ServerError::Refused(StatusCode::CONFLICT, "rekey_running", message),
         KeyError::Locked => ServerError::Refused(StatusCode::CONFLICT, "bucket_locked", message),
         KeyError::Bound(_) => {

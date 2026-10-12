@@ -8,7 +8,7 @@ use aruna_core::structs::storage::abe_access::{
 };
 use aruna_operations::abe::rekey::rekey_page;
 use aruna_operations::abe::{
-    EpochDueOperation, KeyAction, KeyOperation, KeyResult, MemberKeysOperation, ReissueOperation,
+    EpochDueOperation, KeyAction, KeyResult, MemberKeysOperation, ReissueOperation, drive_key,
 };
 use axum::extract::Path;
 
@@ -134,9 +134,9 @@ async fn execute(
     bucket: String,
     action: KeyAction,
 ) -> ServerResult<KeyResult> {
-    let now = aruna_core::time::unix_timestamp_millis();
-    let operation = KeyOperation::new(bucket, auth, state.get_node_id(), action, now);
-    drive(operation, &state.get_ctx()).await.map_err(key_error)
+    drive_key(bucket, auth, state.get_node_id(), action, &state.get_ctx())
+        .await
+        .map_err(key_error)
 }
 /// Opens key requests for members in the group's encrypted buckets and returns open ids.
 pub(crate) async fn member_requests(
