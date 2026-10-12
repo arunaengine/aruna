@@ -1,4 +1,4 @@
-//! Tests DRS object lookup by content hash, covering a missing and a historical hash.
+//! Tests DRS object lookup by content hash and the download of a version owned by another node.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,6 +8,7 @@
 mod shared;
 
 use aruna_core::structs::storage::blob::HashIndex;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
@@ -17,8 +18,9 @@ use serde_json::Value;
 use shared::{
     TestResult, create_bearer_token, create_group_http, create_onboarding_secret,
     create_s3_credentials, s3_client, shutdown_pair, spawn_complete_joiner, spawn_complete_seed,
-    spawn_seed_node, wait_group_http, wait_realm_nodes,
+    spawn_seed_node, wait_group_http, wait_realm_nodes, wait_until,
 };
+use std::time::Duration;
 use ulid::Ulid;
 
 const FIXTURE_BYTES: &[u8] = b"drs placeholder fixture bytes";
@@ -280,6 +282,119 @@ async fn historical_hash_resolves() -> TestResult<()> {
         );
         assert_eq!(download_body.as_ref(), old_body.as_slice());
 
+        Ok(())
+    }
+    .await;
+
+    shutdown_pair(joiner, seed).await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_version_downloads() -> TestResult<()> {
+    let seed = spawn_seed_node().await?;
+    let onboarding_secret =
+        create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server).await?;
+    let joiner = spawn_complete_joiner(&seed, onboarding_secret).await?;
+
+    let result = async {
+        wait_realm_nodes(
+            &[seed.context.as_ref(), joiner.context.as_ref()],
+            &seed.realm_id,
+            2,
+        )
+        .await?;
+        let bearer_token = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&seed.base_url, &bearer_token, "drs-remote-e2e").await?;
+        wait_group_http(&joiner.base_url, &bearer_token, &group.group_id).await?;
+
+        let joiner_s3 = joiner
+            .s3
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("joiner node did not start S3 server"))?;
+        let credentials =
+            create_s3_credentials(&joiner.base_url, &bearer_token, &group.group_id).await?;
+        let s3 = s3_client(joiner_s3, &credentials);
+
+        let bucket = "drs-remote-e2e";
+        let key = "fixtures/versioned.txt";
+        let old_body = fixture_bytes();
+        s3.create_bucket().bucket(bucket).send().await?;
+        let old_put = s3
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(old_body.clone()))
+            .send()
+            .await?;
+        let old_version_id = Ulid::from_string(old_put.version_id().ok_or_else(|| {
+            std::io::Error::other("first put_object did not return a version id")
+        })?)?;
+        // A newer head proves the download is pinned to the requested version.
+        s3.put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(b"newer remote head".to_vec()))
+            .send()
+            .await?;
+
+        let object_id = VersionedObjectArn::new(
+            seed.realm_id,
+            joiner.config.node_id,
+            bucket,
+            key,
+            old_version_id,
+        )?
+        .to_string();
+        let object_url = format!("{}/api/v1/ga4gh/drs/v1/objects/{object_id}", seed.base_url);
+        // The seed answers 503 until the joiner's info document reaches it.
+        wait_until(
+            "routed DRS lookup",
+            shared::WAIT_CAP,
+            Duration::from_millis(200),
+            || {
+                let request = reqwest::Client::new()
+                    .get(&object_url)
+                    .bearer_auth(&bearer_token);
+                async move {
+                    request
+                        .send()
+                        .await
+                        .is_ok_and(|response| response.status() == StatusCode::OK)
+                }
+            },
+        )
+        .await?;
+        let object_body: Value = reqwest::Client::new()
+            .get(&object_url)
+            .bearer_auth(&bearer_token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        let access_url = object_body["access_methods"][0]["access_url"]["url"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other(format!("no access url: {object_body}")))?;
+        let published = "https://api.joiner.example.test";
+        let path = access_url
+            .strip_prefix(published)
+            .ok_or_else(|| std::io::Error::other(format!("not the owner's url: {access_url}")))?;
+        assert!(path.starts_with("/api/v1/ga4gh/drs/v1/download?object_id="));
+
+        // The published url is not routable in tests, so the same path goes to the owner's listener.
+        let download = reqwest::Client::new()
+            .get(format!("{}{path}", joiner.base_url))
+            .bearer_auth(&bearer_token)
+            .send()
+            .await?;
+        assert_eq!(download.status(), StatusCode::OK);
+        assert_eq!(download.bytes().await?.as_ref(), old_body.as_slice());
         Ok(())
     }
     .await;

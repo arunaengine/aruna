@@ -575,7 +575,7 @@ async fn routed_uses_origin() {
         Ulid::from_bytes([5u8; 16]),
     )
     .unwrap();
-    let mut resolved = ResolvedObject {
+    let resolved = ResolvedObject {
         bucket: "mybucket".to_string(),
         key: "path/file.txt".to_string(),
         group_id: Ulid::from_bytes([4u8; 16]),
@@ -597,11 +597,6 @@ async fn routed_uses_origin() {
             encode_component(&arn.to_string())
         )
     );
-
-    // An owner without a published url gets no access method rather than a local one.
-    resolved.origin = None;
-    let response = build_object_response("https://local.example", &resolved);
-    assert!(response.access_methods.is_empty());
 }
 
 // A lost historical observation is not a server fault, drift is transient,

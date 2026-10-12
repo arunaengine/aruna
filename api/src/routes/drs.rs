@@ -363,7 +363,7 @@ objects.
   establishes absence: within one bounded probe budget the answer is its own 404, 403 or the
   object's metadata.
 - Only the owning node serves the bytes, so a routed answer's access method is a download URL on
-  the owner's published API URL; an owner without one gets no access method.
+  the owner's published API URL; an owner that published none is unavailable (503).
 - A content-hash identifier resolves against every object on this node carrying that content and
   returns the first one the caller may read, so the same digest can resolve differently for
   different callers.
@@ -416,7 +416,7 @@ objects.
         (status = 400, description = "The identifier is not one of the accepted forms, or its content hash, key encoding or version is malformed", body = DrsErrorPayload),
         (status = 403, description = "The caller presented a token but may not read the object, or the token belongs to another realm", body = DrsErrorPayload),
         (status = 404, description = "No such object on this node, or an anonymous caller may not read it, which is deliberately indistinguishable", body = DrsErrorPayload),
-        (status = 503, description = "The node owning the identifier could not answer within the request's probe budget, so absence was never established; the caller may retry", body = DrsErrorPayload)
+        (status = 503, description = "The node owning the identifier could not answer within the request's probe budget, or has published no API URL to download from; the caller may retry", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -467,7 +467,8 @@ anonymous caller resolves only publicly readable objects.
 - At most 100 identifiers may be named, and a longer list is rejected before anything is resolved.
 
 **Errors**: a per-identifier failure is reported inside its own entry as `{status_code, msg}`.
-- An owner that did not answer inside the budget is 503, never an absence.
+- An owner that did not answer inside the budget, or published no API URL, is 503, never an
+  absence.
 - An unreadable object is 403 for a token-bearing caller and 404 for an anonymous one.
 - An object that could not be serialized is 500."#,
     request_body(
@@ -879,7 +880,9 @@ async fn resolve_routed(
     let (Some(group_id), Some(size)) = (summary.group_id, summary.blob_size) else {
         return Ok(ResolveOutcome::Unavailable);
     };
-    let origin = owner_origin(state, arn.node_id).await?;
+    let Some(origin) = owner_origin(state, arn.node_id).await? else {
+        return Ok(ResolveOutcome::Unavailable);
+    };
     Ok(ResolveOutcome::Found(ResolvedObject {
         bucket: arn.bucket.clone(),
         key: arn.key.clone(),
@@ -891,7 +894,7 @@ async fn resolve_routed(
         hashes: summary.hashes.into_iter().collect(),
         source_metadata: None,
         location: None,
-        origin,
+        origin: Some(origin),
     }))
 }
 
