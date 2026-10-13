@@ -573,6 +573,7 @@ mod tests {
     use super::*;
     use crate::connectors::repository::{delete_secret_effect, write_secret_effect};
     use crate::driver::drive;
+    use crate::node::usage_stats::RebuildStatsOperation;
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::StorageEffect;
@@ -994,6 +995,17 @@ mod tests {
         assert_eq!(global_usage.objects, 1);
         assert_eq!(global_usage.logical_bytes, 5);
         assert_eq!(global_usage.referenced_bytes, 8);
+
+        // A recount from the stored rows books the same charges.
+        drive(RebuildStatsOperation::new(), context).await.unwrap();
+        assert_eq!(
+            read_usage_counters(context, usage_group_key(group_id)).await,
+            group_usage
+        );
+        assert_eq!(
+            read_usage_counters(context, global_group_key(group_id)).await,
+            global_usage
+        );
     }
 
     #[tokio::test]
