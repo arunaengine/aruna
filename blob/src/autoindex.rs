@@ -154,7 +154,7 @@ impl<'guard> HttpIndexClient<'guard> {
             request = request.basic_auth(username, self.password.as_deref());
         }
         let mut response = request.send().await.map_err(|error| {
-            StagingSourceError::ListError(format!("http request failed: {error}"))
+            StagingSourceError::ListError(format!("http request failed: {}", error.without_url()))
         })?;
 
         let status = response.status();
@@ -193,7 +193,7 @@ impl<'guard> HttpIndexClient<'guard> {
         }
         let mut body: Vec<u8> = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|error| {
-            StagingSourceError::ListError(format!("http request failed: {error}"))
+            StagingSourceError::ListError(format!("http request failed: {}", error.without_url()))
         })? {
             if body.len() + chunk.len() > MAX_INDEX_BYTES {
                 return Err(StagingSourceError::ListError(
@@ -889,6 +889,86 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, StagingSourceError::ListError(_)));
 
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn index_size_bounded() {
+        let page = index_page("/", "<a href=\"a.txt\">a.txt</a>  19-Jul-2026 10:01  10\n");
+        let exact = format!("{page}{}", " ".repeat(MAX_INDEX_BYTES - page.len()));
+        let over = format!("{exact} ");
+        let (server, endpoint) = spawn_index_server(vec![
+            ("/exact/", "text/html", exact),
+            ("/over/", "text/html", over),
+        ])
+        .await;
+        let list = async |root: &str| {
+            let config = HashMap::from([
+                ("endpoint".to_string(), endpoint.clone()),
+                ("root".to_string(), root.to_string()),
+            ]);
+            list_http_autoindex(&test_guard(), &config, "", 0, 10, false, false).await
+        };
+
+        let (entries, _) = list("exact").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        let error = list("over").await.unwrap_err();
+        assert!(
+            matches!(&error, StagingSourceError::ListError(message) if message.contains("size limit")),
+            "{error:?}"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn errors_hide_credentials() {
+        const CANARY: &str = "canary-346-index";
+        let (server, endpoint) = spawn_index_server(vec![(
+            "/",
+            "application/json",
+            "{\"not\":\"an index\"}".to_string(),
+        )])
+        .await;
+        // Accepts and closes every connection, so each request fails in transport.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closing = format!("http://{}/", listener.local_addr().unwrap());
+        let closer = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+
+        let token = HashMap::from([("token".to_string(), CANARY.to_string())]);
+        let password = HashMap::from([
+            ("username".to_string(), "reader".to_string()),
+            ("password".to_string(), CANARY.to_string()),
+        ]);
+        let mut shown = Vec::new();
+        for (endpoint, secret) in [
+            (endpoint.clone(), token.clone()),
+            (endpoint, password.clone()),
+            (closing.clone(), token),
+            (closing.clone(), password),
+            // A key written into the address query must not come back either.
+            (format!("{closing}?token={CANARY}"), HashMap::new()),
+        ] {
+            let mut config = secret;
+            config.insert("endpoint".to_string(), endpoint);
+            let error = list_http_autoindex(&test_guard(), &config, "", 0, 10, false, false)
+                .await
+                .unwrap_err();
+            shown.push(format!("{error} {error:?}"));
+        }
+        assert_eq!(shown.len(), 5);
+        assert!(shown[4].contains("http request failed"), "{}", shown[4]);
+        for text in shown {
+            assert!(!text.contains(CANARY), "{text}");
+        }
+
+        closer.abort();
         server.abort();
         let _ = server.await;
     }

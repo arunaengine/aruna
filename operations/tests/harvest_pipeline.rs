@@ -51,6 +51,7 @@ use axum::Router;
 use axum::extract::Query;
 use axum::routing::get;
 use byteview::ByteView;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -1279,7 +1280,7 @@ async fn parse_failures_classified() -> Result<(), BoxError> {
     Ok(())
 }
 
-/// A response larger than the decoded-byte cap is rejected instead of buffered.
+/// A response that declares more than the byte cap is rejected before it is read.
 #[tokio::test]
 async fn oversized_body_rejected() -> Result<(), BoxError> {
     let fixture = build_fixture().await?;
@@ -1291,12 +1292,126 @@ async fn oversized_body_rejected() -> Result<(), BoxError> {
     let outcome = run(&fixture, &source).await;
     let error = failure(&outcome);
     assert!(
-        error.message.contains("byte cap"),
+        error.message.contains("declares 34603008 bytes"),
         "unexpected failure: {error:?}"
     );
     assert_eq!(error.kind, JobErrorKind::Permanent);
 
     server.abort();
+    fixture.stop().await;
+    Ok(())
+}
+
+/// Answers each ListRecords request with `answer` as written, or closes without answering
+/// when it is empty. Identify gets a 500, which the harvest ignores.
+async fn serve_raw(answer: Vec<u8>) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), BoxError> {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+    let address = listener.local_addr()?;
+    let answer = Arc::new(answer);
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let answer = answer.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let identify = request.windows(13).any(|window| window == b"verb=Identify");
+                let bytes: &[u8] = if identify {
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    &answer
+                };
+                let _ = socket.write_all(bytes).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    Ok((address, server))
+}
+
+const BODY_CAP: usize = 32 * 1024 * 1024;
+
+fn unsized_body(length: usize, chunked: bool) -> Vec<u8> {
+    let mut answer = b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nConnection: close\r\n".to_vec();
+    if chunked {
+        answer.extend_from_slice(
+            format!("Transfer-Encoding: chunked\r\n\r\n{length:x}\r\n").as_bytes(),
+        );
+    } else {
+        answer.extend_from_slice(b"\r\n");
+    }
+    answer.resize(answer.len() + length, b'x');
+    if chunked {
+        answer.extend_from_slice(b"\r\n0\r\n\r\n");
+    }
+    answer
+}
+
+/// Without a declared length the cap is enforced while reading and counts body bytes after
+/// chunk framing is removed: a body at the cap is read in full, one more byte is refused.
+#[tokio::test]
+async fn stream_cap_bounds() -> Result<(), BoxError> {
+    let fixture = build_fixture().await?;
+    for chunked in [false, true] {
+        for (length, capped) in [(BODY_CAP, false), (BODY_CAP + 1, true)] {
+            let (address, server) = serve_raw(unsized_body(length, chunked)).await?;
+            let source = seed_source(&fixture, &format!("http://{address}/oai")).await?;
+            let outcome = run(&fixture, &source).await;
+            // A body without records is an empty listing, so reading it in full succeeds.
+            match (&outcome, capped) {
+                (JobRunOutcome::Succeeded(_), false) => {}
+                (JobRunOutcome::Failed(error), true) => {
+                    assert!(
+                        error.message.contains("body exceeds the 33554432 byte cap"),
+                        "{error:?}"
+                    );
+                    assert_eq!(error.kind, JobErrorKind::Permanent);
+                }
+                _ => panic!("chunked {chunked}, {length} bytes: {}", describe(&outcome)),
+            }
+            server.abort();
+        }
+    }
+    fixture.stop().await;
+    Ok(())
+}
+
+/// Credentials written into a provider address must not reach the stored job failure.
+#[tokio::test]
+async fn failures_hide_userinfo() -> Result<(), BoxError> {
+    const CANARY: &str = "canary-346-harvest";
+    let fixture = build_fixture().await?;
+    let unavailable =
+        b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 30\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let mut hosts = Vec::new();
+    let mut servers = Vec::new();
+    for answer in [
+        Vec::new(),
+        unavailable.to_vec(),
+        unsized_body(BODY_CAP + 1, false),
+    ] {
+        let (address, server) = serve_raw(answer).await?;
+        hosts.push(address.to_string());
+        servers.push(server);
+    }
+    // A private address is refused by the egress screen before any connection.
+    hosts.push("10.0.0.1".to_string());
+
+    for host in hosts {
+        let endpoint = format!("http://harvester:{CANARY}@{host}/oai");
+        let source = seed_source(&fixture, &endpoint).await?;
+        let outcome = run(&fixture, &source).await;
+        let shown = format!("{:?}", failure(&outcome));
+        assert!(!shown.contains(CANARY), "{host}: {shown}");
+    }
+    for server in servers {
+        server.abort();
+    }
     fixture.stop().await;
     Ok(())
 }

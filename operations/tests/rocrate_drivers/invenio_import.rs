@@ -445,7 +445,9 @@ async fn invenio_rejects_corruption() -> Result<(), Box<dyn std::error::Error>> 
             claim_context(&fixture, job_id(), JobPayload::ImportRoCrate(spec.clone())).await?;
         match run_rocrate_import(&ctx, &spec).await {
             JobRunOutcome::Failed(error) => {
-                assert!(error.message.contains(expected), "{}", error.message)
+                assert!(error.message.contains(expected), "{}", error.message);
+                // The connector token was sent with these requests; the failure must not hold it.
+                assert!(!format!("{error:?}").contains("repository-token"));
             }
             _ => panic!("invalid repository input was accepted"),
         }
