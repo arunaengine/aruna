@@ -464,6 +464,25 @@ pub(crate) async fn wait_group_http(
     get_group_http(base_url, bearer_token, group_id).await
 }
 
+/// Waits until the caller's membership reached the node; the group itself syncs first.
+pub(crate) async fn wait_group_member(
+    base_url: &str,
+    bearer_token: &str,
+    group_id: &str,
+) -> TestResult<()> {
+    wait_until(
+        "group membership over REST",
+        WAIT_CAP,
+        Duration::from_millis(100),
+        || async {
+            get_group_http(base_url, bearer_token, group_id)
+                .await
+                .is_ok_and(|group| group.dataset_location.is_some())
+        },
+    )
+    .await
+}
+
 pub(crate) async fn create_s3_credentials(
     base_url: &str,
     bearer_token: &str,
