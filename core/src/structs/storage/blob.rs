@@ -10,7 +10,9 @@ use crate::credential_encryption::{
 use crate::errors::{BlobError, ConversionError};
 use crate::id::NodeId;
 use crate::structs::checksum::HASH_BLAKE3;
+use crate::structs::execution::offered_directory::OFFERED_DIRECTORY_BUCKET;
 use crate::structs::execution::source_access::SourceMetadata;
+use crate::structs::execution::source_connector::SourceConnectorKind;
 use crate::structs::execution::staging::VersionSourceBinding;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
@@ -1219,6 +1221,29 @@ impl BlobVersion {
         self.state.advance_count()
     }
 
+    /// Size of an offered directory observation stored at this bucket and key.
+    /// A copy to another bucket or key is an ordinary reference and yields `None`.
+    pub fn offered_size(&self, bucket: &str, key: &str) -> Option<u64> {
+        let BlobVersionState::Reference {
+            source,
+            cached_metadata,
+            ..
+        } = &self.state
+        else {
+            return None;
+        };
+        let descriptor = &source.descriptor;
+        (source.connector_id.is_none()
+            && descriptor.kind == SourceConnectorKind::LocalDirectory
+            && descriptor
+                .public_config
+                .get(OFFERED_DIRECTORY_BUCKET)
+                .map(String::as_str)
+                == Some(bucket)
+            && descriptor.source_path == key)
+            .then_some(cached_metadata.content_length)
+    }
+
     pub fn is_deleted(&self) -> bool {
         self.state.is_deleted()
     }
@@ -1495,6 +1520,45 @@ mod tests {
 
     fn pointer(generation: u64, seed: u8) -> CurrentVersionPointer {
         CurrentVersionPointer::new_with_generation(Ulid::from_bytes([seed; 16]), generation)
+    }
+
+    #[test]
+    fn offered_size_narrow() {
+        // A copy to another bucket or key, or a connector binding, is an ordinary reference.
+        let observation = |kind, connector_id| {
+            let source = VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind,
+                    public_config: HashMap::from([(
+                        super::OFFERED_DIRECTORY_BUCKET.to_string(),
+                        "photos".to_string(),
+                    )]),
+                    source_path: "trip/one.jpg".to_string(),
+                    version_selector: None,
+                    capabilities: Vec::new(),
+                    origin_node_id: None,
+                },
+                connector_id,
+            };
+            let metadata = SourceMetadata {
+                content_length: 42,
+                content_type: None,
+                etag: None,
+                last_modified: None,
+                source_version: None,
+            };
+            let now = SystemTime::UNIX_EPOCH;
+            BlobVersion::reference(source, metadata, now, UserId::default(), now)
+        };
+        let offered = observation(SourceConnectorKind::LocalDirectory, None);
+        assert_eq!(offered.offered_size("photos", "trip/one.jpg"), Some(42));
+        assert_eq!(offered.offered_size("album", "trip/one.jpg"), None);
+        assert_eq!(offered.offered_size("photos", "trip/copy.jpg"), None);
+        let bound = observation(SourceConnectorKind::LocalDirectory, Some(Ulid::nil()));
+        assert_eq!(bound.offered_size("photos", "trip/one.jpg"), None);
+        let remote = observation(SourceConnectorKind::Http, None);
+        assert_eq!(remote.offered_size("photos", "trip/one.jpg"), None);
     }
 
     #[test]

@@ -795,12 +795,11 @@ impl RebuildStatsOperation {
                     let version = BlobVersion::from_bytes(value.as_ref())?;
                     let version_key = VersionKey::from_bytes(key.as_ref())?;
                     let object = (version_key.bucket.clone(), version_key.key.clone());
-                    if self
+                    let current = self
                         .current_versions
                         .get(&object)
-                        .is_some_and(|version_id| *version_id == version_key.version_id)
-                        && !version.is_deleted()
-                    {
+                        .is_some_and(|version_id| *version_id == version_key.version_id);
+                    if current && !version.is_deleted() {
                         let delta = UsageCounters {
                             objects: 1,
                             ..Default::default()
@@ -815,6 +814,11 @@ impl RebuildStatsOperation {
                         }
                     }
 
+                    // An offered directory is charged only for its current observations.
+                    let charged = current
+                        || version
+                            .offered_size(&version_key.bucket, &version_key.key)
+                            .is_none();
                     let Some((logical_bytes, referenced_bytes)) = (match version.state {
                         BlobVersionState::Materialized { blob_hash, .. } => {
                             let size = self.blob_sizes.get(blob_hash.as_slice()).copied();
@@ -825,7 +829,7 @@ impl RebuildStatsOperation {
                         }
                         BlobVersionState::Reference {
                             cached_metadata, ..
-                        } => Some((0, cached_metadata.content_length)),
+                        } => charged.then_some((0, cached_metadata.content_length)),
                         BlobVersionState::PendingContent { archive, .. } => {
                             let size = self.pending_sizes.get(&archive.to_bytes()).copied();
                             if size.is_none() {
@@ -2559,6 +2563,72 @@ mod tests {
             operation.groups.get(&group_id).unwrap().referenced_bytes,
             1_000_000
         );
+    }
+
+    #[test]
+    fn offered_history_uncharged() {
+        // Only the head observation of an offered file is charged. A copy of the
+        // binding under another key is an ordinary reference and stays charged.
+        let group_id = Ulid::generate();
+        let row = |key: &str, version_id: Ulid, content_length: u64| {
+            let source = VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::LocalDirectory,
+                    public_config: HashMap::from([(
+                        aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_BUCKET
+                            .to_string(),
+                        "offered".to_string(),
+                    )]),
+                    source_path: "data.bin".to_string(),
+                    version_selector: None,
+                    capabilities: Vec::new(),
+                    origin_node_id: None,
+                },
+                connector_id: None,
+            };
+            let metadata = SourceMetadata {
+                content_length,
+                content_type: None,
+                etag: None,
+                last_modified: None,
+                source_version: None,
+            };
+            let now = SystemTime::UNIX_EPOCH;
+            let version = BlobVersion::reference(source, metadata, now, Default::default(), now);
+            (
+                ByteView::from(
+                    VersionKey::new("offered", key, version_id)
+                        .to_bytes()
+                        .unwrap(),
+                ),
+                ByteView::from(version.to_bytes().unwrap()),
+            )
+        };
+        let head = Ulid::from_parts(2, 0);
+        let mut operation = RebuildStatsOperation::new();
+        operation.state = RebuildStatsState::ScanVersions;
+        operation
+            .bucket_groups
+            .insert("offered".to_string(), group_id);
+        operation
+            .current_versions
+            .insert(("offered".to_string(), "data.bin".to_string()), head);
+
+        operation
+            .consume_values(&[
+                row("data.bin", Ulid::from_parts(1, 0), 3),
+                row("data.bin", head, 11),
+                row("copy.bin", Ulid::from_parts(3, 0), 5),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            operation.groups.get(&group_id).unwrap().referenced_bytes,
+            16
+        );
+        assert_eq!(operation.global.referenced_bytes, 16);
+        assert_eq!(operation.groups.get(&group_id).unwrap().objects, 1);
     }
 
     #[test]
