@@ -26,7 +26,8 @@ def wait(description, check):
 
 def refs(api):
     status, body = http(f"{api}/api/v1/metadata/{os.environ['ARUNA_DOCUMENT_ID']}/git")
-    return json.loads(body)["refs"] if status == 200 else None
+    # A pending answer shows the last completed state, which the holder may not serve yet.
+    return None if status != 200 or (state := json.loads(body))["pending"] else state["refs"]
 
 
 def converged():
