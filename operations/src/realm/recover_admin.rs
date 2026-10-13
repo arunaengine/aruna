@@ -356,6 +356,7 @@ mod tests {
             .await
             .unwrap();
             consume(&context, &interrupted, "claimant-a").await.unwrap();
+            context.storage_handle.close().await;
         }
 
         let context = context_at(&path);

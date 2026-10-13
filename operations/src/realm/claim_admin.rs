@@ -909,7 +909,8 @@ mod tests {
 
         net_handle.shutdown().await;
         drop(net_handle);
-        let DriverContext { storage_handle, .. } = context;
+        let storage_handle = context.storage_handle.clone();
+        drop(context);
         storage_handle.close().await;
 
         let reopened = DriverContext {
