@@ -887,4 +887,54 @@ mod tests {
 
         net_handle.shutdown().await;
     }
+
+    // The committed claim must hold after a restart, even with no saved claim flag.
+    #[tokio::test]
+    async fn claim_survives_reopen() {
+        let (context, net_handle, realm_id, node_id, temp_dir) = setup_context().await;
+        let admin_id = UserId::local(Ulid::generate(), realm_id);
+        let claimed = drive(
+            ClaimInitialOperation::new(ClaimInitialInput {
+                actor: Actor {
+                    node_id,
+                    user_id: admin_id,
+                    realm_id,
+                },
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(claimed, ClaimInitialResult::Claimed(_)));
+
+        net_handle.shutdown().await;
+        drop(net_handle);
+        let storage_handle = context.storage_handle.clone();
+        drop(context);
+        storage_handle.close().await;
+
+        let reopened = DriverContext {
+            storage_handle: storage::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap(),
+            blob_handle: None,
+            net_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
+        };
+        for user_id in [admin_id, UserId::local(Ulid::generate(), realm_id)] {
+            let result = drive(
+                ClaimInitialOperation::new(ClaimInitialInput {
+                    actor: Actor {
+                        node_id,
+                        user_id,
+                        realm_id,
+                    },
+                }),
+                &reopened,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, ClaimInitialResult::AlreadyClaimed);
+        }
+    }
 }

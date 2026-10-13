@@ -7,7 +7,7 @@ use crate::auth::{OidcValidator, handle_token};
 use crate::routes::access::sessions::{CreateSessionRequest, CreateSessionResponse};
 use crate::server::Server;
 use crate::server::ServerConfig;
-use crate::server::state::ServerState;
+use crate::server::state::{ADMIN_CLAIMED_KEY, ServerState, load_persisted_state};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -26,12 +26,14 @@ use aruna_core::structs::identity::user::User;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_operations::realm::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
 use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
@@ -239,6 +241,14 @@ async fn read_realm_config(driver_ctx: &DriverContext, realm_id: &RealmId) -> Re
 }
 
 async fn spawn_test_node(provider: OidcProviderConfig, claim_initial_admin: bool) -> TestNode {
+    spawn_node(provider, claim_initial_admin, false).await
+}
+
+async fn spawn_node(
+    provider: OidcProviderConfig,
+    claim_initial_admin: bool,
+    claims_on_register: bool,
+) -> TestNode {
     let temp_dir = tempfile::tempdir().unwrap();
     let storage_handle = FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
     let net_handle = NetHandle::new(
@@ -350,7 +360,7 @@ async fn spawn_test_node(provider: OidcProviderConfig, claim_initial_admin: bool
             realm_id,
             node_id,
             NodeCapabilities::management_node(realm_signing_key).unwrap(),
-            false,
+            claims_on_register,
             Some(Arc::new(OidcValidator::new().unwrap())),
             aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
@@ -1000,6 +1010,160 @@ async fn registration_consumes_secret() {
         .unwrap();
 
     assert_eq!(second_response.status(), StatusCode::UNAUTHORIZED);
+
+    node.server_task.abort();
+    node.net.shutdown().await;
+    oidc_task.abort();
+}
+
+async fn register_status(node: &TestNode, oidc_token: &str, onboarding_secret: &str) -> StatusCode {
+    reqwest::Client::new()
+        .post(format!("{}/api/v1/access/users/register", node.base_url))
+        .bearer_auth(oidc_token)
+        .json(&RegisterUserRequest {
+            onboarding_secret: Some(onboarding_secret.to_string()),
+        })
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn secrets_status(node: &TestNode, token: &str) -> StatusCode {
+    reqwest::Client::new()
+        .get(format!(
+            "{}/api/v1/access/onboarding/secrets",
+            node.base_url
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+// A crash after the secret was consumed but before the administrator claim
+// leaves a used secret and no administrator.
+#[tokio::test]
+async fn burned_secret_recovers() {
+    let issuer = "https://issuer.example";
+    let kid = "main-key";
+    let signing_key = generate_signing_key();
+    let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+    let node = spawn_node(provider, false, true).await;
+
+    let burned = create_local_secret(&node).await;
+    let decoded = OnboardingSecret::decode(&burned).unwrap();
+    drive(
+        ConsumeSecretOperation::new(ConsumeSecretInput {
+            enrollment_id: decoded.enrollment_id,
+            secret_hash: decoded.secret_hash(),
+            node_id: UserId::local(Ulid::generate(), node.realm_id).to_string(),
+            now: super::now_timestamp(),
+        }),
+        node.context.as_ref(),
+    )
+    .await
+    .unwrap();
+
+    let retry_token = sign_oidc_token(issuer, kid, &signing_key, "admin", Some("Admin"), None);
+    assert_eq!(
+        register_status(&node, &retry_token, &burned).await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let replacement = OnboardingSecret {
+        seed_url: node.base_url.clone(),
+        enrollment_id: Ulid::generate(),
+        secret: [8u8; 32],
+        mode: OnboardingMode::Server,
+        realm_id: node.realm_id,
+        purpose: OnboardingPurpose::InitialAdministrator,
+    };
+    drive(
+        RecoverInitialOperation::new(RecoverInitialInput {
+            record: OnboardingSecretRecord {
+                enrollment_id: replacement.enrollment_id,
+                secret_hash: replacement.secret_hash(),
+                mode: OnboardingMode::Server,
+                purpose: OnboardingPurpose::InitialAdministrator,
+                expires_at: u64::MAX,
+                claimed_node_id: None,
+            },
+        }),
+        node.context.as_ref(),
+    )
+    .await
+    .unwrap();
+    let replacement = replacement.encode().unwrap();
+
+    assert_eq!(
+        register_status(&node, &retry_token, &burned).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let (_, admin_token) = register_via_oidc(
+        &node,
+        issuer,
+        kid,
+        &signing_key,
+        "admin",
+        "Admin",
+        Some(replacement.clone()),
+    )
+    .await;
+    assert_eq!(secrets_status(&node, &admin_token).await, StatusCode::OK);
+
+    let other_token = sign_oidc_token(issuer, kid, &signing_key, "other", Some("Other"), None);
+    assert_eq!(
+        register_status(&node, &other_token, &replacement).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        load_persisted_state::<bool>(node.context.as_ref(), ADMIN_CLAIMED_KEY).await,
+        Some(true)
+    );
+
+    node.server_task.abort();
+    node.net.shutdown().await;
+    oidc_task.abort();
+}
+
+// The claim is committed but the claim flag was never saved, as after a crash
+// between the two writes.
+#[tokio::test]
+async fn restart_keeps_administrator() {
+    let issuer = "https://issuer.example";
+    let kid = "main-key";
+    let signing_key = generate_signing_key();
+    let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+    let node = spawn_node(provider, true, true).await;
+    assert_eq!(
+        load_persisted_state::<bool>(node.context.as_ref(), ADMIN_CLAIMED_KEY).await,
+        None
+    );
+
+    let onboarding_secret = create_local_secret(&node).await;
+    let (_, late_token) = register_via_oidc(
+        &node,
+        issuer,
+        kid,
+        &signing_key,
+        "late",
+        "Late",
+        Some(onboarding_secret),
+    )
+    .await;
+
+    assert_eq!(
+        secrets_status(&node, &late_token).await,
+        StatusCode::FORBIDDEN
+    );
+    let admin_token = sign_aruna_token(&node, node.realm_admin_id, None);
+    assert_eq!(secrets_status(&node, &admin_token).await, StatusCode::OK);
+    assert_eq!(
+        load_persisted_state::<bool>(node.context.as_ref(), ADMIN_CLAIMED_KEY).await,
+        Some(true)
+    );
 
     node.server_task.abort();
     node.net.shutdown().await;

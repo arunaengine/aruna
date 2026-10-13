@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    backoff, node_is_ready, prepare_core_documents, publish_core_documents, sync_peer_topic,
-    sync_with_retry, unique_user_topic, watch_target_needed,
+    backoff, ensure_onboarding_secret, node_is_ready, prepare_core_documents,
+    publish_core_documents, sync_peer_topic, sync_with_retry, unique_user_topic,
+    watch_target_needed,
 };
 use crate::identity::PersistedNodeIdentity;
 use aruna_core::NodeId;
@@ -12,6 +13,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, WATCH_INTEREST_KEYSPACE};
+use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
 use aruna_core::structs::execution::notification_watch::{
     WatchEventKind, WatchEventMask, WatchInterestDigest, WatchInterestEntry, interest_dirty_key,
     interest_node_key,
@@ -20,8 +22,11 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::interest::publish_watch_interest;
+use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
+use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
+use aruna_operations::realm::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
 use aruna_operations::sync::document_outbox::read_outbox_records;
 use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::tasks::incoming::OutboxDrainer;
@@ -724,4 +729,93 @@ async fn existing_watch_digest() {
         .unwrap();
 
     assert_eq!(read_digest(&context, realm_id, node_id).await, digest);
+}
+
+fn admin_record(secret_hash: &str) -> OnboardingSecretRecord {
+    OnboardingSecretRecord {
+        enrollment_id: ulid::Ulid::generate(),
+        secret_hash: secret_hash.to_string(),
+        mode: OnboardingMode::Server,
+        purpose: OnboardingPurpose::InitialAdministrator,
+        expires_at: u64::MAX,
+        claimed_node_id: None,
+    }
+}
+
+async fn consume_secret(
+    context: &DriverContext,
+    enrollment_id: ulid::Ulid,
+    secret_hash: String,
+) -> bool {
+    drive(
+        ConsumeSecretOperation::new(ConsumeSecretInput {
+            enrollment_id,
+            secret_hash,
+            node_id: "claimant".to_string(),
+            now: 1,
+        }),
+        context,
+    )
+    .await
+    .is_ok()
+}
+
+// A crash after the secret record commit leaves no encrypted copy of the secret.
+#[tokio::test]
+async fn interrupted_secret_retries() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let realm_id = RealmId::from_bytes([7u8; 32]);
+    let seed_url = "http://127.0.0.1:1".to_string();
+    let orphan = admin_record("orphan");
+
+    let interrupted = context(FjallStorage::open(path).unwrap());
+    drive(
+        CreateSecretOperation::new(CreateSecretInput {
+            record: orphan.clone(),
+        }),
+        &interrupted,
+    )
+    .await
+    .unwrap();
+    interrupted.storage_handle.close().await;
+
+    let retried = context(FjallStorage::open(path).unwrap());
+    let secret = ensure_onboarding_secret(&retried, seed_url.clone(), &[3u8; 32], realm_id)
+        .await
+        .unwrap();
+    assert_ne!(secret.enrollment_id, orphan.enrollment_id);
+    retried.storage_handle.close().await;
+
+    let reopened = context(FjallStorage::open(path).unwrap());
+    let reloaded = ensure_onboarding_secret(&reopened, seed_url.clone(), &[3u8; 32], realm_id)
+        .await
+        .unwrap();
+    assert_eq!(reloaded.enrollment_id, secret.enrollment_id);
+    assert_eq!(reloaded.secret, secret.secret);
+    assert!(
+        ensure_onboarding_secret(&reopened, seed_url, &[4u8; 32], realm_id)
+            .await
+            .is_err()
+    );
+    assert!(consume_secret(&reopened, secret.enrollment_id, secret.secret_hash()).await);
+
+    let replacement = admin_record("replacement");
+    drive(
+        RecoverInitialOperation::new(RecoverInitialInput {
+            record: replacement.clone(),
+        }),
+        &reopened,
+    )
+    .await
+    .unwrap();
+    assert!(!consume_secret(&reopened, orphan.enrollment_id, orphan.secret_hash).await);
+    assert!(
+        consume_secret(
+            &reopened,
+            replacement.enrollment_id,
+            replacement.secret_hash
+        )
+        .await
+    );
 }

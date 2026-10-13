@@ -288,13 +288,106 @@ impl Operation for RecoverInitialOperation {
 mod tests {
     use super::{RecoverInitialInput, RecoverInitialOperation};
     use crate::driver::{DriverContext, drive};
-    use crate::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
+    use crate::onboarding::consume_secret::{
+        ConsumeSecretError, ConsumeSecretInput, ConsumeSecretOperation,
+    };
     use crate::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
     use crate::onboarding::list_secrets::ListSecretsOperation;
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    fn context_at(path: &str) -> DriverContext {
+        DriverContext {
+            storage_handle: storage::FjallStorage::open(path).unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        }
+    }
+
+    fn admin_record(secret_hash: &str) -> OnboardingSecretRecord {
+        OnboardingSecretRecord {
+            enrollment_id: Ulid::generate(),
+            secret_hash: secret_hash.to_string(),
+            mode: OnboardingMode::Server,
+            purpose: OnboardingPurpose::InitialAdministrator,
+            expires_at: u64::MAX,
+            claimed_node_id: None,
+        }
+    }
+
+    async fn consume(
+        context: &DriverContext,
+        record: &OnboardingSecretRecord,
+        claimant: &str,
+    ) -> Result<Option<String>, ConsumeSecretError> {
+        drive(
+            ConsumeSecretOperation::new(ConsumeSecretInput {
+                enrollment_id: record.enrollment_id,
+                secret_hash: record.secret_hash.clone(),
+                node_id: claimant.to_string(),
+                now: 1,
+            }),
+            context,
+        )
+        .await
+        .map(|consumed| consumed.record.claimed_node_id)
+    }
+
+    // A crash after the secret was consumed but before the administrator claim
+    // leaves a used secret and no administrator.
+    #[tokio::test]
+    async fn recovers_after_reopen() {
+        let tempdir = tempdir().unwrap();
+        let path = tempdir.path().to_str().unwrap().to_string();
+        let interrupted = admin_record("interrupted");
+        {
+            let context = context_at(&path);
+            drive(
+                CreateSecretOperation::new(CreateSecretInput {
+                    record: interrupted.clone(),
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+            consume(&context, &interrupted, "claimant-a").await.unwrap();
+            context.storage_handle.close().await;
+        }
+
+        let context = context_at(&path);
+        assert_eq!(
+            consume(&context, &interrupted, "claimant-b").await,
+            Err(ConsumeSecretError::AlreadyClaimed)
+        );
+
+        let replacement = admin_record("replacement");
+        drive(
+            RecoverInitialOperation::new(RecoverInitialInput {
+                record: replacement.clone(),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            consume(&context, &interrupted, "claimant-b").await,
+            Err(ConsumeSecretError::AlreadyClaimed)
+        );
+        assert_eq!(
+            consume(&context, &replacement, "claimant-b").await,
+            Ok(Some("claimant-b".to_string()))
+        );
+        assert_eq!(
+            consume(&context, &interrupted, "claimant-a").await,
+            Ok(Some("claimant-a".to_string()))
+        );
+    }
 
     #[tokio::test]
     async fn replaces_unclaimed_admin() {

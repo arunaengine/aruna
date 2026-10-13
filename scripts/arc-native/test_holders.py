@@ -26,7 +26,8 @@ def wait(description, check):
 
 def refs(api):
     status, body = http(f"{api}/api/v1/metadata/{os.environ['ARUNA_DOCUMENT_ID']}/git")
-    return json.loads(body)["refs"] if status == 200 else None
+    # A pending answer shows the last completed state, which the holder may not serve yet.
+    return None if status != 200 or (state := json.loads(body))["pending"] else state["refs"]
 
 
 def converged():
@@ -56,8 +57,9 @@ def exercise(root):
     content = (a / payload).read_bytes()
     command(a, env, "lfs", "push", "origin", "main")
     command(a, env, "push", "origin", "main")
-    state = wait("the second holder did not receive the push",
-                 lambda: (s := converged()) and s["refs/heads/main"] != first["refs/heads/main"] and s)
+    # The push moves main twice: to the pushed commit, then to the metadata merge commit.
+    state = wait("the second holder did not receive the merged push",
+                 lambda: (s := converged()) and s["refs/heads/main"] not in (first["refs/heads/main"], pushed) and s)
     main = state["refs/heads/main"]
     command(a, env, "fetch", "origin")
     command(a, env, "merge-base", "--is-ancestor", pushed, main)
