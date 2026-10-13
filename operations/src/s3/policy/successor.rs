@@ -647,7 +647,10 @@ impl SuccessorMint {
         let Some(group_id) = self.group_id else {
             return Err(SuccessorError::BucketChanged);
         };
-        let delta = successor_usage(&successor, location.as_ref());
+        let mut delta = successor_usage(&successor, location.as_ref());
+        // An offered directory observation is charged only while it is the head.
+        let released = predecessor.offered_size(&self.plan.context.bucket, &self.plan.context.key);
+        delta.referenced_bytes -= i128::from(released.unwrap_or(0));
         self.quota_bytes = u64::try_from(delta.logical_bytes).unwrap_or_default();
         self.usage = Some(UsageCounterUpdate::for_group(group_id, delta));
         self.outcome = Some(SuccessorOutcome::Minted {
@@ -1905,6 +1908,38 @@ mod pure_tests {
         assert_eq!(counters.referenced_bytes, REFERENCE_BYTES);
         assert_eq!(counters.logical_bytes, 0);
         assert_eq!(counters.objects, 0);
+    }
+
+    #[test]
+    fn offered_successor_uncharged() {
+        // The successor of a head observation takes over its charge, so the
+        // group is charged once and no counter moves.
+        let mut observation = reference();
+        if let aruna_core::structs::storage::blob::BlobVersionState::Reference { source, .. } =
+            &mut observation.state
+        {
+            source.descriptor.kind =
+                aruna_core::structs::execution::source_connector::SourceConnectorKind::LocalDirectory;
+            source.descriptor.source_path = OBJECT.to_string();
+            source.descriptor.public_config.insert(
+                aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_BUCKET
+                    .to_string(),
+                BUCKET.to_string(),
+            );
+        }
+        let policy = verified(1, Some(node_id()));
+        let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
+        mint.plan.resolved = resolution(&policy);
+        drive_to_copy(&mut mint, &observation).expect("writes follow");
+
+        let written = Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        });
+        let effects = mint
+            .step(written, Some(Ulid::from_parts(4, 4)))
+            .expect("the write settles");
+        assert!(effects.is_none());
+        assert_eq!(mint.state, MintState::Done);
     }
 
     #[test]
