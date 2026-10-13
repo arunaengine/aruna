@@ -8,7 +8,7 @@ use crate::download::{self, AdmissionError};
 use crate::error::ServerError;
 use crate::forwarded::{client_ip, external_base_url};
 use crate::rate_limit::LocalKey;
-use crate::server::state::ServerState;
+use crate::server::state::{RestInterfaceRuntime, ServerState};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BackendLocation, object_permission_path};
@@ -17,6 +17,7 @@ use aruna_core::structs::storage::replication::{
 };
 use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::driver::{drive, drive_until};
+use aruna_operations::node::node_info::read_info_documents;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use aruna_operations::replication::protocol::LocationSummaryRequest;
@@ -220,6 +221,8 @@ struct ResolvedObject {
     source_metadata: Option<SourceMetadata>,
     /// Present only when the bytes live here; a routed resolve reports metadata.
     location: Option<BackendLocation>,
+    /// The owning node's published base URL when the bytes live there.
+    origin: Option<String>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -359,7 +362,8 @@ objects.
 - A versioned identifier naming another node of this realm is probed at that node, which alone
   establishes absence: within one bounded probe budget the answer is its own 404, 403 or the
   object's metadata.
-- Only the owning node serves the bytes, so a routed answer advertises no access method.
+- Only the owning node serves the bytes, so a routed answer's access method is a download URL on
+  the owner's published API URL; an owner that published none is unavailable (503).
 - A content-hash identifier resolves against every object on this node carrying that content and
   returns the first one the caller may read, so the same digest can resolve differently for
   different callers.
@@ -412,7 +416,7 @@ objects.
         (status = 400, description = "The identifier is not one of the accepted forms, or its content hash, key encoding or version is malformed", body = DrsErrorPayload),
         (status = 403, description = "The caller presented a token but may not read the object, or the token belongs to another realm", body = DrsErrorPayload),
         (status = 404, description = "No such object on this node, or an anonymous caller may not read it, which is deliberately indistinguishable", body = DrsErrorPayload),
-        (status = 503, description = "The node owning the identifier could not answer within the request's probe budget, so absence was never established; the caller may retry", body = DrsErrorPayload)
+        (status = 503, description = "The node owning the identifier could not answer within the request's probe budget, or has published no API URL to download from; the caller may retry", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -463,7 +467,8 @@ anonymous caller resolves only publicly readable objects.
 - At most 100 identifiers may be named, and a longer list is rejected before anything is resolved.
 
 **Errors**: a per-identifier failure is reported inside its own entry as `{status_code, msg}`.
-- An owner that did not answer inside the budget is 503, never an absence.
+- An owner that did not answer inside the budget, or published no API URL, is 503, never an
+  absence.
 - An unreadable object is 403 for a token-bearing caller and 404 for an anonymous one.
 - An object that could not be serialized is 500."#,
     request_body(
@@ -740,17 +745,20 @@ fn build_object_response(base_url: &str, resolved: &ResolvedObject) -> DrsObject
     } else {
         vec![resolved.canonical_w3id.clone()]
     };
-    // Only the owning node can serve the bytes, so a routed answer advertises none.
-    let access_methods = resolved
-        .location
-        .iter()
-        .map(|_| DrsAccessMethod {
+    // Only the owning node serves the bytes, so a routed answer points at its origin.
+    let origin = match resolved.location {
+        Some(_) => Some(base_url),
+        None => resolved.origin.as_deref(),
+    };
+    let access_methods = origin
+        .into_iter()
+        .map(|origin| DrsAccessMethod {
             access_id: ACCESS_ID_HTTPS.to_string(),
             kind: "https".to_string(),
             region: None,
             access_url: Some(DrsAccessUrl {
                 url: format!(
-                    "{base_url}/api/v1/ga4gh/drs/v1/download?object_id={}",
+                    "{origin}/api/v1/ga4gh/drs/v1/download?object_id={}",
                     encode_component(&resolved.requested_id)
                 ),
                 headers: HashMap::new(),
@@ -872,6 +880,9 @@ async fn resolve_routed(
     let (Some(group_id), Some(size)) = (summary.group_id, summary.blob_size) else {
         return Ok(ResolveOutcome::Unavailable);
     };
+    let Some(origin) = owner_origin(state, arn.node_id).await? else {
+        return Ok(ResolveOutcome::Unavailable);
+    };
     Ok(ResolveOutcome::Found(ResolvedObject {
         bucket: arn.bucket.clone(),
         key: arn.key.clone(),
@@ -883,7 +894,26 @@ async fn resolve_routed(
         hashes: summary.hashes.into_iter().collect(),
         source_metadata: None,
         location: None,
+        origin: Some(origin),
     }))
+}
+
+/// The owner's published base URL, or `None` when it has not published one.
+async fn owner_origin(
+    state: &ServerState,
+    node_id: aruna_core::NodeId,
+) -> Result<Option<String>, DrsError> {
+    let documents = read_info_documents(&state.get_ctx(), &[node_id])
+        .await
+        .map_err(DrsError::internal)?;
+    let Some(published) = documents.get(&node_id).and_then(|doc| doc.urls.api.clone()) else {
+        return Ok(None);
+    };
+    // The published url is absolute, so no bind address is used.
+    let unused = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+    Ok(Some(
+        RestInterfaceRuntime::from_bind_address(unused, Some(&published)).base_url,
+    ))
 }
 
 async fn resolve_versioned(
@@ -960,6 +990,7 @@ async fn resolve_versioned(
         hashes: location.hashes.clone().into_iter().collect(),
         source_metadata: head.source_metadata,
         location: Some(location),
+        origin: None,
     }))
 }
 
@@ -1046,6 +1077,7 @@ async fn resolve_content_hash(
             hashes: location.hashes.clone().into_iter().collect(),
             source_metadata: head.source_metadata,
             location: Some(location),
+            origin: None,
         }));
     }
 

@@ -5,7 +5,8 @@
 use super::{
     DATA_PREFIX, DrsBulkBody, GetObjectError, MAX_OBJECT_IDS, RequestedObjectId, ResolveOutcome,
     ResolvedObject, build_object_response, download_error, drs_denied_error, encode_component,
-    get_authorizations, get_object, parse_object_id, post_objects, resolve_object, routed_deadline,
+    get_authorizations, get_object, owner_origin, parse_object_id, post_objects, resolve_object,
+    routed_deadline,
 };
 use crate::openapi::ApiDoc;
 use crate::server::state::ServerState;
@@ -441,6 +442,7 @@ fn canonical_response_complete() {
         size: 42,
         hashes: materialized_location(blake3).hashes.into_iter().collect(),
         location: Some(materialized_location(blake3)),
+        origin: None,
         source_metadata: Some(SourceMetadata {
             content_length: 42,
             content_type: Some("application/octet-stream".to_string()),
@@ -495,6 +497,7 @@ fn content_response_aliases() {
         size: 42,
         hashes: materialized_location(blake3).hashes.into_iter().collect(),
         location: Some(materialized_location(blake3)),
+        origin: None,
         source_metadata: Some(SourceMetadata {
             content_length: 42,
             content_type: Some("application/octet-stream".to_string()),
@@ -515,6 +518,83 @@ fn content_response_aliases() {
         format!(
             "https://drs.example.test/api/v1/ga4gh/drs/v1/download?object_id={}",
             encode_component(&requested_id)
+        )
+    );
+}
+
+#[tokio::test]
+async fn routed_uses_origin() {
+    use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+    use aruna_core::structs::storage::node_info::{
+        AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
+    };
+
+    let (_dir, state) = test_state().await;
+    let owner = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+    assert_eq!(owner_origin(&state, owner).await.unwrap(), None);
+    let document = NodeInfoDocument {
+        node_id: owner,
+        executors: Vec::new(),
+        labels: Default::default(),
+        urls: NodeUrls {
+            api: Some("https://owner.example/".to_string()),
+            s3: None,
+        },
+        utilization: NodeUtilization {
+            storage_bytes_used: 0,
+            documents_held: None,
+            load_permille: None,
+            heartbeat_at_ms: 1_700_000_000_000,
+        },
+        updated_at_ms: 1_700_000_000_500,
+        epoch: AdvertisementEpoch {
+            membership_generation: 1,
+            publisher_generation: 1,
+            observed_at_ms: 1_700_000_000_500,
+        },
+        compute_draining: false,
+        leaving: false,
+        demand: Default::default(),
+        reservation: Default::default(),
+    };
+    write_fixture(
+        &state,
+        NODE_INFO_KEYSPACE,
+        node_info_key(owner),
+        document.to_bytes().unwrap(),
+    )
+    .await;
+    let origin = owner_origin(&state, owner).await.unwrap();
+    assert_eq!(origin.as_deref(), Some("https://owner.example"));
+
+    let arn = VersionedObjectArn::new(
+        state.get_realm_id(),
+        owner,
+        "mybucket",
+        "path/file.txt",
+        Ulid::from_bytes([5u8; 16]),
+    )
+    .unwrap();
+    let resolved = ResolvedObject {
+        bucket: "mybucket".to_string(),
+        key: "path/file.txt".to_string(),
+        group_id: Ulid::from_bytes([4u8; 16]),
+        version_id: Ulid::from_bytes([5u8; 16]),
+        canonical_w3id: arn.to_w3id(),
+        requested_id: arn.to_string(),
+        size: 42,
+        hashes: Default::default(),
+        source_metadata: None,
+        location: None,
+        origin,
+    };
+    let response = build_object_response("https://local.example", &resolved);
+    assert_eq!(response.access_methods.len(), 1);
+    assert_eq!(
+        response.access_methods[0].access_url.as_ref().unwrap().url,
+        format!(
+            "https://owner.example/api/v1/ga4gh/drs/v1/download?object_id={}",
+            encode_component(&arn.to_string())
         )
     );
 }
