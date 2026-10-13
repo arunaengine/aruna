@@ -894,6 +894,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn index_size_bounded() {
+        let page = index_page("/", "<a href=\"a.txt\">a.txt</a>  19-Jul-2026 10:01  10\n");
+        let exact = format!("{page}{}", " ".repeat(MAX_INDEX_BYTES - page.len()));
+        let over = format!("{exact} ");
+        let (server, endpoint) = spawn_index_server(vec![
+            ("/exact/", "text/html", exact),
+            ("/over/", "text/html", over),
+        ])
+        .await;
+        let list = async |root: &str| {
+            let config = HashMap::from([
+                ("endpoint".to_string(), endpoint.clone()),
+                ("root".to_string(), root.to_string()),
+            ]);
+            list_http_autoindex(&test_guard(), &config, "", 0, 10, false, false).await
+        };
+
+        let (entries, _) = list("exact").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        let error = list("over").await.unwrap_err();
+        assert!(
+            matches!(&error, StagingSourceError::ListError(message) if message.contains("size limit")),
+            "{error:?}"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn errors_hide_credentials() {
+        const CANARY: &str = "canary-346-index";
+        let (server, endpoint) = spawn_index_server(vec![(
+            "/",
+            "application/json",
+            "{\"not\":\"an index\"}".to_string(),
+        )])
+        .await;
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused = format!("http://{}/", closed.local_addr().unwrap());
+        drop(closed);
+
+        let mut shown = Vec::new();
+        for endpoint in [endpoint, refused] {
+            for secret in [
+                HashMap::from([("token".to_string(), CANARY.to_string())]),
+                HashMap::from([
+                    ("username".to_string(), "reader".to_string()),
+                    ("password".to_string(), CANARY.to_string()),
+                ]),
+            ] {
+                let mut config = secret;
+                config.insert("endpoint".to_string(), endpoint.clone());
+                let error = list_http_autoindex(&test_guard(), &config, "", 0, 10, false, false)
+                    .await
+                    .unwrap_err();
+                shown.push(format!("{error} {error:?}"));
+            }
+        }
+        assert_eq!(shown.len(), 4);
+        for text in shown {
+            assert!(!text.contains(CANARY), "{text}");
+        }
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn strict_blocks_index() {
         // The autoindex client is no longer a raw reqwest client.
         let (server, endpoint) =
