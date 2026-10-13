@@ -423,6 +423,7 @@ fn create_error(error: CreateConnectorError) -> ServerError {
         CreateConnectorError::EmptyName
         | CreateConnectorError::EmptyEndpoint
         | CreateConnectorError::AmbiguousEndpoint(_)
+        | CreateConnectorError::EndpointCredentials
         | CreateConnectorError::InsecureEndpoint
         | CreateConnectorError::UnknownPublicKey(_)
         | CreateConnectorError::UnknownSecretKey(_)

@@ -76,6 +76,8 @@ pub enum CreateConnectorError {
     EmptyEndpoint,
     #[error("endpoint `{0}` must be spelled as the http client parses it")]
     AmbiguousEndpoint(String),
+    #[error("connector endpoint must not contain credentials")]
+    EndpointCredentials,
     #[error("repository endpoint must use https outside loopback")]
     InsecureEndpoint,
     #[error("repository connector does not accept public key `{0}`")]
@@ -203,6 +205,12 @@ pub fn validate_connector(
     }
     if endpoint.trim().is_empty() {
         return Err(CreateConnectorError::EmptyEndpoint);
+    }
+    // The endpoint is stored and listed in the clear, and the error must not repeat a password.
+    if url::Url::parse(endpoint)
+        .is_ok_and(|url| !url.username().is_empty() || url.password().is_some())
+    {
+        return Err(CreateConnectorError::EndpointCredentials);
     }
     // Every fetch is built from this string, so a spelling the http client
     // reads as another host fails here rather than at first use.
@@ -424,6 +432,25 @@ mod tests {
             invenio("https://zenodo.org/api/?q=1", &[], &[]),
             Err(CreateConnectorError::AmbiguousEndpoint(_))
         ));
+    }
+
+    #[test]
+    fn endpoint_credentials_refused() {
+        for kind in [
+            RepositoryConnectorKind::OaiPmh,
+            RepositoryConnectorKind::Invenio,
+        ] {
+            for endpoint in [
+                "https://harvester:canary-346-connector@oai.example.org/oai",
+                "https://canary-346-connector@oai.example.org/oai",
+            ] {
+                let error =
+                    validate_connector("repo", kind, endpoint, &HashMap::new(), &HashMap::new())
+                        .unwrap_err();
+                assert_eq!(error, CreateConnectorError::EndpointCredentials);
+                assert!(!format!("{error} {error:?}").contains("canary"));
+            }
+        }
     }
 
     // a wrong event in the write state errors
