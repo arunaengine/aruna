@@ -20,7 +20,7 @@ use serde_json::Value;
 use shared::{
     TestResult, create_bearer_token, create_group_http, create_onboarding_secret,
     create_s3_credentials, s3_client, shutdown_pair, spawn_complete_joiner, spawn_complete_seed,
-    spawn_seed_node, wait_group_http, wait_realm_nodes, wait_until,
+    spawn_seed_node, wait_group_member, wait_realm_nodes, wait_until,
 };
 use std::time::Duration;
 use ulid::Ulid;
@@ -157,7 +157,7 @@ async fn historical_hash_resolves() -> TestResult<()> {
 
         let group =
             create_group_http(&seed.base_url, &bearer_token, "drs-historical-hash-e2e").await?;
-        wait_group_http(&joiner.base_url, &bearer_token, &group.group_id).await?;
+        wait_group_member(&joiner.base_url, &bearer_token, &group.group_id).await?;
 
         let joiner_s3 = joiner
             .s3
@@ -315,7 +315,7 @@ async fn remote_version_downloads() -> TestResult<()> {
         )
         .await?;
         let group = create_group_http(&seed.base_url, &bearer_token, "drs-remote-e2e").await?;
-        wait_group_http(&joiner.base_url, &bearer_token, &group.group_id).await?;
+        wait_group_member(&joiner.base_url, &bearer_token, &group.group_id).await?;
 
         let joiner_s3 = joiner
             .s3
