@@ -1784,41 +1784,22 @@ async fn realm_group_usage(
     Ok(total)
 }
 
-/// Reads the realm-wide total from the summed cache, falling back to an
-/// on-the-fly recompute when the cache entry has not been materialized yet.
+/// Sums the realm-wide total from the live local counters and the remote snapshots, the
+/// same rows quota admission counts. The stored sum can be older than a local write.
 pub async fn load_realm_usage(
     ctx: &DriverContext,
     local_node_id: NodeId,
     scope: RealmUsageScope,
 ) -> Result<UsageCounters, String> {
     let storage = &ctx.storage_handle;
-    let cache_key = match scope {
-        RealmUsageScope::Global => Key::from(SUMMARY_GLOBAL_KEY.to_vec()),
-        RealmUsageScope::Group(group_id) => Key::from(usage_summary_key(group_id)),
-    };
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: NODE_STATS_KEYSPACE.to_string(),
-            key: cache_key,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => UsageCounters::from_bytes(bytes.as_ref()).map_err(|e| e.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => match scope {
-            RealmUsageScope::Global => {
-                let active_node_ids = active_usage_nodes(ctx).await?;
-                realm_global_usage(storage, local_node_id, active_node_ids.as_ref()).await
-            }
-            RealmUsageScope::Group(group_id) => {
-                let active_node_ids = active_usage_nodes(ctx).await?;
-                realm_group_usage(storage, local_node_id, group_id, active_node_ids.as_ref()).await
-            }
-        },
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected realm usage read event: {other:?}")),
+    let active_node_ids = active_usage_nodes(ctx).await?;
+    match scope {
+        RealmUsageScope::Global => {
+            realm_global_usage(storage, local_node_id, active_node_ids.as_ref()).await
+        }
+        RealmUsageScope::Group(group_id) => {
+            realm_group_usage(storage, local_node_id, group_id, active_node_ids.as_ref()).await
+        }
     }
 }
 

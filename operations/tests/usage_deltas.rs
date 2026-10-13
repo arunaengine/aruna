@@ -6,7 +6,10 @@
 #![recursion_limit = "256"]
 
 use aruna_core::structs::storage::format::Compression;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
@@ -29,12 +32,15 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::storage::usage::{
-    NodeUsageSnapshot, UsageCounters, global_shard_keys, usage_group_key, usage_snapshot_key,
+    NodeUsageSnapshot, UsageCounters, dirty_group_key, global_shard_keys, usage_group_key,
+    usage_snapshot_key,
 };
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::records::HeadAliasContext;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::node::usage_stats::RebuildStatsOperation;
+use aruna_operations::node::usage_stats::{
+    RealmUsageScope, RebuildStatsOperation, load_realm_usage, recompute_usage_summary,
+};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
 use aruna_operations::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
@@ -58,7 +64,7 @@ use aruna_operations::s3::object::put::{
 use aruna_operations::s3::policy::successor::{
     MintSuccessorOperation, SuccessorOutcome, SuccessorPlan,
 };
-use aruna_storage::storage;
+use aruna_storage::{StorageHandle, storage};
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -72,11 +78,15 @@ struct Harness {
 
 async fn setup() -> Harness {
     let temp_dir = tempfile::tempdir().unwrap();
+    let storage_handle = storage::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+    setup_on(temp_dir, storage_handle).await
+}
+
+async fn setup_on(temp_dir: TempDir, storage_handle: StorageHandle) -> Harness {
     let temp_root = temp_dir.path().to_str().unwrap();
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
 
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
         .await
         .unwrap();
@@ -1143,4 +1153,276 @@ async fn mint_books_bytes() {
     assert_eq!(group.logical_bytes, 2 * size);
 
     assert_matches_rebuild(&h.driver).await;
+}
+
+async fn reported_bytes(h: &Harness, group_id: Ulid) -> u64 {
+    load_realm_usage(&h.driver, h.node_id, RealmUsageScope::Group(group_id))
+        .await
+        .unwrap()
+        .logical_bytes
+}
+
+/// The usage the quota gate counts for the group, read from a refused one-byte write.
+async fn admitted_bytes(h: &Harness, group_id: Ulid) -> u64 {
+    match try_put_object(h, "bucket", "probe.bin", group_id, &[0u8; 1], Some(0)).await {
+        Err(PutObjectError::QuotaExceeded { usage, .. }) => usage - 1,
+        other => panic!("expected a quota refusal, got {other:?}"),
+    }
+}
+
+/// The usage shown for a group is the usage its quota is enforced on, also after the
+/// realm sum was cached and local writes followed.
+#[tokio::test]
+async fn report_matches_admission() {
+    let h = setup().await;
+    let group_id = Ulid::generate();
+    create_bucket(&h, "bucket", group_id).await;
+    put_object(&h, "bucket", "a.bin", group_id, &[1u8; 10]).await;
+    inject_group_snapshot(&h, group_id, remote_node(9), 80).await;
+    assert_eq!(admitted_bytes(&h, group_id).await, 90);
+    assert_eq!(reported_bytes(&h, group_id).await, 90);
+
+    recompute_usage_summary(&h.driver, h.node_id, false, vec![group_id])
+        .await
+        .unwrap();
+    put_object(&h, "bucket", "b.bin", group_id, &[2u8; 5]).await;
+    let version = put_object(&h, "bucket", "c.bin", group_id, &[3u8; 7]).await;
+    delete_object(&h, "bucket", "c.bin", group_id, Some(version.version_id)).await;
+    assert_eq!(admitted_bytes(&h, group_id).await, 95);
+    assert_eq!(reported_bytes(&h, group_id).await, 95);
+
+    // A publish clears the marker; a stored sum that is older than that must not be shown.
+    delete_key(&h.driver, NODE_STATS_KEYSPACE, dirty_group_key(group_id)).await;
+    assert_eq!(reported_bytes(&h, group_id).await, 95);
+}
+
+/// A node whose storage runs behind a proxy. Once armed, the proxy keeps the answer of the
+/// next commit that books usage forever, with or without applying the commit first.
+struct Faulty {
+    h: Harness,
+    real: StorageHandle,
+    fault: Arc<Mutex<Option<bool>>>,
+    hit: tokio::sync::mpsc::UnboundedReceiver<()>,
+    stop: Arc<AtomicBool>,
+    forwarders: Vec<std::thread::JoinHandle<()>>,
+}
+
+async fn setup_faulty() -> Faulty {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let real = storage::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+    let (proxy, receivers) = real.proxy_channels();
+    let fault: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (hit_tx, hit) = tokio::sync::mpsc::unbounded_channel();
+    let mut forwarders = Vec::new();
+    for lane in [receivers.foreground, receivers.bulk] {
+        let (real, fault, stop, hit_tx) =
+            (real.clone(), fault.clone(), stop.clone(), hit_tx.clone());
+        forwarders.push(std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut booking = HashSet::new();
+            let mut held = Vec::new();
+            // Handles of stopped background work may outlive the node, so the loop polls `stop`.
+            while !stop.load(Ordering::Acquire) {
+                let Ok((effect, response, _span, _queued, in_flight)) =
+                    lane.recv_timeout(Duration::from_millis(20))
+                else {
+                    continue;
+                };
+                let lost = match &effect {
+                    StorageEffect::AddUsage { txn_id, .. } => {
+                        booking.insert(*txn_id);
+                        None
+                    }
+                    StorageEffect::CommitTransaction { txn_id } if booking.contains(txn_id) => {
+                        fault.lock().unwrap().take()
+                    }
+                    _ => None,
+                };
+                if lost == Some(false) {
+                    held.push((response, in_flight));
+                    let _ = hit_tx.send(());
+                    continue;
+                }
+                let Event::Storage(event) = runtime.block_on(real.send_storage_effect(effect))
+                else {
+                    unreachable!("storage answers with storage events");
+                };
+                if lost.is_some() {
+                    held.push((response, in_flight));
+                    let _ = hit_tx.send(());
+                } else {
+                    let _ = response.send(event);
+                }
+            }
+        }));
+    }
+    Faulty {
+        h: setup_on(temp_dir, proxy).await,
+        real,
+        fault,
+        hit,
+        stop,
+        forwarders,
+    }
+}
+
+impl Faulty {
+    /// Runs `action` until the proxy lost its commit, then stops the node as a crash would
+    /// and opens the same storage again.
+    async fn crash_during<R>(
+        mut self,
+        applied: bool,
+        action: impl AsyncFnOnce(&Harness) -> R,
+    ) -> Harness {
+        *self.fault.lock().unwrap() = Some(applied);
+        {
+            let mut action = std::pin::pin!(action(&self.h));
+            tokio::select! {
+                _ = &mut action => panic!("the action finished before its commit was lost"),
+                hit = self.hit.recv() => hit.expect("storage proxy stopped"),
+            }
+        }
+        let Harness {
+            _temp_dir,
+            driver,
+            realm_id,
+            node_id,
+            created_by,
+        } = self.h;
+        if let Some(net_handle) = driver.net_handle.as_ref() {
+            net_handle.shutdown().await;
+        }
+        drop(driver);
+        self.stop.store(true, Ordering::Release);
+        tokio::task::spawn_blocking(move || {
+            for forwarder in self.forwarders {
+                forwarder.join().unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        self.real.close().await;
+        let storage_handle =
+            storage::FjallStorage::open(_temp_dir.path().to_str().unwrap()).unwrap();
+        Harness {
+            _temp_dir,
+            driver: DriverContext {
+                storage_handle,
+                net_handle: None,
+                blob_handle: None,
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            },
+            realm_id,
+            node_id,
+            created_by,
+        }
+    }
+}
+
+/// After a restart the group holds `(objects, logical_bytes)`, the counters equal a
+/// recount, and the marker that asks for the usage to be published exists only when
+/// the interrupted commit was applied.
+async fn assert_settled(h: &Harness, group_id: Ulid, expected: (u64, u64), applied: bool) {
+    let group = read_group(&h.driver, group_id).await;
+    assert_eq!((group.objects, group.logical_bytes), expected);
+    assert_matches_rebuild(&h.driver).await;
+    let marker = read_key(&h.driver, NODE_STATS_KEYSPACE, dirty_group_key(group_id)).await;
+    assert_eq!(marker.is_some(), applied);
+}
+
+async fn delete_key(ctx: &DriverContext, key_space: &str, key: Vec<u8>) {
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+        other => panic!("unexpected delete event: {other:?}"),
+    }
+}
+
+/// A write whose commit never reached storage charges nothing; one whose commit was applied
+/// but never answered is charged exactly once.
+#[tokio::test]
+async fn interrupted_put_settles() {
+    for (applied, expected) in [(false, (0, 0)), (true, (1, 10))] {
+        let node = setup_faulty().await;
+        let group_id = Ulid::generate();
+        create_bucket(&node.h, "bucket", group_id).await;
+        // Earlier writes set the marker too, so only a fresh one proves this commit.
+        delete_key(
+            &node.h.driver,
+            NODE_STATS_KEYSPACE,
+            dirty_group_key(group_id),
+        )
+        .await;
+        let h = node
+            .crash_during(applied, async |h| {
+                try_put_object(h, "bucket", "a.bin", group_id, &[1u8; 10], None).await
+            })
+            .await;
+        assert_settled(&h, group_id, expected, applied).await;
+    }
+}
+
+#[tokio::test]
+async fn interrupted_completion_settles() {
+    let part = vec![b'h'; 5 * 1024 * 1024];
+    let size = part.len() as u64 + 7;
+    for (applied, expected) in [(false, (0, 0)), (true, (1, size))] {
+        let node = setup_faulty().await;
+        let group_id = Ulid::generate();
+        create_bucket(&node.h, "bucket", group_id).await;
+        let upload_id = create_upload(&node.h, "bucket", "big.bin", group_id).await;
+        let parts = [
+            upload_part(&node.h, "bucket", "big.bin", upload_id, 1, &part).await,
+            upload_part(&node.h, "bucket", "big.bin", upload_id, 2, b"world!!").await,
+        ];
+        // Earlier writes set the marker too, so only a fresh one proves this commit.
+        delete_key(
+            &node.h.driver,
+            NODE_STATS_KEYSPACE,
+            dirty_group_key(group_id),
+        )
+        .await;
+        let h = node
+            .crash_during(applied, async |h| {
+                complete_upload(h, "bucket", "big.bin", upload_id, &parts, size).await
+            })
+            .await;
+        assert_settled(&h, group_id, expected, applied).await;
+    }
+}
+
+#[tokio::test]
+async fn interrupted_delete_settles() {
+    for (applied, expected) in [(false, (1, 10)), (true, (0, 0))] {
+        let node = setup_faulty().await;
+        let group_id = Ulid::generate();
+        create_bucket(&node.h, "bucket", group_id).await;
+        let version = put_object(&node.h, "bucket", "a.bin", group_id, &[1u8; 10]).await;
+        // Earlier writes set the marker too, so only a fresh one proves this commit.
+        delete_key(
+            &node.h.driver,
+            NODE_STATS_KEYSPACE,
+            dirty_group_key(group_id),
+        )
+        .await;
+        let h = node
+            .crash_during(applied, async |h| {
+                delete_object(h, "bucket", "a.bin", group_id, Some(version.version_id)).await
+            })
+            .await;
+        assert_settled(&h, group_id, expected, applied).await;
+    }
 }
