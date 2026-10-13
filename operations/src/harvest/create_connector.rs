@@ -74,8 +74,8 @@ pub enum CreateConnectorError {
     EmptyName,
     #[error("connector endpoint must not be empty")]
     EmptyEndpoint,
-    #[error("endpoint `{0}` must be spelled as the http client parses it")]
-    AmbiguousEndpoint(String),
+    #[error("endpoint must be spelled as the http client parses it")]
+    AmbiguousEndpoint,
     #[error("connector endpoint must not contain credentials")]
     EndpointCredentials,
     #[error("repository endpoint must use https outside loopback")]
@@ -206,7 +206,7 @@ pub fn validate_connector(
     if endpoint.trim().is_empty() {
         return Err(CreateConnectorError::EmptyEndpoint);
     }
-    // The endpoint is stored and listed in the clear, and the error must not repeat a password.
+    // The endpoint is stored and listed in the clear, so it must not hold a password.
     if url::Url::parse(endpoint)
         .is_ok_and(|url| !url.username().is_empty() || url.password().is_some())
     {
@@ -215,9 +215,7 @@ pub fn validate_connector(
     // Every fetch is built from this string, so a spelling the http client
     // reads as another host fails here rather than at first use.
     if !endpoint_screening::is_canonical(endpoint) {
-        return Err(CreateConnectorError::AmbiguousEndpoint(
-            endpoint.to_string(),
-        ));
+        return Err(CreateConnectorError::AmbiguousEndpoint);
     }
     match kind {
         RepositoryConnectorKind::OaiPmh => Ok(()),
@@ -232,8 +230,7 @@ fn validate_invenio(
     public_config: &HashMap<String, String>,
     secret_config: &HashMap<String, String>,
 ) -> Result<(), CreateConnectorError> {
-    let url = url::Url::parse(endpoint)
-        .map_err(|_| CreateConnectorError::AmbiguousEndpoint(endpoint.to_string()))?;
+    let url = url::Url::parse(endpoint).map_err(|_| CreateConnectorError::AmbiguousEndpoint)?;
     let loopback = match url.host() {
         Some(url::Host::Domain(host)) => host == "localhost",
         Some(url::Host::Ipv4(address)) => address.is_loopback(),
@@ -248,9 +245,7 @@ fn validate_invenio(
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err(CreateConnectorError::AmbiguousEndpoint(
-            endpoint.to_string(),
-        ));
+        return Err(CreateConnectorError::AmbiguousEndpoint);
     }
     for (key, value) in public_config {
         if key != INVENIO_COMMUNITY {
@@ -365,7 +360,7 @@ mod tests {
             assert!(op.start().is_empty(), "{endpoint}");
             assert_eq!(
                 op.finalize().unwrap_err(),
-                CreateConnectorError::AmbiguousEndpoint(endpoint.to_string())
+                CreateConnectorError::AmbiguousEndpoint
             );
         }
     }
@@ -430,7 +425,7 @@ mod tests {
         );
         assert!(matches!(
             invenio("https://zenodo.org/api/?q=1", &[], &[]),
-            Err(CreateConnectorError::AmbiguousEndpoint(_))
+            Err(CreateConnectorError::AmbiguousEndpoint)
         ));
     }
 
@@ -440,14 +435,25 @@ mod tests {
             RepositoryConnectorKind::OaiPmh,
             RepositoryConnectorKind::Invenio,
         ] {
-            for endpoint in [
-                "https://harvester:canary-346-connector@oai.example.org/oai",
-                "https://canary-346-connector@oai.example.org/oai",
+            for (endpoint, expected) in [
+                (
+                    "https://harvester:canary-346-connector@oai.example.org/oai",
+                    CreateConnectorError::EndpointCredentials,
+                ),
+                (
+                    "https://canary-346-connector@oai.example.org/oai",
+                    CreateConnectorError::EndpointCredentials,
+                ),
+                // An address that does not parse must not come back in the error either.
+                (
+                    "https://harvester:canary-346-connector@oai.example.org:bad/oai",
+                    CreateConnectorError::AmbiguousEndpoint,
+                ),
             ] {
                 let error =
                     validate_connector("repo", kind, endpoint, &HashMap::new(), &HashMap::new())
                         .unwrap_err();
-                assert_eq!(error, CreateConnectorError::EndpointCredentials);
+                assert_eq!(error, expected);
                 assert!(!format!("{error} {error:?}").contains("canary"));
             }
         }

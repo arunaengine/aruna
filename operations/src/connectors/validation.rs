@@ -43,8 +43,8 @@ pub enum ValidationError {
     EmptySecretValue { key: String },
     #[error("public config key `{key}` must be `true` or `false`")]
     InvalidBoolValue { key: String },
-    #[error("endpoint `{0}` must be spelled as the http client parses it")]
-    AmbiguousEndpoint(String),
+    #[error("endpoint must be spelled as the http client parses it")]
+    AmbiguousEndpoint,
     #[error("bucket `{0}` must not contain `/`, `\\`, `?`, `#` or `@`")]
     UnsafeBucket(String),
     #[error("credentials must not be set when `skip_signature` is enabled")]
@@ -125,7 +125,7 @@ pub fn validate_connector_input(
     if let Some(endpoint) = public_config.get("endpoint")
         && !endpoint_screening::is_canonical(endpoint)
     {
-        return Err(ValidationError::AmbiguousEndpoint(endpoint.clone()));
+        return Err(ValidationError::AmbiguousEndpoint);
     }
     if let Some(bucket) = public_config.get("bucket")
         && endpoint_screening::breaks_authority(bucket)
@@ -438,13 +438,31 @@ mod pure_tests {
             let err = validate_connector_input(
                 "http",
                 SourceConnectorKind::Http,
-                &HashMap::from([("endpoint".to_string(), endpoint.clone())]),
+                &HashMap::from([("endpoint".to_string(), endpoint)]),
                 &HashMap::new(),
             )
             .unwrap_err();
 
-            assert_eq!(err, ValidationError::AmbiguousEndpoint(endpoint));
+            assert_eq!(err, ValidationError::AmbiguousEndpoint);
         }
+    }
+
+    #[test]
+    fn refusal_hides_credentials() {
+        // The host is respelled, so the endpoint is refused; the password must not come back.
+        let err = validate_connector_input(
+            "http",
+            SourceConnectorKind::Http,
+            &HashMap::from([(
+                "endpoint".to_string(),
+                "https://reader:canary-346-source@SOURCE.example.org/".to_string(),
+            )]),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, ValidationError::AmbiguousEndpoint);
+        assert!(!format!("{err} {err:?}").contains("canary"));
     }
 
     #[test]
