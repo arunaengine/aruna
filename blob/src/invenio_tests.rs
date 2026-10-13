@@ -265,7 +265,8 @@ fn sized(path: &str) -> String {
         "/api/records/exact-chunked" => {
             answer("200 OK", "Transfer-Encoding: chunked\r\n", &chunked(EXACT))
         }
-        "/api/records/over-declared" => answer("200 OK", "Content-Length: 17\r\n", OVER),
+        // Fewer bytes than declared: only the check of the declared length can answer `Limit`.
+        "/api/records/over-declared" => answer("200 OK", "Content-Length: 17\r\n", EXACT),
         "/api/records/over-stream" => answer("200 OK", "", OVER),
         "/api/records/over-chunked" => {
             answer("200 OK", "Transfer-Encoding: chunked\r\n", &chunked(OVER))
