@@ -36,10 +36,14 @@ pub async fn export_metadata_rocrate(
     match request.view {
         RoCrateExportView::Full => {
             ensure_record_materialized(context, &record).await?;
-            Ok(ExportMetadataResult::Full {
-                jsonld: export_rocrate_jsonld(context, &record.graph_iri).await?,
-                record,
-            })
+            let jsonld = export_rocrate_jsonld(context, &record.graph_iri).await?;
+            // A revision that landed during the export must not be labeled with the older cursor.
+            let current = load_live_record(context, request.document_id).await?;
+            if current.last_event_id != record.last_event_id {
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            ensure_record_materialized(context, &current).await?;
+            Ok(ExportMetadataResult::Full { jsonld, record })
         }
         RoCrateExportView::Summary => {
             ensure_record_materialized(context, &record).await?;

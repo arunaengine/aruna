@@ -336,6 +336,9 @@ pub struct ProjectedRoCrateResponse {
     pub returned_data_entities: Option<usize>,
     pub next_offset: Option<usize>,
     pub next_cursor: Option<String>,
+    /// The event the full view reflects, usable as `expected_revision`; absent for other views.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

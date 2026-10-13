@@ -110,7 +110,8 @@ truncated."#,
                             "total_data_entities": null,
                             "returned_data_entities": null,
                             "next_offset": null,
-                            "next_cursor": null
+                            "next_cursor": null,
+                            "revision": "01JEVENT00123456789ABCDEFG"
                         })
                     )
                 ),

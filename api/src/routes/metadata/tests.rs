@@ -360,6 +360,7 @@ async fn public_routes_work() {
     .await
     .unwrap();
     let response = projected(response);
+    assert_eq!(response.revision, bound.projected_event_id);
     assert!(
         response
             .rocrate

@@ -472,13 +472,14 @@ pub(crate) fn map_export_response(
     view: MetadataRoCrateView,
 ) -> ServerResult<MetadataRoCrateResponse> {
     match export {
-        ExportMetadataResult::Full { jsonld, .. } => Ok(MetadataRoCrateResponse::Projected(
+        ExportMetadataResult::Full { record, jsonld } => Ok(MetadataRoCrateResponse::Projected(
             ProjectedRoCrateResponse {
                 rocrate: parse_jsonld(jsonld)?,
                 total_data_entities: None,
                 returned_data_entities: None,
                 next_offset: None,
                 next_cursor: None,
+                revision: Some(record.last_event_id.to_string()),
             },
         )),
         ExportMetadataResult::Summary { record, jsonld } => Ok(MetadataRoCrateResponse::Projected(
@@ -492,6 +493,7 @@ pub(crate) fn map_export_response(
                 returned_data_entities: None,
                 next_offset: None,
                 next_cursor: None,
+                revision: None,
             },
         )),
         ExportMetadataResult::Page { record, page } => map_page_response(
@@ -541,6 +543,7 @@ fn map_page_response(
             returned_data_entities: Some(page.returned_data_entities),
             next_offset: page.next_offset,
             next_cursor: page.next_cursor,
+            revision: None,
         },
     ))
 }
