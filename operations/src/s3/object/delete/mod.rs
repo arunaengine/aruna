@@ -88,11 +88,14 @@ struct VersionSummary {
     materialized_hash: Option<[u8; 32]>,
     logical_size: Option<u64>,
     referenced: bool,
+    /// Offered directory observations are charged only while they are the head.
+    offered: bool,
     deleted: bool,
 }
 
 impl VersionSummary {
-    fn from_blob_version(version_id: Ulid, version: &BlobVersion) -> Self {
+    fn from_blob_version(key: &VersionKey, version: &BlobVersion) -> Self {
+        let version_id = key.version_id;
         let (materialized_hash, logical_size, referenced) = match &version.state {
             BlobVersionState::Materialized { blob_hash, .. } => (Some(*blob_hash), None, false),
             BlobVersionState::Reference {
@@ -107,6 +110,7 @@ impl VersionSummary {
             materialized_hash,
             logical_size,
             referenced,
+            offered: version.offered_size(&key.bucket, &key.key).is_some(),
             deleted: version.is_deleted(),
         }
     }
@@ -180,6 +184,8 @@ pub struct DeleteObjectOperation {
     /// The Pithos archive the deleted version used, with its stored location.
     target_archive: Option<(ArchiveKey, Option<BackendLocation>)>,
     live_before_marker: bool,
+    /// Offered directory bytes the head stops charging under a delete marker.
+    released_bytes: u64,
     usage_update: Option<UsageCounterUpdate>,
     copy_removal: Option<ManagedCopyRemoval>,
     output: Option<Result<DeleteObjectResult, DeleteObjectError>>,
@@ -210,6 +216,7 @@ impl DeleteObjectOperation {
             target_location: None,
             target_archive: None,
             live_before_marker: false,
+            released_bytes: 0,
             usage_update: None,
             copy_removal: None,
             output: None,
@@ -346,7 +353,10 @@ impl DeleteObjectOperation {
             Err(err) => return self.emit_error(err.into()),
         };
         let location_key = version.location_key();
-        let summary = VersionSummary::from_blob_version(version_id, &version);
+        let summary = VersionSummary::from_blob_version(
+            &VersionKey::new(&self.input.bucket, &self.input.key, version_id),
+            &version,
+        );
         self.target_size = summary.logical_size;
         self.target_version = Some(summary);
         self.target_location = location_key.clone();
@@ -413,10 +423,7 @@ impl DeleteObjectOperation {
                     return None;
                 }
                 let version = BlobVersion::from_bytes(value.as_ref()).ok()?;
-                Some(VersionSummary::from_blob_version(
-                    version_key.version_id,
-                    &version,
-                ))
+                Some(VersionSummary::from_blob_version(&version_key, &version))
             })
             .max_by_key(|summary| summary.version_id);
 
@@ -489,9 +496,11 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
 
-        self.live_before_marker = value
-            .and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok())
-            .is_some_and(|version| !version.is_deleted());
+        let head = value.and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok());
+        self.live_before_marker = head.as_ref().is_some_and(|version| !version.is_deleted());
+        self.released_bytes = head
+            .and_then(|version| version.offered_size(&self.input.bucket, &self.input.key))
+            .unwrap_or(0);
 
         let Some(version_id) = self.version_id else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
@@ -790,6 +799,14 @@ impl DeleteObjectOperation {
             };
             let bytes = self.target_size.map_or(0, |size| -i128::from(size));
             let envelope = -i128::from(self.envelope_bytes);
+            // An offered directory observation is charged only while it is the head.
+            let charged = target.referenced && (pointed_at_target || !target.offered);
+            let promoted = self
+                .latest_remaining
+                .as_ref()
+                .filter(|latest| pointed_at_target && latest.offered)
+                .and_then(|latest| latest.logical_size)
+                .map_or(0, i128::from);
             UsageDelta {
                 objects,
                 logical_bytes: if target.referenced {
@@ -797,12 +814,13 @@ impl DeleteObjectOperation {
                 } else {
                     bytes + envelope
                 },
-                referenced_bytes: if target.referenced { bytes } else { 0 },
+                referenced_bytes: if charged { bytes } else { 0 } + promoted,
                 ..Default::default()
             }
         } else {
             UsageDelta {
                 objects: if self.live_before_marker { -1 } else { 0 },
+                referenced_bytes: -i128::from(self.released_bytes),
                 ..Default::default()
             }
         }
