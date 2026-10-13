@@ -56,8 +56,9 @@ def exercise(root):
     content = (a / payload).read_bytes()
     command(a, env, "lfs", "push", "origin", "main")
     command(a, env, "push", "origin", "main")
-    state = wait("the second holder did not receive the push",
-                 lambda: (s := converged()) and s["refs/heads/main"] != first["refs/heads/main"] and s)
+    # The push moves main twice: to the pushed commit, then to the metadata merge commit.
+    state = wait("the second holder did not receive the merged push",
+                 lambda: (s := converged()) and s["refs/heads/main"] not in (first["refs/heads/main"], pushed) and s)
     main = state["refs/heads/main"]
     command(a, env, "fetch", "origin")
     command(a, env, "merge-base", "--is-ancestor", pushed, main)
