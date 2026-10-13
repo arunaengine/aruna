@@ -1717,6 +1717,52 @@ fn marker_ignores_quota() {
 }
 
 #[test]
+fn head_releases_observation() {
+    // An offered directory observation is charged only as the head, so a
+    // replicated head over it releases its bytes.
+    let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+    manifest.current_version_generation = Some(10);
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(34, 34),
+        iroh::SecretKey::from_bytes(&[83; 32]).public(),
+        RealmId::from_bytes([7u8; 32]),
+        manifest.clone(),
+    );
+    start_apply_transaction(&mut op);
+    let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::from_parts(35, 35), 5);
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0u8; 4].into(),
+        value: Some(existing_pointer.to_bytes().unwrap().into()),
+    }));
+    assert_eq!(op.state, IncomingVersionState::ReadCurrentVersion);
+
+    let mut source = make_source_binding();
+    source.connector_id = None;
+    source.descriptor.kind = SourceConnectorKind::LocalDirectory;
+    source.descriptor.source_path = manifest.key.clone();
+    source.descriptor.public_config = HashMap::from([(
+        aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_BUCKET.to_string(),
+        manifest.bucket.clone(),
+    )]);
+    let metadata = SourceMetadata {
+        content_length: 7,
+        content_type: None,
+        etag: None,
+        last_modified: None,
+        source_version: None,
+    };
+    let now = fixed_created_at();
+    let head = BlobVersion::reference(source, metadata, now, test_user_id(), now);
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0u8; 4].into(),
+        value: Some(head.to_bytes().unwrap().into()),
+    }));
+
+    let delta = op.usage_delta().unwrap();
+    assert_eq!((delta.objects, delta.referenced_bytes), (-1, -7));
+}
+
+#[test]
 fn stale_pointer_skips() {
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     manifest.current_version_generation = Some(10);

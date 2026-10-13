@@ -155,6 +155,92 @@ async fn pending_alias_shared() {
 }
 
 #[tokio::test]
+async fn copy_releases_observation() {
+    // A copy over a head offered directory observation releases its bytes.
+    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
+    use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_BUCKET;
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
+
+    let (_temp, context) = context();
+    let storage = &context.storage_handle;
+    let location = sealed_location();
+    let source_id = Ulid::generate();
+    let now = SystemTime::UNIX_EPOCH;
+    let source = BlobVersion::pending(ArchiveKey::of(&location), now, UserId::default(), None);
+    seed(storage, source_id, &source).await;
+    let request = input(&location, source_id);
+
+    let binding = VersionSourceBinding {
+        strategy: StagingStrategy::Reference,
+        descriptor: PortableSourceDescriptor {
+            kind: SourceConnectorKind::LocalDirectory,
+            public_config: HashMap::from([(
+                OFFERED_DIRECTORY_BUCKET.to_string(),
+                request.bucket.clone(),
+            )]),
+            source_path: request.dest_key.clone(),
+            version_selector: None,
+            capabilities: Vec::new(),
+            origin_node_id: None,
+        },
+        connector_id: None,
+    };
+    let metadata = SourceMetadata {
+        content_length: 7,
+        content_type: None,
+        etag: None,
+        last_modified: None,
+        source_version: None,
+    };
+    let observation = BlobVersion::reference(binding, metadata, now, UserId::default(), now);
+    let head_id = Ulid::generate();
+    let version = VersionKey::new(&request.bucket, &request.dest_key, head_id);
+    let row = observation.to_bytes().unwrap();
+    put(
+        storage,
+        BLOB_VERSIONS_KEYSPACE,
+        version.to_bytes().unwrap(),
+        row,
+    )
+    .await;
+    let head = BlobHeadKey::new(&request.bucket, &request.dest_key);
+    let pointer = CurrentVersionPointer::new(head_id).to_bytes().unwrap();
+    put(
+        storage,
+        BLOB_HEAD_KEYSPACE,
+        head.to_bytes().unwrap(),
+        pointer,
+    )
+    .await;
+    let charged = UsageCounters {
+        objects: 1,
+        referenced_bytes: 7,
+        ..Default::default()
+    };
+    let group = usage_group_key(request.group_id);
+    put(
+        storage,
+        USAGE_STATS_KEYSPACE,
+        group.clone(),
+        charged.to_bytes().unwrap(),
+    )
+    .await;
+
+    drive(SealedCopyOperation::new(request), &context)
+        .await
+        .unwrap();
+
+    let counters = get(storage, USAGE_STATS_KEYSPACE, group).await.unwrap();
+    let counters = UsageCounters::from_bytes(&counters).unwrap();
+    assert_eq!((counters.objects, counters.referenced_bytes), (1, 0));
+}
+
+#[tokio::test]
 async fn known_archive_shared() {
     // A known-hash source keeps its hash and archive; replacement metadata is applied.
     let (_temp, context) = context();

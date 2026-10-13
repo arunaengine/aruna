@@ -254,6 +254,10 @@ pub async fn write_reference_version(
                 }
             }
         }
+        // An offered directory observation is charged only while it is the head.
+        let released = existing_version
+            .as_ref()
+            .and_then(|version| version.offered_size(&write.bucket, &write.key));
         let was_live = existing_version.is_some_and(|version| !version.is_deleted());
         let next_pointer = CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id)?;
 
@@ -295,7 +299,7 @@ pub async fn write_reference_version(
             write.group_id,
             UsageDelta {
                 objects: if was_live { 0 } else { 1 },
-                referenced_bytes: i128::from(referenced_bytes),
+                referenced_bytes: i128::from(referenced_bytes) - i128::from(released.unwrap_or(0)),
                 ..Default::default()
             },
         );
@@ -1189,6 +1193,70 @@ mod tests {
                 .await
                 .referenced_bytes,
             16
+        );
+    }
+
+    #[tokio::test]
+    async fn reference_releases_observation() {
+        // A reference written over a head observation takes its place, so the
+        // observation stops being charged and a recount agrees.
+        use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+        use aruna_core::structs::execution::staging::PortableSourceDescriptor;
+
+        let test_context = setup_driver_context().await;
+        let context = &test_context.driver_context;
+        let root = tempdir().unwrap();
+        std::fs::write(root.path().join("data.bin"), b"offered").unwrap();
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let offer = OfferDirectoryInput {
+            bucket: "offered".to_string(),
+            root: root.path().to_str().unwrap().to_string(),
+            group_id: Ulid::generate(),
+            realm_id,
+            node_id: iroh::SecretKey::generate().public(),
+            user_id: aruna_core::UserId::new(Ulid::generate(), realm_id),
+        };
+        offer_directory(context, offer.clone()).await.unwrap();
+
+        let write = ReferenceWrite {
+            preassigned_version_id: None,
+            group_id: offer.group_id,
+            user_id: offer.user_id,
+            realm_id,
+            node_id: offer.node_id,
+            bucket: offer.bucket.clone(),
+            key: "data.bin".to_string(),
+            expected_bucket: None,
+            version_source: VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::Http,
+                    public_config: HashMap::new(),
+                    source_path: "folder/file.txt".to_string(),
+                    version_selector: None,
+                    capabilities: Vec::new(),
+                    origin_node_id: None,
+                },
+                connector_id: Some(Ulid::generate()),
+            },
+            metadata: SourceMetadata {
+                content_length: 4,
+                content_type: None,
+                etag: None,
+                last_modified: None,
+                source_version: None,
+            },
+            inherited_policies: Vec::new(),
+            connector_guard: None,
+        };
+        write_reference_version(context, write).await.unwrap();
+
+        let usage = read_usage_counters(context, usage_group_key(offer.group_id)).await;
+        assert_eq!((usage.objects, usage.referenced_bytes), (1, 4));
+        drive(RebuildStatsOperation::new(), context).await.unwrap();
+        assert_eq!(
+            read_usage_counters(context, usage_group_key(offer.group_id)).await,
+            usage
         );
     }
 }

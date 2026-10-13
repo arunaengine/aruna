@@ -222,6 +222,8 @@ pub struct PutObjectOperation {
     /// The written location belongs to another version; never delete it.
     adopted: bool,
     was_live: bool,
+    /// Offered directory bytes the replaced head stops charging.
+    released_bytes: u64,
     /// Refuses the write when the key has a live head; a replayed preassigned version passes.
     create_only: bool,
     usage_update: Option<UsageCounterUpdate>,
@@ -277,6 +279,7 @@ impl PutObjectOperation {
             adopt: None,
             adopted: false,
             was_live: false,
+            released_bytes: 0,
             create_only: false,
             usage_update: None,
             quota_gate: None,
@@ -1042,9 +1045,12 @@ impl PutObjectOperation {
             return self.emit_error(PutObjectError::InvalidOperationState);
         };
 
-        self.was_live = value
-            .and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok())
-            .is_some_and(|version| !version.is_deleted());
+        let head = value.and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok());
+        self.was_live = head.as_ref().is_some_and(|version| !version.is_deleted());
+        let request = &self.config.request;
+        self.released_bytes = head
+            .and_then(|version| version.offered_size(&request.bucket, &request.key))
+            .unwrap_or(0);
         if self.create_only && self.was_live {
             return self.emit_error(PutObjectError::ObjectExists);
         }
@@ -1272,6 +1278,7 @@ impl PutObjectOperation {
                 let group_delta = UsageDelta {
                     objects: if self.was_live { 0 } else { 1 },
                     logical_bytes: size + i128::from(self.envelope_bytes),
+                    referenced_bytes: -i128::from(self.released_bytes),
                     ..Default::default()
                 };
                 let Some(stored) = StoredDelta::for_location(&location, self.new_blob) else {
@@ -1480,6 +1487,7 @@ impl PutObjectOperation {
         self.txn_id = None;
         self.existing_pointer = None;
         self.was_live = false;
+        self.released_bytes = 0;
         self.new_blob = false;
         self.cleanup_location = None;
         self.usage_update = None;

@@ -1155,6 +1155,69 @@ async fn mint_books_bytes() {
     assert_matches_rebuild(&h.driver).await;
 }
 
+/// Leaves an offered directory observation as the head of an ordinary bucket:
+/// the offer is withdrawn, then its delete marker is deleted.
+async fn promote_observation(h: &Harness, bucket: &str, group_id: Ulid) {
+    use aruna_operations::staging::offered_directory::{
+        OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("data.bin"), b"offered").unwrap();
+    let offer = OfferDirectoryInput {
+        bucket: bucket.to_string(),
+        root: root.path().to_str().unwrap().to_string(),
+        group_id,
+        realm_id: h.realm_id,
+        node_id: h.node_id,
+        user_id: h.created_by,
+    };
+    offer_directory(&h.driver, offer).await.unwrap();
+    let withdrawal = WithdrawOfferInput {
+        bucket: bucket.to_string(),
+        realm_id: h.realm_id,
+        node_id: h.node_id,
+        user_id: h.created_by,
+    };
+    withdraw_offer(&h.driver, withdrawal).await.unwrap();
+    let head = BlobHeadKey::new(bucket, "data.bin").to_bytes().unwrap();
+    let head = read_key(&h.driver, BLOB_HEAD_KEYSPACE, head).await.unwrap();
+    let marker = CurrentVersionPointer::from_bytes(&head).unwrap().version_id;
+    delete_object(h, bucket, "data.bin", group_id, Some(marker)).await;
+    assert_eq!(read_group(&h.driver, group_id).await.referenced_bytes, 7);
+}
+
+#[tokio::test]
+async fn put_releases_observation() {
+    // A written object replaces the head observation, which stops being charged.
+    let h = setup().await;
+    let group_id = Ulid::generate();
+    promote_observation(&h, "bucket", group_id).await;
+
+    put_object(&h, "bucket", "data.bin", group_id, b"new").await;
+
+    let group = read_group(&h.driver, group_id).await;
+    assert_eq!((group.objects, group.referenced_bytes), (1, 0));
+    assert_matches_rebuild(&h.driver).await;
+}
+
+#[tokio::test]
+async fn multipart_releases_observation() {
+    // A completed upload replaces the head observation like a single write.
+    let h = setup().await;
+    let group_id = Ulid::generate();
+    promote_observation(&h, "bucket", group_id).await;
+
+    let data = [1u8; 25];
+    let upload_id = create_upload(&h, "bucket", "data.bin", group_id).await;
+    let part = upload_part(&h, "bucket", "data.bin", upload_id, 1, &data).await;
+    complete_upload(&h, "bucket", "data.bin", upload_id, &[part], 25).await;
+
+    let group = read_group(&h.driver, group_id).await;
+    assert_eq!((group.objects, group.referenced_bytes), (1, 0));
+    assert_matches_rebuild(&h.driver).await;
+}
+
 async fn reported_bytes(h: &Harness, group_id: Ulid) -> u64 {
     load_realm_usage(&h.driver, h.node_id, RealmUsageScope::Group(group_id))
         .await
