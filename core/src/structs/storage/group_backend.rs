@@ -51,6 +51,19 @@ impl GroupBackendKind {
 
 /// Where registration writes and removes its probe object.
 pub const PROBE_PREFIX: &str = "_aruna_backend_probe";
+/// Where Aruna keeps the replaced bytes of same-name writes.
+pub const VERSIONS_PREFIX: &str = ".aruna-versions";
+
+/// Whether `key` lies where Aruna keeps its own objects on a backend with `container`.
+pub fn reserved_path(container: Option<&str>, key: &str) -> bool {
+    [Some(PROBE_PREFIX), Some(VERSIONS_PREFIX), container]
+        .into_iter()
+        .flatten()
+        .any(|folder| {
+            key.strip_prefix(folder)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+}
 
 impl fmt::Display for GroupBackendKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -99,9 +112,14 @@ pub struct GroupStorage {
 impl GroupStorage {
     /// Whether `key` lies where Aruna writes its own objects on this backend.
     pub fn is_reserved(&self, key: &str) -> bool {
-        let container = self.public_config.get(self.kind.container_key());
-        key.starts_with(&format!("{PROBE_PREFIX}/"))
-            || container.is_some_and(|container| key.starts_with(&format!("{container}/")))
+        reserved_path(self.container(), key)
+    }
+
+    /// The tenant's own container, which also holds Aruna's own layout.
+    pub fn container(&self) -> Option<&str> {
+        self.public_config
+            .get(self.kind.container_key())
+            .map(String::as_str)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -238,6 +256,7 @@ mod tests {
         };
         assert!(record.is_reserved("data/bucket/key_01"));
         assert!(record.is_reserved("_aruna_backend_probe/01"));
+        assert!(record.is_reserved(".aruna-versions/raw/a.csv/01"));
         assert!(!record.is_reserved("database/a.csv"));
         assert!(!record.is_reserved("raw/data/a.csv"));
     }

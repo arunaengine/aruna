@@ -118,6 +118,10 @@ pub enum SubOperationEvent {
     VersionRekeyed {
         outcome: RekeyOutcome,
     },
+    /// The bytes a same-name write replaces were moved aside, or there were none.
+    PlainSetAside {
+        result: Result<(), String>,
+    },
 }
 
 /// How the re-key of one version ended.
@@ -250,6 +254,10 @@ pub enum BlobEvent {
     },
     ExternalHashed {
         location: BackendLocation,
+    },
+    /// `false` while another same-name write holds the path.
+    PlainClaimed {
+        claimed: bool,
     },
 }
 

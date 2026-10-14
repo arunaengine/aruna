@@ -459,9 +459,16 @@ impl BackendLocation {
         }
     }
 
-    /// An object found on a tenant backend that Aruna never wrote. Aruna never deletes it.
+    /// An object at a path of the tenant's own folders, found there or written there for a
+    /// backend import. Aruna never deletes it; only the replaced copies it moved aside are its own.
     pub fn is_external(&self) -> bool {
-        self.storage_bucket.is_empty() && matches!(self.backend, BackendRef::Group(_))
+        let aside = format!(
+            "{}/",
+            crate::structs::storage::group_backend::VERSIONS_PREFIX
+        );
+        self.storage_bucket.is_empty()
+            && matches!(self.backend, BackendRef::Group(_))
+            && !self.backend_path.starts_with(&aside)
     }
 
     /// Whether both name the same physical object. The path carries a per-write

@@ -22,6 +22,7 @@ use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::structs::placement::policy::document::PolicyPublicationClaim;
 use crate::structs::placement::record::PlacementRef;
+use crate::structs::storage::backend_import::PlainPath;
 use crate::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, HiddenBlobKey, ResolvedBackend,
 };
@@ -100,6 +101,8 @@ pub enum BlobEffect {
         resolved: ResolvedBackend,
         created_by: UserId,
         parts: Vec<BackendLocation>,
+        /// Composes raw to this path of the tenant's folders instead of Aruna's own layout.
+        plain: Option<PlainPath>,
     },
     Read {
         location: BackendLocation,
@@ -332,6 +335,28 @@ pub enum BlobEffect {
         resolved: ResolvedBackend,
         path: String,
         created_by: UserId,
+    },
+    /// Streams `blob` raw to `plain.path` on `resolved`, a path in the tenant's folders, and
+    /// answers `WriteFinished`. A failed write never restores what the path held before.
+    WritePlain {
+        resolved: ResolvedBackend,
+        plain: PlainPath,
+        created_by: UserId,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+        size: Option<u64>,
+    },
+    /// Claims `path` on `backend` for one same-name write until `ReleaseReservation { id }`.
+    /// Answers `PlainClaimed`.
+    ClaimPlain {
+        backend: BackendRef,
+        path: String,
+        id: Ulid,
+    },
+    /// Copies the raw bytes at `source` to `path` on its backend and answers `WriteFinished`
+    /// with the hashes of the bytes it read.
+    CopyAside {
+        source: BackendLocation,
+        path: String,
     },
 }
 
