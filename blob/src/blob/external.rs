@@ -144,7 +144,7 @@ impl BlobHandler {
             .await
             .map_err(|_| read_error("timed out reading the object"))?
             .map_err(open_error)?;
-        let version = backend_version(&metadata);
+        let version = backend_version(&operator, &metadata);
         let opened = reader_at(&operator, &storage_path, version.as_deref());
         let reader = timeout(self.io_timeout(), opened)
             .await

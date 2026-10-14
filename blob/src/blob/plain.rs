@@ -114,7 +114,7 @@ impl BlobHandler {
         match timeout(self.io_timeout(), operator.stat(&path)).await {
             Ok(Ok(metadata)) => BlobEvent::PlainStat {
                 exists: true,
-                version: backend_version(&metadata),
+                version: backend_version(&operator, &metadata),
             },
             Ok(Err(error)) if error.kind() == ErrorKind::NotFound => BlobEvent::PlainStat {
                 exists: false,

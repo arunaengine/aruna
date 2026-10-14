@@ -161,8 +161,12 @@ async fn open_writer(
     }
 }
 
-/// The version id of a backend that keeps versions; S3 names a suspended one `null`.
-pub(super) fn backend_version(metadata: &opendal::Metadata) -> Option<String> {
+/// A version id only counts when the backend can read it back; S3 names a suspended one `null`.
+/// GCS generation ids exist without bucket versioning, so they never count.
+pub(super) fn backend_version(operator: &Operator, metadata: &opendal::Metadata) -> Option<String> {
+    if !operator.info().capability().read_with_version {
+        return None;
+    }
     metadata
         .version()
         .filter(|version| *version != "null")
@@ -176,7 +180,7 @@ pub(super) fn reader_at<'a>(
     version: Option<&'a str>,
 ) -> impl Future<Output = Result<opendal::Reader, opendal::Error>> + 'a {
     let reader = operator.reader_with(path);
-    match version {
+    match version.filter(|_| operator.info().capability().read_with_version) {
         Some(version) => reader.version(version),
         None => reader,
     }
@@ -742,7 +746,7 @@ impl BlobHandler {
             reservation.mark_settled();
         }
         let version = match close {
-            Ok(Ok(metadata)) => backend_version(&metadata),
+            Ok(Ok(metadata)) => backend_version(&operator, &metadata),
             Ok(Err(err)) if taken(&err) => return reservation.path_taken().await,
             Ok(Err(err)) => {
                 return reservation
@@ -1569,7 +1573,7 @@ impl BlobHandler {
                         BlobError::WriteError(err.to_string())
                     }
                 })?;
-            version = backend_version(&metadata);
+            version = backend_version(&operator, &metadata);
             Ok((bytes_written, layout))
         }
         .await;
@@ -2244,7 +2248,7 @@ fn hidden_timestamp(path: &str) -> Option<SystemTime> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HIDDEN_LIST_PAGE, next_chunk, take_page};
+    use super::{HIDDEN_LIST_PAGE, backend_version, next_chunk, reader_at, take_page};
     use aruna_core::errors::BlobError;
     use aruna_core::stream::BackendStream;
     use bytes::Bytes;
@@ -2264,6 +2268,27 @@ mod tests {
             task.await.unwrap(),
             Err(BlobError::ReadError(message)) if message == "blob read idle timeout"
         ));
+    }
+
+    #[tokio::test]
+    async fn ignores_unreadable_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let operator =
+            opendal::Operator::from_iter::<opendal::services::Fs>(std::collections::HashMap::from(
+                [("root".to_string(), dir.path().to_str().unwrap().to_string())],
+            ))
+            .unwrap();
+        operator
+            .write("a.txt", Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+
+        let mut builder = opendal::MetadataBuilder::file(4);
+        builder.version("v1");
+        let metadata = builder.build();
+        assert_eq!(backend_version(&operator, &metadata), None);
+        let reader = reader_at(&operator, "a.txt", Some("v1")).await.unwrap();
+        assert_eq!(reader.read(..).await.unwrap().to_vec(), b"data");
     }
 
     #[tokio::test]
