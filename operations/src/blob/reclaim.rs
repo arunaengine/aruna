@@ -10,10 +10,12 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    PENDING_LOCATION_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::storage::backend_import::version_key;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion,
     HashIndex, VersionKey,
@@ -707,18 +709,23 @@ impl ReclaimBlobOperation {
         self.output = Some(Ok(ReclaimVerdict::Freed {
             bytes: location.stored_size(),
         }));
+        let mut deletes = vec![
+            (
+                BLOB_LOCATIONS_KEYSPACE.to_string(),
+                self.location_key().to_bytes().into(),
+            ),
+            (
+                BLOB_RECLAIM_KEYSPACE.to_string(),
+                self.key.to_bytes().into(),
+            ),
+        ];
+        if location.is_external() {
+            let key = version_key(location.ulid);
+            deletes.push((BACKEND_VERSION_KEYSPACE.to_string(), key));
+        }
         self.state = ReclaimState::DeleteRows;
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: vec![
-                (
-                    BLOB_LOCATIONS_KEYSPACE.to_string(),
-                    self.location_key().to_bytes().into()
-                ),
-                (
-                    BLOB_RECLAIM_KEYSPACE.to_string(),
-                    self.key.to_bytes().into()
-                ),
-            ],
+            deletes,
             txn_id: self.txn_id,
         })]
     }
@@ -1858,6 +1865,14 @@ mod tests {
             imported.to_bytes().unwrap(),
         )
         .await;
+        let backend_version = version_key(imported.ulid).to_vec();
+        write(
+            &context,
+            BACKEND_VERSION_KEYSPACE,
+            backend_version.clone(),
+            b"v1".to_vec(),
+        )
+        .await;
         let candidate = ReclaimCandidateKey::new(backend, EncodingClass::Raw, HASH);
         let queued = ReclaimCandidate {
             enqueued_at: SystemTime::UNIX_EPOCH,
@@ -1879,6 +1894,8 @@ mod tests {
                 .await
                 .is_none()
         );
+        let version = read(&context, BACKEND_VERSION_KEYSPACE, backend_version).await;
+        assert!(version.is_none());
         let (cleanups, _) = iter_prefix_page(
             &context.storage_handle,
             BLOB_CLEANUP_KEYSPACE,
