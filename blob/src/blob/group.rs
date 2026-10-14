@@ -143,6 +143,9 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         BlobEffect::ReplicateLeased { location, .. } => push(&mut ids, &location.backend),
         BlobEffect::ListExternal { backend, .. } => push(&mut ids, backend),
         BlobEffect::HashExternal { resolved, .. } => push(&mut ids, &resolved.backend),
+        BlobEffect::WritePlain { resolved, .. } => push(&mut ids, &resolved.backend),
+        BlobEffect::ClaimPlain { .. } => {}
+        BlobEffect::CopyAside { source, .. } => push(&mut ids, &source.backend),
     }
     ids
 }

@@ -69,3 +69,122 @@ async fn hashes_in_place() {
     assert_eq!(read_back(&handler, location).await, b"outside bytes");
     assert!(root.join("raw/a.txt").exists());
 }
+
+#[tokio::test]
+async fn writes_plain_paths() {
+    use super::stream_from_bytes;
+    use aruna_core::structs::storage::backend_import::PlainPath;
+    use ulid::Ulid;
+
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let root = context._temp_dir.path().join("hot");
+    let backend = BackendRef::Node("default".to_string());
+    let resolved = ResolvedBackend::new(backend.clone(), None);
+    let plain = PlainPath {
+        path: "raw/a.txt".to_string(),
+        ulid: Ulid::generate(),
+    };
+
+    let BlobEvent::WriteFinished { location: old } = handler
+        .write_plain(
+            resolved.clone(),
+            plain.clone(),
+            test_user_id(),
+            stream_from_bytes(b"first"),
+            Some(5),
+        )
+        .await
+    else {
+        panic!("plain write failed")
+    };
+    assert_eq!(std::fs::read(root.join("raw/a.txt")).unwrap(), b"first");
+    assert!(old.storage_bucket.is_empty());
+    assert_eq!(old.ulid, plain.ulid);
+
+    let aside = ".aruna-versions/raw/a.txt/01".to_string();
+    let BlobEvent::WriteFinished { location: moved } =
+        handler.copy_aside(old.clone(), aside.clone()).await
+    else {
+        panic!("aside copy failed")
+    };
+    assert_eq!(moved.backend_path, aside);
+    assert_eq!(moved.get_blake3(), old.get_blake3());
+
+    // A second same-name write waits until the first releases its claim.
+    assert!(handler.claim_plain(backend.clone(), plain.path.clone(), plain.ulid));
+    assert!(!handler.claim_plain(backend.clone(), plain.path.clone(), Ulid::generate()));
+    handler.release_plain(plain.ulid);
+    let next = PlainPath {
+        ulid: Ulid::generate(),
+        ..plain
+    };
+    assert!(handler.claim_plain(backend, next.path.clone(), next.ulid));
+
+    let BlobEvent::WriteFinished { .. } = handler
+        .write_plain(
+            resolved,
+            next,
+            test_user_id(),
+            stream_from_bytes(b"second"),
+            None,
+        )
+        .await
+    else {
+        panic!("overwrite failed")
+    };
+    assert_eq!(std::fs::read(root.join("raw/a.txt")).unwrap(), b"second");
+    assert_eq!(read_back(&handler, moved).await, b"first");
+}
+
+#[tokio::test]
+async fn keeps_tenant_paths() {
+    use super::stream_from_bytes;
+    use aruna_core::structs::storage::backend_import::PlainPath;
+    use ulid::Ulid;
+
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let root = context._temp_dir.path().join("hot");
+    // Only a tenant backend has tenant paths.
+    let mut resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
+    let plain = PlainPath {
+        path: "raw/a.txt".to_string(),
+        ulid: Ulid::generate(),
+    };
+    let BlobEvent::WriteFinished { location } = handler
+        .write_plain(
+            resolved.clone(),
+            plain,
+            test_user_id(),
+            stream_from_bytes(b"mine"),
+            None,
+        )
+        .await
+    else {
+        panic!("plain write failed")
+    };
+    let aside = ".aruna-versions/raw/a.txt/01".to_string();
+    let BlobEvent::WriteFinished { location: moved } =
+        handler.copy_aside(location.clone(), aside).await
+    else {
+        panic!("aside copy failed")
+    };
+
+    resolved.backend = BackendRef::Group(Ulid::generate());
+    let tenant = aruna_core::structs::storage::blob::BackendLocation {
+        backend: resolved.backend.clone(),
+        ..location
+    };
+    assert!(matches!(
+        handler.delete_blob(tenant).await,
+        BlobEvent::DeleteFinished
+    ));
+    assert!(root.join("raw/a.txt").exists());
+
+    assert!(matches!(
+        handler.delete_blob(moved).await,
+        BlobEvent::DeleteFinished
+    ));
+    assert!(!root.join(".aruna-versions/raw/a.txt/01").exists());
+}

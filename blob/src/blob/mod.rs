@@ -24,6 +24,7 @@ mod group;
 mod in_place;
 mod io;
 pub mod pithos;
+mod plain;
 mod registry;
 mod replication;
 mod runtime;
@@ -73,6 +74,9 @@ pub struct BlobHandler {
     /// operation still holds would leave that work unable to roll back.
     group_effects: Arc<StdMutex<HashMap<Ulid, group::GroupBackendUse>>>,
     reservation_active: Arc<StdMutex<HashSet<Ulid>>>,
+    /// Paths of tenant folders that a same-name write holds, with the id that releases them.
+    plain_claims:
+        Arc<StdMutex<HashMap<(aruna_core::structs::storage::blob::BackendRef, String), Ulid>>>,
     /// Hash states of in-place uploads, by provider upload id. Lost on restart, which only costs
     /// a longer read at completion.
     part_chains: Arc<StdMutex<HashMap<String, in_place::UploadState>>>,

@@ -2036,6 +2036,10 @@ impl BlobHandler {
             Err(error) => return BlobEvent::Error(error),
         };
         self.clear_active(location.ulid);
+        // A path in the tenant's own folders is never Aruna's to delete.
+        if location.is_external() {
+            return BlobEvent::DeleteFinished;
+        }
         // An in-place part is no object: its provider upload holds the bytes until it settles.
         // Deleting it ends its claim: it was rolled back, or a staged record replaced it.
         if location.partial {
