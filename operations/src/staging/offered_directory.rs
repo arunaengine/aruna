@@ -514,14 +514,17 @@ async fn observe(
     )
     .await?;
 
-    // Charge the current observation and release bytes from the replaced content.
+    // Charge the current observation and release the observation it replaces.
     let live = existing.filter(|version| !version.is_deleted());
+    let released = live
+        .as_ref()
+        .and_then(|version| version.offered_size(&input.bucket, &entry.path));
     let mut usage = UsageCounterUpdate::for_group(
         input.group_id,
         UsageDelta {
             objects: i128::from(u8::from(live.is_none())),
             referenced_bytes: i128::from(metadata.content_length)
-                - i128::from(live.as_ref().map_or(0, observed_bytes)),
+                - i128::from(released.unwrap_or(0)),
             ..Default::default()
         },
     );
@@ -529,18 +532,6 @@ async fn observe(
         run_usage_update(context, txn_id, &mut usage).await?;
     }
     Ok(version_id)
-}
-
-/// Bytes a stored observation charges to its group.
-fn observed_bytes(version: &BlobVersion) -> u64 {
-    match &version.state {
-        BlobVersionState::Reference {
-            cached_metadata, ..
-        } => cached_metadata.content_length,
-        BlobVersionState::Materialized { .. }
-        | BlobVersionState::Deleted
-        | BlobVersionState::PendingContent { .. } => 0,
-    }
 }
 
 /// Tombstones every observation whose file the walk did not see. A file the
@@ -673,7 +664,7 @@ async fn tombstone(
         scope.group_id,
         UsageDelta {
             objects: -1,
-            referenced_bytes: -i128::from(observed_bytes(&live)),
+            referenced_bytes: -i128::from(live.offered_size(&scope.bucket, key).unwrap_or(0)),
             ..Default::default()
         },
     );
@@ -986,6 +977,14 @@ mod tests {
             .expect("second offer must succeed");
         let usage = group_usage(context, offer.group_id).await;
         assert_eq!((usage.objects, usage.referenced_bytes), (1, 11));
+
+        crate::driver::drive(
+            crate::node::usage_stats::RebuildStatsOperation::new(),
+            context,
+        )
+        .await
+        .expect("recount must succeed");
+        assert_eq!(group_usage(context, offer.group_id).await, usage);
     }
 
     // A file the owner removed stops being offered: the object becomes a delete
@@ -1012,6 +1011,14 @@ mod tests {
 
         let usage = group_usage(context, offer.group_id).await;
         assert_eq!((usage.objects, usage.referenced_bytes), (1, 4));
+
+        crate::driver::drive(
+            crate::node::usage_stats::RebuildStatsOperation::new(),
+            context,
+        )
+        .await
+        .expect("recount must succeed");
+        assert_eq!(group_usage(context, offer.group_id).await, usage);
         assert!(
             head_version(context, "sweep", "gone.txt")
                 .await

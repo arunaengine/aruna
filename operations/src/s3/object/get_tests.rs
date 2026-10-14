@@ -1819,6 +1819,68 @@ async fn read_reference_version(ctx: &DriverContext, version_id: Ulid) -> Source
     cached_metadata
 }
 
+// An offered file that changed is charged once: the successor replaces the
+// observation it supersedes, and a recount agrees.
+#[tokio::test]
+async fn offered_drift_replaces() {
+    use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+
+    let fixture = crate::tests::staging::setup_driver_context().await;
+    let context = &fixture.driver_context;
+    let root = tempdir().unwrap();
+    let file = root.path().join("data.bin");
+    std::fs::write(&file, b"one").unwrap();
+    let realm_id = RealmId::from_bytes([7u8; 32]);
+    let offer = OfferDirectoryInput {
+        bucket: "offered".to_string(),
+        root: root.path().to_str().unwrap().to_string(),
+        group_id: Ulid::generate(),
+        realm_id,
+        node_id: test_node_id(),
+        user_id: UserId::new(Ulid::generate(), realm_id),
+    };
+    offer_directory(context, offer.clone()).await.unwrap();
+    std::fs::write(&file, b"one-changed").unwrap();
+
+    let mut operation = GetObjectOperation::new(GetObjectInput {
+        bucket: offer.bucket.clone(),
+        key: "data.bin".to_string(),
+        version_id: None,
+        range: None,
+        group_id: offer.group_id,
+        user_identity: offer.user_id,
+        realm_id,
+        node_id: offer.node_id,
+    });
+    operation.now_override = Some(SystemTime::now() + 2 * MIN_ADVANCE_INTERVAL);
+    let mut stream = drive(operation, context).await.unwrap().blob;
+    while let Some(Ok(_)) = stream.next().await {}
+
+    let usage = || async {
+        let read = StorageEffect::Read {
+            key_space: aruna_core::keyspaces::USAGE_STATS_KEYSPACE.to_string(),
+            key: usage_group_key(offer.group_id).into(),
+            txn_id: None,
+        };
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) =
+            context.storage_handle.send_storage_effect(read).await
+        else {
+            panic!("missing usage counters");
+        };
+        aruna_core::structs::storage::usage::UsageCounters::from_bytes(value.unwrap().as_ref())
+            .unwrap()
+    };
+    let counters = usage().await;
+    assert_eq!((counters.objects, counters.referenced_bytes), (1, 11));
+    drive(
+        crate::node::usage_stats::RebuildStatsOperation::new(),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(usage().await, counters);
+}
+
 // A pinned historical version whose source drifted has no cached bytes
 // (#375 deferred), so it cannot serve current content.
 #[tokio::test]

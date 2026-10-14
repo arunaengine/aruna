@@ -304,6 +304,8 @@ pub struct GetObjectOperation {
     reference_explicit: bool,
     /// Fresh observation to record in the successor and then serve.
     advance_observation: Option<SourceMetadata>,
+    /// Offered directory bytes the superseded head stops charging.
+    released_bytes: u64,
     /// Embedded `referenced_bytes` counter update for the successor.
     usage_update: Option<UsageCounterUpdate>,
     /// Advance attempts so a still-drifting source cannot spin forever.
@@ -363,6 +365,7 @@ impl GetObjectOperation {
             reference_last_refresh: None,
             reference_explicit: false,
             advance_observation: None,
+            released_bytes: 0,
             usage_update: None,
             drift_attempts: 0,
             restrictions: None,
@@ -1179,6 +1182,9 @@ impl GetObjectOperation {
         let Some(advance_count) = current.advance_count() else {
             return self.restart_after_conflict();
         };
+        self.released_bytes = current
+            .offered_size(&self.input.bucket, &self.input.key)
+            .unwrap_or(0);
         if advance_count >= MAX_AUTO_ADVANCES {
             return self.abort_with_error(GetObjectError::ReferenceAdvanceExhausted);
         }
@@ -1289,9 +1295,10 @@ impl GetObjectOperation {
         let Some(observation) = self.advance_observation.as_ref() else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
-        // Every stored reference version is charged its own full size, and the
-        // superseded version stays stored, so the successor adds its own size.
-        let referenced_bytes = i128::from(observation.content_length);
+        // The successor adds its own size. A superseded reference stays stored and
+        // charged, except an offered directory observation, which is released.
+        let referenced_bytes =
+            i128::from(observation.content_length) - i128::from(self.released_bytes);
         let mut update = UsageCounterUpdate::for_group(
             self.input.group_id,
             UsageDelta {

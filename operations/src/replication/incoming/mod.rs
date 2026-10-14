@@ -3307,6 +3307,18 @@ impl IncomingVersionOperation {
         if let Err(error) = self.validate_advance(&version) {
             return self.fail(error);
         }
+        // A new head releases an offered directory observation. A replaced row is
+        // already debited, so the same version is not released twice.
+        let replaced = self
+            .existing_current_pointer
+            .as_ref()
+            .is_some_and(|pointer| pointer.version_id == self.manifest.version_id);
+        if !replaced {
+            let released = version.offered_size(&self.manifest.bucket, &self.manifest.key);
+            self.replaced_reference_bytes = self
+                .replaced_reference_bytes
+                .saturating_add(released.unwrap_or(0));
+        }
         self.apply_liveness(!version.is_deleted())
     }
 

@@ -795,12 +795,11 @@ impl RebuildStatsOperation {
                     let version = BlobVersion::from_bytes(value.as_ref())?;
                     let version_key = VersionKey::from_bytes(key.as_ref())?;
                     let object = (version_key.bucket.clone(), version_key.key.clone());
-                    if self
+                    let current = self
                         .current_versions
                         .get(&object)
-                        .is_some_and(|version_id| *version_id == version_key.version_id)
-                        && !version.is_deleted()
-                    {
+                        .is_some_and(|version_id| *version_id == version_key.version_id);
+                    if current && !version.is_deleted() {
                         let delta = UsageCounters {
                             objects: 1,
                             ..Default::default()
@@ -815,6 +814,11 @@ impl RebuildStatsOperation {
                         }
                     }
 
+                    // An offered directory is charged only for its current observations.
+                    let charged = current
+                        || version
+                            .offered_size(&version_key.bucket, &version_key.key)
+                            .is_none();
                     let Some((logical_bytes, referenced_bytes)) = (match version.state {
                         BlobVersionState::Materialized { blob_hash, .. } => {
                             let size = self.blob_sizes.get(blob_hash.as_slice()).copied();
@@ -825,7 +829,7 @@ impl RebuildStatsOperation {
                         }
                         BlobVersionState::Reference {
                             cached_metadata, ..
-                        } => Some((0, cached_metadata.content_length)),
+                        } => charged.then_some((0, cached_metadata.content_length)),
                         BlobVersionState::PendingContent { archive, .. } => {
                             let size = self.pending_sizes.get(&archive.to_bytes()).copied();
                             if size.is_none() {
@@ -1784,41 +1788,22 @@ async fn realm_group_usage(
     Ok(total)
 }
 
-/// Reads the realm-wide total from the summed cache, falling back to an
-/// on-the-fly recompute when the cache entry has not been materialized yet.
+/// Sums the realm-wide total from the live local counters and the remote snapshots, the
+/// same rows quota admission counts. The stored sum can be older than a local write.
 pub async fn load_realm_usage(
     ctx: &DriverContext,
     local_node_id: NodeId,
     scope: RealmUsageScope,
 ) -> Result<UsageCounters, String> {
     let storage = &ctx.storage_handle;
-    let cache_key = match scope {
-        RealmUsageScope::Global => Key::from(SUMMARY_GLOBAL_KEY.to_vec()),
-        RealmUsageScope::Group(group_id) => Key::from(usage_summary_key(group_id)),
-    };
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: NODE_STATS_KEYSPACE.to_string(),
-            key: cache_key,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => UsageCounters::from_bytes(bytes.as_ref()).map_err(|e| e.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => match scope {
-            RealmUsageScope::Global => {
-                let active_node_ids = active_usage_nodes(ctx).await?;
-                realm_global_usage(storage, local_node_id, active_node_ids.as_ref()).await
-            }
-            RealmUsageScope::Group(group_id) => {
-                let active_node_ids = active_usage_nodes(ctx).await?;
-                realm_group_usage(storage, local_node_id, group_id, active_node_ids.as_ref()).await
-            }
-        },
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected realm usage read event: {other:?}")),
+    let active_node_ids = active_usage_nodes(ctx).await?;
+    match scope {
+        RealmUsageScope::Global => {
+            realm_global_usage(storage, local_node_id, active_node_ids.as_ref()).await
+        }
+        RealmUsageScope::Group(group_id) => {
+            realm_group_usage(storage, local_node_id, group_id, active_node_ids.as_ref()).await
+        }
     }
 }
 
@@ -2578,6 +2563,72 @@ mod tests {
             operation.groups.get(&group_id).unwrap().referenced_bytes,
             1_000_000
         );
+    }
+
+    #[test]
+    fn offered_history_uncharged() {
+        // Only the head observation of an offered file is charged. A copy of the
+        // binding under another key is an ordinary reference and stays charged.
+        let group_id = Ulid::generate();
+        let row = |key: &str, version_id: Ulid, content_length: u64| {
+            let source = VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::LocalDirectory,
+                    public_config: HashMap::from([(
+                        aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_BUCKET
+                            .to_string(),
+                        "offered".to_string(),
+                    )]),
+                    source_path: "data.bin".to_string(),
+                    version_selector: None,
+                    capabilities: Vec::new(),
+                    origin_node_id: None,
+                },
+                connector_id: None,
+            };
+            let metadata = SourceMetadata {
+                content_length,
+                content_type: None,
+                etag: None,
+                last_modified: None,
+                source_version: None,
+            };
+            let now = SystemTime::UNIX_EPOCH;
+            let version = BlobVersion::reference(source, metadata, now, Default::default(), now);
+            (
+                ByteView::from(
+                    VersionKey::new("offered", key, version_id)
+                        .to_bytes()
+                        .unwrap(),
+                ),
+                ByteView::from(version.to_bytes().unwrap()),
+            )
+        };
+        let head = Ulid::from_parts(2, 0);
+        let mut operation = RebuildStatsOperation::new();
+        operation.state = RebuildStatsState::ScanVersions;
+        operation
+            .bucket_groups
+            .insert("offered".to_string(), group_id);
+        operation
+            .current_versions
+            .insert(("offered".to_string(), "data.bin".to_string()), head);
+
+        operation
+            .consume_values(&[
+                row("data.bin", Ulid::from_parts(1, 0), 3),
+                row("data.bin", head, 11),
+                row("copy.bin", Ulid::from_parts(3, 0), 5),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            operation.groups.get(&group_id).unwrap().referenced_bytes,
+            16
+        );
+        assert_eq!(operation.global.referenced_bytes, 16);
+        assert_eq!(operation.groups.get(&group_id).unwrap().objects, 1);
     }
 
     #[test]

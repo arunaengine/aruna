@@ -149,6 +149,8 @@ pub struct SealedCopyOperation {
     version: Option<BlobVersion>,
     existing: Option<CurrentVersionPointer>,
     was_live: bool,
+    /// Offered directory bytes the replaced head stops charging.
+    released_bytes: u64,
     quota: Option<QuotaGate>,
     usage: Option<UsageCounterUpdate>,
     /// Admitted parameters and epoch, the complete envelope the copy reuses and its own one.
@@ -175,6 +177,7 @@ impl SealedCopyOperation {
             version: None,
             existing: None,
             was_live: false,
+            released_bytes: 0,
             quota: None,
             usage: None,
             admitted: None,
@@ -483,10 +486,13 @@ impl SealedCopyOperation {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return Err(SealedCopyError::InvalidState);
         };
-        self.was_live = value
+        let head = value
             .map(|value| BlobVersion::from_bytes(value.as_ref()))
-            .transpose()?
-            .is_some_and(|version| !version.is_deleted());
+            .transpose()?;
+        self.was_live = head.as_ref().is_some_and(|version| !version.is_deleted());
+        self.released_bytes = head
+            .and_then(|version| version.offered_size(&self.input.bucket, &self.input.dest_key))
+            .unwrap_or(0);
         self.write_head()
     }
 
@@ -651,6 +657,7 @@ impl SealedCopyOperation {
         let delta = UsageDelta {
             objects: i128::from(!self.was_live),
             logical_bytes: i128::from(added),
+            referenced_bytes: -i128::from(self.released_bytes),
             ..Default::default()
         };
         self.usage = Some(UsageCounterUpdate::for_group(self.input.group_id, delta));

@@ -254,6 +254,8 @@ pub struct CompleteUploadOperation {
     existing_pointer: Option<CurrentVersionPointer>,
     new_blob: bool,
     was_live: bool,
+    /// Offered directory bytes the replaced head stops charging.
+    released_bytes: u64,
     usage_update: Option<UsageCounterUpdate>,
     quota_gate: Option<QuotaGate>,
     output: Option<Result<CompleteUploadResult, CompleteUploadError>>,
@@ -311,6 +313,7 @@ impl CompleteUploadOperation {
             existing_pointer: None,
             new_blob: false,
             was_live: false,
+            released_bytes: 0,
             usage_update: None,
             quota_gate: None,
             output: None,
@@ -1409,9 +1412,11 @@ impl CompleteUploadOperation {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
 
-        self.was_live = value
-            .and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok())
-            .is_some_and(|version| !version.is_deleted());
+        let head = value.and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok());
+        self.was_live = head.as_ref().is_some_and(|version| !version.is_deleted());
+        self.released_bytes = head
+            .and_then(|version| version.offered_size(&self.input.bucket, &self.input.key))
+            .unwrap_or(0);
 
         let existing_pointer = self.existing_pointer.clone();
         self.write_current_lookup(existing_pointer.as_ref())
@@ -1833,6 +1838,7 @@ impl CompleteUploadOperation {
         let group_delta = UsageDelta {
             objects: if self.was_live { 0 } else { 1 },
             logical_bytes: size + i128::from(self.envelope_bytes),
+            referenced_bytes: -i128::from(self.released_bytes),
             ..Default::default()
         };
         let stored = self

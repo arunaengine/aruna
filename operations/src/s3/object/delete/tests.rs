@@ -233,7 +233,8 @@ fn reference_counts_content() {
         Default::default(),
         SystemTime::UNIX_EPOCH,
     );
-    let summary = VersionSummary::from_blob_version(version_id, &version);
+    let key = VersionKey::new("bucket", "object.bin", version_id);
+    let summary = VersionSummary::from_blob_version(&key, &version);
 
     assert_eq!(summary.logical_size, Some(1_000_000));
     assert!(summary.referenced);
@@ -256,6 +257,7 @@ fn sized_delete_op() -> DeleteObjectOperation {
         materialized_hash: Some([4u8; 32]),
         logical_size: None,
         referenced: false,
+        offered: false,
         deleted: false,
     });
     op.existing_pointer = Some(CurrentVersionPointer::new(version_id));
@@ -1367,4 +1369,124 @@ async fn removes_pending_copy() {
         let group = read_counters(&context, usage_group_key(group_id)).await;
         assert_eq!((group.objects, group.logical_bytes), (0, 0));
     }
+}
+
+/// Offers one file twice with changed content and returns the offer with the
+/// stale first observation. `withdraw` then puts a delete marker over both.
+async fn offered_history(
+    context: &DriverContext,
+    withdraw: bool,
+) -> (crate::staging::offered_directory::OfferDirectoryInput, Ulid) {
+    use crate::staging::offered_directory::{
+        OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
+    };
+
+    let root = tempdir().unwrap();
+    let file = root.path().join("data.bin");
+    let realm_id = RealmId::from_bytes([7u8; 32]);
+    let offer = OfferDirectoryInput {
+        bucket: "offered".to_string(),
+        root: root.path().to_str().unwrap().to_string(),
+        group_id: Ulid::generate(),
+        realm_id,
+        node_id: test_node_id(),
+        user_id: aruna_core::UserId::new(Ulid::generate(), realm_id),
+    };
+    std::fs::write(&file, b"one").unwrap();
+    let first = offer_directory(context, offer.clone()).await.unwrap();
+    std::fs::write(&file, b"one-changed").unwrap();
+    offer_directory(context, offer.clone()).await.unwrap();
+    if withdraw {
+        let input = WithdrawOfferInput {
+            bucket: offer.bucket.clone(),
+            realm_id,
+            node_id: offer.node_id,
+            user_id: offer.user_id,
+        };
+        withdraw_offer(context, input).await.unwrap();
+    }
+    (offer, first.observed[0].version_id)
+}
+
+/// Runs one delete and requires the group counters to equal a recount.
+async fn delete_then_recount(
+    context: &DriverContext,
+    offer: &crate::staging::offered_directory::OfferDirectoryInput,
+    version_id: Option<Ulid>,
+) -> (u64, u64) {
+    use aruna_core::structs::storage::usage::usage_group_key;
+
+    let input = DeleteObjectInput {
+        bucket: offer.bucket.clone(),
+        key: "data.bin".to_string(),
+        version_id,
+        group_id: offer.group_id,
+        realm_id: offer.realm_id,
+        node_id: offer.node_id,
+        deleted_by: offer.user_id,
+    };
+    drive(DeleteObjectOperation::new(input), context)
+        .await
+        .unwrap();
+    let counters = read_counters(context, usage_group_key(offer.group_id)).await;
+    drive(
+        crate::node::usage_stats::RebuildStatsOperation::new(),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_counters(context, usage_group_key(offer.group_id)).await,
+        counters
+    );
+    (counters.objects, counters.referenced_bytes)
+}
+
+async fn head_id(context: &DriverContext, bucket: &str) -> Ulid {
+    let key = BlobHeadKey::new(bucket, "data.bin").to_bytes().unwrap();
+    let value = read_value(context, BLOB_HEAD_KEYSPACE, key).await.unwrap();
+    CurrentVersionPointer::from_bytes(value.as_ref())
+        .unwrap()
+        .version_id
+}
+
+// A replaced observation was released when its successor became the head, so
+// deleting its row must not release it a second time.
+#[tokio::test]
+async fn stale_observation_uncharged() {
+    let fixture = crate::tests::staging::setup_driver_context().await;
+    let context = &fixture.driver_context;
+    let (offer, stale) = offered_history(context, false).await;
+
+    assert_eq!(
+        delete_then_recount(context, &offer, Some(stale)).await,
+        (1, 11)
+    );
+}
+
+// Deleting the delete marker makes the last observation the head again, so it
+// is charged again.
+#[tokio::test]
+async fn promoted_observation_charged() {
+    let fixture = crate::tests::staging::setup_driver_context().await;
+    let context = &fixture.driver_context;
+    let (offer, _) = offered_history(context, true).await;
+    let marker = head_id(context, &offer.bucket).await;
+
+    assert_eq!(
+        delete_then_recount(context, &offer, Some(marker)).await,
+        (1, 11)
+    );
+}
+
+// A delete marker over a head observation releases it, as a withdrawal does.
+#[tokio::test]
+async fn marker_releases_observation() {
+    let fixture = crate::tests::staging::setup_driver_context().await;
+    let context = &fixture.driver_context;
+    let (offer, _) = offered_history(context, true).await;
+    let marker = head_id(context, &offer.bucket).await;
+    delete_then_recount(context, &offer, Some(marker)).await;
+
+    assert_eq!(delete_then_recount(context, &offer, None).await, (0, 0));
 }

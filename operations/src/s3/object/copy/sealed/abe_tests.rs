@@ -524,8 +524,19 @@ async fn group_bytes(storage: &StorageHandle, sealed: &Sealed) -> u64 {
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
     let key = usage_group_key(input(&sealed.location, Ulid::nil()).group_id);
-    let value = get(storage, USAGE_STATS_KEYSPACE, key).await.unwrap();
-    UsageCounters::from_bytes(&value).unwrap().logical_bytes
+    let value = get(storage, USAGE_STATS_KEYSPACE, key).await;
+    value.map_or(0, |value| {
+        UsageCounters::from_bytes(&value).unwrap().logical_bytes
+    })
+}
+
+/// The group's logical bytes after a full recount from the stored rows.
+async fn recounted_bytes(context: &DriverContext, sealed: &Sealed) -> u64 {
+    use crate::node::usage_stats::RebuildStatsOperation;
+    crate::driver::drive(RebuildStatsOperation::new(), context)
+        .await
+        .unwrap();
+    group_bytes(&context.storage_handle, sealed).await
 }
 
 #[tokio::test]
@@ -534,13 +545,22 @@ async fn pending_charge_replaced() {
     let (_temp, context) = context();
     let storage = &context.storage_handle;
     let (sealed, source_id, _) = sealed(storage).await;
+    // The source rows are seeded by hand: the recount needs the archive's location row for
+    // its size, and its first result is the baseline for the rows seeded without a charge.
+    let archive = ArchiveKey::of(&sealed.location).to_bytes();
+    let location = sealed.location.to_bytes().unwrap();
+    let pending_keyspace = aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
+    put(storage, pending_keyspace, archive.to_vec(), location).await;
+    let base = recounted_bytes(&context, &sealed).await;
     let copy = copy_input(&sealed, (SOURCE, source_id), "copy");
     let version_id = run(SealedCopyOperation::new(copy), storage, None, Race::Off)
         .await
         .unwrap()
         .version_id;
     let row = pending_row(storage, "copy", version_id).await.unwrap();
-    assert_eq!(group_bytes(storage, &sealed).await, 50 + row.len() as u64);
+    let pending = base + 50 + row.len() as u64;
+    assert_eq!(group_bytes(storage, &sealed).await, pending);
+    assert_eq!(recounted_bytes(&context, &sealed).await, pending);
     let outcome = complete(storage, "copy", version_id, Some(&sealed), Race::Off).await;
     assert_eq!(outcome, Ok(CopyOutcome::Completed));
     let (envelope, _) = envelope_of(storage, "copy", version_id).await.unwrap();
@@ -551,7 +571,8 @@ async fn pending_charge_replaced() {
     let archive_keyspace = aruna_core::keyspaces::ABE_ARCHIVE_KEYSPACE;
     let archive = get(storage, archive_keyspace, id).await.unwrap();
     let charge = aruna_core::structs::storage::abe::envelope_charge(&bytes, &archive);
-    assert_eq!(group_bytes(storage, &sealed).await, 50 + charge);
+    assert_eq!(group_bytes(storage, &sealed).await, base + 50 + charge);
+    assert_eq!(recounted_bytes(&context, &sealed).await, base + 50 + charge);
 }
 
 #[tokio::test]
