@@ -234,10 +234,13 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
   `backend_prefix`) + `write_pattern`, with `{dir}` = `d/`, `{name}` = `n` and `{id}` = the
   version id, so other tools see it. Uploads under the rule's own import folder are not imported
   again; later changes to such a file are.
-- A pattern without `{id}` replaces the file of the same name. Aruna first moves the bytes of the
-  version stored there to `.aruna-versions/<path>/<id>`, so older versions stay readable. A second
-  upload to the same file while one runs gets `409 OperationAborted`. A rejected upload does not
-  bring back the replaced file.
+- A pattern without `{id}` keeps the file name. No upload waits for another. A new file is
+  created only if the name is still free. If the file exists and the backend keeps versions, the
+  upload replaces it and older Aruna versions still read their own backend version. Without
+  backend versions the upload is stored next to it as `<name>~<version id>`, and the bucket key
+  stays the same. If another upload creates the same new file first, a single upload gets
+  `503 ServiceUnavailable` and its retry is stored next to the file; a multipart upload is
+  stored next to it directly. Backends without conditional writes (B2) only check the name first.
 - A bucket that turns on compression or encryption later stores new uploads in Aruna's own layout.
 - Nothing runs on creation. Start a run on request or give a `schedule`.
 - Aruna never deletes imported bytes from the backend. Deleting an object in Aruna only removes

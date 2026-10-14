@@ -114,7 +114,7 @@ async fn rejects_bad_input() {
     assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
 
     let mut reserved = request(&test, backend_id, "raw/");
-    reserved.write_prefix = Some(".aruna-versions/".to_string());
+    reserved.write_prefix = Some("_aruna_backend_probe/".to_string());
     let result = create_import(State(test.state.clone()), auth(), group(), Json(reserved)).await;
     assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
 
