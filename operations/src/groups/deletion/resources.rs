@@ -29,6 +29,7 @@ const TABLES: &[(&str, &str, bool)] = &[
     (S3_SESSION_KEYSPACE, "active S3 sessions", false),
     (PLACEMENT_POLICY_KEYSPACE, "owned placement policies", false),
     (STORAGE_ROUTING_KEYSPACE, "default storage routing", true),
+    (BACKEND_IMPORT_KEYSPACE, "backend imports", true),
     (JOB_KEYSPACE, "job records", false),
     (FAMILY_RECORD_KEYSPACE, "job families", false),
     (FAMILY_PENDING_KEYSPACE, "pending job families", false),
