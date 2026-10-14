@@ -240,7 +240,8 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
   backend versions the upload is stored next to it as `<name>~<version id>`, and the bucket key
   stays the same. If another upload creates the same new file first, a single upload gets
   `503 ServiceUnavailable` and its retry is stored next to the file; a multipart upload is
-  stored next to it directly. Backends without conditional writes (B2) only check the name first.
+  stored next to it directly. Backends without conditional writes (B2) always store the upload
+  at the tagged name `<name>~<version id>`.
 - A bucket that turns on compression or encryption later stores new uploads in Aruna's own layout.
 - Nothing runs on creation. Start a run on request or give a `schedule`.
 - Aruna never deletes imported bytes from the backend. Deleting an object in Aruna only removes
