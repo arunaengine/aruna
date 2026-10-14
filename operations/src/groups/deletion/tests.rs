@@ -482,3 +482,72 @@ async fn unauthorized_commit_refuses() {
         .is_some()
     );
 }
+
+#[tokio::test]
+async fn retained_backend_removed() {
+    use crate::groups::backends::{backend_key, index_key, record_writes};
+    use aruna_core::compute::{SecretBytes, SharedSecret};
+    use aruna_core::structs::storage::cleanup::CleanupStrategy;
+    use aruna_core::structs::storage::group_backend::{
+        GroupBackendKind, GroupStorage, GroupStorageSecret,
+    };
+
+    let fixture = Fixture::new(&[1]).await;
+    let storage = &fixture.context.storage_handle;
+    let mut record = GroupStorage {
+        backend_id: Ulid::from_bytes([6; 16]),
+        group_id: fixture.plan.group_id,
+        name: "tenant".into(),
+        kind: GroupBackendKind::S3,
+        public_config: Default::default(),
+        created_at: SystemTime::UNIX_EPOCH,
+        updated_at: SystemTime::UNIX_EPOCH,
+        created_by: fixture.actor.user_id,
+        disabled: true,
+        cleanup: CleanupStrategy::node_default(),
+    };
+    let entry = GroupStorageSecret::vault_entry(record.backend_id);
+    let secret = SharedSecret::new(SecretBytes::new(vec![1]));
+    let writes = record_writes(&record).unwrap();
+    for effect in [
+        StorageEffect::VaultWrite {
+            entry,
+            secret,
+            txn_id: None,
+        },
+        StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        },
+    ] {
+        let event = storage.send_storage_effect(effect).await;
+        assert!(!matches!(event, Event::Storage(StorageEvent::Error { .. })));
+    }
+    // A reclaiming backend still has bytes to drain, so it blocks the deletion.
+    assert_eq!(
+        fixture.prepare(1).await,
+        Err(GroupDeletionError::NotEmpty("storage backends".into()))
+    );
+
+    record.cleanup = CleanupStrategy::Retain;
+    let writes = record_writes(&record).unwrap();
+    let effect = StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
+    };
+    storage.send_storage_effect(effect).await;
+    let proof = fixture.prepare(1).await.unwrap();
+    fixture.commit(vec![proof]).await.unwrap();
+
+    let group_id = fixture.plan.group_id;
+    for (space, key) in [
+        (STORAGE_BACKEND_KEYSPACE, backend_key(record.backend_id)),
+        (
+            BACKEND_INDEX_KEYSPACE,
+            index_key(group_id, record.backend_id),
+        ),
+        (NODE_VAULT_KEYSPACE, entry.key().into()),
+    ] {
+        assert!(read(&fixture.context, space, key.to_vec()).await.is_none());
+    }
+}

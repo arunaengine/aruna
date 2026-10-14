@@ -9,7 +9,8 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    DOCUMENT_STATE_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    BACKEND_INDEX_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE,
+    NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentState, decode_reducer_state};
@@ -23,11 +24,13 @@ use aruna_core::structs::identity::group_delete::{
     MembershipFence,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::groups::backends::{backend_key, index_prefix};
 use crate::placement::fence::WriteFence;
 use crate::placement::target_placement_ref;
 use crate::sync::document_outbox::{
@@ -42,6 +45,7 @@ enum State {
     GroupAuth,
     RealmAuth,
     Write,
+    Backends,
     Delete,
     Fence,
     Commit,
@@ -264,6 +268,48 @@ impl CommitOperation {
         })])
     }
 
+    /// Pages through this node's backend records of the group; prepare left only retained ones.
+    fn scan_backends(&mut self, start: Option<Key>) -> Effects {
+        self.state = State::Backends;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BACKEND_INDEX_KEYSPACE.to_string(),
+            prefix: Some(index_prefix(self.certificate.plan.group_id)),
+            start: start.map(aruna_core::effects::IterStart::After),
+            limit: 128,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn drop_backends(
+        &mut self,
+        values: Vec<(Key, Value)>,
+        next: Option<Key>,
+    ) -> Result<Effects, GroupDeletionError> {
+        for (key, value) in values {
+            let record = GroupStorage::from_bytes(&value)?;
+            if record.group_id != self.certificate.plan.group_id {
+                return Err(GroupDeletionError::Invalid("backend index mismatch".into()));
+            }
+            let entry = GroupStorageSecret::vault_entry(record.backend_id);
+            self.deletes.extend([
+                (
+                    STORAGE_BACKEND_KEYSPACE.to_string(),
+                    backend_key(record.backend_id),
+                ),
+                (BACKEND_INDEX_KEYSPACE.to_string(), key),
+                (NODE_VAULT_KEYSPACE.to_string(), entry.key().into()),
+            ]);
+        }
+        if next.is_some() {
+            return Ok(self.scan_backends(next));
+        }
+        self.state = State::Delete;
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes: std::mem::take(&mut self.deletes),
+            txn_id: self.txn_id
+        })])
+    }
+
     fn commit(&mut self, txn_id: TxnId) -> Effects {
         self.state = State::Commit;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
@@ -355,12 +401,15 @@ impl Operation for CommitOperation {
                 )),
             },
             (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.state = State::Delete;
-                Ok(smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: std::mem::take(&mut self.deletes),
-                    txn_id: self.txn_id
-                })])
+                Ok(self.scan_backends(None))
             }
+            (
+                State::Backends,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => self.drop_backends(values, next_start_after),
             (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
                 match self.txn_id {
                     Some(txn_id) if self.fence.is_empty() => Ok(self.commit(txn_id)),

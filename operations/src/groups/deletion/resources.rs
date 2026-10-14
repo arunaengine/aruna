@@ -13,6 +13,7 @@ use aruna_core::structs::identity::group_delete::GroupDeletionError;
 use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
+use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::GroupStorageRouting;
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -137,8 +138,11 @@ impl EmptyCheck {
                         matches!(pending.envelope.record, JobFamilyRecord::Spec(spec) if spec.group_id == self.group_id)
                     }
                     S3_BUCKET_KEYSPACE => BucketInfo::from_bytes(&value)?.group_id == self.group_id,
+                    // A disabled `retain` backend keeps its bytes in tenant storage; the commit drops it.
                     STORAGE_BACKEND_KEYSPACE => {
-                        GroupStorage::from_bytes(&value)?.group_id == self.group_id
+                        let record = GroupStorage::from_bytes(&value)?;
+                        record.group_id == self.group_id
+                            && !(record.disabled && record.cleanup == CleanupStrategy::Retain)
                     }
                     USER_ACCESS_KEYSPACE => {
                         let record = UserAccess::from_bytes(&value)?;
