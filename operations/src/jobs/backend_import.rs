@@ -7,20 +7,21 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
+    PLAIN_NAME_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{JobError, JobId, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportCheckpoint, BackendImportSpec, ExternalObject, ImportedObject,
-    object_key,
+    object_key, plain_name_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer, ResolvedBackend,
     VersionKey, bucket_permission_path,
 };
 use aruna_core::structs::storage::group_backend::GroupStorage;
-use aruna_core::structs::storage::routing::{RoutingSnapshot, resolve_backend};
+use aruna_core::structs::storage::routing::{RoutingSnapshot, RoutingTarget, RuleSource};
 use aruna_core::types::{Effects, Key, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -274,25 +275,31 @@ async fn import_object(
     object: &ExternalObject,
 ) -> Result<Outcome, ItemError> {
     let rule = &run.rule;
-    let Some(key) = rule.aruna_key(&object.key) else {
-        return Ok(Outcome::Ignored);
-    };
-    if run.backend.is_reserved(&object.key) {
+    if rule.aruna_key(&object.key).is_none() || run.backend.is_reserved(&object.key) {
         return Ok(Outcome::Ignored);
     }
     let row_key = object_key(rule.import_id, &object.key);
+    let [row] = read_values(&ctx.driver, [(IMPORTED_OBJECT_KEYSPACE, row_key.clone())]).await?;
+    let row = parse(row, ImportedObject::from_bytes)?;
+    // Aruna's own write is recorded with its key; its first listing only notes ETag and time.
+    if let Some(listed) = row.as_ref().and_then(|row| row.first_listing(object)) {
+        write_value(
+            &ctx.driver,
+            IMPORTED_OBJECT_KEYSPACE,
+            row_key,
+            encode(&listed)?,
+        )
+        .await?;
+        return Ok(Outcome::Skipped);
+    }
+    let key = match row.as_ref().and_then(|row| row.key.clone()) {
+        Some(key) => key,
+        None => rule.aruna_key(&object.key).unwrap_or_default(),
+    };
     let head_key = BlobHeadKey::new(&rule.bucket, &key)
         .to_bytes()
         .map_err(|error| ItemError::Item(error.to_string()))?;
-    let [row, head] = read_values(
-        &ctx.driver,
-        [
-            (IMPORTED_OBJECT_KEYSPACE, row_key.clone()),
-            (BLOB_HEAD_KEYSPACE, head_key.into()),
-        ],
-    )
-    .await?;
-    let row = parse(row, ImportedObject::from_bytes)?;
+    let [head] = read_values(&ctx.driver, [(BLOB_HEAD_KEYSPACE, head_key.into())]).await?;
     let head = parse(head, CurrentVersionPointer::from_bytes)?.map(|head| head.version_id);
     let version_exists = match (&row, head) {
         (Some(row), None) => {
@@ -309,24 +316,44 @@ async fn import_object(
         Decision::Skip => return Ok(Outcome::Skipped),
         Decision::Import(version_id) => version_id,
     };
-    let intent = ImportedObject::new(version_id, object);
+    let intent = ImportedObject {
+        key: row.as_ref().and_then(|row| row.key.clone()),
+        ..ImportedObject::new(version_id, object)
+    };
     if row.as_ref() != Some(&intent) {
-        write_row(&ctx.driver, row_key, &intent).await?;
+        write_value(
+            &ctx.driver,
+            IMPORTED_OBJECT_KEYSPACE,
+            row_key,
+            encode(&intent)?,
+        )
+        .await?;
     }
-    let resolved = resolve_backend(&run.routing, &rule.bucket, &key)
-        .map_err(|error| ItemError::Item(error.to_string()))?;
-    if resolved.backend != BackendRef::Group(rule.backend_id) {
-        return Err(ItemError::Item(
-            "writes to this key route to another backend".to_string(),
-        ));
-    }
+    // The bytes stay on the rule's backend, wherever new writes to the key are routed.
+    let target = RoutingTarget::Backend(BackendRef::Group(rule.backend_id));
+    let resolved = match run
+        .routing
+        .catalog
+        .resolve_target(&target, RuleSource::Tenant)
+    {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return Err(ItemError::Item("the backend is not usable".to_string())),
+        Err(error) => return Err(ItemError::Item(error.to_string())),
+    };
     let location = hash_object(ctx, spec, resolved, &object.key).await?;
     if location.blob_size != object.size {
         return Err(ItemError::Item(
             "the object changed while it was read".to_string(),
         ));
     }
+    let hint = location.location_key().ok();
     put_version(ctx, spec, run, key.clone(), version_id, location).await?;
+    // A same-name write to this path first moves the imported bytes aside.
+    if let Some(hint) = hint.filter(|_| rule.same_name() && rule.write_backend() == rule.backend_id)
+    {
+        let name = plain_name_key(&BackendRef::Group(rule.backend_id), &object.key);
+        write_value(&ctx.driver, PLAIN_NAME_KEYSPACE, name, hint.to_bytes()).await?;
+    }
     // Without the replication seed, peers never learn about the version.
     drive(
         LiveVersionOperation::new(LiveVersionInput {
@@ -439,18 +466,21 @@ async fn read_values<const N: usize>(
     }
 }
 
-async fn write_row(
+fn encode(row: &ImportedObject) -> Result<Vec<u8>, ItemError> {
+    row.to_bytes()
+        .map_err(|error| ItemError::System(error.to_string()))
+}
+
+async fn write_value(
     context: &DriverContext,
+    key_space: &str,
     key: Key,
-    row: &ImportedObject,
+    value: Vec<u8>,
 ) -> Result<(), ItemError> {
-    let value = row
-        .to_bytes()
-        .map_err(|error| ItemError::System(error.to_string()))?;
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
+            key_space: key_space.to_string(),
             key,
             value: value.into(),
             txn_id: None,

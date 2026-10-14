@@ -15,7 +15,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::group_delete::check_group_write;
-use aruna_core::structs::storage::backend_import::BackendImport;
+use aruna_core::structs::storage::backend_import::{BackendImport, valid_pattern};
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::Compression;
@@ -37,6 +37,9 @@ pub struct CreateImportInput {
     pub bucket: String,
     pub key_prefix: String,
     pub schedule: Option<String>,
+    pub write_backend_id: Option<Ulid>,
+    pub write_prefix: Option<String>,
+    pub write_pattern: String,
     pub now: SystemTime,
 }
 
@@ -51,9 +54,9 @@ enum CreateState {
     Finish,
 }
 
-/// Checks the bucket, the backend and the group's other rules in one transaction, then
+/// Checks the bucket, both backends and the group's other rules in one transaction, then
 /// writes the rule and, when it is missing, the routing rule that sends the folder's
-/// writes to the backend. Imported bytes are adopted only where routing resolves there.
+/// writes to the write backend.
 #[derive(Debug, PartialEq)]
 pub struct CreateImportOperation {
     input: CreateImportInput,
@@ -88,6 +91,14 @@ impl CreateImportOperation {
     fn validate(&self) -> Result<(), ImportRuleError> {
         validate_folder("backend_prefix", &self.input.backend_prefix)?;
         validate_folder("key_prefix", &self.input.key_prefix)?;
+        if let Some(prefix) = self.input.write_prefix.as_deref() {
+            validate_folder("write_prefix", prefix)?;
+        }
+        if !valid_pattern(&self.input.write_pattern) {
+            return Err(ImportRuleError::Invalid(
+                "write_pattern needs {name} and may only use {dir}, {name} and {id}".to_string(),
+            ));
+        }
         if self.input.bucket.is_empty() {
             return Err(ImportRuleError::Invalid("bucket is required".to_string()));
         }
@@ -111,6 +122,9 @@ impl CreateImportOperation {
             updated_at: self.input.now,
             last_job: None,
             last_started_ms: None,
+            write_backend_id: self.input.write_backend_id,
+            write_prefix: self.input.write_prefix.clone(),
+            write_pattern: self.input.write_pattern.clone(),
         }
     }
 
@@ -127,13 +141,17 @@ impl CreateImportOperation {
                     backend_key(self.input.backend_id)
                 ),
                 group_fence_key(self.input.group_id),
+                (
+                    STORAGE_BACKEND_KEYSPACE.to_string(),
+                    backend_key(self.write_backend())
+                ),
             ],
             txn_id: Some(txn_id),
         })]
     }
 
     fn checked(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let [bucket, encryption, backend, fence] = match <[_; 4]>::try_from(values) {
+        let [bucket, encryption, backend, fence, write_backend] = match <[_; 5]>::try_from(values) {
             Ok(values) => values.map(|(_, value)| value),
             Err(_) => return self.fail(ImportRuleError::Unexpected("Read")),
         };
@@ -158,19 +176,15 @@ impl CreateImportOperation {
             Ok(_) => {}
             Err(error) => return self.fail(error.into()),
         }
-        let backend = match backend
-            .map(|value| GroupStorage::from_bytes(&value))
-            .transpose()
-        {
-            Ok(Some(backend)) if backend.group_id == self.input.group_id => backend,
-            Ok(_) => return self.invalid("the storage backend does not belong to this group"),
-            Err(error) => return self.fail(error.into()),
+        let (backend, write_backend) = match (self.owned(backend), self.owned(write_backend)) {
+            (Ok(backend), Ok(write_backend)) => (backend, write_backend),
+            (Err(error), _) | (_, Err(error)) => return self.fail(error),
         };
-        if backend.disabled {
-            return self.invalid("the storage backend is disabled");
-        }
         if backend.is_reserved(&self.input.backend_prefix) {
             return self.invalid("backend_prefix lies inside the folder Aruna writes to");
+        }
+        if write_backend.is_reserved(self.write_folder()) {
+            return self.invalid("write_prefix lies inside the folder Aruna writes to");
         }
         if let Err(error) = self.route(bucket) {
             return self.fail(error);
@@ -178,9 +192,44 @@ impl CreateImportOperation {
         self.scan(None)
     }
 
+    fn write_backend(&self) -> Ulid {
+        self.input.write_backend_id.unwrap_or(self.input.backend_id)
+    }
+
+    fn write_folder(&self) -> &str {
+        let prefix = self.input.write_prefix.as_deref();
+        prefix.unwrap_or(&self.input.backend_prefix)
+    }
+
+    /// An enabled backend of this group.
+    fn owned(&self, record: Option<Value>) -> Result<GroupStorage, ImportRuleError> {
+        let invalid = |reason: &str| ImportRuleError::Invalid(reason.to_string());
+        match record
+            .map(|value| GroupStorage::from_bytes(&value))
+            .transpose()?
+        {
+            Some(backend) if backend.group_id != self.input.group_id => {
+                Err(invalid("the storage backend does not belong to this group"))
+            }
+            Some(backend) if backend.disabled => Err(invalid("the storage backend is disabled")),
+            Some(backend) => Ok(backend),
+            None => Err(invalid("the storage backend does not belong to this group")),
+        }
+    }
+
+    /// Another rule must neither write where this one reads or writes, nor read where it writes.
+    fn shares_folder(&self, rule: &BackendImport) -> bool {
+        let (read, write) = (self.input.backend_id, self.write_backend());
+        let prefix = self.input.backend_prefix.as_str();
+        (rule.write_backend() == write && folders_overlap(rule.write_folder(), self.write_folder()))
+            || (rule.backend_id == write
+                && folders_overlap(&rule.backend_prefix, self.write_folder()))
+            || (rule.write_backend() == read && folders_overlap(rule.write_folder(), prefix))
+    }
+
     /// Adds the folder's routing rule; an existing rule for the same folder must agree.
     fn route(&mut self, mut bucket: BucketInfo) -> Result<(), ImportRuleError> {
-        let target = RoutingTarget::Backend(BackendRef::Group(self.input.backend_id));
+        let target = RoutingTarget::Backend(BackendRef::Group(self.write_backend()));
         let existing = bucket
             .storage_routing
             .iter()
@@ -224,6 +273,12 @@ impl CreateImportOperation {
             {
                 return self.fail(ImportRuleError::Conflict(format!(
                     "import {} already imports into this folder",
+                    rule.import_id
+                )));
+            }
+            if self.shares_folder(&rule) {
+                return self.fail(ImportRuleError::Conflict(format!(
+                    "import {} reads or writes the same backend folder",
                     rule.import_id
                 )));
             }
@@ -336,6 +391,7 @@ impl Operation for CreateImportOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structs::storage::backend_import::DEFAULT_PATTERN;
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::group_backend::GroupBackendKind;
     use std::collections::HashMap;
@@ -357,6 +413,9 @@ mod tests {
             bucket: "bucket".to_string(),
             key_prefix: key_prefix.to_string(),
             schedule: Some("0 3 * * *".to_string()),
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: DEFAULT_PATTERN.to_string(),
             now: SystemTime::UNIX_EPOCH,
         }
     }
@@ -401,7 +460,7 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
-        let values = [bucket, None, backend(), None]
+        let values = [bucket, None, backend(), None, backend()]
             .into_iter()
             .map(|value| (Key::from(Vec::new()), value))
             .collect();
@@ -526,6 +585,49 @@ mod tests {
 
         let mut bad = input("raw", "");
         bad.schedule = Some("hourly please".to_string());
+        let mut operation = CreateImportOperation::new(bad);
+        assert!(operation.start().is_empty());
+        assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
+    }
+
+    #[test]
+    fn routes_write_backend() {
+        let other = Ulid::from_bytes([9u8; 16]);
+        let mut moved = input("raw/", "imported/");
+        moved.write_backend_id = Some(other);
+        moved.write_pattern = "{dir}{name}".to_string();
+        let (mut operation, _) = after_reads(moved, bucket(Vec::new(), Compression::Off));
+        let effects = scan_page(&mut operation, &[]);
+
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one batch write")
+        };
+        let rule = BackendImport::from_bytes(&writes[0].2).unwrap();
+        assert_eq!(rule.write_backend(), other);
+        assert!(rule.same_name());
+        let routing = BucketInfo::from_bytes(&writes[1].2)
+            .unwrap()
+            .storage_routing;
+        assert_eq!(
+            routing[0].target,
+            RoutingTarget::Backend(BackendRef::Group(other))
+        );
+    }
+
+    #[test]
+    fn refuses_shared_folder() {
+        let (mut operation, _) = after_reads(
+            input("raw/x/", "imported/"),
+            bucket(Vec::new(), Compression::Off),
+        );
+        let mut other = operation.record();
+        other.key_prefix = "elsewhere/".to_string();
+        other.backend_prefix = "raw/".to_string();
+        scan_page(&mut operation, &[other]);
+        assert!(matches!(failure(operation), ImportRuleError::Conflict(_)));
+
+        let mut bad = input("raw/", "imported/");
+        bad.write_pattern = "{dir}{id}".to_string();
         let mut operation = CreateImportOperation::new(bad);
         assert!(operation.start().is_empty());
         assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
