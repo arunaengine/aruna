@@ -141,19 +141,26 @@ impl PutObjectOperation {
             })]);
         }
         let mut writes = Vec::new();
+        // A deduplicated version reads the older location, so it needs no version row.
+        let (output, written) = (self.get_output(), self.get_written_location());
+        let fresh = output
+            .zip(written)
+            .is_some_and(|(output, written)| output.ulid == written.ulid);
         if let Some(rows) = self.import_rows.as_ref() {
             if self.rule_exists != Some(true) {
                 return Some(self.emit_error(PutObjectError::ImportRemoved));
             }
-            writes.extend(rows.writes.iter().cloned());
+            let rows = rows.writes.iter();
+            writes.extend(
+                rows.filter(|(space, ..)| fresh || space != BACKEND_VERSION_KEYSPACE)
+                    .cloned(),
+            );
         }
         if let Some(plain) = self.plain.as_ref() {
-            let (output, written) = (self.get_output()?, self.get_written_location()?);
-            // A deduplicated version reads the older location, so it needs no version row.
-            let version = plain
-                .version
-                .as_deref()
-                .filter(|_| output.same_object(written));
+            let (Some(_), Some(written)) = (output, written) else {
+                return None;
+            };
+            let version = plain.version.as_deref().filter(|_| fresh);
             let record = PlainRecord {
                 target: &plain.target,
                 written,
@@ -385,7 +392,8 @@ mod tests {
             let location = written("raw/x/one.csv".to_string(), id);
             operation.written_location = Some(location.clone());
             let output = match deduplicated {
-                true => written("raw/x/old.csv".to_string(), Ulid::from_parts(3, 3)),
+                // An identical earlier upload to the same name keeps its own location.
+                true => written("raw/x/one.csv".to_string(), Ulid::from_parts(3, 3)),
                 false => location,
             };
             operation.output = Some(Ok(output));
@@ -493,6 +501,40 @@ mod tests {
         assert_eq!(
             operation.finalize().unwrap_err(),
             PutObjectError::ImportRemoved
+        );
+    }
+
+    #[test]
+    fn drops_deduplicated_version() {
+        let version_row = (
+            BACKEND_VERSION_KEYSPACE.to_string(),
+            version_key(Ulid::from_parts(5, 5)),
+            Value::from(b"v1".to_vec()),
+        );
+        let rows = |committed: Ulid| {
+            let import_id = Ulid::from_bytes([4u8; 16]);
+            let mut operation =
+                operation(DEFAULT_PATTERN).with_import_rows(import_id, vec![version_row.clone()]);
+            operation.written_location =
+                Some(written("raw/a.csv".to_string(), Ulid::from_parts(5, 5)));
+            operation.output = Some(Ok(written("raw/a.csv".to_string(), committed)));
+            operation.txn_id = Some(Ulid::nil());
+            operation.plain_records(Ulid::nil()).expect("a rule read");
+            operation.step(read(Some(vec![0u8])))
+        };
+
+        let effects = rows(Ulid::from_parts(5, 5));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the version row, got {effects:?}")
+        };
+        assert_eq!(writes, &vec![version_row.clone()]);
+        // Dedup keeps an older location, so the new one gets no version row.
+        let effects = rows(Ulid::from_parts(6, 6));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Storage(StorageEffect::BatchWrite { .. }))),
+            "{effects:?}"
         );
     }
 
