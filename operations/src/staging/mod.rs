@@ -102,6 +102,9 @@ pub(crate) fn describe_event(event: &Event) -> String {
             SubOperationEvent::VersionRekeyed { .. } => {
                 "Event::SubOperation(SubOperationEvent::VersionRekeyed)".to_string()
             }
+            SubOperationEvent::PlainSetAside { .. } => {
+                "Event::SubOperation(SubOperationEvent::PlainSetAside)".to_string()
+            }
         },
         Event::Task(_) => "Event::Task".to_string(),
         Event::Search() => "Event::Search".to_string(),
