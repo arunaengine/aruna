@@ -498,7 +498,7 @@ async fn put_version(
 /// Only a refusal of this one object fails it and lets the run go on; storage and other
 /// system errors end the run for a retry, so the checkpoint never passes an undecided object.
 fn put_failure(error: PutObjectError) -> ItemError {
-    use PolicyGateError::{Denied, ForeignPolicy, Invalid, NoSubject, Required, Unavailable};
+    use PolicyGateError::{Denied, ForeignPolicy, Invalid, NoSubject, Required};
     match error {
         PutObjectError::QuotaExceeded { .. }
         | PutObjectError::ObjectExists
@@ -507,12 +507,7 @@ fn put_failure(error: PutObjectError) -> ItemError {
         | PutObjectError::PolicyError(_)
         | PutObjectError::PurgeFence(PurgeFenceError::Suspended)
         | PutObjectError::PolicyGate(
-            Denied { .. }
-            | ForeignPolicy { .. }
-            | Required { .. }
-            | Unavailable { .. }
-            | Invalid
-            | NoSubject,
+            Denied { .. } | ForeignPolicy { .. } | Required { .. } | Invalid | NoSubject,
         ) => ItemError::Item(error.to_string()),
         error => ItemError::System(error.to_string()),
     }
@@ -822,6 +817,10 @@ mod tests {
         )));
         assert!(!item(PutObjectError::ImportRemoved));
         assert!(!item(PutObjectError::PolicyGate(PolicyGateError::Drift)));
+        let unavailable = PolicyGateError::Unavailable {
+            policy_ids: Vec::new(),
+        };
+        assert!(!item(PutObjectError::PolicyGate(unavailable)));
 
         // A backend outage while hashing ends the run; a vanished object fails alone.
         let gone = BlobError::Unreadable("gone".to_string());
