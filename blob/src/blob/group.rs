@@ -11,6 +11,7 @@ use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
 use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret, PROBE_PREFIX};
 use aruna_core::types::Key;
+use opendal::ErrorKind;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
@@ -351,22 +352,57 @@ impl BlobHandler {
 
         let probe = format!("{PROBE_PREFIX}/{}", Ulid::generate());
         if let Err(error) = operator.write(&probe, b"aruna".to_vec()).await {
-            return BlobEvent::Error(BlobError::WriteError(error.to_string()));
+            tracing::warn!(backend_id = %record.backend_id, kind = ?error.kind(), %error, "group backend test write failed");
+            return BlobEvent::Error(BlobError::WriteError(probe_message(&record, &error, false)));
         }
         // Credentials that cannot delete break object deletion, multipart abort
         // and cleanup later, and leak the probe object now.
         if let Err(error) = operator.delete(&probe).await {
-            return BlobEvent::Error(BlobError::DeleteError(format!(
-                "group backend probe object could not be removed: {error}"
-            )));
+            tracing::warn!(backend_id = %record.backend_id, kind = ?error.kind(), %error, "group backend test delete failed");
+            return BlobEvent::Error(BlobError::DeleteError(probe_message(&record, &error, true)));
         }
         BlobEvent::GroupBackendChecked
     }
 }
 
+/// A short user-facing reason for a failed probe; the full error goes to the node log.
+fn probe_message(record: &GroupStorage, error: &opendal::Error, delete: bool) -> String {
+    let (label, name) = ["bucket", "container", "filesystem"]
+        .into_iter()
+        .find_map(|key| {
+            record
+                .public_config
+                .get(key)
+                .map(|name| (key, name.as_str()))
+        })
+        .unwrap_or(("bucket", ""));
+    match (error.kind(), delete) {
+        (ErrorKind::PermissionDenied, false) => format!(
+            "The storage refused a test write to {label} `{name}`: access denied. Check that the \
+             key may write and delete objects there."
+        ),
+        (ErrorKind::PermissionDenied, true) => format!(
+            "The storage refused to delete a test object in {label} `{name}`: the key may write \
+             but not delete objects; Aruna needs both."
+        ),
+        (ErrorKind::NotFound, false) => {
+            format!("The {label} `{name}` does not exist at this endpoint.")
+        }
+        (ErrorKind::ConfigInvalid, _) => {
+            format!("The backend settings are invalid: {}", error.message())
+        }
+        (_, false) => "The storage could not be reached or refused the test write. The node log \
+                       has details."
+            .to_string(),
+        (_, true) => {
+            "The storage could not delete the test object. The node log has details.".to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{group_entry, group_ids};
+    use super::{group_entry, group_ids, probe_message};
     use aruna_core::effects::BlobEffect;
     use aruna_core::structs::storage::blob::{
         Backend, BackendRef, BlobTimeoutConfig, ResolvedBackend,
@@ -402,6 +438,20 @@ mod tests {
             secret_config: HashMap::from([("account_key".to_string(), "canary-a3e6".to_string())]),
             updated_at: SystemTime::UNIX_EPOCH,
         }
+    }
+
+    #[test]
+    fn probe_hides_details() {
+        let record = record(GroupBackendKind::Azblob, &[("container", "data")]);
+        let raw = "PUT https://acct.blob.core.windows.net/data <Error>AuthorizationFailure</Error>";
+        let denied = opendal::Error::new(opendal::ErrorKind::PermissionDenied, raw);
+
+        let write = probe_message(&record, &denied, false);
+        let delete = probe_message(&record, &denied, true);
+
+        assert!(write.contains("container `data`: access denied"), "{write}");
+        assert!(delete.contains("not delete objects"), "{delete}");
+        assert!(!write.contains("Error") && !delete.contains("https://"));
     }
 
     #[test]
