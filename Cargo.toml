@@ -88,6 +88,7 @@ craqle = { git = "https://github.com/arunaengine/craqle", rev = "9a21ab6fb1cf535
     "shacl-core",
 ] }
 crc-fast = "1.10.0"
+croner = { version = "4.0.1", default-features = false, features = ["chrono"] }
 crossfire = "3.1.20"
 crypto_box = "0.9.1"
 dirs = "7.0.0"

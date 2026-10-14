@@ -294,6 +294,10 @@ impl TaskQueues {
             handler
                 .reschedule_timer(TaskKey::MigrateCompression, Duration::ZERO)
                 .await;
+            // The run computes every rule's next due time and re-arms itself.
+            handler
+                .reschedule_timer(TaskKey::RunBackendImports, Duration::ZERO)
+                .await;
         }
         if refresh_holders {
             handler
