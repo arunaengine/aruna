@@ -96,7 +96,8 @@ pub fn validate_folder(field: &str, folder: &str) -> Result<(), ImportRuleError>
     if folder.trim() != folder {
         return Err(invalid("must not start or end with spaces"));
     }
-    if !folder.ends_with('/') || folder.starts_with('/') || folder.contains("//") {
+    let dot = folder.split('/').any(|segment| segment == ".");
+    if !folder.ends_with('/') || folder.starts_with('/') || folder.contains("//") || dot {
         return Err(invalid(
             "must be empty or a relative folder that ends with `/`",
         ));
@@ -180,6 +181,8 @@ mod tests {
             "raw/../x/",
             " raw/",
             "raw/ ",
+            "raw/./",
+            "./raw/",
         ] {
             assert!(validate_folder("folder", folder).is_err(), "{folder}");
         }
