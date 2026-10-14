@@ -144,6 +144,9 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             Box::pin(crate::jobs::workflow::purge::run_storage_purge(ctx, spec)).await
         }
         JobPayload::CopyObject(spec) => Box::pin(crate::jobs::copy::run_copy_job(ctx, spec)).await,
+        JobPayload::BackendImport(spec) => {
+            Box::pin(crate::jobs::backend_import::run_backend_import(ctx, spec)).await
+        }
         JobPayload::RegisterIdentifiers(spec) => {
             Box::pin(crate::jobs::persistent_id::run_register_identifiers(
                 ctx, spec,
@@ -176,7 +179,8 @@ pub fn run_cleanup(payload: &JobPayload) {
         | JobPayload::WriteRunCrate { .. }
         | JobPayload::TerminalCleanup { .. }
         | JobPayload::CopyObject(_)
-        | JobPayload::RegisterIdentifiers(_) => {}
+        | JobPayload::RegisterIdentifiers(_)
+        | JobPayload::BackendImport(_) => {}
     }
 }
 

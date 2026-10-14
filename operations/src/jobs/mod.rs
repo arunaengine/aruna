@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+pub mod backend_import;
 pub mod command;
 pub mod copy;
 pub mod drain;

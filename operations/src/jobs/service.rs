@@ -21,6 +21,7 @@ use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::placement::record::{
     DEFAULT_SHARD_COUNT, FIRST_GRANTABLE_HANDLE, shard_for_subject,
 };
+use aruna_core::structs::storage::backend_import::BackendImportSpec;
 use aruna_core::structs::storage::storage_purge::StoragePurgeSpec;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
@@ -301,6 +302,37 @@ pub async fn submit_copy_job(
             created_by,
             owner_node_id,
             dedup_key: None,
+            now_ms: unix_timestamp_millis(),
+            retention_ms,
+            workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
+            active_cap: None,
+        },
+        job_id,
+    )
+    .await
+}
+
+/// Queues one run of a backend import on this node. A scheduled run passes its due
+/// time in `dedup`, so a repeated timer never starts the same run twice.
+pub async fn submit_import_job(
+    context: &DriverContext,
+    spec: BackendImportSpec,
+    owner_node_id: NodeId,
+    dedup: Option<String>,
+    retention_ms: u64,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let created_by = spec.auth_context.user_id;
+    let dedup_key = dedup.map(|key| user_dedup_key(created_by, &key));
+    let realm_id = spec.auth_context.realm_id;
+    let job_id = mint_local_job(context, realm_id, owner_node_id, dedup_key.as_deref()).await?;
+    submit_local_job(
+        context,
+        SubmitJobSpec {
+            payload: JobPayload::BackendImport(spec),
+            created_by,
+            owner_node_id,
+            dedup_key,
             now_ms: unix_timestamp_millis(),
             retention_ms,
             workspace_mode: WorkspaceMode::default(),
