@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError};
+use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, EncryptionMode};
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use aruna_core::{NodeId, UserId};
@@ -114,6 +114,9 @@ impl UnlockLimitOperation {
         }
         if self.input.max_unlock_ms == Some(0) {
             return self.fail(BucketKeyError::InvalidDuration);
+        }
+        if settings.mode == EncryptionMode::NodeManaged && self.input.max_unlock_ms.is_some() {
+            return self.fail(BucketKeyError::ManagedLimit);
         }
         settings.max_unlock_ms = self.input.max_unlock_ms;
         let record = BucketAuditRecord {
@@ -255,7 +258,12 @@ mod tests {
     }
 
     fn run(max_unlock_ms: Option<u64>, expected: u64) -> (UnlockLimitOperation, Effects) {
-        run_by(max_unlock_ms, expected, &[caller()])
+        run_by(
+            max_unlock_ms,
+            expected,
+            &[caller()],
+            EncryptionMode::VaultLocked,
+        )
     }
 
     /// Runs a change by `caller()` while `admins` hold the group admin role in the transaction.
@@ -263,6 +271,7 @@ mod tests {
         max_unlock_ms: Option<u64>,
         expected: u64,
         admins: &[UserId],
+        mode: EncryptionMode,
     ) -> (UnlockLimitOperation, Effects) {
         let mut operation = UnlockLimitOperation::new(UnlockLimitInput {
             bucket: "raw".to_string(),
@@ -279,7 +288,7 @@ mod tests {
             txn_id: TXN,
         }));
         let settings = BucketEncryption {
-            mode: EncryptionMode::VaultLocked,
+            mode,
             bucket_id: Some(Ulid::from_bytes([4; 16])),
             key_generation: 1,
             storage_generation: 2,
@@ -311,6 +320,23 @@ mod tests {
     }
 
     #[test]
+    fn managed_refuses_limit() {
+        let (operation, _) = run_by(Some(60_000), 2, &[caller()], EncryptionMode::NodeManaged);
+        assert_eq!(
+            operation.finalize(),
+            Err(UnlockLimitError::Key(BucketKeyError::ManagedLimit))
+        );
+
+        let (mut operation, effects) = run_by(None, 2, &[caller()], EncryptionMode::NodeManaged);
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = &effects[..] else {
+            panic!("expected one batch write, got {effects:?}");
+        };
+        let stored = BucketEncryption::from_bytes(writes[0].2.as_ref()).unwrap();
+        assert_eq!(stored.max_unlock_ms, None);
+        operation.abort();
+    }
+
+    #[test]
     fn refuses_bad_changes() {
         for (max, expected, error) in [
             (
@@ -339,7 +365,7 @@ mod tests {
     #[test]
     fn revoked_admin_refused() {
         // The route saw the caller as admin, but the role was revoked before the transaction.
-        let (operation, effects) = run_by(Some(60_000), 2, &[]);
+        let (operation, effects) = run_by(Some(60_000), 2, &[], EncryptionMode::VaultLocked);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::AbortTransaction { .. })]

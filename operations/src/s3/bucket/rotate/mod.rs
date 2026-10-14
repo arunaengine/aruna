@@ -228,6 +228,11 @@ impl ChangeEncryptionOperation {
         self.info = Some(state.info);
         self.settings = state.settings;
         let wanted = self.wanted();
+        if wanted.0 == EncryptionMode::NodeManaged
+            && matches!(self.input.max_unlock_ms, Some(Some(_)))
+        {
+            return self.fail(BucketKeyError::ManagedLimit);
+        }
         let current = (
             self.settings.mode,
             self.settings.cipher,

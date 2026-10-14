@@ -122,6 +122,12 @@ impl BucketEncryption {
         self.mode != EncryptionMode::Off
     }
 
+    /// The unlock maximum in force; an Aruna-managed bucket has none.
+    pub fn unlock_limit(&self) -> Option<u64> {
+        self.max_unlock_ms
+            .filter(|_| self.mode != EncryptionMode::NodeManaged)
+    }
+
     /// The generation new writes seal to, if the bucket encrypts them.
     pub fn active_key(&self) -> Option<BucketKeyRef> {
         let bucket_id = self.bucket_id.filter(|_| self.is_encrypted())?;
@@ -605,6 +611,8 @@ pub enum BucketKeyError {
     /// The token of a token credential does not open its copy of the bucket key.
     #[error("the token does not open the bucket key")]
     InvalidToken,
+    #[error("An Aruna-managed bucket has no unlock limit.")]
+    ManagedLimit,
 }
 
 #[cfg(test)]

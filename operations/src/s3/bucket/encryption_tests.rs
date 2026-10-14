@@ -468,3 +468,16 @@ fn oversized_copy_refused() {
         [Effect::Blob(BlobEffect::GenerateBucketKey)]
     ));
 }
+
+#[test]
+fn managed_refuses_limit() {
+    let mut limited = input(EncryptionMode::NodeManaged, BTreeMap::new());
+    limited.max_unlock_ms = Some(60_000);
+    let mut operation = EnableEncryptionOperation::new(limited);
+
+    assert!(operation.start().is_empty());
+    assert_eq!(
+        operation.finalize(),
+        Err(EnableError::Key(BucketKeyError::ManagedLimit))
+    );
+}
