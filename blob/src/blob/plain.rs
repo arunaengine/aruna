@@ -11,7 +11,7 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle as _;
 use aruna_core::keyspaces::BACKEND_VERSION_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::storage::backend_import::{PlainPath, version_key};
+use aruna_core::structs::storage::backend_import::{PlainPath, tagged_path, version_key};
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, ResolvedBackend};
 use aruna_core::structs::storage::format::{Compression, StoredFormat};
 use bytes::Bytes;
@@ -20,9 +20,20 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 use tokio::time::timeout;
 
-/// Without the capability the caller's stat is the only check.
-fn conditional(operator: &Operator, plain: &PlainPath) -> bool {
-    plain.if_not_exists && operator.info().capability().write_with_if_not_exists
+/// Without conditional writes a stat proves nothing, so a write that must find its path
+/// free goes to its tagged path, chosen before any byte is read.
+pub(super) fn conditional(
+    operator: &Operator,
+    location: &mut BackendLocation,
+    plain: &PlainPath,
+) -> bool {
+    if operator.info().capability().write_with_if_not_exists || !plain.if_not_exists {
+        return plain.if_not_exists;
+    }
+    if !plain.path.ends_with(&format!("~{}", plain.ulid)) {
+        location.backend_path = tagged_path(&plain.path, plain.ulid);
+    }
+    false
 }
 
 impl BlobHandler {
@@ -61,7 +72,7 @@ impl BlobHandler {
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
         let class = resolved.storage_class.clone();
-        let location = match self.plain_location(resolved.backend, class, &plain, created_by) {
+        let mut location = match self.plain_location(resolved.backend, class, &plain, created_by) {
             Ok(location) => location,
             Err(error) => return BlobEvent::Error(error),
         };
@@ -69,7 +80,7 @@ impl BlobHandler {
             Ok(operator) => operator,
             Err(error) => return BlobEvent::Error(error),
         };
-        let conditional = conditional(&operator, &plain);
+        let conditional = conditional(&operator, &mut location, &plain);
         Box::pin(self.write_tenant(location, operator, blob, conditional)).await
     }
 
@@ -81,7 +92,7 @@ impl BlobHandler {
         parts: Vec<BackendLocation>,
     ) -> BlobEvent {
         let class = resolved.storage_class.clone();
-        let location = match self.plain_location(resolved.backend, class, &plain, created_by) {
+        let mut location = match self.plain_location(resolved.backend, class, &plain, created_by) {
             Ok(location) => location,
             Err(error) => return BlobEvent::Error(error),
         };
@@ -94,7 +105,7 @@ impl BlobHandler {
         };
         let total = parts.iter().map(|part| part.blob_size).sum();
         let chunk = compose_chunk(&backend_type, total, false);
-        let conditional = conditional(&operator, &plain);
+        let conditional = conditional(&operator, &mut location, &plain);
         let composed = self.compose_parts(
             location,
             operator,

@@ -236,3 +236,35 @@ async fn keeps_tenant_paths() {
     assert_eq!(cleanup.await, Ok(()));
     assert!(root.join("raw/a.txt").exists());
 }
+
+#[test]
+fn tags_without_condition() {
+    use crate::blob::plain::conditional;
+    use aruna_core::structs::storage::backend_import::{PlainPath, tagged_path};
+    use ulid::Ulid;
+
+    let config = [
+        ("bucket", "b"),
+        ("bucket_id", "id"),
+        ("application_key_id", "key"),
+        ("application_key", "secret"),
+    ];
+    let config = config.map(|(key, value)| (key.to_string(), value.to_string()));
+    let operator = opendal::Operator::from_iter::<opendal::services::B2>(config).unwrap();
+    let ulid = Ulid::generate();
+    let mut location = super::make_test_location();
+    let mut plain = PlainPath {
+        path: "raw/a.txt".to_string(),
+        ulid,
+        if_not_exists: true,
+    };
+
+    assert!(!conditional(&operator, &mut location, &plain));
+    assert_eq!(location.backend_path, tagged_path("raw/a.txt", ulid));
+
+    // An already tagged path is not tagged twice.
+    plain.path = tagged_path("raw/a.txt", ulid);
+    location.backend_path = plain.path.clone();
+    assert!(!conditional(&operator, &mut location, &plain));
+    assert_eq!(location.backend_path, plain.path);
+}
