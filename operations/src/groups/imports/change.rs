@@ -1,4 +1,4 @@
-//! Changes one backend import rule: its schedule, or the run it last started.
+//! Changes the schedule of one backend import rule.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -9,7 +9,6 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::storage::backend_import::{BackendImport, import_key};
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
@@ -19,7 +18,6 @@ use ulid::Ulid;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImportChange {
     Schedule(Option<String>),
-    Started { job_id: JobId, at_ms: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,10 +73,6 @@ impl ChangeImportOperation {
             ImportChange::Schedule(schedule) => {
                 record.schedule = schedule.clone();
                 record.updated_at = self.now;
-            }
-            ImportChange::Started { job_id, at_ms } => {
-                record.last_job = Some(*job_id);
-                record.last_started_ms = Some(*at_ms);
             }
         }
         let value = match record.to_bytes() {

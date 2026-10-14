@@ -11,13 +11,15 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    ACTIVE_USER_KEYSPACE, DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
+    ACTIVE_USER_KEYSPACE, BACKEND_IMPORT_KEYSPACE, DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE,
+    ROCRATE_UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     ActiveJobKind, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobPayload, JobRecord,
     RoCrateUploadRecord, WorkspaceMode, job_active_prefix, job_record_key, parse_dedup_value,
 };
+use aruna_core::structs::storage::backend_import::{BackendImport, import_key};
 use aruna_core::structured_id::{
     BucketId, ClockHealthError, JobId as RoutableJobId, PlacementHandle, StructuredIdGenerator,
 };
@@ -30,6 +32,7 @@ use tracing::warn;
 
 use super::import::{UploadClaimError, claim_upload, upload_key};
 use super::store::{decode_job_record, dedup_index_key, job_insert_entries};
+use crate::groups::imports::schedule::is_running;
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
 pub fn schedule_drain_effect() -> Effect {
@@ -108,6 +111,10 @@ pub enum SubmitJobError {
     ActiveJobLimit { limit: u32 },
     #[error(transparent)]
     Upload(#[from] UploadClaimError),
+    #[error("the import rule does not exist")]
+    ImportMissing,
+    #[error("the last run of this import has not finished")]
+    ImportRunning,
     #[error("unexpected event while submitting job: {0}")]
     UnexpectedEvent(String),
 }
@@ -133,6 +140,13 @@ enum SubmitState {
     ClaimUpload {
         txn_id: TxnId,
     },
+    /// Reads the rule of a backend import run, then the run it last started.
+    ReadImport {
+        txn_id: TxnId,
+    },
+    CheckImportRun {
+        txn_id: TxnId,
+    },
     WriteJob {
         txn_id: Option<TxnId>,
     },
@@ -154,6 +168,10 @@ pub struct SubmitJobOperation {
     upload_checked: bool,
     /// The claim of the upload an upload-backed import reads, written with the job.
     upload_claim: Option<(String, Key, Value)>,
+    import_checked: bool,
+    import_rule: Option<BackendImport>,
+    /// The rule of a backend import run with this job as its last run, written with the job.
+    import_claim: Option<(String, Key, Value)>,
     active_cap: Option<u32>,
     state: SubmitState,
     output: Option<Result<SubmitJobResult, SubmitJobError>>,
@@ -193,6 +211,9 @@ impl SubmitJobOperation {
             group_checked: false,
             upload_checked: false,
             upload_claim: None,
+            import_checked: false,
+            import_rule: None,
+            import_claim: None,
             active_cap,
             state: SubmitState::Init,
             output: None,
@@ -206,6 +227,8 @@ impl SubmitJobOperation {
             | SubmitState::VerifyDedup { txn_id, .. }
             | SubmitState::CheckActive { txn_id }
             | SubmitState::ClaimUpload { txn_id }
+            | SubmitState::ReadImport { txn_id }
+            | SubmitState::CheckImportRun { txn_id }
             | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
             SubmitState::WriteJob { txn_id } => txn_id,
             _ => None,
@@ -221,6 +244,9 @@ impl SubmitJobOperation {
         self.group_checked = false;
         self.upload_checked = false;
         self.upload_claim = None;
+        self.import_checked = false;
+        self.import_rule = None;
+        self.import_claim = None;
         self.state = SubmitState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
@@ -315,11 +341,27 @@ impl SubmitJobOperation {
                 txn_id: Some(txn_id),
             })];
         }
+        // A rule records its run with the job, so two starts never both pass the check.
+        if !self.import_checked
+            && let JobPayload::BackendImport(spec) = &self.record.payload
+        {
+            let Some(txn_id) = txn_id else {
+                return self.start_transaction();
+            };
+            let key = import_key(spec.group_id, spec.import_id);
+            self.state = SubmitState::ReadImport { txn_id };
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+                key,
+                txn_id: Some(txn_id),
+            })];
+        }
         let mut writes = match job_insert_entries(&self.record) {
             Ok(writes) => writes,
             Err(error) => return self.fail(error.into()),
         };
         writes.extend(self.upload_claim.clone());
+        writes.extend(self.import_claim.clone());
         self.state = SubmitState::WriteJob { txn_id };
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
@@ -359,6 +401,55 @@ impl SubmitJobOperation {
         }
         self.upload_checked = true;
         Ok(())
+    }
+
+    /// Reads the run the rule last started, or records this job when it has none.
+    fn import_read(&mut self, txn_id: TxnId, value: Option<&[u8]>) -> Effects {
+        let Some(value) = value else {
+            return self.fail(SubmitJobError::ImportMissing);
+        };
+        let rule = match BackendImport::from_bytes(value) {
+            Ok(rule) => rule,
+            Err(error) => return self.fail(error.into()),
+        };
+        let Some(last_job) = rule.last_job else {
+            return self.claim_import(txn_id, rule);
+        };
+        self.import_rule = Some(rule);
+        self.state = SubmitState::CheckImportRun { txn_id };
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: JOB_KEYSPACE.to_string(),
+            key: job_record_key(last_job),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    /// A pruned last run no longer holds the rule.
+    fn import_run_read(&mut self, txn_id: TxnId, value: Option<&[u8]>) -> Effects {
+        let Some(rule) = self.import_rule.take() else {
+            return self.fail(SubmitJobError::UnexpectedEvent(
+                "import run check without a rule".to_string(),
+            ));
+        };
+        match value.map(decode_job_record).transpose() {
+            Ok(Some(last)) if is_running(last.state) => self.fail(SubmitJobError::ImportRunning),
+            Ok(_) => self.claim_import(txn_id, rule),
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
+    fn claim_import(&mut self, txn_id: TxnId, mut rule: BackendImport) -> Effects {
+        rule.last_job = Some(self.record.job_id);
+        rule.last_started_ms = Some(self.record.created_at_ms);
+        match rule.to_bytes() {
+            Ok(value) => {
+                let key_space = BACKEND_IMPORT_KEYSPACE.to_string();
+                self.import_claim = Some((key_space, rule.key(), value.into()));
+                self.import_checked = true;
+                self.write_job(Some(txn_id))
+            }
+            Err(error) => self.fail(error.into()),
+        }
     }
 
     fn schedule_drain(&mut self) -> Effects {
@@ -513,6 +604,20 @@ impl Operation for SubmitJobOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
             },
+            SubmitState::ReadImport { txn_id } => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    self.import_read(txn_id, value.as_deref())
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+            },
+            SubmitState::CheckImportRun { txn_id } => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    self.import_run_read(txn_id, value.as_deref())
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+            },
             SubmitState::WriteJob { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => match txn_id {
                     Some(txn_id) => {
@@ -566,6 +671,8 @@ impl Operation for SubmitJobOperation {
             | SubmitState::VerifyDedup { txn_id, .. }
             | SubmitState::CheckActive { txn_id }
             | SubmitState::ClaimUpload { txn_id }
+            | SubmitState::ReadImport { txn_id }
+            | SubmitState::CheckImportRun { txn_id }
             | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
             SubmitState::WriteJob { txn_id } => txn_id,
             _ => None,
@@ -589,6 +696,7 @@ mod tests {
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+    use aruna_core::structs::storage::backend_import::BackendImportSpec;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
     use byteview::ByteView;
@@ -811,6 +919,80 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => panic!("unexpected write event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn records_import_run() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+        let base = spec(None);
+        let rule = BackendImport {
+            import_id: Ulid::from_bytes([6u8; 16]),
+            group_id: Ulid::from_bytes([3u8; 16]),
+            backend_id: Ulid::from_bytes([5u8; 16]),
+            backend_prefix: "raw/".to_string(),
+            bucket: "bucket".to_string(),
+            key_prefix: "in/".to_string(),
+            schedule: None,
+            created_by: base.created_by,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: "{dir}{name}".to_string(),
+        };
+        let run = || SubmitJobSpec {
+            payload: JobPayload::BackendImport(BackendImportSpec {
+                auth_context: AuthContext {
+                    user_id: base.created_by,
+                    realm_id: RealmId([1u8; 32]),
+                    path_restrictions: None,
+                    session: None,
+                },
+                node_id: node_id(7),
+                group_id: rule.group_id,
+                import_id: rule.import_id,
+            }),
+            ..spec(None)
+        };
+        let missing = drive(operation(run()), &ctx).await;
+        assert_eq!(missing, Err(SubmitJobError::ImportMissing));
+
+        let value = ByteView::from(rule.to_bytes().unwrap());
+        write_raw(&storage, BACKEND_IMPORT_KEYSPACE, rule.key(), value).await;
+        let first = drive(operation(run()), &ctx).await.unwrap();
+        let rule_key = rule.key();
+        let stored = |storage: StorageHandle| {
+            let key = rule_key.clone();
+            async move {
+                let event = storage
+                    .send_storage_effect(StorageEffect::Read {
+                        key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+                        key,
+                        txn_id: None,
+                    })
+                    .await;
+                let Event::Storage(StorageEvent::ReadResult {
+                    value: Some(value), ..
+                }) = event
+                else {
+                    panic!("the rule is missing: {event:?}")
+                };
+                BackendImport::from_bytes(&value).unwrap()
+            }
+        };
+        let recorded = stored(storage.clone()).await;
+        assert_eq!(recorded.last_job, Some(first.job_id));
+        assert_eq!(recorded.last_started_ms, Some(1_000));
+
+        // While the first run is queued, a second start is refused and records nothing.
+        let second = drive(operation(run()), &ctx).await;
+        assert_eq!(second, Err(SubmitJobError::ImportRunning));
+        assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
+        assert_eq!(stored(storage).await.last_job, Some(first.job_id));
     }
 
     #[tokio::test]

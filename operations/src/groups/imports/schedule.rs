@@ -2,12 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::change::{ChangeImportOperation, ImportChange};
 use super::remove::RemoveImportOperation;
 use super::{ImportRuleError, all_imports};
-use crate::driver::{DriverContext, drive, now_ms};
+use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_import_job;
-use crate::jobs::store::{iter_prefix_page, read_job_record};
+use crate::jobs::store::iter_prefix_page;
+use crate::jobs::submit::SubmitJobError;
 use crate::tasks::task_persistence::persist_task_effect;
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
@@ -21,7 +21,7 @@ use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use chrono::{DateTime, Utc};
 use croner::Cron;
 use croner::parser::{CronParser, Seconds, Year};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -54,8 +54,8 @@ pub fn is_running(state: JobState) -> bool {
     !state.is_terminal() && state != JobState::Indeterminate
 }
 
-/// Starts one run unless the last one is still going, then records it on the rule.
-/// Answers `None` while a run is going.
+/// Starts one run unless the last one is still going. The job and the rule's record of
+/// it commit in one transaction. Answers `None` while a run is going.
 pub async fn start_run(
     context: &DriverContext,
     rule: &BackendImport,
@@ -64,31 +64,18 @@ pub async fn start_run(
     dedup: Option<String>,
     retention_ms: u64,
 ) -> Result<Option<JobId>, ImportRuleError> {
-    if let Some(job_id) = rule.last_job {
-        let record = read_job_record(&context.storage_handle, job_id, None)
-            .await
-            .map_err(ImportRuleError::Read)?;
-        if record.is_some_and(|record| is_running(record.state)) {
-            return Ok(None);
-        }
-    }
     let spec = BackendImportSpec {
         auth_context,
         node_id,
         group_id: rule.group_id,
         import_id: rule.import_id,
     };
-    let job_id = submit_import_job(context, spec, node_id, dedup, retention_ms)
-        .await?
-        .job_id;
-    let started = ImportChange::Started {
-        job_id,
-        at_ms: now_ms(),
-    };
-    let change =
-        ChangeImportOperation::new(rule.group_id, rule.import_id, started, SystemTime::now());
-    drive(change, context).await?;
-    Ok(Some(job_id))
+    match submit_import_job(context, spec, node_id, dedup, retention_ms).await {
+        Ok(submitted) => Ok(Some(submitted.job_id)),
+        Err(SubmitJobError::ImportRunning) => Ok(None),
+        Err(SubmitJobError::ImportMissing) => Err(ImportRuleError::NotFound),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Finishes removals that stopped after their rule was deleted; `false` while one is left.
