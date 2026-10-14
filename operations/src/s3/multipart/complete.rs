@@ -2442,7 +2442,7 @@ fn composite_digest(algorithm: ChecksumAlgorithm, bytes: &[u8]) -> Vec<u8> {
     }
 }
 
-#[path = "complete_plain.rs"]
+#[path = "plain.rs"]
 mod plain;
 
 #[cfg(test)]

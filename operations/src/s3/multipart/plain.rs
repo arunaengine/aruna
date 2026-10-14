@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_upload_keeps_layout() {
+    fn keeps_provider_layout() {
         // An upload opened before the rule assembles in Aruna's own layout.
         let mut operation = operation(DEFAULT_PATTERN);
         let location = BackendLocation {

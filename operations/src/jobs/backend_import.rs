@@ -50,10 +50,9 @@ enum Decision {
     Import,
 }
 
-/// Objects a bucket already holds win, and so do later writes and deletes in Aruna:
-/// a changed object gets a new version only while the key still shows the imported
-/// one or nothing. An unchanged object whose version was purged is imported again.
-/// `changed` is a hash that differs from the committed version.
+/// Writes and deletes in Aruna win: a changed object (or `changed`, a hash unlike the committed
+/// one) gets a new version only while the key shows the imported one or nothing.
+/// A purged but unchanged object is imported again.
 fn decide(
     object: &ExternalObject,
     row: Option<&ImportedObject>,
