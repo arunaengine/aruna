@@ -503,16 +503,36 @@ async fn write_value(
 /// Emits one listing or hashing effect and hands back the blob adapter's answer.
 #[derive(Debug, PartialEq)]
 struct BlobRequest {
-    effect: Option<BlobEffect>,
+    state: RequestState,
     output: Option<Result<BlobEvent, BlobError>>,
+}
+
+#[derive(Debug, PartialEq)]
+enum RequestState {
+    Ready(BlobEffect),
+    Sent(Answer),
+    Done,
+}
+
+/// The one event kind that answers a sent request, besides an error.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Answer {
+    Listed,
+    Hashed,
 }
 
 impl BlobRequest {
     fn new(effect: BlobEffect) -> Self {
         Self {
-            effect: Some(effect),
+            state: RequestState::Ready(effect),
             output: None,
         }
+    }
+
+    fn finish(&mut self, output: Result<BlobEvent, BlobError>) -> Effects {
+        self.state = RequestState::Done;
+        self.output = Some(output);
+        smallvec![]
     }
 }
 
@@ -521,26 +541,42 @@ impl Operation for BlobRequest {
     type Error = BlobError;
 
     fn start(&mut self) -> Effects {
-        match self.effect.take() {
-            Some(effect) => smallvec![Effect::Blob(effect)],
-            None => {
-                self.output = Some(Err(BlobError::ReadError("request already sent".into())));
-                smallvec![]
+        let RequestState::Ready(effect) = std::mem::replace(&mut self.state, RequestState::Done)
+        else {
+            return self.finish(Err(BlobError::ReadError("request already sent".into())));
+        };
+        let answer = match &effect {
+            BlobEffect::ListExternal { .. } => Answer::Listed,
+            BlobEffect::HashExternal { .. } => Answer::Hashed,
+            other => {
+                let error = format!("not a listing or hashing request: {other:?}");
+                return self.finish(Err(BlobError::ReadError(error)));
+            }
+        };
+        self.state = RequestState::Sent(answer);
+        smallvec![Effect::Blob(effect)]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        let RequestState::Sent(answer) = self.state else {
+            let error = format!("event outside a sent request: {event:?}");
+            return self.finish(Err(BlobError::ReadError(error)));
+        };
+        match (answer, event) {
+            (_, Event::Blob(BlobEvent::Error(error))) => self.finish(Err(error)),
+            (Answer::Listed, Event::Blob(event @ BlobEvent::ExternalListed { .. }))
+            | (Answer::Hashed, Event::Blob(event @ BlobEvent::ExternalHashed { .. })) => {
+                self.finish(Ok(event))
+            }
+            (_, other) => {
+                let error = format!("unexpected event {other:?}");
+                self.finish(Err(BlobError::ReadError(error)))
             }
         }
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.output = Some(match event {
-            Event::Blob(BlobEvent::Error(error)) => Err(error),
-            Event::Blob(event) => Ok(event),
-            other => Err(BlobError::ReadError(format!("unexpected event {other:?}"))),
-        });
-        smallvec![]
-    }
-
     fn is_complete(&self) -> bool {
-        self.output.is_some()
+        self.state == RequestState::Done
     }
 
     fn finalize(self) -> Result<BlobEvent, BlobError> {
@@ -568,6 +604,48 @@ mod tests {
 
     fn row(version_id: Ulid, etag: &str) -> ImportedObject {
         ImportedObject::new(version_id, &object(etag))
+    }
+
+    fn listing() -> BlobEffect {
+        BlobEffect::ListExternal {
+            backend: BackendRef::Group(Ulid::nil()),
+            prefix: "raw/".to_string(),
+            start_after: None,
+            limit: 1,
+        }
+    }
+
+    fn listed() -> Event {
+        Event::Blob(BlobEvent::ExternalListed {
+            objects: Vec::new(),
+            next: None,
+        })
+    }
+
+    #[test]
+    fn checks_blob_answers() {
+        let mut request = BlobRequest::new(listing());
+        assert_eq!(request.start().len(), 1);
+        request.step(listed());
+        assert!(request.is_complete());
+        assert!(request.finalize().is_ok());
+
+        // Another kind of answer does not end a listing.
+        let mut request = BlobRequest::new(listing());
+        request.start();
+        request.step(Event::Blob(BlobEvent::DeleteFinished));
+        assert!(request.is_complete());
+        assert!(request.finalize().is_err());
+
+        // Events before the request is sent or after its answer are refused.
+        let mut request = BlobRequest::new(listing());
+        request.step(listed());
+        assert!(request.finalize().is_err());
+        let mut request = BlobRequest::new(listing());
+        request.start();
+        request.step(listed());
+        request.step(listed());
+        assert!(request.finalize().is_err());
     }
 
     #[test]
