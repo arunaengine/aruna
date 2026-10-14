@@ -5,7 +5,8 @@
 use super::*;
 use crate::s3::object::put::{plain_writes, set_aside};
 use aruna_core::events::SubOperationEvent;
-use aruna_core::structs::storage::backend_import::PlainPath;
+use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
+use aruna_core::structs::storage::backend_import::{PlainPath, import_key};
 
 impl CompleteUploadOperation {
     /// Routing inputs that may name a plain path for the completed object.
@@ -97,9 +98,34 @@ impl CompleteUploadOperation {
         })]
     }
 
+    /// Reads the rule of a listed plain object in the finalize transaction, so its import
+    /// row is written only while the rule exists.
+    pub(super) fn plain_fence(&mut self) -> Option<Effects> {
+        let target = self.plain.as_ref().filter(|target| target.listed)?;
+        let group_id = self.upload_record.as_ref()?.group_id;
+        let key = import_key(group_id, target.import_id);
+        self.state = CompleteUploadState::ReadImportRule;
+        Some(smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            key,
+            txn_id: self.txn_id,
+        })])
+    }
+
+    pub(super) fn import_rule_read(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                self.write_cleanup_records(value.is_some())
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
+            _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
+        }
+    }
+
     /// The hint and import row of a plain object, written with its version.
     pub(super) fn plain_records(
         &self,
+        rule_exists: bool,
     ) -> Result<Vec<(String, Key, Value)>, aruna_core::errors::ConversionError> {
         let (Some(target), Some(location), Some(version_id)) = (
             self.plain.as_ref(),
@@ -108,13 +134,14 @@ impl CompleteUploadOperation {
         ) else {
             return Ok(Vec::new());
         };
-        plain_writes(target, location, version_id, &self.input.key)
+        plain_writes(target, location, version_id, &self.input.key, rule_exists)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::keyspaces::IMPORTED_OBJECT_KEYSPACE;
     use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::multipart::BackendUpload;
@@ -189,6 +216,58 @@ mod tests {
         let mut operation = CompleteUploadOperation::new(input).with_routing(routing);
         operation.upload_record = Some(record);
         operation
+    }
+
+    #[test]
+    fn fences_import_row() {
+        let rows = |exists: bool| {
+            let mut operation = operation("{dir}{name}");
+            operation.compose_blob();
+            let id = operation.version_id.unwrap();
+            operation.final_location = Some(BackendLocation {
+                backend: BackendRef::Group(backend_id()),
+                storage_class: None,
+                root: String::new(),
+                storage_bucket: String::new(),
+                backend_path: "raw/object".to_string(),
+                ulid: id,
+                format: aruna_core::structs::storage::format::StoredFormat::default(),
+                created_by: UserId::default(),
+                created_at: SystemTime::UNIX_EPOCH,
+                staging: false,
+                partial: false,
+                blob_size: 3,
+                hashes: HashMap::from([(
+                    aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+                    vec![7u8; 32],
+                )]),
+            });
+            operation.txn_id = Some(Ulid::nil());
+            operation.state = CompleteUploadState::DeleteUploadRecords;
+            let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+                entries: Vec::new(),
+            }));
+            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
+            else {
+                panic!("expected the rule read, got {effects:?}")
+            };
+            assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
+            let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: Vec::new().into(),
+                value: exists.then(|| vec![0u8].into()),
+            }));
+            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
+            else {
+                panic!("expected the records, got {effects:?}")
+            };
+            writes
+                .iter()
+                .filter(|(key_space, _, _)| key_space == IMPORTED_OBJECT_KEYSPACE)
+                .count()
+        };
+        assert_eq!(rows(true), 1);
+        // A rule removed meanwhile gets no row its removal would miss.
+        assert_eq!(rows(false), 0);
     }
 
     #[test]

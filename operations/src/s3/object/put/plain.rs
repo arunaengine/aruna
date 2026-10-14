@@ -133,7 +133,11 @@ impl PutObjectOperation {
 
     /// The rule whose existence the version transaction must read before its rows.
     fn rule_fence(&self) -> Option<Key> {
-        let import_id = self.import_rows.as_ref()?.import_id;
+        let import_id = match (&self.import_rows, &self.plain) {
+            (Some(rows), _) => rows.import_id,
+            (None, Some(plain)) if plain.target.listed => plain.target.import_id,
+            _ => return None,
+        };
         Some(import_key(self.config.group_id, import_id))
     }
 
@@ -158,7 +162,8 @@ impl PutObjectOperation {
         if let Some(plain) = self.plain.as_ref() {
             let (location, version_id) = (self.get_output()?, self.version_id?);
             let key = &self.config.request.key;
-            match plain_writes(&plain.target, location, version_id, key) {
+            let rule_exists = self.rule_exists == Some(true);
+            match plain_writes(&plain.target, location, version_id, key, rule_exists) {
                 Ok(rows) => writes.extend(rows),
                 Err(error) => return Some(self.emit_error(error.into())),
             }
@@ -189,12 +194,14 @@ impl PutObjectOperation {
 }
 
 /// Rows a plain write commits with its version. The hint lets the next same-name write find
-/// the bytes; the import row keeps the rule's importer from importing them again.
+/// the bytes; the import row, written only while the rule exists, keeps its importer from
+/// importing them again.
 pub(crate) fn plain_writes(
     target: &PlainTarget,
     location: &BackendLocation,
     version_id: Ulid,
     key: &str,
+    rule_exists: bool,
 ) -> Result<Vec<(String, Key, Value)>, ConversionError> {
     let mut writes = Vec::new();
     if target.same_name {
@@ -202,7 +209,7 @@ pub(crate) fn plain_writes(
         let hint = location.location_key()?.to_bytes();
         writes.push((PLAIN_NAME_KEYSPACE.to_string(), name, hint.into()));
     }
-    if target.listed {
+    if target.listed && rule_exists {
         let row = ImportedObject::written(version_id, key.to_string(), location.blob_size);
         let row_key = object_key(target.import_id, &target.path);
         let row = row.to_bytes()?;
@@ -346,10 +353,17 @@ mod tests {
         begin(&mut operation);
         let id = operation.version_id.unwrap();
         operation.output = Some(Ok(written("raw/x/one.csv".to_string(), id)));
+        operation.txn_id = Some(Ulid::nil());
 
+        // The import row needs the rule, read in the version transaction.
         let Some(effects) = operation.plain_records(Ulid::nil()) else {
-            panic!("expected the plain records")
+            panic!("expected the rule read")
         };
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == BACKEND_IMPORT_KEYSPACE
+        ));
+        let effects = operation.step(read(Some(vec![0u8])));
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected one batch write, got {effects:?}")
         };
@@ -366,6 +380,19 @@ mod tests {
         assert_eq!(row.key.as_deref(), Some("in/x/one.csv"));
         assert_eq!(row.version_id, id);
         assert!(row.unlisted());
+
+        // Without the rule only the hint is written; the version itself still commits.
+        let mut operation = self::operation("{dir}{name}");
+        begin(&mut operation);
+        operation.output = Some(Ok(written("raw/x/one.csv".to_string(), id)));
+        operation.txn_id = Some(Ulid::nil());
+        operation.plain_records(Ulid::nil());
+        let effects = operation.step(read(None));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one batch write, got {effects:?}")
+        };
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, PLAIN_NAME_KEYSPACE);
     }
 
     #[test]

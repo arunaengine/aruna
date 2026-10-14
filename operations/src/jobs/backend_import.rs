@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::errors::BlobError;
+use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
-    PLAIN_NAME_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
+    JOB_STATE_KEYSPACE, PLAIN_NAME_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{JobError, JobId, JobResultPayload};
@@ -294,17 +294,12 @@ async fn import_object(
         return Ok(Outcome::Ignored);
     }
     let row_key = object_key(rule.import_id, &object.key);
-    let [row] = read_values(&ctx.driver, [(IMPORTED_OBJECT_KEYSPACE, row_key.clone())]).await?;
-    let row = parse(row, ImportedObject::from_bytes)?;
+    let [stored] = read_values(&ctx.driver, [(IMPORTED_OBJECT_KEYSPACE, row_key.clone())]).await?;
+    let row = parse(stored.clone(), ImportedObject::from_bytes)?;
     // Aruna's own write is recorded with its key; its first listing only notes ETag and time.
-    if let Some(listed) = row.as_ref().and_then(|row| row.first_listing(object)) {
-        write_value(
-            &ctx.driver,
-            IMPORTED_OBJECT_KEYSPACE,
-            row_key,
-            encode(&listed)?,
-        )
-        .await?;
+    let listed = row.as_ref().and_then(|row| row.first_listing(object));
+    if let (Some(listed), Some(seen)) = (listed, stored) {
+        note_listing(&ctx.driver, rule, row_key, &seen, encode(&listed)?).await?;
         return Ok(Outcome::Skipped);
     }
     let key = match row.as_ref().and_then(|row| row.key.clone()) {
@@ -540,6 +535,67 @@ async fn write_value(
     }
 }
 
+/// Replaces the row only while the rule exists and the row still holds `seen`, in one
+/// transaction. Otherwise nothing is written and the next run looks at the object again.
+async fn note_listing(
+    context: &DriverContext,
+    rule: &BackendImport,
+    row_key: Key,
+    seen: &Value,
+    row: Vec<u8>,
+) -> Result<(), ItemError> {
+    let storage = &context.storage_handle;
+    let unexpected = |event: Event| ItemError::System(format!("unexpected answer {event:?}"));
+    let started = StorageEffect::StartTransaction { read: false };
+    let txn_id = match storage.send_storage_effect(started).await {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        other => return Err(unexpected(other)),
+    };
+    let abort = StorageEffect::AbortTransaction { txn_id };
+    let reads = vec![
+        (BACKEND_IMPORT_KEYSPACE.to_string(), rule.key()),
+        (IMPORTED_OBJECT_KEYSPACE.to_string(), row_key.clone()),
+    ];
+    let read = StorageEffect::BatchRead {
+        reads,
+        txn_id: Some(txn_id),
+    };
+    let values = match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+        other => {
+            storage.send_storage_effect(abort).await;
+            return Err(unexpected(other));
+        }
+    };
+    if !matches!(values.as_slice(), [(_, Some(_)), (_, Some(value))] if value == seen) {
+        storage.send_storage_effect(abort).await;
+        return Ok(());
+    }
+    let write = StorageEffect::Write {
+        key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
+        key: row_key,
+        value: row.into(),
+        txn_id: Some(txn_id),
+    };
+    match storage.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => {
+            storage.send_storage_effect(abort).await;
+            return Err(unexpected(other));
+        }
+    }
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }) => Ok(()),
+        other => Err(unexpected(other)),
+    }
+}
+
 /// Emits one listing or hashing effect and hands back the blob adapter's answer.
 #[derive(Debug, PartialEq)]
 struct BlobRequest {
@@ -718,6 +774,69 @@ mod tests {
         )));
         assert!(!item(PutObjectError::ImportRemoved));
         assert!(!item(PutObjectError::PolicyGate(PolicyGateError::Drift)));
+    }
+
+    #[tokio::test]
+    async fn notes_listing_guarded() {
+        let (_directory, storage) = crate::tests::s3::test_storage();
+        let context = crate::tests::s3::test_context(storage);
+        let rule = BackendImport {
+            import_id: Ulid::from_parts(4, 4),
+            group_id: Ulid::from_parts(3, 3),
+            backend_id: Ulid::from_parts(5, 5),
+            backend_prefix: "raw/".to_string(),
+            bucket: "bucket".to_string(),
+            key_prefix: "in/".to_string(),
+            schedule: None,
+            created_by: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: "{dir}{name}".to_string(),
+        };
+        let row_key = object_key(rule.import_id, "raw/a.csv");
+        let written = ImportedObject::written(Ulid::nil(), "in/a.csv".to_string(), 4);
+        let seen = Value::from(written.to_bytes().unwrap());
+        let listed = written.first_listing(&object("e1")).unwrap();
+        let stored = || async {
+            let read = read_values(&context, [(IMPORTED_OBJECT_KEYSPACE, row_key.clone())]).await;
+            let Ok([Some(value)]) = read else {
+                panic!("the row is missing")
+            };
+            ImportedObject::from_bytes(&value).unwrap()
+        };
+        let update = encode(&listed).ok().unwrap();
+        let row = write_value(
+            &context,
+            IMPORTED_OBJECT_KEYSPACE,
+            row_key.clone(),
+            seen.to_vec(),
+        );
+        assert!(row.await.is_ok());
+
+        // A removed rule gets no row update.
+        let note = note_listing(&context, &rule, row_key.clone(), &seen, update.clone());
+        assert!(note.await.is_ok());
+        assert_eq!(stored().await, written);
+
+        let value = rule.to_bytes().unwrap();
+        assert!(
+            write_value(&context, BACKEND_IMPORT_KEYSPACE, rule.key(), value)
+                .await
+                .is_ok()
+        );
+        // A row another write replaced meanwhile stays as that write left it.
+        let other = Value::from(listed.to_bytes().unwrap());
+        let note = note_listing(&context, &rule, row_key.clone(), &other, update.clone());
+        assert!(note.await.is_ok());
+        assert_eq!(stored().await, written);
+
+        let note = note_listing(&context, &rule, row_key.clone(), &seen, update);
+        assert!(note.await.is_ok());
+        assert_eq!(stored().await, listed);
     }
 
     #[test]

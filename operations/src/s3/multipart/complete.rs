@@ -101,6 +101,8 @@ pub enum CompleteUploadState {
     RegisterManagedCopy,
     WriteObjectMetadata,
     DeleteUploadRecords,
+    /// Reads the import rule a plain object's import row belongs to.
+    ReadImportRule,
     WriteCleanupRecords,
     WriteReplicationObligation,
     EnforceQuota,
@@ -1736,12 +1738,15 @@ impl CompleteUploadOperation {
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
-        self.write_cleanup_records()
+        if let Some(effects) = self.plain_fence() {
+            return effects;
+        }
+        self.write_cleanup_records(true)
     }
 
     // Deferred housekeeping commits atomically with the completed upload, so a
     // crash after commit can never leak part blobs.
-    fn write_cleanup_records(&mut self) -> Effects {
+    fn write_cleanup_records(&mut self, rule_exists: bool) -> Effects {
         let mut works: Vec<BlobCleanupWork> = self
             .upload_parts
             .iter()
@@ -1784,7 +1789,7 @@ impl CompleteUploadOperation {
             });
         }
 
-        let mut writes = match self.plain_records() {
+        let mut writes = match self.plain_records(rule_exists) {
             Ok(writes) => writes,
             Err(err) => return self.schedule_error(err.into()),
         };
@@ -2267,6 +2272,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::RegisterManagedCopy => self.handle_copy_registered(event),
             CompleteUploadState::WriteObjectMetadata => self.metadata_written(event),
             CompleteUploadState::DeleteUploadRecords => self.records_deleted(event),
+            CompleteUploadState::ReadImportRule => self.import_rule_read(event),
             CompleteUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
             CompleteUploadState::WriteReplicationObligation => self.obligation_written(event),
             CompleteUploadState::EnforceQuota => self.handle_enforce_quota(event),
