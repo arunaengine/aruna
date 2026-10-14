@@ -34,11 +34,12 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::driver::{DriverContext, drive, gate_context, now_ms, routing_snapshot};
 use crate::groups::backends::query::GetBackendOperation;
 use crate::groups::imports::read_import;
-use crate::placement::policy::GateContext;
+use crate::placement::policy::{GateContext, PolicyGateError};
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::purge_fence::PurgeFenceError;
 
 const LIST_PAGE: usize = 500;
 
@@ -154,23 +155,11 @@ pub async fn run_backend_import(ctx: &JobContext, spec: &BackendImportSpec) -> J
             if ctx.shutdown.is_cancelled() {
                 return JobRunOutcome::Interrupted;
             }
-            let counted = match import_object(ctx, spec, &run, &object).await {
-                Ok(Outcome::Imported) => {
-                    checkpoint.imported += 1;
-                    true
-                }
-                Ok(Outcome::Skipped) => {
-                    checkpoint.skipped += 1;
-                    false
-                }
-                Ok(Outcome::Ignored) => false,
-                Err(ItemError::Item(error)) => {
-                    checkpoint.fail(&object.key, error);
-                    true
-                }
-                Err(ItemError::System(error)) => return retryable(error),
+            let result = import_object(ctx, spec, &run, &object).await;
+            let counted = match tally(&mut checkpoint, &object.key, result) {
+                Ok(counted) => counted,
+                Err(error) => return retryable(error),
             };
-            checkpoint.cursor = Some(object.key);
             // Skips are cheap to repeat after a restart, so only real work is persisted at once.
             if counted && let Err(error) = persist(ctx, &checkpoint).await {
                 return retryable(error);
@@ -191,6 +180,33 @@ pub async fn run_backend_import(ctx: &JobContext, spec: &BackendImportSpec) -> J
             });
         }
     }
+}
+
+/// Counts one object and moves the cursor past it. Answers whether the count is worth
+/// persisting at once; a system error leaves the cursor so a retry decides the object.
+fn tally(
+    checkpoint: &mut BackendImportCheckpoint,
+    key: &str,
+    result: Result<Outcome, ItemError>,
+) -> Result<bool, String> {
+    let counted = match result {
+        Ok(Outcome::Imported) => {
+            checkpoint.imported += 1;
+            true
+        }
+        Ok(Outcome::Skipped) => {
+            checkpoint.skipped += 1;
+            false
+        }
+        Ok(Outcome::Ignored) => false,
+        Err(ItemError::Item(error)) => {
+            checkpoint.fail(key, error);
+            true
+        }
+        Err(ItemError::System(error)) => return Err(error),
+    };
+    checkpoint.cursor = Some(key.to_string());
+    Ok(counted)
 }
 
 /// Rereads the rule and everything it depends on before each page, so a removed rule,
@@ -348,7 +364,7 @@ async fn import_object(
         Ok(()) => {}
         // An Aruna write or delete marker came first and keeps the key.
         Err(PutObjectError::HeadChanged) => return Ok(Outcome::Skipped),
-        Err(error) => return Err(ItemError::Item(error.to_string())),
+        Err(error) => return Err(put_failure(error)),
     }
     // A same-name write to this path first moves the imported bytes aside.
     if let Some(hint) = hint.filter(|_| rule.same_name() && rule.write_backend() == rule.backend_id)
@@ -435,6 +451,29 @@ async fn put_version(
         operation = operation.with_gate(gate);
     }
     drive(operation, &ctx.driver).await.map(|_| ())
+}
+
+/// Only a refusal of this one object fails it and lets the run go on; storage and other
+/// system errors end the run for a retry, so the checkpoint never passes an undecided object.
+fn put_failure(error: PutObjectError) -> ItemError {
+    use PolicyGateError::{Denied, ForeignPolicy, Invalid, NoSubject, Required, Unavailable};
+    match error {
+        PutObjectError::QuotaExceeded { .. }
+        | PutObjectError::ObjectExists
+        | PutObjectError::MissingHash(_)
+        | PutObjectError::RoutingFailed(_)
+        | PutObjectError::PolicyError(_)
+        | PutObjectError::PurgeFence(PurgeFenceError::Suspended)
+        | PutObjectError::PolicyGate(
+            Denied { .. }
+            | ForeignPolicy { .. }
+            | Required { .. }
+            | Unavailable { .. }
+            | Invalid
+            | NoSubject,
+        ) => ItemError::Item(error.to_string()),
+        error => ItemError::System(error.to_string()),
+    }
 }
 
 fn parse<T>(
@@ -647,6 +686,38 @@ mod tests {
         request.step(listed());
         request.step(listed());
         assert!(request.finalize().is_err());
+    }
+
+    #[test]
+    fn counts_outcomes() {
+        let mut checkpoint = BackendImportCheckpoint::default();
+        assert_eq!(tally(&mut checkpoint, "a", Ok(Outcome::Skipped)), Ok(false));
+        assert_eq!(tally(&mut checkpoint, "b", Ok(Outcome::Imported)), Ok(true));
+        let failed = Err(ItemError::Item("broken".to_string()));
+        assert_eq!(tally(&mut checkpoint, "c", failed), Ok(true));
+        assert_eq!(tally(&mut checkpoint, "d", Ok(Outcome::Ignored)), Ok(false));
+        assert_eq!(
+            (checkpoint.skipped, checkpoint.imported, checkpoint.failed),
+            (1, 1, 1)
+        );
+        assert_eq!(checkpoint.cursor.as_deref(), Some("d"));
+
+        // A system error ends the run before the cursor passes the object.
+        let error = Err(ItemError::System("storage down".to_string()));
+        assert!(tally(&mut checkpoint, "e", error).is_err());
+        assert_eq!(checkpoint.cursor.as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn classifies_put_errors() {
+        let item = |error| matches!(put_failure(error), ItemError::Item(_));
+        assert!(item(PutObjectError::QuotaExceeded { limit: 1, usage: 2 }));
+        assert!(item(PutObjectError::PolicyGate(PolicyGateError::Invalid)));
+        assert!(!item(PutObjectError::StorageError(
+            aruna_core::errors::StorageError::TransactionConflict
+        )));
+        assert!(!item(PutObjectError::ImportRemoved));
+        assert!(!item(PutObjectError::PolicyGate(PolicyGateError::Drift)));
     }
 
     #[test]
