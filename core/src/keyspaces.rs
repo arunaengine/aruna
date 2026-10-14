@@ -211,6 +211,11 @@ pub const BACKEND_SECRET_KEYSPACE: &str = "group_storage_backend_secret";
 /// transaction as the id-keyed record it mirrors.
 pub const BACKEND_INDEX_KEYSPACE: &str = "group_storage_backend_index";
 
+/// Node-local backend import rules, keyed by `group id || import id`.
+pub const BACKEND_IMPORT_KEYSPACE: &str = "backend_imports";
+/// What each import run recorded per backend key, keyed by `import id || backend key`.
+pub const IMPORTED_OBJECT_KEYSPACE: &str = "backend_import_objects";
+
 /// Device-local registrations of the directories this node offers as read-only
 /// buckets, keyed by bucket name. Never replicated: the root path is the one
 /// detail about the owner's machine that must not leave it.
@@ -466,6 +471,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     STORAGE_BACKEND_KEYSPACE,
     BACKEND_SECRET_KEYSPACE,
     BACKEND_INDEX_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE,
     OFFERED_DIRECTORY_KEYSPACE,
     DEVICE_INTAKE_KEYSPACE,
     REALM_MARKER_KEYSPACE,

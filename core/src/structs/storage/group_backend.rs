@@ -38,7 +38,19 @@ impl GroupBackendKind {
     }
 
     pub const ALL: [Self; 5] = [Self::S3, Self::Gcs, Self::Azblob, Self::Azdls, Self::B2];
+
+    /// The config key naming the tenant's own container; nothing is ever minted.
+    pub const fn container_key(self) -> &'static str {
+        match self {
+            Self::S3 | Self::Gcs | Self::B2 => "bucket",
+            Self::Azblob => "container",
+            Self::Azdls => "filesystem",
+        }
+    }
 }
+
+/// Where registration writes and removes its probe object.
+pub const PROBE_PREFIX: &str = "_aruna_backend_probe";
 
 impl fmt::Display for GroupBackendKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -85,6 +97,13 @@ pub struct GroupStorage {
 }
 
 impl GroupStorage {
+    /// Whether `key` lies where Aruna writes its own objects on this backend.
+    pub fn is_reserved(&self, key: &str) -> bool {
+        let container = self.public_config.get(self.kind.container_key());
+        key.starts_with(&format!("{PROBE_PREFIX}/"))
+            || container.is_some_and(|container| key.starts_with(&format!("{container}/")))
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
@@ -201,5 +220,25 @@ mod tests {
             assert_eq!(GroupBackendKind::from_str(kind.as_str()).unwrap(), kind);
         }
         assert!(GroupBackendKind::from_str("webdav").is_err());
+    }
+
+    #[test]
+    fn reserves_own_namespace() {
+        let record = GroupStorage {
+            backend_id: Ulid::from_bytes([1u8; 16]),
+            group_id: Ulid::from_bytes([2u8; 16]),
+            name: "tenant-az".to_string(),
+            kind: GroupBackendKind::Azblob,
+            public_config: HashMap::from([("container".to_string(), "data".to_string())]),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: UserId::default(),
+            disabled: false,
+            cleanup: CleanupStrategy::Retain,
+        };
+        assert!(record.is_reserved("data/bucket/key_01"));
+        assert!(record.is_reserved("_aruna_backend_probe/01"));
+        assert!(!record.is_reserved("database/a.csv"));
+        assert!(!record.is_reserved("raw/data/a.csv"));
     }
 }

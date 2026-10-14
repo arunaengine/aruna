@@ -243,6 +243,14 @@ pub enum BlobEvent {
         share: WorkingShare,
     },
     Abe(Box<crate::structs::storage::abe::AbeEvent>),
+    /// One listing page; `next` is the `start_after` of the following page.
+    ExternalListed {
+        objects: Vec<crate::structs::storage::backend_import::ExternalObject>,
+        next: Option<String>,
+    },
+    ExternalHashed {
+        location: BackendLocation,
+    },
 }
 
 #[derive(Debug, PartialEq)]

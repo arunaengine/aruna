@@ -459,6 +459,11 @@ impl BackendLocation {
         }
     }
 
+    /// An object found on a tenant backend that Aruna never wrote. Aruna never deletes it.
+    pub fn is_external(&self) -> bool {
+        self.storage_bucket.is_empty() && matches!(self.backend, BackendRef::Group(_))
+    }
+
     /// Whether both name the same physical object. The path carries a per-write
     /// id, so this distinguishes two copies of identical content.
     pub fn same_object(&self, other: &Self) -> bool {

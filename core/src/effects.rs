@@ -22,7 +22,9 @@ use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::structs::placement::policy::document::PolicyPublicationClaim;
 use crate::structs::placement::record::PlacementRef;
-use crate::structs::storage::blob::{ArchiveKey, BackendLocation, HiddenBlobKey, ResolvedBackend};
+use crate::structs::storage::blob::{
+    ArchiveKey, BackendLocation, BackendRef, HiddenBlobKey, ResolvedBackend,
+};
 use crate::structs::storage::encryption::{BucketKeyRef, CopyTarget, KeyTicket, ReadLease};
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use crate::structs::storage::multipart::{BackendUpload, MultipartPart, WorkingShare};
@@ -316,6 +318,21 @@ pub enum BlobEffect {
         object: Option<[u8; 32]>,
     },
     Abe(Box<crate::structs::storage::abe::AbeEffect>),
+    /// Lists at most `limit` objects under `prefix` of `backend`, in key order after
+    /// `start_after`. Answers `ExternalListed`.
+    ListExternal {
+        backend: BackendRef,
+        prefix: String,
+        start_after: Option<String>,
+        limit: usize,
+    },
+    /// Hashes the object at `path`, which Aruna did not write, and answers its location on
+    /// `resolved` as `ExternalHashed`. The bytes are read once and never moved.
+    HashExternal {
+        resolved: ResolvedBackend,
+        path: String,
+        created_by: UserId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
