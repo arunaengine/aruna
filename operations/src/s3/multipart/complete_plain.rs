@@ -142,7 +142,7 @@ impl CompleteUploadOperation {
         let record = PlainRecord {
             target,
             written,
-            version: version.filter(|_| output.same_object(written)),
+            version: version.filter(|_| output.ulid == written.ulid),
             version_id,
             key: &self.input.key,
         };
@@ -153,7 +153,7 @@ impl CompleteUploadOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::keyspaces::IMPORTED_OBJECT_KEYSPACE;
+    use aruna_core::keyspaces::{BACKEND_VERSION_KEYSPACE, IMPORTED_OBJECT_KEYSPACE};
     use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::multipart::BackendUpload;
@@ -230,57 +230,73 @@ mod tests {
         operation
     }
 
+    fn record_writes(exists: bool, committed: Option<Ulid>) -> Vec<(String, Key, Value)> {
+        let mut operation = operation("{dir}{name}");
+        operation.compose_blob();
+        operation.plain_version = Some("v1".to_string());
+        let id = operation.version_id.unwrap();
+        operation.composed_location = Some(BackendLocation {
+            backend: BackendRef::Group(backend_id()),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: "raw/object".to_string(),
+            ulid: id,
+            format: aruna_core::structs::storage::format::StoredFormat::default(),
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 3,
+            hashes: HashMap::from([(
+                aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+                vec![7u8; 32],
+            )]),
+        });
+        operation.final_location = operation.composed_location.clone();
+        if let (Some(location), Some(ulid)) = (operation.final_location.as_mut(), committed) {
+            location.ulid = ulid;
+        }
+        operation.txn_id = Some(Ulid::nil());
+        operation.state = CompleteUploadState::DeleteUploadRecords;
+        let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the rule read, got {effects:?}")
+        };
+        assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: exists.then(|| vec![0u8].into()),
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the records, got {effects:?}")
+        };
+        writes.clone()
+    }
+
+    fn count(writes: &[(String, Key, Value)], keyspace: &str) -> usize {
+        writes
+            .iter()
+            .filter(|(key_space, _, _)| key_space == keyspace)
+            .count()
+    }
+
     #[test]
     fn fences_import_row() {
-        let rows = |exists: bool| {
-            let mut operation = operation("{dir}{name}");
-            operation.compose_blob();
-            let id = operation.version_id.unwrap();
-            operation.composed_location = Some(BackendLocation {
-                backend: BackendRef::Group(backend_id()),
-                storage_class: None,
-                root: String::new(),
-                storage_bucket: String::new(),
-                backend_path: "raw/object".to_string(),
-                ulid: id,
-                format: aruna_core::structs::storage::format::StoredFormat::default(),
-                created_by: UserId::default(),
-                created_at: SystemTime::UNIX_EPOCH,
-                staging: false,
-                partial: false,
-                blob_size: 3,
-                hashes: HashMap::from([(
-                    aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
-                    vec![7u8; 32],
-                )]),
-            });
-            operation.final_location = operation.composed_location.clone();
-            operation.txn_id = Some(Ulid::nil());
-            operation.state = CompleteUploadState::DeleteUploadRecords;
-            let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-                entries: Vec::new(),
-            }));
-            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
-            else {
-                panic!("expected the rule read, got {effects:?}")
-            };
-            assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
-            let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-                key: Vec::new().into(),
-                value: exists.then(|| vec![0u8].into()),
-            }));
-            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
-            else {
-                panic!("expected the records, got {effects:?}")
-            };
-            writes
-                .iter()
-                .filter(|(key_space, _, _)| key_space == IMPORTED_OBJECT_KEYSPACE)
-                .count()
-        };
+        let rows = |exists: bool| count(&record_writes(exists, None), IMPORTED_OBJECT_KEYSPACE);
         assert_eq!(rows(true), 1);
         // A rule removed meanwhile gets no row its removal would miss.
         assert_eq!(rows(false), 0);
+    }
+
+    #[test]
+    fn drops_deduplicated_version() {
+        let versions = |committed| count(&record_writes(true, committed), BACKEND_VERSION_KEYSPACE);
+        assert_eq!(versions(None), 1);
+        // Dedup keeps an older location at the same path, so the new one gets no version row.
+        assert_eq!(versions(Some(Ulid::from_parts(6, 6))), 0);
     }
 
     #[test]
