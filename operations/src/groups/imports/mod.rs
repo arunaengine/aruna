@@ -93,6 +93,9 @@ pub fn validate_folder(field: &str, folder: &str) -> Result<(), ImportRuleError>
     if folder.is_empty() {
         return Ok(());
     }
+    if folder.trim() != folder {
+        return Err(invalid("must not start or end with spaces"));
+    }
     if !folder.ends_with('/') || folder.starts_with('/') || folder.contains("//") {
         return Err(invalid(
             "must be empty or a relative folder that ends with `/`",
@@ -169,7 +172,15 @@ mod tests {
     fn checks_folders() {
         assert!(validate_folder("folder", "").is_ok());
         assert!(validate_folder("folder", "raw/2026/").is_ok());
-        for folder in ["raw", "/raw/", "raw//x/", "../raw/", "raw/../x/"] {
+        for folder in [
+            "raw",
+            "/raw/",
+            "raw//x/",
+            "../raw/",
+            "raw/../x/",
+            " raw/",
+            "raw/ ",
+        ] {
             assert!(validate_folder("folder", folder).is_err(), "{folder}");
         }
         assert!(folders_overlap("", "raw/"));
