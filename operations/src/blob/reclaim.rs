@@ -738,6 +738,10 @@ impl ReclaimBlobOperation {
         else {
             return self.commit();
         };
+        // Bytes Aruna found on a tenant backend are never deleted; only the row goes.
+        if location.is_external() {
+            return self.debit_usage();
+        }
         let work = match (BlobCleanupWork::DeleteBlob { location }).to_bytes() {
             Ok(work) => work,
             Err(error) => return self.fail(error.into()),
@@ -759,6 +763,10 @@ impl ReclaimBlobOperation {
                 event,
             );
         };
+        self.debit_usage()
+    }
+
+    fn debit_usage(&mut self) -> Effects {
         let (Some(txn_id), Some(location)) = (self.txn_id, self.location.as_ref()) else {
             return self.fail(ReclaimBlobError::Failed);
         };
@@ -1807,5 +1815,83 @@ mod tests {
             operation.finalize(),
             Err(ReclaimBlobError::InvalidStateEvent { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn keeps_external_bytes() {
+        let dir = tempdir().unwrap();
+        let context = context(dir.path().to_str().unwrap());
+        let backend_id = Ulid::from_bytes([7u8; 16]);
+        let backend = BackendRef::Group(backend_id);
+        let record = GroupStorage {
+            backend_id,
+            group_id: Ulid::from_bytes([8u8; 16]),
+            name: "tenant".to_string(),
+            kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
+            public_config: HashMap::new(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            disabled: false,
+            cleanup: CleanupStrategy::Reclaim {
+                after: Duration::from_secs(60),
+            },
+        };
+        write(
+            &context,
+            STORAGE_BACKEND_KEYSPACE,
+            backend_id.to_bytes().to_vec(),
+            record.to_bytes().unwrap(),
+        )
+        .await;
+        let imported = BackendLocation {
+            backend: backend.clone(),
+            storage_bucket: String::new(),
+            backend_path: "raw/a.csv".to_string(),
+            ..location(10)
+        };
+        let location_key = BlobLocationKey::new(HASH, EncodingClass::Raw, backend.clone());
+        write(
+            &context,
+            BLOB_LOCATIONS_KEYSPACE,
+            location_key.to_bytes(),
+            imported.to_bytes().unwrap(),
+        )
+        .await;
+        let candidate = ReclaimCandidateKey::new(backend, EncodingClass::Raw, HASH);
+        let queued = ReclaimCandidate {
+            enqueued_at: SystemTime::UNIX_EPOCH,
+        };
+        write(
+            &context,
+            BLOB_RECLAIM_KEYSPACE,
+            candidate.to_bytes(),
+            queued.to_bytes().unwrap(),
+        )
+        .await;
+
+        assert_eq!(
+            drive(reclaim_op(candidate), &context).await.unwrap(),
+            ReclaimVerdict::Freed { bytes: 10 }
+        );
+        assert!(
+            read(&context, BLOB_LOCATIONS_KEYSPACE, location_key.to_bytes())
+                .await
+                .is_none()
+        );
+        let (cleanups, _) = iter_prefix_page(
+            &context.storage_handle,
+            BLOB_CLEANUP_KEYSPACE,
+            None,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cleanups.is_empty(),
+            "no delete is queued for imported bytes"
+        );
     }
 }
