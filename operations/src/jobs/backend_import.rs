@@ -17,8 +17,8 @@ use aruna_core::structs::storage::backend_import::{
     object_key, version_key,
 };
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer, ResolvedBackend,
-    VersionKey, bucket_permission_path, ensure_confined_path,
+    BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
+    ResolvedBackend, VersionKey, bucket_permission_path, ensure_confined_path,
 };
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{RoutingSnapshot, RoutingTarget, RuleSource};
@@ -296,11 +296,29 @@ async fn import_object(
     let row_key = object_key(rule.import_id, &object.key);
     let [stored] = read_values(&ctx.driver, [(IMPORTED_OBJECT_KEYSPACE, row_key.clone())]).await?;
     let row = parse(stored.clone(), ImportedObject::from_bytes)?;
+    // The bytes stay on the rule's backend, wherever new writes to the key are routed.
+    let target = RoutingTarget::Backend(BackendRef::Group(rule.backend_id));
+    let resolved = match run
+        .routing
+        .catalog
+        .resolve_target(&target, RuleSource::Tenant)
+    {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return Err(ItemError::Item("the backend is not usable".to_string())),
+        Err(error) => return Err(ItemError::Item(error.to_string())),
+    };
     // Aruna's own write is recorded with its key; its first listing only notes ETag and time.
+    // An equal size is no proof, so the bytes must also hash to the committed version.
     let listed = row.as_ref().and_then(|row| row.first_listing(object));
+    let mut hashed = None;
     if let (Some(listed), Some(seen)) = (listed, stored) {
-        note_listing(&ctx.driver, rule, row_key, &seen, encode(&listed)?).await?;
-        return Ok(Outcome::Skipped);
+        let found = hash_object(ctx, spec, resolved.clone(), &object.key).await?;
+        let committed = committed_hash(&ctx.driver, &rule.bucket, &listed).await?;
+        if committed.is_some_and(|hash| Some(&hash[..]) == found.0.get_blake3()) {
+            note_listing(&ctx.driver, rule, row_key, &seen, encode(&listed)?).await?;
+            return Ok(Outcome::Skipped);
+        }
+        hashed = Some(found);
     }
     let key = match row.as_ref().and_then(|row| row.key.clone()) {
         Some(key) => key,
@@ -337,18 +355,10 @@ async fn import_object(
         key: row.as_ref().and_then(|row| row.key.clone()),
         ..ImportedObject::new(version_id, object)
     };
-    // The bytes stay on the rule's backend, wherever new writes to the key are routed.
-    let target = RoutingTarget::Backend(BackendRef::Group(rule.backend_id));
-    let resolved = match run
-        .routing
-        .catalog
-        .resolve_target(&target, RuleSource::Tenant)
-    {
-        Ok(Some(resolved)) => resolved,
-        Ok(None) => return Err(ItemError::Item("the backend is not usable".to_string())),
-        Err(error) => return Err(ItemError::Item(error.to_string())),
+    let (location, version) = match hashed {
+        Some(hashed) => hashed,
+        None => hash_object(ctx, spec, resolved, &object.key).await?,
     };
-    let (location, version) = hash_object(ctx, spec, resolved, &object.key).await?;
     if location.blob_size != object.size {
         return Err(ItemError::Item(
             "the object changed while it was read".to_string(),
@@ -386,6 +396,21 @@ async fn import_object(
     )
     .await;
     Ok(Outcome::Imported)
+}
+
+/// The BLAKE3 hash of the version Aruna committed in `bucket` for `row`, if it still exists.
+async fn committed_hash(
+    context: &DriverContext,
+    bucket: &str,
+    row: &ImportedObject,
+) -> Result<Option<[u8; 32]>, ItemError> {
+    let key = row.key.as_deref().unwrap_or_default();
+    let version_key = VersionKey::new(bucket, key, row.version_id)
+        .to_bytes()
+        .map_err(|error| ItemError::Item(error.to_string()))?;
+    let [version] = read_values(context, [(BLOB_VERSIONS_KEYSPACE, version_key.into())]).await?;
+    let version = parse(version, BlobVersion::from_bytes)?;
+    Ok(version.and_then(|version| version.blob_hash().copied()))
 }
 
 async fn hash_object(
@@ -866,6 +891,35 @@ mod tests {
         let note = note_listing(&context, &rule, row_key.clone(), &seen, update);
         assert!(note.await.is_ok());
         assert_eq!(stored().await, listed);
+    }
+
+    #[tokio::test]
+    async fn reads_committed_hash() {
+        let (_directory, storage) = crate::tests::s3::test_storage();
+        let context = crate::tests::s3::test_context(storage);
+        let row = ImportedObject::written(Ulid::from_parts(6, 6), "in/a.csv".to_string(), 4);
+        assert_eq!(
+            committed_hash(&context, "bucket", &row).await.ok(),
+            Some(None)
+        );
+
+        let version = BlobVersion::materialized(
+            [7; 32],
+            BackendRef::Group(Ulid::from_parts(5, 5)),
+            aruna_core::structs::storage::format::EncodingClass::Raw,
+            std::time::SystemTime::UNIX_EPOCH,
+            Default::default(),
+            None,
+        );
+        let key = VersionKey::new("bucket", "in/a.csv", row.version_id);
+        let key = Key::from(key.to_bytes().unwrap());
+        let value = version.to_bytes().unwrap();
+        let write = write_value(&context, BLOB_VERSIONS_KEYSPACE, key, value);
+        assert!(write.await.is_ok());
+        assert_eq!(
+            committed_hash(&context, "bucket", &row).await.ok(),
+            Some(Some([7; 32]))
+        );
     }
 
     #[test]
