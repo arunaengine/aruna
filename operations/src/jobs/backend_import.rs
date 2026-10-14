@@ -6,15 +6,15 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
-    JOB_STATE_KEYSPACE, PLAIN_NAME_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{JobError, JobId, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportCheckpoint, BackendImportSpec, ExternalObject, ImportedObject,
-    object_key, plain_name_key,
+    object_key, version_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer, ResolvedBackend,
@@ -36,7 +36,7 @@ use crate::groups::backends::query::GetBackendOperation;
 use crate::groups::imports::read_import;
 use crate::placement::policy::{GateContext, PolicyGateError};
 use crate::realm::get_config::GetConfigOperation;
-use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
+use crate::replication::queue::complete_put;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::s3::purge_fence::PurgeFenceError;
@@ -348,39 +348,43 @@ async fn import_object(
         Ok(None) => return Err(ItemError::Item("the backend is not usable".to_string())),
         Err(error) => return Err(ItemError::Item(error.to_string())),
     };
-    let location = hash_object(ctx, spec, resolved, &object.key).await?;
+    let (location, version) = hash_object(ctx, spec, resolved, &object.key).await?;
     if location.blob_size != object.size {
         return Err(ItemError::Item(
             "the object changed while it was read".to_string(),
         ));
     }
-    let hint = location.location_key().ok();
-    match put_version(ctx, spec, run, key.clone(), location, committed, head).await {
+    let size = location.blob_size;
+    let put = put_version(
+        ctx,
+        spec,
+        run,
+        key.clone(),
+        (location, version),
+        committed,
+        head,
+    );
+    match put.await {
         Ok(()) => {}
         // An Aruna write or delete marker came first and keeps the key.
         Err(PutObjectError::HeadChanged) => return Ok(Outcome::Skipped),
         Err(error) => return Err(put_failure(error)),
     }
-    // A same-name write to this path first moves the imported bytes aside.
-    if let Some(hint) = hint.filter(|_| rule.same_name() && rule.write_backend() == rule.backend_id)
-    {
-        let name = plain_name_key(&BackendRef::Group(rule.backend_id), &object.key);
-        write_value(&ctx.driver, PLAIN_NAME_KEYSPACE, name, hint.to_bytes()).await?;
-    }
-    // Without the replication seed, peers never learn about the version.
-    drive(
-        LiveVersionOperation::new(LiveVersionInput {
-            local_node_id: spec.node_id,
-            auth_context: spec.auth_context.clone(),
-            bucket: rule.bucket.clone(),
-            key,
-            version_id,
-            delete_marker: false,
-        }),
+    // As for any put, a failed queue write after the commit leaves the obligation for repair.
+    let auth = spec.auth_context.clone();
+    let (realm_id, group_id, bucket) = (auth.realm_id, rule.group_id, rule.bucket.clone());
+    complete_put(
         &ctx.driver,
+        realm_id,
+        spec.node_id,
+        auth,
+        group_id,
+        bucket,
+        key,
+        version_id,
+        size,
     )
-    .await
-    .map_err(|error| ItemError::Item(format!("replication queue failed: {error}")))?;
+    .await;
     Ok(Outcome::Imported)
 }
 
@@ -389,16 +393,25 @@ async fn hash_object(
     spec: &BackendImportSpec,
     resolved: ResolvedBackend,
     path: &str,
-) -> Result<BackendLocation, ItemError> {
+) -> Result<(BackendLocation, Option<String>), ItemError> {
     let effect = BlobEffect::HashExternal {
         resolved,
         path: path.to_string(),
         created_by: spec.auth_context.user_id,
     };
     match drive(BlobRequest::new(effect), &ctx.driver).await {
-        Ok(BlobEvent::ExternalHashed { location }) => Ok(location),
+        Ok(BlobEvent::ExternalHashed { location, version }) => Ok((location, version)),
         Ok(other) => Err(ItemError::System(format!("unexpected answer {other:?}"))),
-        Err(error) => Err(ItemError::Item(error.to_string())),
+        Err(error) => Err(hash_failure(error)),
+    }
+}
+
+/// Only an object that is gone or unreadable by its key fails alone; a backend outage
+/// ends the run for a retry.
+fn hash_failure(error: BlobError) -> ItemError {
+    match error {
+        BlobError::Unreadable(_) => ItemError::Item(error.to_string()),
+        error => ItemError::System(error.to_string()),
     }
 }
 
@@ -407,16 +420,25 @@ async fn put_version(
     spec: &BackendImportSpec,
     run: &ImportRun,
     key: String,
-    location: BackendLocation,
+    (location, version): (BackendLocation, Option<String>),
     row: ImportedObject,
     head: Option<Ulid>,
 ) -> Result<(), PutObjectError> {
     let row_key = object_key(run.rule.import_id, &location.backend_path);
-    let rows = vec![(
+    let mut rows = vec![(
         IMPORTED_OBJECT_KEYSPACE.to_string(),
         row_key,
         row.to_bytes()?.into(),
     )];
+    // A later same-name overwrite must not change what this version reads.
+    if let Some(version) = version {
+        let value = version.into_bytes().into();
+        rows.push((
+            BACKEND_VERSION_KEYSPACE.to_string(),
+            version_key(location.ulid),
+            value,
+        ));
+    }
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: spec.auth_context.user_id,
         group_id: run.rule.group_id,
@@ -513,6 +535,7 @@ fn encode(row: &ImportedObject) -> Result<Vec<u8>, ItemError> {
         .map_err(|error| ItemError::System(error.to_string()))
 }
 
+#[cfg(test)]
 async fn write_value(
     context: &DriverContext,
     key_space: &str,
@@ -774,6 +797,12 @@ mod tests {
         )));
         assert!(!item(PutObjectError::ImportRemoved));
         assert!(!item(PutObjectError::PolicyGate(PolicyGateError::Drift)));
+
+        // A backend outage while hashing ends the run; a vanished object fails alone.
+        let gone = BlobError::Unreadable("gone".to_string());
+        assert!(matches!(hash_failure(gone), ItemError::Item(_)));
+        let down = BlobError::ReadError("connection refused".to_string());
+        assert!(matches!(hash_failure(down), ItemError::System(_)));
     }
 
     #[tokio::test]
