@@ -18,6 +18,7 @@ use ulid::Ulid;
 mod abe;
 mod backend;
 mod control_plane;
+mod external;
 mod frames;
 mod group;
 mod in_place;

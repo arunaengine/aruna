@@ -118,6 +118,8 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::ServeSealedRead { .. } => (EffectClass::Transfer, "serve_sealed_read"),
         BlobEffect::ReserveCompose { .. } => (EffectClass::Local, "reserve_compose"),
         BlobEffect::ReplicateLeased { .. } => (EffectClass::Transfer, "replicate_leased"),
+        BlobEffect::ListExternal { .. } => (EffectClass::Control, "list_external"),
+        BlobEffect::HashExternal { .. } => (EffectClass::Transfer, "hash_external"),
     }
 }
 
@@ -852,6 +854,20 @@ impl BlobHandler {
                 Box::pin(composed).await
             }
             BlobEffect::ReserveCompose { content } => self.reserve_compose(content).await,
+            BlobEffect::ListExternal {
+                backend,
+                prefix,
+                start_after,
+                limit,
+            } => {
+                let list = self.list_external(&backend, &prefix, start_after, limit);
+                Box::pin(list).await
+            }
+            BlobEffect::HashExternal {
+                resolved,
+                path,
+                created_by,
+            } => Box::pin(self.hash_external(resolved, path, created_by)).await,
             BlobEffect::HashArchive { location, lease } => {
                 Box::pin(self.hash_archive(location, *lease)).await
             }

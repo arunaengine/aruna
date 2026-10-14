@@ -3920,3 +3920,6 @@ mod parts;
 
 #[path = "rewrite_tests.rs"]
 mod rewrite;
+
+#[path = "external_tests.rs"]
+mod external;
