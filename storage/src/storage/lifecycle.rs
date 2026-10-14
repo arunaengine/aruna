@@ -15,6 +15,9 @@ use super::{
     READ_POOL_THREADS, StorageHandle, Store, WorkerLifecycleGuard, spawn_read_pool,
 };
 
+/// Block cache of the node database; Fjall's 32 MiB default rereads blocks on large scans.
+const CACHE_BYTES: u64 = 256 << 20;
+
 impl FjallStorage {
     #[tracing::instrument(name = "storage.open", level = "debug", fields(path = %path))]
     pub fn open(path: &str) -> Result<StorageHandle, StorageLibError> {
@@ -46,6 +49,7 @@ impl FjallStorage {
     ) -> Result<StorageHandle, StorageLibError> {
         let db = OptimisticTxDatabase::builder(path)
             .manual_journal_persist(true)
+            .cache_size(CACHE_BYTES)
             .open()?;
 
         let (sender, receivers) = StorageHandle::new();
