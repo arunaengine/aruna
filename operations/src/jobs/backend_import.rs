@@ -53,16 +53,18 @@ enum Decision {
 /// Objects a bucket already holds win, and so do later writes and deletes in Aruna:
 /// a changed object gets a new version only while the key still shows the imported
 /// one or nothing. An unchanged object whose version was purged is imported again.
+/// `changed` is a hash that differs from the committed version.
 fn decide(
     object: &ExternalObject,
     row: Option<&ImportedObject>,
     head: Option<Ulid>,
     version_exists: bool,
+    changed: bool,
 ) -> Decision {
     match row {
         None if head.is_some() => Decision::Skip,
         None => Decision::Import,
-        Some(row) if row.matches(object) => match head {
+        Some(row) if !changed && row.matches(object) => match head {
             None if !version_exists => Decision::Import,
             _ => Decision::Skip,
         },
@@ -307,19 +309,6 @@ async fn import_object(
         Ok(None) => return Err(ItemError::Item("the backend is not usable".to_string())),
         Err(error) => return Err(ItemError::Item(error.to_string())),
     };
-    // Aruna's own write is recorded with its key; its first listing only notes ETag and time.
-    // An equal size is no proof, so the bytes must also hash to the committed version.
-    let listed = row.as_ref().and_then(|row| row.first_listing(object));
-    let mut hashed = None;
-    if let (Some(listed), Some(seen)) = (listed, stored) {
-        let found = hash_object(ctx, spec, resolved.clone(), &object.key).await?;
-        let committed = committed_hash(&ctx.driver, &rule.bucket, &listed).await?;
-        if committed.is_some_and(|hash| Some(&hash[..]) == found.0.get_blake3()) {
-            note_listing(&ctx.driver, rule, row_key, &seen, encode(&listed)?).await?;
-            return Ok(Outcome::Skipped);
-        }
-        hashed = Some(found);
-    }
     let key = match row.as_ref().and_then(|row| row.key.clone()) {
         Some(key) => key,
         None => rule.aruna_key(&object.key).unwrap_or_default(),
@@ -330,6 +319,24 @@ async fn import_object(
         ));
     }
     ensure_confined_path(Path::new(&key)).map_err(|error| ItemError::Item(error.to_string()))?;
+    // An equal size is no proof for the first listing of Aruna's own write (which only notes
+    // ETag and time) or a listing without both, so the bytes must hash to the committed version.
+    let listed = row.as_ref().and_then(|row| row.first_listing(object));
+    let unmarked = object.etag.is_none() && object.modified_ms.is_none();
+    let blind = row
+        .clone()
+        .filter(|row| unmarked && row.size == object.size);
+    let (mut hashed, mut changed) = (None, false);
+    if let (Some(listed), Some(seen)) = (listed.or(blind), stored) {
+        let found = hash_object(ctx, spec, resolved.clone(), &object.key).await?;
+        let committed = committed_hash(&ctx.driver, &rule.bucket, &key, listed.version_id).await?;
+        if committed.is_some_and(|hash| Some(&hash[..]) == found.0.get_blake3()) {
+            note_listing(&ctx.driver, rule, row_key, &seen, encode(&listed)?).await?;
+            return Ok(Outcome::Skipped);
+        }
+        changed = committed.is_some();
+        hashed = Some(found);
+    }
     let head_key = BlobHeadKey::new(&rule.bucket, &key)
         .to_bytes()
         .map_err(|error| ItemError::Item(error.to_string()))?;
@@ -346,7 +353,7 @@ async fn import_object(
         }
         _ => false,
     };
-    if decide(object, row.as_ref(), head, version_exists) == Decision::Skip {
+    if decide(object, row.as_ref(), head, version_exists, changed) == Decision::Skip {
         return Ok(Outcome::Skipped);
     }
     // The committed row stays until the new version replaces it in one transaction.
@@ -398,14 +405,14 @@ async fn import_object(
     Ok(Outcome::Imported)
 }
 
-/// The BLAKE3 hash of the version Aruna committed in `bucket` for `row`, if it still exists.
+/// The BLAKE3 hash of the committed version of `key` in `bucket`, if it still exists.
 async fn committed_hash(
     context: &DriverContext,
     bucket: &str,
-    row: &ImportedObject,
+    key: &str,
+    version_id: Ulid,
 ) -> Result<Option<[u8; 32]>, ItemError> {
-    let key = row.key.as_deref().unwrap_or_default();
-    let version_key = VersionKey::new(bucket, key, row.version_id)
+    let version_key = VersionKey::new(bucket, key, version_id)
         .to_bytes()
         .map_err(|error| ItemError::Item(error.to_string()))?;
     let [version] = read_values(context, [(BLOB_VERSIONS_KEYSPACE, version_key.into())]).await?;
@@ -898,7 +905,9 @@ mod tests {
         let context = crate::tests::s3::test_context(storage);
         let row = ImportedObject::written(Ulid::from_parts(6, 6), "in/a.csv".to_string(), 4);
         assert_eq!(
-            committed_hash(&context, "bucket", &row).await.ok(),
+            committed_hash(&context, "bucket", "in/a.csv", row.version_id)
+                .await
+                .ok(),
             Some(None)
         );
 
@@ -916,17 +925,25 @@ mod tests {
         let write = write_value(&context, BLOB_VERSIONS_KEYSPACE, key, value);
         assert!(write.await.is_ok());
         assert_eq!(
-            committed_hash(&context, "bucket", &row).await.ok(),
+            committed_hash(&context, "bucket", "in/a.csv", row.version_id)
+                .await
+                .ok(),
             Some(Some([7; 32]))
         );
     }
 
     #[test]
     fn imports_new_objects() {
-        assert_eq!(decide(&object("e1"), None, None, false), Decision::Import);
+        assert_eq!(
+            decide(&object("e1"), None, None, false, false),
+            Decision::Import
+        );
         // A key the bucket already holds is never taken over.
         let other = Some(Ulid::generate());
-        assert_eq!(decide(&object("e1"), None, other, false), Decision::Skip);
+        assert_eq!(
+            decide(&object("e1"), None, other, false, false),
+            Decision::Skip
+        );
     }
 
     #[test]
@@ -934,16 +951,16 @@ mod tests {
         let version = Ulid::generate();
         let row = row(version, "e1");
         assert_eq!(
-            decide(&object("e1"), Some(&row), Some(version), true),
+            decide(&object("e1"), Some(&row), Some(version), true, false),
             Decision::Skip
         );
         // A purged version is imported again.
         assert_eq!(
-            decide(&object("e1"), Some(&row), None, false),
+            decide(&object("e1"), Some(&row), None, false, false),
             Decision::Import
         );
         assert_eq!(
-            decide(&object("e1"), Some(&row), None, true),
+            decide(&object("e1"), Some(&row), None, true, false),
             Decision::Skip
         );
     }
@@ -953,15 +970,33 @@ mod tests {
         let version = Ulid::generate();
         let row = row(version, "e1");
         let changed = object("e2");
-        let fresh = decide(&changed, Some(&row), Some(version), true);
+        let fresh = decide(&changed, Some(&row), Some(version), true, false);
         assert_eq!(fresh, Decision::Import);
-        assert_eq!(decide(&changed, Some(&row), None, true), Decision::Import);
+        assert_eq!(
+            decide(&changed, Some(&row), None, true, false),
+            Decision::Import
+        );
         // A later write or delete marker in Aruna keeps the key as Aruna has it.
         let newer = Some(Ulid::generate());
-        assert_eq!(decide(&changed, Some(&row), newer, true), Decision::Skip);
         assert_eq!(
-            decide(&object("e1"), Some(&row), newer, true),
+            decide(&changed, Some(&row), newer, true, false),
             Decision::Skip
         );
+        assert_eq!(
+            decide(&object("e1"), Some(&row), newer, true, false),
+            Decision::Skip
+        );
+    }
+
+    #[test]
+    fn imports_hash_mismatch() {
+        let version = Ulid::generate();
+        let row = row(version, "e1");
+        // Same size and ETag, yet the bytes hash differently.
+        let ours = decide(&object("e1"), Some(&row), Some(version), true, true);
+        assert_eq!(ours, Decision::Import);
+        let newer = Some(Ulid::generate());
+        let later = decide(&object("e1"), Some(&row), newer, true, true);
+        assert_eq!(later, Decision::Skip);
     }
 }
