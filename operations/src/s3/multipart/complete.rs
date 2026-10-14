@@ -41,6 +41,7 @@ use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::abe::{AbeError, ObjectEnvelope};
+use aruna_core::structs::storage::backend_import::PlainPath;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
     BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend, VersionKey,
@@ -70,9 +71,8 @@ const PART_PAGE: usize = 256;
 #[derive(Debug, Eq, PartialEq)]
 pub enum CompleteUploadState {
     Init,
-    /// Claims the path of a same-name object, then moves the bytes it replaces aside.
-    ClaimPlain,
-    SetAside,
+    /// Looks at the path of a same-name object before it is composed.
+    StatPlain,
     StartMarkTransaction,
     CheckPurgeMark,
     ReadUploadMark,
@@ -186,10 +186,6 @@ pub enum CompleteUploadError {
     NotFinished,
     #[error(transparent)]
     BucketKey(#[from] BucketKeyError),
-    #[error("another write to this file is in progress")]
-    PlainBusy,
-    #[error("{0}")]
-    PlainAside(String),
 }
 
 impl From<UploadTargetError> for CompleteUploadError {
@@ -301,8 +297,9 @@ pub struct CompleteUploadOperation {
     recheck_pending: bool,
     routing: Option<RoutingSnapshot>,
     plain: Option<PlainTarget>,
-    /// Released with the completion; it names the path's claim and the plain location.
-    plain_claim: Option<Ulid>,
+    /// The path composed last and the backend version the compose reported.
+    plain_path: Option<PlainPath>,
+    plain_version: Option<String>,
 }
 
 impl CompleteUploadOperation {
@@ -349,7 +346,8 @@ impl CompleteUploadOperation {
             recheck_pending: false,
             routing: None,
             plain: None,
-            plain_claim: None,
+            plain_path: None,
+            plain_version: None,
         }
     }
 
@@ -386,11 +384,7 @@ impl CompleteUploadOperation {
     fn emit_error(&mut self, error: CompleteUploadError) -> Effects {
         self.state = CompleteUploadState::Error;
         self.output = Some(Err(error));
-        let mut effects = self.abort();
-        if let Some(id) = self.plain_claim.take() {
-            effects.push(Effect::Blob(BlobEffect::ReleaseReservation { id }));
-        }
-        effects
+        self.abort()
     }
 
     fn schedule_error(&mut self, error: CompleteUploadError) -> Effects {
@@ -1077,6 +1071,11 @@ impl CompleteUploadOperation {
     fn handle_blob_composed(&mut self, event: Event) -> Effects {
         let mut location = match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
+            Event::Blob(BlobEvent::PlainWritten { location, version }) => {
+                self.plain_version = version;
+                location
+            }
+            Event::Blob(BlobEvent::Error(BlobError::PathTaken)) => return self.plain_taken(),
             Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
                 self.cleanup.set_release(location.ulid);
                 self.delete_location = Some(location);
@@ -2242,8 +2241,7 @@ impl Operation for CompleteUploadOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             CompleteUploadState::Init => self.handle_init(),
-            CompleteUploadState::ClaimPlain => self.plain_claimed(event),
-            CompleteUploadState::SetAside => self.plain_set_aside(event),
+            CompleteUploadState::StatPlain => self.plain_stat(event),
             CompleteUploadState::StartMarkTransaction => self.mark_started(event),
             CompleteUploadState::CheckPurgeMark => self.mark_fence_checked(event),
             CompleteUploadState::ReadUploadMark => self.mark_upload_read(event),

@@ -3,10 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::s3::object::put::{plain_writes, set_aside};
-use aruna_core::events::SubOperationEvent;
+use crate::s3::object::put::{PlainRecord, same_name_path};
 use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
-use aruna_core::structs::storage::backend_import::{PlainPath, import_key};
+use aruna_core::structs::storage::backend_import::{import_key, tagged_path};
 
 impl CompleteUploadOperation {
     /// Routing inputs that may name a plain path for the completed object.
@@ -15,7 +14,8 @@ impl CompleteUploadOperation {
         self
     }
 
-    /// A plain path only for raw parts composed on the rule's write backend.
+    /// A plain path only for raw parts composed on the rule's write backend. A same-name
+    /// object first looks at the path; no lock is held.
     pub(super) fn plain_compose(&mut self) -> Option<Effects> {
         let upload = self.upload_record.as_ref()?;
         if self.compression != Compression::Off || upload.backend_upload.is_some() {
@@ -29,60 +29,62 @@ impl CompleteUploadOperation {
             .plain_target(bucket, key, id)
             .filter(|target| target.backend == upload.backend)?;
         self.version_id = Some(id);
-        let same_name = target.same_name;
-        let claim = BlobEffect::ClaimPlain {
+        let stat = BlobEffect::StatPlain {
             backend: target.backend.clone(),
             path: target.path.clone(),
-            id,
         };
+        let (same_name, path) = (target.same_name, target.path.clone());
         self.plain = Some(target);
         if !same_name {
-            return Some(self.compose_plain());
+            return Some(self.compose_plain(path, false));
         }
-        self.plain_claim = Some(id);
-        self.state = CompleteUploadState::ClaimPlain;
-        Some(smallvec![Effect::Blob(claim)])
+        self.state = CompleteUploadState::StatPlain;
+        Some(smallvec![Effect::Blob(stat)])
     }
 
-    pub(super) fn plain_claimed(&mut self, event: Event) -> Effects {
-        match (event, self.plain.as_ref()) {
-            (Event::Blob(BlobEvent::PlainClaimed { claimed: true }), Some(target)) => {
-                let effect = set_aside(target.backend.clone(), target.path.clone());
-                self.state = CompleteUploadState::SetAside;
-                smallvec![effect]
-            }
-            (Event::Blob(BlobEvent::PlainClaimed { claimed: false }), _) => {
-                self.schedule_error(CompleteUploadError::PlainBusy)
-            }
-            _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
-        }
-    }
-
-    pub(super) fn plain_set_aside(&mut self, event: Event) -> Effects {
+    pub(super) fn plain_stat(&mut self, event: Event) -> Effects {
+        let (Some(target), Some(id)) = (self.plain.as_ref(), self.version_id) else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
         match event {
-            Event::SubOperation(SubOperationEvent::PlainSetAside { result: Ok(()) }) => {
-                self.compose_plain()
+            Event::Blob(BlobEvent::PlainStat { exists, version }) => {
+                let path = &target.path;
+                let (path, if_not_exists) = same_name_path(path, id, exists, version.is_some());
+                self.compose_plain(path, if_not_exists)
             }
-            Event::SubOperation(SubOperationEvent::PlainSetAside { result: Err(error) }) => {
-                self.schedule_error(CompleteUploadError::PlainAside(error))
-            }
+            Event::Blob(BlobEvent::Error(error)) => self.schedule_error(error.into()),
             _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
         }
     }
 
-    fn compose_plain(&mut self) -> Effects {
-        let (Some(upload), Some(target), Some(ulid)) = (
-            self.upload_record.as_ref(),
-            self.plain.as_ref(),
-            self.version_id,
-        ) else {
+    /// Another writer took the free path first; the parts are still there, so the object
+    /// takes its tagged path instead.
+    pub(super) fn plain_taken(&mut self) -> Effects {
+        let (Some(target), Some(id)) = (self.plain.as_ref(), self.version_id) else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        let tagged = tagged_path(&target.path, id);
+        if self
+            .plain_path
+            .as_ref()
+            .is_some_and(|plain| plain.path == tagged)
+        {
+            return self.schedule_error(BlobError::PathTaken.into());
+        }
+        self.compose_plain(tagged, true)
+    }
+
+    fn compose_plain(&mut self, path: String, if_not_exists: bool) -> Effects {
+        let (Some(upload), Some(ulid)) = (self.upload_record.as_ref(), self.version_id) else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         let resolved = ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone());
         let plain = PlainPath {
-            path: target.path.clone(),
+            path,
             ulid,
+            if_not_exists,
         };
+        self.plain_path = Some(plain.clone());
         self.state = CompleteUploadState::ComposeBlob;
         smallvec![Effect::Blob(BlobEffect::Compose {
             bucket: self.input.bucket.clone(),
@@ -122,19 +124,29 @@ impl CompleteUploadOperation {
         }
     }
 
-    /// The hint and import row of a plain object, written with its version.
+    /// The backend version and import row of a plain object, written with its version.
     pub(super) fn plain_records(
         &self,
         rule_exists: bool,
     ) -> Result<Vec<(String, Key, Value)>, aruna_core::errors::ConversionError> {
-        let (Some(target), Some(location), Some(version_id)) = (
+        let (Some(target), Some(written), Some(output), Some(version_id)) = (
             self.plain.as_ref(),
+            self.composed_location.as_ref(),
             self.final_location.as_ref(),
             self.version_id,
         ) else {
             return Ok(Vec::new());
         };
-        plain_writes(target, location, version_id, &self.input.key, rule_exists)
+        // A deduplicated version reads the older location, so it needs no version row.
+        let version = self.plain_version.as_deref();
+        let record = PlainRecord {
+            target,
+            written,
+            version: version.filter(|_| output.same_object(written)),
+            version_id,
+            key: &self.input.key,
+        };
+        record.writes(rule_exists)
     }
 }
 
@@ -224,7 +236,7 @@ mod tests {
             let mut operation = operation("{dir}{name}");
             operation.compose_blob();
             let id = operation.version_id.unwrap();
-            operation.final_location = Some(BackendLocation {
+            operation.composed_location = Some(BackendLocation {
                 backend: BackendRef::Group(backend_id()),
                 storage_class: None,
                 root: String::new(),
@@ -242,6 +254,7 @@ mod tests {
                     vec![7u8; 32],
                 )]),
             });
+            operation.final_location = operation.composed_location.clone();
             operation.txn_id = Some(Ulid::nil());
             operation.state = CompleteUploadState::DeleteUploadRecords;
             let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
@@ -289,23 +302,46 @@ mod tests {
     }
 
     #[test]
-    fn claims_same_name() {
+    fn falls_back_tagged() {
         let mut operation = operation("{dir}{name}");
         let effects = operation.compose_blob();
+        let id = operation.version_id.unwrap();
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Blob(BlobEffect::ClaimPlain { path, .. })] if path == "raw/object"
+            [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "raw/object"
         ));
-        let effects = operation.step(Event::Blob(BlobEvent::PlainClaimed { claimed: false }));
+        let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+            exists: false,
+            version: None,
+        }));
+        let composed = |effects: &Effects| match effects.as_slice() {
+            [
+                Effect::Blob(BlobEffect::Compose {
+                    plain: Some(plain), ..
+                }),
+            ] => plain.clone(),
+            _ => panic!("expected a plain compose, got {effects:?}"),
+        };
+        let plain = composed(&effects);
+        assert_eq!(plain.path, "raw/object");
+        assert!(plain.if_not_exists);
+
+        // Another upload took the free path first; the parts still compose next to it.
+        let taken = || Event::Blob(BlobEvent::Error(BlobError::PathTaken));
+        let plain = composed(&operation.step(taken()));
+        assert_eq!(plain.path, format!("raw/object~{id}"));
+        assert!(plain.if_not_exists);
+
+        let effects = operation.step(taken());
         assert!(
             !effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::Blob(BlobEffect::Compose { .. }))),
-            "a busy path is never composed: {effects:?}"
+            "a taken tagged path is not tried again: {effects:?}"
         );
         assert_eq!(
             operation.cleanup.take_error(),
-            Some(CompleteUploadError::PlainBusy)
+            Some(CompleteUploadError::BlobError(BlobError::PathTaken))
         );
     }
 
