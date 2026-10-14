@@ -1250,7 +1250,7 @@ fn map_put_error(error: PutObjectError) -> CallToolResult {
         | PutObjectError::IncompleteBody
         | PutObjectError::MissingExpectedChecksum(_)
         | PutObjectError::ChecksumMismatch(_)) => bad_request(error),
-        error @ (PutObjectError::QuotaExceeded { .. } | PutObjectError::PlainBusy) => {
+        error @ PutObjectError::QuotaExceeded { .. } => {
             server_error(crate::error::ServerError::Conflict(error.to_string()))
         }
         PutObjectError::StorageError(error) => internal_error(error),
@@ -1274,7 +1274,6 @@ fn map_put_error(error: PutObjectError) -> CallToolResult {
         PutObjectError::PolicyGate(error) => internal_error(error),
         PutObjectError::PurgeFence(error) => internal_error(error),
         PutObjectError::PutObjectFailed => internal_error("object write failed"),
-        PutObjectError::PlainAside(error) => internal_error(error),
         error @ (PutObjectError::HeadChanged | PutObjectError::ImportRemoved) => {
             internal_error(error)
         }

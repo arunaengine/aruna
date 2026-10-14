@@ -26,7 +26,7 @@ use crate::s3::write_cleanup::{CleanupStep, WriteCleanup};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
+use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
@@ -113,9 +113,8 @@ pub enum PutObjectState {
     ReadAbe,
     FenceAbe,
     WriteEnvelope,
-    /// Claims the path of a same-name write, then moves the bytes it replaces aside.
-    ClaimPlain,
-    SetAside,
+    /// Looks at the path of a same-name write before it is written.
+    StatPlain,
     WritePlainRecords,
     /// Reads the import rule that the version's import rows belong to.
     ReadImportRule,
@@ -171,10 +170,6 @@ pub enum PutObjectError {
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("Something went wrong ...")]
     PutObjectFailed,
-    #[error("another write to this file is in progress")]
-    PlainBusy,
-    #[error("{0}")]
-    PlainAside(String),
     #[error("the object key changed since it was read")]
     HeadChanged,
     #[error("the import rule was removed")]
@@ -274,8 +269,6 @@ pub struct PutObjectOperation {
     envelope: Option<aruna_core::structs::storage::abe::ObjectEnvelope>,
     envelope_bytes: u64,
     plain: Option<plain::PlainWrite>,
-    /// Released with the operation; it names the path's claim and the plain location.
-    plain_claim: Option<Ulid>,
     /// The head the caller saw, `None` for no head; another head refuses the write.
     expected_head: Option<Option<Ulid>>,
     import_rows: Option<plain::ImportRows>,
@@ -326,7 +319,6 @@ impl PutObjectOperation {
             envelope: None,
             envelope_bytes: 0,
             plain: None,
-            plain_claim: None,
             expected_head: None,
             import_rows: None,
             rule_exists: None,
@@ -765,6 +757,12 @@ impl PutObjectOperation {
                 location
             }
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
+            Event::Blob(BlobEvent::PlainWritten { location, version }) => {
+                if let Some(plain) = self.plain.as_mut() {
+                    plain.version = version;
+                }
+                location
+            }
             // Only a client-sourced stream fault may become a client error; a
             // server-side write fault must stay retryable, never a bad digest.
             Event::Blob(BlobEvent::Error(BlobError::StreamFailed(message))) => {
@@ -1795,8 +1793,7 @@ impl Operation for PutObjectOperation {
                 _ => self.emit_error(PutObjectError::InvalidOperationState),
             },
             PutObjectState::WriteBlob => self.handle_write_finished(event),
-            PutObjectState::ClaimPlain => self.plain_claimed(event),
-            PutObjectState::SetAside => self.plain_set_aside(event),
+            PutObjectState::StatPlain => self.plain_stat(event),
             PutObjectState::WritePlainRecords => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => match self.txn_id {
                     Some(txn_id) => {
@@ -1866,9 +1863,6 @@ impl Operation for PutObjectOperation {
         }
         if let Some(txn_id) = self.txn_id.take() {
             actions.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
-        }
-        if let Some(id) = self.plain_claim.take() {
-            actions.push(Effect::Blob(BlobEffect::ReleaseReservation { id }));
         }
         actions
     }
@@ -2619,11 +2613,9 @@ mod decision_tests {
     }
 }
 
-mod aside;
 mod plain;
 
-pub use aside::{AsideError, PlainAsideOperation, set_aside};
-pub(crate) use plain::plain_writes;
+pub(crate) use plain::{PlainRecord, same_name_path};
 
 #[path = "abe.rs"]
 pub(crate) mod abe;

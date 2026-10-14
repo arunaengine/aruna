@@ -2,23 +2,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::aside::set_aside;
 use super::*;
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, PLAIN_NAME_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
 };
 use aruna_core::structs::storage::backend_import::{
-    ImportedObject, PlainPath, import_key, object_key, plain_name_key,
+    ImportedObject, PlainPath, import_key, object_key, tagged_path, version_key,
 };
 use aruna_core::structs::storage::blob::ResolvedBackend;
 use aruna_core::structs::storage::routing::PlainTarget;
 use aruna_core::types::{Key, Value};
 
-/// The path a write takes and the backend it resolved to.
+/// The path a write takes, the backend it resolved to and the backend version it got.
 #[derive(Debug, PartialEq)]
 pub(super) struct PlainWrite {
     target: PlainTarget,
     resolved: ResolvedBackend,
+    pub(super) version: Option<String>,
 }
 
 /// Rows an import commits with its version; the rule must still exist in that transaction.
@@ -52,60 +52,48 @@ impl PutObjectOperation {
     }
 
     /// Nothing at a tenant path is ever deleted, so the write counts as adopted from here on.
+    /// A same-name write first looks at the path; no lock is held.
     pub(super) fn start_plain(
         &mut self,
         target: PlainTarget,
         resolved: ResolvedBackend,
     ) -> Effects {
-        let Some(id) = self.version_id else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
         self.adopted = true;
-        let effect = BlobEffect::ClaimPlain {
+        let stat = BlobEffect::StatPlain {
             backend: target.backend.clone(),
             path: target.path.clone(),
-            id,
         };
-        let same_name = target.same_name;
-        self.plain = Some(PlainWrite { target, resolved });
+        let (same_name, path) = (target.same_name, target.path.clone());
+        self.plain = Some(PlainWrite {
+            target,
+            resolved,
+            version: None,
+        });
         if !same_name {
-            return self.write_plain();
+            return self.write_plain(path, false);
         }
-        self.plain_claim = Some(id);
-        self.state = PutObjectState::ClaimPlain;
-        smallvec![Effect::Blob(effect)]
+        self.state = PutObjectState::StatPlain;
+        smallvec![Effect::Blob(stat)]
     }
 
-    pub(super) fn plain_claimed(&mut self, event: Event) -> Effects {
+    pub(super) fn plain_stat(&mut self, event: Event) -> Effects {
+        let (Some(plain), Some(id)) = (self.plain.as_ref(), self.version_id) else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
         match event {
-            Event::Blob(BlobEvent::PlainClaimed { claimed: true }) => {
-                let Some(plain) = self.plain.as_ref() else {
-                    return self.emit_error(PutObjectError::InvalidOperationState);
-                };
-                let target = &plain.target;
-                self.state = PutObjectState::SetAside;
-                smallvec![set_aside(target.backend.clone(), target.path.clone())]
+            Event::Blob(BlobEvent::PlainStat { exists, version }) => {
+                let path = &plain.target.path;
+                let (path, if_not_exists) = same_name_path(path, id, exists, version.is_some());
+                self.write_plain(path, if_not_exists)
             }
-            Event::Blob(BlobEvent::PlainClaimed { claimed: false }) => {
-                self.emit_error(PutObjectError::PlainBusy)
+            Event::Blob(BlobEvent::Error(error)) => {
+                self.emit_error(PutObjectError::BlobWriteFailed(error))
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
         }
     }
 
-    pub(super) fn plain_set_aside(&mut self, event: Event) -> Effects {
-        match event {
-            Event::SubOperation(SubOperationEvent::PlainSetAside { result: Ok(()) }) => {
-                self.write_plain()
-            }
-            Event::SubOperation(SubOperationEvent::PlainSetAside { result: Err(error) }) => {
-                self.emit_error(PutObjectError::PlainAside(error))
-            }
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
-        }
-    }
-
-    fn write_plain(&mut self) -> Effects {
+    fn write_plain(&mut self, path: String, if_not_exists: bool) -> Effects {
         let (Some(plain), Some(ulid)) = (self.plain.as_ref(), self.version_id) else {
             return self.emit_error(PutObjectError::InvalidOperationState);
         };
@@ -116,8 +104,9 @@ impl PutObjectOperation {
         smallvec![Effect::Blob(BlobEffect::WritePlain {
             resolved: plain.resolved.clone(),
             plain: PlainPath {
-                path: plain.target.path.clone(),
+                path,
                 ulid,
+                if_not_exists,
             },
             created_by: self.config.user_id,
             blob,
@@ -160,10 +149,20 @@ impl PutObjectOperation {
             writes.extend(rows.writes.iter().cloned());
         }
         if let Some(plain) = self.plain.as_ref() {
-            let (location, version_id) = (self.get_output()?, self.version_id?);
-            let key = &self.config.request.key;
-            let rule_exists = self.rule_exists == Some(true);
-            match plain_writes(&plain.target, location, version_id, key, rule_exists) {
+            let (output, written) = (self.get_output()?, self.get_written_location()?);
+            // A deduplicated version reads the older location, so it needs no version row.
+            let version = plain
+                .version
+                .as_deref()
+                .filter(|_| output.same_object(written));
+            let record = PlainRecord {
+                target: &plain.target,
+                written,
+                version,
+                version_id: self.version_id?,
+                key: &self.config.request.key,
+            };
+            match record.writes(self.rule_exists == Some(true)) {
                 Ok(rows) => writes.extend(rows),
                 Err(error) => return Some(self.emit_error(error.into())),
             }
@@ -193,29 +192,58 @@ impl PutObjectOperation {
     }
 }
 
-/// Rows a plain write commits with its version. The hint lets the next same-name write find
-/// the bytes; the import row, written only while the rule exists, keeps its importer from
-/// importing them again.
-pub(crate) fn plain_writes(
-    target: &PlainTarget,
-    location: &BackendLocation,
-    version_id: Ulid,
-    key: &str,
-    rule_exists: bool,
-) -> Result<Vec<(String, Key, Value)>, ConversionError> {
-    let mut writes = Vec::new();
-    if target.same_name {
-        let name = plain_name_key(&target.backend, &target.path);
-        let hint = location.location_key()?.to_bytes();
-        writes.push((PLAIN_NAME_KEYSPACE.to_string(), name, hint.into()));
+/// Where a same-name write goes and whether it must find the path free. A free path takes
+/// the file; a backend with versions keeps the replaced bytes; else a tagged path is used.
+pub(crate) fn same_name_path(
+    path: &str,
+    id: Ulid,
+    exists: bool,
+    versioned: bool,
+) -> (String, bool) {
+    match (exists, versioned) {
+        (false, _) => (path.to_string(), true),
+        (true, true) => (path.to_string(), false),
+        (true, false) => (tagged_path(path, id), true),
     }
-    if target.listed && rule_exists {
-        let row = ImportedObject::written(version_id, key.to_string(), location.blob_size);
-        let row_key = object_key(target.import_id, &target.path);
-        let row = row.to_bytes()?;
-        writes.push((IMPORTED_OBJECT_KEYSPACE.to_string(), row_key, row.into()));
+}
+
+/// What a plain write commits with its version.
+pub(crate) struct PlainRecord<'a> {
+    pub target: &'a PlainTarget,
+    pub written: &'a BackendLocation,
+    pub version: Option<&'a str>,
+    pub version_id: Ulid,
+    pub key: &'a str,
+}
+
+impl PlainRecord<'_> {
+    /// The backend version lets older versions read their own bytes after an overwrite; the
+    /// import row, written only while the rule exists, keeps its importer from importing them.
+    pub(crate) fn writes(
+        &self,
+        rule_exists: bool,
+    ) -> Result<Vec<(String, Key, Value)>, ConversionError> {
+        let mut writes = Vec::new();
+        if let Some(version) = self.version {
+            let key = version_key(self.written.ulid);
+            let value = version.as_bytes().to_vec().into();
+            writes.push((BACKEND_VERSION_KEYSPACE.to_string(), key, value));
+        }
+        if self.target.listed && rule_exists {
+            let row = ImportedObject::written(
+                self.version_id,
+                self.key.to_string(),
+                self.written.blob_size,
+            );
+            let row_key = object_key(self.target.import_id, &self.written.backend_path);
+            writes.push((
+                IMPORTED_OBJECT_KEYSPACE.to_string(),
+                row_key,
+                row.to_bytes()?.into(),
+            ));
+        }
+        Ok(writes)
     }
-    Ok(writes)
 }
 
 #[cfg(test)]
@@ -333,10 +361,12 @@ mod tests {
         };
         assert_eq!(plain.path, format!("raw/x/{id}_one.csv"));
         assert_eq!(plain.ulid, id);
+        assert!(!plain.if_not_exists);
 
         // A failed write leaves the tenant path alone.
-        operation.step(Event::Blob(BlobEvent::WriteFinished {
+        operation.step(Event::Blob(BlobEvent::PlainWritten {
             location: written(plain.path.clone(), id),
+            version: None,
         }));
         let effects = operation.abort();
         assert!(
@@ -349,28 +379,47 @@ mod tests {
 
     #[test]
     fn records_own_write() {
-        let mut operation = operation("{dir}{name}");
-        begin(&mut operation);
-        let id = operation.version_id.unwrap();
-        operation.output = Some(Ok(written("raw/x/one.csv".to_string(), id)));
-        operation.txn_id = Some(Ulid::nil());
+        let records = |rule: bool, deduplicated: bool| {
+            let mut operation = operation("{dir}{name}");
+            begin(&mut operation);
+            let id = operation.version_id.unwrap();
+            let location = written("raw/x/one.csv".to_string(), id);
+            operation.written_location = Some(location.clone());
+            let output = match deduplicated {
+                true => written("raw/x/old.csv".to_string(), Ulid::from_parts(3, 3)),
+                false => location,
+            };
+            operation.output = Some(Ok(output));
+            operation.plain.as_mut().unwrap().version = Some("v1".to_string());
+            operation.txn_id = Some(Ulid::nil());
 
-        // The import row needs the rule, read in the version transaction.
-        let Some(effects) = operation.plain_records(Ulid::nil()) else {
-            panic!("expected the rule read")
+            // The import row needs the rule, read in the version transaction.
+            let Some(effects) = operation.plain_records(Ulid::nil()) else {
+                panic!("expected the rule read")
+            };
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == BACKEND_IMPORT_KEYSPACE
+            ));
+            let effects = operation.step(read(rule.then(|| vec![0u8])));
+            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
+            else {
+                panic!("expected one batch write, got {effects:?}")
+            };
+            (id, writes.clone())
         };
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == BACKEND_IMPORT_KEYSPACE
-        ));
-        let effects = operation.step(read(Some(vec![0u8])));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected one batch write, got {effects:?}")
+
+        let (id, writes) = records(true, false);
+        let [
+            (version_space, version_row, version),
+            (row_space, row_key, row),
+        ] = writes.as_slice()
+        else {
+            panic!("expected the backend version and the import row")
         };
-        let [(hint_space, _, _), (row_space, row_key, row)] = writes.as_slice() else {
-            panic!("expected the hint and the import row")
-        };
-        assert_eq!(hint_space, PLAIN_NAME_KEYSPACE);
+        assert_eq!(version_space, BACKEND_VERSION_KEYSPACE);
+        assert_eq!(*version_row, version_key(id));
+        assert_eq!(version.as_ref(), b"v1");
         assert_eq!(row_space, IMPORTED_OBJECT_KEYSPACE);
         assert_eq!(
             *row_key,
@@ -381,18 +430,21 @@ mod tests {
         assert_eq!(row.version_id, id);
         assert!(row.unlisted());
 
-        // Without the rule only the hint is written; the version itself still commits.
-        let mut operation = self::operation("{dir}{name}");
-        begin(&mut operation);
-        operation.output = Some(Ok(written("raw/x/one.csv".to_string(), id)));
-        operation.txn_id = Some(Ulid::nil());
-        operation.plain_records(Ulid::nil());
-        let effects = operation.step(read(None));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected one batch write, got {effects:?}")
-        };
+        // Without the rule only the backend version is written; the version still commits.
+        let (_, writes) = records(false, false);
         assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].0, PLAIN_NAME_KEYSPACE);
+        assert_eq!(writes[0].0, BACKEND_VERSION_KEYSPACE);
+
+        // A deduplicated version reads an older location; the written path still gets its row.
+        let (_, writes) = records(true, true);
+        let [(row_space, row_key, _)] = writes.as_slice() else {
+            panic!("expected only the import row, got {writes:?}")
+        };
+        assert_eq!(row_space, IMPORTED_OBJECT_KEYSPACE);
+        assert_eq!(
+            *row_key,
+            object_key(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv")
+        );
     }
 
     #[test]
@@ -493,54 +545,71 @@ mod tests {
     }
 
     #[test]
-    fn claims_same_name() {
-        let mut operation = operation("{dir}{name}");
-        let effects = begin(&mut operation);
-        let id = operation.version_id.unwrap();
-        let [
-            Effect::Blob(BlobEffect::ClaimPlain {
-                path, id: claim, ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected a claim, got {effects:?}")
-        };
-        assert_eq!((path.as_str(), *claim), ("raw/x/one.csv", id));
-
-        let effects = operation.step(Event::Blob(BlobEvent::PlainClaimed { claimed: true }));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let effects = operation.step(Event::SubOperation(SubOperationEvent::PlainSetAside {
-            result: Ok(()),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::WritePlain { .. })]
-        ));
+    fn picks_same_name() {
+        let id = Ulid::from_parts(7, 7);
+        let path = "raw/a.csv";
+        assert_eq!(
+            same_name_path(path, id, false, false),
+            (path.to_string(), true)
+        );
+        assert_eq!(
+            same_name_path(path, id, false, true),
+            (path.to_string(), true)
+        );
+        // A backend with versions keeps the replaced bytes, so the write overwrites.
+        assert_eq!(
+            same_name_path(path, id, true, true),
+            (path.to_string(), false)
+        );
+        // Without versions the write goes next to the file, never over it.
+        assert_eq!(
+            same_name_path(path, id, true, false),
+            (format!("raw/a.csv~{id}"), true)
+        );
     }
 
     #[test]
-    fn busy_path_conflicts() {
+    fn stats_same_name() {
+        let mut operation = operation("{dir}{name}");
+        let effects = begin(&mut operation);
+        let id = operation.version_id.unwrap();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "raw/x/one.csv"
+        ));
+
+        let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+            exists: true,
+            version: None,
+        }));
+        let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
+            panic!("expected a plain write, got {effects:?}")
+        };
+        assert_eq!(plain.path, format!("raw/x/one.csv~{id}"));
+        assert!(plain.if_not_exists);
+    }
+
+    #[test]
+    fn taken_path_fails() {
         let mut operation = operation("{dir}{name}");
         begin(&mut operation);
-
-        operation.step(Event::Blob(BlobEvent::PlainClaimed { claimed: false }));
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize().unwrap_err(), PutObjectError::PlainBusy);
-
-        // A failed move releases the claim the write holds.
-        let mut operation = self::operation("{dir}{name}");
-        begin(&mut operation);
-        let id = operation.version_id.unwrap();
-        operation.step(Event::Blob(BlobEvent::PlainClaimed { claimed: true }));
-        let effects = operation.step(Event::SubOperation(SubOperationEvent::PlainSetAside {
-            result: Err("gone".to_string()),
+        operation.step(Event::Blob(BlobEvent::PlainStat {
+            exists: false,
+            version: None,
         }));
+
+        // Another upload took the free path first; nothing at the path is deleted.
+        let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
         assert!(
-            effects.iter().any(|effect| matches!(
-                effect,
-                Effect::Blob(BlobEffect::ReleaseReservation { id: released }) if *released == id
-            )),
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Blob(BlobEffect::Delete { .. }))),
             "{effects:?}"
+        );
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize().unwrap_err(),
+            PutObjectError::BlobWriteFailed(BlobError::PathTaken)
         );
     }
 }
