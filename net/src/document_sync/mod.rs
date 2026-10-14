@@ -125,6 +125,8 @@ pub const BATCH_TOPIC_LIMIT: usize = 1_024;
 const OUTBOUND_PEER_LIMIT: usize = 8;
 const SYNC_FANOUT_DOMAIN: &[u8] = b"aruna-document-sync-fanout-v1";
 const SYNC_FANOUT_KEYSPACE: &str = "document-sync-fanout";
+/// Block cache of the sync store; Fjall's 32 MiB default rereads blocks of long topic histories.
+const SYNC_CACHE_BYTES: u64 = 512 << 20;
 const SYNC_MESSAGE_LIMIT: usize = 4_096;
 const SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 // A frame is meaningful progress; a byte trickle cannot retain a permit forever.
@@ -463,6 +465,7 @@ impl DocumentSyncService {
         let default_peers: BTreeSet<PeerId> = peer_nodes.iter().map(node_to_peer).collect();
         let db = fjall::OptimisticTxDatabase::builder(&storage_path)
             .manual_journal_persist(true)
+            .cache_size(SYNC_CACHE_BYTES)
             .open()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         let fanout_cursors = db
