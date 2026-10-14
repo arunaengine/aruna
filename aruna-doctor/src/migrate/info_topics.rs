@@ -14,8 +14,11 @@ use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, R
 use irokle::{FjallStorage, Storage, TopicId};
 use std::path::Path;
 
-/// Ops one purge transaction deletes at most.
-const PURGE_STEP: usize = 10_000;
+/// Rows one purge transaction deletes: large, since each step rescans the rows earlier steps
+/// deleted, but within irokle's 128 MiB transaction buffer.
+const PURGE_STEP: usize = 250_000;
+/// Block cache for the purge; the 32 MiB default rereads each table block per removed op.
+const PURGE_CACHE: u64 = 1 << 30;
 /// Fan-out cursors of the document sync store.
 const FANOUT_KEYSPACE: &str = "document-sync-fanout";
 
@@ -126,7 +129,9 @@ pub(super) fn purge_topics(
     if topics.is_empty() {
         return Ok((0, 0));
     }
-    let db = OptimisticTxDatabase::builder(sync_path).open()?;
+    let db = OptimisticTxDatabase::builder(sync_path)
+        .cache_size(PURGE_CACHE)
+        .open()?;
     let fanout = db.keyspace(FANOUT_KEYSPACE, KeyspaceCreateOptions::default)?;
     let storage = FjallStorage::from_database(db.clone())?;
     let (mut ops, mut cursors) = (0, 0);
