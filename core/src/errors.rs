@@ -95,6 +95,12 @@ pub enum BlobError {
     BucketKey(#[from] crate::structs::storage::encryption::BucketKeyError),
     #[error(transparent)]
     Abe(#[from] crate::structs::storage::abe::AbeError),
+    /// A conditional write found a file already at the path.
+    #[error("Another file took the path first")]
+    PathTaken,
+    /// This one object cannot be read: it is gone, or its key cannot be read exactly.
+    #[error("Object cannot be read: {0}")]
+    Unreadable(String),
 }
 
 #[derive(Debug, Error, PartialEq)]

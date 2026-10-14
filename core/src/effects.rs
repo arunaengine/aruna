@@ -101,7 +101,7 @@ pub enum BlobEffect {
         resolved: ResolvedBackend,
         created_by: UserId,
         parts: Vec<BackendLocation>,
-        /// Composes raw to this path of the tenant's folders instead of Aruna's own layout.
+        /// Composes raw to this path of the tenant's folders and answers `PlainWritten`.
         plain: Option<PlainPath>,
     },
     Read {
@@ -337,7 +337,7 @@ pub enum BlobEffect {
         created_by: UserId,
     },
     /// Streams `blob` raw to `plain.path` on `resolved`, a path in the tenant's folders, and
-    /// answers `WriteFinished`. A failed write never restores what the path held before.
+    /// answers `PlainWritten`. A failed write never deletes or restores what the path holds.
     WritePlain {
         resolved: ResolvedBackend,
         plain: PlainPath,
@@ -345,17 +345,9 @@ pub enum BlobEffect {
         blob: BackendStream<Result<Bytes, StreamError>>,
         size: Option<u64>,
     },
-    /// Claims `path` on `backend` for one same-name write until `ReleaseReservation { id }`.
-    /// Answers `PlainClaimed`.
-    ClaimPlain {
+    /// Answers `PlainStat` for `path` on `backend`.
+    StatPlain {
         backend: BackendRef,
-        path: String,
-        id: Ulid,
-    },
-    /// Copies the raw bytes at `source` to `path` on its backend and answers `WriteFinished`
-    /// with the hashes of the bytes it read.
-    CopyAside {
-        source: BackendLocation,
         path: String,
     },
 }

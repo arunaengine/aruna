@@ -7,8 +7,6 @@ use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::execution::job::JobId;
 use crate::structs::identity::auth::AuthContext;
-use crate::structs::storage::blob::BackendRef;
-use crate::structs::storage::group_backend::VERSIONS_PREFIX;
 use crate::types::{GroupId, Key};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
@@ -135,9 +133,9 @@ fn plain_safe(path: &str) -> bool {
         })
 }
 
-/// Where Aruna keeps the bytes a same-name write replaced at `path`.
-pub fn aside_path(path: &str, id: Ulid) -> String {
-    format!("{VERSIONS_PREFIX}/{path}/{id}")
+/// Where a same-name write of version `id` goes when a file without versions holds `path`.
+pub fn tagged_path(path: &str, id: Ulid) -> String {
+    format!("{path}~{id}")
 }
 
 /// Rules are keyed by group first, so one group's rules are one prefix scan.
@@ -153,22 +151,22 @@ pub fn object_key(import_id: Ulid, backend_key: &str) -> Key {
     key.into()
 }
 
-pub fn plain_name_key(backend: &BackendRef, path: &str) -> Key {
-    let mut key = backend.key_bytes();
-    key.push(0);
-    key.extend_from_slice(path.as_bytes());
-    key.into()
+/// Backend versions are keyed by the ulid of the location they belong to.
+pub fn version_key(location: Ulid) -> Key {
+    location.to_bytes().to_vec().into()
 }
 
 pub fn object_prefix(import_id: Ulid) -> Key {
     import_id.to_bytes().to_vec().into()
 }
 
-/// A write to a fixed path in the tenant's folders; `ulid` names its location and its claim.
+/// A write to a fixed path in the tenant's folders; `ulid` names its location.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlainPath {
     pub path: String,
     pub ulid: Ulid,
+    /// Fails the write with `PathTaken` if a file is already at the path.
+    pub if_not_exists: bool,
 }
 
 /// One object of a backend listing.

@@ -215,9 +215,8 @@ pub const BACKEND_INDEX_KEYSPACE: &str = "group_storage_backend_index";
 pub const BACKEND_IMPORT_KEYSPACE: &str = "backend_imports";
 /// What each import run recorded per backend key, keyed by `import id || backend key`.
 pub const IMPORTED_OBJECT_KEYSPACE: &str = "backend_import_objects";
-/// The location row of the bytes Aruna last placed at a path of a tenant's folders, keyed by
-/// `backend key bytes || 0 || path`. A hint only: readers check that the row still names the path.
-pub const PLAIN_NAME_KEYSPACE: &str = "plain_names";
+/// The backend version id of bytes at a path of a tenant's folders, keyed by location ulid.
+pub const BACKEND_VERSION_KEYSPACE: &str = "backend_versions";
 /// Removed import rules whose object rows are not all deleted yet, keyed by import id.
 pub const IMPORT_REMOVAL_KEYSPACE: &str = "backend_import_removals";
 
@@ -478,7 +477,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BACKEND_INDEX_KEYSPACE,
     BACKEND_IMPORT_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE,
-    PLAIN_NAME_KEYSPACE,
+    BACKEND_VERSION_KEYSPACE,
     IMPORT_REMOVAL_KEYSPACE,
     OFFERED_DIRECTORY_KEYSPACE,
     DEVICE_INTAKE_KEYSPACE,

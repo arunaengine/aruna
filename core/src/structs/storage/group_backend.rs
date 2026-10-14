@@ -51,12 +51,10 @@ impl GroupBackendKind {
 
 /// Where registration writes and removes its probe object.
 pub const PROBE_PREFIX: &str = "_aruna_backend_probe";
-/// Where Aruna keeps the replaced bytes of same-name writes.
-pub const VERSIONS_PREFIX: &str = ".aruna-versions";
 
 /// Whether `key` lies where Aruna keeps its own objects on a backend with `container`.
 pub fn reserved_path(container: Option<&str>, key: &str) -> bool {
-    [Some(PROBE_PREFIX), Some(VERSIONS_PREFIX), container]
+    [Some(PROBE_PREFIX), container]
         .into_iter()
         .flatten()
         .any(|folder| {
@@ -256,7 +254,6 @@ mod tests {
         };
         assert!(record.is_reserved("data/bucket/key_01"));
         assert!(record.is_reserved("_aruna_backend_probe/01"));
-        assert!(record.is_reserved(".aruna-versions/raw/a.csv/01"));
         assert!(!record.is_reserved("database/a.csv"));
         assert!(!record.is_reserved("raw/data/a.csv"));
     }
