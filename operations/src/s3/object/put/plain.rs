@@ -4,9 +4,11 @@
 
 use super::aside::set_aside;
 use super::*;
-use aruna_core::keyspaces::{IMPORTED_OBJECT_KEYSPACE, PLAIN_NAME_KEYSPACE};
+use aruna_core::keyspaces::{
+    BACKEND_IMPORT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, PLAIN_NAME_KEYSPACE,
+};
 use aruna_core::structs::storage::backend_import::{
-    ImportedObject, PlainPath, object_key, plain_name_key,
+    ImportedObject, PlainPath, import_key, object_key, plain_name_key,
 };
 use aruna_core::structs::storage::blob::ResolvedBackend;
 use aruna_core::structs::storage::routing::PlainTarget;
@@ -17,6 +19,13 @@ use aruna_core::types::{Key, Value};
 pub(super) struct PlainWrite {
     target: PlainTarget,
     resolved: ResolvedBackend,
+}
+
+/// Rows an import commits with its version; the rule must still exist in that transaction.
+#[derive(Debug, PartialEq)]
+pub(super) struct ImportRows {
+    import_id: Ulid,
+    writes: Vec<(String, Key, Value)>,
 }
 
 impl PutObjectOperation {
@@ -116,20 +125,66 @@ impl PutObjectOperation {
         })]
     }
 
+    /// Rows committed with the version only while the import rule `import_id` exists.
+    pub fn with_import_rows(mut self, import_id: Ulid, writes: Vec<(String, Key, Value)>) -> Self {
+        self.import_rows = Some(ImportRows { import_id, writes });
+        self
+    }
+
+    /// The rule whose existence the version transaction must read before its rows.
+    fn rule_fence(&self) -> Option<Key> {
+        let import_id = self.import_rows.as_ref()?.import_id;
+        Some(import_key(self.config.group_id, import_id))
+    }
+
     pub(super) fn plain_records(&mut self, txn_id: Ulid) -> Option<Effects> {
-        let target = &self.plain.as_ref()?.target;
-        let (location, version_id) = (self.get_output()?, self.version_id?);
-        let key = &self.config.request.key;
-        let writes = match plain_writes(target, location, version_id, key) {
-            Ok(writes) if writes.is_empty() => return None,
-            Ok(writes) => writes,
-            Err(error) => return Some(self.emit_error(error.into())),
-        };
+        if self.rule_exists.is_none()
+            && let Some(key) = self.rule_fence()
+        {
+            self.state = PutObjectState::ReadImportRule;
+            return Some(smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+                key,
+                txn_id: Some(txn_id),
+            })]);
+        }
+        let mut writes = Vec::new();
+        if let Some(rows) = self.import_rows.as_ref() {
+            if self.rule_exists != Some(true) {
+                return Some(self.emit_error(PutObjectError::ImportRemoved));
+            }
+            writes.extend(rows.writes.iter().cloned());
+        }
+        if let Some(plain) = self.plain.as_ref() {
+            let (location, version_id) = (self.get_output()?, self.version_id?);
+            let key = &self.config.request.key;
+            match plain_writes(&plain.target, location, version_id, key) {
+                Ok(rows) => writes.extend(rows),
+                Err(error) => return Some(self.emit_error(error.into())),
+            }
+        }
+        if writes.is_empty() {
+            return None;
+        }
         self.state = PutObjectState::WritePlainRecords;
         Some(smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: Some(txn_id),
         })])
+    }
+
+    pub(super) fn import_rule_read(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(PutObjectError::NoTransactionFound);
+        };
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                self.rule_exists = Some(value.is_some());
+                self.write_cleanup_row(txn_id)
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
+            _ => self.emit_error(PutObjectError::InvalidOperationState),
+        }
     }
 }
 
@@ -311,6 +366,103 @@ mod tests {
         assert_eq!(row.key.as_deref(), Some("in/x/one.csv"));
         assert_eq!(row.version_id, id);
         assert!(row.unlisted());
+    }
+
+    #[test]
+    fn fences_import_rows() {
+        let import_id = Ulid::from_bytes([4u8; 16]);
+        let row = (
+            IMPORTED_OBJECT_KEYSPACE.to_string(),
+            Key::from(vec![1u8]),
+            Value::from(vec![2u8]),
+        );
+        let fenced = |exists: bool| {
+            let mut operation =
+                operation(DEFAULT_PATTERN).with_import_rows(import_id, vec![row.clone()]);
+            operation.txn_id = Some(Ulid::nil());
+            let effects = operation.plain_records(Ulid::nil()).expect("a rule read");
+            let [
+                Effect::Storage(StorageEffect::Read {
+                    key_space,
+                    key,
+                    txn_id,
+                    ..
+                }),
+            ] = effects.as_slice()
+            else {
+                panic!("expected the rule read, got {effects:?}")
+            };
+            assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
+            assert_eq!(*key, import_key(Ulid::from_parts(2, 2), import_id));
+            assert_eq!(*txn_id, Some(Ulid::nil()));
+            let value = exists.then(|| vec![0u8]);
+            let effects = operation.step(read(value));
+            (operation, effects)
+        };
+
+        let (_, effects) = fenced(true);
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the rows, got {effects:?}")
+        };
+        assert_eq!(writes, &vec![row.clone()]);
+
+        // A removed rule refuses the version, so no row outlives it.
+        let (operation, effects) = fenced(false);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert_eq!(
+            operation.finalize().unwrap_err(),
+            PutObjectError::ImportRemoved
+        );
+    }
+
+    #[test]
+    fn checks_expected_head() {
+        let head = Ulid::from_parts(9, 9);
+        let pointer = |id| {
+            Some(
+                CurrentVersionPointer::new_with_generation(id, 1)
+                    .to_bytes()
+                    .unwrap(),
+            )
+        };
+        let lookup = |expected: Option<Ulid>, found: Option<Vec<u8>>| {
+            let mut operation = operation(DEFAULT_PATTERN).with_expected_head(expected);
+            operation.txn_id = Some(Ulid::nil());
+            operation.state = PutObjectState::ReadObjectLookup;
+            let effects = operation.step(read(found));
+            (operation, effects)
+        };
+
+        let (_, effects) = lookup(Some(head), pointer(head));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+        let (_, effects) = lookup(None, None);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { .. })]
+        ));
+
+        // A write or a delete marker since the caller looked keeps the key.
+        for (expected, found) in [
+            (Some(head), pointer(Ulid::from_parts(9, 10))),
+            (None, pointer(head)),
+            (Some(head), None),
+        ] {
+            let (operation, effects) = lookup(expected, found);
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+            ));
+            assert_eq!(
+                operation.finalize().unwrap_err(),
+                PutObjectError::HeadChanged
+            );
+        }
     }
 
     #[test]

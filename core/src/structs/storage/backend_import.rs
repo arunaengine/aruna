@@ -180,8 +180,8 @@ pub struct ExternalObject {
     pub modified_ms: Option<u64>,
 }
 
-/// What a run recorded for one backend key. It is written before the version, so a
-/// failed run retries the same version id.
+/// What a run recorded for one backend key. It commits with the version it names, so a
+/// failed import leaves the previous row in place.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ImportedObject {
     pub version_id: Ulid,

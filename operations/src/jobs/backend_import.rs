@@ -38,7 +38,7 @@ use crate::placement::policy::GateContext;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 
 const LIST_PAGE: usize = 500;
 
@@ -46,12 +46,12 @@ const LIST_PAGE: usize = 500;
 #[derive(Debug, PartialEq)]
 enum Decision {
     Skip,
-    Import(Ulid),
+    Import,
 }
 
 /// Objects a bucket already holds win, and so do later writes and deletes in Aruna:
 /// a changed object gets a new version only while the key still shows the imported
-/// one or nothing. A recorded attempt without a version retries the same version id.
+/// one or nothing. An unchanged object whose version was purged is imported again.
 fn decide(
     object: &ExternalObject,
     row: Option<&ImportedObject>,
@@ -60,14 +60,12 @@ fn decide(
 ) -> Decision {
     match row {
         None if head.is_some() => Decision::Skip,
-        None => Decision::Import(Ulid::generate()),
+        None => Decision::Import,
         Some(row) if row.matches(object) => match head {
-            None if !version_exists => Decision::Import(row.version_id),
+            None if !version_exists => Decision::Import,
             _ => Decision::Skip,
         },
-        Some(row) if head.is_none_or(|head| head == row.version_id) => {
-            Decision::Import(Ulid::generate())
-        }
+        Some(row) if head.is_none_or(|head| head == row.version_id) => Decision::Import,
         Some(_) => Decision::Skip,
     }
 }
@@ -319,23 +317,15 @@ async fn import_object(
         }
         _ => false,
     };
-    let version_id = match decide(object, row.as_ref(), head, version_exists) {
-        Decision::Skip => return Ok(Outcome::Skipped),
-        Decision::Import(version_id) => version_id,
-    };
-    let intent = ImportedObject {
+    if decide(object, row.as_ref(), head, version_exists) == Decision::Skip {
+        return Ok(Outcome::Skipped);
+    }
+    // The committed row stays until the new version replaces it in one transaction.
+    let version_id = Ulid::generate();
+    let committed = ImportedObject {
         key: row.as_ref().and_then(|row| row.key.clone()),
         ..ImportedObject::new(version_id, object)
     };
-    if row.as_ref() != Some(&intent) {
-        write_value(
-            &ctx.driver,
-            IMPORTED_OBJECT_KEYSPACE,
-            row_key,
-            encode(&intent)?,
-        )
-        .await?;
-    }
     // The bytes stay on the rule's backend, wherever new writes to the key are routed.
     let target = RoutingTarget::Backend(BackendRef::Group(rule.backend_id));
     let resolved = match run
@@ -354,7 +344,12 @@ async fn import_object(
         ));
     }
     let hint = location.location_key().ok();
-    put_version(ctx, spec, run, key.clone(), version_id, location).await?;
+    match put_version(ctx, spec, run, key.clone(), location, committed, head).await {
+        Ok(()) => {}
+        // An Aruna write or delete marker came first and keeps the key.
+        Err(PutObjectError::HeadChanged) => return Ok(Outcome::Skipped),
+        Err(error) => return Err(ItemError::Item(error.to_string())),
+    }
     // A same-name write to this path first moves the imported bytes aside.
     if let Some(hint) = hint.filter(|_| rule.same_name() && rule.write_backend() == rule.backend_id)
     {
@@ -401,9 +396,16 @@ async fn put_version(
     spec: &BackendImportSpec,
     run: &ImportRun,
     key: String,
-    version_id: Ulid,
     location: BackendLocation,
-) -> Result<(), ItemError> {
+    row: ImportedObject,
+    head: Option<Ulid>,
+) -> Result<(), PutObjectError> {
+    let row_key = object_key(run.rule.import_id, &location.backend_path);
+    let rows = vec![(
+        IMPORTED_OBJECT_KEYSPACE.to_string(),
+        row_key,
+        row.to_bytes()?.into(),
+    )];
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: spec.auth_context.user_id,
         group_id: run.rule.group_id,
@@ -419,21 +421,20 @@ async fn put_version(
         checksum_type: None,
         exists: false,
         version_source: None,
-        preassigned_version_id: Some(version_id),
+        preassigned_version_id: Some(row.version_id),
         quota_ceiling: run.quota,
         routing: run.routing.clone(),
     })
     .without_envelope()
     .with_adopted(location)
     .with_bucket_guard(run.bucket.clone())
-    .with_restrictions(spec.auth_context.path_restrictions.clone());
+    .with_restrictions(spec.auth_context.path_restrictions.clone())
+    .with_expected_head(head)
+    .with_import_rows(run.rule.import_id, rows);
     if let Some(gate) = run.gate.clone() {
         operation = operation.with_gate(gate);
     }
-    drive(operation, &ctx.driver)
-        .await
-        .map(|_| ())
-        .map_err(|error| ItemError::Item(error.to_string()))
+    drive(operation, &ctx.driver).await.map(|_| ())
 }
 
 fn parse<T>(
@@ -650,10 +651,7 @@ mod tests {
 
     #[test]
     fn imports_new_objects() {
-        assert!(matches!(
-            decide(&object("e1"), None, None, false),
-            Decision::Import(_)
-        ));
+        assert_eq!(decide(&object("e1"), None, None, false), Decision::Import);
         // A key the bucket already holds is never taken over.
         let other = Some(Ulid::generate());
         assert_eq!(decide(&object("e1"), None, other, false), Decision::Skip);
@@ -667,10 +665,10 @@ mod tests {
             decide(&object("e1"), Some(&row), Some(version), true),
             Decision::Skip
         );
-        // An attempt that never wrote its version retries the same id.
+        // A purged version is imported again.
         assert_eq!(
             decide(&object("e1"), Some(&row), None, false),
-            Decision::Import(version)
+            Decision::Import
         );
         assert_eq!(
             decide(&object("e1"), Some(&row), None, true),
@@ -684,10 +682,8 @@ mod tests {
         let row = row(version, "e1");
         let changed = object("e2");
         let fresh = decide(&changed, Some(&row), Some(version), true);
-        assert!(matches!(fresh, Decision::Import(id) if id != version));
-        assert!(
-            matches!(decide(&changed, Some(&row), None, true), Decision::Import(id) if id != version)
-        );
+        assert_eq!(fresh, Decision::Import);
+        assert_eq!(decide(&changed, Some(&row), None, true), Decision::Import);
         // A later write or delete marker in Aruna keeps the key as Aruna has it.
         let newer = Some(Ulid::generate());
         assert_eq!(decide(&changed, Some(&row), newer, true), Decision::Skip);

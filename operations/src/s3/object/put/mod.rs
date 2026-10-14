@@ -117,6 +117,8 @@ pub enum PutObjectState {
     ClaimPlain,
     SetAside,
     WritePlainRecords,
+    /// Reads the import rule that the version's import rows belong to.
+    ReadImportRule,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -173,6 +175,10 @@ pub enum PutObjectError {
     PlainBusy,
     #[error("{0}")]
     PlainAside(String),
+    #[error("the object key changed since it was read")]
+    HeadChanged,
+    #[error("the import rule was removed")]
+    ImportRemoved,
 }
 
 #[derive(Debug, PartialEq)]
@@ -270,6 +276,11 @@ pub struct PutObjectOperation {
     plain: Option<plain::PlainWrite>,
     /// Released with the operation; it names the path's claim and the plain location.
     plain_claim: Option<Ulid>,
+    /// The head the caller saw, `None` for no head; another head refuses the write.
+    expected_head: Option<Option<Ulid>>,
+    import_rows: Option<plain::ImportRows>,
+    /// Whether the import rule exists, read in the current version transaction.
+    rule_exists: Option<bool>,
 }
 
 impl PutObjectOperation {
@@ -316,6 +327,9 @@ impl PutObjectOperation {
             envelope_bytes: 0,
             plain: None,
             plain_claim: None,
+            expected_head: None,
+            import_rows: None,
+            rule_exists: None,
         }
     }
 
@@ -346,6 +360,12 @@ impl PutObjectOperation {
 
     pub fn create_only(mut self) -> Self {
         self.create_only = true;
+        self
+    }
+
+    /// Refuses the write with `HeadChanged` unless the key's head is still `head`.
+    pub fn with_expected_head(mut self, head: Option<Ulid>) -> Self {
+        self.expected_head = Some(head);
         self
     }
 
@@ -1034,6 +1054,11 @@ impl PutObjectOperation {
             Ok(existing) => existing,
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
+        if let Some(expected) = self.expected_head
+            && existing.as_ref().map(|pointer| pointer.version_id) != expected
+        {
+            return self.emit_error(PutObjectError::HeadChanged);
+        }
         self.existing_pointer = existing;
         let existing_pointer = self.existing_pointer.clone();
         if let Some(pointer) = existing_pointer.as_ref() {
@@ -1513,6 +1538,7 @@ impl PutObjectOperation {
         self.usage_update = None;
         self.quota_gate = None;
         self.output = None;
+        self.rule_exists = None;
         self.state = PutObjectState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -1782,6 +1808,7 @@ impl Operation for PutObjectOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
                 _ => self.emit_error(PutObjectError::InvalidOperationState),
             },
+            PutObjectState::ReadImportRule => self.import_rule_read(event),
             PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
             PutObjectState::WriteCleanupRow => self.handle_cleanup_row(event),
