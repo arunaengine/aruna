@@ -53,6 +53,7 @@ use aruna_core::structs::storage::multipart::{
     MultipartObjectSummary, MultipartPart, MultipartPartKey, MultipartUpload,
     MultipartUploadStatus, WorkingShare,
 };
+use aruna_core::structs::storage::routing::{PlainTarget, RoutingSnapshot};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -69,6 +70,9 @@ const PART_PAGE: usize = 256;
 #[derive(Debug, Eq, PartialEq)]
 pub enum CompleteUploadState {
     Init,
+    /// Claims the path of a same-name object, then moves the bytes it replaces aside.
+    ClaimPlain,
+    SetAside,
     StartMarkTransaction,
     CheckPurgeMark,
     ReadUploadMark,
@@ -180,6 +184,10 @@ pub enum CompleteUploadError {
     NotFinished,
     #[error(transparent)]
     BucketKey(#[from] BucketKeyError),
+    #[error("another write to this file is in progress")]
+    PlainBusy,
+    #[error("{0}")]
+    PlainAside(String),
 }
 
 impl From<UploadTargetError> for CompleteUploadError {
@@ -289,6 +297,10 @@ pub struct CompleteUploadOperation {
     reclaim_pending: bool,
     /// A refused publication rechecks its pending envelope in the reset.
     recheck_pending: bool,
+    routing: Option<RoutingSnapshot>,
+    plain: Option<PlainTarget>,
+    /// Released with the completion; it names the path's claim and the plain location.
+    plain_claim: Option<Ulid>,
 }
 
 impl CompleteUploadOperation {
@@ -333,6 +345,9 @@ impl CompleteUploadOperation {
             envelope_bytes: 0,
             reclaim_pending: false,
             recheck_pending: false,
+            routing: None,
+            plain: None,
+            plain_claim: None,
         }
     }
 
@@ -369,7 +384,11 @@ impl CompleteUploadOperation {
     fn emit_error(&mut self, error: CompleteUploadError) -> Effects {
         self.state = CompleteUploadState::Error;
         self.output = Some(Err(error));
-        self.abort()
+        let mut effects = self.abort();
+        if let Some(id) = self.plain_claim.take() {
+            effects.push(Effect::Blob(BlobEffect::ReleaseReservation { id }));
+        }
+        effects
     }
 
     fn schedule_error(&mut self, error: CompleteUploadError) -> Effects {
@@ -1015,6 +1034,12 @@ impl CompleteUploadOperation {
                 share,
             })];
         }
+        if let Some(effects) = self.plain_compose() {
+            return effects;
+        }
+        let Some(upload) = self.upload_record.as_ref() else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
         if let Some(backend_upload) = upload.backend_upload.clone() {
             self.state = CompleteUploadState::ComposeBlob;
             return smallvec![Effect::Blob(BlobEffect::CompleteUpload {
@@ -1043,6 +1068,7 @@ impl CompleteUploadOperation {
             resolved: pinned,
             created_by: self.input.created_by,
             parts,
+            plain: None,
         })]
     }
 
@@ -1758,7 +1784,10 @@ impl CompleteUploadOperation {
             });
         }
 
-        let mut writes = Vec::with_capacity(works.len());
+        let mut writes = match self.plain_records() {
+            Ok(writes) => writes,
+            Err(err) => return self.schedule_error(err.into()),
+        };
         for work in works {
             let key = match &work {
                 BlobCleanupWork::ReconcileWrite { location, .. } => {
@@ -2208,6 +2237,8 @@ impl Operation for CompleteUploadOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             CompleteUploadState::Init => self.handle_init(),
+            CompleteUploadState::ClaimPlain => self.plain_claimed(event),
+            CompleteUploadState::SetAside => self.plain_set_aside(event),
             CompleteUploadState::StartMarkTransaction => self.mark_started(event),
             CompleteUploadState::CheckPurgeMark => self.mark_fence_checked(event),
             CompleteUploadState::ReadUploadMark => self.mark_upload_read(event),
@@ -2406,6 +2437,9 @@ fn composite_digest(algorithm: ChecksumAlgorithm, bytes: &[u8]) -> Vec<u8> {
         ChecksumAlgorithm::Crc64Nvme => hashes.crc64nvme.to_vec(),
     }
 }
+
+#[path = "complete_plain.rs"]
+mod plain;
 
 #[cfg(test)]
 #[path = "complete_tests.rs"]

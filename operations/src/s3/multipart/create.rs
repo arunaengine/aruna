@@ -225,6 +225,13 @@ impl CreateMultipartOperation {
         let Some(resolved) = self.resolved.clone() else {
             return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
+        // A provider upload ends in Aruna's own layout; completion composes the plain path.
+        let (bucket, key) = (&self.input.bucket, &self.input.key);
+        if let Some(target) = self.input.routing.plain_target(bucket, key, Ulid::nil())
+            && target.backend == resolved.backend
+        {
+            return self.start_transaction();
+        }
         self.state = CreateMultipartState::OpenUpload;
         smallvec![Effect::Blob(BlobEffect::OpenUpload {
             record_id: self.upload_id,
@@ -1076,6 +1083,7 @@ mod pure_tests {
         let snapshot = snapshot().with_group_inputs(GroupRoutingInputs {
             default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
             backend_ids: BTreeSet::from([backend_id]),
+            ..Default::default()
         });
         let mut operation = CreateMultipartOperation::new(input(snapshot));
         operation.start();
@@ -1179,6 +1187,7 @@ mod pure_tests {
         let snapshot = snapshot().with_group_inputs(GroupRoutingInputs {
             default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
             backend_ids: BTreeSet::from([backend_id]),
+            ..Default::default()
         });
         let mut operation = CreateMultipartOperation::new(input(snapshot));
         operation.start();
