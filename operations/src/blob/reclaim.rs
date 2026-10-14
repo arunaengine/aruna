@@ -10,10 +10,12 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    PENDING_LOCATION_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::storage::backend_import::version_key;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion,
     HashIndex, VersionKey,
@@ -707,18 +709,23 @@ impl ReclaimBlobOperation {
         self.output = Some(Ok(ReclaimVerdict::Freed {
             bytes: location.stored_size(),
         }));
+        let mut deletes = vec![
+            (
+                BLOB_LOCATIONS_KEYSPACE.to_string(),
+                self.location_key().to_bytes().into(),
+            ),
+            (
+                BLOB_RECLAIM_KEYSPACE.to_string(),
+                self.key.to_bytes().into(),
+            ),
+        ];
+        if location.is_external() {
+            let key = version_key(location.ulid);
+            deletes.push((BACKEND_VERSION_KEYSPACE.to_string(), key));
+        }
         self.state = ReclaimState::DeleteRows;
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: vec![
-                (
-                    BLOB_LOCATIONS_KEYSPACE.to_string(),
-                    self.location_key().to_bytes().into()
-                ),
-                (
-                    BLOB_RECLAIM_KEYSPACE.to_string(),
-                    self.key.to_bytes().into()
-                ),
-            ],
+            deletes,
             txn_id: self.txn_id,
         })]
     }
@@ -738,6 +745,10 @@ impl ReclaimBlobOperation {
         else {
             return self.commit();
         };
+        // Bytes Aruna found on a tenant backend are never deleted; only the row goes.
+        if location.is_external() {
+            return self.debit_usage();
+        }
         let work = match (BlobCleanupWork::DeleteBlob { location }).to_bytes() {
             Ok(work) => work,
             Err(error) => return self.fail(error.into()),
@@ -759,6 +770,10 @@ impl ReclaimBlobOperation {
                 event,
             );
         };
+        self.debit_usage()
+    }
+
+    fn debit_usage(&mut self) -> Effects {
         let (Some(txn_id), Some(location)) = (self.txn_id, self.location.as_ref()) else {
             return self.fail(ReclaimBlobError::Failed);
         };
@@ -1807,5 +1822,93 @@ mod tests {
             operation.finalize(),
             Err(ReclaimBlobError::InvalidStateEvent { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn keeps_external_bytes() {
+        let dir = tempdir().unwrap();
+        let context = context(dir.path().to_str().unwrap());
+        let backend_id = Ulid::from_bytes([7u8; 16]);
+        let backend = BackendRef::Group(backend_id);
+        let record = GroupStorage {
+            backend_id,
+            group_id: Ulid::from_bytes([8u8; 16]),
+            name: "tenant".to_string(),
+            kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
+            public_config: HashMap::new(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            disabled: false,
+            cleanup: CleanupStrategy::Reclaim {
+                after: Duration::from_secs(60),
+            },
+        };
+        write(
+            &context,
+            STORAGE_BACKEND_KEYSPACE,
+            backend_id.to_bytes().to_vec(),
+            record.to_bytes().unwrap(),
+        )
+        .await;
+        let imported = BackendLocation {
+            backend: backend.clone(),
+            storage_bucket: String::new(),
+            backend_path: "raw/a.csv".to_string(),
+            ..location(10)
+        };
+        let location_key = BlobLocationKey::new(HASH, EncodingClass::Raw, backend.clone());
+        write(
+            &context,
+            BLOB_LOCATIONS_KEYSPACE,
+            location_key.to_bytes(),
+            imported.to_bytes().unwrap(),
+        )
+        .await;
+        let backend_version = version_key(imported.ulid).to_vec();
+        write(
+            &context,
+            BACKEND_VERSION_KEYSPACE,
+            backend_version.clone(),
+            b"v1".to_vec(),
+        )
+        .await;
+        let candidate = ReclaimCandidateKey::new(backend, EncodingClass::Raw, HASH);
+        let queued = ReclaimCandidate {
+            enqueued_at: SystemTime::UNIX_EPOCH,
+        };
+        write(
+            &context,
+            BLOB_RECLAIM_KEYSPACE,
+            candidate.to_bytes(),
+            queued.to_bytes().unwrap(),
+        )
+        .await;
+
+        assert_eq!(
+            drive(reclaim_op(candidate), &context).await.unwrap(),
+            ReclaimVerdict::Freed { bytes: 10 }
+        );
+        assert!(
+            read(&context, BLOB_LOCATIONS_KEYSPACE, location_key.to_bytes())
+                .await
+                .is_none()
+        );
+        let version = read(&context, BACKEND_VERSION_KEYSPACE, backend_version).await;
+        assert!(version.is_none());
+        let (cleanups, _) = iter_prefix_page(
+            &context.storage_handle,
+            BLOB_CLEANUP_KEYSPACE,
+            None,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cleanups.is_empty(),
+            "no delete is queued for imported bytes"
+        );
     }
 }

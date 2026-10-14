@@ -7,8 +7,11 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_ROUTING_KEYSPACE};
+use aruna_core::keyspaces::{
+    BACKEND_IMPORT_KEYSPACE, BACKEND_INDEX_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+};
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, GroupStorageRouting, RoutingError, RoutingTarget, validate_tenant_target,
@@ -31,6 +34,7 @@ enum LoadInputsState {
     Init,
     ReadDefault,
     ScanBackends,
+    ScanImports,
     Finish,
     Error,
 }
@@ -75,6 +79,17 @@ impl GroupInputsOperation {
         })]
     }
 
+    fn scan_imports(&mut self, start_after: Option<Key>) -> Effects {
+        self.state = LoadInputsState::ScanImports;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            prefix: Some(self.group_id.to_bytes().to_vec().into()),
+            start: start_after.map(IterStart::After),
+            limit: BACKEND_PAGE_SIZE,
+            txn_id: None,
+        })]
+    }
+
     fn fail(&mut self, error: GroupInputsError) -> Effects {
         self.state = LoadInputsState::Error;
         self.output = Some(Err(error));
@@ -109,14 +124,34 @@ impl Operation for GroupInputsOperation {
             }
             LoadInputsState::ScanBackends => match parse_iter(event, GroupStorage::from_bytes) {
                 Ok((records, next_start_after)) => {
-                    self.inputs.backend_ids.extend(
-                        records
-                            .into_iter()
-                            .filter(|record| record.group_id == self.group_id && !record.disabled)
-                            .map(|record| record.backend_id),
-                    );
+                    for record in records {
+                        if record.group_id != self.group_id || record.disabled {
+                            continue;
+                        }
+                        if let Some(container) = record.container() {
+                            let container = container.to_string();
+                            self.inputs.containers.insert(record.backend_id, container);
+                        }
+                        self.inputs.backend_ids.insert(record.backend_id);
+                    }
                     if let Some(start_after) = next_start_after {
                         return self.scan_backends(Some(start_after));
+                    }
+                    self.scan_imports(None)
+                }
+                Err(error) => self.fail(error.into()),
+            },
+            // A rule whose write backend is disabled or gone keeps Aruna's own layout.
+            LoadInputsState::ScanImports => match parse_iter(event, BackendImport::from_bytes) {
+                Ok((rules, next_start_after)) => {
+                    let backends = &self.inputs.backend_ids;
+                    let usable = rules
+                        .into_iter()
+                        .filter(|rule| backends.contains(&rule.write_backend()))
+                        .collect::<Vec<_>>();
+                    self.inputs.imports.extend(usable);
+                    if let Some(start_after) = next_start_after {
+                        return self.scan_imports(Some(start_after));
                     }
                     self.state = LoadInputsState::Finish;
                     self.output = Some(Ok(std::mem::take(&mut self.inputs)));
@@ -434,8 +469,11 @@ mod pure_tests {
     use crate::groups::backends::{index_key, index_prefix};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-    use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_ROUTING_KEYSPACE};
+    use aruna_core::keyspaces::{
+        BACKEND_IMPORT_KEYSPACE, BACKEND_INDEX_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+    };
     use aruna_core::operation::Operation;
+    use aruna_core::structs::storage::backend_import::BackendImport;
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::structs::storage::routing::{
@@ -457,6 +495,7 @@ mod pure_tests {
             result: Ok(GroupRoutingInputs {
                 default_target: None,
                 backend_ids: owned,
+                ..Default::default()
             }),
         }))
     }
@@ -621,7 +660,7 @@ mod pure_tests {
 
         let mut leaving = backend(disabled, group());
         leaving.disabled = true;
-        operation.step(Event::Storage(StorageEvent::IterResult {
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
             values: vec![
                 (
                     index_key(group(), mine),
@@ -634,14 +673,46 @@ mod pure_tests {
             ],
             next_start_after: None,
         }));
+        let [Effect::Storage(StorageEffect::Iter { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the import scan, got {effects:?}")
+        };
+        assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
 
+        // A rule that writes to a disabled backend keeps Aruna's own layout.
+        let rule = |import: u8, backend_id| BackendImport {
+            import_id: Ulid::from_bytes([import; 16]),
+            group_id: group(),
+            backend_id,
+            backend_prefix: String::new(),
+            bucket: "b".to_string(),
+            key_prefix: String::new(),
+            schedule: None,
+            created_by: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: "{dir}{id}_{name}".to_string(),
+        };
+        let (kept, dropped) = (rule(8, mine), rule(9, disabled));
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: [&kept, &dropped]
+                .into_iter()
+                .map(|rule| (rule.key(), rule.to_bytes().unwrap().into()))
+                .collect(),
+            next_start_after: None,
+        }));
+
+        let inputs = operation.finalize().unwrap();
         assert_eq!(
-            operation.finalize().unwrap(),
-            GroupRoutingInputs {
-                default_target: Some(RoutingTarget::Class("cold".to_string())),
-                backend_ids: BTreeSet::from([mine]),
-            }
+            inputs.default_target,
+            Some(RoutingTarget::Class("cold".to_string()))
         );
+        assert_eq!(inputs.backend_ids, BTreeSet::from([mine]));
+        assert_eq!(inputs.imports, vec![kept]);
+        assert!(!inputs.containers.contains_key(&disabled));
     }
 
     #[test]

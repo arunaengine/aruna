@@ -615,6 +615,8 @@ pub enum JobPayload {
     CopyObject(CopyJobSpec),
     /// Adds repository identifiers to a document's PID mapping. Internal and idempotent.
     RegisterIdentifiers(crate::structs::secondary_id::RegisterIdentifiersSpec),
+    /// One run of a backend import rule. Safe to requeue: registered objects are skipped.
+    BackendImport(crate::structs::storage::backend_import::BackendImportSpec),
 }
 
 impl ExecutionSpec {
@@ -641,6 +643,7 @@ impl JobPayload {
             Self::Harvest(spec) => Some(spec.group_id),
             Self::StoragePurge(spec) => Some(spec.group_id),
             Self::CopyObject(spec) => Some(spec.group_id),
+            Self::BackendImport(spec) => Some(spec.group_id),
             Self::Probe { .. }
             | Self::WriteRunCrate { .. }
             | Self::TerminalCleanup { .. }
@@ -665,6 +668,7 @@ impl JobPayload {
             JobPayload::StoragePurge(_) => "storage_purge",
             JobPayload::CopyObject(_) => "copy_object",
             JobPayload::RegisterIdentifiers(_) => "register_identifiers",
+            JobPayload::BackendImport(_) => "backend_import",
         }
     }
 
@@ -675,7 +679,8 @@ impl JobPayload {
             JobPayload::Execution(_) => "phases",
             JobPayload::Staging(_)
             | JobPayload::ImportRoCrate(_)
-            | JobPayload::ExportRoCrate(_) => "items",
+            | JobPayload::ExportRoCrate(_)
+            | JobPayload::BackendImport(_) => "items",
             JobPayload::Harvest(_) => "records",
             JobPayload::StoragePurge(_) => "entries",
             JobPayload::CopyObject(_) => "bytes",
@@ -700,7 +705,8 @@ impl JobPayload {
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. }
             | JobPayload::CopyObject(_)
-            | JobPayload::RegisterIdentifiers(_) => JobExecutionClass::InProcess,
+            | JobPayload::RegisterIdentifiers(_)
+            | JobPayload::BackendImport(_) => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
         }
     }

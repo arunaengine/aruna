@@ -4,9 +4,11 @@
 
 use crate::UserId;
 use crate::errors::ConversionError;
+use crate::structs::storage::backend_import::BackendImport;
 use crate::structs::storage::blob::{BackendRef, ResolvedBackend};
 use crate::structs::storage::cleanup::CleanupStrategy;
 use crate::structs::storage::format::Compression;
+use crate::structs::storage::group_backend::reserved_path;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -102,6 +104,22 @@ impl GroupStorageRouting {
 pub struct GroupRoutingInputs {
     pub default_target: Option<RoutingTarget>,
     pub backend_ids: BTreeSet<Ulid>,
+    /// The group's backend import rules on this node.
+    pub imports: Vec<BackendImport>,
+    /// The tenant container of each enabled group backend, by backend id.
+    pub containers: BTreeMap<Ulid, String>,
+}
+
+/// Where a write under a backend import rule is stored instead of Aruna's own layout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlainTarget {
+    pub import_id: Ulid,
+    pub backend: BackendRef,
+    pub path: String,
+    /// The rule's pattern has no `{id}`, so the write replaces the file at `path`.
+    pub same_name: bool,
+    /// `path` lies in the folder the rule imports from, so its importer must skip it.
+    pub listed: bool,
 }
 
 /// Operator-authored all-groups rule from the node's backends file. An unset
@@ -393,6 +411,8 @@ pub struct RoutingSnapshot {
     pub bucket_rules: Vec<StorageRoutingRule>,
     /// The bucket's compression, stamped on every backend this snapshot resolves.
     pub compression: Compression,
+    pub imports: Vec<BackendImport>,
+    pub containers: BTreeMap<Ulid, String>,
 }
 
 impl RoutingSnapshot {
@@ -404,6 +424,8 @@ impl RoutingSnapshot {
             group_default: None,
             bucket_rules: Vec::new(),
             compression: Compression::Off,
+            imports: Vec::new(),
+            containers: BTreeMap::new(),
         }
     }
 
@@ -437,7 +459,40 @@ impl RoutingSnapshot {
     pub fn with_group_inputs(mut self, inputs: GroupRoutingInputs) -> Self {
         self.group_default = inputs.default_target;
         self.catalog = self.catalog.with_group_backends(inputs.backend_ids);
+        self.imports = inputs.imports;
+        self.containers = inputs.containers;
         self
+    }
+
+    /// The backend path a write of `key` as version `id` takes under an import rule. A
+    /// compressing bucket keeps Aruna's own layout, as does a key without a file name.
+    pub fn plain_target(&self, bucket: &str, key: &str, id: Ulid) -> Option<PlainTarget> {
+        let rule = self
+            .imports
+            .iter()
+            .filter(|rule| rule.bucket == bucket && key.starts_with(&rule.key_prefix))
+            .max_by_key(|rule| rule.key_prefix.len())?;
+        if self.compression != Compression::Off {
+            tracing::warn!(
+                import_id = %rule.import_id,
+                bucket,
+                "Compressing bucket keeps Aruna's layout for an import folder"
+            );
+            return None;
+        }
+        let path = rule.plain_path(key, id)?;
+        let backend = rule.write_backend();
+        let container = self.containers.get(&backend).map(String::as_str);
+        if reserved_path(container, &path) {
+            return None;
+        }
+        Some(PlainTarget {
+            import_id: rule.import_id,
+            backend: BackendRef::Group(backend),
+            same_name: rule.same_name(),
+            listed: backend == rule.backend_id && path.starts_with(&rule.backend_prefix),
+            path,
+        })
     }
 }
 
@@ -1146,5 +1201,51 @@ mod tests {
             BackendRef::Node(id.to_string()).key_bytes(),
             BackendRef::Group(id).key_bytes()
         );
+    }
+
+    #[test]
+    fn finds_plain_targets() {
+        use crate::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
+        use crate::structs::storage::format::Compression;
+        let (source, target) = (Ulid::from_bytes([2u8; 16]), Ulid::from_bytes([3u8; 16]));
+        let rule = BackendImport {
+            import_id: Ulid::nil(),
+            group_id: Ulid::nil(),
+            backend_id: source,
+            backend_prefix: "raw/".to_string(),
+            bucket: "b".to_string(),
+            key_prefix: "in/".to_string(),
+            schedule: None,
+            created_by: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: DEFAULT_PATTERN.to_string(),
+        };
+        let id = Ulid::from_parts(1, 1);
+        let mut snapshot = snapshot();
+        snapshot.imports = vec![rule.clone()];
+        let found = snapshot.plain_target("b", "in/a.csv", id).unwrap();
+        assert_eq!(found.path, format!("raw/{id}_a.csv"));
+        assert_eq!(found.backend, BackendRef::Group(source));
+        assert!(found.listed && !found.same_name);
+        assert_eq!(snapshot.plain_target("b", "out/a.csv", id), None);
+        assert_eq!(snapshot.plain_target("other", "in/a.csv", id), None);
+
+        let mut moved = rule;
+        moved.write_backend_id = Some(target);
+        moved.write_prefix = Some("data/".to_string());
+        snapshot.imports = vec![moved];
+        assert!(!snapshot.plain_target("b", "in/a.csv", id).unwrap().listed);
+        // The write folder may not reach into Aruna's own container on the backend.
+        snapshot.containers.insert(target, "data".to_string());
+        assert_eq!(snapshot.plain_target("b", "in/a.csv", id), None);
+
+        snapshot.containers.clear();
+        let compressed = snapshot.with_compression(Compression::Zstd { level: 3 });
+        assert_eq!(compressed.plain_target("b", "in/a.csv", id), None);
     }
 }

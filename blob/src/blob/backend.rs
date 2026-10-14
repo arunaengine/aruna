@@ -677,6 +677,10 @@ impl BlobHandler {
     }
 
     pub(super) fn stats_managed(&self, backend: &BackendRef, bucket: &str) -> bool {
+        // A path of a tenant's own folders belongs to no Aruna bucket.
+        if bucket.is_empty() && matches!(backend, BackendRef::Group(_)) {
+            return false;
+        }
         self.registry
             .config_for(backend)
             .ok()

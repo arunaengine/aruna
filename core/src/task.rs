@@ -82,6 +82,8 @@ pub enum TaskKey {
     },
     /// Registers the realm with its registry, or withdraws it, on the reporting node.
     PublishRegistration,
+    /// Starts the backend imports whose schedule is due; re-armed to the next due time.
+    RunBackendImports,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

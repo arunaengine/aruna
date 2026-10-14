@@ -919,6 +919,24 @@ impl OperationsTaskHandler {
             TaskKey::PublishRegistration => Box::pin(async move {
                 self.publish_registration().await;
             }),
+            TaskKey::RunBackendImports => Box::pin(async move {
+                let Some(net_handle) = self.context.net_handle.as_ref() else {
+                    warn!("Cannot start backend imports without net handle");
+                    return;
+                };
+                let retention_ms = self.rocrate_limits.artifact_retention_ms;
+                let now = unix_timestamp_millis();
+                let run = crate::groups::imports::schedule::run_due(
+                    &self.context,
+                    net_handle.node_id(),
+                    retention_ms,
+                    now,
+                );
+                if let Some(after) = run.await {
+                    self.reschedule_timer(TaskKey::RunBackendImports, after)
+                        .await;
+                }
+            }),
             TaskKey::DrainFamilyOutbox => Box::pin(async move {
                 self.drain_family_outbox().await;
             }),

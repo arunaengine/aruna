@@ -66,6 +66,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(staging::router())
         .merge(storage::deletion::router())
         .merge(storage::group_backends::router())
+        .merge(storage::imports::router())
         .merge(storage::routing::router())
         .merge(sync::router())
         .merge(sync::quarantine::router())
@@ -209,6 +210,10 @@ pub(crate) mod tests {
             "DELETE",
             "/data/groups/{group_id}/storage/backends/{backend_id}",
         ),
+        (
+            "DELETE",
+            "/data/groups/{group_id}/storage/imports/{import_id}",
+        ),
         ("DELETE", "/access/groups/{id}"),
         ("DELETE", "/access/groups/{id}/members/{user_id}"),
         ("DELETE", "/access/groups/{id}/roles/{role_id}"),
@@ -315,6 +320,8 @@ pub(crate) mod tests {
             "/data/groups/{group_id}/storage/backends/{backend_id}/reclaim/status",
         ),
         ("GET", "/data/groups/{group_id}/storage/routing"),
+        ("GET", "/data/groups/{group_id}/storage/imports"),
+        ("GET", "/data/groups/{group_id}/storage/imports/{import_id}"),
         ("GET", "/access/groups/{id}"),
         ("GET", "/access/groups/{id}/data/paths"),
         ("GET", "/access/groups/{id}/service-accounts"),
@@ -420,6 +427,11 @@ pub(crate) mod tests {
         (
             "POST",
             "/data/groups/{group_id}/storage/backends/{backend_id}/enable",
+        ),
+        ("POST", "/data/groups/{group_id}/storage/imports"),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/run",
         ),
         ("POST", "/access/groups/{id}/leave"),
         ("POST", "/access/groups/{id}/members"),
@@ -539,6 +551,7 @@ pub(crate) mod tests {
             "/data/groups/{group_id}/storage/backends/{backend_id}",
         ),
         ("PUT", "/data/groups/{group_id}/storage/routing"),
+        ("PUT", "/data/groups/{group_id}/storage/imports/{import_id}"),
         ("PUT", "/system/realm/federation"),
         ("PUT", "/system/realm/quota"),
         ("PUT", "/metadata/{document_id}/rocrate"),

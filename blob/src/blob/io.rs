@@ -53,6 +53,8 @@ struct WriteLimits {
     deadline: Option<StdInstant>,
     /// Writer chunk that keeps a large object within its provider's part limit.
     chunk: Option<usize>,
+    /// Fails the write with `PathTaken` when a file is already at the path.
+    if_not_exists: bool,
 }
 
 /// Turns original bytes into stored bytes: zstd frames, or one Pithos archive of a bucket key.
@@ -141,13 +143,52 @@ async fn open_writer(
     operator: &Operator,
     path: &str,
     backend: &BackendRef,
-    chunk: Option<usize>,
+    (chunk, if_not_exists): (Option<usize>, bool),
 ) -> Result<opendal::Writer, opendal::Error> {
+    let writer = |chunk| {
+        operator
+            .writer_with(path)
+            .chunk(chunk)
+            .if_not_exists(if_not_exists)
+    };
     match (backend, chunk) {
-        (_, Some(chunk)) => operator.writer_with(path).chunk(chunk).await,
-        (BackendRef::Group(_), None) => operator.writer_with(path).chunk(GROUP_WRITE_CHUNK).await,
-        (BackendRef::Node(_), None) => operator.writer(path).await,
+        (_, Some(chunk)) => writer(chunk).await,
+        (BackendRef::Group(_), None) => writer(GROUP_WRITE_CHUNK).await,
+        (BackendRef::Node(_), None) => {
+            let writer = operator.writer_with(path);
+            writer.if_not_exists(if_not_exists).await
+        }
     }
+}
+
+/// A version id only counts when the backend can read it back; S3 names a suspended one `null`.
+/// GCS generation ids exist without bucket versioning, so they never count.
+pub(super) fn backend_version(operator: &Operator, metadata: &opendal::Metadata) -> Option<String> {
+    if !operator.info().capability().read_with_version {
+        return None;
+    }
+    metadata
+        .version()
+        .filter(|version| *version != "null")
+        .map(str::to_string)
+}
+
+/// Opens `path` at `version` when one is given, else at its newest bytes.
+pub(super) fn reader_at<'a>(
+    operator: &'a Operator,
+    path: &'a str,
+    version: Option<&'a str>,
+) -> impl Future<Output = Result<opendal::Reader, opendal::Error>> + 'a {
+    let reader = operator.reader_with(path);
+    match version.filter(|_| operator.info().capability().read_with_version) {
+        Some(version) => reader.version(version),
+        None => reader,
+    }
+    .into_future()
+}
+
+fn taken(error: &opendal::Error) -> bool {
+    error.kind() == opendal::ErrorKind::ConditionNotMatch
 }
 
 /// Writer chunk for a composition. `None` keeps each input part as one S3 part; other kinds
@@ -263,6 +304,16 @@ impl HiddenReservation {
 
     fn mark_settled(&mut self) {
         self.abandoned = false;
+    }
+
+    /// The backend refused a conditional write; the file at the path is not ours to delete.
+    async fn path_taken(&mut self) -> BlobEvent {
+        let (abandoned, limit) = (self.abandoned, self.handler.io_timeout());
+        if let Some(writer) = self.writer.as_mut().filter(|_| !abandoned) {
+            let _ = abort_partial_writer(writer, limit).await;
+        }
+        self.writer = None;
+        BlobEvent::Error(BlobError::PathTaken)
     }
 
     /// Boxed, so each failure exit of a write keeps only a pointer in the caller's stack frame.
@@ -420,6 +471,21 @@ impl BlobHandler {
         Box::pin(self.write_stream_limit(location, operator, blob, limits, None, None)).await
     }
 
+    /// Raw bytes to a tenant path; `if_not_exists` fails the write with `PathTaken`.
+    pub(super) async fn write_tenant(
+        &self,
+        location: BackendLocation,
+        operator: Operator,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+        if_not_exists: bool,
+    ) -> BlobEvent {
+        let limits = WriteLimits {
+            if_not_exists,
+            ..WriteLimits::default()
+        };
+        Box::pin(self.write_stream_limit(location, operator, blob, limits, None, None)).await
+    }
+
     /// Writes the original bytes as frames compressed with `compression`, or as one Pithos
     /// archive when `seal` names a bucket key.
     pub(super) async fn write_encoded(
@@ -497,6 +563,7 @@ impl BlobHandler {
         }
         match write {
             Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) if taken(&err) => Err(reservation.path_taken().await),
             Ok(Err(err)) => Err(reservation
                 .fail(BlobError::WriteError(err.to_string()))
                 .await),
@@ -521,6 +588,7 @@ impl BlobHandler {
             max_bytes,
             deadline,
             chunk,
+            if_not_exists,
         } = limits;
         let mut plain = HiddenReservation::new(self.clone());
         let reservation = reservation.unwrap_or(&mut plain);
@@ -534,19 +602,30 @@ impl BlobHandler {
             Some(deadline) => {
                 with_deadline(
                     Some(deadline),
-                    open_writer(&operator, &storage_path, &location.backend, chunk),
+                    open_writer(
+                        &operator,
+                        &storage_path,
+                        &location.backend,
+                        (chunk, if_not_exists),
+                    ),
                 )
                 .await
             }
             None => timeout(
                 self.io_timeout(),
-                open_writer(&operator, &storage_path, &location.backend, chunk),
+                open_writer(
+                    &operator,
+                    &storage_path,
+                    &location.backend,
+                    (chunk, if_not_exists),
+                ),
             )
             .await
             .map_err(|_| ()),
         };
         match open {
             Ok(Ok(writer)) => reservation.set_writer(writer),
+            Ok(Err(error)) if taken(&error) => return reservation.path_taken().await,
             Ok(Err(_)) => {
                 return reservation
                     .fail(BlobError::OperatorCreationFailed(
@@ -666,8 +745,9 @@ impl BlobHandler {
         if close.is_ok() {
             reservation.mark_settled();
         }
-        match close {
-            Ok(Ok(_)) => {}
+        let version = match close {
+            Ok(Ok(metadata)) => backend_version(&operator, &metadata),
+            Ok(Err(err)) if taken(&err) => return reservation.path_taken().await,
             Ok(Err(err)) => {
                 return reservation
                     .fail_close(BlobError::WriteError(err.to_string()))
@@ -681,10 +761,13 @@ impl BlobHandler {
                     ))
                     .await;
             }
-        }
+        };
         reservation.finish();
         location.blob_size = bytes_written;
         location.hashes = hashes;
+        if location.is_external() {
+            return BlobEvent::PlainWritten { location, version };
+        }
         BlobEvent::WriteFinished { location }
     }
 
@@ -765,6 +848,7 @@ impl BlobHandler {
                     max_bytes,
                     deadline,
                     chunk: None,
+                    if_not_exists: false,
                 },
                 None,
                 Some(&mut reservation),
@@ -803,6 +887,13 @@ impl BlobHandler {
         storage_path: Option<&str>,
         location: Option<&BackendLocation>,
     ) -> Result<(), BlobError> {
+        // A tenant path may hold another writer's file, so only the open writer is aborted.
+        if location.is_some_and(BackendLocation::is_external) {
+            if let Some(writer) = writer.filter(|_| !abandoned) {
+                let _ = abort_partial_writer(writer, self.io_timeout()).await;
+            }
+            return Ok(());
+        }
         if let Some(writer) = writer
             && !abandoned
         {
@@ -1329,6 +1420,7 @@ impl BlobHandler {
             parts,
             chunk,
             resolved.compression,
+            false,
         );
         match Box::pin(composed).await {
             BlobEvent::WriteFinished { location } => {
@@ -1359,6 +1451,7 @@ impl BlobHandler {
         parts: Vec<BackendLocation>,
         chunk: Option<usize>,
         compression: Compression,
+        if_not_exists: bool,
     ) -> BlobEvent {
         let mut encoder = match compression {
             Compression::Off => None,
@@ -1376,14 +1469,20 @@ impl BlobHandler {
                     operator
                         .writer_with(&storage_path)
                         .chunk(chunk)
+                        .if_not_exists(if_not_exists)
                         .into_future(),
                 )
                 .await
             }
-            None => timeout(self.io_timeout(), operator.writer(&storage_path)).await,
+            None => {
+                let writer = operator.writer_with(&storage_path);
+                let writer = writer.if_not_exists(if_not_exists).into_future();
+                timeout(self.io_timeout(), writer).await
+            }
         };
         let mut writer = match opened {
             Ok(Ok(writer)) => writer,
+            Ok(Err(error)) if taken(&error) => return BlobEvent::Error(BlobError::PathTaken),
             Ok(Err(error)) => {
                 return BlobEvent::Error(BlobError::OperatorCreationFailed(error.to_string()));
             }
@@ -1397,6 +1496,7 @@ impl BlobHandler {
 
         let mut hasher = Hasher::new();
         let mut ambiguous = false;
+        let mut version = None;
         // A timeout drops the writer future mid-poll, which leaves the writer unusable.
         let mut abandoned = false;
         let compose_result: Result<(u64, Option<FrameLayout>), BlobError> = async {
@@ -1459,17 +1559,21 @@ impl BlobHandler {
                     .await?;
                 layout = Some(framed);
             }
-            timeout(self.transfer_idle_timeout(), writer.close())
+            let metadata = timeout(self.transfer_idle_timeout(), writer.close())
                 .await
                 .map_err(|_| {
                     ambiguous = true;
                     abandoned = true;
                     BlobError::WriteError("compose close idle timeout".to_string())
                 })?
-                .map_err(|err| {
-                    ambiguous = true;
-                    BlobError::WriteError(err.to_string())
+                .map_err(|err| match taken(&err) {
+                    true => BlobError::PathTaken,
+                    false => {
+                        ambiguous = true;
+                        BlobError::WriteError(err.to_string())
+                    }
                 })?;
+            version = backend_version(&operator, &metadata);
             Ok((bytes_written, layout))
         }
         .await;
@@ -1478,6 +1582,13 @@ impl BlobHandler {
         let (bytes_written, layout) = match compose_result {
             Ok(composed) => composed,
             Err(err) => {
+                // A tenant path may hold another writer's file, so it is never deleted.
+                if location.is_external() {
+                    if !abandoned {
+                        let _ = abort_partial_writer(&mut writer, self.io_timeout()).await;
+                    }
+                    return BlobEvent::Error(err);
+                }
                 let cleanup = if abandoned {
                     match self.delete_path(&operator, &storage_path).await {
                         Ok(()) => Box::pin(self.abort_uploads(&location, &storage_path)).await,
@@ -1509,6 +1620,9 @@ impl BlobHandler {
         location.hashes = hasher.to_map();
         if let Some(layout) = layout {
             location.format.layout = StoredLayout::Frames(Box::new(layout));
+        }
+        if location.is_external() {
+            return BlobEvent::PlainWritten { location, version };
         }
         BlobEvent::WriteFinished { location }
     }
@@ -1562,7 +1676,12 @@ impl BlobHandler {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
-        let reader = match timeout(self.io_timeout(), operator.reader(&storage_path)).await {
+        let version = match self.read_version(&location).await {
+            Ok(version) => version,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let opened = reader_at(&operator, &storage_path, version.as_deref());
+        let reader = match timeout(self.io_timeout(), opened).await {
             Ok(Ok(reader)) => {
                 match timeout(self.io_timeout(), reader.into_bytes_stream(..)).await {
                     Ok(Ok(stream)) => stream,
@@ -1644,7 +1763,12 @@ impl BlobHandler {
             Err(e) => return BlobEvent::Error(e),
         };
         let stream_size = range_length(&range, location.blob_size);
-        let reader = match timeout(self.io_timeout(), operator.reader(&storage_path)).await {
+        let version = match self.read_version(&location).await {
+            Ok(version) => version,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let opened = reader_at(&operator, &storage_path, version.as_deref());
+        let reader = match timeout(self.io_timeout(), opened).await {
             Ok(Ok(reader)) => {
                 match timeout(self.io_timeout(), reader.into_bytes_stream(range)).await {
                     Ok(Ok(stream)) => stream,
@@ -2036,6 +2160,10 @@ impl BlobHandler {
             Err(error) => return BlobEvent::Error(error),
         };
         self.clear_active(location.ulid);
+        // A path in the tenant's own folders is never Aruna's to delete.
+        if location.is_external() {
+            return BlobEvent::DeleteFinished;
+        }
         // An in-place part is no object: its provider upload holds the bytes until it settles.
         // Deleting it ends its claim: it was rolled back, or a staged record replaced it.
         if location.partial {
@@ -2120,7 +2248,7 @@ fn hidden_timestamp(path: &str) -> Option<SystemTime> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HIDDEN_LIST_PAGE, next_chunk, take_page};
+    use super::{HIDDEN_LIST_PAGE, backend_version, next_chunk, reader_at, take_page};
     use aruna_core::errors::BlobError;
     use aruna_core::stream::BackendStream;
     use bytes::Bytes;
@@ -2140,6 +2268,27 @@ mod tests {
             task.await.unwrap(),
             Err(BlobError::ReadError(message)) if message == "blob read idle timeout"
         ));
+    }
+
+    #[tokio::test]
+    async fn ignores_unreadable_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let operator =
+            opendal::Operator::from_iter::<opendal::services::Fs>(std::collections::HashMap::from(
+                [("root".to_string(), dir.path().to_str().unwrap().to_string())],
+            ))
+            .unwrap();
+        operator
+            .write("a.txt", Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+
+        let mut builder = opendal::MetadataBuilder::file(4);
+        builder.version("v1");
+        let metadata = builder.build();
+        assert_eq!(backend_version(&operator, &metadata), None);
+        let reader = reader_at(&operator, "a.txt", Some("v1")).await.unwrap();
+        assert_eq!(reader.read(..).await.unwrap().to_vec(), b"data");
     }
 
     #[tokio::test]

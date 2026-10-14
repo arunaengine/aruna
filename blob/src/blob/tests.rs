@@ -2106,7 +2106,14 @@ async fn compose_part_sizes() {
             };
             let (operator, sizes) = failing_close::operator_with_sizes();
             let event = handler
-                .compose_parts(target, operator, parts.clone(), None, Compression::Off)
+                .compose_parts(
+                    target,
+                    operator,
+                    parts.clone(),
+                    None,
+                    Compression::Off,
+                    false,
+                )
                 .await;
             assert!(matches!(
                 event,
@@ -2155,6 +2162,7 @@ async fn compose_streams_chunks() {
             parts,
             Some(chunk),
             Compression::Off,
+            false,
         )
         .await;
 
@@ -2225,6 +2233,7 @@ async fn compose_timeout_deletes() {
             vec![part],
             None,
             Compression::Off,
+            false,
         )
         .await;
 
@@ -2274,7 +2283,14 @@ async fn compose_close_fails() {
 
     let (operator, aborts) = failing_close::operator_with_aborts();
     let event = handler
-        .compose_parts(target.clone(), operator, vec![part], None, Compression::Off)
+        .compose_parts(
+            target.clone(),
+            operator,
+            vec![part],
+            None,
+            Compression::Off,
+            false,
+        )
         .await;
 
     assert!(
@@ -2329,7 +2345,14 @@ async fn compose_cleanup_error() {
     let event = context
         .blob_handle
         .handler
-        .compose_parts(target.clone(), operator, Vec::new(), None, Compression::Off)
+        .compose_parts(
+            target.clone(),
+            operator,
+            Vec::new(),
+            None,
+            Compression::Off,
+            false,
+        )
         .await;
 
     let BlobEvent::Error(BlobError::WriteCleanup { location, .. }) = event else {
@@ -3920,3 +3943,6 @@ mod parts;
 
 #[path = "rewrite_tests.rs"]
 mod rewrite;
+
+#[path = "external_tests.rs"]
+mod external;

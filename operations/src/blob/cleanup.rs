@@ -476,6 +476,10 @@ async fn register_dht(
 }
 
 async fn delete_blob(context: &DriverContext, location: BackendLocation) -> bool {
+    // An imported object is never Aruna's to delete; the row is settled without it.
+    if location.is_external() {
+        return true;
+    }
     let Some(blob_handle) = context.blob_handle.as_ref() else {
         return false;
     };

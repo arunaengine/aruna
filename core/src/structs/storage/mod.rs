@@ -4,6 +4,7 @@
 
 pub mod abe;
 pub mod abe_access;
+pub mod backend_import;
 pub mod backends;
 pub mod blob;
 pub mod cleanup;

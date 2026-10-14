@@ -30,6 +30,7 @@ pub enum JobKind {
     StoragePurge,
     CopyObject,
     RegisterIdentifiers,
+    BackendImport,
 }
 
 impl JobKind {
@@ -47,6 +48,7 @@ impl JobKind {
             Self::StoragePurge => "storage_purge",
             Self::CopyObject => "copy_object",
             Self::RegisterIdentifiers => "register_identifiers",
+            Self::BackendImport => "backend_import",
         }
     }
 
@@ -77,6 +79,7 @@ impl From<&JobPayload> for JobKind {
             JobPayload::StoragePurge(_) => Self::StoragePurge,
             JobPayload::CopyObject(_) => Self::CopyObject,
             JobPayload::RegisterIdentifiers(_) => Self::RegisterIdentifiers,
+            JobPayload::BackendImport(_) => Self::BackendImport,
         }
     }
 }

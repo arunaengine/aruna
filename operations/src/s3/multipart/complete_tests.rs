@@ -1225,7 +1225,7 @@ fn cleanup_covers_omitted() {
     op.upload_parts = vec![requested.clone(), omitted.clone()];
     op.resolved_parts = vec![requested.clone()];
 
-    let effects = op.write_cleanup_records();
+    let effects = op.write_cleanup_records(true);
     let [
         Effect::Storage(StorageEffect::BatchWrite {
             writes,

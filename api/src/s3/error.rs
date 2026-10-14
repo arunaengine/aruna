@@ -190,6 +190,15 @@ fn completion_lease_error() -> S3Error {
     error
 }
 
+/// Another upload created the same new file of a linked folder first; a retry stores this
+/// one next to it.
+fn path_taken_error() -> S3Error {
+    s3_error!(
+        ServiceUnavailable,
+        "Another upload created this file first, retry the request."
+    )
+}
+
 fn incomplete_body_error() -> S3Error {
     s3_error!(
         IncompleteBody,
@@ -337,6 +346,7 @@ impl IntoS3Error for PutObjectError {
             PutObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
             PutObjectError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
             PutObjectError::UsageUpdateError(_) => usage_accounting_error(),
+            PutObjectError::BlobWriteFailed(BlobError::PathTaken) => path_taken_error(),
             err => internal_error(err),
         }
     }

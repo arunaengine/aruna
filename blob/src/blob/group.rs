@@ -9,9 +9,7 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
-use aruna_core::structs::storage::group_backend::{
-    GroupBackendKind, GroupStorage, GroupStorageSecret,
-};
+use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret, PROBE_PREFIX};
 use aruna_core::types::Key;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -21,17 +19,6 @@ use ulid::Ulid;
 /// Uniform tenant write chunk. azblob and azdls declare no minimum, so without
 /// one they emit a block per stream chunk against a 50,000-block ceiling.
 pub(super) const GROUP_WRITE_CHUNK: usize = 8 * 1024 * 1024;
-
-const PROBE_KEY: &str = "_aruna_backend_probe";
-
-/// The tenant's own container is the only one; nothing is ever minted.
-fn container_key(kind: GroupBackendKind) -> &'static str {
-    match kind {
-        GroupBackendKind::S3 | GroupBackendKind::Gcs | GroupBackendKind::B2 => "bucket",
-        GroupBackendKind::Azblob => "container",
-        GroupBackendKind::Azdls => "filesystem",
-    }
-}
 
 /// Synthesizes the registry entry a stored `BackendRef::Group` resolves to.
 /// `multipart_bucket` names the tenant's own container, which also keeps the
@@ -45,7 +32,7 @@ pub(super) fn group_entry(
     service_config.extend(secret.secret_config.clone());
     let root = service_config.remove("root").unwrap_or_default();
     let container = service_config
-        .get(container_key(record.kind))
+        .get(record.kind.container_key())
         .cloned()
         .ok_or_else(|| {
             BlobError::OperatorCreationFailed(format!(
@@ -154,6 +141,10 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         BlobEffect::ServeSealedRead { location, .. } => push(&mut ids, &location.backend),
         BlobEffect::ReserveCompose { .. } => {}
         BlobEffect::ReplicateLeased { location, .. } => push(&mut ids, &location.backend),
+        BlobEffect::ListExternal { backend, .. } => push(&mut ids, backend),
+        BlobEffect::HashExternal { resolved, .. } => push(&mut ids, &resolved.backend),
+        BlobEffect::WritePlain { resolved, .. } => push(&mut ids, &resolved.backend),
+        BlobEffect::StatPlain { backend, .. } => push(&mut ids, backend),
     }
     ids
 }
@@ -358,7 +349,7 @@ impl BlobHandler {
             Err(error) => return BlobEvent::Error(BlobError::OperatorCreationFailed(error)),
         };
 
-        let probe = format!("{PROBE_KEY}/{}", Ulid::generate());
+        let probe = format!("{PROBE_PREFIX}/{}", Ulid::generate());
         if let Err(error) = operator.write(&probe, b"aruna".to_vec()).await {
             return BlobEvent::Error(BlobError::WriteError(error.to_string()));
         }

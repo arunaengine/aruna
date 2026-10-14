@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::BlobHandler;
+use super::io::reader_at;
 use crate::bao_tree::OpenDalReader;
 use crate::codec::{self, FrameIndex};
 use aruna_core::errors::BlobError;
@@ -359,10 +360,15 @@ impl BlobHandler {
         }
         let operator = self.operator_from_location(location)?;
         let path = location.get_storage_path()?;
-        let idle = self.transfer_idle_timeout();
-        OpenDalReader::new(&operator, &path, location.blob_size, idle)
+        let version = self.read_version(location).await?;
+        let failed = |error: opendal::Error| BlobError::OperatorCreationFailed(error.to_string());
+        let reader = reader_at(&operator, &path, version.as_deref())
             .await
-            .map(SliceReader::Raw)
-            .map_err(|error| BlobError::OperatorCreationFailed(error.to_string()))
+            .map_err(failed)?;
+        Ok(SliceReader::Raw(OpenDalReader {
+            stream: reader.into_futures_async_read(..).await.map_err(failed)?,
+            blob_size: location.blob_size,
+            idle_timeout: self.transfer_idle_timeout(),
+        }))
     }
 }

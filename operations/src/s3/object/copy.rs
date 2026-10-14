@@ -322,12 +322,18 @@ async fn copy_inner(
     let metadata = input.metadata.unwrap_or(source.metadata);
     let routing = routing_snapshot(context, input.group_id, &input.dest_bucket).await?;
     // Bytes the destination's backend already holds in the destination's encoding
-    // are adopted, not streamed; another encoding gets its own copy.
+    // are adopted, not streamed; another encoding gets its own copy. A key under a
+    // backend import folder streams, so its file appears at the folder's path.
+    let (bucket, key) = (&input.dest_bucket, &input.dest_key);
+    let plain = routing.plain_target(bucket, key, Ulid::nil()).is_some();
     let adopt = source.location.clone().filter(|location| {
-        resolve_backend(&routing, &input.dest_bucket, &input.dest_key).is_ok_and(|resolved| {
-            resolved.backend == location.backend
-                && EncodingClass::from(resolved.compression) == location.format.encoding()
-        })
+        !plain
+            && resolve_backend(&routing, &input.dest_bucket, &input.dest_key).is_ok_and(
+                |resolved| {
+                    resolved.backend == location.backend
+                        && EncodingClass::from(resolved.compression) == location.format.encoding()
+                },
+            )
     });
     let body = match (adopt.is_some(), progress) {
         (true, _) => None,

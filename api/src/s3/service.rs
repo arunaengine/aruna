@@ -1389,6 +1389,11 @@ impl S3 for ArunaS3Service {
         let gate = gate_context(&self.state, self.realm_id, now_ms())
             .await
             .map_err(gate_context_error)?;
+        let routing = match bucket_info.as_ref() {
+            Some(info) => bucket_snapshot(&self.state, info).await,
+            None => routing_snapshot(&self.state, group_id, &req.input.bucket).await,
+        }
+        .map_err(routing_inputs_error)?;
         let checksum_type = parse_checksum_type(&checksum_request.checksum_type);
         let object_size = req.input.mpu_object_size.map(checked_size).transpose()?;
         let declared = DeclaredChecksum {
@@ -1419,7 +1424,8 @@ impl S3 for ArunaS3Service {
             now_ms: now_ms(),
         })
         .with_rocrate_limits(self.rocrate_limits.clone())
-        .with_restrictions(replication_auth.path_restrictions.clone());
+        .with_restrictions(replication_auth.path_restrictions.clone())
+        .with_routing(routing);
         if let Some(gate) = gate {
             operation = operation.with_gate(gate);
         }

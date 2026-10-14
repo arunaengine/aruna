@@ -38,6 +38,29 @@ impl GroupBackendKind {
     }
 
     pub const ALL: [Self; 5] = [Self::S3, Self::Gcs, Self::Azblob, Self::Azdls, Self::B2];
+
+    /// The config key naming the tenant's own container; nothing is ever minted.
+    pub const fn container_key(self) -> &'static str {
+        match self {
+            Self::S3 | Self::Gcs | Self::B2 => "bucket",
+            Self::Azblob => "container",
+            Self::Azdls => "filesystem",
+        }
+    }
+}
+
+/// Where registration writes and removes its probe object.
+pub const PROBE_PREFIX: &str = "_aruna_backend_probe";
+
+/// Whether `key` lies where Aruna keeps its own objects on a backend with `container`.
+pub fn reserved_path(container: Option<&str>, key: &str) -> bool {
+    [Some(PROBE_PREFIX), container]
+        .into_iter()
+        .flatten()
+        .any(|folder| {
+            key.strip_prefix(folder)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
 }
 
 impl fmt::Display for GroupBackendKind {
@@ -85,6 +108,18 @@ pub struct GroupStorage {
 }
 
 impl GroupStorage {
+    /// Whether `key` lies where Aruna writes its own objects on this backend.
+    pub fn is_reserved(&self, key: &str) -> bool {
+        reserved_path(self.container(), key)
+    }
+
+    /// The tenant's own container, which also holds Aruna's own layout.
+    pub fn container(&self) -> Option<&str> {
+        self.public_config
+            .get(self.kind.container_key())
+            .map(String::as_str)
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
@@ -201,5 +236,25 @@ mod tests {
             assert_eq!(GroupBackendKind::from_str(kind.as_str()).unwrap(), kind);
         }
         assert!(GroupBackendKind::from_str("webdav").is_err());
+    }
+
+    #[test]
+    fn reserves_own_namespace() {
+        let record = GroupStorage {
+            backend_id: Ulid::from_bytes([1u8; 16]),
+            group_id: Ulid::from_bytes([2u8; 16]),
+            name: "tenant-az".to_string(),
+            kind: GroupBackendKind::Azblob,
+            public_config: HashMap::from([("container".to_string(), "data".to_string())]),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: UserId::default(),
+            disabled: false,
+            cleanup: CleanupStrategy::Retain,
+        };
+        assert!(record.is_reserved("data/bucket/key_01"));
+        assert!(record.is_reserved("_aruna_backend_probe/01"));
+        assert!(!record.is_reserved("database/a.csv"));
+        assert!(!record.is_reserved("raw/data/a.csv"));
     }
 }

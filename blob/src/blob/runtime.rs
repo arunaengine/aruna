@@ -118,6 +118,10 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::ServeSealedRead { .. } => (EffectClass::Transfer, "serve_sealed_read"),
         BlobEffect::ReserveCompose { .. } => (EffectClass::Local, "reserve_compose"),
         BlobEffect::ReplicateLeased { .. } => (EffectClass::Transfer, "replicate_leased"),
+        BlobEffect::ListExternal { .. } => (EffectClass::Control, "list_external"),
+        BlobEffect::HashExternal { .. } => (EffectClass::Transfer, "hash_external"),
+        BlobEffect::WritePlain { .. } => (EffectClass::Transfer, "write_plain"),
+        BlobEffect::StatPlain { .. } => (EffectClass::Control, "stat_plain"),
     }
 }
 
@@ -143,6 +147,7 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::WritePiece { .. }
             | BlobEffect::ComposePieces { .. }
             | BlobEffect::ReplicateLeased { .. }
+            | BlobEffect::WritePlain { .. }
     )
 }
 
@@ -714,6 +719,18 @@ impl BlobHandler {
                 resolved,
                 created_by,
                 parts,
+                plain: Some(plain),
+            } => {
+                let _ = (bucket, key);
+                Box::pin(self.compose_plain(resolved, plain, created_by, parts)).await
+            }
+            BlobEffect::Compose {
+                bucket,
+                key,
+                resolved,
+                created_by,
+                parts,
+                plain: None,
             } => Box::pin(self.compose_blob(&bucket, &key, resolved, created_by, parts)).await,
             BlobEffect::OpenUpload {
                 record_id,
@@ -852,6 +869,29 @@ impl BlobHandler {
                 Box::pin(composed).await
             }
             BlobEffect::ReserveCompose { content } => self.reserve_compose(content).await,
+            BlobEffect::ListExternal {
+                backend,
+                prefix,
+                start_after,
+                limit,
+            } => {
+                let list = self.list_external(&backend, &prefix, start_after, limit);
+                Box::pin(list).await
+            }
+            BlobEffect::HashExternal {
+                resolved,
+                path,
+                created_by,
+            } => Box::pin(self.hash_external(resolved, path, created_by)).await,
+            BlobEffect::WritePlain {
+                resolved,
+                plain,
+                created_by,
+                blob,
+            } => Box::pin(self.write_plain(resolved, plain, created_by, blob)).await,
+            BlobEffect::StatPlain { backend, path } => {
+                Box::pin(self.stat_plain(backend, path)).await
+            }
             BlobEffect::HashArchive { location, lease } => {
                 Box::pin(self.hash_archive(location, *lease)).await
             }

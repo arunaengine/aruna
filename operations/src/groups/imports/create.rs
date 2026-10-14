@@ -1,0 +1,635 @@
+//! Creates a backend import rule together with the bucket routing rule for its folder.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::schedule::parse_schedule;
+use super::{ImportRuleError, folders_overlap, validate_folder};
+use crate::groups::backends::backend_key;
+use crate::groups::fence::group_fence_key;
+use aruna_core::UserId;
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{
+    BACKEND_IMPORT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
+};
+use aruna_core::operation::Operation;
+use aruna_core::structs::identity::group_delete::check_group_write;
+use aruna_core::structs::storage::backend_import::{BackendImport, valid_pattern};
+use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
+use aruna_core::structs::storage::encryption::BucketEncryption;
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::group_backend::GroupStorage;
+use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
+use smallvec::smallvec;
+use std::time::SystemTime;
+use ulid::Ulid;
+
+const SCAN_PAGE: usize = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateImportInput {
+    pub group_id: GroupId,
+    pub created_by: UserId,
+    pub backend_id: Ulid,
+    pub backend_prefix: String,
+    pub bucket: String,
+    pub key_prefix: String,
+    pub schedule: Option<String>,
+    pub write_backend_id: Option<Ulid>,
+    pub write_prefix: Option<String>,
+    pub write_pattern: String,
+    pub now: SystemTime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreateState {
+    Init,
+    Start,
+    Read,
+    Scan,
+    Write,
+    Commit,
+    Finish,
+}
+
+/// Checks the bucket, both backends and the group's other rules in one transaction, then
+/// writes the rule and, when it is missing, the routing rule that sends the folder's
+/// writes to the write backend.
+#[derive(Debug, PartialEq)]
+pub struct CreateImportOperation {
+    input: CreateImportInput,
+    state: CreateState,
+    txn_id: Option<TxnId>,
+    /// The bucket record with the added routing rule; `None` keeps the stored one.
+    routed: Option<BucketInfo>,
+    output: Option<Result<BackendImport, ImportRuleError>>,
+}
+
+impl CreateImportOperation {
+    pub fn new(input: CreateImportInput) -> Self {
+        Self {
+            input,
+            state: CreateState::Init,
+            txn_id: None,
+            routed: None,
+            output: None,
+        }
+    }
+
+    fn fail(&mut self, error: ImportRuleError) -> Effects {
+        self.state = CreateState::Finish;
+        self.output = Some(Err(error));
+        self.abort()
+    }
+
+    fn invalid(&mut self, reason: &str) -> Effects {
+        self.fail(ImportRuleError::Invalid(reason.to_string()))
+    }
+
+    fn validate(&self) -> Result<(), ImportRuleError> {
+        validate_folder("backend_prefix", &self.input.backend_prefix)?;
+        validate_folder("key_prefix", &self.input.key_prefix)?;
+        if let Some(prefix) = self.input.write_prefix.as_deref() {
+            validate_folder("write_prefix", prefix)?;
+        }
+        if !valid_pattern(&self.input.write_pattern) {
+            return Err(ImportRuleError::Invalid(
+                "write_pattern needs {name} and may only use {dir}, {name} and {id}".to_string(),
+            ));
+        }
+        if self.input.bucket.is_empty() {
+            return Err(ImportRuleError::Invalid("bucket is required".to_string()));
+        }
+        if let Some(schedule) = self.input.schedule.as_deref() {
+            parse_schedule(schedule)?;
+        }
+        Ok(())
+    }
+
+    fn record(&self) -> BackendImport {
+        BackendImport {
+            import_id: Ulid::generate(),
+            group_id: self.input.group_id,
+            backend_id: self.input.backend_id,
+            backend_prefix: self.input.backend_prefix.clone(),
+            bucket: self.input.bucket.clone(),
+            key_prefix: self.input.key_prefix.clone(),
+            schedule: self.input.schedule.clone(),
+            created_by: self.input.created_by,
+            created_at: self.input.now,
+            updated_at: self.input.now,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: self.input.write_backend_id,
+            write_prefix: self.input.write_prefix.clone(),
+            write_pattern: self.input.write_pattern.clone(),
+        }
+    }
+
+    fn read(&mut self, txn_id: TxnId) -> Effects {
+        self.txn_id = Some(txn_id);
+        self.state = CreateState::Read;
+        let bucket: Key = self.input.bucket.as_bytes().to_vec().into();
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (S3_BUCKET_KEYSPACE.to_string(), bucket.clone()),
+                (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket),
+                (
+                    STORAGE_BACKEND_KEYSPACE.to_string(),
+                    backend_key(self.input.backend_id)
+                ),
+                group_fence_key(self.input.group_id),
+                (
+                    STORAGE_BACKEND_KEYSPACE.to_string(),
+                    backend_key(self.write_backend())
+                ),
+            ],
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn checked(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+        let [bucket, encryption, backend, fence, write_backend] = match <[_; 5]>::try_from(values) {
+            Ok(values) => values.map(|(_, value)| value),
+            Err(_) => return self.fail(ImportRuleError::Unexpected("Read")),
+        };
+        if let Err(error) = check_group_write(fence.as_deref()) {
+            return self.fail(error.into());
+        }
+        let bucket = match bucket
+            .map(|value| BucketInfo::from_bytes(&value))
+            .transpose()
+        {
+            Ok(Some(bucket)) if bucket.group_id == self.input.group_id => bucket,
+            Ok(_) => return self.invalid("the bucket does not exist in this group on this node"),
+            Err(error) => return self.fail(error.into()),
+        };
+        if bucket.compression != Compression::Off {
+            return self.invalid("a bucket with compression cannot import objects in place");
+        }
+        match BucketEncryption::from_row(encryption.as_deref()) {
+            Ok(settings) if settings.is_encrypted() => {
+                return self.invalid("an encrypted bucket cannot import objects in place");
+            }
+            Ok(_) => {}
+            Err(error) => return self.fail(error.into()),
+        }
+        let (backend, write_backend) = match (self.owned(backend), self.owned(write_backend)) {
+            (Ok(backend), Ok(write_backend)) => (backend, write_backend),
+            (Err(error), _) | (_, Err(error)) => return self.fail(error),
+        };
+        if backend.is_reserved(&self.input.backend_prefix) {
+            return self.invalid("backend_prefix lies inside the folder Aruna writes to");
+        }
+        if write_backend.is_reserved(self.write_folder()) {
+            return self.invalid("write_prefix lies inside the folder Aruna writes to");
+        }
+        if let Err(error) = self.route(bucket) {
+            return self.fail(error);
+        }
+        self.scan(None)
+    }
+
+    fn write_backend(&self) -> Ulid {
+        self.input.write_backend_id.unwrap_or(self.input.backend_id)
+    }
+
+    fn write_folder(&self) -> &str {
+        let prefix = self.input.write_prefix.as_deref();
+        prefix.unwrap_or(&self.input.backend_prefix)
+    }
+
+    /// An enabled backend of this group.
+    fn owned(&self, record: Option<Value>) -> Result<GroupStorage, ImportRuleError> {
+        let invalid = |reason: &str| ImportRuleError::Invalid(reason.to_string());
+        match record
+            .map(|value| GroupStorage::from_bytes(&value))
+            .transpose()?
+        {
+            Some(backend) if backend.group_id != self.input.group_id => {
+                Err(invalid("the storage backend does not belong to this group"))
+            }
+            Some(backend) if backend.disabled => Err(invalid("the storage backend is disabled")),
+            Some(backend) => Ok(backend),
+            None => Err(invalid("the storage backend does not belong to this group")),
+        }
+    }
+
+    /// Another rule must neither write where this one reads or writes, nor read where it writes.
+    fn shares_folder(&self, rule: &BackendImport) -> bool {
+        let (read, write) = (self.input.backend_id, self.write_backend());
+        let prefix = self.input.backend_prefix.as_str();
+        (rule.write_backend() == write && folders_overlap(rule.write_folder(), self.write_folder()))
+            || (rule.backend_id == write
+                && folders_overlap(&rule.backend_prefix, self.write_folder()))
+            || (rule.write_backend() == read && folders_overlap(rule.write_folder(), prefix))
+    }
+
+    /// Adds the folder's routing rule; an existing rule for the same folder must agree.
+    fn route(&mut self, mut bucket: BucketInfo) -> Result<(), ImportRuleError> {
+        let target = RoutingTarget::Backend(BackendRef::Group(self.write_backend()));
+        let existing = bucket
+            .storage_routing
+            .iter()
+            .find(|rule| !rule.exact && rule.key_prefix == self.input.key_prefix);
+        match existing {
+            Some(rule) if rule.target == target => Ok(()),
+            Some(_) => Err(ImportRuleError::Conflict(
+                "a routing rule for this folder names another target".to_string(),
+            )),
+            None => {
+                bucket.storage_routing.push(StorageRoutingRule {
+                    key_prefix: self.input.key_prefix.clone(),
+                    exact: false,
+                    target,
+                });
+                self.routed = Some(bucket);
+                Ok(())
+            }
+        }
+    }
+
+    fn scan(&mut self, start_after: Option<Key>) -> Effects {
+        self.state = CreateState::Scan;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            prefix: Some(self.input.group_id.to_bytes().to_vec().into()),
+            start: start_after.map(IterStart::After),
+            limit: SCAN_PAGE,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+        for (_, value) in values {
+            let rule = match BackendImport::from_bytes(&value) {
+                Ok(rule) => rule,
+                Err(error) => return self.fail(error.into()),
+            };
+            if rule.bucket == self.input.bucket
+                && folders_overlap(&rule.key_prefix, &self.input.key_prefix)
+            {
+                return self.fail(ImportRuleError::Conflict(format!(
+                    "import {} already imports into this folder",
+                    rule.import_id
+                )));
+            }
+            if self.shares_folder(&rule) {
+                return self.fail(ImportRuleError::Conflict(format!(
+                    "import {} reads or writes the same backend folder",
+                    rule.import_id
+                )));
+            }
+        }
+        if next.is_some() {
+            return self.scan(next);
+        }
+        self.write()
+    }
+
+    fn write(&mut self) -> Effects {
+        let record = self.record();
+        let mut writes = Vec::new();
+        match record.to_bytes() {
+            Ok(value) => writes.push((
+                BACKEND_IMPORT_KEYSPACE.to_string(),
+                record.key(),
+                value.into(),
+            )),
+            Err(error) => return self.fail(error.into()),
+        }
+        if let Some(bucket) = self.routed.take() {
+            match bucket.to_bytes() {
+                Ok(value) => writes.push((
+                    S3_BUCKET_KEYSPACE.to_string(),
+                    self.input.bucket.as_bytes().to_vec().into(),
+                    value.into(),
+                )),
+                Err(error) => return self.fail(error.into()),
+            }
+        }
+        self.output = Some(Ok(record));
+        self.state = CreateState::Write;
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn commit(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(ImportRuleError::Unexpected("Write"));
+        };
+        self.state = CreateState::Commit;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+}
+
+impl Operation for CreateImportOperation {
+    type Output = BackendImport;
+    type Error = ImportRuleError;
+
+    fn start(&mut self) -> Effects {
+        if let Err(error) = self.validate() {
+            return self.fail(error);
+        }
+        self.state = CreateState::Start;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = event {
+            return self.fail(error.into());
+        }
+        match (self.state, event) {
+            (CreateState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
+                self.read(txn_id)
+            }
+            (CreateState::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                self.checked(values)
+            }
+            (
+                CreateState::Scan,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => self.scanned(values, next_start_after),
+            (CreateState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                self.commit()
+            }
+            (CreateState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
+                self.txn_id = None;
+                self.state = CreateState::Finish;
+                smallvec![]
+            }
+            _ => self.fail(ImportRuleError::Unexpected("CreateImport")),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.state == CreateState::Finish
+    }
+
+    fn finalize(self) -> Result<BackendImport, ImportRuleError> {
+        self.output
+            .unwrap_or(Err(ImportRuleError::Unexpected("Finish")))
+    }
+
+    fn abort(&mut self) -> Effects {
+        self.txn_id
+            .take()
+            .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::storage::backend_import::DEFAULT_PATTERN;
+    use aruna_core::structs::storage::cleanup::CleanupStrategy;
+    use aruna_core::structs::storage::group_backend::GroupBackendKind;
+    use std::collections::HashMap;
+
+    fn group() -> Ulid {
+        Ulid::from_bytes([1u8; 16])
+    }
+
+    fn backend_id() -> Ulid {
+        Ulid::from_bytes([2u8; 16])
+    }
+
+    fn input(backend_prefix: &str, key_prefix: &str) -> CreateImportInput {
+        CreateImportInput {
+            group_id: group(),
+            created_by: UserId::default(),
+            backend_id: backend_id(),
+            backend_prefix: backend_prefix.to_string(),
+            bucket: "bucket".to_string(),
+            key_prefix: key_prefix.to_string(),
+            schedule: Some("0 3 * * *".to_string()),
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: DEFAULT_PATTERN.to_string(),
+            now: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn bucket(routing: Vec<StorageRoutingRule>, compression: Compression) -> Option<Value> {
+        let bucket = BucketInfo {
+            group_id: group(),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: UserId::default(),
+            cors_configuration: None,
+            storage_routing: routing,
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression,
+        };
+        Some(bucket.to_bytes().unwrap().into())
+    }
+
+    fn backend() -> Option<Value> {
+        let record = GroupStorage {
+            backend_id: backend_id(),
+            group_id: group(),
+            name: "tenant".to_string(),
+            kind: GroupBackendKind::S3,
+            public_config: HashMap::from([("bucket".to_string(), "data".to_string())]),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: UserId::default(),
+            disabled: false,
+            cleanup: CleanupStrategy::Retain,
+        };
+        Some(record.to_bytes().unwrap().into())
+    }
+
+    /// Runs the operation up to its reads and answers them with `bucket`.
+    fn after_reads(
+        input: CreateImportInput,
+        bucket: Option<Value>,
+    ) -> (CreateImportOperation, Effects) {
+        let mut operation = CreateImportOperation::new(input);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        let values = [bucket, None, backend(), None, backend()]
+            .into_iter()
+            .map(|value| (Key::from(Vec::new()), value))
+            .collect();
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        (operation, effects)
+    }
+
+    fn scan_page(operation: &mut CreateImportOperation, rules: &[BackendImport]) -> Effects {
+        let values = rules
+            .iter()
+            .map(|rule| (rule.key(), rule.to_bytes().unwrap().into()))
+            .collect();
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        }))
+    }
+
+    fn failure(operation: CreateImportOperation) -> ImportRuleError {
+        assert!(operation.is_complete());
+        operation.finalize().unwrap_err()
+    }
+
+    #[test]
+    fn writes_routing_rule() {
+        let (mut operation, _) = after_reads(
+            input("raw/", "imported/"),
+            bucket(Vec::new(), Compression::Off),
+        );
+        let effects = scan_page(&mut operation, &[]);
+
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one batch write, got {effects:?}")
+        };
+        let [(rule_space, _, rule), (bucket_space, _, bucket)] = writes.as_slice() else {
+            panic!("expected the rule and the bucket record")
+        };
+        assert_eq!(rule_space, BACKEND_IMPORT_KEYSPACE);
+        assert_eq!(bucket_space, S3_BUCKET_KEYSPACE);
+        let rule = BackendImport::from_bytes(rule).unwrap();
+        assert_eq!(
+            (rule.backend_prefix.as_str(), rule.key_prefix.as_str()),
+            ("raw/", "imported/")
+        );
+        let routing = BucketInfo::from_bytes(bucket).unwrap().storage_routing;
+        assert_eq!(
+            routing,
+            vec![StorageRoutingRule {
+                key_prefix: "imported/".to_string(),
+                exact: false,
+                target: RoutingTarget::Backend(BackendRef::Group(backend_id())),
+            }]
+        );
+
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: TxnId::default(),
+        }));
+        assert_eq!(operation.finalize().unwrap(), rule);
+    }
+
+    #[test]
+    fn keeps_matching_route() {
+        let routing = vec![StorageRoutingRule {
+            key_prefix: "imported/".to_string(),
+            exact: false,
+            target: RoutingTarget::Backend(BackendRef::Group(backend_id())),
+        }];
+        let (mut operation, _) =
+            after_reads(input("", "imported/"), bucket(routing, Compression::Off));
+        let effects = scan_page(&mut operation, &[]);
+
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one batch write")
+        };
+        assert_eq!(writes.len(), 1, "the bucket record stays as it is");
+    }
+
+    #[test]
+    fn refuses_other_route() {
+        let routing = vec![StorageRoutingRule {
+            key_prefix: "imported/".to_string(),
+            exact: false,
+            target: RoutingTarget::Class("cold".to_string()),
+        }];
+        let (operation, effects) =
+            after_reads(input("", "imported/"), bucket(routing, Compression::Off));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert!(matches!(failure(operation), ImportRuleError::Conflict(_)));
+    }
+
+    #[test]
+    fn refuses_overlapping_import() {
+        let (mut operation, _) = after_reads(
+            input("", "imported/x/"),
+            bucket(Vec::new(), Compression::Off),
+        );
+        let mut other = operation.record();
+        other.key_prefix = "imported/".to_string();
+        scan_page(&mut operation, &[other]);
+
+        assert!(matches!(failure(operation), ImportRuleError::Conflict(_)));
+    }
+
+    #[test]
+    fn refuses_unsuitable_inputs() {
+        let compressed = Compression::Zstd { level: 3 };
+        let (operation, _) = after_reads(input("", ""), bucket(Vec::new(), compressed));
+        assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
+
+        let (operation, _) = after_reads(input("data/", ""), bucket(Vec::new(), Compression::Off));
+        assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
+
+        let (operation, _) = after_reads(input("", ""), None);
+        assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
+
+        let mut bad = input("raw", "");
+        bad.schedule = Some("hourly please".to_string());
+        let mut operation = CreateImportOperation::new(bad);
+        assert!(operation.start().is_empty());
+        assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
+    }
+
+    #[test]
+    fn routes_write_backend() {
+        let other = Ulid::from_bytes([9u8; 16]);
+        let mut moved = input("raw/", "imported/");
+        moved.write_backend_id = Some(other);
+        moved.write_pattern = "{dir}{name}".to_string();
+        let (mut operation, _) = after_reads(moved, bucket(Vec::new(), Compression::Off));
+        let effects = scan_page(&mut operation, &[]);
+
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one batch write")
+        };
+        let rule = BackendImport::from_bytes(&writes[0].2).unwrap();
+        assert_eq!(rule.write_backend(), other);
+        assert!(rule.same_name());
+        let routing = BucketInfo::from_bytes(&writes[1].2)
+            .unwrap()
+            .storage_routing;
+        assert_eq!(
+            routing[0].target,
+            RoutingTarget::Backend(BackendRef::Group(other))
+        );
+    }
+
+    #[test]
+    fn refuses_shared_folder() {
+        let (mut operation, _) = after_reads(
+            input("raw/x/", "imported/"),
+            bucket(Vec::new(), Compression::Off),
+        );
+        let mut other = operation.record();
+        other.key_prefix = "elsewhere/".to_string();
+        other.backend_prefix = "raw/".to_string();
+        scan_page(&mut operation, &[other]);
+        assert!(matches!(failure(operation), ImportRuleError::Conflict(_)));
+
+        let mut bad = input("raw/", "imported/");
+        bad.write_pattern = "{dir}{id}".to_string();
+        let mut operation = CreateImportOperation::new(bad);
+        assert!(operation.start().is_empty());
+        assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
+    }
+}

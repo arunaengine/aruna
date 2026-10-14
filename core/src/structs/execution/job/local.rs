@@ -199,6 +199,11 @@ pub enum JobResultPayload {
     Identifiers {
         changed: bool,
     },
+    BackendImport {
+        imported: u64,
+        skipped: u64,
+        failed: u64,
+    },
 }
 
 impl JobResultPayload {
@@ -216,6 +221,7 @@ impl JobResultPayload {
             JobResultPayload::StoragePurge(_) => "storage_purge",
             JobResultPayload::CopyObject { .. } => "copy_object",
             JobResultPayload::Identifiers { .. } => "identifiers",
+            JobResultPayload::BackendImport { .. } => "backend_import",
         }
     }
 
@@ -403,6 +409,15 @@ impl JobResultPayload {
                 "blake3": blake3,
             }),
             JobResultPayload::Identifiers { changed } => serde_json::json!({ "changed": changed }),
+            JobResultPayload::BackendImport {
+                imported,
+                skipped,
+                failed,
+            } => serde_json::json!({
+                "imported": imported,
+                "skipped": skipped,
+                "failed": failed,
+            }),
         }
     }
 }

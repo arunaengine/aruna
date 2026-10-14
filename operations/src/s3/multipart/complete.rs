@@ -41,6 +41,7 @@ use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::abe::{AbeError, ObjectEnvelope};
+use aruna_core::structs::storage::backend_import::PlainPath;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
     BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend, VersionKey,
@@ -53,6 +54,7 @@ use aruna_core::structs::storage::multipart::{
     MultipartObjectSummary, MultipartPart, MultipartPartKey, MultipartUpload,
     MultipartUploadStatus, WorkingShare,
 };
+use aruna_core::structs::storage::routing::{PlainTarget, RoutingSnapshot};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -69,6 +71,8 @@ const PART_PAGE: usize = 256;
 #[derive(Debug, Eq, PartialEq)]
 pub enum CompleteUploadState {
     Init,
+    /// Looks at the path of a same-name object before it is composed.
+    StatPlain,
     StartMarkTransaction,
     CheckPurgeMark,
     ReadUploadMark,
@@ -97,6 +101,8 @@ pub enum CompleteUploadState {
     RegisterManagedCopy,
     WriteObjectMetadata,
     DeleteUploadRecords,
+    /// Reads the import rule a plain object's import row belongs to.
+    ReadImportRule,
     WriteCleanupRecords,
     WriteReplicationObligation,
     EnforceQuota,
@@ -289,6 +295,11 @@ pub struct CompleteUploadOperation {
     reclaim_pending: bool,
     /// A refused publication rechecks its pending envelope in the reset.
     recheck_pending: bool,
+    routing: Option<RoutingSnapshot>,
+    plain: Option<PlainTarget>,
+    /// The path composed last and the backend version the compose reported.
+    plain_path: Option<PlainPath>,
+    plain_version: Option<String>,
 }
 
 impl CompleteUploadOperation {
@@ -333,6 +344,10 @@ impl CompleteUploadOperation {
             envelope_bytes: 0,
             reclaim_pending: false,
             recheck_pending: false,
+            routing: None,
+            plain: None,
+            plain_path: None,
+            plain_version: None,
         }
     }
 
@@ -1015,6 +1030,12 @@ impl CompleteUploadOperation {
                 share,
             })];
         }
+        if let Some(effects) = self.plain_compose() {
+            return effects;
+        }
+        let Some(upload) = self.upload_record.as_ref() else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
         if let Some(backend_upload) = upload.backend_upload.clone() {
             self.state = CompleteUploadState::ComposeBlob;
             return smallvec![Effect::Blob(BlobEffect::CompleteUpload {
@@ -1043,12 +1064,18 @@ impl CompleteUploadOperation {
             resolved: pinned,
             created_by: self.input.created_by,
             parts,
+            plain: None,
         })]
     }
 
     fn handle_blob_composed(&mut self, event: Event) -> Effects {
         let mut location = match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
+            Event::Blob(BlobEvent::PlainWritten { location, version }) => {
+                self.plain_version = version;
+                location
+            }
+            Event::Blob(BlobEvent::Error(BlobError::PathTaken)) => return self.plain_taken(),
             Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
                 self.cleanup.set_release(location.ulid);
                 self.delete_location = Some(location);
@@ -1710,12 +1737,15 @@ impl CompleteUploadOperation {
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
-        self.write_cleanup_records()
+        if let Some(effects) = self.plain_fence() {
+            return effects;
+        }
+        self.write_cleanup_records(true)
     }
 
     // Deferred housekeeping commits atomically with the completed upload, so a
     // crash after commit can never leak part blobs.
-    fn write_cleanup_records(&mut self) -> Effects {
+    fn write_cleanup_records(&mut self, rule_exists: bool) -> Effects {
         let mut works: Vec<BlobCleanupWork> = self
             .upload_parts
             .iter()
@@ -1758,7 +1788,10 @@ impl CompleteUploadOperation {
             });
         }
 
-        let mut writes = Vec::with_capacity(works.len());
+        let mut writes = match self.plain_records(rule_exists) {
+            Ok(writes) => writes,
+            Err(err) => return self.schedule_error(err.into()),
+        };
         for work in works {
             let key = match &work {
                 BlobCleanupWork::ReconcileWrite { location, .. } => {
@@ -2208,6 +2241,7 @@ impl Operation for CompleteUploadOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             CompleteUploadState::Init => self.handle_init(),
+            CompleteUploadState::StatPlain => self.plain_stat(event),
             CompleteUploadState::StartMarkTransaction => self.mark_started(event),
             CompleteUploadState::CheckPurgeMark => self.mark_fence_checked(event),
             CompleteUploadState::ReadUploadMark => self.mark_upload_read(event),
@@ -2236,6 +2270,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::RegisterManagedCopy => self.handle_copy_registered(event),
             CompleteUploadState::WriteObjectMetadata => self.metadata_written(event),
             CompleteUploadState::DeleteUploadRecords => self.records_deleted(event),
+            CompleteUploadState::ReadImportRule => self.import_rule_read(event),
             CompleteUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
             CompleteUploadState::WriteReplicationObligation => self.obligation_written(event),
             CompleteUploadState::EnforceQuota => self.handle_enforce_quota(event),
@@ -2406,6 +2441,9 @@ fn composite_digest(algorithm: ChecksumAlgorithm, bytes: &[u8]) -> Vec<u8> {
         ChecksumAlgorithm::Crc64Nvme => hashes.crc64nvme.to_vec(),
     }
 }
+
+#[path = "plain.rs"]
+mod plain;
 
 #[cfg(test)]
 #[path = "complete_tests.rs"]

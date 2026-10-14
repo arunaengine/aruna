@@ -387,6 +387,7 @@ mod pure_tests {
             result: Ok(GroupRoutingInputs {
                 default_target: None,
                 backend_ids: owned,
+                ..Default::default()
             }),
         }))
     }

@@ -113,6 +113,11 @@ pub enum PutObjectState {
     ReadAbe,
     FenceAbe,
     WriteEnvelope,
+    /// Looks at the path of a same-name write before it is written.
+    StatPlain,
+    WritePlainRecords,
+    /// Reads the import rule that the version's import rows belong to.
+    ReadImportRule,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -165,6 +170,10 @@ pub enum PutObjectError {
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("Something went wrong ...")]
     PutObjectFailed,
+    #[error("the object key changed since it was read")]
+    HeadChanged,
+    #[error("the import rule was removed")]
+    ImportRemoved,
 }
 
 #[derive(Debug, PartialEq)]
@@ -259,6 +268,12 @@ pub struct PutObjectOperation {
     envelope_plan: Option<aruna_core::structs::storage::abe::EnvelopePlan>,
     envelope: Option<aruna_core::structs::storage::abe::ObjectEnvelope>,
     envelope_bytes: u64,
+    plain: Option<plain::PlainWrite>,
+    /// The head the caller saw, `None` for no head; another head refuses the write.
+    expected_head: Option<Option<Ulid>>,
+    import_rows: Option<plain::ImportRows>,
+    /// Whether the import rule exists, read in the current version transaction.
+    rule_exists: Option<bool>,
 }
 
 impl PutObjectOperation {
@@ -303,6 +318,10 @@ impl PutObjectOperation {
             envelope_plan: None,
             envelope: None,
             envelope_bytes: 0,
+            plain: None,
+            expected_head: None,
+            import_rows: None,
+            rule_exists: None,
         }
     }
 
@@ -333,6 +352,12 @@ impl PutObjectOperation {
 
     pub fn create_only(mut self) -> Self {
         self.create_only = true;
+        self
+    }
+
+    /// Refuses the write with `HeadChanged` unless the key's head is still `head`.
+    pub fn with_expected_head(mut self, head: Option<Ulid>) -> Self {
+        self.expected_head = Some(head);
         self
     }
 
@@ -667,7 +692,8 @@ impl PutObjectOperation {
                     "an encrypting bucket does not adopt another blob".to_string(),
                 ));
             }
-            if location.backend != resolved.backend {
+            // Imported bytes stay on the backend they were found on.
+            if location.backend != resolved.backend && !location.is_external() {
                 return self.emit_error(PutObjectError::WriteFailed(
                     "the adopted blob sits on another backend".to_string(),
                 ));
@@ -683,6 +709,9 @@ impl PutObjectOperation {
             return smallvec![Effect::Storage(StorageEffect::StartTransaction {
                 read: false
             })];
+        }
+        if let Some(target) = self.plain_target(&resolved) {
+            return self.start_plain(target, resolved);
         }
         self.state = PutObjectState::WriteBlob;
         if let Some(blob) = self.config.request.body.take() {
@@ -728,6 +757,12 @@ impl PutObjectOperation {
                 location
             }
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
+            Event::Blob(BlobEvent::PlainWritten { location, version }) => {
+                if let Some(plain) = self.plain.as_mut() {
+                    plain.version = version;
+                }
+                location
+            }
             // Only a client-sourced stream fault may become a client error; a
             // server-side write fault must stay retryable, never a bad digest.
             Event::Blob(BlobEvent::Error(BlobError::StreamFailed(message))) => {
@@ -1017,6 +1052,11 @@ impl PutObjectOperation {
             Ok(existing) => existing,
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
+        if let Some(expected) = self.expected_head
+            && existing.as_ref().map(|pointer| pointer.version_id) != expected
+        {
+            return self.emit_error(PutObjectError::HeadChanged);
+        }
         self.existing_pointer = existing;
         let existing_pointer = self.existing_pointer.clone();
         if let Some(pointer) = existing_pointer.as_ref() {
@@ -1409,6 +1449,9 @@ impl PutObjectOperation {
     }
 
     fn write_cleanup_row(&mut self, txn_id: Ulid) -> Effects {
+        if let Some(effects) = self.plain_records(txn_id) {
+            return effects;
+        }
         if self.adopted {
             self.state = PutObjectState::CommitTransaction;
             return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
@@ -1493,6 +1536,7 @@ impl PutObjectOperation {
         self.usage_update = None;
         self.quota_gate = None;
         self.output = None;
+        self.rule_exists = None;
         self.state = PutObjectState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -1749,6 +1793,19 @@ impl Operation for PutObjectOperation {
                 _ => self.emit_error(PutObjectError::InvalidOperationState),
             },
             PutObjectState::WriteBlob => self.handle_write_finished(event),
+            PutObjectState::StatPlain => self.plain_stat(event),
+            PutObjectState::WritePlainRecords => match event {
+                Event::Storage(StorageEvent::BatchWriteResult { .. }) => match self.txn_id {
+                    Some(txn_id) => {
+                        self.state = PutObjectState::CommitTransaction;
+                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                    }
+                    None => self.emit_error(PutObjectError::NoTransactionFound),
+                },
+                Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
+                _ => self.emit_error(PutObjectError::InvalidOperationState),
+            },
+            PutObjectState::ReadImportRule => self.import_rule_read(event),
             PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
             PutObjectState::WriteCleanupRow => self.handle_cleanup_row(event),
@@ -1981,6 +2038,7 @@ mod pure_tests {
             .with_group_inputs(GroupRoutingInputs {
                 default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
                 backend_ids: BTreeSet::from([backend_id]),
+                ..Default::default()
             })
             .with_bucket_rules(Vec::new());
         let mut operation = PutObjectOperation::new(config(snapshot));
@@ -2038,6 +2096,7 @@ mod pure_tests {
             .with_group_inputs(GroupRoutingInputs {
                 default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
                 backend_ids: BTreeSet::from([backend_id]),
+                ..Default::default()
             })
             .with_bucket_rules(Vec::new());
         let mut operation = PutObjectOperation::new(config(snapshot));
@@ -2553,6 +2612,10 @@ mod decision_tests {
         }
     }
 }
+
+mod plain;
+
+pub(crate) use plain::{PlainRecord, same_name_path};
 
 #[path = "abe.rs"]
 pub(crate) mod abe;

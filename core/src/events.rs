@@ -243,6 +243,26 @@ pub enum BlobEvent {
         share: WorkingShare,
     },
     Abe(Box<crate::structs::storage::abe::AbeEvent>),
+    /// One listing page; `next` is the `start_after` of the following page.
+    ExternalListed {
+        objects: Vec<crate::structs::storage::backend_import::ExternalObject>,
+        next: Option<String>,
+    },
+    /// `version` names the bytes read on a backend that keeps versions.
+    ExternalHashed {
+        location: BackendLocation,
+        version: Option<String>,
+    },
+    /// Whether a file is at the path, and its version id on a backend that keeps versions.
+    PlainStat {
+        exists: bool,
+        version: Option<String>,
+    },
+    /// `version` is the backend's id of the bytes written, on a backend that keeps versions.
+    PlainWritten {
+        location: BackendLocation,
+        version: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq)]

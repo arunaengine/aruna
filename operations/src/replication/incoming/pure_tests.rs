@@ -2365,6 +2365,7 @@ fn probes_rule_backend() {
         GroupRoutingInputs {
             default_target: None,
             backend_ids: BTreeSet::from([backend_id]),
+            ..Default::default()
         },
     );
 
@@ -2383,6 +2384,7 @@ fn probes_group_default() {
         GroupRoutingInputs {
             default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
             backend_ids: BTreeSet::from([backend_id]),
+            ..Default::default()
         },
     );
 
@@ -2398,6 +2400,7 @@ fn keeps_loaded_inputs() {
         GroupRoutingInputs {
             default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
             backend_ids: BTreeSet::from([backend_id]),
+            ..Default::default()
         },
     );
     let mut location = make_location();
