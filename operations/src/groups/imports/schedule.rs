@@ -3,15 +3,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::change::{ChangeImportOperation, ImportChange};
+use super::remove::RemoveImportOperation;
 use super::{ImportRuleError, all_imports};
 use crate::driver::{DriverContext, drive, now_ms};
 use crate::jobs::service::submit_import_job;
-use crate::jobs::store::read_job_record;
+use crate::jobs::store::{iter_prefix_page, read_job_record};
 use crate::tasks::task_persistence::persist_task_effect;
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
+use aruna_core::keyspaces::IMPORT_REMOVAL_KEYSPACE;
 use aruna_core::structs::execution::job::{JobId, JobState};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::backend_import::{BackendImport, BackendImportSpec};
@@ -21,9 +23,13 @@ use croner::Cron;
 use croner::parser::{CronParser, Seconds, Year};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
+use ulid::Ulid;
 
 /// How long a due rule waits while its last run is still going.
 const BUSY_RETRY_MS: u64 = 60_000;
+
+/// Interrupted removals finished per schedule run; the rest wait for the next one.
+const REMOVAL_PAGE: usize = 64;
 
 /// Seconds and years are refused, so no schedule fires more than once a minute.
 pub fn parse_schedule(pattern: &str) -> Result<Cron, ImportRuleError> {
@@ -85,14 +91,49 @@ pub async fn start_run(
     Ok(Some(job_id))
 }
 
-/// Starts every scheduled rule that is due, as its creator without a session. Answers
-/// when to look again, or `None` while no rule has a schedule. Missed times run once.
+/// Finishes removals that stopped after their rule was deleted; `false` while one is left.
+async fn finish_removals(context: &DriverContext) -> bool {
+    let page = iter_prefix_page(
+        &context.storage_handle,
+        IMPORT_REMOVAL_KEYSPACE,
+        None,
+        None,
+        REMOVAL_PAGE,
+        None,
+    )
+    .await;
+    let (marks, rest) = match page {
+        Ok(page) => page,
+        Err(error) => {
+            warn!(error = %error, "Backend import removals could not be read");
+            return false;
+        }
+    };
+    let mut done = rest.is_none();
+    for (key, _) in marks {
+        let Ok(bytes) = <[u8; 16]>::try_from(key.as_ref()) else {
+            warn!("Backend import removal mark has an invalid key");
+            continue;
+        };
+        let import_id = Ulid::from_bytes(bytes);
+        if let Err(error) = drive(RemoveImportOperation::resume(import_id), context).await {
+            warn!(import_id = %import_id, error = %error, "Backend import removal did not finish");
+            done = false;
+        }
+    }
+    done
+}
+
+/// Starts every scheduled rule that is due, as its creator without a session, after
+/// finishing interrupted removals. Answers when to look again, or `None` while no rule
+/// has a schedule and no removal is left. Missed times run once.
 pub async fn run_due(
     context: &DriverContext,
     node_id: NodeId,
     retention_ms: u64,
     now_ms: u64,
 ) -> Option<Duration> {
+    let removed = finish_removals(context).await;
     let rules = match all_imports(context).await {
         Ok(rules) => rules,
         Err(error) => {
@@ -100,7 +141,7 @@ pub async fn run_due(
             return Some(Duration::from_millis(BUSY_RETRY_MS));
         }
     };
-    let mut next: Option<u64> = None;
+    let mut next = (!removed).then(|| now_ms.saturating_add(BUSY_RETRY_MS));
     for rule in rules {
         let Some(schedule) = rule.schedule.as_deref() else {
             continue;

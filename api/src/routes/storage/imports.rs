@@ -555,12 +555,16 @@ pub async fn delete_import(
 ) -> ServerResult<StatusCode> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
     let import_id = Ulid::from_str(&import_id).map_err(|_| ServerError::BadRequest)?;
-    drive(
+    let removed = drive(
         RemoveImportOperation::new(group_id, import_id),
         &state.get_ctx(),
     )
-    .await
-    .map_err(map_error)?;
+    .await;
+    if removed.is_err() {
+        // A removal that stopped after deleting the rule is finished by the schedule.
+        wake_schedule(&state.get_ctx()).await;
+    }
+    removed.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
