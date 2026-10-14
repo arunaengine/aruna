@@ -121,8 +121,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::ListExternal { .. } => (EffectClass::Control, "list_external"),
         BlobEffect::HashExternal { .. } => (EffectClass::Transfer, "hash_external"),
         BlobEffect::WritePlain { .. } => (EffectClass::Transfer, "write_plain"),
-        BlobEffect::ClaimPlain { .. } => (EffectClass::Local, "claim_plain"),
-        BlobEffect::CopyAside { .. } => (EffectClass::Transfer, "copy_aside"),
+        BlobEffect::StatPlain { .. } => (EffectClass::Control, "stat_plain"),
     }
 }
 
@@ -149,7 +148,6 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::ComposePieces { .. }
             | BlobEffect::ReplicateLeased { .. }
             | BlobEffect::WritePlain { .. }
-            | BlobEffect::CopyAside { .. }
     )
 }
 
@@ -578,7 +576,6 @@ impl BlobHandler {
             group_effects: Arc::new(std::sync::Mutex::new(HashMap::new())),
             frame_indexes: Arc::new(std::sync::Mutex::new(super::frames::IndexCache::new())),
             reservation_active: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            plain_claims: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             part_chains: Arc::default(),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             close_lock: Arc::new(std::sync::RwLock::new(())),
@@ -756,7 +753,6 @@ impl BlobHandler {
             BlobEffect::Delete { location } => Box::pin(self.delete_blob(location)).await,
             BlobEffect::ReleaseReservation { id } => {
                 self.clear_active(id);
-                self.release_plain(id);
                 BlobEvent::ReservationReleased { id }
             }
             BlobEffect::SpoolHidden {
@@ -892,12 +888,11 @@ impl BlobHandler {
                 plain,
                 created_by,
                 blob,
-                size,
-            } => Box::pin(self.write_plain(resolved, plain, created_by, blob, size)).await,
-            BlobEffect::ClaimPlain { backend, path, id } => BlobEvent::PlainClaimed {
-                claimed: self.claim_plain(backend, path, id),
-            },
-            BlobEffect::CopyAside { source, path } => Box::pin(self.copy_aside(source, path)).await,
+                size: _,
+            } => Box::pin(self.write_plain(resolved, plain, created_by, blob)).await,
+            BlobEffect::StatPlain { backend, path } => {
+                Box::pin(self.stat_plain(backend, path)).await
+            }
             BlobEffect::HashArchive { location, lease } => {
                 Box::pin(self.hash_archive(location, *lease)).await
             }

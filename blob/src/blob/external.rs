@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::BlobHandler;
+use super::io::{backend_version, reader_at};
 use crate::hash::Hasher;
 use aruna_core::UserId;
 use aruna_core::errors::BlobError;
@@ -129,14 +130,26 @@ impl BlobHandler {
         let operator = self.operator_from_location(&location)?;
         let storage_path = location.get_storage_path()?;
         let read_error = |error: &str| BlobError::ReadError(error.to_string());
+        let open_error = |error: opendal::Error| match error.kind() {
+            opendal::ErrorKind::NotFound => BlobError::Unreadable(error.to_string()),
+            _ => read_error(&error.to_string()),
+        };
         // OpenDAL trims and drops empty parts, so `raw//a.txt` would read `raw/a.txt`.
         if opendal::raw::normalize_path(&storage_path) != storage_path {
-            return Err(read_error("the backend cannot read this key exactly"));
+            let message = "the backend cannot read this key exactly".to_string();
+            return Err(BlobError::Unreadable(message));
         }
-        let reader = timeout(self.io_timeout(), operator.reader(&storage_path))
+        // The stat names the version that is read, so a later overwrite cannot change it.
+        let metadata = timeout(self.io_timeout(), operator.stat(&storage_path))
+            .await
+            .map_err(|_| read_error("timed out reading the object"))?
+            .map_err(open_error)?;
+        let version = backend_version(&metadata);
+        let opened = reader_at(&operator, &storage_path, version.as_deref());
+        let reader = timeout(self.io_timeout(), opened)
             .await
             .map_err(|_| read_error("timed out opening the object"))?
-            .map_err(|error| read_error(&error.to_string()))?;
+            .map_err(open_error)?;
         let stream = timeout(self.io_timeout(), reader.into_bytes_stream(..))
             .await
             .map_err(|_| read_error("timed out starting the object read"))?
@@ -158,6 +171,7 @@ impl BlobHandler {
                 hashes: hasher.to_map(),
                 ..location
             },
+            version,
         })
     }
 }

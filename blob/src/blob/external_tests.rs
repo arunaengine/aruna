@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{read_back, setup_two_backends, test_user_id};
+use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::storage::blob::{BackendRef, ResolvedBackend};
@@ -51,7 +52,7 @@ async fn hashes_in_place() {
     place(&root, "raw/a.txt", b"outside bytes");
     let resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
 
-    let BlobEvent::ExternalHashed { location } = handler
+    let BlobEvent::ExternalHashed { location, .. } = handler
         .hash_external(resolved, "raw/a.txt".to_string(), test_user_id())
         .await
     else {
@@ -86,14 +87,25 @@ async fn refuses_inexact_keys() {
         let event = handler
             .hash_external(resolved.clone(), key.to_string(), test_user_id())
             .await;
-        assert!(matches!(event, BlobEvent::Error(_)), "{key}: {event:?}");
+        assert!(
+            matches!(event, BlobEvent::Error(BlobError::Unreadable(_))),
+            "{key}: {event:?}"
+        );
     }
+    // A key that is gone fails only this object.
+    let event = handler
+        .hash_external(resolved, "raw/gone.txt".to_string(), test_user_id())
+        .await;
+    assert!(
+        matches!(event, BlobEvent::Error(BlobError::Unreadable(_))),
+        "{event:?}"
+    );
 }
 
 #[tokio::test]
 async fn writes_plain_paths() {
     use super::stream_from_bytes;
-    use aruna_core::structs::storage::backend_import::PlainPath;
+    use aruna_core::structs::storage::backend_import::{PlainPath, tagged_path};
     use ulid::Ulid;
 
     let context = setup_two_backends().await;
@@ -101,110 +113,126 @@ async fn writes_plain_paths() {
     let root = context._temp_dir.path().join("hot");
     let backend = BackendRef::Node("default".to_string());
     let resolved = ResolvedBackend::new(backend.clone(), None);
-    let plain = PlainPath {
-        path: "raw/a.txt".to_string(),
+    let path = "raw/a.txt".to_string();
+    let plain = |path: &str, if_not_exists| PlainPath {
+        path: path.to_string(),
         ulid: Ulid::generate(),
+        if_not_exists,
+    };
+    let write = |plain: PlainPath, body: &'static [u8]| {
+        let handler = handler.clone();
+        let resolved = resolved.clone();
+        async move {
+            let blob = stream_from_bytes(body);
+            handler
+                .write_plain(resolved, plain, test_user_id(), blob)
+                .await
+        }
     };
 
-    let BlobEvent::WriteFinished { location: old } = handler
-        .write_plain(
-            resolved.clone(),
-            plain.clone(),
-            test_user_id(),
-            stream_from_bytes(b"first"),
-            Some(5),
-        )
-        .await
-    else {
+    let stat = handler.stat_plain(backend.clone(), path.clone()).await;
+    assert_eq!(
+        stat,
+        BlobEvent::PlainStat {
+            exists: false,
+            version: None
+        }
+    );
+    let first = plain(&path, true);
+    let BlobEvent::WriteFinished { location } = write(first.clone(), b"first").await else {
         panic!("plain write failed")
     };
-    assert_eq!(std::fs::read(root.join("raw/a.txt")).unwrap(), b"first");
-    assert!(old.storage_bucket.is_empty());
-    assert_eq!(old.ulid, plain.ulid);
+    assert!(location.storage_bucket.is_empty());
+    assert_eq!(location.ulid, first.ulid);
+    let stat = handler.stat_plain(backend, path.clone()).await;
+    assert!(matches!(
+        stat,
+        BlobEvent::PlainStat {
+            exists: true,
+            version: None
+        }
+    ));
 
-    let aside = ".aruna-versions/raw/a.txt/01".to_string();
-    let BlobEvent::WriteFinished { location: moved } =
-        handler.copy_aside(old.clone(), aside.clone()).await
-    else {
-        panic!("aside copy failed")
+    // A conditional write never replaces another writer's file.
+    let event = write(plain(&path, true), b"second").await;
+    assert_eq!(event, BlobEvent::Error(BlobError::PathTaken));
+    assert_eq!(std::fs::read(root.join(&path)).unwrap(), b"first");
+
+    // Without versions the next write takes a tagged path next to the file.
+    let tagged = tagged_path(&path, Ulid::generate());
+    let BlobEvent::WriteFinished { .. } = write(plain(&tagged, true), b"second").await else {
+        panic!("tagged write failed")
     };
-    assert_eq!(moved.backend_path, aside);
-    assert_eq!(moved.get_blake3(), old.get_blake3());
+    assert_eq!(std::fs::read(root.join(&tagged)).unwrap(), b"second");
+    assert_eq!(std::fs::read(root.join(&path)).unwrap(), b"first");
 
-    // A second same-name write waits until the first releases its claim.
-    assert!(handler.claim_plain(backend.clone(), plain.path.clone(), plain.ulid));
-    assert!(!handler.claim_plain(backend.clone(), plain.path.clone(), Ulid::generate()));
-    handler.release_plain(plain.ulid);
-    let next = PlainPath {
-        ulid: Ulid::generate(),
-        ..plain
-    };
-    assert!(handler.claim_plain(backend, next.path.clone(), next.ulid));
-
-    let BlobEvent::WriteFinished { .. } = handler
-        .write_plain(
-            resolved,
-            next,
-            test_user_id(),
-            stream_from_bytes(b"second"),
-            None,
-        )
-        .await
-    else {
+    // A backend that keeps versions is overwritten without the condition.
+    let BlobEvent::WriteFinished { .. } = write(plain(&path, false), b"third").await else {
         panic!("overwrite failed")
     };
-    assert_eq!(std::fs::read(root.join("raw/a.txt")).unwrap(), b"second");
-    assert_eq!(read_back(&handler, moved).await, b"first");
+    assert_eq!(std::fs::read(root.join(&path)).unwrap(), b"third");
+}
+
+#[tokio::test]
+async fn reads_recorded_version() {
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::handle::Handle as _;
+    use aruna_core::keyspaces::BACKEND_VERSION_KEYSPACE;
+    use aruna_core::structs::storage::backend_import::version_key;
+    use ulid::Ulid;
+
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let mut location = super::make_test_location();
+    location.storage_bucket = String::new();
+    location.backend = BackendRef::Group(Ulid::generate());
+    assert_eq!(handler.read_version(&location).await, Ok(None));
+
+    let write = StorageEffect::Write {
+        key_space: BACKEND_VERSION_KEYSPACE.to_string(),
+        key: version_key(location.ulid),
+        value: b"v1".to_vec().into(),
+        txn_id: None,
+    };
+    context
+        .storage_handle
+        .send_effect(Effect::Storage(write))
+        .await;
+    assert_eq!(handler.read_version(&location).await, Ok(Some("v1".into())));
+
+    // Aruna's own layout never names a backend version.
+    location.storage_bucket = "bucket".to_string();
+    assert_eq!(handler.read_version(&location).await, Ok(None));
 }
 
 #[tokio::test]
 async fn keeps_tenant_paths() {
-    use super::stream_from_bytes;
-    use aruna_core::structs::storage::backend_import::PlainPath;
     use ulid::Ulid;
 
     let context = setup_two_backends().await;
     let handler = context.blob_handle.handler.clone();
     let root = context._temp_dir.path().join("hot");
-    // Only a tenant backend has tenant paths.
-    let mut resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
-    let plain = PlainPath {
-        path: "raw/a.txt".to_string(),
-        ulid: Ulid::generate(),
-    };
-    let BlobEvent::WriteFinished { location } = handler
-        .write_plain(
-            resolved.clone(),
-            plain,
-            test_user_id(),
-            stream_from_bytes(b"mine"),
-            None,
-        )
+    place(&root, "raw/a.txt", b"theirs");
+    let resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
+    let BlobEvent::ExternalHashed { location, .. } = handler
+        .hash_external(resolved, "raw/a.txt".to_string(), test_user_id())
         .await
     else {
-        panic!("plain write failed")
-    };
-    let aside = ".aruna-versions/raw/a.txt/01".to_string();
-    let BlobEvent::WriteFinished { location: moved } =
-        handler.copy_aside(location.clone(), aside).await
-    else {
-        panic!("aside copy failed")
+        panic!("hash failed")
     };
 
-    resolved.backend = BackendRef::Group(Ulid::generate());
+    let operator = handler.operator_from_location(&location).unwrap();
     let tenant = aruna_core::structs::storage::blob::BackendLocation {
-        backend: resolved.backend.clone(),
+        backend: BackendRef::Group(Ulid::generate()),
         ..location
     };
     assert!(matches!(
-        handler.delete_blob(tenant).await,
+        handler.delete_blob(tenant.clone()).await,
         BlobEvent::DeleteFinished
     ));
+    // A failed write cleans nothing at a tenant path.
+    let path = Some("raw/a.txt");
+    let cleanup = handler.clean_partial(None, true, Some(&operator), path, Some(&tenant));
+    assert_eq!(cleanup.await, Ok(()));
     assert!(root.join("raw/a.txt").exists());
-
-    assert!(matches!(
-        handler.delete_blob(moved).await,
-        BlobEvent::DeleteFinished
-    ));
-    assert!(!root.join(".aruna-versions/raw/a.txt/01").exists());
 }
