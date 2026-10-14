@@ -63,6 +63,9 @@ fn request(test: &TestState, backend_id: Ulid, backend_prefix: &str) -> CreateIm
         bucket: test.bucket.clone(),
         key_prefix: "imported/".to_string(),
         schedule: None,
+        write_backend_id: None,
+        write_prefix: None,
+        write_pattern: None,
     }
 }
 
@@ -103,6 +106,16 @@ async fn rejects_bad_input() {
     let mut scheduled = request(&test, backend_id, "raw/");
     scheduled.schedule = Some("every night".to_string());
     let result = create_import(State(test.state.clone()), auth(), group(), Json(scheduled)).await;
+    assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
+
+    let mut pattern = request(&test, backend_id, "raw/");
+    pattern.write_pattern = Some("{dir}{id}".to_string());
+    let result = create_import(State(test.state.clone()), auth(), group(), Json(pattern)).await;
+    assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
+
+    let mut reserved = request(&test, backend_id, "raw/");
+    reserved.write_prefix = Some(".aruna-versions/".to_string());
+    let result = create_import(State(test.state.clone()), auth(), group(), Json(reserved)).await;
     assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
 
     let unknown = Json(request(&test, Ulid::generate(), "raw/"));
@@ -175,4 +188,50 @@ async fn manages_rule() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     let gone = get_import(State(test.state.clone()), auth(), rule()).await;
     assert!(matches!(gone, Err(ServerError::NotFound)));
+}
+
+#[tokio::test]
+async fn routes_new_uploads() {
+    let test = setup_state().await;
+    let backend_id = register_backend(&test).await;
+    let write_backend = register_backend(&test).await;
+    let auth = || Extension(Some(test.auth.clone()));
+    let group = || Path(test.group_id.to_string());
+
+    let mut body = request(&test, backend_id, "raw/");
+    body.write_backend_id = Some(write_backend.to_string());
+    body.write_prefix = Some("uploads/".to_string());
+    body.write_pattern = Some("{dir}{name}".to_string());
+    let (_, Json(created)) = create_import(State(test.state.clone()), auth(), group(), Json(body))
+        .await
+        .unwrap();
+    assert_eq!(created.write_backend_id, Some(write_backend.to_string()));
+    assert_eq!(created.write_prefix.as_deref(), Some("uploads/"));
+    assert_eq!(created.write_pattern, "{dir}{name}");
+    let rules = drive(
+        GetRoutingOperation::new(test.bucket.clone()),
+        &test.state.get_ctx(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rules[0].target,
+        RoutingTarget::Backend(BackendRef::Group(write_backend))
+    );
+
+    // A second rule may not read the folder the first one writes to.
+    let mut other = request(&test, write_backend, "uploads/x/");
+    other.key_prefix = "other/".to_string();
+    let result = create_import(State(test.state.clone()), auth(), group(), Json(other)).await;
+    assert!(matches!(result, Err(ServerError::Conflict(_))));
+
+    // Defaults stay unset and the pattern names a unique file per version.
+    let mut plain = request(&test, backend_id, "elsewhere/");
+    plain.key_prefix = "plain/".to_string();
+    let (_, Json(created)) = create_import(State(test.state.clone()), auth(), group(), Json(plain))
+        .await
+        .unwrap();
+    assert_eq!(created.write_backend_id, None);
+    assert_eq!(created.write_prefix, None);
+    assert_eq!(created.write_pattern, "{dir}{id}_{name}");
 }

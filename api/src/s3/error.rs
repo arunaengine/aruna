@@ -190,6 +190,16 @@ fn completion_lease_error() -> S3Error {
     error
 }
 
+/// Another upload replaces the same file of a linked folder right now.
+fn plain_busy_error() -> S3Error {
+    let mut error = S3Error::with_message(
+        S3ErrorCode::OperationAborted,
+        "Another upload to this file is in progress, retry shortly.".to_string(),
+    );
+    error.set_status_code(http::StatusCode::CONFLICT);
+    error
+}
+
 fn incomplete_body_error() -> S3Error {
     s3_error!(
         IncompleteBody,
@@ -337,6 +347,7 @@ impl IntoS3Error for PutObjectError {
             PutObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
             PutObjectError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
             PutObjectError::UsageUpdateError(_) => usage_accounting_error(),
+            PutObjectError::PlainBusy => plain_busy_error(),
             err => internal_error(err),
         }
     }
@@ -403,6 +414,7 @@ impl IntoS3Error for CompleteUploadError {
             | CompleteUploadError::UploadTargetMismatch
             | CompleteUploadError::UploadNotOpen => missing_upload_error(),
             CompleteUploadError::CompletionInProgress => completion_lease_error(),
+            CompleteUploadError::PlainBusy => plain_busy_error(),
             CompleteUploadError::MissingParts => {
                 s3_error!(InvalidRequest, "You must specify at least one part.")
             }

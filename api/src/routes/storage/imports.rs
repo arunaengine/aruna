@@ -7,7 +7,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::routing::ensure_group_admin;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::backend_import::BackendImport;
+use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::drive;
@@ -53,6 +53,17 @@ pub struct CreateImportRequest {
     /// Five-field cron expression in UTC; omitted runs only on request.
     #[serde(default)]
     pub schedule: Option<String>,
+    /// Another enabled backend of the group for new uploads; omitted uses `backend_id`.
+    #[serde(default)]
+    pub write_backend_id: Option<String>,
+    /// Folder for new uploads: empty, or a relative path ending with `/`; omitted uses
+    /// `backend_prefix`.
+    #[serde(default)]
+    pub write_prefix: Option<String>,
+    /// Path of a new upload below the write folder with `{dir}`, `{name}` and `{id}`;
+    /// omitted uses `{dir}{id}_{name}`.
+    #[serde(default)]
+    pub write_pattern: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -90,6 +101,13 @@ pub struct ImportResponse {
     pub backend_prefix: String,
     pub bucket: String,
     pub key_prefix: String,
+    /// Omitted when new uploads go to `backend_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_backend_id: Option<String>,
+    /// Omitted when new uploads go to `backend_prefix`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_prefix: Option<String>,
+    pub write_pattern: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<String>,
     /// When the schedule starts the next run; omitted without a schedule.
@@ -171,6 +189,9 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
         backend_prefix: rule.backend_prefix,
         bucket: rule.bucket,
         key_prefix: rule.key_prefix,
+        write_backend_id: rule.write_backend_id.map(|id| id.to_string()),
+        write_prefix: rule.write_prefix,
+        write_pattern: rule.write_pattern,
         schedule: rule.schedule,
         next_run_at,
         created_at: rfc3339(millis(rule.created_at)),
@@ -205,10 +226,19 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
 **Authentication**: realm bearer token with WRITE on the group's admin path and WRITE on the bucket.
 
 **Behavior**
-- The rule also adds a bucket routing rule that sends writes under `key_prefix` to the backend, so
-  imported objects and later writes share that backend. An existing rule for the same folder must
-  already name the backend.
+- The rule also adds a bucket routing rule that sends writes under `key_prefix` to the write
+  backend (`write_backend_id`, else `backend_id`). An existing rule for the same folder must
+  already name it.
 - A backend key `backend_prefix` + `x` becomes the bucket key `key_prefix` + `x`.
+- A new upload to `key_prefix` + `d/n` is stored at the write folder (`write_prefix`, else
+  `backend_prefix`) + `write_pattern`, with `{dir}` = `d/`, `{name}` = `n` and `{id}` = the
+  version id, so other tools see it. Uploads under the rule's own import folder are not imported
+  again; later changes to such a file are.
+- A pattern without `{id}` replaces the file of the same name. Aruna first moves the bytes of the
+  version stored there to `.aruna-versions/<path>/<id>`, so older versions stay readable. A second
+  upload to the same file while one runs gets `409 OperationAborted`. A rejected upload does not
+  bring back the replaced file.
+- A bucket that turns on compression or encryption later stores new uploads in Aruna's own layout.
 - Nothing runs on creation. Start a run on request or give a `schedule`.
 - Aruna never deletes imported bytes from the backend. Deleting an object in Aruna only removes
   Aruna's record of it.
@@ -216,9 +246,11 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
 
 **Limits**
 - The bucket must belong to the group, without compression and without encryption.
-- Both prefixes are empty or relative folders ending with `/`; `backend_prefix` may not lie inside
-  the folder where Aruna stores its own objects on that backend.
-- Two rules may not import into overlapping folders of one bucket.
+- All prefixes are empty or relative folders ending with `/`; `backend_prefix` and the write
+  folder may not lie inside the folders where Aruna stores its own objects on that backend.
+- `write_pattern` must contain `{name}` and give a relative path.
+- Two rules may not import into overlapping folders of one bucket, and no rule may write into a
+  backend folder that another rule reads or writes.
 - `schedule` is a five-field cron expression evaluated in UTC."#,
     params(("group_id" = String, Path, description = "Group that owns the backend and the bucket, as a 26-character ULID")),
     request_body(
@@ -229,6 +261,7 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
             "backend_prefix": "instrument/raw/",
             "bucket": "research-raw",
             "key_prefix": "raw/",
+            "write_pattern": "{dir}{id}_{name}",
             "schedule": "0 3 * * *"
         })
     ),
@@ -244,6 +277,7 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
                 "backend_prefix": "instrument/raw/",
                 "bucket": "research-raw",
                 "key_prefix": "raw/",
+                "write_pattern": "{dir}{id}_{name}",
                 "schedule": "0 3 * * *",
                 "next_run_at": "2026-10-15T03:00:00+00:00",
                 "created_at": "2026-10-14T09:12:00+00:00",
@@ -253,7 +287,7 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
         (status = 400, description = "Invalid ids, prefixes, schedule, bucket or backend", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or on the bucket", body = ErrorResponse),
-        (status = 409, description = "A routing rule for the folder names another target, another rule imports into an overlapping folder, or the group is being deleted", body = ErrorResponse)
+        (status = 409, description = "A routing rule for the folder names another target, another rule imports into an overlapping folder or shares a backend folder, or the group is being deleted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -265,6 +299,10 @@ pub async fn create_import(
 ) -> ServerResult<(StatusCode, Json<ImportResponse>)> {
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let backend_id = Ulid::from_str(&request.backend_id).map_err(|_| ServerError::BadRequest)?;
+    let write_backend_id = match request.write_backend_id.as_deref() {
+        None | Some("") => None,
+        Some(id) => Some(Ulid::from_str(id).map_err(|_| ServerError::BadRequest)?),
+    };
     let bucket_path = bucket_permission_path(
         state.get_realm_id(),
         group_id,
@@ -282,6 +320,11 @@ pub async fn create_import(
             bucket: request.bucket,
             key_prefix: request.key_prefix,
             schedule: request.schedule,
+            write_backend_id,
+            write_prefix: request.write_prefix,
+            write_pattern: request
+                .write_pattern
+                .unwrap_or_else(|| DEFAULT_PATTERN.to_string()),
             now: SystemTime::now(),
         }),
         &state.get_ctx(),
@@ -316,6 +359,7 @@ pub async fn create_import(
                     "backend_prefix": "instrument/raw/",
                     "bucket": "research-raw",
                     "key_prefix": "raw/",
+                    "write_pattern": "{dir}{id}_{name}",
                     "created_at": "2026-10-14T09:12:00+00:00",
                     "updated_at": "2026-10-14T09:12:00+00:00",
                     "last_run": {
@@ -376,6 +420,9 @@ pub async fn list_group_imports(
                 "backend_prefix": "",
                 "bucket": "research-raw",
                 "key_prefix": "",
+                "write_backend_id": "01JBCKND0123456789ABCDEFGJ",
+                "write_prefix": "uploads/",
+                "write_pattern": "{dir}{name}",
                 "created_at": "2026-10-14T09:12:00+00:00",
                 "updated_at": "2026-10-14T09:12:00+00:00",
                 "last_run": {
@@ -439,6 +486,7 @@ pub async fn get_import(
                 "backend_prefix": "instrument/raw/",
                 "bucket": "research-raw",
                 "key_prefix": "raw/",
+                "write_pattern": "{dir}{id}_{name}",
                 "schedule": "*/30 * * * *",
                 "next_run_at": "2026-10-14T10:00:00+00:00",
                 "created_at": "2026-10-14T09:12:00+00:00",
