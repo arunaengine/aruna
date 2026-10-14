@@ -126,11 +126,13 @@ pub fn valid_pattern(pattern: &str) -> bool {
         })
 }
 
-/// Relative, without empty, `.` or `..` parts and without control characters.
+/// Relative, without empty, `.` or `..` parts and without control characters. OpenDAL
+/// trims the ends of a path, so a path with outer whitespace would name another file.
 fn plain_safe(path: &str) -> bool {
-    path.split('/').all(|part| {
-        !part.is_empty() && part != "." && part != ".." && !part.chars().any(char::is_control)
-    })
+    path.trim() == path
+        && path.split('/').all(|part| {
+            !part.is_empty() && part != "." && part != ".." && !part.chars().any(char::is_control)
+        })
 }
 
 /// Where Aruna keeps the bytes a same-name write replaced at `path`.
@@ -354,6 +356,9 @@ mod tests {
             assert_eq!(path(DEFAULT_PATTERN, key), None, "{key}");
         }
         assert_eq!(path("{dir}{name}", "imported/../a.csv"), None);
+        // A trimmed path would name another file.
+        assert_eq!(path("{dir}{name}", "imported/a.csv "), None);
+        assert!(!valid_pattern("{name} "));
 
         let mut moved = rule("{name}");
         moved.write_prefix = Some("new/".to_string());

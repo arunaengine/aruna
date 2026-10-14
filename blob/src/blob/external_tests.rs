@@ -71,6 +71,26 @@ async fn hashes_in_place() {
 }
 
 #[tokio::test]
+async fn refuses_inexact_keys() {
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    place(
+        &context._temp_dir.path().join("hot"),
+        "raw/a.txt",
+        b"other bytes",
+    );
+    let resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
+
+    // Each key would read `raw/a.txt`, which is another object.
+    for key in ["raw//a.txt", "raw/a.txt ", " raw/a.txt"] {
+        let event = handler
+            .hash_external(resolved.clone(), key.to_string(), test_user_id())
+            .await;
+        assert!(matches!(event, BlobEvent::Error(_)), "{key}: {event:?}");
+    }
+}
+
+#[tokio::test]
 async fn writes_plain_paths() {
     use super::stream_from_bytes;
     use aruna_core::structs::storage::backend_import::PlainPath;

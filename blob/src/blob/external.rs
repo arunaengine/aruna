@@ -129,6 +129,10 @@ impl BlobHandler {
         let operator = self.operator_from_location(&location)?;
         let storage_path = location.get_storage_path()?;
         let read_error = |error: &str| BlobError::ReadError(error.to_string());
+        // OpenDAL trims and drops empty parts, so `raw//a.txt` would read `raw/a.txt`.
+        if opendal::raw::normalize_path(&storage_path) != storage_path {
+            return Err(read_error("the backend cannot read this key exactly"));
+        }
         let reader = timeout(self.io_timeout(), operator.reader(&storage_path))
             .await
             .map_err(|_| read_error("timed out opening the object"))?

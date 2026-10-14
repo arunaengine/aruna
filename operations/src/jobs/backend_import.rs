@@ -18,13 +18,14 @@ use aruna_core::structs::storage::backend_import::{
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer, ResolvedBackend,
-    VersionKey, bucket_permission_path,
+    VersionKey, bucket_permission_path, ensure_confined_path,
 };
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{RoutingSnapshot, RoutingTarget, RuleSource};
 use aruna_core::types::{Effects, Key, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
+use std::path::Path;
 use ulid::Ulid;
 
 use super::executor::{JobContext, JobRunOutcome};
@@ -296,6 +297,12 @@ async fn import_object(
         Some(key) => key,
         None => rule.aruna_key(&object.key).unwrap_or_default(),
     };
+    if key.is_empty() {
+        return Err(ItemError::Item(
+            "the object maps to an empty key".to_string(),
+        ));
+    }
+    ensure_confined_path(Path::new(&key)).map_err(|error| ItemError::Item(error.to_string()))?;
     let head_key = BlobHeadKey::new(&rule.bucket, &key)
         .to_bytes()
         .map_err(|error| ItemError::Item(error.to_string()))?;
