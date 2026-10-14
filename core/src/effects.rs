@@ -343,7 +343,6 @@ pub enum BlobEffect {
         plain: PlainPath,
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
-        size: Option<u64>,
     },
     /// Answers `PlainStat` for `path` on `backend`.
     StatPlain {

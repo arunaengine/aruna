@@ -888,7 +888,6 @@ impl BlobHandler {
                 plain,
                 created_by,
                 blob,
-                size: _,
             } => Box::pin(self.write_plain(resolved, plain, created_by, blob)).await,
             BlobEffect::StatPlain { backend, path } => {
                 Box::pin(self.stat_plain(backend, path)).await

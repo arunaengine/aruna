@@ -110,7 +110,6 @@ impl PutObjectOperation {
             },
             created_by: self.config.user_id,
             blob,
-            size: self.config.request.content_length,
         })]
     }
 
