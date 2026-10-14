@@ -221,7 +221,7 @@ group's data, so the group write rights that suffice for objects are not enough.
 - Config keys are a closed allowlist per kind, are lowercased before matching, and may not be given
   twice.
 - `s3` needs `endpoint` and `bucket` plus the secrets `access_key_id` and `secret_access_key`, and
-  also accepts `region`, `root` and `force_path_style`.
+  also accepts `region` (default `us-east-1`), `root` and `force_path_style`.
 - `gcs` needs `bucket` plus the secret `credential`, and also accepts `root` and `endpoint`.
 - `azblob` needs `endpoint`, `container` and `account_name`; `azdls` needs `endpoint`, `filesystem`
   and `account_name`; both accept `root` and take either `account_key` or `sas_token`.

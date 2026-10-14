@@ -143,6 +143,8 @@ pub const fn rules_for_kind(kind: GroupBackendKind) -> GroupBackendRules {
     }
 }
 
+const DEFAULT_S3_REGION: &str = "us-east-1";
+
 pub fn validate_backend_input(
     name: &str,
     kind: GroupBackendKind,
@@ -154,12 +156,18 @@ pub fn validate_backend_input(
     }
 
     let rules = rules_for_kind(kind);
-    let public = normalize(public_config, rules.allowed_public, |key| {
+    let mut public = normalize(public_config, rules.allowed_public, |key| {
         GroupBackendError::UnknownPublicKey { kind, key }
     })?;
     let secret = normalize(secret_config, rules.allowed_secret, |key| {
         GroupBackendError::UnknownSecretKey { kind, key }
     })?;
+    // Both S3 clients need a signing region; the stored default keeps them in step.
+    if kind == GroupBackendKind::S3 {
+        public
+            .entry("region".to_string())
+            .or_insert_with(|| DEFAULT_S3_REGION.to_string());
+    }
 
     for key in rules.required_public {
         if !public.contains_key(*key) {
@@ -267,8 +275,21 @@ mod pure_tests {
             validate_backend_input("tenant", GroupBackendKind::S3, &s3_public(), &s3_secret())
                 .unwrap();
 
-        assert_eq!(normalized.public, s3_public());
+        let mut expected = s3_public();
+        expected.insert("region".to_string(), "us-east-1".to_string());
+        assert_eq!(normalized.public, expected);
         assert_eq!(normalized.secret, s3_secret());
+    }
+
+    #[test]
+    fn keeps_given_region() {
+        let mut public = s3_public();
+        public.insert("region".to_string(), "eu-central-1".to_string());
+
+        let normalized =
+            validate_backend_input("tenant", GroupBackendKind::S3, &public, &s3_secret()).unwrap();
+
+        assert_eq!(normalized.public, public);
     }
 
     #[test]
