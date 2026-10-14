@@ -26,7 +26,7 @@ use crate::s3::write_cleanup::{CleanupStep, WriteCleanup};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
+use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
@@ -113,6 +113,10 @@ pub enum PutObjectState {
     ReadAbe,
     FenceAbe,
     WriteEnvelope,
+    /// Claims the path of a same-name write, then moves the bytes it replaces aside.
+    ClaimPlain,
+    SetAside,
+    WritePlainRecords,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -165,6 +169,10 @@ pub enum PutObjectError {
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("Something went wrong ...")]
     PutObjectFailed,
+    #[error("another write to this file is in progress")]
+    PlainBusy,
+    #[error("{0}")]
+    PlainAside(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -259,6 +267,9 @@ pub struct PutObjectOperation {
     envelope_plan: Option<aruna_core::structs::storage::abe::EnvelopePlan>,
     envelope: Option<aruna_core::structs::storage::abe::ObjectEnvelope>,
     envelope_bytes: u64,
+    plain: Option<plain::PlainWrite>,
+    /// Released with the operation; it names the path's claim and the plain location.
+    plain_claim: Option<Ulid>,
 }
 
 impl PutObjectOperation {
@@ -303,6 +314,8 @@ impl PutObjectOperation {
             envelope_plan: None,
             envelope: None,
             envelope_bytes: 0,
+            plain: None,
+            plain_claim: None,
         }
     }
 
@@ -667,7 +680,8 @@ impl PutObjectOperation {
                     "an encrypting bucket does not adopt another blob".to_string(),
                 ));
             }
-            if location.backend != resolved.backend {
+            // Imported bytes stay on the backend they were found on.
+            if location.backend != resolved.backend && !location.is_external() {
                 return self.emit_error(PutObjectError::WriteFailed(
                     "the adopted blob sits on another backend".to_string(),
                 ));
@@ -683,6 +697,9 @@ impl PutObjectOperation {
             return smallvec![Effect::Storage(StorageEffect::StartTransaction {
                 read: false
             })];
+        }
+        if let Some(target) = self.plain_target(&resolved) {
+            return self.start_plain(target, resolved);
         }
         self.state = PutObjectState::WriteBlob;
         if let Some(blob) = self.config.request.body.take() {
@@ -1409,6 +1426,9 @@ impl PutObjectOperation {
     }
 
     fn write_cleanup_row(&mut self, txn_id: Ulid) -> Effects {
+        if let Some(effects) = self.plain_records(txn_id) {
+            return effects;
+        }
         if self.adopted {
             self.state = PutObjectState::CommitTransaction;
             return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
@@ -1749,6 +1769,19 @@ impl Operation for PutObjectOperation {
                 _ => self.emit_error(PutObjectError::InvalidOperationState),
             },
             PutObjectState::WriteBlob => self.handle_write_finished(event),
+            PutObjectState::ClaimPlain => self.plain_claimed(event),
+            PutObjectState::SetAside => self.plain_set_aside(event),
+            PutObjectState::WritePlainRecords => match event {
+                Event::Storage(StorageEvent::BatchWriteResult { .. }) => match self.txn_id {
+                    Some(txn_id) => {
+                        self.state = PutObjectState::CommitTransaction;
+                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                    }
+                    None => self.emit_error(PutObjectError::NoTransactionFound),
+                },
+                Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
+                _ => self.emit_error(PutObjectError::InvalidOperationState),
+            },
             PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
             PutObjectState::WriteCleanupRow => self.handle_cleanup_row(event),
@@ -1806,6 +1839,9 @@ impl Operation for PutObjectOperation {
         }
         if let Some(txn_id) = self.txn_id.take() {
             actions.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
+        }
+        if let Some(id) = self.plain_claim.take() {
+            actions.push(Effect::Blob(BlobEffect::ReleaseReservation { id }));
         }
         actions
     }
@@ -1981,6 +2017,7 @@ mod pure_tests {
             .with_group_inputs(GroupRoutingInputs {
                 default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
                 backend_ids: BTreeSet::from([backend_id]),
+                ..Default::default()
             })
             .with_bucket_rules(Vec::new());
         let mut operation = PutObjectOperation::new(config(snapshot));
@@ -2038,6 +2075,7 @@ mod pure_tests {
             .with_group_inputs(GroupRoutingInputs {
                 default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
                 backend_ids: BTreeSet::from([backend_id]),
+                ..Default::default()
             })
             .with_bucket_rules(Vec::new());
         let mut operation = PutObjectOperation::new(config(snapshot));
@@ -2553,6 +2591,12 @@ mod decision_tests {
         }
     }
 }
+
+mod aside;
+mod plain;
+
+pub use aside::{AsideError, PlainAsideOperation, set_aside};
+pub(crate) use plain::plain_writes;
 
 #[path = "abe.rs"]
 pub(crate) mod abe;
