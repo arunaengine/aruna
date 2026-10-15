@@ -64,6 +64,9 @@ pub struct CreateImportRequest {
     /// omitted uses `{dir}{id}_{name}`.
     #[serde(default)]
     pub write_pattern: Option<String>,
+    /// Also moves the bucket's stored files under `key_prefix` to the write folder.
+    #[serde(default)]
+    pub move_existing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -249,6 +252,9 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
   at the tagged name `<name>~<version id>`.
 - A bucket that turns on compression or encryption later stores new uploads in Aruna's own layout.
 - Nothing runs on creation. Start a run on request or give a `schedule`.
+- With `move_existing` the bucket's files already stored under `key_prefix` move in the
+  background to the paths new uploads get, as `POST /data/buckets/{bucket}/storage/move` with
+  `prefix` = `key_prefix` does. Files already in a linked folder stay where they are.
 - Aruna never deletes imported bytes from the backend. Deleting an object in Aruna only removes
   Aruna's record of it.
 - The rule is node-local.
@@ -341,6 +347,7 @@ pub async fn create_import(
                 .write_pattern
                 .unwrap_or_else(|| DEFAULT_PATTERN.to_string()),
             now: SystemTime::now(),
+            move_existing: request.move_existing,
         }),
         &state.get_ctx(),
     )

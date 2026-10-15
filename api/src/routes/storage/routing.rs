@@ -315,7 +315,8 @@ pub async fn get_bucket_routing(
 - Resolution is most specific first: exact key, then the longest matching `key_prefix` (an empty
   prefix is the bucket default), then the group default, the operator's node rules, and the node's
   default backend.
-- Rules steer writes made after the change; stored objects are never moved.
+- Rules steer writes made after the change. `POST /data/buckets/{bucket}/storage/move` moves
+  stored objects to where the rules send them now.
 - A target this node cannot serve is stored anyway, because the bucket record replicates to nodes
   that may offer it, and comes back in `warnings`.
 
@@ -476,7 +477,8 @@ pub async fn get_group_routing(
 - The submitted value replaces the stored default outright; omitting `default_target` or sending it
   as null clears it and returns the group to the operator's node rules and the node default.
 - The default is weaker than any matching rule on an individual bucket.
-- It steers writes made after the change; stored objects are never moved.
+- It steers writes made after the change. `POST /data/buckets/{bucket}/storage/move` moves
+  stored objects of a bucket to where the rules send them now.
 - A target this node cannot serve is stored anyway, because the record replicates to nodes that may
   offer it, and comes back in `warnings`.
 - A group storage without a fixed bucket takes Aruna's own layout in `bucket`. The bucket is found or

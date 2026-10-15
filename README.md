@@ -173,15 +173,19 @@ the group's Storage tab with the endpoint and keys; it needs no bucket. Then add
 - **Default rule.** New uploads of all the group's buckets go into one bucket of your storage, in
   Aruna's own layout. Aruna finds or creates the bucket when you save the rule and never reads it
   back. A group has at most one default rule. "Use as default" on Aruna storage sends new uploads
-  to the node again; files already in your storage stay there.
+  to the node again; files already stored stay where they are until you move them.
 - **Linked buckets.** A bucket (or folder) in Aruna and a bucket (or folder) in your storage show
   the same files both ways: a run imports files found there, and new uploads are stored there
   under their own names. Aruna never deletes them.
 - **No overlaps.** Two linked rules may not share folders of one bucket, and no linked rule may use
   the default rule's bucket. Paths in your storage are at most 1024 bytes long.
+- **Move files.** Moving a bucket copies its stored files to where the rules send new uploads
+  now, then deletes the old copies. A new linked rule can move the folder's files at once.
+  Encrypted buckets cannot move yet.
 
 `PUT /data/groups/{group_id}/storage/routing` sets the default rule; linked rules live under
-`/data/groups/{group_id}/storage/imports`.
+`/data/groups/{group_id}/storage/imports`; `/data/buckets/{bucket}/storage/move` counts and moves
+stored files.
 
 ## Realm Registry
 

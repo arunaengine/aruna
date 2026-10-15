@@ -13,3 +13,4 @@ pub mod encryption;
 pub mod group_backends;
 pub mod imports;
 pub mod routing;
+pub mod storage_move;
