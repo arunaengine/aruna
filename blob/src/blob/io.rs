@@ -1384,6 +1384,24 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
+        let sources = parts
+            .into_iter()
+            .map(|part| {
+                let range = 0..part.blob_size;
+                (part, range)
+            })
+            .collect();
+        Box::pin(self.compose_into(template, resolved, sources)).await
+    }
+
+    /// Composes `parts`, each a byte range of a part's original bytes, into a new copy at the
+    /// template's path.
+    pub(super) async fn compose_into(
+        &self,
+        template: BackendLocation,
+        resolved: ResolvedBackend,
+        parts: Vec<(BackendLocation, Range<u64>)>,
+    ) -> BlobEvent {
         let Some(mut reservation) = self.hold_reservation(template.ulid) else {
             return BlobEvent::Error(BlobError::WriteError(
                 "too many active blob reservations".to_string(),
@@ -1411,14 +1429,14 @@ impl BlobHandler {
                 return BlobEvent::Error(err);
             }
         };
-        let total = parts.iter().map(|part| part.blob_size).sum();
+        let total = parts.iter().map(|(_, range)| range.end - range.start).sum();
         // Decoded frames do not keep the stored part bounds, so they stream in chunks too.
         let framed = resolved.compression != Compression::Off
             || parts
                 .iter()
-                .any(|part| matches!(part.format.layout, StoredLayout::Frames(_)));
+                .any(|(part, _)| matches!(part.format.layout, StoredLayout::Frames(_)));
         let chunk = compose_chunk(&backend_type, total, framed);
-        let composed = self.compose_parts(
+        let composed = self.compose_ranges(
             location.clone(),
             operator,
             parts,
@@ -1450,9 +1468,30 @@ impl BlobHandler {
 
     pub(super) async fn compose_parts(
         &self,
-        mut location: BackendLocation,
+        location: BackendLocation,
         operator: Operator,
         parts: Vec<BackendLocation>,
+        chunk: Option<usize>,
+        compression: Compression,
+        if_not_exists: bool,
+    ) -> BlobEvent {
+        let parts = parts
+            .into_iter()
+            .map(|part| {
+                let range = 0..part.blob_size;
+                (part, range)
+            })
+            .collect();
+        let composed =
+            self.compose_ranges(location, operator, parts, chunk, compression, if_not_exists);
+        Box::pin(composed).await
+    }
+
+    async fn compose_ranges(
+        &self,
+        mut location: BackendLocation,
+        operator: Operator,
+        parts: Vec<(BackendLocation, Range<u64>)>,
         chunk: Option<usize>,
         compression: Compression,
         if_not_exists: bool,
@@ -1505,13 +1544,13 @@ impl BlobHandler {
         let mut abandoned = false;
         let compose_result: Result<(u64, Option<FrameLayout>), BlobError> = async {
             let mut bytes_written = 0u64;
-            for part in parts {
+            for (part, range) in parts {
                 // A framed part is read as its original bytes, never as stored frames.
                 let mut reader = match &part.format.layout {
                     StoredLayout::Frames(layout) => {
-                        self.frames_stream(&part, layout, 0..part.blob_size).await?
+                        self.frames_stream(&part, layout, range).await?
                     }
-                    _ => self.compose_reader(&part).await?,
+                    _ => self.compose_reader(&part, range).await?,
                 };
                 // Without a chunk the whole part is written at once so it keeps its own boundary.
                 let mut part_chunks = Vec::new();
@@ -1626,6 +1665,7 @@ impl BlobHandler {
     async fn compose_reader(
         &self,
         part: &BackendLocation,
+        range: Range<u64>,
     ) -> Result<BackendStream<Result<Bytes, StreamError>>, BlobError> {
         let part_operator = self.operator_from_location(part)?;
         let part_storage_path = part.get_storage_path()?;
@@ -1633,7 +1673,7 @@ impl BlobHandler {
             .await
             .map_err(|_| BlobError::ReadError("timed out opening compose reader".to_string()))?
             .map_err(|err| BlobError::ReadError(err.to_string()))?;
-        let reader = timeout(self.io_timeout(), reader.into_bytes_stream(..))
+        let reader = timeout(self.io_timeout(), reader.into_bytes_stream(range))
             .await
             .map_err(|_| BlobError::ReadError("timed out starting compose reader".to_string()))?
             .map_err(|err| BlobError::ReadError(err.to_string()))?;
