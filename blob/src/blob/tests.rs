@@ -3041,7 +3041,7 @@ async fn s3_provider_upload() {
         .concat();
 
     let BlobEvent::WriteFinished { location } = handler
-        .complete_upload(upload.clone(), listed.clone(), &[])
+        .complete_upload(upload.clone(), listed.clone(), &[], Compression::Off)
         .await
     else {
         panic!("in-place completion failed")
@@ -3051,8 +3051,9 @@ async fn s3_provider_upload() {
     assert_eq!(read_back(&handler, location.clone()).await, expected);
 
     // A repeated completion whose first answer was lost finds the object and hashes it again.
-    let BlobEvent::WriteFinished { location: again } =
-        handler.complete_upload(upload.clone(), listed, &[]).await
+    let BlobEvent::WriteFinished { location: again } = handler
+        .complete_upload(upload.clone(), listed, &[], Compression::Off)
+        .await
     else {
         panic!("repeated completion failed")
     };
@@ -3061,7 +3062,9 @@ async fn s3_provider_upload() {
     // A lost completion of another selection of the same size is not this object.
     let other = vec![parts[&1].clone(), parts[&3].clone(), parts[&4].clone()];
     assert!(matches!(
-        handler.complete_upload(upload, other, &[]).await,
+        handler
+            .complete_upload(upload, other, &[], Compression::Off)
+            .await,
         BlobEvent::Error(_)
     ));
 }
@@ -3154,7 +3157,7 @@ async fn s3_staged_replacement() {
     };
 
     let BlobEvent::WriteFinished { location } = handler
-        .complete_upload(upload, vec![staged, last], &[])
+        .complete_upload(upload, vec![staged, last], &[], Compression::Off)
         .await
     else {
         panic!("completion with a staged part failed")
@@ -3403,7 +3406,7 @@ async fn s3_overlapping_writes() {
     };
 
     let BlobEvent::WriteFinished { location } = handler
-        .complete_upload(upload, vec![staged, last], &[])
+        .complete_upload(upload, vec![staged, last], &[], Compression::Off)
         .await
     else {
         panic!("completion failed")
@@ -3466,7 +3469,7 @@ async fn s3_delayed_write() {
 
     let last = in_place_part(&handler, &upload, 2, b"tail").await;
     let BlobEvent::WriteFinished { location } = handler
-        .complete_upload(upload, vec![accepted, last], &[])
+        .complete_upload(upload, vec![accepted, last], &[], Compression::Off)
         .await
     else {
         panic!("completion of the acknowledged parts failed")

@@ -251,6 +251,7 @@ impl BlobHandler {
         parts: &[MultipartPart],
         level: u8,
         streamed: &[u16],
+        compression: Compression,
     ) -> Result<Finished, BlobError> {
         let Some(last) = parts.last() else {
             return Err(BlobError::WriteError(
@@ -309,7 +310,8 @@ impl BlobHandler {
         let (table, layout) = writer.finish()?;
         let table = Bytes::from(table);
         if !plan_runs(&mut steps, &table, &occupied) {
-            let composed = Box::pin(self.compose_fallback(upload, parts, level)).await?;
+            let fallback = self.compose_fallback(upload, parts, level, compression);
+            let composed = Box::pin(fallback).await?;
             return Ok(Finished::Composed(Box::new(composed)));
         }
         let native = self.native_upload(&upload.location)?;
@@ -347,13 +349,14 @@ impl BlobHandler {
         Ok(Finished::Framed(layout))
     }
 
-    /// Completes the listed streamed parts as an object of their own, then composes it with the
-    /// staged parts into a new copy, reading both as original bytes in bounded chunks.
+    /// Completes the listed streamed parts as an object of their own at the opening `level`, then
+    /// composes it with the staged parts into a new copy with the bucket's current `compression`.
     async fn compose_fallback(
         &self,
         upload: &BackendUpload,
         parts: &[MultipartPart],
         level: u8,
+        compression: Compression,
     ) -> Result<BackendLocation, BlobError> {
         let mut writer = FrameWriter::new(level);
         let mut etags = Vec::new();
@@ -425,7 +428,7 @@ impl BlobHandler {
         };
         let backend = upload.location.backend.clone();
         let resolved = ResolvedBackend::new(backend, upload.location.storage_class.clone())
-            .with_compression(Compression::Zstd { level });
+            .with_compression(compression);
         match Box::pin(self.compose_into(template, resolved, sources)).await {
             BlobEvent::WriteFinished { location } => Ok(location),
             BlobEvent::Error(error) => Err(error),

@@ -461,13 +461,15 @@ impl BlobHandler {
         upload: BackendUpload,
         parts: Vec<MultipartPart>,
         streamed: &[u16],
+        compression: Compression,
     ) -> BlobEvent {
         let Some(mut reservation) = self.hold_reservation(upload.location.ulid) else {
             return BlobEvent::Error(BlobError::WriteError(
                 "too many active blob reservations".to_string(),
             ));
         };
-        match Box::pin(self.finish_upload(&upload, &parts, streamed)).await {
+        let finished = self.finish_upload(&upload, &parts, streamed, compression);
+        match Box::pin(finished).await {
             Ok(location) => {
                 self.chains().remove(&upload.upload_id);
                 reservation.retain();
@@ -490,6 +492,7 @@ impl BlobHandler {
         upload: &BackendUpload,
         parts: &[MultipartPart],
         streamed: &[u16],
+        compression: Compression,
     ) -> Result<BackendLocation, BlobError> {
         let mut listed = Vec::with_capacity(parts.len());
         let mut etags = Vec::with_capacity(parts.len());
@@ -529,7 +532,8 @@ impl BlobHandler {
             ..upload.location.clone()
         };
         if let Some(level) = part_level(upload) {
-            match Box::pin(self.finish_framed(upload, parts, level, streamed)).await? {
+            let finished = self.finish_framed(upload, parts, level, streamed, compression);
+            match Box::pin(finished).await? {
                 Finished::Framed(layout) => {
                     location.format.layout = StoredLayout::Frames(Box::new(layout));
                 }

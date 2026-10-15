@@ -681,6 +681,7 @@ fn completes_at_provider() {
             backend_upload,
             parts,
             streamed,
+            compression,
         }),
     ] = effects.as_slice()
     else {
@@ -689,6 +690,7 @@ fn completes_at_provider() {
     assert_eq!(backend_upload.location, target);
     assert_eq!(parts, &op.resolved_parts);
     assert_eq!(streamed, &vec![2]);
+    assert_eq!(compression, &op.compression);
 }
 
 #[test]

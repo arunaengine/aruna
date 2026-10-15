@@ -27,6 +27,7 @@ use crate::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, HiddenBlobKey, ResolvedBackend,
 };
 use crate::structs::storage::encryption::{BucketKeyRef, CopyTarget, KeyTicket, ReadLease};
+use crate::structs::storage::format::Compression;
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use crate::structs::storage::multipart::{BackendUpload, MultipartPart, WorkingShare};
 use crate::structs::storage::usage::UsageDelta;
@@ -93,6 +94,8 @@ pub enum BlobEffect {
         parts: Vec<MultipartPart>,
         /// Numbers of every streamed provider part, listed or not; completion never replaces one.
         streamed: Vec<u16>,
+        /// The bucket's setting at completion, which a copy composed instead applies.
+        compression: Compression,
     },
     AbortUpload {
         backend_upload: Box<BackendUpload>,

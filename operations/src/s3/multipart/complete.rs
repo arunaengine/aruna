@@ -1046,6 +1046,7 @@ impl CompleteUploadOperation {
                 backend_upload: Box::new(backend_upload),
                 parts: self.resolved_parts.clone(),
                 streamed: streamed.map(|part| part.part_number).collect(),
+                compression: self.compression,
             })];
         }
         let parts = self

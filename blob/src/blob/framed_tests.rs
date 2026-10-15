@@ -8,7 +8,7 @@ use crate::codec::PART_MIN;
 use crate::hash::Hasher;
 use aruna_core::events::BlobEvent;
 use aruna_core::structs::storage::blob::{BackendLocation, ResolvedBackend};
-use aruna_core::structs::storage::format::{Compression, StoredLayout};
+use aruna_core::structs::storage::format::{Compression, EncodingClass, StoredLayout};
 use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};
 use futures::TryStreamExt;
 use std::ops::Range;
@@ -16,9 +16,10 @@ use std::time::SystemTime;
 use ulid::Ulid;
 
 const MIB: usize = 1 << 20;
+const ZSTD: Compression = Compression::Zstd { level: 3 };
 
 fn framed() -> ResolvedBackend {
-    cold_backend().with_compression(Compression::Zstd { level: 3 })
+    cold_backend().with_compression(ZSTD)
 }
 
 /// Repeated text, which compresses to a few KiB per MiB.
@@ -161,7 +162,7 @@ async fn s3_framed_parts() {
     let listed = vec![one, two, three];
 
     let event = handler
-        .complete_upload(upload.clone(), listed.clone(), &[])
+        .complete_upload(upload.clone(), listed.clone(), &[], ZSTD)
         .await;
     let BlobEvent::WriteFinished { location } = event else {
         panic!("compressed completion failed: {event:?}")
@@ -173,7 +174,7 @@ async fn s3_framed_parts() {
 
     // A repeated completion whose first answer was lost finds the object by its seek table.
     let BlobEvent::WriteFinished { location: again } =
-        handler.complete_upload(upload, listed, &[]).await
+        handler.complete_upload(upload, listed, &[], ZSTD).await
     else {
         panic!("repeated completion failed")
     };
@@ -205,7 +206,7 @@ async fn s3_framed_table() {
     assert!(three.location.partial);
 
     let event = handler
-        .complete_upload(upload.clone(), vec![one, two, three], &[])
+        .complete_upload(upload.clone(), vec![one, two, three], &[], ZSTD)
         .await;
     let BlobEvent::WriteFinished { location } = event else {
         panic!("compressed completion failed: {event:?}")
@@ -228,7 +229,7 @@ async fn s3_decoded_compose() {
     let data = text(20 * MIB, b"decoded part ");
     let part = put(&handler, &upload, 1, &data).await;
     let BlobEvent::WriteFinished { location: framed } =
-        handler.complete_upload(upload, vec![part], &[]).await
+        handler.complete_upload(upload, vec![part], &[], ZSTD).await
     else {
         panic!("compressed completion failed")
     };
@@ -299,13 +300,16 @@ async fn s3_framed_fallback() {
     let [(one, first), (two, second), (three, third)] =
         staged_around(&handler, &upload, [20 * MIB, 6 * MIB]).await;
 
+    // The bucket level changed since the upload opened: the new copy takes the current one.
+    let current = Compression::Zstd { level: 5 };
     let event = handler
-        .complete_upload(upload.clone(), vec![one, two, three], &[2])
+        .complete_upload(upload.clone(), vec![one, two, three], &[2], current)
         .await;
     let BlobEvent::WriteFinished { location } = event else {
         panic!("fallback completion failed: {event:?}")
     };
     assert!(!location.same_object(&upload.location));
+    assert_eq!(location.format.encoding(), EncodingClass::from(current));
     let expected = [first.as_slice(), &second, &third].concat();
     let borders = [first.len() as u64, (first.len() + second.len()) as u64];
     assert_reads(&handler, &location, &expected, &borders).await;
@@ -323,17 +327,23 @@ async fn s3_omitted_part() {
     let [(one, first), (two, second), (three, third)] =
         staged_around(&handler, &upload, [10 * MIB, 10 * MIB]).await;
 
+    // Compression was turned off since the upload opened: the new copy keeps original bytes.
     let listed = vec![one.clone(), three.clone()];
-    let event = handler.complete_upload(upload.clone(), listed, &[2]).await;
+    let off = Compression::Off;
+    let event = handler
+        .complete_upload(upload.clone(), listed, &[2], off)
+        .await;
     let BlobEvent::WriteFinished { location } = event else {
         panic!("fallback completion failed: {event:?}")
     };
     assert!(!location.same_object(&upload.location));
+    assert_eq!(location.format.layout, StoredLayout::Raw);
     let expected = [first.as_slice(), &third].concat();
-    assert_reads(&handler, &location, &expected, &[first.len() as u64]).await;
+    assert_eq!(location.hashes, Hasher::new_with_bytes(&expected).to_map());
+    assert_eq!(read_back(&handler, location.clone()).await, expected);
 
     let event = handler
-        .complete_upload(upload.clone(), vec![one, two, three], &[2])
+        .complete_upload(upload.clone(), vec![one, two, three], &[2], ZSTD)
         .await;
     let BlobEvent::WriteFinished { location } = event else {
         panic!("completion with the omitted part failed: {event:?}")
