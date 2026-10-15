@@ -712,7 +712,7 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
 }}"#
     );
 
-    // The create's background drain may commit alongside; a client retries the conflict.
+    // The create's background drain may commit alongside; the write succeeds on a retry.
     let mut updated = None;
     for _ in 0..CONFLICT_ATTEMPTS {
         let outcome = drive(
