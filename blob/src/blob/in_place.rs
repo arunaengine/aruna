@@ -550,11 +550,7 @@ impl BlobHandler {
         if offset < total {
             let mut stream = match &location.format.layout {
                 StoredLayout::Frames(layout) => {
-                    match Box::pin(self.read_frames(&location, layout, offset..total)).await {
-                        BlobEvent::ReadFinished { blob, .. } => blob,
-                        BlobEvent::Error(error) => return Err(error),
-                        _ => return Err(BlobError::ReadError("unexpected frame read".into())),
-                    }
+                    self.frames_stream(&location, layout, offset..total).await?
                 }
                 _ => {
                     let late = |what: &str| BlobError::ReadError(format!("timed out {what}"));

@@ -1502,22 +1502,13 @@ impl BlobHandler {
         let compose_result: Result<(u64, Option<FrameLayout>), BlobError> = async {
             let mut bytes_written = 0u64;
             for part in parts {
-                let part_operator = self.operator_from_location(&part)?;
-                let part_storage_path = part.get_storage_path()?;
-                let reader = timeout(self.io_timeout(), part_operator.reader(&part_storage_path))
-                    .await
-                    .map_err(|_| {
-                        BlobError::ReadError("timed out opening compose reader".to_string())
-                    })?
-                    .map_err(|err| BlobError::ReadError(err.to_string()))?;
-                let reader = timeout(self.io_timeout(), reader.into_bytes_stream(..))
-                    .await
-                    .map_err(|_| {
-                        BlobError::ReadError("timed out starting compose reader".to_string())
-                    })?
-                    .map_err(|err| BlobError::ReadError(err.to_string()))?;
-
-                let mut reader = BackendStream::new(reader);
+                // A framed part is read as its original bytes, never as stored frames.
+                let mut reader = match &part.format.layout {
+                    StoredLayout::Frames(layout) => {
+                        self.frames_stream(&part, layout, 0..part.blob_size).await?
+                    }
+                    _ => self.compose_reader(&part).await?,
+                };
                 // Without a chunk the whole part is written at once so it keeps its own boundary.
                 let mut part_chunks = Vec::new();
                 let mut part_size = 0u64;
@@ -1625,6 +1616,24 @@ impl BlobHandler {
             return BlobEvent::PlainWritten { location, version };
         }
         BlobEvent::WriteFinished { location }
+    }
+
+    /// The stored bytes of one part to compose.
+    async fn compose_reader(
+        &self,
+        part: &BackendLocation,
+    ) -> Result<BackendStream<Result<Bytes, StreamError>>, BlobError> {
+        let part_operator = self.operator_from_location(part)?;
+        let part_storage_path = part.get_storage_path()?;
+        let reader = timeout(self.io_timeout(), part_operator.reader(&part_storage_path))
+            .await
+            .map_err(|_| BlobError::ReadError("timed out opening compose reader".to_string()))?
+            .map_err(|err| BlobError::ReadError(err.to_string()))?;
+        let reader = timeout(self.io_timeout(), reader.into_bytes_stream(..))
+            .await
+            .map_err(|_| BlobError::ReadError("timed out starting compose reader".to_string()))?
+            .map_err(|err| BlobError::ReadError(err.to_string()))?;
+        Ok(BackendStream::new(reader))
     }
 
     /// A timeout drops the write mid-poll, so the writer is marked abandoned.

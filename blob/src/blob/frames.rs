@@ -9,7 +9,7 @@ use crate::bao_tree::OpenDalReader;
 use crate::codec::{self, FrameIndex};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
-use aruna_core::stream::BackendStream;
+use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::format::{FrameLayout, StoredLayout};
 use bytes::{Bytes, BytesMut};
@@ -277,6 +277,20 @@ impl BlobHandler {
                 }
             }
             Err(error) => BlobEvent::Error(error),
+        }
+    }
+
+    /// The original bytes in `range` of a framed copy as a stream.
+    pub(super) async fn frames_stream(
+        &self,
+        location: &BackendLocation,
+        layout: &FrameLayout,
+        range: Range<u64>,
+    ) -> Result<BackendStream<Result<Bytes, StreamError>>, BlobError> {
+        match Box::pin(self.read_frames(location, layout, range)).await {
+            BlobEvent::ReadFinished { blob, .. } => Ok(blob),
+            BlobEvent::Error(error) => Err(error),
+            _ => Err(BlobError::ReadError("unexpected frame read".to_string())),
         }
     }
 
