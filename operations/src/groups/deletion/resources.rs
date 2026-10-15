@@ -13,6 +13,7 @@ use aruna_core::structs::identity::group_delete::GroupDeletionError;
 use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
+use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::GroupStorageRouting;
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -47,6 +48,8 @@ pub(super) struct EmptyCheck {
     table: usize,
     pending: bool,
     next: Option<Key>,
+    /// Every kind of resource found so far; the check names them all.
+    found: Vec<&'static str>,
 }
 
 impl EmptyCheck {
@@ -57,6 +60,7 @@ impl EmptyCheck {
             table: 0,
             pending: false,
             next: None,
+            found: Vec::new(),
         }
     }
 
@@ -94,7 +98,9 @@ impl EmptyCheck {
                 let record: MetadataEventRecord = postcard::from_bytes(&value)
                     .map_err(|error| GroupDeletionError::Unavailable(error.to_string()))?;
                 if record.record.group_id == self.group_id {
-                    return Err(GroupDeletionError::NotEmpty(reason.into()));
+                    self.found.push(reason);
+                    self.next = None;
+                    break;
                 }
             }
         } else {
@@ -137,8 +143,11 @@ impl EmptyCheck {
                         matches!(pending.envelope.record, JobFamilyRecord::Spec(spec) if spec.group_id == self.group_id)
                     }
                     S3_BUCKET_KEYSPACE => BucketInfo::from_bytes(&value)?.group_id == self.group_id,
+                    // A disabled `retain` backend keeps its bytes in tenant storage; the commit drops it.
                     STORAGE_BACKEND_KEYSPACE => {
-                        GroupStorage::from_bytes(&value)?.group_id == self.group_id
+                        let record = GroupStorage::from_bytes(&value)?;
+                        record.group_id == self.group_id
+                            && !(record.disabled && record.cleanup == CleanupStrategy::Retain)
                     }
                     USER_ACCESS_KEYSPACE => {
                         let record = UserAccess::from_bytes(&value)?;
@@ -162,13 +171,54 @@ impl EmptyCheck {
                     _ => prefix,
                 };
                 if owned {
-                    return Err(GroupDeletionError::NotEmpty(reason.into()));
+                    self.found.push(reason);
+                    self.next = None;
+                    break;
                 }
             }
         }
         if self.next.is_none() {
             self.table += 1;
         }
-        Ok((self.table < TABLES.len()).then(|| self.start(txn_id)))
+        if self.table < TABLES.len() {
+            return Ok(Some(self.start(txn_id)));
+        }
+        match self.found.split_last() {
+            None => Ok(None),
+            Some((last, [])) => Err(GroupDeletionError::NotEmpty((*last).into())),
+            Some((last, rest)) => Err(GroupDeletionError::NotEmpty(format!(
+                "{} and {last}",
+                rest.join(", ")
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_every_kind() {
+        let group_id = ulid::Ulid::from_bytes([1u8; 16]);
+        let txn_id = TxnId::default();
+        let mut check = EmptyCheck::new(group_id, SystemTime::UNIX_EPOCH);
+        let mut result = Ok(None);
+        for table in 0..TABLES.len() {
+            // The first two tables are scoped by group, so any row there is owned.
+            let values = match table < 2 {
+                true => vec![(Key::from(vec![1]), vec![0].into())],
+                false => Vec::new(),
+            };
+            let event = Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after: None,
+            });
+            result = check.step(event, txn_id);
+        }
+        let Err(GroupDeletionError::NotEmpty(reason)) = result else {
+            panic!("expected a non-empty group, got {result:?}");
+        };
+        assert_eq!(reason, "metadata documents and source connectors");
     }
 }

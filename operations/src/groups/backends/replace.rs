@@ -162,13 +162,14 @@ impl ReplaceBackendOperation {
     /// Reading the record again inside the write transaction serializes the
     /// update against a concurrent disable, which the probe is too slow to see.
     fn handle_verified(&mut self, event: Event) -> Effects {
-        let disabled = match parse_read(event, GroupStorage::from_bytes) {
-            Ok(Some(record)) if record.group_id == self.input.group_id => record.disabled,
+        let verified = match parse_read(event, GroupStorage::from_bytes) {
+            Ok(Some(record)) if record.group_id == self.input.group_id => record,
             Ok(_) => return self.fail(CreateBackendError::NotFound),
             Err(error) => return self.fail(CreateBackendError::Read(error)),
         };
         if let Some(record) = self.record.as_mut() {
-            record.disabled = disabled;
+            record.disabled = verified.disabled;
+            record.public_config.extend(verified.managed_config());
         }
 
         let Some(record) = self.record.as_ref() else {
@@ -470,6 +471,28 @@ mod pure_tests {
         commit_update(&mut operation, stored);
 
         assert!(operation.finalize().unwrap().disabled);
+    }
+
+    #[test]
+    fn update_keeps_managed() {
+        // The default bucket comes from the record read in the transaction, not the request.
+        let group_id = Ulid::from_bytes([1u8; 16]);
+        let backend_id = Ulid::from_bytes([9u8; 16]);
+        let mut stored = existing(group_id, backend_id);
+        stored
+            .public_config
+            .insert("default_bucket".to_string(), "lab-default".to_string());
+        let mut operation = ReplaceBackendOperation::new(backend_id, input(group_id));
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(existing(group_id, backend_id).to_bytes().unwrap().into()),
+        }));
+
+        commit_update(&mut operation, stored);
+
+        let record = operation.finalize().unwrap();
+        assert_eq!(record.default_bucket(), Some("lab-default"));
     }
 
     #[test]

@@ -81,7 +81,12 @@ impl BlobHandler {
             storage_class: resolved.storage_class.clone(),
             root,
             storage_bucket: multipart_bucket.clone(),
-            backend_path: build_part_path(part.upload_id, part.part_number, ulid),
+            backend_path: build_part_path(
+                self.registry.splits(&resolved.backend),
+                part.upload_id,
+                part.part_number,
+                ulid,
+            ),
             ulid,
             format: StoredFormat::default(),
             created_by,
@@ -144,7 +149,7 @@ impl BlobHandler {
         blob: BackendStream<Result<Bytes, StreamError>>,
         share: &Share,
     ) -> Result<(BackendLocation, Piece), BlobError> {
-        let path = location.get_storage_path()?;
+        let path = self.object_path(&location)?;
         let (mut writer, mut abandoned) = (None, false);
         let mut hasher = Hasher::new();
         let sealed = self
@@ -366,7 +371,7 @@ impl BlobHandler {
         parts: &[MultipartPart],
     ) -> Result<(), BlobError> {
         let operator = self.operator_from_location(location)?;
-        let path = location.get_storage_path()?;
+        let path = self.object_path(location)?;
         let backend = self.registry.config_for(&location.backend)?.backend_type;
         let chunk = compose_chunk(&backend, composition.archive_len(), true);
         let opened = match chunk {
@@ -446,7 +451,7 @@ impl BlobHandler {
         part: &BackendLocation,
     ) -> Result<u64, BlobError> {
         let operator = self.operator_from_location(part)?;
-        let path = part.get_storage_path()?;
+        let path = self.object_path(part)?;
         let read_error = |error: opendal::Error| BlobError::ReadError(error.to_string());
         let opening = async {
             let reader = operator.reader(&path).await.map_err(read_error)?;

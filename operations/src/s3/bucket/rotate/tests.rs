@@ -409,7 +409,7 @@ fn concurrent_put_converted() {
 #[test]
 fn combined_settings_atomic() {
     let change = KeyChange::Settings {
-        mode: EncryptionMode::NodeManaged,
+        mode: EncryptionMode::VaultLocked,
         cipher: BlockCipher::Aes256Gcm,
         block_keys: BlockKeys::default(),
     };
@@ -417,13 +417,36 @@ fn combined_settings_atomic() {
     operation.input.max_unlock_ms = Some(Some(60_000));
     let writes = rows(&loaded(
         &mut operation,
-        EncryptionMode::NodeManaged,
+        EncryptionMode::VaultLocked,
         Vec::new(),
     ));
     let stored = BucketEncryption::from_bytes(&row(&writes, BUCKET_ENCRYPTION_KEYSPACE)).unwrap();
     assert_eq!(stored.cipher, BlockCipher::Aes256Gcm);
     assert_eq!(stored.max_unlock_ms, Some(60_000));
     assert_eq!(stored.storage_generation, 5);
+}
+
+#[test]
+fn managed_refuses_limit() {
+    let mut operation = operation(settings_change(EncryptionMode::NodeManaged));
+    operation.input.max_unlock_ms = Some(Some(60_000));
+
+    operation.start();
+    operation.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: TxnId::default(),
+    }));
+    let current = settings(EncryptionMode::NodeManaged);
+    let values = authority_rows(&info(), Some(&current), &[admin()]);
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    assert_eq!(
+        operation.finalize(),
+        Err(ChangeError::Key(BucketKeyError::ManagedLimit))
+    );
 }
 
 #[test]

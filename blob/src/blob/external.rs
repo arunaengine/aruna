@@ -43,7 +43,22 @@ impl BlobHandler {
         start_after: Option<&str>,
         limit: usize,
     ) -> Result<BlobEvent, BlobError> {
-        let operator = self.registry.bucket_operator(backend, "", &self.egress)?;
+        // A storage without a bucket lists one bucket; its keys keep the bucket in front.
+        let (bucket, prefix) = match self.registry.splits(backend) {
+            true => match prefix.split_once('/') {
+                Some((bucket, rest)) if !bucket.is_empty() => (bucket, rest),
+                _ => return Err(list_error("the folder names no bucket")),
+            },
+            false => ("", prefix),
+        };
+        let scope = match bucket {
+            "" => String::new(),
+            bucket => format!("{bucket}/"),
+        };
+        let start_after = start_after.map(|after| after.strip_prefix(&scope).unwrap_or(after));
+        let operator = self
+            .registry
+            .bucket_operator(backend, bucket, &self.egress)?;
         let ordered = operator.info().capability().list_with_start_after;
         let mut request = operator.lister_with(prefix).recursive(true);
         if ordered && let Some(start_after) = start_after {
@@ -69,7 +84,7 @@ impl BlobHandler {
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                 .map(|since| since.as_millis() as u64);
             let object = ExternalObject {
-                key: entry.path().to_string(),
+                key: format!("{scope}{}", entry.path()),
                 size: metadata.content_length(),
                 etag: metadata.etag().map(str::to_string),
                 modified_ms,
@@ -128,7 +143,7 @@ impl BlobHandler {
             hashes: HashMap::new(),
         };
         let operator = self.operator_from_location(&location)?;
-        let storage_path = location.get_storage_path()?;
+        let storage_path = self.object_path(&location)?;
         let read_error = |error: &str| BlobError::ReadError(error.to_string());
         let open_error = |error: opendal::Error| match error.kind() {
             opendal::ErrorKind::NotFound => BlobError::Unreadable(error.to_string()),

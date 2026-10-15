@@ -218,8 +218,13 @@ jobs:
           | test(=blob::tests::s3_provider_upload) | test(=blob::tests::s3_provider_abort)
           | test(=blob::tests::s3_abort_streaming) | test(=blob::tests::s3_staged_replacement)
           | test(=blob::tests::s3_cancelled_write) | test(=blob::tests::s3_overlapping_writes)
-          | test(=blob::tests::s3_delayed_write))
-          | (package(aruna-operations) & binary(multipart) & test(=s3_provider_flow))'
+          | test(=blob::tests::s3_delayed_write) | test(=blob::tests::framed::s3_framed_parts)
+          | test(=blob::tests::framed::s3_framed_table) | test(=blob::tests::framed::s3_decoded_compose)
+          | test(=blob::tests::framed::s3_framed_fallback) | test(=blob::tests::framed::s3_omitted_part)
+          | test(=blob::tests::framed::s3_completion_budget)
+          | test(=blob::tests::framed::s3_bucketless_framed))
+          | (package(aruna-operations) & binary(multipart)
+          & (test(=s3_provider_flow) | test(=s3_framed_completion)))'
 
   docker-backend:
     runs-on: ubuntu-latest

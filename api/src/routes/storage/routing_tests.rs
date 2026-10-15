@@ -104,6 +104,7 @@ async fn group_default_roundtrip() {
         Extension(Some(test.auth.clone())),
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
+            bucket: None,
             default_target: Some(RoutingTargetRequest {
                 backend_id: None,
                 class: Some("cold".to_string()),
@@ -125,6 +126,7 @@ async fn group_default_roundtrip() {
         Extension(Some(test.auth.clone())),
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
+            bucket: None,
             default_target: None,
         }),
     )
@@ -142,6 +144,7 @@ async fn rejects_invalid_class() {
         Extension(Some(test.auth.clone())),
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
+            bucket: None,
             default_target: Some(RoutingTargetRequest {
                 backend_id: None,
                 class: Some("NOT VALID".to_string()),
@@ -151,6 +154,28 @@ async fn rejects_invalid_class() {
     .await;
 
     assert!(matches!(result, Err(ServerError::BadRequestReason(_))));
+}
+
+#[tokio::test]
+async fn bucket_needs_storage() {
+    // A default bucket only means something on one of the group's storages.
+    let test = setup_state().await;
+
+    let result = put_group_routing(
+        State(test.state.clone()),
+        Extension(Some(test.auth.clone())),
+        Path(test.group_id.to_string()),
+        Json(GroupRoutingRequest {
+            bucket: Some("lab-default".to_string()),
+            default_target: Some(RoutingTargetRequest {
+                backend_id: None,
+                class: Some("cold".to_string()),
+            }),
+        }),
+    )
+    .await;
+
+    assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
 }
 
 #[tokio::test]

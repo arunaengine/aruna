@@ -11,9 +11,10 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE};
 use aruna_core::structs::storage::blob::{
-    Backend, BackendBucket, BackendLocation, BackendRef, BlobCleanupWork, HIDDEN_BLOB_PREFIX,
-    HiddenBlobKey, MULTIPART_PART_PREFIX, ensure_confined_path,
+    Backend, BackendBucket, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork,
+    HIDDEN_BLOB_PREFIX, HiddenBlobKey, MULTIPART_PART_PREFIX, ensure_confined_path,
 };
+use aruna_core::structs::storage::group_backend::{DEFAULT_BUCKET, MAX_KEY_LEN, PARTS_PREFIX};
 use aruna_core::types::TxnId;
 use aruna_storage::storage::TransactionOwner;
 use byteview::ByteView;
@@ -141,8 +142,8 @@ impl BlobHandler {
         skip: &[String],
     ) -> Result<String, BlobError> {
         let config = self.registry.config_for(backend)?.clone();
-        if let Some(bucket) = config.service_config.get("bucket") {
-            return Ok(bucket.clone());
+        if let Some(bucket) = fixed_bucket(&config)? {
+            return Ok(bucket);
         }
 
         let buckets = self
@@ -677,8 +678,8 @@ impl BlobHandler {
     }
 
     pub(super) fn stats_managed(&self, backend: &BackendRef, bucket: &str) -> bool {
-        // A path of a tenant's own folders belongs to no Aruna bucket.
-        if bucket.is_empty() && matches!(backend, BackendRef::Group(_)) {
+        // Group storages keep no bucket stats: Aruna writes to one bucket or a tenant path.
+        if matches!(backend, BackendRef::Group(_)) {
             return false;
         }
         self.registry
@@ -1169,12 +1170,19 @@ impl BlobHandler {
         &self,
         location: &BackendLocation,
     ) -> Result<Operator, BlobError> {
-        self.registry.operator_for(
-            &location.backend,
-            &location.root,
-            &location.storage_bucket,
-            &self.egress,
-        )
+        let bucket = if self.registry.splits(&location.backend) {
+            split_location(location)?.0
+        } else {
+            location.storage_bucket.clone()
+        };
+        self.registry
+            .operator_for(&location.backend, &location.root, &bucket, &self.egress)
+    }
+
+    /// The path of `location` below its operator's root. A group storage refuses keys its
+    /// provider would refuse, before any byte is written.
+    pub(super) fn object_path(&self, location: &BackendLocation) -> Result<String, BlobError> {
+        object_key(location, self.registry.splits(&location.backend))
     }
 
     pub(super) fn operator_from_hidden(&self, key: &HiddenBlobKey) -> Result<Operator, BlobError> {
@@ -1242,6 +1250,68 @@ fn stats_prefix(backend: &BackendRef, bucket_prefix: Option<&str>) -> Vec<u8> {
     prefix
 }
 
+/// The one bucket a group storage writes Aruna's layout to: its container or its default
+/// bucket, never a linked bucket. Node backends answer `None` unless their config pins one.
+fn fixed_bucket(config: &BackendConfig) -> Result<Option<String>, BlobError> {
+    if let Some(bucket) = config.service_config.get("bucket") {
+        return Ok(Some(bucket.clone()));
+    }
+    if !matches!(config.backend_type, Backend::Group(_)) {
+        return Ok(None);
+    }
+    let default = config.service_config.get(DEFAULT_BUCKET);
+    default.cloned().map(Some).ok_or_else(|| {
+        BlobError::WriteError("this storage has no default bucket for Aruna's files".to_string())
+    })
+}
+
+/// The path of `location` below its root; `split` drops the bucket in front.
+pub(super) fn object_key(location: &BackendLocation, split: bool) -> Result<String, BlobError> {
+    let path = location.get_storage_path()?;
+    let path = match split {
+        true => split_location(location)?.1,
+        false => path,
+    };
+    if matches!(location.backend, BackendRef::Group(_)) {
+        key_fits(&location.root, &path)?;
+    }
+    Ok(path)
+}
+
+/// Refuses a group storage key over the provider limit, counted with the root in front.
+pub(super) fn key_fits(root: &str, path: &str) -> Result<(), BlobError> {
+    let root = root.trim_matches('/');
+    let length = path.len() + if root.is_empty() { 0 } else { root.len() + 1 };
+    match length > MAX_KEY_LEN {
+        true => Err(BlobError::KeyTooLong),
+        false => Ok(()),
+    }
+}
+
+/// The bucket and key of a location on a storage that names the bucket in each path: the
+/// storage bucket of Aruna's layout, or the first folder of a tenant path.
+pub(super) fn split_location(location: &BackendLocation) -> Result<(String, String), BlobError> {
+    if !location.storage_bucket.is_empty() {
+        return Ok((
+            location.storage_bucket.clone(),
+            location.backend_path.clone(),
+        ));
+    }
+    split_bucket(&location.backend_path)
+}
+
+/// Splits `bucket/key`; both parts must be present.
+pub(super) fn split_bucket(path: &str) -> Result<(String, String), BlobError> {
+    match path.split_once('/') {
+        Some((bucket, key)) if !bucket.is_empty() && !key.is_empty() => {
+            Ok((bucket.to_string(), key.to_string()))
+        }
+        _ => Err(BlobError::UnknownBackend(format!(
+            "the storage path `{path}` names no bucket"
+        ))),
+    }
+}
+
 fn location_bucket(template: &BackendLocation, bucket: &str) -> BackendLocation {
     let mut location = template.clone();
     location.storage_bucket = bucket.to_string();
@@ -1293,8 +1363,20 @@ pub(super) fn build_hidden_path(
         .map_err(|_| ConversionError::OsStringError)
 }
 
-pub(super) fn build_part_path(upload_id: Ulid, part_number: u16, ulid: Ulid) -> String {
-    PathBuf::from(MULTIPART_PART_PREFIX)
+/// A part path; on a storage without a bucket the parts wait in a tenant bucket, so their
+/// folder is named as Aruna's own.
+pub(super) fn build_part_path(
+    split: bool,
+    upload_id: Ulid,
+    part_number: u16,
+    ulid: Ulid,
+) -> String {
+    let prefix = if split {
+        PARTS_PREFIX
+    } else {
+        MULTIPART_PART_PREFIX
+    };
+    PathBuf::from(prefix)
         .join(upload_id.to_string())
         .join(format!("{:05}_{}", part_number, ulid))
         .into_os_string()
@@ -1321,4 +1403,84 @@ pub(super) fn rebuild_backend_path(
     path.into_os_string()
         .into_string()
         .map_err(|_| ConversionError::OsStringError)
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::{fixed_bucket, object_key, split_bucket};
+    use aruna_core::errors::BlobError;
+    use aruna_core::structs::storage::blob::{Backend, BackendConfig, BlobTimeoutConfig};
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::structs::storage::group_backend::GroupBackendKind;
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+    use ulid::Ulid;
+
+    fn location(storage_bucket: &str, backend_path: &str) -> BackendLocation {
+        BackendLocation {
+            backend: BackendRef::Group(Ulid::nil()),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: storage_bucket.to_string(),
+            backend_path: backend_path.to_string(),
+            ulid: Ulid::nil(),
+            format: StoredFormat::default(),
+            created_by: aruna_core::UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 0,
+            hashes: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn splits_storage_paths() {
+        // Aruna's layout on a default bucket keeps no second bucket folder.
+        let layout = location("lab-default", "seq/a.csv_01");
+        assert_eq!(object_key(&layout, true).unwrap(), "seq/a.csv_01");
+        assert_eq!(
+            object_key(&layout, false).unwrap(),
+            "lab-default/seq/a.csv_01"
+        );
+        // A tenant path names its bucket in the first folder.
+        let tenant = location("", "lab-raw/2024/a.csv");
+        assert_eq!(object_key(&tenant, true).unwrap(), "2024/a.csv");
+        assert_eq!(object_key(&tenant, false).unwrap(), "lab-raw/2024/a.csv");
+        assert!(object_key(&location("", "a.csv"), true).is_err());
+        assert!(split_bucket("/a.csv").is_err());
+    }
+
+    #[test]
+    fn layout_skips_parts() {
+        // Parts may wait in a linked bucket; Aruna's own layout never goes there.
+        let config = |public: &[(&str, &str)]| BackendConfig {
+            backend_type: Backend::Group(GroupBackendKind::S3),
+            root: String::new(),
+            service_config: public
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            bucket_prefix: None,
+            max_bucket_size: None,
+            multipart_bucket: Some("lab-raw".to_string()),
+            timeouts: BlobTimeoutConfig::default(),
+        };
+        assert!(fixed_bucket(&config(&[])).is_err());
+        let chosen = fixed_bucket(&config(&[("default_bucket", "lab-default")])).unwrap();
+        assert_eq!(chosen.as_deref(), Some("lab-default"));
+    }
+
+    #[test]
+    fn refuses_long_keys() {
+        let name = "a".repeat(1000);
+        let mut fits = location("", &format!("lab-raw/{name}"));
+        assert!(object_key(&fits, true).is_ok());
+        fits.root = "r".repeat(30);
+        assert_eq!(object_key(&fits, true), Err(BlobError::KeyTooLong));
+        // Node backends keep their own limits.
+        fits.backend = BackendRef::node_default();
+        assert!(object_key(&fits, false).is_ok());
+    }
 }

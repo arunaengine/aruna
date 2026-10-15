@@ -25,7 +25,7 @@ use ulid::Ulid;
 
 const BACKEND_PAGE_SIZE: usize = 128;
 
-fn routing_key(group_id: GroupId) -> Key {
+pub(crate) fn routing_key(group_id: GroupId) -> Key {
     group_id.to_bytes().to_vec().into()
 }
 
@@ -128,10 +128,8 @@ impl Operation for GroupInputsOperation {
                         if record.group_id != self.group_id || record.disabled {
                             continue;
                         }
-                        if let Some(container) = record.container() {
-                            let container = container.to_string();
-                            self.inputs.containers.insert(record.backend_id, container);
-                        }
+                        let folders = record.reserved_folders();
+                        self.inputs.containers.insert(record.backend_id, folders);
                         self.inputs.backend_ids.insert(record.backend_id);
                     }
                     if let Some(start_after) = next_start_after {
@@ -211,6 +209,15 @@ pub enum PutGroupError {
     InvalidTarget(#[from] RoutingError),
     #[error("could not load the group's storage backends: {0}")]
     InputsUnavailable(String),
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    Conflict(String),
+    /// The default bucket could not be found, created or written to.
+    #[error(transparent)]
+    Unusable(aruna_core::errors::BlobError),
+    #[error("unexpected event in state {0}")]
+    Unexpected(&'static str),
     #[error("group routing write did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]

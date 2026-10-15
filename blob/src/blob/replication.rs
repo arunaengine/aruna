@@ -516,7 +516,7 @@ impl BlobHandler {
         let mut stream = stream.lock().await;
         let rx = &mut stream.1;
         let rx_wrapper = RecvStreamWrapper::new(rx, self.transfer_idle_timeout());
-        let storage_path = match location.get_storage_path() {
+        let storage_path = match self.object_path(&location) {
             Ok(storage_path) => storage_path,
             Err(e) => {
                 _ = self.release_reservation(&location).await;

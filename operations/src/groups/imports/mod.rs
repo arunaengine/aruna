@@ -14,7 +14,7 @@ use crate::jobs::store::{iter_prefix_page, read_job_record};
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
-use aruna_core::structs::execution::job::{JobId, JobState};
+use aruna_core::structs::execution::job::{JobError, JobId, JobState};
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportCheckpoint, import_key,
@@ -58,6 +58,35 @@ pub struct LastRun {
     pub state: JobState,
     pub started_ms: u64,
     pub checkpoint: BackendImportCheckpoint,
+    /// Why the run as a whole did not finish, such as a bucket it could not list.
+    pub error: Option<String>,
+}
+
+/// A short fixed reason why a run stopped as a whole, only for a run that ended without
+/// success. Provider text can carry signed URLs, so it never leaves the job record.
+pub fn run_error(state: JobState, error: Option<&JobError>) -> Option<String> {
+    if !matches!(state, JobState::Failed | JobState::Indeterminate) {
+        return None;
+    }
+    let text = error?.message.to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|word| text.contains(word));
+    let reason = if has(&["permission", "denied", "forbidden", "unauthorized"]) {
+        "No access to the bucket"
+    } else if has(&["not found", "nosuchbucket", "does not exist"]) {
+        "Bucket not found"
+    } else if has(&[
+        "timed out",
+        "timeout",
+        "connect",
+        "unreachable",
+        "dns",
+        "unavailable",
+    ]) {
+        "Storage could not be reached"
+    } else {
+        "The run stopped with an error"
+    };
+    Some(reason.to_string())
 }
 
 /// `None` before the first run and after the run's job record was pruned.
@@ -83,6 +112,7 @@ pub async fn last_run(
         state: record.state,
         started_ms,
         checkpoint,
+        error: run_error(record.state, record.last_error.as_ref()),
     }))
 }
 
@@ -168,6 +198,29 @@ pub async fn read_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hides_provider_text() {
+        let signed = "List error: PermissionDenied at list => GET \
+                      https://acct.blob.core.windows.net/c?sv=2024&sig=SECRET (persistent)";
+        let shown = run_error(JobState::Failed, Some(&JobError::retryable(signed))).unwrap();
+        assert_eq!(shown, "No access to the bucket");
+        assert!(!shown.contains("SECRET") && !shown.contains("https://"));
+        let lost = JobError::retryable("Read error: timed out reading the listing");
+        assert_eq!(
+            run_error(JobState::Indeterminate, Some(&lost)).as_deref(),
+            Some("Storage could not be reached")
+        );
+        let odd = JobError::permanent("sig=SECRET");
+        assert_eq!(
+            run_error(JobState::Failed, Some(&odd)).as_deref(),
+            Some("The run stopped with an error")
+        );
+        // A retry that later succeeded leaves its old error behind.
+        assert_eq!(run_error(JobState::Succeeded, Some(&odd)), None);
+        assert_eq!(run_error(JobState::Running, Some(&odd)), None);
+        assert_eq!(run_error(JobState::Failed, None), None);
+    }
 
     #[test]
     fn checks_folders() {

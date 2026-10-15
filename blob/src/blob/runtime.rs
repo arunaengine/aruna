@@ -122,6 +122,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::HashExternal { .. } => (EffectClass::Transfer, "hash_external"),
         BlobEffect::WritePlain { .. } => (EffectClass::Transfer, "write_plain"),
         BlobEffect::StatPlain { .. } => (EffectClass::Control, "stat_plain"),
+        BlobEffect::EnsureBucket { .. } => (EffectClass::Control, "ensure_bucket"),
     }
 }
 
@@ -138,6 +139,7 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::CompleteUpload { .. }
             | BlobEffect::AbortUpload { .. }
             | BlobEffect::SpoolHidden { .. }
+            | BlobEffect::EnsureBucket { .. }
             | BlobEffect::Replicate { .. }
             | BlobEffect::HandleReplication { .. }
             | BlobEffect::ReceiveRead { .. }
@@ -742,7 +744,12 @@ impl BlobHandler {
             BlobEffect::CompleteUpload {
                 backend_upload,
                 parts,
-            } => Box::pin(self.complete_upload(*backend_upload, parts)).await,
+                streamed,
+                compression,
+            } => {
+                let complete = self.complete_upload(*backend_upload, parts, &streamed, compression);
+                Box::pin(complete).await
+            }
             BlobEffect::AbortUpload { backend_upload } => {
                 Box::pin(self.abort_upload(*backend_upload)).await
             }
@@ -891,6 +898,9 @@ impl BlobHandler {
             } => Box::pin(self.write_plain(resolved, plain, created_by, blob)).await,
             BlobEffect::StatPlain { backend, path } => {
                 Box::pin(self.stat_plain(backend, path)).await
+            }
+            BlobEffect::EnsureBucket { backend, bucket } => {
+                Box::pin(self.ensure_bucket(&backend, &bucket)).await
             }
             BlobEffect::HashArchive { location, lease } => {
                 Box::pin(self.hash_archive(location, *lease)).await

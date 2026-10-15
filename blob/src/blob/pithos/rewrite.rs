@@ -131,7 +131,7 @@ impl BlobHandler {
             StoredLayout::Pithos(layout) => {
                 let keys = self.lease_keys(&source, lease)?;
                 let operator = self.operator_from_location(&source)?;
-                let path = source.get_storage_path()?;
+                let path = self.object_path(&source)?;
                 let range = 0..source.blob_size;
                 let idle = self.transfer_idle_timeout();
                 let opening = Opening {
@@ -215,7 +215,7 @@ impl BlobHandler {
         // Covers the decoded view, the raw directory and the replacement held at once.
         let _budget = self.reserve_pithos(working_set(source.blob_size)).await?;
         let operator = self.operator_from_location(source)?;
-        let path = source.get_storage_path()?;
+        let path = self.object_path(source)?;
         let idle = self.transfer_idle_timeout();
         let stored = StoredBytes {
             operator: operator.clone(),
@@ -289,7 +289,7 @@ impl BlobHandler {
         let written = self.copy_archive(&location, copy).await;
         if let Err(error) = written {
             if let Ok(operator) = self.operator_from_location(&location)
-                && let Ok(path) = location.get_storage_path()
+                && let Ok(path) = self.object_path(&location)
             {
                 _ = self.delete_path(&operator, &path).await;
             }
@@ -316,7 +316,7 @@ impl BlobHandler {
             &location.storage_bucket,
             &self.egress,
         )?;
-        let path = location.get_storage_path()?;
+        let path = self.object_path(location)?;
         let (io, idle) = (self.io_timeout(), self.transfer_idle_timeout());
         let mut writer = match timeout(io, operator.writer(&path)).await {
             Ok(Ok(writer)) => writer,

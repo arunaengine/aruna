@@ -264,6 +264,7 @@ pub(crate) fn key_refusal(error: &BucketKeyError) -> ServerError {
         BucketKeyError::SessionMismatch => (StatusCode::CONFLICT, "session_mismatch"),
         BucketKeyError::Capacity => (StatusCode::SERVICE_UNAVAILABLE, "unlock_capacity"),
         BucketKeyError::InvalidDuration => (StatusCode::BAD_REQUEST, "invalid_duration"),
+        BucketKeyError::ManagedLimit => (StatusCode::BAD_REQUEST, "managed_limit"),
         BucketKeyError::Seal => return ServerError::InternalError(message),
         BucketKeyError::Unsupported => (StatusCode::NOT_IMPLEMENTED, "not_supported"),
         BucketKeyError::InvalidToken => (StatusCode::FORBIDDEN, "invalid_token"),
@@ -623,7 +624,7 @@ pub(crate) fn build_status(
         fingerprint: active_record.map(|record| hex::encode(record.fingerprint)),
         cipher: settings.cipher,
         block_keys: settings.block_keys,
-        max_unlock_ms: settings.max_unlock_ms,
+        max_unlock_ms: settings.unlock_limit(),
         unlock: active.map(|active| unlock_of(active.generation)),
         generations,
         holders: report.map(|report| HolderCounts {
@@ -741,7 +742,8 @@ pub async fn get_bucket_encryption(
 - On an encrypted bucket, another mode, `off`, cipher or block-key mode starts a transition of
   this node's stored copies; `transition` in the status reports its progress.
 - `max_unlock_ms` changes the longest unlock of an encrypted bucket from the next unlock on;
-  an absent field keeps it, `null` removes the limit.
+  an absent field keeps it, `null` removes the limit. A `node_managed` bucket has no limit and
+  answers 400 `managed_limit` to one.
 - A change that needs the old key answers 409 `bucket_locked` while that key is locked.
 - While stored copies still move, a further change answers 409 `transition_running`; a bucket
   set to `off` enables again once its decryption has finished."#,

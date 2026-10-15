@@ -25,6 +25,9 @@ impl ChangeEncryptionOperation {
         if let Some(max) = self.input.max_unlock_ms {
             settings.max_unlock_ms = max;
         }
+        if mode == EncryptionMode::NodeManaged {
+            settings.max_unlock_ms = None;
+        }
         let format_changed = previous.cipher != cipher
             || previous.block_keys != block_keys
             || mode == EncryptionMode::Off;

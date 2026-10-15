@@ -4,6 +4,8 @@
 
 use super::BlobHandler;
 use super::backend::{build_backend_path, intent_key};
+use super::framed_parts::{Finished, part_level, streams_now};
+use crate::codec::Guard;
 use crate::hash::Hasher;
 use crate::part_chain::{PartAttempt, PartChain};
 use crate::s3::{NativeMultipart, multipart_etag};
@@ -18,7 +20,7 @@ use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, ResolvedBackend, WriteOwner,
 };
-use aruna_core::structs::storage::format::{Compression, StoredFormat};
+use aruna_core::structs::storage::format::{Compression, PartLayout, StoredFormat, StoredLayout};
 use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};
 use bytes::Bytes;
 use byteview::ByteView;
@@ -55,7 +57,10 @@ impl BlobHandler {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn native_upload(&self, location: &BackendLocation) -> Result<NativeMultipart, BlobError> {
+    pub(super) fn native_upload(
+        &self,
+        location: &BackendLocation,
+    ) -> Result<NativeMultipart, BlobError> {
         self.native_for(location)?.ok_or_else(|| {
             BlobError::WriteError("the backend has no provider multipart upload".to_string())
         })
@@ -111,7 +116,7 @@ impl BlobHandler {
 
     /// Removes an in-place target, every provider upload under its path and its reservation.
     pub(super) async fn discard_target(&self, location: &BackendLocation) -> Result<(), BlobError> {
-        let path = location.get_storage_path()?;
+        let path = self.object_path(location)?;
         let operator = self.operator_from_location(location)?;
         self.delete_path(&operator, &path).await?;
         Box::pin(self.abort_uploads(location, &path)).await?;
@@ -135,7 +140,7 @@ impl BlobHandler {
             Ok(path) => path,
             Err(error) => return BlobEvent::Error(BlobError::ConversionError(error)),
         };
-        let template = BackendLocation {
+        let mut template = BackendLocation {
             backend: resolved.backend.clone(),
             storage_class: resolved.storage_class,
             root,
@@ -150,12 +155,14 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
-        // Only S3 backends have a provider upload; the others keep one blob per part. A provider
-        // upload assembles the raw parts, so a compressed bucket composes frames from blobs.
-        if resolved.compression != Compression::Off {
-            return BlobEvent::UploadOpened {
-                backend_upload: None,
-            };
+        // Only S3 backends have a provider upload; the others keep one blob per part. The parts
+        // of a compressed upload record their frames in this layout.
+        if let Compression::Zstd { level } = resolved.compression {
+            template.format.layout = StoredLayout::FramedPart(Box::new(PartLayout {
+                level,
+                frames: Vec::new(),
+                padding: 0,
+            }));
         }
         match self.native_for(&template) {
             Ok(Some(_)) => {}
@@ -177,7 +184,7 @@ impl BlobHandler {
         }
         let opened = async {
             let native = self.native_upload(&location)?;
-            let path = location.get_storage_path()?;
+            let path = self.object_path(&location)?;
             timeout(self.io_timeout(), native.create(&path))
                 .await
                 .map_err(|_| BlobError::WriteError("timed out opening the upload".to_string()))?
@@ -241,6 +248,9 @@ impl BlobHandler {
         size: Option<u64>,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
+        if part_level(&upload).is_some() && !streams_now(part.part_number, size) {
+            return Box::pin(self.write_blob_part(part, resolved, created_by, blob)).await;
+        }
         let attempt = Ulid::generate();
         match self.claim_part(&upload.upload_id, part.part_number, attempt) {
             Ok(Some(chain)) => {
@@ -335,20 +345,24 @@ impl BlobHandler {
             }
             chunk
         });
-        let sent = async {
-            let native = self.native_upload(&upload.location)?;
-            let path = upload.location.get_storage_path()?;
-            native
-                .upload_part(
-                    &path,
-                    &upload.upload_id,
-                    part_number,
-                    size,
-                    BackendStream(Box::pin(body)),
-                )
+        let body = BackendStream(Box::pin(body));
+        let sent = match part_level(&upload) {
+            Some(level) => {
+                let framed = self.upload_framed(&upload, part_number, size, level, body);
+                framed.await.map(|(etag, layout)| (etag, Some(layout)))
+            }
+            None => {
+                async {
+                    let native = self.native_upload(&upload.location)?;
+                    let path = self.object_path(&upload.location)?;
+                    native
+                        .upload_part(&path, &upload.upload_id, part_number, size, body)
+                        .await
+                        .map(|etag| (etag, None))
+                }
                 .await
-        }
-        .await;
+            }
+        };
         let tee = std::mem::replace(
             &mut *tee.lock().unwrap_or_else(PoisonError::into_inner),
             PartTee {
@@ -362,8 +376,8 @@ impl BlobHandler {
         if write.settle(accepted).await {
             return BlobEvent::Error(aborted_upload());
         }
-        let backend_etag = match (sent, tee.client_failed) {
-            (Ok(etag), None) if tee.size == size => etag,
+        let (backend_etag, layout) = match (sent, tee.client_failed) {
+            (Ok(sent), None) if tee.size == size => sent,
             (sent, failed) => {
                 self.with_chain(&upload.upload_id, |chain| {
                     chain.abandon(part_number, attempt);
@@ -385,16 +399,20 @@ impl BlobHandler {
             };
             self.with_chain(&upload.upload_id, |chain| chain.finish(part, state));
         }
+        let mut location = BackendLocation {
+            ulid: attempt,
+            created_by,
+            created_at: SystemTime::now(),
+            partial: true,
+            blob_size: size,
+            hashes: tee.part.to_map(),
+            ..upload.location
+        };
+        if let Some(layout) = layout {
+            location.format.layout = StoredLayout::FramedPart(Box::new(layout));
+        }
         BlobEvent::PartWritten {
-            location: BackendLocation {
-                ulid: attempt,
-                created_by,
-                created_at: SystemTime::now(),
-                partial: true,
-                blob_size: size,
-                hashes: tee.part.to_map(),
-                ..upload.location
-            },
+            location,
             backend_etag,
         }
     }
@@ -404,7 +422,7 @@ impl BlobHandler {
     async fn abort_again(&self, upload: &BackendUpload) {
         let aborted = async {
             let native = self.native_upload(&upload.location)?;
-            let path = upload.location.get_storage_path()?;
+            let path = self.object_path(&upload.location)?;
             timeout(self.io_timeout(), native.abort(&path, &upload.upload_id))
                 .await
                 .map_err(|_| BlobError::DeleteError("timed out aborting the upload".into()))?
@@ -443,16 +461,23 @@ impl BlobHandler {
         &self,
         upload: BackendUpload,
         parts: Vec<MultipartPart>,
+        streamed: &[u16],
+        compression: Compression,
     ) -> BlobEvent {
         let Some(mut reservation) = self.hold_reservation(upload.location.ulid) else {
             return BlobEvent::Error(BlobError::WriteError(
                 "too many active blob reservations".to_string(),
             ));
         };
-        match Box::pin(self.finish_upload(&upload, &parts)).await {
+        let finished = self.finish_upload(&upload, &parts, streamed, compression);
+        match Box::pin(finished).await {
             Ok(location) => {
                 self.chains().remove(&upload.upload_id);
                 reservation.retain();
+                // A composed copy keeps its own reservation; the target row discards the target.
+                if !location.same_object(&upload.location) {
+                    return BlobEvent::WriteFinished { location };
+                }
                 // The object is the only copy of the parts: its row keeps it for a retry.
                 match self.write_target_row(&location, upload.record_id).await {
                     Ok(()) => BlobEvent::WriteFinished { location },
@@ -467,6 +492,8 @@ impl BlobHandler {
         &self,
         upload: &BackendUpload,
         parts: &[MultipartPart],
+        streamed: &[u16],
+        compression: Compression,
     ) -> Result<BackendLocation, BlobError> {
         let mut listed = Vec::with_capacity(parts.len());
         let mut etags = Vec::with_capacity(parts.len());
@@ -499,9 +526,24 @@ impl BlobHandler {
         }
         let total: u64 = listed.iter().map(|part| part.size).sum();
         let native = self.native_upload(&upload.location)?;
-        let path = upload.location.get_storage_path()?;
+        let path = self.object_path(&upload.location)?;
         let operator = self.operator_from_location(&upload.location)?;
-        if let Err(error) = self
+        let mut location = BackendLocation {
+            blob_size: total,
+            ..upload.location.clone()
+        };
+        // The completion's reservation also covers the hash read of the framed object.
+        let mut share = None;
+        if let Some(level) = part_level(upload) {
+            let finished = self.finish_framed(upload, parts, level, streamed, compression);
+            match Box::pin(finished).await? {
+                Finished::Framed(layout, held) => {
+                    location.format.layout = StoredLayout::Frames(Box::new(layout));
+                    share = Some(held);
+                }
+                Finished::Composed(composed) => return Ok(*composed),
+            }
+        } else if let Err(error) = self
             .assemble(&native, &path, upload, parts, etags.clone())
             .await
         {
@@ -524,16 +566,27 @@ impl BlobHandler {
         );
         let mut hashed = offset;
         if offset < total {
-            let reader = timeout(self.io_timeout(), operator.reader(&path))
-                .await
-                .map_err(|_| BlobError::ReadError("timed out opening the object".to_string()))?
-                .map_err(|error| BlobError::ReadError(error.to_string()))?;
-            let mut stream = timeout(self.io_timeout(), reader.into_bytes_stream(offset..))
-                .await
-                .map_err(|_| BlobError::ReadError("timed out reading the object".to_string()))?
-                .map_err(|error| BlobError::ReadError(error.to_string()))?;
+            let mut stream = match &location.format.layout {
+                StoredLayout::Frames(layout) => {
+                    let guard = share.clone().map(|share| -> Guard { share });
+                    self.frames_stream(&location, layout, offset..total, guard)
+                        .await?
+                }
+                _ => {
+                    let late = |what: &str| BlobError::ReadError(format!("timed out {what}"));
+                    let reader = timeout(self.io_timeout(), operator.reader(&path))
+                        .await
+                        .map_err(|_| late("opening the object"))?
+                        .map_err(|error| BlobError::ReadError(error.to_string()))?;
+                    let stream = timeout(self.io_timeout(), reader.into_bytes_stream(offset..))
+                        .await
+                        .map_err(|_| late("reading the object"))?
+                        .map_err(|error| BlobError::ReadError(error.to_string()))?;
+                    BackendStream::new(stream)
+                }
+            };
             loop {
-                let next = timeout(self.transfer_idle_timeout(), stream.next())
+                let next = timeout(self.transfer_idle_timeout(), stream.0.next())
                     .await
                     .map_err(|_| BlobError::ReadError("object read idle timeout".to_string()))?;
                 let Some(chunk) = next else {
@@ -549,11 +602,9 @@ impl BlobHandler {
                 "the assembled object holds {hashed} bytes, the parts {total}"
             )));
         }
-        Ok(BackendLocation {
-            blob_size: total,
-            hashes: state.to_map(),
-            ..upload.location.clone()
-        })
+        location.hashes = state.to_map();
+        drop(share);
+        Ok(location)
     }
 
     /// Copies staged replacements into the provider upload, then completes it.
@@ -570,7 +621,7 @@ impl BlobHandler {
                 continue;
             }
             let source = self.native_upload(&part.location)?;
-            let source_path = part.location.get_storage_path()?;
+            let source_path = self.object_path(&part.location)?;
             slot.1 = native
                 .copy_part(
                     path,
@@ -593,7 +644,7 @@ impl BlobHandler {
             .aborted = true;
         let aborted = async {
             let native = self.native_upload(&upload.location)?;
-            let path = upload.location.get_storage_path()?;
+            let path = self.object_path(&upload.location)?;
             timeout(self.io_timeout(), native.abort(&path, &upload.upload_id))
                 .await
                 .map_err(|_| BlobError::DeleteError("timed out aborting the upload".into()))??;

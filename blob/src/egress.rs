@@ -164,6 +164,8 @@ pub struct EgressGuard {
     lookup: Lookup,
     opendal: reqwest::Client,
     plain: reqwest::Client,
+    /// Unscreened client of operator backends, owned here instead of opendal's process default.
+    direct: reqwest::Client,
 }
 
 impl fmt::Debug for EgressGuard {
@@ -189,6 +191,7 @@ impl EgressGuard {
                 Some(REDIRECT_HOPS),
                 READ_TIMEOUT,
             )?,
+            direct: reqwest::Client::new(),
             lookup,
             policy,
         })
@@ -217,6 +220,13 @@ impl EgressGuard {
             client: ReqwestTransport::new(self.opendal.clone()),
             policy: self.policy.clone(),
         }))
+    }
+
+    /// The transport of operator backends. Its pool belongs to this guard, so a connection never
+    /// outlives the runtime that opened it, as opendal's process wide client can in tests.
+    pub(crate) fn direct_context(&self) -> OperationContext {
+        let client = ReqwestTransport::new(self.direct.clone());
+        OperationContext::new().with_http_transport(HttpTransporter::new(client))
     }
 
     /// Screened GET builder for plain HTTP fetches that are not opendal calls.

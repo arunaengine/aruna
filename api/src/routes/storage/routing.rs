@@ -9,6 +9,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BackendRef, bucket_permission_path};
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule, target_warnings};
 use aruna_operations::driver::{drive, node_routing};
+use aruna_operations::groups::default_rule::PutDefaultOperation;
 use aruna_operations::groups::storage_routing::{
     GroupInputsOperation, GroupRoutingOperation, PutGroupError, PutGroupOperation,
 };
@@ -78,6 +79,10 @@ pub struct BucketRoutingResponse {
 pub struct GroupRoutingRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_target: Option<RoutingTargetRequest>,
+    /// Bucket on a target storage without a fixed bucket that receives the uploads; found or
+    /// created first. Omitted keeps the storage's stored default bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -146,6 +151,10 @@ impl From<StorageRoutingRule> for RoutingRuleRequest {
 fn map_group_error(error: PutGroupError) -> ServerError {
     match error {
         PutGroupError::InvalidTarget(reason) => ServerError::BadRequestReason(reason.to_string()),
+        PutGroupError::Invalid(message) => ServerError::BadRequestMessage(message),
+        PutGroupError::Unusable(error) => ServerError::BadRequestMessage(error.reason()),
+        PutGroupError::Conflict(message) => ServerError::Conflict(message),
+        PutGroupError::GroupWrite(error) => ServerError::Conflict(error.to_string()),
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -470,12 +479,19 @@ pub async fn get_group_routing(
 - It steers writes made after the change; stored objects are never moved.
 - A target this node cannot serve is stored anyway, because the record replicates to nodes that may
   offer it, and comes back in `warnings`.
+- A group storage without a fixed bucket takes Aruna's own layout in `bucket`. The bucket is found or
+  created and tested with a write and a delete before anything is stored; the storage then lists it
+  as `default_bucket` in its `public_config`. A later request without `bucket` keeps that bucket.
+- Clearing the target, or naming a class, returns new uploads to Aruna storage; files already on
+  the group's storage stay there.
 
 **Limits**
 - The target sets exactly one of `backend_id` or `class`.
 - A `backend_id` must name a backend the group itself registered, so a tenant can never bind an
   operator's node backend.
-- A `class` must be a valid storage class name."#,
+- A `class` must be a valid storage class name.
+- `bucket` is only accepted with a `backend_id` of a storage without a fixed bucket. It follows the
+  S3 naming rules and must not be a bucket a linked folder of that storage uses."#,
     params(("group_id" = String, Path, description = "Group id as a 26-character ULID")),
     request_body(
         content = GroupRoutingRequest,
@@ -497,9 +513,10 @@ pub async fn get_group_routing(
                 ]
             })
         ),
-        (status = 400, description = "The path segment is not a valid group ULID, or the target is invalid or names a backend the group does not own", body = ErrorResponse),
+        (status = 400, description = "The path segment is not a valid group ULID, the target is invalid or names a backend the group does not own, or the bucket is invalid or cannot be used", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse)
+        (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
+        (status = 409, description = "A linked folder uses the bucket, or the group is being deleted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -518,11 +535,23 @@ pub async fn put_group_routing(
         .map(RoutingTarget::try_from)
         .transpose()?;
 
-    let record = drive(
-        PutGroupOperation::new(group_id, target, auth.user_id, SystemTime::now()),
-        &state.get_ctx(),
-    )
-    .await
+    let now = SystemTime::now();
+    let record = match (target, request.bucket) {
+        (Some(RoutingTarget::Backend(BackendRef::Group(backend_id))), bucket) => {
+            let operation =
+                PutDefaultOperation::new(group_id, backend_id, bucket, auth.user_id, now);
+            drive(operation, &state.get_ctx()).await
+        }
+        (_, Some(_)) => {
+            return Err(ServerError::BadRequestMessage(
+                "A bucket needs one of the group's storages as target.".to_string(),
+            ));
+        }
+        (target, None) => {
+            let operation = PutGroupOperation::new(group_id, target, auth.user_id, now);
+            drive(operation, &state.get_ctx()).await
+        }
+    }
     .map_err(map_group_error)?;
 
     let target = record.default_target;

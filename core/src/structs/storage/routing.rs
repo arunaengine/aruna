@@ -106,8 +106,8 @@ pub struct GroupRoutingInputs {
     pub backend_ids: BTreeSet<Ulid>,
     /// The group's backend import rules on this node.
     pub imports: Vec<BackendImport>,
-    /// The tenant container of each enabled group backend, by backend id.
-    pub containers: BTreeMap<Ulid, String>,
+    /// The folders Aruna keeps its own objects in on each enabled group backend.
+    pub containers: BTreeMap<Ulid, Vec<String>>,
 }
 
 /// Where a write under a backend import rule is stored instead of Aruna's own layout.
@@ -412,7 +412,7 @@ pub struct RoutingSnapshot {
     /// The bucket's compression, stamped on every backend this snapshot resolves.
     pub compression: Compression,
     pub imports: Vec<BackendImport>,
-    pub containers: BTreeMap<Ulid, String>,
+    pub containers: BTreeMap<Ulid, Vec<String>>,
 }
 
 impl RoutingSnapshot {
@@ -482,8 +482,8 @@ impl RoutingSnapshot {
         }
         let path = rule.plain_path(key, id)?;
         let backend = rule.write_backend();
-        let container = self.containers.get(&backend).map(String::as_str);
-        if reserved_path(container, &path) {
+        let folders = self.containers.get(&backend).map_or(&[][..], Vec::as_slice);
+        if reserved_path(folders, &path) {
             return None;
         }
         Some(PlainTarget {
@@ -1241,7 +1241,7 @@ mod tests {
         snapshot.imports = vec![moved];
         assert!(!snapshot.plain_target("b", "in/a.csv", id).unwrap().listed);
         // The write folder may not reach into Aruna's own container on the backend.
-        snapshot.containers.insert(target, "data".to_string());
+        snapshot.containers.insert(target, vec!["data".to_string()]);
         assert_eq!(snapshot.plain_target("b", "in/a.csv", id), None);
 
         snapshot.containers.clear();

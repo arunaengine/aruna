@@ -101,6 +101,25 @@ pub enum BlobError {
     /// This one object cannot be read: it is gone, or its key cannot be read exactly.
     #[error("Object cannot be read: {0}")]
     Unreadable(String),
+    /// The backend key would be longer than group storages accept.
+    #[error("The path is too long for this storage: keys are at most 1024 bytes")]
+    KeyTooLong,
+}
+
+impl BlobError {
+    /// The message without the error kind in front, for short reasons shown to users.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::WriteError(message)
+            | Self::DeleteError(message)
+            | Self::ReadError(message)
+            | Self::ListError(message)
+            | Self::MakeBucketError(message)
+            | Self::OperatorCreationFailed(message)
+            | Self::UnknownBackend(message) => message.clone(),
+            other => other.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]

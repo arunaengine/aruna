@@ -161,7 +161,7 @@ impl UnlockBucketOperation {
                 current: settings.key_generation,
             });
         }
-        self.max = settings.max_unlock_ms.map(Duration::from_millis);
+        self.max = settings.unlock_limit().map(Duration::from_millis);
         if matches!((self.input.duration, self.max), (Some(asked), Some(max)) if asked > max) {
             return self.fail(BucketKeyError::InvalidDuration);
         }

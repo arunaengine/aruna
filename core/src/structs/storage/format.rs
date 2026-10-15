@@ -57,6 +57,8 @@ pub enum StoredLayout {
     Frames(Box<FrameLayout>),
     /// A Pithos 1.1 archive with one encrypted file.
     Pithos(Box<PithosLayout>),
+    /// Frames of one compressed part in a provider upload; completion adds the seek table.
+    FramedPart(Box<PartLayout>),
 }
 
 /// Record of a framed copy. The index hash covers the frame digests and seek table at its end.
@@ -68,6 +70,23 @@ pub struct FrameLayout {
     pub frames: u32,
     pub stored_size: u64,
     pub index_hash: [u8; 32],
+}
+
+/// Frames one part sent to a provider upload, then padding that lifts it to the 5 MiB minimum.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PartLayout {
+    pub level: u8,
+    pub frames: Vec<PartFrame>,
+    /// Length of the skippable frame after the frames; zero for none.
+    pub padding: u32,
+}
+
+/// Stored length, original length and BLAKE3 of the stored bytes of one frame.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PartFrame {
+    pub stored: u32,
+    pub original: u32,
+    pub digest: [u8; 32],
 }
 
 /// Record of a Pithos copy. The digest covers every directory of the archive, so a changed
@@ -136,7 +155,10 @@ impl StoredFormat {
     /// Raw bytes and frames are plain; a Pithos archive always names its key generation.
     pub fn checked(&self) -> Result<(), ConversionError> {
         match (&self.layout, &self.encryption) {
-            (StoredLayout::Raw | StoredLayout::Frames(_), StoredEncryption::None)
+            (
+                StoredLayout::Raw | StoredLayout::Frames(_) | StoredLayout::FramedPart(_),
+                StoredEncryption::None,
+            )
             | (StoredLayout::Pithos(_), StoredEncryption::Pithos(_)) => Ok(()),
             _ => Err(ConversionError::InvalidLength(
                 "stored layout and encryption do not match".to_string(),
@@ -157,6 +179,9 @@ impl StoredFormat {
         match &self.layout {
             StoredLayout::Raw => EncodingClass::Raw,
             StoredLayout::Frames(layout) => EncodingClass::Zstd {
+                level: layout.level,
+            },
+            StoredLayout::FramedPart(layout) => EncodingClass::Zstd {
                 level: layout.level,
             },
             StoredLayout::Pithos(layout) => EncodingClass::Pithos {

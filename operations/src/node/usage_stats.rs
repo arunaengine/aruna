@@ -93,7 +93,7 @@ impl StoredDelta {
     pub fn of_copy(location: &BackendLocation, blobs: i128, bytes: i128) -> Option<Self> {
         let shard = match &location.format.layout {
             StoredLayout::Pithos(_) => shard_for_archive(location.ulid),
-            StoredLayout::Raw | StoredLayout::Frames(_) => {
+            StoredLayout::Raw | StoredLayout::Frames(_) | StoredLayout::FramedPart(_) => {
                 shard_for_hash(location.get_blake3()?.try_into().ok()?)
             }
         };

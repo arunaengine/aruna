@@ -592,7 +592,7 @@ impl BlobHandler {
         };
         let range = range.unwrap_or(0..location.blob_size);
         let operator = self.operator_from_location(location)?;
-        let path = location.get_storage_path()?;
+        let path = self.object_path(location)?;
         let idle = self.transfer_idle_timeout();
         let size = range.end.saturating_sub(range.start);
         let share = self.reserve_pithos(working_set(location.blob_size)).await?;
@@ -625,7 +625,7 @@ impl BlobHandler {
         };
         let keys = self.sealed_keys(location, &lease)?;
         let operator = self.operator_from_location(location)?;
-        let path = location.get_storage_path()?;
+        let path = self.object_path(location)?;
         let share = self.reserve_pithos(working_set(location.blob_size)).await?;
         let opening = Opening {
             original: location.blob_size,
@@ -672,7 +672,7 @@ impl BlobHandler {
             share: Some(Arc::clone(&share)),
         };
         let operator = self.operator_from_location(location)?;
-        let path = location.get_storage_path()?;
+        let path = self.object_path(location)?;
         let idle = self.transfer_idle_timeout();
         let stream = read_within(operator, path, layout, keys, range, idle, opening).await?;
         Ok(Budgeted {

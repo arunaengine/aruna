@@ -515,6 +515,9 @@ impl Operation for EnableEncryptionOperation {
         if self.input.mode == EncryptionMode::Off || self.input.max_unlock_ms == Some(0) {
             return self.fail(EnableError::InvalidMode);
         }
+        if self.input.mode == EncryptionMode::NodeManaged && self.input.max_unlock_ms.is_some() {
+            return self.fail(BucketKeyError::ManagedLimit);
+        }
         self.state = EnableState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false

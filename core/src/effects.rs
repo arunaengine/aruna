@@ -27,6 +27,7 @@ use crate::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, HiddenBlobKey, ResolvedBackend,
 };
 use crate::structs::storage::encryption::{BucketKeyRef, CopyTarget, KeyTicket, ReadLease};
+use crate::structs::storage::format::Compression;
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use crate::structs::storage::multipart::{BackendUpload, MultipartPart, WorkingShare};
 use crate::structs::storage::usage::UsageDelta;
@@ -91,6 +92,10 @@ pub enum BlobEffect {
     CompleteUpload {
         backend_upload: Box<BackendUpload>,
         parts: Vec<MultipartPart>,
+        /// Numbers of every streamed provider part, listed or not; completion never replaces one.
+        streamed: Vec<u16>,
+        /// The bucket's setting at completion, which a copy composed instead applies.
+        compression: Compression,
     },
     AbortUpload {
         backend_upload: Box<BackendUpload>,
@@ -348,6 +353,12 @@ pub enum BlobEffect {
     StatPlain {
         backend: BackendRef,
         path: String,
+    },
+    /// Finds or creates `bucket` on a group storage without a bucket and proves that Aruna
+    /// may write and delete there; answers `BucketReady`.
+    EnsureBucket {
+        backend: BackendRef,
+        bucket: String,
     },
 }
 
