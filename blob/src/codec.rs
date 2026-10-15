@@ -125,6 +125,16 @@ pub(crate) fn padding(len: u32) -> Bytes {
     out.freeze()
 }
 
+/// Refuses another entry after `entries` once the table holds `MAX_ENTRIES`.
+fn entry_room(entries: u64) -> Result<(), BlobError> {
+    match entries < MAX_ENTRIES {
+        true => Ok(()),
+        false => Err(BlobError::WriteError(
+            "object has too many frames".to_string(),
+        )),
+    }
+}
+
 /// Collects the seek table while frames are written.
 pub(crate) struct FrameWriter {
     level: u8,
@@ -155,11 +165,7 @@ impl FrameWriter {
 
     /// Adds the entry of a frame written elsewhere.
     pub(crate) fn entry(&mut self, frame: PartFrame) -> Result<(), BlobError> {
-        if self.frames.len() as u64 >= MAX_ENTRIES {
-            return Err(BlobError::WriteError(
-                "object has too many frames".to_string(),
-            ));
-        }
+        entry_room(self.frames.len() as u64)?;
         self.stored += u64::from(frame.stored);
         self.frames.push(frame);
         Ok(())
@@ -755,17 +761,9 @@ mod tests {
         assert!(plausible_frames(size, MAX_FRAMES + 1_023));
         assert!(plausible_frames(size, MAX_ENTRIES));
         assert!(!plausible_frames(size, MAX_ENTRIES + 1));
-        let mut writer = FrameWriter::new(3);
-        writer.frames = vec![
-            PartFrame {
-                stored: 9,
-                original: 1,
-                digest: [0; 32],
-            };
-            MAX_ENTRIES as usize - 1
-        ];
-        assert!(writer.pad(9).is_ok());
-        assert!(writer.pad(9).is_err());
+        assert!(entry_room(MAX_FRAMES + 1_022).is_ok());
+        assert!(entry_room(MAX_ENTRIES - 1).is_ok());
+        assert!(entry_room(MAX_ENTRIES).is_err());
     }
 
     #[test]
