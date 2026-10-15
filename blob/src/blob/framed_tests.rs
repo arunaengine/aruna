@@ -99,7 +99,8 @@ async fn assert_part_sizes(
 ) -> Vec<u64> {
     let native = handler.native_for(&upload.location).unwrap().unwrap();
     let path = upload.location.get_storage_path().unwrap();
-    let sizes = native.part_sizes(&path, numbers).await;
+    let (listed, sizes): (Vec<i32>, Vec<u64>) = native.part_sizes(&path).await.into_iter().unzip();
+    assert_eq!(listed, numbers);
     assert_eq!(sizes.iter().sum::<u64>(), location.stored_size());
     let (_, others) = sizes.split_last().unwrap();
     assert!(others.iter().all(|size| *size >= PART_MIN), "{sizes:?}");
@@ -183,8 +184,8 @@ async fn s3_framed_parts() {
 #[tokio::test]
 #[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
 async fn s3_framed_table() {
-    // A streamed last part leaves the seek table to a part of its own. A replacement of an
-    // acknowledged part waits in a blob and is framed and padded at completion.
+    // A streamed last part leaves the seek table to a part of its own. Replacements of
+    // acknowledged parts wait in blobs; at completion both go into one provider part.
     let env = s3_env();
     let context = setup_s3_mixed(&env).await;
     let handler = context.blob_handle.handler.clone();
@@ -194,7 +195,9 @@ async fn s3_framed_table() {
     let replaced = text(5 * MIB + 1, b"replaced two ");
     let third = text(5 * MIB, b"three ");
 
+    assert!(put(&handler, &upload, 1, &second).await.location.partial);
     let one = put(&handler, &upload, 1, &first).await;
+    assert!(!one.location.partial);
     assert!(put(&handler, &upload, 2, &second).await.location.partial);
     let two = put(&handler, &upload, 2, &replaced).await;
     assert!(!two.location.partial);
@@ -210,6 +213,6 @@ async fn s3_framed_table() {
     let expected = [first.as_slice(), &replaced, &third].concat();
     let borders = [first.len() as u64, (first.len() + replaced.len()) as u64];
     assert_reads(&handler, &location, &expected, &borders).await;
-    let sizes = assert_part_sizes(&handler, &upload, &location, &[1, 2, 3, 10_000]).await;
-    assert!(sizes[3] < MIB as u64);
+    let sizes = assert_part_sizes(&handler, &upload, &location, &[1, 3, 10_000]).await;
+    assert!(sizes[2] < MIB as u64);
 }
