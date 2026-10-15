@@ -29,6 +29,9 @@ const WINDOW_LOG: u32 = 20;
 const MAX_FRAMES: u64 = 5 << 20;
 /// Parts of the largest S3 multipart upload; each may end with one short frame.
 const MAX_PARTS: u64 = 10_000;
+/// Table entries of the largest object: its full frames, then one short frame and one padding
+/// entry per part.
+const MAX_ENTRIES: u64 = MAX_FRAMES + 2 * MAX_PARTS;
 /// Largest zstd block; raw frames are cut into blocks of this size.
 const BLOCK_MAX: usize = 128 << 10;
 
@@ -45,7 +48,7 @@ fn table_len(frames: u64) -> u64 {
 /// frame and one padding entry.
 fn plausible_frames(size: u64, frames: u64) -> bool {
     let least = frame_count(size);
-    frames <= MAX_FRAMES && frames >= least && frames <= (least + 2 * MAX_PARTS).min(2 * size)
+    frames <= MAX_ENTRIES && frames >= least && frames <= (least + 2 * MAX_PARTS).min(2 * size)
 }
 
 fn integrity(message: &str) -> BlobError {
@@ -136,7 +139,7 @@ impl FrameWriter {
 
     /// Adds the entry of a frame written elsewhere.
     pub(crate) fn entry(&mut self, frame: PartFrame) -> Result<(), BlobError> {
-        if self.frames.len() as u64 >= MAX_FRAMES {
+        if self.frames.len() as u64 >= MAX_ENTRIES {
             return Err(BlobError::WriteError(
                 "object has too many frames".to_string(),
             ));
@@ -703,6 +706,26 @@ mod tests {
         assert_eq!(index.fetch_frames(2, 4, u64::MAX), 3..5);
         assert_eq!(padding_len(PART_MIN - 3), HEADER_LEN as u32);
         assert_eq!(padding_len(PART_MIN), 0);
+    }
+
+    #[test]
+    fn largest_upload_fits() {
+        // 1,024 parts of 5 GiB in full frames, with padding after every part but the last.
+        let size = 5 << 40;
+        assert!(plausible_frames(size, MAX_FRAMES + 1_023));
+        assert!(plausible_frames(size, MAX_ENTRIES));
+        assert!(!plausible_frames(size, MAX_ENTRIES + 1));
+        let mut writer = FrameWriter::new(3);
+        writer.frames = vec![
+            PartFrame {
+                stored: 9,
+                original: 1,
+                digest: [0; 32],
+            };
+            MAX_ENTRIES as usize - 1
+        ];
+        assert!(writer.pad(9).is_ok());
+        assert!(writer.pad(9).is_err());
     }
 
     #[test]
