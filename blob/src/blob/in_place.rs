@@ -116,7 +116,7 @@ impl BlobHandler {
 
     /// Removes an in-place target, every provider upload under its path and its reservation.
     pub(super) async fn discard_target(&self, location: &BackendLocation) -> Result<(), BlobError> {
-        let path = self.object_path(&location)?;
+        let path = self.object_path(location)?;
         let operator = self.operator_from_location(location)?;
         self.delete_path(&operator, &path).await?;
         Box::pin(self.abort_uploads(location, &path)).await?;
