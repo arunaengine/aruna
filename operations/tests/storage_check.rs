@@ -11,6 +11,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::stream::BackendStream;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BlobVersion, BucketInfo, VersionKey,
@@ -25,6 +26,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::bucket::compression::PutCompressionOperation;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::storage_check::StartCheckOperation;
+use aruna_operations::s3::bucket::storage_move::StartMoveOperation;
 use aruna_operations::s3::object::delete::DeleteObjectInput;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_storage::storage;
@@ -237,59 +239,46 @@ async fn finds_and_cleans_broken() {
         [("genes/b.faa.gz", missing), ("genes/c.faa.gz", missing)]
     );
 
-    // A version that changed since the check stays.
-    let key = VersionKey::new(BUCKET, "genes/c.faa.gz", changed);
-    let mut edited = version(&context, "genes/c.faa.gz", changed).await;
-    edited
-        .metadata
-        .insert("note".to_string(), "edited".to_string());
-    write(&context, &key, &edited).await;
-
-    let cleaned = clean_broken(&context.driver, &template(&context), None, 10)
+    // A caller without WRITE on the objects deletes nothing.
+    let auth = AuthContext {
+        user_id: context.user_id,
+        realm_id: RealmId::from_bytes([7u8; 32]),
+        path_restrictions: None,
+        session: None,
+    };
+    let cleaned = clean_broken(&context.driver, &template(&context), &auth, None, 10)
         .await
         .unwrap();
-    assert_eq!((cleaned.deleted, cleaned.kept, cleaned.more), (1, 1, false));
-    let gone = VersionKey::new(BUCKET, "genes/b.faa.gz", lost)
-        .to_bytes()
-        .unwrap();
-    assert!(read(&context, BLOB_VERSIONS_KEYSPACE, gone).await.is_none());
-    assert_eq!(version(&context, "genes/c.faa.gz", changed).await, edited);
-    assert!(
-        read(&context, BLOB_VERSIONS_KEYSPACE, version_key(healthy))
-            .await
-            .is_some()
+    assert_eq!(
+        (cleaned.deleted, cleaned.denied, cleaned.next),
+        (0, 2, None)
     );
     let (rows, _) = list_broken(&context.driver, BUCKET, None, 10)
         .await
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].0.key, "genes/c.faa.gz");
-}
-
-fn version_key(id: Ulid) -> Vec<u8> {
-    VersionKey::new(BUCKET, "a.txt", id).to_bytes().unwrap()
-}
-
-async fn write(context: &TestContext, key: &VersionKey, version: &BlobVersion) {
-    let event = context
-        .driver
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: key.to_bytes().unwrap().into(),
-            value: version.to_bytes().unwrap().into(),
-            txn_id: None,
-        })
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
+    assert_eq!(rows.len(), 2);
+    // Kept entries never block later pages: the cursor moves past them.
+    let first = clean_broken(&context.driver, &template(&context), &auth, None, 1)
+        .await
+        .unwrap();
+    assert_eq!(first.denied, 1);
+    let second = clean_broken(&context.driver, &template(&context), &auth, first.next, 1)
+        .await
+        .unwrap();
+    assert_eq!((second.denied, second.next), (1, None));
+    for (key, id) in [
+        ("genes/b.faa.gz", lost),
+        ("genes/c.faa.gz", changed),
+        ("a.txt", healthy),
+    ] {
+        let key = VersionKey::new(BUCKET, key, id).to_bytes().unwrap();
+        assert!(read(&context, BLOB_VERSIONS_KEYSPACE, key).await.is_some());
+    }
 }
 
 #[tokio::test]
-async fn rewrite_records_broken() {
-    // A copy that cannot be read is recorded as broken instead of failing every retry pass.
+async fn move_records_broken() {
+    // A move records a copy it cannot read as broken instead of failing every retry pass.
     let context = setup_context().await;
     let lost = put(
         &context,
@@ -300,6 +289,8 @@ async fn rewrite_records_broken() {
     lose_blob(&context, "genes/b.faa.gz", lost).await;
     let zstd = Compression::Zstd { level: 3 };
     let operation = PutCompressionOperation::new(BUCKET.to_string(), context.group_id, zstd, 1);
+    drive(operation, &context.driver).await.unwrap();
+    let operation = StartMoveOperation::new(BUCKET.to_string(), context.group_id, String::new(), 2);
     drive(operation, &context.driver).await.unwrap();
 
     assert!(run(&context).await.is_none());

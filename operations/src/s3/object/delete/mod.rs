@@ -140,6 +140,8 @@ pub enum DeleteObjectError {
     PurgeFence(#[from] PurgeFenceError),
     #[error("DeleteObject failed")]
     DeleteObjectFailed,
+    #[error("The version changed since it was read.")]
+    VersionChanged,
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -191,6 +193,8 @@ pub struct DeleteObjectOperation {
     output: Option<Result<DeleteObjectResult, DeleteObjectError>>,
     restrictions: Option<Vec<PathRestriction>>,
     metadata: HashMap<String, String>,
+    /// The record the deleted version must still have inside the delete's transaction.
+    expected: Option<BlobVersion>,
 }
 
 impl DeleteObjectOperation {
@@ -222,6 +226,7 @@ impl DeleteObjectOperation {
             output: None,
             restrictions: None,
             metadata: HashMap::new(),
+            expected: None,
         }
     }
 
@@ -236,6 +241,12 @@ impl DeleteObjectOperation {
     /// The deleter's credential restrictions. They are persisted on the durable
     /// replication obligation, so a scoped delete cannot escalate to unscoped
     /// when the obligation repair path enqueues replication instead.
+    /// Deletes the version only while its record still equals `version`.
+    pub fn with_expected(mut self, version: BlobVersion) -> Self {
+        self.expected = Some(version);
+        self
+    }
+
     pub fn with_restrictions(mut self, restrictions: Option<Vec<PathRestriction>>) -> Self {
         self.restrictions = restrictions;
         self
@@ -352,6 +363,13 @@ impl DeleteObjectOperation {
             Ok(version) => version,
             Err(err) => return self.emit_error(err.into()),
         };
+        if self
+            .expected
+            .as_ref()
+            .is_some_and(|expected| *expected != version)
+        {
+            return self.emit_error(DeleteObjectError::VersionChanged);
+        }
         let location_key = version.location_key();
         let summary = VersionSummary::from_blob_version(
             &VersionKey::new(&self.input.bucket, &self.input.key, version_id),

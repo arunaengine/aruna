@@ -122,8 +122,25 @@ pub struct BucketCleanupResponse {
     pub deleted: u64,
     /// Recorded versions that changed since the check or could not be deleted; they stay listed.
     pub kept: u64,
-    /// More recorded versions remain; send the request again.
-    pub more: bool,
+    /// Recorded versions the caller may not delete by object permission or policy; they stay.
+    pub denied: u64,
+    /// Pass as `after` to clean the next page; absent after the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+pub struct CleanupQuery {
+    /// The `next` value of the previous cleanup; omitted starts at the first broken file.
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+fn parse_after(after: Option<&str>) -> ServerResult<Option<aruna_core::types::Key>> {
+    match after.map(hex::decode).transpose() {
+        Ok(after) => Ok(after.map(Into::into)),
+        Err(_) => Err(ServerError::BadRequestReason("invalid `after`".to_string())),
+    }
 }
 
 async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<ulid::Ulid> {
@@ -214,10 +231,7 @@ pub async fn get_bucket_check(
             "`limit` must be 1 to 1000".to_string(),
         ));
     }
-    let after = match query.after.as_deref().map(hex::decode).transpose() {
-        Ok(after) => after.map(Into::into),
-        Err(_) => return Err(ServerError::BadRequestReason("invalid `after`".to_string())),
-    };
+    let after = parse_after(query.after.as_deref())?;
     let group_id = bucket_group(&state, &bucket).await?;
     ensure_bucket(&state, &auth, &bucket, group_id, Permission::READ).await?;
     let ctx = state.get_ctx();
@@ -307,18 +321,24 @@ pub async fn start_bucket_check(
 on the owning group's admin path, as for the bucket's storage settings.
 
 **Behavior**
-- Only versions whose record did not change since the check are deleted. Others stay listed until
-  the next check.
+- Each file also needs WRITE on its own object path and must pass the request policies, as in an
+  S3 `DeleteObjects`; denied files stay listed and count in `denied`.
+- Only versions whose record did not change since the check are deleted, decided in the delete's
+  own transaction. Others stay listed until the next check.
 - A deleted current version makes the key show its previous version, if one exists.
-- One request handles up to 1000 recorded versions; `more` asks for another request."#,
-    params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
+- One request handles up to 1000 recorded versions after `after`; pass `next` to go on."#,
+    params(
+        ("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash"),
+        CleanupQuery
+    ),
     responses(
         (
             status = 200,
             description = "What the request deleted",
             body = BucketCleanupResponse,
-            example = json!({ "bucket": "research-raw", "deleted": 2, "kept": 0, "more": false })
+            example = json!({ "bucket": "research-raw", "deleted": 2, "kept": 0, "denied": 0 })
         ),
+        (status = 400, description = "Invalid `after`", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the bucket or the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
@@ -329,8 +349,10 @@ pub async fn clean_bucket_check(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(bucket): Path<String>,
+    Query(query): Query<CleanupQuery>,
 ) -> ServerResult<Json<BucketCleanupResponse>> {
     let auth = require_realm_auth(&state, auth)?;
+    let after = parse_after(query.after.as_deref())?;
     let group_id = bucket_group(&state, &bucket).await?;
     ensure_bucket(&state, &auth, &bucket, group_id, Permission::WRITE).await?;
     ensure_group_admin(&state, &auth, group_id).await?;
@@ -343,14 +365,18 @@ pub async fn clean_bucket_check(
         node_id: state.get_node_id(),
         deleted_by: auth.user_id,
     };
-    let restrictions = auth.path_restrictions.clone();
-    let cleaned = clean_broken(&state.get_ctx(), &template, restrictions, PAGE_MAX)
+    let cleaned = clean_broken(&state.get_ctx(), &template, &auth, after, PAGE_MAX)
         .await
         .map_err(ServerError::InternalError)?;
     Ok(Json(BucketCleanupResponse {
         bucket,
         deleted: cleaned.deleted,
         kept: cleaned.kept,
-        more: cleaned.more,
+        denied: cleaned.denied,
+        next: cleaned.next.map(|key| hex::encode(key.as_ref() as &[u8])),
     }))
 }
+
+#[cfg(test)]
+#[path = "storage_check_tests.rs"]
+mod tests;

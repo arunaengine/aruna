@@ -440,41 +440,61 @@ pub async fn list_broken(
 }
 
 /// What one cleanup request did.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Cleaned {
     pub deleted: u64,
     /// Recorded versions that changed since the check, or whose delete failed; their rows stay.
     pub kept: u64,
-    /// More recorded versions remain after this request's page.
-    pub more: bool,
+    /// Recorded versions the caller may not delete; their rows stay.
+    pub denied: u64,
+    /// The key the next request starts after; `None` after the last page.
+    pub next: Option<Key>,
 }
 
-/// Deletes up to `limit` recorded broken versions of `template.bucket` through the object
-/// delete with the caller's path restrictions, each only while unchanged since the check.
+/// Deletes up to `limit` recorded broken versions of `template.bucket` after `after` through
+/// the object delete. Each object path is authorized for `auth` like an S3 bulk delete, and a
+/// version is deleted only while its record in the delete's transaction is the recorded one.
 pub async fn clean_broken(
     context: &DriverContext,
     template: &crate::s3::object::delete::DeleteObjectInput,
-    restrictions: Option<Vec<aruna_core::structs::identity::auth::PathRestriction>>,
+    auth: &aruna_core::structs::identity::auth::AuthContext,
+    after: Option<Key>,
     limit: usize,
 ) -> Result<Cleaned, String> {
-    use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
-    let (rows, next) = list_broken(context, &template.bucket, None, limit).await?;
+    use crate::auth::request_authorization::{AuthorizeError, authorize};
+    use crate::auth::request_policy::PolicyRequestExtras;
+    use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
+    use aruna_core::structs::identity::auth::Permission;
+    let (rows, next) = list_broken(context, &template.bucket, after, limit).await?;
     let mut cleaned = Cleaned {
-        more: next.is_some(),
+        next,
         ..Cleaned::default()
     };
     for (key, row) in rows {
-        let current = read_value(
+        let path = aruna_core::structs::storage::blob::object_permission_path(
+            template.realm_id,
+            template.group_id,
+            template.node_id,
+            &key.bucket,
+            &key.key,
+        );
+        let extras = PolicyRequestExtras::rest();
+        match authorize(
             context,
-            crate::blob::records::read_version_effect(&key, None),
+            template.realm_id,
+            auth,
+            &path,
+            &Permission::WRITE,
+            extras,
         )
-        .await?
-        .map(|value| BlobVersion::from_bytes(&value))
-        .transpose()
-        .map_err(|error| error.to_string())?;
-        if current.as_ref() != Some(&row.version) {
-            cleaned.kept += 1;
-            continue;
+        .await
+        {
+            Ok(()) => {}
+            Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
+                cleaned.denied += 1;
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
         }
         let input = DeleteObjectInput {
             bucket: key.bucket.clone(),
@@ -485,9 +505,13 @@ pub async fn clean_broken(
             node_id: template.node_id,
             deleted_by: template.deleted_by,
         };
-        let operation = DeleteObjectOperation::new(input).with_restrictions(restrictions.clone());
+        let operation = DeleteObjectOperation::new(input)
+            .with_restrictions(auth.path_restrictions.clone())
+            .with_expected(row.version);
         if let Err(error) = crate::driver::drive(operation, context).await {
-            tracing::warn!(bucket = %key.bucket, %error, "Failed to delete a broken version");
+            if error != DeleteObjectError::VersionChanged {
+                tracing::warn!(bucket = %key.bucket, %error, "Failed to delete a broken version");
+            }
             cleaned.kept += 1;
             continue;
         }
@@ -502,19 +526,6 @@ pub async fn clean_broken(
         }
     }
     Ok(cleaned)
-}
-
-async fn read_value(
-    context: &DriverContext,
-    read: Result<Effect, ConversionError>,
-) -> Result<Option<Vec<u8>>, String> {
-    let Ok(Effect::Storage(read)) = read else {
-        return Err("could not build a version read".to_string());
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.map(|v| v.to_vec())),
-        other => Err(format!("could not read a version: {other:?}")),
-    }
 }
 
 #[cfg(test)]
