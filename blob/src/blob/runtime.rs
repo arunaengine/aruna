@@ -742,7 +742,8 @@ impl BlobHandler {
             BlobEffect::CompleteUpload {
                 backend_upload,
                 parts,
-            } => Box::pin(self.complete_upload(*backend_upload, parts)).await,
+                streamed,
+            } => Box::pin(self.complete_upload(*backend_upload, parts, &streamed)).await,
             BlobEffect::AbortUpload { backend_upload } => {
                 Box::pin(self.abort_upload(*backend_upload)).await
             }

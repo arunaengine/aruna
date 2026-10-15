@@ -1038,9 +1038,14 @@ impl CompleteUploadOperation {
         };
         if let Some(backend_upload) = upload.backend_upload.clone() {
             self.state = CompleteUploadState::ComposeBlob;
+            let streamed = self
+                .upload_parts
+                .iter()
+                .filter(|part| part.location.partial);
             return smallvec![Effect::Blob(BlobEffect::CompleteUpload {
                 backend_upload: Box::new(backend_upload),
                 parts: self.resolved_parts.clone(),
+                streamed: streamed.map(|part| part.part_number).collect(),
             })];
         }
         let parts = self

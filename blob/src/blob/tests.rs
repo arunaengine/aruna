@@ -3041,7 +3041,7 @@ async fn s3_provider_upload() {
         .concat();
 
     let BlobEvent::WriteFinished { location } = handler
-        .complete_upload(upload.clone(), listed.clone())
+        .complete_upload(upload.clone(), listed.clone(), &[])
         .await
     else {
         panic!("in-place completion failed")
@@ -3052,7 +3052,7 @@ async fn s3_provider_upload() {
 
     // A repeated completion whose first answer was lost finds the object and hashes it again.
     let BlobEvent::WriteFinished { location: again } =
-        handler.complete_upload(upload.clone(), listed).await
+        handler.complete_upload(upload.clone(), listed, &[]).await
     else {
         panic!("repeated completion failed")
     };
@@ -3061,7 +3061,7 @@ async fn s3_provider_upload() {
     // A lost completion of another selection of the same size is not this object.
     let other = vec![parts[&1].clone(), parts[&3].clone(), parts[&4].clone()];
     assert!(matches!(
-        handler.complete_upload(upload, other).await,
+        handler.complete_upload(upload, other, &[]).await,
         BlobEvent::Error(_)
     ));
 }
@@ -3153,8 +3153,9 @@ async fn s3_staged_replacement() {
         piece: None,
     };
 
-    let BlobEvent::WriteFinished { location } =
-        handler.complete_upload(upload, vec![staged, last]).await
+    let BlobEvent::WriteFinished { location } = handler
+        .complete_upload(upload, vec![staged, last], &[])
+        .await
     else {
         panic!("completion with a staged part failed")
     };
@@ -3401,8 +3402,9 @@ async fn s3_overlapping_writes() {
         piece: None,
     };
 
-    let BlobEvent::WriteFinished { location } =
-        handler.complete_upload(upload, vec![staged, last]).await
+    let BlobEvent::WriteFinished { location } = handler
+        .complete_upload(upload, vec![staged, last], &[])
+        .await
     else {
         panic!("completion failed")
     };
@@ -3463,8 +3465,9 @@ async fn s3_delayed_write() {
     assert!(!location.partial);
 
     let last = in_place_part(&handler, &upload, 2, b"tail").await;
-    let BlobEvent::WriteFinished { location } =
-        handler.complete_upload(upload, vec![accepted, last]).await
+    let BlobEvent::WriteFinished { location } = handler
+        .complete_upload(upload, vec![accepted, last], &[])
+        .await
     else {
         panic!("completion of the acknowledged parts failed")
     };

@@ -666,6 +666,13 @@ fn completes_at_provider() {
     let target = composed_location(Ulid::from_bytes([5u8; 16]));
     op.upload_record = Some(in_place_record(&op, &target));
     op.resolved_parts = vec![part_record(1, 10)];
+    // Every streamed part is named, listed or not, so completion never writes over one.
+    let mut staged = [part_record(1, 10), part_record(3, 10)];
+    for part in &mut staged {
+        part.location.partial = false;
+    }
+    let [first, last] = staged;
+    op.upload_parts = vec![first, part_record(2, 10), last];
 
     let effects = op.compose_blob();
 
@@ -673,6 +680,7 @@ fn completes_at_provider() {
         Effect::Blob(BlobEffect::CompleteUpload {
             backend_upload,
             parts,
+            streamed,
         }),
     ] = effects.as_slice()
     else {
@@ -680,6 +688,7 @@ fn completes_at_provider() {
     };
     assert_eq!(backend_upload.location, target);
     assert_eq!(parts, &op.resolved_parts);
+    assert_eq!(streamed, &vec![2]);
 }
 
 #[test]

@@ -4,26 +4,43 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::BlobHandler;
+use super::backend::rebuild_backend_path;
 use super::frames::read_range;
 use crate::codec::{
     FRAME_SIZE, FrameEncoder, FrameWriter, PART_MIN, compressor_memory, padding, padding_len,
 };
 use crate::s3::NativeMultipart;
 use aruna_core::errors::BlobError;
+use aruna_core::events::BlobEvent;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::storage::blob::BackendLocation;
-use aruna_core::structs::storage::format::{FrameLayout, PartFrame, PartLayout, StoredLayout};
-use aruna_core::structs::storage::multipart::{BackendUpload, MAX_PART_SIZE, MultipartPart};
+use aruna_core::structs::storage::blob::{BackendLocation, ResolvedBackend};
+use aruna_core::structs::storage::format::{
+    Compression, FrameLayout, PartFrame, PartLayout, StoredFormat, StoredLayout,
+};
+use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart};
 use bytes::Bytes;
 use futures::channel::mpsc;
 use futures::{SinkExt, StreamExt, stream};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::time::SystemTime;
 use tokio::time::timeout;
+use ulid::Ulid;
 
 /// Largest part framed in memory to learn its stored size; a larger one waits in a blob.
 const BUFFER_MAX: u64 = 64 << 20;
 /// The provider part that takes the seek table when the last listed part was streamed.
 const TABLE_PART: u16 = 10_000;
+/// Largest provider part. Tests use a small one, so a plan that does not fit stays cheap.
+#[cfg(not(test))]
+const PART_MAX: u64 = aruna_core::structs::storage::multipart::MAX_PART_SIZE;
+#[cfg(test)]
+const PART_MAX: u64 = 16 << 20;
+
+/// How a compressed completion ended: the provider object, or a copy composed instead.
+pub(super) enum Finished {
+    Framed(FrameLayout),
+    Composed(Box<BackendLocation>),
+}
 
 /// One staged part of a run: its frames from the first framing and its padding.
 struct Staged<'a> {
@@ -93,16 +110,12 @@ fn stopped() -> BlobError {
     BlobError::WriteError("the part upload stopped".to_string())
 }
 
-/// Cuts each run into provider parts. A run may use the part numbers up to the next streamed
-/// part, or up to 10000 when it ends the upload; unlisted provider parts there are replaced.
-fn plan_runs(steps: &mut [Step<'_>], table: &Bytes) -> Result<(), BlobError> {
+/// Cuts each run into provider parts. A run may use the part numbers before the next streamed
+/// part, listed or not, or up to 10000. Returns `false` when a run needs more numbers.
+fn plan_runs(steps: &mut [Step<'_>], table: &Bytes, streamed: &BTreeSet<u16>) -> bool {
     let ends = steps.len();
-    for index in 0..ends {
-        let limit = match steps.get(index + 1) {
-            Some(Step::Direct(number, _)) => number - 1,
-            _ => TABLE_PART,
-        };
-        let Step::Run(run) = &mut steps[index] else {
+    for (index, step) in steps.iter_mut().enumerate() {
+        let Step::Run(run) = step else {
             continue;
         };
         for staged in &run.parts {
@@ -116,16 +129,21 @@ fn plan_runs(steps: &mut [Step<'_>], table: &Bytes) -> Result<(), BlobError> {
             run.units.push(table.len() as u64);
             run.table = Some(table.clone());
         }
-        run.counts = cut_pieces(&run.units, MAX_PART_SIZE, PART_MIN);
-        if run.counts.len() > usize::from(limit - run.first) + 1 {
-            return Err(BlobError::WriteError(format!(
-                "parts from {} need {} provider parts, but only part numbers up to {limit} are free",
-                run.first,
-                run.counts.len()
-            )));
+        run.counts = cut_pieces(&run.units, PART_MAX, PART_MIN);
+        let free = run_limit(run.first, streamed) - run.first;
+        if run.counts.len() > usize::from(free) + 1 {
+            return false;
         }
     }
-    Ok(())
+    true
+}
+
+/// The last part number a run from `first` may write: the one before the next streamed part.
+fn run_limit(first: u16, streamed: &BTreeSet<u16>) -> u16 {
+    streamed
+        .range(first + 1..)
+        .next()
+        .map_or(TABLE_PART, |next| next - 1)
 }
 
 /// Cuts units into pieces of at most `max` bytes, filling each in turn. A short last piece takes
@@ -231,7 +249,8 @@ impl BlobHandler {
         upload: &BackendUpload,
         parts: &[MultipartPart],
         level: u8,
-    ) -> Result<FrameLayout, BlobError> {
+        streamed: &[u16],
+    ) -> Result<Finished, BlobError> {
         let Some(last) = parts.last() else {
             return Err(BlobError::WriteError(
                 "the upload lists no part".to_string(),
@@ -239,6 +258,7 @@ impl BlobHandler {
         };
         let mut writer = FrameWriter::new(level);
         let mut steps = Vec::with_capacity(parts.len());
+        let mut occupied: BTreeSet<u16> = streamed.iter().copied().collect();
         for part in parts {
             let number = part.part_number;
             match (&part.location.format.layout, part.location.partial) {
@@ -252,6 +272,7 @@ impl BlobHandler {
                     if layout.padding > 0 {
                         writer.pad(layout.padding)?;
                     }
+                    occupied.insert(number);
                     steps.push(Step::Direct(number, etag));
                 }
                 (StoredLayout::Raw, false) => {
@@ -286,7 +307,10 @@ impl BlobHandler {
         }
         let (table, layout) = writer.finish()?;
         let table = Bytes::from(table);
-        plan_runs(&mut steps, &table)?;
+        if !plan_runs(&mut steps, &table, &occupied) {
+            let composed = Box::pin(self.compose_fallback(upload, parts, level)).await?;
+            return Ok(Finished::Composed(Box::new(composed)));
+        }
         let native = self.native_upload(&upload.location)?;
         let path = upload.location.get_storage_path()?;
         let sent = async {
@@ -319,7 +343,95 @@ impl BlobHandler {
         {
             return Err(error);
         }
-        Ok(layout)
+        Ok(Finished::Framed(layout))
+    }
+
+    /// Completes the listed streamed parts as an object of their own, then composes it with the
+    /// staged parts into a new copy, reading both as original bytes in bounded chunks.
+    async fn compose_fallback(
+        &self,
+        upload: &BackendUpload,
+        parts: &[MultipartPart],
+        level: u8,
+    ) -> Result<BackendLocation, BlobError> {
+        let mut writer = FrameWriter::new(level);
+        let mut etags = Vec::new();
+        let mut sources = Vec::with_capacity(parts.len());
+        let mut assembled = upload.location.clone();
+        assembled.blob_size = 0;
+        for part in parts {
+            let size = part.location.blob_size;
+            let StoredLayout::FramedPart(layout) = &part.location.format.layout else {
+                sources.push((Some(part.location.clone()), 0..size));
+                continue;
+            };
+            let etag = part.backend_etag.clone().ok_or_else(|| {
+                let number = part.part_number;
+                BlobError::WriteError(format!("part {number} has no provider ETag"))
+            })?;
+            for frame in &layout.frames {
+                writer.entry(frame.clone())?;
+            }
+            if layout.padding > 0 {
+                writer.pad(layout.padding)?;
+            }
+            etags.push((part.part_number, etag));
+            sources.push((None, assembled.blob_size..assembled.blob_size + size));
+            assembled.blob_size += size;
+        }
+        // Only listed streamed parts and the table part are assembled, so no part is replaced.
+        if !etags.is_empty() {
+            let (table, layout) = writer.finish()?;
+            let table = Bytes::from(table);
+            let native = self.native_upload(&upload.location)?;
+            let path = upload.location.get_storage_path()?;
+            let sent = async {
+                let body = BackendStream(Box::pin(stream::iter([Ok(table.clone())])));
+                let length = table.len() as u64;
+                let etag = native
+                    .upload_part(&path, &upload.upload_id, TABLE_PART, length, body)
+                    .await?;
+                etags.push((TABLE_PART, etag));
+                native.complete(&path, &upload.upload_id, &etags).await
+            }
+            .await;
+            if let Err(error) = sent
+                && !self
+                    .holds_table(&upload.location, &path, &layout, &table)
+                    .await
+            {
+                return Err(error);
+            }
+            assembled.format.layout = StoredLayout::Frames(Box::new(layout));
+        }
+        let sources = sources
+            .into_iter()
+            .map(|(part, range)| (part.unwrap_or_else(|| assembled.clone()), range))
+            .collect();
+        let ulid = Ulid::generate();
+        let backend_path = rebuild_backend_path(&upload.location.backend_path, ulid)
+            .map_err(BlobError::ConversionError)?;
+        let template = BackendLocation {
+            storage_bucket: String::new(),
+            backend_path,
+            ulid,
+            format: StoredFormat::default(),
+            created_at: SystemTime::now(),
+            partial: false,
+            blob_size: 0,
+            hashes: HashMap::new(),
+            ..upload.location.clone()
+        };
+        let backend = upload.location.backend.clone();
+        let resolved = ResolvedBackend::new(backend, upload.location.storage_class.clone())
+            .with_compression(Compression::Zstd { level });
+        match Box::pin(self.compose_into(template, resolved, sources)).await {
+            BlobEvent::WriteFinished { location } => Ok(location),
+            BlobEvent::Error(error) => Err(error),
+            other => Err(BlobError::WriteError(format!(
+                "unexpected compose result: {other:?}"
+            ))),
+        }
     }
 
     /// Frames the staged parts of a run again and sends them as its provider parts, checking
@@ -462,7 +574,8 @@ impl BlobHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::cut_pieces;
+    use super::{cut_pieces, run_limit};
+    use std::collections::BTreeSet;
 
     #[test]
     fn cuts_fill_pieces() {
@@ -476,5 +589,15 @@ mod tests {
         // A last piece may stay short when the piece before has a single unit.
         assert_eq!(cut_pieces(&[95, 6], 100, 10), vec![1, 1]);
         assert_eq!(cut_pieces(&[], 100, 10), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn streamed_ends_runs() {
+        // Streamed parts keep their numbers, listed or not; a run ends before the next one.
+        let streamed = BTreeSet::from([2, 7]);
+        assert_eq!(run_limit(1, &streamed), 1);
+        assert_eq!(run_limit(3, &streamed), 6);
+        assert_eq!(run_limit(8, &streamed), 10_000);
+        assert_eq!(run_limit(10_000, &BTreeSet::new()), 10_000);
     }
 }

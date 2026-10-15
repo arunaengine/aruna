@@ -91,6 +91,8 @@ pub enum BlobEffect {
     CompleteUpload {
         backend_upload: Box<BackendUpload>,
         parts: Vec<MultipartPart>,
+        /// Numbers of every streamed provider part, listed or not; completion never replaces one.
+        streamed: Vec<u16>,
     },
     AbortUpload {
         backend_upload: Box<BackendUpload>,

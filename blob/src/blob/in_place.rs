@@ -4,7 +4,7 @@
 
 use super::BlobHandler;
 use super::backend::{build_backend_path, intent_key};
-use super::framed_parts::{part_level, streams_now};
+use super::framed_parts::{Finished, part_level, streams_now};
 use crate::hash::Hasher;
 use crate::part_chain::{PartAttempt, PartChain};
 use crate::s3::{NativeMultipart, multipart_etag};
@@ -460,16 +460,21 @@ impl BlobHandler {
         &self,
         upload: BackendUpload,
         parts: Vec<MultipartPart>,
+        streamed: &[u16],
     ) -> BlobEvent {
         let Some(mut reservation) = self.hold_reservation(upload.location.ulid) else {
             return BlobEvent::Error(BlobError::WriteError(
                 "too many active blob reservations".to_string(),
             ));
         };
-        match Box::pin(self.finish_upload(&upload, &parts)).await {
+        match Box::pin(self.finish_upload(&upload, &parts, streamed)).await {
             Ok(location) => {
                 self.chains().remove(&upload.upload_id);
                 reservation.retain();
+                // A composed copy keeps its own reservation; the target row discards the target.
+                if !location.same_object(&upload.location) {
+                    return BlobEvent::WriteFinished { location };
+                }
                 // The object is the only copy of the parts: its row keeps it for a retry.
                 match self.write_target_row(&location, upload.record_id).await {
                     Ok(()) => BlobEvent::WriteFinished { location },
@@ -484,6 +489,7 @@ impl BlobHandler {
         &self,
         upload: &BackendUpload,
         parts: &[MultipartPart],
+        streamed: &[u16],
     ) -> Result<BackendLocation, BlobError> {
         let mut listed = Vec::with_capacity(parts.len());
         let mut etags = Vec::with_capacity(parts.len());
@@ -523,8 +529,12 @@ impl BlobHandler {
             ..upload.location.clone()
         };
         if let Some(level) = part_level(upload) {
-            let layout = Box::pin(self.finish_framed(upload, parts, level)).await?;
-            location.format.layout = StoredLayout::Frames(Box::new(layout));
+            match Box::pin(self.finish_framed(upload, parts, level, streamed)).await? {
+                Finished::Framed(layout) => {
+                    location.format.layout = StoredLayout::Frames(Box::new(layout));
+                }
+                Finished::Composed(composed) => return Ok(*composed),
+            }
         } else if let Err(error) = self
             .assemble(&native, &path, upload, parts, etags.clone())
             .await
