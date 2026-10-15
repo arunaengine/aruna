@@ -30,6 +30,8 @@ const INDEX_CACHE_BYTES: usize = 64 << 20;
 const FETCH_BYTES: u64 = 8 << 20;
 /// Frames of one batch that decode on the blocking pool at the same time.
 const DECODE_TASKS: usize = 4;
+/// Memory a frame reader holds: the batch being decoded, its frames and the next fetch.
+pub(super) const READ_MEMORY: u64 = 3 * FETCH_BYTES;
 
 /// Parsed seek tables keyed by their hash. Stored objects never change, so entries stay valid.
 #[derive(Debug)]

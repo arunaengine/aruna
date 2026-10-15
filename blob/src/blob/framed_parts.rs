@@ -5,7 +5,9 @@
 
 use super::BlobHandler;
 use super::backend::rebuild_backend_path;
-use super::frames::read_range;
+use super::frames::{READ_MEMORY, read_range};
+use super::io::compose_chunk;
+use super::pithos::Share;
 use crate::codec::{
     FRAME_SIZE, FrameEncoder, FrameWriter, PART_MIN, compressor_memory, padding, padding_len,
 };
@@ -13,7 +15,7 @@ use crate::s3::NativeMultipart;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::storage::blob::{BackendLocation, ResolvedBackend};
+use aruna_core::structs::storage::blob::{Backend, BackendLocation, ResolvedBackend};
 use aruna_core::structs::storage::format::{
     Compression, FrameLayout, PartFrame, PartLayout, StoredFormat, StoredLayout,
 };
@@ -34,7 +36,7 @@ const TABLE_PART: u16 = 10_000;
 #[cfg(not(test))]
 const PART_MAX: u64 = aruna_core::structs::storage::multipart::MAX_PART_SIZE;
 #[cfg(test)]
-const PART_MAX: u64 = 16 << 20;
+const PART_MAX: u64 = 10 << 20;
 
 /// How a compressed completion ended: the provider object, or a copy composed instead.
 pub(super) enum Finished {
@@ -186,6 +188,28 @@ pub(super) fn streams_now(part_number: u16, size: Option<u64>) -> bool {
     part_number < TABLE_PART && size.is_some_and(|size| (PART_MIN..=BUFFER_MAX).contains(&size))
 }
 
+/// Memory one seek table entry takes while completing: as a staged frame, a table entry, its
+/// table bytes and a cut unit, with room for vector growth.
+const ENTRY_MEMORY: u64 = 160;
+
+/// Working set of one compressed completion, held through a fallback: entries and the seek
+/// table, framing and composer buffers, both compressors, a frame reader and a writer chunk.
+fn completion_charge(sizes: &[u64], level: u8, compression: Compression, backend: &Backend) -> u64 {
+    let entries: u64 = sizes.iter().map(|size| size.div_ceil(FRAME_SIZE) + 2).sum();
+    let current = match compression {
+        Compression::Off => 0,
+        Compression::Zstd { level } => compressor_memory(level),
+    };
+    let total = sizes.iter().sum();
+    let chunk = compose_chunk(backend, total, true).map_or(0, |chunk| chunk as u64);
+    entries * ENTRY_MEMORY
+        + compressor_memory(level)
+        + current
+        + 16 * FRAME_SIZE
+        + READ_MEMORY
+        + chunk
+}
+
 /// Memory one framed part may hold: its frames or padding, a received chunk of up to the part
 /// size, the frame being encoded with its buffers, and the compressor workspace.
 fn framed_charge(size: u64, level: u8) -> u64 {
@@ -258,6 +282,14 @@ impl BlobHandler {
                 "the upload lists no part".to_string(),
             ));
         };
+        // Held until the end, also through a fallback; compression tasks keep their own clone.
+        let backend = self
+            .registry
+            .config_for(&upload.location.backend)?
+            .backend_type;
+        let sizes: Vec<u64> = parts.iter().map(|part| part.location.blob_size).collect();
+        let charge = completion_charge(&sizes, level, compression, &backend);
+        let share = self.reserve_pithos(charge).await?;
         let mut writer = FrameWriter::new(level);
         let mut steps = Vec::with_capacity(parts.len());
         let mut occupied: BTreeSet<u16> = streamed.iter().copied().collect();
@@ -278,7 +310,8 @@ impl BlobHandler {
                     steps.push(Step::Direct(number, etag));
                 }
                 (StoredLayout::Raw, false) => {
-                    let frames = self.frame_blob(&part.location, level, None).await?;
+                    let frames = self.frame_blob(&part.location, level, &share, None);
+                    let frames = frames.await?;
                     let stored = frames.iter().map(|frame| u64::from(frame.stored)).sum();
                     let padding = match std::ptr::eq(part, last) {
                         true => 0,
@@ -323,7 +356,8 @@ impl BlobHandler {
                     Step::Direct(number, etag) => etags.push((*number, etag.clone())),
                     Step::Run(run) => {
                         let id = &upload.upload_id;
-                        etags.extend(self.send_run(&native, &path, id, level, run).await?);
+                        let sent = self.send_run(&native, &path, id, level, &share, run);
+                        etags.extend(sent.await?);
                     }
                 }
             }
@@ -446,6 +480,7 @@ impl BlobHandler {
         path: &str,
         upload_id: &str,
         level: u8,
+        share: &Share,
         run: &Run<'_>,
     ) -> Result<Vec<(u16, String)>, BlobError> {
         let mut router = Router {
@@ -462,7 +497,8 @@ impl BlobHandler {
             let produced = async {
                 for staged in &run.parts {
                     let location = &staged.part.location;
-                    let frames = self.frame_blob(location, level, Some(&mut router)).await?;
+                    let sink = Some(&mut router);
+                    let frames = self.frame_blob(location, level, share, sink).await?;
                     if frames != staged.frames {
                         return Err(BlobError::IntegrityCheckFailed(
                             "a staged part framed differently".to_string(),
@@ -510,6 +546,7 @@ impl BlobHandler {
         &self,
         location: &BackendLocation,
         level: u8,
+        share: &Share,
         mut sink: Option<&mut Router>,
     ) -> Result<Vec<PartFrame>, BlobError> {
         let read = |error: opendal::Error| BlobError::ReadError(error.to_string());
@@ -524,7 +561,7 @@ impl BlobHandler {
             .await
             .map_err(|_| late())?
             .map_err(read)?;
-        let mut encoder = FrameEncoder::new(level);
+        let mut encoder = FrameEncoder::new(level).holding(share.clone());
         while let Some(chunk) = timeout(self.transfer_idle_timeout(), stream.next())
             .await
             .map_err(|_| late())?
@@ -578,7 +615,11 @@ impl BlobHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{cut_pieces, run_limit};
+    use super::{completion_charge, cut_pieces, run_limit};
+    use crate::blob::pithos::WORKING_SET;
+    use crate::codec::compressor_memory;
+    use aruna_core::structs::storage::blob::Backend;
+    use aruna_core::structs::storage::format::Compression;
     use std::collections::BTreeSet;
 
     #[test]
@@ -593,6 +634,20 @@ mod tests {
         // A last piece may stay short when the piece before has a single unit.
         assert_eq!(cut_pieces(&[95, 6], 100, 10), vec![1, 1]);
         assert_eq!(cut_pieces(&[], 100, 10), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn charge_fits_budget() {
+        // The largest upload, 1,024 parts of 5 GiB at the highest level, fits the working set.
+        let largest = vec![5 << 30; 1_024];
+        let zstd = Compression::Zstd { level: 22 };
+        let charge = completion_charge(&largest, 22, zstd, &Backend::S3);
+        assert!(charge <= WORKING_SET, "{charge}");
+        // Both compressors count: the opening level and the bucket's current one.
+        let off = completion_charge(&largest, 22, Compression::Off, &Backend::S3);
+        assert_eq!(charge - off, compressor_memory(22));
+        let small = completion_charge(&[6 << 20], 3, zstd, &Backend::S3);
+        assert!(small > compressor_memory(3) + compressor_memory(22));
     }
 
     #[test]
