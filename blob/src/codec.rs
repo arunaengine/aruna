@@ -1,6 +1,5 @@
 //! Stores blobs in the zstd seekable format: 1 MiB zstd frames, a skippable frame with the BLAKE3
 //! of each stored frame, then the seek table. The location record keeps the BLAKE3 of both.
-//! A provider part may end with a padding skippable frame; its table entry has original size 0.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -13,6 +12,7 @@ use zstd::zstd_safe::{CParameter, DParameter};
 pub(crate) const FRAME_SIZE: u64 = 1 << 20;
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A5E;
 const DIGEST_MAGIC: u32 = 0x184D_2A50;
+/// Skippable frame that pads a provider part; its table entry has original size 0.
 const PADDING_MAGIC: u32 = 0x184D_2A51;
 /// Smallest S3 part other than the last.
 pub(crate) const PART_MIN: u64 = 5 << 20;

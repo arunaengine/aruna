@@ -19,6 +19,7 @@ mod abe;
 mod backend;
 mod control_plane;
 mod external;
+mod framed_parts;
 mod frames;
 mod group;
 mod in_place;
