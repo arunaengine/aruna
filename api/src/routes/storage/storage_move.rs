@@ -95,7 +95,8 @@ async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<ulid::U
 - A version counts when its copy is not on the storage, or not in the encoding, that the bucket,
   group and node rules choose for a new upload of its key.
 - Not counted: versions of an encrypted bucket, files in a linked folder, unfinished copies,
-  versions with placement policies on another storage, and keys the rules cannot place now.
+  versions with placement policies on another storage, keys the rules cannot place now, and
+  broken files a storage check recorded.
 - Every version, current or not, counts on its own.
 - `prefix` limits the count to keys under it, such as the folder of a linked rule.
 
@@ -178,6 +179,7 @@ pub async fn get_bucket_move(
 - A version is published only if its rules, bucket settings and the version itself did not change
   during the copy; otherwise it stays and counts as skipped.
 - Files in a linked folder stay where they are. Versions already in place are skipped.
+- A version whose copy cannot be read is recorded as broken, as by a storage check, and skipped.
 - `prefix` limits the move to keys under it. Other keys still get the bucket's compression.
 - Versions that fail are retried in later passes like a compression change. Sending the same
   request again resumes a running move or restarts one that finished; a running move with another

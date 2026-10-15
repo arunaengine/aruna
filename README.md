@@ -182,10 +182,12 @@ the group's Storage tab with the endpoint and keys; it needs no bucket. Then add
 - **Move files.** Moving a bucket copies its stored files to where the rules send new uploads
   now, then deletes the old copies. A new linked rule can move the folder's files at once.
   Encrypted buckets cannot move yet.
+- **Broken files.** A check finds files whose stored copy is gone, for example after a storage
+  was removed, and lists them; a cleanup deletes them.
 
 `PUT /data/groups/{group_id}/storage/routing` sets the default rule; linked rules live under
 `/data/groups/{group_id}/storage/imports`; `/data/buckets/{bucket}/storage/move` counts and moves
-stored files.
+stored files, and `/data/buckets/{bucket}/storage/check` finds and deletes broken files.
 
 ## Realm Registry
 
