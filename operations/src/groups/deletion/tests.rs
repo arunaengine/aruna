@@ -333,7 +333,7 @@ async fn occupied_peer_refuses() {
     first.prepare(1).await.unwrap();
     assert_eq!(
         second.prepare(2).await,
-        Err(GroupDeletionError::NotEmpty("S3 buckets".into()))
+        Err(GroupDeletionError::NotEmpty("S3 buckets (owned)".into()))
     );
     for fixture in [&first, &second] {
         assert!(

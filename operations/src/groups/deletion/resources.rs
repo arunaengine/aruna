@@ -52,9 +52,9 @@ pub(super) struct EmptyCheck {
     next: Option<Key>,
     /// Every kind of resource found so far; the check names them all.
     found: Vec<&'static str>,
-    /// Names of the first blocking buckets, and how many more were seen.
+    /// Names of the first blocking buckets, and whether more exist.
     buckets: Vec<String>,
-    more: usize,
+    more: bool,
 }
 
 impl EmptyCheck {
@@ -67,7 +67,7 @@ impl EmptyCheck {
             next: None,
             found: Vec::new(),
             buckets: Vec::new(),
-            more: 0,
+            more: false,
         }
     }
 
@@ -181,12 +181,13 @@ impl EmptyCheck {
                     if self.buckets.is_empty() {
                         self.found.push(reason);
                     }
-                    match self.buckets.len() < MAX_NAMED {
-                        true => self
-                            .buckets
-                            .push(String::from_utf8_lossy(&key).into_owned()),
-                        false => self.more += 1,
+                    if self.buckets.len() == MAX_NAMED {
+                        self.more = true;
+                        self.next = None;
+                        break;
                     }
+                    self.buckets
+                        .push(String::from_utf8_lossy(&key).into_owned());
                 } else if owned {
                     self.found.push(reason);
                     self.next = None;
@@ -201,12 +202,9 @@ impl EmptyCheck {
             return Ok(Some(self.start(txn_id)));
         }
         let named = format!(
-            "S3 buckets: {}{}",
+            "S3 buckets ({}{})",
             self.buckets.join(", "),
-            match self.more {
-                0 => String::new(),
-                more => format!(" (+{more} more)"),
-            }
+            if self.more { ", and more" } else { "" }
         );
         let found: Vec<&str> = self
             .found
@@ -227,6 +225,17 @@ impl EmptyCheck {
                 rest.join(", ")
             ))),
         }
+    }
+}
+
+/// Drops the bucket names from a reason, for callers who may not read the group's data.
+pub(super) fn coarse(reason: &str) -> String {
+    match reason.split_once("S3 buckets (") {
+        Some((head, rest)) => match rest.split_once(')') {
+            Some((_, tail)) => format!("{head}S3 buckets{tail}"),
+            None => reason.to_string(),
+        },
+        None => reason.to_string(),
     }
 }
 
@@ -258,12 +267,8 @@ mod tests {
         assert_eq!(reason, "metadata documents and source connectors");
     }
 
-    #[test]
-    fn names_buckets() {
-        let group_id = ulid::Ulid::from_bytes([1u8; 16]);
-        let txn_id = TxnId::default();
-        let mut check = EmptyCheck::new(group_id, SystemTime::UNIX_EPOCH);
-        let bucket: Vec<u8> = BucketInfo {
+    fn bucket(group_id: GroupId) -> aruna_core::types::Value {
+        BucketInfo {
             group_id,
             created_at: SystemTime::UNIX_EPOCH,
             created_by: Default::default(),
@@ -274,29 +279,67 @@ mod tests {
             compression: aruna_core::structs::storage::format::Compression::Off,
         }
         .to_bytes()
-        .unwrap();
+        .unwrap()
+        .into()
+    }
+
+    fn page(rows: &[(&str, GroupId)], next: Option<&str>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: rows
+                .iter()
+                .map(|(name, group)| (Key::from(name.as_bytes().to_vec()), bucket(*group)))
+                .collect(),
+            next_start_after: next.map(|next| Key::from(next.as_bytes().to_vec())),
+        })
+    }
+
+    fn run(first: &[(&str, GroupId)], second: &[(&str, GroupId)], paged: bool) -> String {
+        let group_id = ulid::Ulid::from_bytes([1u8; 16]);
+        let txn_id = TxnId::default();
+        let mut check = EmptyCheck::new(group_id, SystemTime::UNIX_EPOCH);
+        let empty = || page(&[], None);
+        let mut events = vec![empty(), empty(), empty(), empty()];
+        events.push(page(first, paged.then_some("p1")));
+        if paged {
+            events.push(page(second, None));
+        }
+        events.extend((5..TABLES.len()).map(|_| empty()));
         let mut result = Ok(None);
-        for table in 0..TABLES.len() {
-            let values = match TABLES[table].0 == S3_BUCKET_KEYSPACE {
-                true => (0..7)
-                    .map(|n| {
-                        (
-                            Key::from(format!("b{n}").into_bytes()),
-                            bucket.clone().into(),
-                        )
-                    })
-                    .collect(),
-                false => Vec::new(),
-            };
-            let event = Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after: None,
-            });
+        for event in events {
             result = check.step(event, txn_id);
         }
         let Err(GroupDeletionError::NotEmpty(reason)) = result else {
             panic!("expected a non-empty group, got {result:?}");
         };
-        assert_eq!(reason, "S3 buckets: b0, b1, b2, b3, b4 (+2 more)");
+        reason
+    }
+
+    #[test]
+    fn names_buckets() {
+        let mine = ulid::Ulid::from_bytes([1u8; 16]);
+        let other = ulid::Ulid::from_bytes([2u8; 16]);
+        let first = [("a", mine), ("x", other), ("b", mine), ("c", mine)];
+        let second = [
+            ("d", mine),
+            ("y", other),
+            ("e", mine),
+            ("f", mine),
+            ("g", mine),
+        ];
+        assert_eq!(
+            run(&first, &second, true),
+            "S3 buckets (a, b, c, d, e, and more)"
+        );
+        assert_eq!(run(&first, &[], false), "S3 buckets (a, b, c)");
+    }
+
+    #[test]
+    fn hides_names() {
+        assert_eq!(coarse("S3 buckets (a, b, and more)"), "S3 buckets");
+        assert_eq!(
+            coarse("metadata documents and S3 buckets (a, b)"),
+            "metadata documents and S3 buckets"
+        );
+        assert_eq!(coarse("storage backends"), "storage backends");
     }
 }

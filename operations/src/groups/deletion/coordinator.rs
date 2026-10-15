@@ -9,18 +9,20 @@ use std::time::SystemTime;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE};
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::group_delete::{
     GroupDeleteAction, GroupDeleteCertificate, GroupDeletePhase, GroupDeletePlan, GroupDeleteProof,
     GroupDeleteRecord, GroupDeletionError,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, admin_documents::AdminDocumentEvent};
 use futures_util::{StreamExt, stream};
 use ulid::Ulid;
 
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{ForwardAuthError, authorize_write};
 use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
@@ -28,6 +30,7 @@ use crate::placement::process_placements::load_realm_config;
 
 use super::commit::CommitOperation;
 use super::prepare::PrepareOperation;
+use super::resources::coarse;
 
 pub(super) fn coordinator(config: &RealmConfigDocument) -> Result<NodeId, GroupDeletionError> {
     config
@@ -110,6 +113,29 @@ async fn authorize(
         }
     }
     Err(GroupDeletionError::Unauthorized)
+}
+
+// Bucket names are shown only to callers who may read the group's data on that node.
+async fn blocked(
+    context: &Arc<DriverContext>,
+    auth: &AuthContext,
+    group_id: GroupId,
+    node: NodeId,
+    reason: String,
+) -> GroupDeletionError {
+    let path = group_permission_path(auth.realm_id, group_id, node);
+    let readable = crate::auth::request_authorization::authorize(
+        context.as_ref(),
+        auth.realm_id,
+        auth,
+        &path,
+        &Permission::READ,
+        PolicyRequestExtras::rest(),
+    )
+    .await
+    .is_ok();
+    let reason = if readable { reason } else { coarse(&reason) };
+    GroupDeletionError::NotEmpty(format!("node {node}: {reason}"))
 }
 
 pub async fn delete_group(
@@ -202,7 +228,12 @@ pub async fn delete_group(
     .await
     {
         cancel_plan(context, &plan).await?;
-        return Err(error);
+        return Err(match error {
+            GroupDeletionError::NotEmpty(reason) => {
+                blocked(context, &auth, group_id, net.node_id(), reason).await
+            }
+            error => error,
+        });
     }
     let replies = stream::iter(plan.nodes.iter().copied().map(|node| {
         let plan = plan.clone();
@@ -235,9 +266,7 @@ pub async fn delete_group(
                 )))
             }
             Err(GroupDeletionError::NotEmpty(reason)) => {
-                failure = Some(GroupDeletionError::NotEmpty(format!(
-                    "node {node}: {reason}"
-                )))
+                failure = Some(blocked(context, &auth, group_id, node, reason).await)
             }
             Err(error) => failure = Some(error),
         }
