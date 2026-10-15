@@ -3041,7 +3041,7 @@ async fn s3_provider_upload() {
         .concat();
 
     let BlobEvent::WriteFinished { location } = handler
-        .complete_upload(upload.clone(), listed.clone())
+        .complete_upload(upload.clone(), listed.clone(), &[], Compression::Off)
         .await
     else {
         panic!("in-place completion failed")
@@ -3051,8 +3051,9 @@ async fn s3_provider_upload() {
     assert_eq!(read_back(&handler, location.clone()).await, expected);
 
     // A repeated completion whose first answer was lost finds the object and hashes it again.
-    let BlobEvent::WriteFinished { location: again } =
-        handler.complete_upload(upload.clone(), listed).await
+    let BlobEvent::WriteFinished { location: again } = handler
+        .complete_upload(upload.clone(), listed, &[], Compression::Off)
+        .await
     else {
         panic!("repeated completion failed")
     };
@@ -3061,7 +3062,9 @@ async fn s3_provider_upload() {
     // A lost completion of another selection of the same size is not this object.
     let other = vec![parts[&1].clone(), parts[&3].clone(), parts[&4].clone()];
     assert!(matches!(
-        handler.complete_upload(upload, other).await,
+        handler
+            .complete_upload(upload, other, &[], Compression::Off)
+            .await,
         BlobEvent::Error(_)
     ));
 }
@@ -3153,8 +3156,9 @@ async fn s3_staged_replacement() {
         piece: None,
     };
 
-    let BlobEvent::WriteFinished { location } =
-        handler.complete_upload(upload, vec![staged, last]).await
+    let BlobEvent::WriteFinished { location } = handler
+        .complete_upload(upload, vec![staged, last], &[], Compression::Off)
+        .await
     else {
         panic!("completion with a staged part failed")
     };
@@ -3401,8 +3405,9 @@ async fn s3_overlapping_writes() {
         piece: None,
     };
 
-    let BlobEvent::WriteFinished { location } =
-        handler.complete_upload(upload, vec![staged, last]).await
+    let BlobEvent::WriteFinished { location } = handler
+        .complete_upload(upload, vec![staged, last], &[], Compression::Off)
+        .await
     else {
         panic!("completion failed")
     };
@@ -3463,8 +3468,9 @@ async fn s3_delayed_write() {
     assert!(!location.partial);
 
     let last = in_place_part(&handler, &upload, 2, b"tail").await;
-    let BlobEvent::WriteFinished { location } =
-        handler.complete_upload(upload, vec![accepted, last]).await
+    let BlobEvent::WriteFinished { location } = handler
+        .complete_upload(upload, vec![accepted, last], &[], Compression::Off)
+        .await
     else {
         panic!("completion of the acknowledged parts failed")
     };
@@ -3583,32 +3589,6 @@ async fn s3_framed_compose() {
     assert!(location.stored_size() < mib as u64);
     assert_eq!(location.hashes, Hasher::new_with_bytes(&expected).to_map());
     assert_eq!(read_back(&handler, location).await, expected);
-}
-
-#[tokio::test]
-#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
-async fn s3_compressed_upload() {
-    // A provider upload assembles raw parts, so a compressed bucket keeps a blob per part.
-    let env = s3_env();
-    let context = setup_s3_mixed(&env).await;
-    let handler = context.blob_handle.handler.clone();
-
-    let event = handler
-        .open_upload(
-            Ulid::generate(),
-            "bucket",
-            "framed.bin",
-            cold_backend().with_compression(Compression::Zstd { level: 3 }),
-            test_user_id(),
-        )
-        .await;
-
-    assert!(matches!(
-        event,
-        BlobEvent::UploadOpened {
-            backend_upload: None
-        }
-    ));
 }
 
 async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bool) {
@@ -3940,6 +3920,9 @@ mod pithos;
 
 #[path = "parts_tests.rs"]
 mod parts;
+
+#[path = "framed_tests.rs"]
+mod framed;
 
 #[path = "rewrite_tests.rs"]
 mod rewrite;

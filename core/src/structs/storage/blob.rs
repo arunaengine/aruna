@@ -456,6 +456,10 @@ impl BackendLocation {
             StoredLayout::Raw => self.blob_size,
             StoredLayout::Frames(layout) => layout.stored_size,
             StoredLayout::Pithos(layout) => layout.stored_size,
+            StoredLayout::FramedPart(layout) => {
+                let frames = layout.frames.iter().map(|frame| u64::from(frame.stored));
+                frames.sum::<u64>() + u64::from(layout.padding)
+            }
         }
     }
 

@@ -4,14 +4,20 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::errors::BlobError;
-use aruna_core::structs::storage::format::FrameLayout;
+use aruna_core::structs::storage::format::{FrameLayout, PartFrame};
 use bytes::{Bytes, BytesMut};
+use std::any::Any;
 use std::ops::Range;
+use std::sync::Arc;
 use zstd::zstd_safe::{CParameter, DParameter};
 
 pub(crate) const FRAME_SIZE: u64 = 1 << 20;
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A5E;
 const DIGEST_MAGIC: u32 = 0x184D_2A50;
+/// Skippable frame that pads a provider part; its table entry has original size 0.
+const PADDING_MAGIC: u32 = 0x184D_2A51;
+/// Smallest S3 part other than the last.
+pub(crate) const PART_MIN: u64 = 5 << 20;
 const SEEKABLE_MAGIC: u32 = 0x8F92_EAB1;
 /// Stored size and original size of one frame.
 const ENTRY_LEN: u64 = 8;
@@ -25,6 +31,9 @@ const WINDOW_LOG: u32 = 20;
 const MAX_FRAMES: u64 = 5 << 20;
 /// Parts of the largest S3 multipart upload; each may end with one short frame.
 const MAX_PARTS: u64 = 10_000;
+/// Table entries of the largest object: its full frames, then one short frame and one padding
+/// entry per part.
+const MAX_ENTRIES: u64 = MAX_FRAMES + 2 * MAX_PARTS;
 /// Largest zstd block; raw frames are cut into blocks of this size.
 const BLOCK_MAX: usize = 128 << 10;
 
@@ -37,10 +46,11 @@ fn table_len(frames: u64) -> u64 {
     2 * HEADER_LEN + frames * (DIGEST_LEN + ENTRY_LEN) + FOOTER_LEN
 }
 
-/// Whether `frames` frames of at most 1 MiB, with one short frame per part, can hold `size`.
+/// Whether `frames` entries can hold `size`: frames of at most 1 MiB, and per part one short
+/// frame and one padding entry.
 fn plausible_frames(size: u64, frames: u64) -> bool {
     let least = frame_count(size);
-    frames <= MAX_FRAMES && frames >= least && frames <= (least + MAX_PARTS).min(size)
+    frames <= MAX_ENTRIES && frames >= least && frames <= (least + 2 * MAX_PARTS).min(2 * size)
 }
 
 fn integrity(message: &str) -> BlobError {
@@ -53,6 +63,20 @@ fn read_u32(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(value)
 }
 
+/// Memory the zstd compressor of `level` uses for a 1 MiB frame, rounded up to whole MiB.
+pub(crate) fn compressor_memory(level: u8) -> u64 {
+    let mib = match level {
+        0..=2 => 1,
+        3 => 2,
+        4..=6 => 3,
+        7..=8 => 6,
+        9..=12 => 11,
+        13..=17 => 17,
+        _ => 18,
+    };
+    mib << 20
+}
+
 /// Compresses one frame with a zstd checksum. A frame that saves less than
 /// max(1 KiB, 5 percent) is stored as raw blocks instead.
 pub(crate) fn encode_frame(raw: Bytes, level: u8) -> Result<Bytes, BlobError> {
@@ -62,7 +86,9 @@ pub(crate) fn encode_frame(raw: Bytes, level: u8) -> Result<Bytes, BlobError> {
     compressor
         .set_parameter(CParameter::ChecksumFlag(true))
         .map_err(failed)?;
-    let compressed = compressor.compress(&raw).map_err(failed)?;
+    let mut compressed = compressor.compress(&raw).map_err(failed)?;
+    // The output buffer is sized for the worst case; a kept frame holds only its bytes.
+    compressed.shrink_to_fit();
     let wanted = 1024.max(raw.len() / 20);
     match raw.len().saturating_sub(compressed.len()) >= wanted {
         true => Ok(Bytes::from(compressed)),
@@ -85,12 +111,36 @@ fn raw_frame(raw: &[u8]) -> Bytes {
     out.freeze()
 }
 
+/// Padding a part of `stored` bytes needs to reach `PART_MIN`; zero when it is large enough.
+pub(crate) fn padding_len(stored: u64) -> u32 {
+    match PART_MIN.checked_sub(stored) {
+        None | Some(0) => 0,
+        Some(missing) => missing.max(HEADER_LEN) as u32,
+    }
+}
+
+/// A skippable frame of `len` bytes, zero after its header.
+pub(crate) fn padding(len: u32) -> Bytes {
+    let mut out = BytesMut::zeroed(len as usize);
+    out[..4].copy_from_slice(&PADDING_MAGIC.to_le_bytes());
+    out[4..8].copy_from_slice(&(len - HEADER_LEN as u32).to_le_bytes());
+    out.freeze()
+}
+
+/// Refuses another entry after `entries` once the table holds `MAX_ENTRIES`.
+fn entry_room(entries: u64) -> Result<(), BlobError> {
+    match entries < MAX_ENTRIES {
+        true => Ok(()),
+        false => Err(BlobError::WriteError(
+            "object has too many frames".to_string(),
+        )),
+    }
+}
+
 /// Collects the seek table while frames are written.
 pub(crate) struct FrameWriter {
     level: u8,
-    entries: Vec<u8>,
-    digests: Vec<u8>,
-    frames: u32,
+    frames: Vec<PartFrame>,
     stored: u64,
 }
 
@@ -98,53 +148,64 @@ impl FrameWriter {
     pub(crate) fn new(level: u8) -> Self {
         Self {
             level,
-            entries: Vec::new(),
-            digests: Vec::new(),
-            frames: 0,
+            frames: Vec::new(),
             stored: 0,
         }
     }
 
     pub(crate) fn push(&mut self, original: usize, stored: &[u8]) -> Result<(), BlobError> {
         let too_large = || BlobError::WriteError("frame is too large".to_string());
-        let len = u32::try_from(stored.len()).map_err(|_| too_large())?;
         if original == 0 || original as u64 > FRAME_SIZE {
             return Err(too_large());
         }
-        let original = u32::try_from(original).map_err(|_| too_large())?;
-        if u64::from(self.frames) >= MAX_FRAMES {
-            return Err(BlobError::WriteError(
-                "object has too many frames".to_string(),
-            ));
-        }
-        self.frames += 1;
-        self.digests
-            .extend_from_slice(blake3::hash(stored).as_bytes());
-        self.entries.extend_from_slice(&len.to_le_bytes());
-        self.entries.extend_from_slice(&original.to_le_bytes());
-        self.stored += u64::from(len);
+        self.entry(PartFrame {
+            stored: u32::try_from(stored.len()).map_err(|_| too_large())?,
+            original: original as u32,
+            digest: *blake3::hash(stored).as_bytes(),
+        })
+    }
+
+    /// Adds the entry of a frame written elsewhere.
+    pub(crate) fn entry(&mut self, frame: PartFrame) -> Result<(), BlobError> {
+        entry_room(self.frames.len() as u64)?;
+        self.stored += u64::from(frame.stored);
+        self.frames.push(frame);
         Ok(())
+    }
+
+    /// Adds the entry of a padding frame of `len` bytes.
+    pub(crate) fn pad(&mut self, len: u32) -> Result<(), BlobError> {
+        self.entry(PartFrame {
+            stored: len,
+            original: 0,
+            digest: *blake3::hash(&padding(len)).as_bytes(),
+        })
     }
 
     /// Returns the digests and seek table that end the object and the layout record that names them.
     pub(crate) fn finish(self) -> Result<(Vec<u8>, FrameLayout), BlobError> {
         let too_large = |_| BlobError::WriteError("seek table is too large".to_string());
-        let frame_size =
-            u32::try_from(self.entries.len() as u64 + FOOTER_LEN).map_err(too_large)?;
-        let digest_size = u32::try_from(self.digests.len()).map_err(too_large)?;
-        let mut table = Vec::with_capacity(table_len(u64::from(self.frames)) as usize);
+        let count = self.frames.len() as u64;
+        let frame_size = u32::try_from(count * ENTRY_LEN + FOOTER_LEN).map_err(too_large)?;
+        let digest_size = u32::try_from(count * DIGEST_LEN).map_err(too_large)?;
+        let mut table = Vec::with_capacity(table_len(count) as usize);
         table.extend_from_slice(&DIGEST_MAGIC.to_le_bytes());
         table.extend_from_slice(&digest_size.to_le_bytes());
-        table.extend_from_slice(&self.digests);
+        for frame in &self.frames {
+            table.extend_from_slice(&frame.digest);
+        }
         table.extend_from_slice(&SKIPPABLE_MAGIC.to_le_bytes());
         table.extend_from_slice(&frame_size.to_le_bytes());
-        table.extend_from_slice(&self.entries);
-        table.extend_from_slice(&self.frames.to_le_bytes());
+        for frame in &self.frames {
+            table.extend_from_slice(&frame.stored.to_le_bytes());
+            table.extend_from_slice(&frame.original.to_le_bytes());
+        }
+        table.extend_from_slice(&(count as u32).to_le_bytes());
         table.push(0);
         table.extend_from_slice(&SEEKABLE_MAGIC.to_le_bytes());
         let layout = FrameLayout {
             level: self.level,
-            frames: self.frames,
+            frames: count as u32,
             stored_size: self.stored + table.len() as u64,
             index_hash: *blake3::hash(&table).as_bytes(),
         };
@@ -152,11 +213,15 @@ impl FrameWriter {
     }
 }
 
+/// Memory reservation an encoder keeps alive in each compression task.
+pub(crate) type Guard = Arc<dyn Any + Send + Sync>;
+
 /// Cuts a byte stream into frames and returns the stored bytes to write, in order.
 pub(crate) struct FrameEncoder {
     level: u8,
     pending: BytesMut,
     writer: FrameWriter,
+    guard: Option<Guard>,
 }
 
 impl FrameEncoder {
@@ -165,24 +230,40 @@ impl FrameEncoder {
             level,
             pending: BytesMut::new(),
             writer: FrameWriter::new(level),
+            guard: None,
         }
     }
 
-    pub(crate) async fn push(&mut self, bytes: &[u8]) -> Result<Vec<Bytes>, BlobError> {
-        self.pending.extend_from_slice(bytes);
+    /// Each compression task holds `guard`, so a cancelled caller frees it only after the task.
+    pub(crate) fn holding(mut self, guard: Guard) -> Self {
+        self.guard = Some(guard);
+        self
+    }
+
+    /// Copies at most one frame of input at a time, so a large chunk is never held twice.
+    pub(crate) async fn push(&mut self, mut bytes: &[u8]) -> Result<Vec<Bytes>, BlobError> {
         let mut out = Vec::new();
-        while self.pending.len() as u64 >= FRAME_SIZE {
-            let frame = self.pending.split_to(FRAME_SIZE as usize).freeze();
-            out.push(self.encode(frame).await?);
+        while !bytes.is_empty() {
+            let take = (FRAME_SIZE as usize - self.pending.len()).min(bytes.len());
+            self.pending.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.pending.len() as u64 == FRAME_SIZE {
+                let frame = self.pending.split().freeze();
+                out.push(self.encode(frame).await?);
+            }
         }
         Ok(out)
     }
 
     async fn encode(&mut self, frame: Bytes) -> Result<Bytes, BlobError> {
-        let (level, original) = (self.level, frame.len());
-        let stored = tokio::task::spawn_blocking(move || encode_frame(frame, level))
-            .await
-            .map_err(|error| BlobError::WriteError(error.to_string()))??;
+        let (level, original, guard) = (self.level, frame.len(), self.guard.clone());
+        let stored = tokio::task::spawn_blocking(move || {
+            let stored = encode_frame(frame, level);
+            drop(guard);
+            stored
+        })
+        .await
+        .map_err(|error| BlobError::WriteError(error.to_string()))??;
         self.writer.push(original, &stored)?;
         Ok(stored)
     }
@@ -197,6 +278,18 @@ impl FrameEncoder {
         let (table, layout) = self.writer.finish()?;
         out.push(Bytes::from(table));
         Ok((out, layout))
+    }
+
+    /// Encodes the last short frame and returns it with the entries of all frames, without a table.
+    pub(crate) async fn finish_part(
+        mut self,
+    ) -> Result<(Option<Bytes>, Vec<PartFrame>), BlobError> {
+        let mut last = None;
+        if !self.pending.is_empty() {
+            let frame = std::mem::take(&mut self.pending).freeze();
+            last = Some(self.encode(frame).await?);
+        }
+        Ok((last, self.writer.frames))
     }
 }
 
@@ -263,7 +356,9 @@ impl FrameIndex {
         for entry in entries.as_chunks::<{ ENTRY_LEN as usize }>().0 {
             let stored = u64::from(read_u32(entry, 0));
             let original = u64::from(read_u32(entry, 4));
-            if stored == 0 || stored > bound || original == 0 || original > FRAME_SIZE {
+            let frame = stored > 0 && stored <= bound && original > 0 && original <= FRAME_SIZE;
+            let padding = original == 0 && (HEADER_LEN..=PART_MIN).contains(&stored);
+            if !frame && !padding {
                 return Err(integrity("seek table entry is invalid"));
             }
             offsets.push(start);
@@ -285,6 +380,7 @@ impl FrameIndex {
     }
 
     /// The frame that holds original byte `position`, which must be below the object size.
+    /// Padding shares its start with the frame after it, so it is never the answer.
     pub(crate) fn frame_at(&self, position: u64) -> u64 {
         (self.starts.partition_point(|start| *start <= position) - 1) as u64
     }
@@ -304,11 +400,15 @@ impl FrameIndex {
     }
 
     /// Frames from `first` up to `last` whose stored bytes and original bytes each fit
-    /// `budget` together. Always holds `first`.
-    pub(crate) fn fetch_frames(&self, first: u64, last: u64, budget: u64) -> Range<u64> {
+    /// `budget` together. Skips padding before `first` and ends before padding. Always holds a frame.
+    pub(crate) fn fetch_frames(&self, mut first: u64, last: u64, budget: u64) -> Range<u64> {
+        while self.original_len(first) == 0 && first < last {
+            first += 1;
+        }
         let (start, original) = (self.offsets[first as usize], self.starts[first as usize]);
         let mut end = first + 1;
         while end <= last
+            && self.original_len(end) > 0
             && self.offsets[end as usize + 1] - start <= budget
             && self.starts[end as usize + 1] - original <= budget
         {
@@ -606,6 +706,110 @@ mod tests {
     }
 
     #[test]
+    fn padded_parts_read() {
+        // The first of two parts compresses well, so padding lifts it to the part minimum.
+        let data = text(3 * FRAME_SIZE as usize + 100);
+        let cut = 2 * FRAME_SIZE as usize;
+        let mut writer = FrameWriter::new(3);
+        let mut stored = Vec::new();
+        for (index, part) in [&data[..cut], &data[cut..]].into_iter().enumerate() {
+            for chunk in part.chunks(FRAME_SIZE as usize) {
+                let frame = encode_frame(Bytes::copy_from_slice(chunk), 3).unwrap();
+                writer.push(chunk.len(), &frame).unwrap();
+                stored.extend_from_slice(&frame);
+            }
+            if index == 0 {
+                let len = padding_len(stored.len() as u64);
+                writer.pad(len).unwrap();
+                stored.extend_from_slice(&padding(len));
+                assert_eq!(stored.len() as u64, PART_MIN);
+            }
+        }
+        let (table, layout) = writer.finish().unwrap();
+        stored.extend(table);
+        let size = data.len() as u64;
+
+        for range in [
+            0..size,
+            2 * FRAME_SIZE - 5..2 * FRAME_SIZE + 5,
+            size - 3..size,
+        ] {
+            let expected = &data[range.start as usize..range.end as usize];
+            assert_eq!(decode(&stored, &layout, size, range).unwrap(), expected);
+        }
+        assert_eq!(zstd::stream::decode_all(&stored[..]).unwrap(), data);
+        // Batches end before the padding entry and start after it, so its bytes are never read.
+        let index = index_of(&stored, &layout, size);
+        assert_eq!(index.frame_at(2 * FRAME_SIZE), 3);
+        assert_eq!(index.fetch_frames(0, 4, u64::MAX), 0..2);
+        assert_eq!(index.fetch_frames(2, 4, u64::MAX), 3..5);
+        assert_eq!(padding_len(PART_MIN - 3), HEADER_LEN as u32);
+        assert_eq!(padding_len(PART_MIN), 0);
+    }
+
+    use aruna_core::structs::storage::format::Compression;
+
+    #[test]
+    fn workspace_covers_levels() {
+        // The compressor of each level fits its charge after framing 1 MiB.
+        let data = random(FRAME_SIZE as usize, 3);
+        for level in 1..=Compression::MAX_LEVEL {
+            let mut cctx = zstd::zstd_safe::CCtx::create();
+            let params = [
+                CParameter::CompressionLevel(i32::from(level)),
+                CParameter::ChecksumFlag(true),
+            ];
+            for param in params {
+                cctx.set_parameter(param).unwrap();
+            }
+            let mut out = Vec::with_capacity(zstd::zstd_safe::compress_bound(data.len()));
+            cctx.compress2(&mut out, &data).unwrap();
+            assert!(
+                cctx.sizeof() as u64 <= compressor_memory(level),
+                "level {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_keeps_guard() {
+        // One blocking thread, held busy, so the compression task waits in the queue.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let busy = tokio::task::spawn_blocking(move || wait.recv());
+            let guard: Guard = Arc::new(());
+            let mut encoder = FrameEncoder::new(3).holding(guard.clone());
+            let data = random(FRAME_SIZE as usize, 5);
+            let mut push = Box::pin(encoder.push(&data));
+            assert!(futures::poll!(&mut push).is_pending());
+            drop(push);
+            drop(encoder);
+            // The cancelled push still keeps the guard in its queued task.
+            assert_eq!(Arc::strong_count(&guard), 2);
+            release.send(()).unwrap();
+            busy.await.unwrap().unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert_eq!(Arc::strong_count(&guard), 1);
+        });
+    }
+
+    #[test]
+    fn largest_upload_fits() {
+        // 1,024 parts of 5 GiB in full frames, with padding after every part but the last.
+        let size = 5 << 40;
+        assert!(plausible_frames(size, MAX_FRAMES + 1_023));
+        assert!(plausible_frames(size, MAX_ENTRIES));
+        assert!(!plausible_frames(size, MAX_ENTRIES + 1));
+        assert!(entry_room(MAX_FRAMES + 1_022).is_ok());
+        assert!(entry_room(MAX_ENTRIES - 1).is_ok());
+        assert!(entry_room(MAX_ENTRIES).is_err());
+    }
+
+    #[test]
     fn fetches_join_frames() {
         let data = random(5 * FRAME_SIZE as usize, 9);
         let (stored, layout) = encode(&data, 3);
@@ -657,5 +861,16 @@ mod tests {
         assert_eq!((stored.clone(), layout.clone()), encode(&data, 3));
         let size = data.len() as u64;
         assert_eq!(decode(&stored, &layout, size, 0..size).unwrap(), data);
+
+        // One large chunk gives the same frames and never buffers more than one frame of it.
+        let mut encoder = FrameEncoder::new(3);
+        let mut whole = Vec::new();
+        for piece in encoder.push(&data).await.unwrap() {
+            assert!(encoder.pending.capacity() <= FRAME_SIZE as usize);
+            whole.extend_from_slice(&piece);
+        }
+        let (rest, _) = encoder.finish().await.unwrap();
+        whole.extend(rest.concat());
+        assert_eq!(whole, stored);
     }
 }

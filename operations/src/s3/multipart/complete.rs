@@ -1038,9 +1038,15 @@ impl CompleteUploadOperation {
         };
         if let Some(backend_upload) = upload.backend_upload.clone() {
             self.state = CompleteUploadState::ComposeBlob;
+            let streamed = self
+                .upload_parts
+                .iter()
+                .filter(|part| part.location.partial);
             return smallvec![Effect::Blob(BlobEffect::CompleteUpload {
                 backend_upload: Box::new(backend_upload),
                 parts: self.resolved_parts.clone(),
+                streamed: streamed.map(|part| part.part_number).collect(),
+                compression: self.compression,
             })];
         }
         let parts = self
@@ -1084,10 +1090,11 @@ impl CompleteUploadOperation {
             Event::Blob(BlobEvent::Error(error)) => return self.schedule_error(error.into()),
             _ => return self.schedule_error(CompleteUploadError::InvalidOperationState),
         };
-        // The provider assembled raw parts, but compression was turned on after the upload
-        // opened: the object is composed into frames. Its target row keeps the raw object for
-        // a retry and discards it once the upload record is gone.
-        if self.compression != Compression::Off && self.in_place_target(&location) {
+        // The compression changed after the provider upload opened: its original bytes are
+        // composed again. The target row keeps the provider object until the upload is gone.
+        if EncodingClass::from(self.compression) != location.format.encoding()
+            && self.in_place_target(&location)
+        {
             return self.compose_parts(vec![location]);
         }
         // A sealed object has no full-object digest; its CRCs combine from the parts.

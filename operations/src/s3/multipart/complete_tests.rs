@@ -666,6 +666,13 @@ fn completes_at_provider() {
     let target = composed_location(Ulid::from_bytes([5u8; 16]));
     op.upload_record = Some(in_place_record(&op, &target));
     op.resolved_parts = vec![part_record(1, 10)];
+    // Every streamed part is named, listed or not, so completion never writes over one.
+    let mut staged = [part_record(1, 10), part_record(3, 10)];
+    for part in &mut staged {
+        part.location.partial = false;
+    }
+    let [first, last] = staged;
+    op.upload_parts = vec![first, part_record(2, 10), last];
 
     let effects = op.compose_blob();
 
@@ -673,6 +680,8 @@ fn completes_at_provider() {
         Effect::Blob(BlobEffect::CompleteUpload {
             backend_upload,
             parts,
+            streamed,
+            compression,
         }),
     ] = effects.as_slice()
     else {
@@ -680,6 +689,8 @@ fn completes_at_provider() {
     };
     assert_eq!(backend_upload.location, target);
     assert_eq!(parts, &op.resolved_parts);
+    assert_eq!(streamed, &vec![2]);
+    assert_eq!(compression, &op.compression);
 }
 
 #[test]
@@ -720,6 +731,43 @@ fn frames_provider_object() {
         [Effect::Storage(StorageEffect::StartTransaction { .. })]
     ));
     assert_eq!(op.composed_location, Some(framed));
+}
+
+#[test]
+fn framed_provider_object() {
+    // A framed provider object is published as it is; another level composes its original bytes.
+    use aruna_core::structs::storage::format::{FrameLayout, StoredLayout};
+    let mut target = composed_location(Ulid::from_bytes([5u8; 16]));
+    target.format.layout = StoredLayout::Frames(Box::new(FrameLayout {
+        level: 3,
+        frames: 1,
+        stored_size: 9,
+        index_hash: [1; 32],
+    }));
+    for (level, composes) in [(3, false), (5, true)] {
+        let mut op = CompleteUploadOperation::new(finalize_input());
+        op.upload_record = Some(in_place_record(&op, &target));
+        op.compression = Compression::Zstd { level };
+        op.state = CompleteUploadState::ComposeBlob;
+
+        let effects = op.step(Event::Blob(BlobEvent::WriteFinished {
+            location: target.clone(),
+        }));
+
+        match composes {
+            true => assert!(matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::Compose { parts, .. })] if parts == &vec![target.clone()]
+            )),
+            false => {
+                assert!(matches!(
+                    effects.as_slice(),
+                    [Effect::Storage(StorageEffect::StartTransaction { .. })]
+                ));
+                assert_eq!(op.composed_location.as_ref(), Some(&target));
+            }
+        }
+    }
 }
 
 #[test]

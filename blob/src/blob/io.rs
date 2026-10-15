@@ -9,7 +9,7 @@ use super::backend::{
 };
 use super::group::GROUP_WRITE_CHUNK;
 use super::pithos::{ArchiveEncoder, Share, working_set};
-use crate::codec::FrameEncoder;
+use crate::codec::{FrameEncoder, Guard};
 use crate::hash::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
 use crate::s3::NativeMultipart;
@@ -1388,6 +1388,25 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
+        let sources = parts
+            .into_iter()
+            .map(|part| {
+                let range = 0..part.blob_size;
+                (part, range)
+            })
+            .collect();
+        Box::pin(self.compose_into(template, resolved, sources, None)).await
+    }
+
+    /// Composes `parts`, each a byte range of a part's original bytes, into a new copy at the
+    /// template's path. Its compression and decode tasks hold `guard`.
+    pub(super) async fn compose_into(
+        &self,
+        template: BackendLocation,
+        resolved: ResolvedBackend,
+        parts: Vec<(BackendLocation, Range<u64>)>,
+        guard: Option<Guard>,
+    ) -> BlobEvent {
         let Some(mut reservation) = self.hold_reservation(template.ulid) else {
             return BlobEvent::Error(BlobError::WriteError(
                 "too many active blob reservations".to_string(),
@@ -1415,16 +1434,21 @@ impl BlobHandler {
                 return BlobEvent::Error(err);
             }
         };
-        let total = parts.iter().map(|part| part.blob_size).sum();
-        let framed = resolved.compression != Compression::Off;
+        let total = parts.iter().map(|(_, range)| range.end - range.start).sum();
+        // Decoded frames do not keep the stored part bounds, so they stream in chunks too.
+        let framed = resolved.compression != Compression::Off
+            || parts
+                .iter()
+                .any(|(part, _)| matches!(part.format.layout, StoredLayout::Frames(_)));
         let chunk = compose_chunk(&backend_type, total, framed);
-        let composed = self.compose_parts(
+        let composed = self.compose_ranges(
             location.clone(),
             operator,
             parts,
             chunk,
             resolved.compression,
             false,
+            guard,
         );
         match Box::pin(composed).await {
             BlobEvent::WriteFinished { location } => {
@@ -1450,16 +1474,49 @@ impl BlobHandler {
 
     pub(super) async fn compose_parts(
         &self,
-        mut location: BackendLocation,
+        location: BackendLocation,
         operator: Operator,
         parts: Vec<BackendLocation>,
         chunk: Option<usize>,
         compression: Compression,
         if_not_exists: bool,
     ) -> BlobEvent {
-        let mut encoder = match compression {
-            Compression::Off => None,
-            Compression::Zstd { level } => Some(FrameEncoder::new(level)),
+        let parts = parts
+            .into_iter()
+            .map(|part| {
+                let range = 0..part.blob_size;
+                (part, range)
+            })
+            .collect();
+        let composed = self.compose_ranges(
+            location,
+            operator,
+            parts,
+            chunk,
+            compression,
+            if_not_exists,
+            None,
+        );
+        Box::pin(composed).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn compose_ranges(
+        &self,
+        mut location: BackendLocation,
+        operator: Operator,
+        parts: Vec<(BackendLocation, Range<u64>)>,
+        chunk: Option<usize>,
+        compression: Compression,
+        if_not_exists: bool,
+        guard: Option<Guard>,
+    ) -> BlobEvent {
+        let mut encoder = match (compression, guard.clone()) {
+            (Compression::Off, _) => None,
+            (Compression::Zstd { level }, None) => Some(FrameEncoder::new(level)),
+            (Compression::Zstd { level }, Some(guard)) => {
+                Some(FrameEncoder::new(level).holding(guard))
+            }
         };
         let storage_path = match self.object_path(&location) {
             Ok(storage_path) => storage_path,
@@ -1505,23 +1562,15 @@ impl BlobHandler {
         let mut abandoned = false;
         let compose_result: Result<(u64, Option<FrameLayout>), BlobError> = async {
             let mut bytes_written = 0u64;
-            for part in parts {
-                let part_operator = self.operator_from_location(&part)?;
-                let part_storage_path = self.object_path(&part)?;
-                let reader = timeout(self.io_timeout(), part_operator.reader(&part_storage_path))
-                    .await
-                    .map_err(|_| {
-                        BlobError::ReadError("timed out opening compose reader".to_string())
-                    })?
-                    .map_err(|err| BlobError::ReadError(err.to_string()))?;
-                let reader = timeout(self.io_timeout(), reader.into_bytes_stream(..))
-                    .await
-                    .map_err(|_| {
-                        BlobError::ReadError("timed out starting compose reader".to_string())
-                    })?
-                    .map_err(|err| BlobError::ReadError(err.to_string()))?;
-
-                let mut reader = BackendStream::new(reader);
+            for (part, range) in parts {
+                // A framed part is read as its original bytes, never as stored frames.
+                let mut reader = match &part.format.layout {
+                    StoredLayout::Frames(layout) => {
+                        self.frames_stream(&part, layout, range, guard.clone())
+                            .await?
+                    }
+                    _ => self.compose_reader(&part, range).await?,
+                };
                 // Without a chunk the whole part is written at once so it keeps its own boundary.
                 let mut part_chunks = Vec::new();
                 let mut part_size = 0u64;
@@ -1629,6 +1678,25 @@ impl BlobHandler {
             return BlobEvent::PlainWritten { location, version };
         }
         BlobEvent::WriteFinished { location }
+    }
+
+    /// The stored bytes of one part to compose.
+    async fn compose_reader(
+        &self,
+        part: &BackendLocation,
+        range: Range<u64>,
+    ) -> Result<BackendStream<Result<Bytes, StreamError>>, BlobError> {
+        let part_operator = self.operator_from_location(part)?;
+        let part_storage_path = self.object_path(part)?;
+        let reader = timeout(self.io_timeout(), part_operator.reader(&part_storage_path))
+            .await
+            .map_err(|_| BlobError::ReadError("timed out opening compose reader".to_string()))?
+            .map_err(|err| BlobError::ReadError(err.to_string()))?;
+        let reader = timeout(self.io_timeout(), reader.into_bytes_stream(range))
+            .await
+            .map_err(|_| BlobError::ReadError("timed out starting compose reader".to_string()))?
+            .map_err(|err| BlobError::ReadError(err.to_string()))?;
+        Ok(BackendStream::new(reader))
     }
 
     /// A timeout drops the write mid-poll, so the writer is marked abandoned.

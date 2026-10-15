@@ -2120,7 +2120,7 @@ async fn read_object(context: &TestContext, location: &BackendLocation) -> Vec<u
 #[tokio::test]
 #[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
 async fn s3_framed_completion() {
-    // Both kinds of S3 upload end as one framed copy in a compressed bucket.
+    // An S3 upload ends as one copy in the encoding the bucket has at completion.
     let (context, _) = setup_s3_context().await;
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
@@ -2165,19 +2165,39 @@ async fn s3_framed_completion() {
         }
     };
 
-    // Opened in a compressed bucket: the parts are blobs, composed into frames.
+    let hashes = aruna_blob::hash::Hasher::new_with_bytes(&expected).to_map();
+    // Opened in a compressed bucket: the provider object holds the frames and is published.
     set_compression(&context, "bucket", group_id, zstd).await;
     let upload = create_upload(&context, "bucket", "framed.bin", group_id, created_by).await;
-    assert!(upload.backend_upload.is_none());
+    let target = upload
+        .backend_upload
+        .clone()
+        .expect("an S3 backend opens one");
     let parts = upload_parts("framed.bin", upload.upload_id).await;
     let result = complete("framed.bin", upload.upload_id, parts).await;
     assert_eq!(result.location.format.encoding(), EncodingClass::from(zstd));
+    assert!(result.location.same_object(&target.location));
     assert_eq!(result.location.blob_size, expected.len() as u64);
+    assert_eq!(result.location.hashes, hashes);
+    assert_eq!(read_object(&context, &result.location).await, expected);
+
+    // Compression turned off while a compressed upload was open: its original bytes are stored.
+    let upload = create_upload(&context, "bucket", "unframed.bin", group_id, created_by).await;
+    let target = upload
+        .backend_upload
+        .clone()
+        .expect("an S3 backend opens one");
+    let parts = upload_parts("unframed.bin", upload.upload_id).await;
+    set_compression(&context, "bucket", group_id, Compression::Off).await;
+    let result = complete("unframed.bin", upload.upload_id, parts).await;
+    assert_eq!(result.location.format.encoding(), EncodingClass::Raw);
+    assert!(!result.location.same_object(&target.location));
+    assert_eq!(result.location.blob_size, expected.len() as u64);
+    assert_eq!(result.location.hashes, hashes);
     assert_eq!(read_object(&context, &result.location).await, expected);
 
     // Compression turned on while an in-place upload was open: the provider object is
     // composed into frames, and the raw object is left to its target row.
-    set_compression(&context, "bucket", group_id, Compression::Off).await;
     let upload = create_upload(&context, "bucket", "in-place.bin", group_id, created_by).await;
     let target = upload
         .backend_upload
@@ -2189,10 +2209,7 @@ async fn s3_framed_completion() {
     let result = complete("in-place.bin", upload.upload_id, parts).await;
     assert_eq!(result.location.format.encoding(), EncodingClass::from(zstd));
     assert!(!result.location.same_object(&target));
-    assert_eq!(
-        result.location.hashes,
-        aruna_blob::hash::Hasher::new_with_bytes(&expected).to_map()
-    );
+    assert_eq!(result.location.hashes, hashes);
     assert_eq!(read_object(&context, &result.location).await, expected);
     assert!(read_upload(&context, upload.upload_id).await.is_none());
     let row = read_value(

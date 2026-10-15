@@ -148,6 +148,25 @@ impl NativeMultipart {
         self.client.config().region().map(ToString::to_string)
     }
 
+    /// Number and size of each part of a completed object.
+    #[cfg(test)]
+    pub(crate) async fn part_sizes(&self, path: &str) -> Vec<(i32, u64)> {
+        use aws_sdk_s3::types::ObjectAttributes;
+        let request = self.client.get_object_attributes().bucket(&self.bucket);
+        let request = request.key(self.key(path)).max_parts(1000);
+        let output = request
+            .object_attributes(ObjectAttributes::ObjectParts)
+            .send()
+            .await
+            .unwrap();
+        let parts = output.object_parts().unwrap().parts();
+        let size = |part: &aws_sdk_s3::types::ObjectPart| part.size().unwrap() as u64;
+        parts
+            .iter()
+            .map(|part| (part.part_number().unwrap(), size(part)))
+            .collect()
+    }
+
     /// The object key OpenDAL uses for `path` under this backend's root.
     fn key(&self, path: &str) -> String {
         let path = path.trim_start_matches('/');
