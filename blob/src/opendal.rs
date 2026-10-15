@@ -63,8 +63,11 @@ pub(crate) fn init_operator(
     guard: &EgressGuard,
 ) -> Result<Operator, BlobError> {
     match backend_type {
-        Backend::S3 => build_service::<services::S3>(s3_operator_config(config), None)
-            .map_err(blob_creation_error),
+        Backend::S3 => {
+            let context = Some(guard.direct_context());
+            build_service::<services::S3>(s3_operator_config(config), context)
+                .map_err(blob_creation_error)
+        }
         Backend::FileSystem => {
             build_service::<services::Fs>(config, None).map_err(blob_creation_error)
         }
