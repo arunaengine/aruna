@@ -6,6 +6,7 @@ use crate::UserId;
 use crate::compute::SecretBytes;
 use crate::errors::ConversionError;
 use crate::node_vault::{VaultEntry, VaultPurpose};
+use crate::structs::storage::blob::MULTIPART_PART_PREFIX;
 use crate::structs::storage::cleanup::CleanupStrategy;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,10 @@ pub const DEFAULT_BUCKET: &str = "default_bucket";
 /// Public config key prefix Aruna sets per checked bucket: `created` or `found`.
 pub const BUCKET_STATE: &str = "bucket:";
 
+/// Public config key prefix Aruna sets per bucket that ever held the default rule; Aruna's
+/// own files may still live there.
+pub const LAYOUT_BUCKET: &str = "layout:";
+
 /// Object keys longer than this are refused by S3, GCS, Azure and B2.
 pub const MAX_KEY_LEN: usize = 1024;
 
@@ -81,11 +86,11 @@ pub fn valid_bucket(name: &str) -> bool {
         && !name.contains("..")
 }
 
-/// Whether `key` lies where Aruna keeps its own objects on a backend with `container`.
-pub fn reserved_path(container: Option<&str>, key: &str) -> bool {
-    [Some(PROBE_PREFIX), container]
-        .into_iter()
-        .flatten()
+/// Whether `key` lies where Aruna keeps its own objects: below a probe folder or one of
+/// `folders`.
+pub fn reserved_path(folders: &[String], key: &str) -> bool {
+    std::iter::once(PROBE_PREFIX)
+        .chain(folders.iter().map(String::as_str))
         .any(|folder| {
             key.strip_prefix(folder)
                 .is_some_and(|rest| rest.starts_with('/'))
@@ -139,7 +144,7 @@ pub struct GroupStorage {
 impl GroupStorage {
     /// Whether `key` lies where Aruna writes its own objects on this backend.
     pub fn is_reserved(&self, key: &str) -> bool {
-        reserved_path(self.layout_folder(), key)
+        reserved_path(&self.reserved_folders(), key)
     }
 
     /// The tenant's own container, which also holds Aruna's own layout.
@@ -163,13 +168,54 @@ impl GroupStorage {
     pub fn managed_config(&self) -> impl Iterator<Item = (String, String)> + '_ {
         self.public_config
             .iter()
-            .filter(|(key, _)| key.as_str() == DEFAULT_BUCKET || key.starts_with(BUCKET_STATE))
+            .filter(|(key, _)| {
+                key.as_str() == DEFAULT_BUCKET
+                    || key.starts_with(BUCKET_STATE)
+                    || key.starts_with(LAYOUT_BUCKET)
+            })
             .map(|(key, value)| (key.clone(), value.clone()))
     }
 
-    /// Where Aruna writes its own layout: the container, or the default bucket.
-    pub fn layout_folder(&self) -> Option<&str> {
-        self.container().or_else(|| self.default_bucket())
+    /// Buckets checked for a rule, where Aruna may write and delete.
+    pub fn checked_buckets(&self) -> impl Iterator<Item = &str> {
+        self.public_config
+            .keys()
+            .filter_map(|key| key.strip_prefix(BUCKET_STATE))
+    }
+
+    /// Buckets that hold or held the default rule, so Aruna's own files may live there.
+    pub fn layout_buckets(&self) -> Vec<&str> {
+        let former = self
+            .public_config
+            .keys()
+            .filter_map(|key| key.strip_prefix(LAYOUT_BUCKET));
+        let mut buckets: Vec<&str> = self.default_bucket().into_iter().chain(former).collect();
+        buckets.sort_unstable();
+        buckets.dedup();
+        buckets
+    }
+
+    /// Where the parts of an upload wait: the default bucket, else the first checked bucket.
+    pub fn parts_bucket(&self) -> Option<&str> {
+        self.default_bucket()
+            .or_else(|| self.checked_buckets().min())
+    }
+
+    /// Folders where Aruna keeps its own objects: the container, or on a storage without a
+    /// bucket every default bucket and the probe and parts folders of each checked bucket.
+    pub fn reserved_folders(&self) -> Vec<String> {
+        if let Some(container) = self.container() {
+            return vec![container.to_string()];
+        }
+        let own = [PROBE_PREFIX, MULTIPART_PART_PREFIX];
+        let checked = self
+            .checked_buckets()
+            .flat_map(|bucket| own.map(|folder| format!("{bucket}/{folder}")));
+        self.layout_buckets()
+            .into_iter()
+            .map(str::to_string)
+            .chain(checked)
+            .collect()
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -331,6 +377,17 @@ mod tests {
             .insert(super::DEFAULT_BUCKET.to_string(), "lab-default".to_string());
         assert!(record.is_reserved("lab-default/a.csv"));
         assert!(!record.is_reserved("lab-raw/a.csv"));
+        // A former default bucket and the parts folder of a checked bucket stay Aruna's.
+        record
+            .public_config
+            .insert("layout:lab-old".to_string(), "true".to_string());
+        record
+            .public_config
+            .insert("bucket:lab-raw".to_string(), "found".to_string());
+        assert!(record.is_reserved("lab-old/a.csv"));
+        assert!(record.is_reserved("lab-raw/_parts/01/00001_01"));
+        assert!(!record.is_reserved("lab-raw/parts/a.csv"));
+        assert_eq!(record.parts_bucket(), Some("lab-default"));
         record
             .public_config
             .insert("bucket".to_string(), "fixed".to_string());

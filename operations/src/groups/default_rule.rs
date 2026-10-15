@@ -6,20 +6,24 @@ use crate::groups::backends::{backend_key, parse_read, record_writes};
 use crate::groups::fence::{parse_group_record, read_group_record};
 use crate::groups::storage_routing::{PutGroupError, load_group_inputs, routing_key};
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE};
+use aruna_core::keyspaces::{
+    BACKEND_IMPORT_KEYSPACE, STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::group_backend::{
-    BUCKET_STATE, DEFAULT_BUCKET, GroupStorage, valid_bucket,
+    BUCKET_STATE, DEFAULT_BUCKET, GroupStorage, LAYOUT_BUCKET, valid_bucket,
 };
 use aruna_core::structs::storage::routing::{GroupStorageRouting, RoutingError, RoutingTarget};
-use aruna_core::types::{Effects, GroupId, TxnId};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::time::SystemTime;
 use ulid::Ulid;
+
+const SCAN_PAGE: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DefaultState {
@@ -29,6 +33,7 @@ enum DefaultState {
     EnsureBucket,
     Start,
     Verify,
+    Scan,
     Write,
     Commit,
     Finish,
@@ -46,6 +51,8 @@ pub struct PutDefaultOperation {
     imports: Vec<BackendImport>,
     /// The bucket the record gets, and whether Aruna created it.
     checked: Option<(String, Option<bool>)>,
+    /// The storage record as the write transaction read it.
+    verified: Option<GroupStorage>,
     state: DefaultState,
     txn_id: Option<TxnId>,
     output: Option<Result<GroupStorageRouting, PutGroupError>>,
@@ -67,6 +74,7 @@ impl PutDefaultOperation {
             updated_at,
             imports: Vec::new(),
             checked: None,
+            verified: None,
             state: DefaultState::Init,
             txn_id: None,
             output: None,
@@ -117,10 +125,7 @@ impl PutDefaultOperation {
             .iter()
             .find(|rule| rule.uses_bucket(self.backend_id, &bucket))
         {
-            return Err(PutGroupError::Conflict(format!(
-                "Bucket `{bucket}` is linked to the Aruna bucket `{}`. Pick another bucket.",
-                rule.bucket
-            )));
+            return Err(linked_error(&bucket, rule));
         }
         Ok(Some(bucket))
     }
@@ -176,9 +181,9 @@ impl PutDefaultOperation {
     }
 
     /// The record is read again with the group fence, so a disable or a deletion that
-    /// committed meanwhile wins.
-    fn write(&mut self, event: Event) -> Effects {
-        let mut record = match parse_group_record(event)
+    /// committed meanwhile wins. The linked rules are read again in the same transaction.
+    fn verify(&mut self, event: Event) -> Effects {
+        let record = match parse_group_record(event)
             .map_err(PutGroupError::from)
             .and_then(|value| {
                 Ok(value
@@ -189,6 +194,50 @@ impl PutDefaultOperation {
         {
             Ok(record) => record,
             Err(error) => return self.fail(error),
+        };
+        if record.splits() != self.checked.is_some() {
+            return self.fail(PutGroupError::Unexpected("Verify"));
+        }
+        self.verified = Some(record);
+        match self.checked.is_some() {
+            true => self.scan(None),
+            false => self.write(),
+        }
+    }
+
+    fn scan(&mut self, start_after: Option<Key>) -> Effects {
+        self.state = DefaultState::Scan;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            prefix: Some(self.group_id.to_bytes().to_vec().into()),
+            start: start_after.map(IterStart::After),
+            limit: SCAN_PAGE,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+        let Some((bucket, _)) = self.checked.clone() else {
+            return self.fail(PutGroupError::Unexpected("Scan"));
+        };
+        for (_, value) in values {
+            match BackendImport::from_bytes(&value) {
+                Ok(rule) if rule.uses_bucket(self.backend_id, &bucket) => {
+                    return self.fail(linked_error(&bucket, &rule));
+                }
+                Ok(_) => {}
+                Err(error) => return self.fail(error.into()),
+            }
+        }
+        match next {
+            Some(next) => self.scan(Some(next)),
+            None => self.write(),
+        }
+    }
+
+    fn write(&mut self) -> Effects {
+        let Some(mut record) = self.verified.take() else {
+            return self.fail(PutGroupError::Unexpected("Write"));
         };
         let routing = GroupStorageRouting {
             group_id: self.group_id,
@@ -204,12 +253,11 @@ impl PutDefaultOperation {
             )],
             Err(error) => return self.fail(error.into()),
         };
-        if record.splits() != self.checked.is_some() {
-            return self.fail(PutGroupError::Unexpected("Verify"));
-        }
         if let Some((bucket, created)) = self.checked.clone() {
             let config = &mut record.public_config;
             config.insert(DEFAULT_BUCKET.to_string(), bucket.clone());
+            // Aruna's files stay in a former default bucket, so it stays reserved.
+            config.insert(format!("{LAYOUT_BUCKET}{bucket}"), "true".to_string());
             if let Some(created) = created {
                 let state = if created { "created" } else { "found" };
                 config.insert(format!("{BUCKET_STATE}{bucket}"), state.to_string());
@@ -227,6 +275,13 @@ impl PutDefaultOperation {
             txn_id: self.txn_id,
         })]
     }
+}
+
+fn linked_error(bucket: &str, rule: &BackendImport) -> PutGroupError {
+    PutGroupError::Conflict(format!(
+        "Bucket `{bucket}` is linked to the Aruna bucket `{}`. Pick another bucket.",
+        rule.bucket
+    ))
 }
 
 impl Operation for PutDefaultOperation {
@@ -271,7 +326,14 @@ impl Operation for PutDefaultOperation {
                     txn_id,
                 )]
             }
-            (DefaultState::Verify, event) => self.write(event),
+            (DefaultState::Verify, event) => self.verify(event),
+            (
+                DefaultState::Scan,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => self.scanned(values, next_start_after),
             (DefaultState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
                 let Some(txn_id) = self.txn_id else {
                     return self.fail(PutGroupError::Unexpected("Write"));
@@ -407,15 +469,17 @@ mod tests {
             [Effect::Storage(StorageEffect::StartTransaction { .. })]
         ));
         let txn_id = TxnId::from(3);
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    backend_key(backend()),
-                    Some(record.to_bytes().unwrap().into()),
-                ),
-                (routing_key(group()), None),
-            ],
+        let effects = verified(&mut operation, &record, txn_id);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter {
+                txn_id: Some(_),
+                ..
+            })]
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
         }));
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected one write, got {effects:?}");
@@ -423,6 +487,7 @@ mod tests {
         assert_eq!(writes.len(), 3);
         let stored = GroupStorage::from_bytes(&writes[1].2).unwrap();
         assert_eq!(stored.default_bucket(), Some("lab-default"));
+        assert_eq!(stored.layout_buckets(), vec!["lab-default"]);
         assert_eq!(
             stored
                 .public_config
@@ -444,6 +509,46 @@ mod tests {
         }));
         assert!(operation.is_complete());
         assert!(operation.finalize().is_ok());
+    }
+
+    /// Starts the write transaction and answers its read of the storage record.
+    fn verified(
+        operation: &mut PutDefaultOperation,
+        record: &GroupStorage,
+        txn_id: TxnId,
+    ) -> Effects {
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    backend_key(backend()),
+                    Some(record.to_bytes().unwrap().into()),
+                ),
+                (routing_key(group()), None),
+            ],
+        }))
+    }
+
+    #[test]
+    fn rechecks_links_late() {
+        // A link saved while the bucket was checked stops the default before it is written.
+        let record = storage(&[("endpoint", "https://s3.lab")]);
+        let (mut operation, _) = read(Some("lab-raw"), record.clone(), Vec::new());
+        operation.step(Event::Blob(BlobEvent::BucketReady { created: false }));
+        verified(&mut operation, &record, TxnId::from(4));
+        let rule = linked("lab-raw/");
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(rule.key(), rule.to_bytes().unwrap().into())],
+            next_start_after: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutGroupError::Conflict(_))
+        ));
     }
 
     #[test]

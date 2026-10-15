@@ -454,8 +454,8 @@ impl CreateImportOperation {
     }
 }
 
-/// A folder on a storage without a bucket starts with a bucket other than the default
-/// rule's; any folder leaves room for a file below it. Answers the bucket to check.
+/// A folder on a storage without a bucket starts with a bucket that never held the default
+/// rule; any folder leaves room for a file below it. Answers the bucket to check.
 fn check_folder(storage: &GroupStorage, folder: &str) -> Result<Option<String>, ImportRuleError> {
     let (bucket, rest) = match storage.splits() {
         true => match path_bucket(folder).filter(|bucket| valid_bucket(bucket)) {
@@ -469,9 +469,10 @@ fn check_folder(storage: &GroupStorage, folder: &str) -> Result<Option<String>, 
         },
         false => (None, folder),
     };
-    if let Some(bucket) = bucket.filter(|bucket| Some(*bucket) == storage.default_bucket()) {
+    // A former default bucket may still hold Aruna's own files.
+    if let Some(bucket) = bucket.filter(|bucket| storage.layout_buckets().contains(bucket)) {
         return Err(ImportRuleError::Conflict(format!(
-            "Bucket `{bucket}` holds the default rule. Pick another bucket."
+            "Bucket `{bucket}` holds Aruna's files of a default rule. Pick another bucket."
         )));
     }
     if rest.len() + NAME_ROOM > MAX_KEY_LEN {
@@ -702,12 +703,14 @@ mod tests {
         let record = storage(&[
             ("endpoint", "https://s3.lab"),
             ("default_bucket", "lab-default"),
+            ("layout:lab-old", "true"),
         ]);
         let long = format!("lab-raw/{}/", "a".repeat(1000));
         for (folder, conflict) in [
             ("", false),
             ("Raw/", false),
             ("lab-default/x/", true),
+            ("lab-old/", true),
             (long.as_str(), false),
         ] {
             let (operation, effects) = on_split(input(folder, "imported/"), &record);

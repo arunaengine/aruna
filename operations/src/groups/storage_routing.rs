@@ -128,10 +128,8 @@ impl Operation for GroupInputsOperation {
                         if record.group_id != self.group_id || record.disabled {
                             continue;
                         }
-                        if let Some(container) = record.layout_folder() {
-                            let container = container.to_string();
-                            self.inputs.containers.insert(record.backend_id, container);
-                        }
+                        let folders = record.reserved_folders();
+                        self.inputs.containers.insert(record.backend_id, folders);
                         self.inputs.backend_ids.insert(record.backend_id);
                     }
                     if let Some(start_after) = next_start_after {
