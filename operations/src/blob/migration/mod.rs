@@ -16,7 +16,7 @@ use crate::groups::storage_routing::routing_key;
 use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::object::put::{PlainRecord, same_name_path};
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -27,7 +27,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, PlainPath, import_key, object_key,
+    BackendImport, ImportedObject, PlainPath, object_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
@@ -59,6 +59,7 @@ pub enum MigrateState {
     WriteBlob,
     StartTransaction,
     ReadBucket,
+    ScanRules,
     FenceTarget,
     CheckVersion,
     CheckCopy,
@@ -127,6 +128,8 @@ pub struct MigrateVersionOperation {
     backend_version: Option<String>,
     /// A finished copy found at the target row; on another backend it is probed before use.
     found: Option<BackendLocation>,
+    /// The routing the publication transaction read.
+    fresh: Option<RoutingSnapshot>,
     state: MigrateState,
     txn_id: Option<TxnId>,
     version: Option<BlobVersion>,
@@ -152,6 +155,7 @@ impl MigrateVersionOperation {
             plain_path: None,
             backend_version: None,
             found: None,
+            fresh: None,
             state: MigrateState::Init,
             txn_id: None,
             version: None,
@@ -473,7 +477,7 @@ impl MigrateVersionOperation {
             return smallvec![settings_read(&self.version_key.bucket, Some(txn_id))];
         };
         let bucket: Key = self.version_key.bucket.as_bytes().to_vec().into();
-        let mut reads = vec![
+        let reads = vec![
             (S3_BUCKET_KEYSPACE.to_string(), bucket.clone()),
             (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket),
             (
@@ -481,20 +485,20 @@ impl MigrateVersionOperation {
                 routing_key(routing.group_id),
             ),
         ];
-        if let Some(plain) = self.plain.as_ref() {
-            let key = import_key(routing.group_id, plain.import_id);
-            reads.push((BACKEND_IMPORT_KEYSPACE.to_string(), key));
-        }
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads,
             txn_id: Some(txn_id),
         })]
     }
 
-    /// Whether the rules as this transaction reads them still choose the target of the move.
-    fn still_chosen(&self, values: Vec<Option<Value>>) -> Result<bool, MigrateVersionError> {
+    /// The rules as this transaction reads them, without import rules yet; `None` when the
+    /// bucket is gone or encrypts.
+    fn fresh_routing(
+        &self,
+        values: Vec<Option<Value>>,
+    ) -> Result<Option<RoutingSnapshot>, MigrateVersionError> {
         let Some(mut routing) = self.routing.clone() else {
-            return Ok(false);
+            return Ok(None);
         };
         let mut values = values.into_iter();
         let (Some(info), Some(settings), Some(group)) =
@@ -506,10 +510,10 @@ impl MigrateVersionOperation {
             .map(|info| BucketInfo::from_bytes(info.as_ref()))
             .transpose()?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         if BucketEncryption::from_row(settings.as_deref())?.is_encrypted() {
-            return Ok(false);
+            return Ok(None);
         }
         let group = group.map(|group| GroupStorageRouting::from_bytes(group.as_ref()));
         let default = group.transpose()?.and_then(|group| group.default_target);
@@ -517,18 +521,56 @@ impl MigrateVersionOperation {
             .with_bucket_rules(info.storage_routing)
             .with_compression(info.compression)
             .with_group_default(default);
-        if let Some(plain) = self.plain.as_ref() {
-            let rule = values.next().flatten();
-            routing
-                .imports
-                .retain(|rule| rule.import_id != plain.import_id);
-            let rule = rule.map(|rule| BackendImport::from_bytes(rule.as_ref()));
-            routing.imports.extend(rule.transpose()?);
+        routing.imports.clear();
+        Ok(Some(routing))
+    }
+
+    /// Reads the group's import rules in this transaction, so a rule created during the copy
+    /// counts too.
+    fn scan_rules(&mut self, after: Option<Key>) -> Effects {
+        let Some(routing) = self.fresh.as_ref() else {
+            return self.fail(MigrateVersionError::NotFinished);
+        };
+        self.state = MigrateState::ScanRules;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            prefix: Some(routing.group_id.to_bytes().to_vec().into()),
+            start: after.map(IterStart::After),
+            limit: RULE_PAGE,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// Publishes only while the fresh rules still choose the target of the move.
+    fn handle_rules(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return self.unexpected(event);
+        };
+        let Some(routing) = self.fresh.as_mut() else {
+            return self.fail(MigrateVersionError::NotFinished);
+        };
+        for (_, value) in values {
+            match BackendImport::from_bytes(value.as_ref()) {
+                Ok(rule) if rule.bucket == self.version_key.bucket => routing.imports.push(rule),
+                Ok(_) => {}
+                Err(error) => return self.fail(error.into()),
+            }
         }
-        Ok(match place(&routing, &self.version_key) {
-            Ok((resolved, plain)) => Some(resolved) == self.resolved && plain == self.plain,
-            Err(_) => false,
-        })
+        if next_start_after.is_some() {
+            return self.scan_rules(next_start_after);
+        }
+        match place(routing, &self.version_key) {
+            Ok((resolved, plain))
+                if Some(&resolved) == self.resolved.as_ref() && plain == self.plain =>
+            {
+                self.fence_target()
+            }
+            _ => self.skip(),
+        }
     }
 
     /// Publishes only while the bucket still asks for this target and stores plain bytes; an
@@ -539,9 +581,12 @@ impl MigrateVersionOperation {
         };
         if self.routing.is_some() {
             let values = values.into_iter().map(|(_, value)| value);
-            return match self.still_chosen(values.collect()) {
-                Ok(true) => self.fence_target(),
-                Ok(false) => self.skip(),
+            return match self.fresh_routing(values.collect()) {
+                Ok(Some(routing)) => {
+                    self.fresh = Some(routing);
+                    self.scan_rules(None)
+                }
+                Ok(None) => self.skip(),
                 Err(error) => self.fail(error),
             };
         }
@@ -834,6 +879,7 @@ impl Operation for MigrateVersionOperation {
             MigrateState::WriteBlob => self.handle_written(event),
             MigrateState::StartTransaction => self.handle_started(event),
             MigrateState::ReadBucket => self.handle_bucket(event),
+            MigrateState::ScanRules => self.handle_rules(event),
             MigrateState::FenceTarget => self.handle_fence(event),
             MigrateState::CheckVersion => self.handle_check(event),
             MigrateState::CheckCopy => self.handle_copy(event),
@@ -911,6 +957,9 @@ fn source_key(
 fn stays(location: &BackendLocation, moving: bool) -> bool {
     location.staging || location.partial || (moving && location.is_external())
 }
+
+/// Import rules one publication read returns at a time.
+const RULE_PAGE: usize = 128;
 
 /// Versions one task run handles per bucket before it yields to other timers.
 const MIGRATION_PAGE: usize = 64;
@@ -1719,22 +1768,37 @@ mod tests {
         }
 
         /// The publication's reads: bucket, encryption, group default and the linked rule.
-        fn rules_read(default: Option<RoutingTarget>, rule: Option<BackendImport>) -> Event {
+        /// Answers the publication's rule reads: bucket, encryption, group default, then the
+        /// group's import rules; returns what follows them.
+        fn rules_read(
+            operation: &mut MigrateVersionOperation,
+            default: Option<RoutingTarget>,
+            rule: Option<BackendImport>,
+        ) -> Effects {
             let group = GroupStorageRouting {
                 group_id: GROUP,
                 default_target: default,
                 updated_at: SystemTime::UNIX_EPOCH,
                 updated_by: Default::default(),
             };
-            let mut values = vec![
+            let values = vec![
                 (Vec::new().into(), Some(bucket(Compression::Off).into())),
                 (Vec::new().into(), None),
                 (Vec::new().into(), Some(group.to_bytes().unwrap().into())),
             ];
-            if let Some(rule) = rule {
-                values.push((Vec::new().into(), Some(rule.to_bytes().unwrap().into())));
-            }
-            Event::Storage(StorageEvent::BatchReadResult { values })
+            let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+            let [Effect::Storage(StorageEffect::Iter { key_space, .. })] = effects.as_slice()
+            else {
+                panic!("expected the import rule scan, got {effects:?}")
+            };
+            assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
+            let values = (rule.into_iter())
+                .map(|rule| (rule.key(), rule.to_bytes().unwrap().into()))
+                .collect();
+            operation.step(Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after: None,
+            }))
         }
 
         fn storage_record(disabled: bool) -> Event {
@@ -1756,7 +1820,7 @@ mod tests {
         /// Answers the rule reads and the target storage fence, up to the version read.
         fn published(operation: &mut MigrateVersionOperation, rule: Option<BackendImport>) {
             let default = Some(RoutingTarget::Backend(storage()));
-            let effects = operation.step(rules_read(default, rule));
+            let effects = rules_read(operation, default, rule);
             let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
             else {
                 panic!("expected the storage fence, got {effects:?}")
@@ -1879,7 +1943,7 @@ mod tests {
             let mut operation = operation("k", Vec::new());
             copied(&mut operation, &raw_version(), false);
 
-            let effects = operation.step(rules_read(None, None));
+            let effects = rules_read(&mut operation, None, None);
 
             assert!(aborted(&effects));
             operation.step(Event::Storage(StorageEvent::TransactionAborted {
@@ -1898,7 +1962,11 @@ mod tests {
             // A storage disabled during the copy never takes the version, so nothing is reclaimed.
             let mut operation = operation("k", Vec::new());
             copied(&mut operation, &raw_version(), false);
-            operation.step(rules_read(Some(RoutingTarget::Backend(storage())), None));
+            rules_read(
+                &mut operation,
+                Some(RoutingTarget::Backend(storage())),
+                None,
+            );
 
             let effects = operation.step(storage_record(true));
 
@@ -1966,7 +2034,7 @@ mod tests {
             else {
                 panic!("expected the publication reads, got {effects:?}")
             };
-            assert_eq!(reads.len(), 4);
+            assert_eq!(reads.len(), 3);
             let plain = operation.plain_path.clone().unwrap();
             assert_eq!(
                 plain.path,
@@ -2005,12 +2073,24 @@ mod tests {
         }
 
         #[test]
+        fn new_rule_discards() {
+            // A linked rule created during an ordinary move is read in the publication.
+            let mut operation = operation("in/x/one.csv", Vec::new());
+            copied(&mut operation, &raw_version(), false);
+            let default = Some(RoutingTarget::Backend(storage()));
+
+            let effects = rules_read(&mut operation, default, Some(rule()));
+
+            assert!(aborted(&effects));
+        }
+
+        #[test]
         fn removed_rule_discards() {
             let mut operation = operation("in/x/one.csv", vec![rule()]);
             copied(&mut operation, &raw_version(), false);
             let default = Some(RoutingTarget::Backend(storage()));
 
-            let effects = operation.step(rules_read(default, None));
+            let effects = rules_read(&mut operation, default, None);
 
             assert!(aborted(&effects));
         }
