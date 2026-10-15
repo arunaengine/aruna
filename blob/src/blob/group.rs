@@ -458,7 +458,7 @@ fn probe_message(label: &str, name: &str, error: &opendal::Error, delete: bool) 
             format!("The {label} `{name}` does not exist at this endpoint.")
         }
         (ErrorKind::ConfigInvalid, _) => {
-            format!("The backend settings are invalid: {}", error.message())
+            "The backend settings are invalid. Check endpoint, bucket and region.".to_string()
         }
         (_, false) => "The storage could not be reached or refused the test write. The node log \
                        has details."
