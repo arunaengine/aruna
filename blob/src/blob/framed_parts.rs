@@ -38,9 +38,10 @@ const PART_MAX: u64 = aruna_core::structs::storage::multipart::MAX_PART_SIZE;
 #[cfg(test)]
 const PART_MAX: u64 = 10 << 20;
 
-/// How a compressed completion ended: the provider object, or a copy composed instead.
+/// How a compressed completion ended: the provider object with the reservation that must
+/// cover its final hash read, or a copy composed instead.
 pub(super) enum Finished {
-    Framed(FrameLayout),
+    Framed(FrameLayout, Share),
     Composed(Box<BackendLocation>),
 }
 
@@ -380,7 +381,7 @@ impl BlobHandler {
         {
             return Err(error);
         }
-        Ok(Finished::Framed(layout))
+        Ok(Finished::Framed(layout, share))
     }
 
     /// Completes the listed streamed parts as an object of their own at the opening `level`, then

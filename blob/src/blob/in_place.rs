@@ -531,11 +531,14 @@ impl BlobHandler {
             blob_size: total,
             ..upload.location.clone()
         };
+        // The completion's reservation also covers the hash read of the framed object.
+        let mut share = None;
         if let Some(level) = part_level(upload) {
             let finished = self.finish_framed(upload, parts, level, streamed, compression);
             match Box::pin(finished).await? {
-                Finished::Framed(layout) => {
+                Finished::Framed(layout, held) => {
                     location.format.layout = StoredLayout::Frames(Box::new(layout));
+                    share = Some(held);
                 }
                 Finished::Composed(composed) => return Ok(*composed),
             }
@@ -597,6 +600,7 @@ impl BlobHandler {
             )));
         }
         location.hashes = state.to_map();
+        drop(share);
         Ok(location)
     }
 
