@@ -247,6 +247,9 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
 - Aruna never deletes imported bytes from the backend. Deleting an object in Aruna only removes
   Aruna's record of it.
 - The rule is node-local.
+- On a backend without a fixed bucket the first folder of `backend_prefix` and of the write folder
+  names a bucket. Each such bucket is found or created and tested with a write and a delete
+  before the rule is stored; the backend then lists it as `bucket:<name>` in its `public_config`.
 
 **Limits**
 - The bucket must belong to the group, without compression and without encryption.
@@ -255,7 +258,10 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
 - `write_pattern` must contain `{name}` and give a relative path.
 - Two rules may not import into overlapping folders of one bucket, and no rule may write into a
   backend folder that another rule reads or writes.
-- `schedule` is a five-field cron expression evaluated in UTC."#,
+- `schedule` is a five-field cron expression evaluated in UTC.
+- On a backend without a fixed bucket both folders start with a valid bucket name other than the
+  default rule's bucket.
+- A folder must leave room for a file name: keys on group backends are at most 1024 bytes."#,
     params(("group_id" = String, Path, description = "Group that owns the backend and the bucket, as a 26-character ULID")),
     request_body(
         content = CreateImportRequest,
@@ -288,10 +294,10 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
                 "updated_at": "2026-10-14T09:12:00+00:00"
             })
         ),
-        (status = 400, description = "Invalid ids, prefixes, schedule, bucket or backend", body = ErrorResponse),
+        (status = 400, description = "Invalid ids, prefixes, schedule, bucket or backend, or a backend bucket that cannot be found, created or written", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or on the bucket", body = ErrorResponse),
-        (status = 409, description = "A routing rule for the folder names another target, another rule imports into an overlapping folder or shares a backend folder, or the group is being deleted", body = ErrorResponse)
+        (status = 409, description = "A routing rule for the folder names another target, another rule imports into an overlapping folder or shares a backend folder, a folder lies in the default rule's bucket, or the group is being deleted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

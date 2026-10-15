@@ -181,7 +181,7 @@ fn map_create_error(error: CreateBackendError) -> ServerError {
     match error {
         CreateBackendError::NotFound => ServerError::NotFound,
         CreateBackendError::Invalid(error) => ServerError::BadRequestMessage(error.to_string()),
-        CreateBackendError::Unreachable(error) => ServerError::BadRequestMessage(error.to_string()),
+        CreateBackendError::Unreachable(error) => ServerError::BadRequestMessage(error.reason()),
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -210,6 +210,11 @@ group's data, so the group write rights that suffice for objects are not enough.
 **Behavior**
 - Registration probes the endpoint first, writing a sentinel object and deleting it again, so the
   credentials need delete rights as well as write rights; a failed probe registers nothing.
+- An `s3` backend without `bucket` names a bucket per rule instead: the first folder of each linked
+  folder is a bucket, and the default rule names its own bucket. Its probe only checks the keys;
+  each rule's bucket is found or created and tested when the rule is saved.
+- `public_config` in responses also holds what Aruna set itself: `default_bucket`, and
+  `bucket:<name>` with `created` or `found` for each bucket a rule checked.
 - `secret_config` is write-only: credentials are stored apart from the record, are never returned,
   and no field reports whether they are set.
 - `cleanup` defaults to `retain`, which never deletes from tenant storage.
@@ -220,8 +225,8 @@ group's data, so the group write rights that suffice for objects are not enough.
 - `kind` is one of `s3`, `gcs`, `azblob`, `azdls` and `b2`, matched case-insensitively.
 - Config keys are a closed allowlist per kind, are lowercased before matching, and may not be given
   twice.
-- `s3` needs `endpoint` and `bucket` plus the secrets `access_key_id` and `secret_access_key`, and
-  also accepts `region` (default `us-east-1`), `root` and `force_path_style`.
+- `s3` needs `endpoint` plus the secrets `access_key_id` and `secret_access_key`, and also accepts
+  `bucket`, `region` (default `us-east-1`), `root` and `force_path_style`.
 - `gcs` needs `bucket` plus the secret `credential`, and also accepts `root` and `endpoint`.
 - `azblob` needs `endpoint`, `container` and `account_name`; `azdls` needs `endpoint`, `filesystem`
   and `account_name`; both accept `root` and take either `account_key` or `sas_token`.

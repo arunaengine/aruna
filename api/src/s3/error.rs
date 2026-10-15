@@ -199,6 +199,13 @@ fn path_taken_error() -> S3Error {
     )
 }
 
+fn long_key_error() -> S3Error {
+    s3_error!(
+        KeyTooLongError,
+        "The path is too long for the group's storage: keys there are at most 1024 bytes."
+    )
+}
+
 fn incomplete_body_error() -> S3Error {
     s3_error!(
         IncompleteBody,
@@ -347,6 +354,7 @@ impl IntoS3Error for PutObjectError {
             PutObjectError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
             PutObjectError::UsageUpdateError(_) => usage_accounting_error(),
             PutObjectError::BlobWriteFailed(BlobError::PathTaken) => path_taken_error(),
+            PutObjectError::BlobWriteFailed(BlobError::KeyTooLong) => long_key_error(),
             err => internal_error(err),
         }
     }
@@ -359,6 +367,7 @@ impl IntoS3Error for CreateMultipartError {
                 backend_full_error(&backend.to_string())
             }
             CreateMultipartError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
+            CreateMultipartError::BlobError(BlobError::KeyTooLong) => long_key_error(),
             err => internal_error(err),
         }
     }
@@ -460,6 +469,7 @@ impl IntoS3Error for CompleteUploadError {
             }
             CompleteUploadError::ManagedCopyError(ref error) => managed_copy_error(error),
             CompleteUploadError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
+            CompleteUploadError::BlobError(BlobError::KeyTooLong) => long_key_error(),
             CompleteUploadError::BlobError(ref error) => {
                 compose_failed_error(error, matches!(error, BlobError::ReadError(_)))
             }
@@ -731,6 +741,23 @@ mod tests {
             *UploadPartError::IncompleteBody.into_s3_error().code(),
             S3ErrorCode::IncompleteBody
         );
+    }
+
+    #[test]
+    fn maps_long_keys() {
+        let errors = [
+            PutObjectError::BlobWriteFailed(BlobError::KeyTooLong).into_s3_error(),
+            CreateMultipartError::BlobError(BlobError::KeyTooLong).into_s3_error(),
+            CompleteUploadError::BlobError(BlobError::KeyTooLong).into_s3_error(),
+        ];
+        for error in errors {
+            assert_eq!(*error.code(), S3ErrorCode::KeyTooLongError);
+            assert!(
+                error
+                    .message()
+                    .is_some_and(|text| text.contains("1024 bytes"))
+            );
+        }
     }
 
     // A failed blob write maps to BadDigest (400) so SDKs do not retry it.
