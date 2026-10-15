@@ -1412,7 +1412,11 @@ impl BlobHandler {
             }
         };
         let total = parts.iter().map(|part| part.blob_size).sum();
-        let framed = resolved.compression != Compression::Off;
+        // Decoded frames do not keep the stored part bounds, so they stream in chunks too.
+        let framed = resolved.compression != Compression::Off
+            || parts
+                .iter()
+                .any(|part| matches!(part.format.layout, StoredLayout::Frames(_)));
         let chunk = compose_chunk(&backend_type, total, framed);
         let composed = self.compose_parts(
             location.clone(),

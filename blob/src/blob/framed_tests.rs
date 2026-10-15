@@ -216,3 +216,40 @@ async fn s3_framed_table() {
     let sizes = assert_part_sizes(&handler, &upload, &location, &[1, 3, 10_000]).await;
     assert!(sizes[2] < MIB as u64);
 }
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_decoded_compose() {
+    // A framed object composed without compression streams in chunks, never as one buffer.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let upload = open(&handler, "decoded.bin").await;
+    let data = text(20 * MIB, b"decoded part ");
+    let part = put(&handler, &upload, 1, &data).await;
+    let BlobEvent::WriteFinished { location: framed } =
+        handler.complete_upload(upload, vec![part]).await
+    else {
+        panic!("compressed completion failed")
+    };
+
+    let event = handler
+        .compose_blob(
+            "bucket",
+            "raw.bin",
+            cold_backend(),
+            test_user_id(),
+            vec![framed],
+        )
+        .await;
+    let BlobEvent::WriteFinished { location } = event else {
+        panic!("decoded compose failed: {event:?}")
+    };
+    assert_eq!(location.format.layout, StoredLayout::Raw);
+    assert_eq!(read_back(&handler, location.clone()).await, data);
+    let native = handler.native_for(&location).unwrap().unwrap();
+    let parts = native
+        .part_sizes(&location.get_storage_path().unwrap())
+        .await;
+    assert_eq!(parts.len(), 3, "{parts:?}");
+}
