@@ -203,8 +203,9 @@ impl BlobHandler {
         level: u8,
         mut body: BackendStream<Result<Bytes, StreamError>>,
     ) -> Result<(String, PartLayout), BlobError> {
-        let _share = self.reserve_pithos(framed_charge(size, level)).await?;
-        let mut encoder = FrameEncoder::new(level);
+        // Held until the part is sent; each compression task keeps a clone of its own.
+        let share = self.reserve_pithos(framed_charge(size, level)).await?;
+        let mut encoder = FrameEncoder::new(level).holding(share.clone());
         let mut pieces = Vec::new();
         let mut received = 0u64;
         while let Some(chunk) = body.0.next().await {

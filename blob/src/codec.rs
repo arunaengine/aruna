@@ -6,7 +6,9 @@
 use aruna_core::errors::BlobError;
 use aruna_core::structs::storage::format::{FrameLayout, PartFrame};
 use bytes::{Bytes, BytesMut};
+use std::any::Any;
 use std::ops::Range;
+use std::sync::Arc;
 use zstd::zstd_safe::{CParameter, DParameter};
 
 pub(crate) const FRAME_SIZE: u64 = 1 << 20;
@@ -211,11 +213,15 @@ impl FrameWriter {
     }
 }
 
+/// Memory reservation an encoder keeps alive in each compression task.
+pub(crate) type Guard = Arc<dyn Any + Send + Sync>;
+
 /// Cuts a byte stream into frames and returns the stored bytes to write, in order.
 pub(crate) struct FrameEncoder {
     level: u8,
     pending: BytesMut,
     writer: FrameWriter,
+    guard: Option<Guard>,
 }
 
 impl FrameEncoder {
@@ -224,7 +230,14 @@ impl FrameEncoder {
             level,
             pending: BytesMut::new(),
             writer: FrameWriter::new(level),
+            guard: None,
         }
+    }
+
+    /// Each compression task holds `guard`, so a cancelled caller frees it only after the task.
+    pub(crate) fn holding(mut self, guard: Guard) -> Self {
+        self.guard = Some(guard);
+        self
     }
 
     /// Copies at most one frame of input at a time, so a large chunk is never held twice.
@@ -243,10 +256,14 @@ impl FrameEncoder {
     }
 
     async fn encode(&mut self, frame: Bytes) -> Result<Bytes, BlobError> {
-        let (level, original) = (self.level, frame.len());
-        let stored = tokio::task::spawn_blocking(move || encode_frame(frame, level))
-            .await
-            .map_err(|error| BlobError::WriteError(error.to_string()))??;
+        let (level, original, guard) = (self.level, frame.len(), self.guard.clone());
+        let stored = tokio::task::spawn_blocking(move || {
+            let stored = encode_frame(frame, level);
+            drop(guard);
+            stored
+        })
+        .await
+        .map_err(|error| BlobError::WriteError(error.to_string()))??;
         self.writer.push(original, &stored)?;
         Ok(stored)
     }
@@ -752,6 +769,32 @@ mod tests {
                 "level {level}"
             );
         }
+    }
+
+    #[test]
+    fn cancel_keeps_guard() {
+        // One blocking thread, held busy, so the compression task waits in the queue.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let busy = tokio::task::spawn_blocking(move || wait.recv());
+            let guard: Guard = Arc::new(());
+            let mut encoder = FrameEncoder::new(3).holding(guard.clone());
+            let data = random(FRAME_SIZE as usize, 5);
+            let mut push = Box::pin(encoder.push(&data));
+            assert!(futures::poll!(&mut push).is_pending());
+            drop(push);
+            drop(encoder);
+            // The cancelled push still keeps the guard in its queued task.
+            assert_eq!(Arc::strong_count(&guard), 2);
+            release.send(()).unwrap();
+            busy.await.unwrap().unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert_eq!(Arc::strong_count(&guard), 1);
+        });
     }
 
     #[test]
