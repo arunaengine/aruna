@@ -30,44 +30,36 @@ pub enum StartMoveError {
     NoSuchBucket,
     #[error("an encrypted bucket keeps its stored copies where they are")]
     Encrypted,
+    #[error("a move of the keys under `{0}` is still running")]
+    MoveRunning(String),
     #[error("the storage move did not finish")]
     NotFinished,
     #[error("unexpected event: {0:?}")]
     Unexpected(Box<Event>),
 }
 
-/// The move record that starts or resumes a move of the keys under `prefix`. A running move
-/// with the same prefix resumes; another running one widens to the prefix both share.
+/// The move record that starts or resumes a move of the keys under `prefix`. An unfinished
+/// move with the same prefix resumes, or restarts once it waits with failures; an unfinished
+/// move with another prefix, also one waiting for a retry, refuses the new one.
 pub fn move_record(
     stored: Option<CompressionMigration>,
     compression: Compression,
     prefix: &str,
     now_ms: u64,
-) -> CompressionMigration {
-    let running = stored.filter(|record| {
-        record.moving && record.finished_at_ms.is_none() && record.retry_at_ms.is_none()
-    });
-    if let Some(record) = running.as_ref().filter(|record| {
-        record.prefix == prefix && record.target == compression && record.failed == 0
-    }) {
-        return record.clone();
+) -> Result<CompressionMigration, StartMoveError> {
+    let running = stored.filter(|record| record.moving && record.finished_at_ms.is_none());
+    if let Some(record) = running {
+        if record.prefix != prefix {
+            return Err(StartMoveError::MoveRunning(record.prefix));
+        }
+        let waiting = record.retry_at_ms.is_some() || record.failed > 0;
+        if record.target == compression && !waiting {
+            return Ok(record);
+        }
     }
-    let prefix = match running {
-        Some(record) => shared_prefix(&record.prefix, prefix),
-        None => prefix.to_string(),
-    };
     let mut record = CompressionMigration::new(compression, now_ms);
-    (record.moving, record.prefix) = (true, prefix);
-    record
-}
-
-fn shared_prefix(first: &str, second: &str) -> String {
-    let shared = first.char_indices().zip(second.chars());
-    let end = shared
-        .take_while(|((_, left), right)| left == right)
-        .last()
-        .map_or(0, |((index, left), _)| index + left.len_utf8());
-    first[..end].to_string()
+    (record.moving, record.prefix) = (true, prefix.to_string());
+    Ok(record)
 }
 
 /// The record and queue rows that hand a move to the migration task.
@@ -190,7 +182,7 @@ impl StartMoveOperation {
             transition.as_deref(),
             stored.as_deref(),
         )?;
-        let record = move_record(stored, info.compression, &self.prefix, self.now_ms);
+        let record = move_record(stored, info.compression, &self.prefix, self.now_ms)?;
         let writes = move_rows(&self.bucket, &record)?;
         self.output = Some(Ok(record));
         Ok(writes)
@@ -281,21 +273,27 @@ mod tests {
         let mut stored = running("in/");
         stored.migrated = 4;
         let record = move_record(Some(stored.clone()), Compression::Off, "in/", 9);
-        assert_eq!(record, stored);
+        assert_eq!(record, Ok(stored));
     }
 
     #[test]
-    fn widens_running_move() {
-        let record = move_record(Some(running("in/a/")), Compression::Off, "in/b/", 9);
-        assert_eq!((record.prefix.as_str(), record.started_at_ms), ("in/", 9));
-        let fresh = move_record(
-            Some(CompressionMigration::new(Compression::Off, 1)),
-            Compression::Off,
-            "x/",
-            9,
+    fn refuses_other_prefix() {
+        // An unfinished move keeps its scope, also while it waits for a retry pass.
+        let mut waiting = running("in/a/");
+        (waiting.failed, waiting.retry_at_ms) = (2, Some(50));
+        let refused = move_record(Some(waiting.clone()), Compression::Off, "in/b/", 9);
+        assert_eq!(
+            refused,
+            Err(StartMoveError::MoveRunning("in/a/".to_string()))
         );
-        assert_eq!(fresh.prefix, "x/");
-        assert!(fresh.moving);
+        let restarted = move_record(Some(waiting), Compression::Off, "in/a/", 9).unwrap();
+        assert_eq!(
+            (restarted.prefix.as_str(), restarted.started_at_ms),
+            ("in/a/", 9)
+        );
+        let compression = Some(CompressionMigration::new(Compression::Off, 1));
+        let fresh = move_record(compression, Compression::Off, "x/", 9).unwrap();
+        assert!(fresh.moving && fresh.prefix == "x/");
     }
 
     #[test]

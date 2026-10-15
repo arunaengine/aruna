@@ -65,7 +65,7 @@ pub struct BucketMoveResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct BucketMoveStarted {
     pub bucket: String,
-    /// The keys the move handles; a running move with another prefix widens to the shared one.
+    /// The keys the move handles.
     pub prefix: String,
     pub progress: MigrationProgress,
 }
@@ -182,8 +182,9 @@ pub async fn get_bucket_move(
 - A version whose copy cannot be read is recorded as broken, as by a storage check, and skipped.
 - `prefix` limits the move to keys under it. Other keys still get the bucket's compression.
 - Versions that fail are retried in later passes like a compression change. Sending the same
-  request again resumes a running move or restarts one that finished; a running move with another
-  prefix widens to the prefix both share.
+  request again resumes a running move, or restarts one that finished or waits with failures.
+- While a move with another prefix is unfinished, also while it waits for a retry pass, the
+  request answers 409 `move_running`.
 - `GET` on this path reports the progress and how many versions are still not in place.
 
 **Limits**
@@ -217,7 +218,7 @@ pub async fn get_bucket_move(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node, or no longer owned by the authorized group", body = ErrorResponse),
-        (status = 409, description = "`bucket_encrypted`: the bucket is encrypted or changes its encryption", body = ErrorResponse)
+        (status = 409, description = "`bucket_encrypted`: the bucket is encrypted or changes its encryption; `move_running`: a move with another prefix is unfinished", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -250,6 +251,11 @@ pub async fn start_bucket_move(
 fn move_refusal(error: StartMoveError) -> ServerError {
     match error {
         StartMoveError::NoSuchBucket => ServerError::NotFound,
+        StartMoveError::MoveRunning(prefix) => ServerError::Refused(
+            StatusCode::CONFLICT,
+            "move_running",
+            format!("a move of the keys under `{prefix}` is still running; retry when it finishes"),
+        ),
         StartMoveError::Encrypted => ServerError::Refused(
             StatusCode::CONFLICT,
             "bucket_encrypted",

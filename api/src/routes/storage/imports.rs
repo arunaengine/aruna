@@ -254,7 +254,8 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
 - Nothing runs on creation. Start a run on request or give a `schedule`.
 - With `move_existing` the bucket's files already stored under `key_prefix` move in the
   background to the paths new uploads get, as `POST /data/buckets/{bucket}/storage/move` with
-  `prefix` = `key_prefix` does. Files already in a linked folder stay where they are.
+  `prefix` = `key_prefix` does. Files already in a linked folder stay where they are. While a
+  move of the bucket with another prefix is unfinished, the rule is not created (409).
 - Aruna never deletes imported bytes from the backend. Deleting an object in Aruna only removes
   Aruna's record of it.
 - The rule is node-local.

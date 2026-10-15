@@ -269,8 +269,11 @@ impl CreateImportOperation {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let prefix = &self.input.key_prefix;
-        let record = move_record(stored, Compression::Off, prefix, now_ms.as_millis() as u64);
-        self.moving = Some(record);
+        let now_ms = now_ms.as_millis() as u64;
+        match move_record(stored, Compression::Off, prefix, now_ms) {
+            Ok(record) => self.moving = Some(record),
+            Err(error) => return Err(ImportRuleError::Conflict(error.to_string())),
+        }
         Ok(())
     }
 
@@ -916,6 +919,38 @@ mod tests {
             effects.as_slice(),
             [Effect::Task(TaskEffect::ShortenTimer { .. })]
         ));
+    }
+
+    #[test]
+    fn running_move_refuses() {
+        // An unfinished move of another folder fails the rule before anything is written.
+        let mut input = input("raw/", "imported/");
+        input.move_existing = true;
+        let mut operation = CreateImportOperation::new(input);
+        operation.start();
+        operation.step(values(vec![backend(), backend()]));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        let mut running = CompressionMigration::new(Compression::Off, 1);
+        (running.moving, running.prefix) = (true, "other/".to_string());
+        let reads = vec![
+            bucket(Vec::new(), Compression::Off),
+            None,
+            backend(),
+            None,
+            backend(),
+            None,
+            Some(running.to_bytes().unwrap().into()),
+        ];
+
+        let effects = operation.step(values(reads));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert!(matches!(failure(operation), ImportRuleError::Conflict(_)));
     }
 
     #[test]
