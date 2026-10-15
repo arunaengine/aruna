@@ -454,6 +454,7 @@ pub struct Cleaned {
 /// Deletes up to `limit` recorded broken versions of `template.bucket` after `after` through
 /// the object delete. Each object path is authorized for `auth` like an S3 bulk delete, and a
 /// version is deleted only while its record in the delete's transaction is the recorded one.
+/// Denied rows do not count toward `limit` and never name `next`; the scan reads past them.
 pub async fn clean_broken(
     context: &DriverContext,
     template: &crate::s3::object::delete::DeleteObjectInput,
@@ -461,78 +462,100 @@ pub async fn clean_broken(
     after: Option<Key>,
     limit: usize,
 ) -> Result<Cleaned, String> {
+    let (mut after, mut handled) = (after, 0);
+    let mut last = None;
+    let mut cleaned = Cleaned::default();
+    loop {
+        let (rows, next) = list_broken(context, &template.bucket, after.take(), limit).await?;
+        for (key, row) in rows {
+            if handled == limit {
+                cleaned.next = last;
+                return Ok(cleaned);
+            }
+            if clean_one(context, template, auth, &key, row, &mut cleaned).await? {
+                handled += 1;
+                last = Some(key.to_bytes().map_err(|error| error.to_string())?.into());
+            }
+        }
+        match next {
+            Some(next) => after = Some(next),
+            None => return Ok(cleaned),
+        }
+    }
+}
+
+/// Cleans one recorded version; `false` when the caller may not delete it.
+async fn clean_one(
+    context: &DriverContext,
+    template: &crate::s3::object::delete::DeleteObjectInput,
+    auth: &aruna_core::structs::identity::auth::AuthContext,
+    key: &VersionKey,
+    row: BrokenVersion,
+    cleaned: &mut Cleaned,
+) -> Result<bool, String> {
     use crate::auth::request_authorization::{AuthorizeError, authorize};
     use crate::auth::request_policy::PolicyRequestExtras;
     use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
     use aruna_core::structs::identity::auth::Permission;
-    let (rows, next) = list_broken(context, &template.bucket, after, limit).await?;
-    let mut cleaned = Cleaned {
-        next,
-        ..Cleaned::default()
-    };
-    for (key, row) in rows {
-        let path = aruna_core::structs::storage::blob::object_permission_path(
-            template.realm_id,
-            template.group_id,
-            template.node_id,
-            &key.bucket,
-            &key.key,
-        );
-        let extras = PolicyRequestExtras::rest();
-        match authorize(
-            context,
-            template.realm_id,
-            auth,
-            &path,
-            &Permission::WRITE,
-            extras,
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
-                cleaned.denied += 1;
-                continue;
-            }
-            Err(error) => return Err(error.to_string()),
+    let path = aruna_core::structs::storage::blob::object_permission_path(
+        template.realm_id,
+        template.group_id,
+        template.node_id,
+        &key.bucket,
+        &key.key,
+    );
+    let extras = PolicyRequestExtras::rest();
+    match authorize(
+        context,
+        template.realm_id,
+        auth,
+        &path,
+        &Permission::WRITE,
+        extras,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
+            cleaned.denied += 1;
+            return Ok(false);
         }
-        let input = DeleteObjectInput {
-            bucket: key.bucket.clone(),
-            key: key.key.clone(),
-            version_id: Some(key.version_id),
-            group_id: template.group_id,
-            realm_id: template.realm_id,
-            node_id: template.node_id,
-            deleted_by: template.deleted_by,
-        };
-        let operation = DeleteObjectOperation::new(input)
-            .with_restrictions(auth.path_restrictions.clone())
-            .with_expected(row.version);
-        // A version deleted meanwhile only leaves its row behind.
-        let deleted = match crate::driver::drive(operation, context).await {
-            Ok(_) => true,
-            Err(DeleteObjectError::NoSuchVersion) => false,
-            Err(error) => {
-                if error != DeleteObjectError::VersionChanged {
-                    tracing::warn!(bucket = %key.bucket, %error, "Failed to delete a broken version");
-                }
-                cleaned.kept += 1;
-                continue;
-            }
-        };
-        let delete = StorageEffect::Delete {
-            key_space: BROKEN_VERSION_KEYSPACE.to_string(),
-            key: key.to_bytes().map_err(|error| error.to_string())?.into(),
-            txn_id: None,
-        };
-        match context.storage_handle.send_storage_effect(delete).await {
-            Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                cleaned.deleted += u64::from(deleted)
-            }
-            other => return Err(format!("could not clear a broken version: {other:?}")),
-        }
+        Err(error) => return Err(error.to_string()),
     }
-    Ok(cleaned)
+    let input = DeleteObjectInput {
+        bucket: key.bucket.clone(),
+        key: key.key.clone(),
+        version_id: Some(key.version_id),
+        group_id: template.group_id,
+        realm_id: template.realm_id,
+        node_id: template.node_id,
+        deleted_by: template.deleted_by,
+    };
+    let operation = DeleteObjectOperation::new(input)
+        .with_restrictions(auth.path_restrictions.clone())
+        .with_expected(row.version);
+    // A version deleted meanwhile only leaves its row behind.
+    let deleted = match crate::driver::drive(operation, context).await {
+        Ok(_) => true,
+        Err(DeleteObjectError::NoSuchVersion) => false,
+        Err(error) => {
+            if error != DeleteObjectError::VersionChanged {
+                tracing::warn!(bucket = %key.bucket, %error, "Failed to delete a broken version");
+            }
+            cleaned.kept += 1;
+            return Ok(true);
+        }
+    };
+    let delete = StorageEffect::Delete {
+        key_space: BROKEN_VERSION_KEYSPACE.to_string(),
+        key: key.to_bytes().map_err(|error| error.to_string())?.into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(delete).await {
+        Event::Storage(StorageEvent::DeleteResult { .. }) => cleaned.deleted += u64::from(deleted),
+        other => return Err(format!("could not clear a broken version: {other:?}")),
+    }
+    Ok(true)
 }
 
 /// Whether `key` names the current version of its object.

@@ -257,15 +257,11 @@ async fn finds_and_cleans_broken() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 2);
-    // Kept entries never block later pages: the cursor moves past them.
-    let first = clean_broken(&context.driver, &template(&context), &auth, None, 1)
+    // Denied rows never count toward the limit nor name the cursor.
+    let paged = clean_broken(&context.driver, &template(&context), &auth, None, 1)
         .await
         .unwrap();
-    assert_eq!(first.denied, 1);
-    let second = clean_broken(&context.driver, &template(&context), &auth, first.next, 1)
-        .await
-        .unwrap();
-    assert_eq!((second.denied, second.next), (1, None));
+    assert_eq!((paged.denied, paged.next), (2, None));
     for (key, id) in [
         ("genes/b.faa.gz", lost),
         ("genes/c.faa.gz", changed),

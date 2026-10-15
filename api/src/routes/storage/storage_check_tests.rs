@@ -14,6 +14,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::broken::{BrokenReason, BrokenVersion};
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_operations::blob::migration::check::clean_broken;
 use axum::Extension;
 use axum::extract::{Path, Query, State};
 use std::time::SystemTime;
@@ -235,4 +236,81 @@ async fn cleanup_clears_vanished() {
     .unwrap()
     .0;
     assert!(listed.broken.is_empty());
+}
+
+/// A token that may write the group but neither read nor write `a/**` and `c/**`.
+fn hiding(test: &TestState) -> AuthContext {
+    let realm = test.state.get_realm_id();
+    let node = test.state.get_node_id();
+    let deny = |prefix: &str| PathRestriction {
+        pattern: object_permission_path(realm, test.group_id, node, &test.bucket, prefix),
+        permission: Permission::DENY,
+    };
+    let group = PathRestriction {
+        pattern: format!("/{realm}/g/{}/**", test.group_id),
+        permission: Permission::WRITE,
+    };
+    AuthContext {
+        path_restrictions: Some(vec![group, deny("a/**"), deny("c/**")]),
+        ..test.auth.clone()
+    }
+}
+
+fn cursor_key(next: &str) -> String {
+    VersionKey::from_bytes(&hex::decode(next).unwrap())
+        .unwrap()
+        .key
+}
+
+#[tokio::test]
+async fn cursor_names_visible() {
+    // With one file per page the cursor never names a hidden row, and every visible one shows.
+    let test = setup_state().await;
+    for (key, seed) in [("a/x.gz", 1), ("b/y.gz", 2), ("c/z.gz", 3), ("d/w.gz", 4)] {
+        broken(&test, key, seed, None).await;
+    }
+    let (mut after, mut listed) = (None, Vec::new());
+    loop {
+        let query = BucketCheckQuery {
+            after: after.clone(),
+            limit: Some(1),
+        };
+        let page = get_bucket_check(
+            State(test.state.clone()),
+            Extension(Some(hiding(&test))),
+            Path(test.bucket.clone()),
+            Query(query),
+        )
+        .await
+        .unwrap()
+        .0;
+        listed.extend(page.broken.into_iter().map(|file| file.key));
+        let Some(next) = page.next else { break };
+        assert!(["b/y.gz", "d/w.gz"].contains(&cursor_key(&next).as_str()));
+        after = Some(next);
+    }
+    assert_eq!(listed, ["b/y.gz", "d/w.gz"]);
+
+    let template = aruna_operations::s3::object::delete::DeleteObjectInput {
+        bucket: test.bucket.clone(),
+        key: String::new(),
+        version_id: None,
+        group_id: test.group_id,
+        realm_id: test.state.get_realm_id(),
+        node_id: test.state.get_node_id(),
+        deleted_by: test.auth.user_id,
+    };
+    let (ctx, auth) = (test.state.get_ctx(), hiding(&test));
+    let first = clean_broken(&ctx, &template, &auth, None, 1).await.unwrap();
+    let next = first.next.clone().unwrap();
+    assert_eq!(VersionKey::from_bytes(&next).unwrap().key, "b/y.gz");
+    let second = clean_broken(&ctx, &template, &auth, Some(next), 1)
+        .await
+        .unwrap();
+    assert!(
+        second
+            .next
+            .is_none_or(|next| VersionKey::from_bytes(&next).unwrap().key == "d/w.gz")
+    );
+    assert_eq!(first.deleted + second.deleted, 2);
 }

@@ -182,8 +182,8 @@ async fn ensure_bucket(
 - The list is kept until the next check or a cleanup. A storage move also records a version it
   cannot read because its copy is broken.
 - Only versions that are still the current version of their key are listed, and only for
-  objects the caller may read (object READ and request policies). A page can therefore hold
-  fewer than `limit` files while `next` is still set.
+  objects the caller may read (object READ and request policies). Hidden rows are skipped
+  until `limit` files are found; `next` always names the last listed file.
 - `progress.broken` counts what the last check found; the list also shrinks with cleanups.
 
 **Limits**
@@ -241,41 +241,67 @@ pub async fn get_bucket_check(
     let progress = read_check(&ctx, &bucket)
         .await
         .map_err(ServerError::InternalError)?;
-    let (rows, next) = list_broken(&ctx, &bucket, after, limit)
-        .await
-        .map_err(ServerError::InternalError)?;
-    let mut broken = Vec::with_capacity(rows.len());
-    for (key, row) in rows {
-        // Only current versions, and only objects the caller may read, are listed.
-        if !is_current(&ctx, &key)
+    // Reads past hidden rows until `limit` visible ones; broken rows are few per bucket.
+    let (mut after, mut broken, mut next) = (after, Vec::new(), None);
+    'scan: loop {
+        let (rows, more) = list_broken(&ctx, &bucket, after.take(), limit)
             .await
-            .map_err(ServerError::InternalError)?
-        {
-            continue;
+            .map_err(ServerError::InternalError)?;
+        for (key, row) in rows {
+            if broken.len() == limit {
+                break 'scan;
+            }
+            if !visible(&state, &auth, group_id, &key).await? {
+                continue;
+            }
+            next = Some(
+                key.to_bytes()
+                    .map_err(|e| ServerError::InternalError(e.to_string()))?,
+            );
+            broken.push(BrokenFile {
+                key: key.key,
+                version_id: key.version_id.to_string(),
+                reason: row.reason.into(),
+                found_at_ms: row.found_at_ms,
+            });
         }
-        let path = object_permission_path(
-            state.get_realm_id(),
-            group_id,
-            state.get_node_id(),
-            &bucket,
-            &key.key,
-        );
-        if !crate::auth::permission_granted(&state, &auth, path, Permission::READ).await? {
-            continue;
+        match more {
+            Some(more) => after = Some(more),
+            None => {
+                next = None;
+                break;
+            }
         }
-        broken.push(BrokenFile {
-            key: key.key,
-            version_id: key.version_id.to_string(),
-            reason: row.reason.into(),
-            found_at_ms: row.found_at_ms,
-        });
     }
     Ok(Json(BucketCheckResponse {
         bucket,
         progress: progress.map(Into::into),
         broken,
-        next: next.map(|key| hex::encode(key.as_ref() as &[u8])),
+        next: next.map(hex::encode),
     }))
+}
+
+/// Only current versions, and only objects the caller may read, are listed.
+async fn visible(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: ulid::Ulid,
+    key: &aruna_core::structs::storage::blob::VersionKey,
+) -> ServerResult<bool> {
+    if !is_current(&state.get_ctx(), key)
+        .await
+        .map_err(ServerError::InternalError)?
+    {
+        return Ok(false);
+    }
+    let path = object_permission_path(
+        state.get_realm_id(),
+        group_id,
+        state.get_node_id(),
+        &key.bucket,
+        &key.key,
+    );
+    crate::auth::permission_granted(state, auth, path, Permission::READ).await
 }
 
 #[utoipa::path(
