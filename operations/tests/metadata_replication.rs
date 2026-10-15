@@ -15,6 +15,7 @@ use aruna_core::document::{
     shard_topic_id,
 };
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
@@ -39,7 +40,7 @@ use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
+use aruna_operations::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::{project_create_events, replay_event_log};
@@ -71,6 +72,9 @@ use ulid::Ulid;
 
 mod convergence;
 use convergence::wait_for_convergence;
+
+/// Retries of a write that lost a commit race to background work; 20 ms apart.
+const CONFLICT_ATTEMPTS: usize = 500;
 
 /// Mints the held-bucket structured id a local create embeds on `node_id`.
 fn mint_local(
@@ -708,25 +712,38 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
 }}"#
     );
 
-    let updated = drive(
-        UpdateDocumentOperation::new(UpdateDocumentConfig {
-            actor: Actor {
-                node_id: nodes[0].net.node_id(),
-                user_id: UserId::local(Ulid::generate(), realm_id),
-                realm_id,
-            },
-            group_id,
-            document_id,
-            public: true,
-            mutation: UpdateDocumentMutation::ReplaceRoCrate {
-                jsonld: updated_jsonld,
-            },
-            expected_revision: None,
-        }),
-        nodes[0].context.as_ref(),
-    )
-    .await?;
-    assert!(updated.public);
+    // The create's background drain may commit alongside; the write succeeds on a retry.
+    let mut updated = None;
+    for _ in 0..CONFLICT_ATTEMPTS {
+        let outcome = drive(
+            UpdateDocumentOperation::new(UpdateDocumentConfig {
+                actor: Actor {
+                    node_id: nodes[0].net.node_id(),
+                    user_id: UserId::local(Ulid::generate(), realm_id),
+                    realm_id,
+                },
+                group_id,
+                document_id,
+                public: true,
+                mutation: UpdateDocumentMutation::ReplaceRoCrate {
+                    jsonld: updated_jsonld.clone(),
+                },
+                expected_revision: None,
+            }),
+            nodes[0].context.as_ref(),
+        )
+        .await;
+        match outcome {
+            Err(UpdateDocumentError::StorageError(StorageError::TransactionConflict)) => {
+                sleep(Duration::from_millis(20)).await
+            }
+            outcome => {
+                updated = Some(outcome?);
+                break;
+            }
+        }
+    }
+    assert!(updated.ok_or("the update kept conflicting")?.public);
 
     wait_metadata_state(
         &nodes,
@@ -738,19 +755,33 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    drive(
-        DeleteDocumentOperation::new(
-            Actor {
-                node_id: nodes[0].net.node_id(),
-                user_id: UserId::local(Ulid::generate(), realm_id),
-                realm_id,
-            },
-            group_id,
-            document_id,
-        ),
-        nodes[0].context.as_ref(),
-    )
-    .await?;
+    let mut deleted = false;
+    for _ in 0..CONFLICT_ATTEMPTS {
+        let outcome = drive(
+            DeleteDocumentOperation::new(
+                Actor {
+                    node_id: nodes[0].net.node_id(),
+                    user_id: UserId::local(Ulid::generate(), realm_id),
+                    realm_id,
+                },
+                group_id,
+                document_id,
+            ),
+            nodes[0].context.as_ref(),
+        )
+        .await;
+        match outcome {
+            Err(DeleteDocumentError::StorageError(StorageError::TransactionConflict)) => {
+                sleep(Duration::from_millis(20)).await
+            }
+            outcome => {
+                outcome?;
+                deleted = true;
+                break;
+            }
+        }
+    }
+    assert!(deleted, "the delete kept conflicting");
 
     wait_metadata_absence(&nodes, group_id, document_id, &created.record.graph_iri).await?;
     shutdown_nodes(nodes).await;

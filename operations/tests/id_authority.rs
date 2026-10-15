@@ -46,6 +46,8 @@ const MANAGEMENT_NODES: usize = 5;
 const USER_NODES: usize = 1;
 const REPLICATION_FACTOR: u32 = 3;
 const JOB_RETENTION_MS: u64 = 60_000;
+/// Plantings of a pending projection marker before a drain race counts as a failure.
+const PLANT_ATTEMPTS: usize = 20;
 
 /// Mint from a node that holds nothing: the mapping must land on the document's
 /// holders and never in the forwarder's own store, and every node must resolve it.
@@ -576,8 +578,16 @@ async fn delete_waits_projection() -> TestResult<()> {
     )
     .await?;
 
-    queue_projection(realm.holder(&placement), document_id).await?;
-    let pending = routed_delete(&realm, sender, document_id).await;
+    let holder = realm.holder(&placement);
+    let mut pending = Ok(());
+    for _ in 0..PLANT_ATTEMPTS {
+        let key = queue_projection(holder, document_id).await?;
+        pending = routed_delete(&realm, sender, document_id).await;
+        // A drain left from earlier work may clear the planted marker first; absence is then true.
+        if !matches!(pending, Err(MetadataWriteError::NotFound)) || has_entry(holder, key).await? {
+            break;
+        }
+    }
     assert!(
         matches!(pending, Err(MetadataWriteError::Undeliverable(_))),
         "a queued projection makes the holder's answer retryable: {pending:?}"
@@ -685,14 +695,26 @@ async fn write_mapping(node: &TestNode, mapping: PersistentIdMapping) -> TestRes
 }
 
 /// Marks a committed create as still unprojected on one node.
-async fn queue_projection(node: &TestNode, document_id: Ulid) -> TestResult<()> {
-    write_entry(
-        node,
-        PENDING_PROJECTION_KEYSPACE,
-        pending_projection_key(document_id, Ulid::generate()).to_vec(),
-        Vec::new(),
-    )
-    .await
+async fn queue_projection(node: &TestNode, document_id: Ulid) -> TestResult<Vec<u8>> {
+    let key = pending_projection_key(document_id, Ulid::generate()).to_vec();
+    write_entry(node, PENDING_PROJECTION_KEYSPACE, key.clone(), Vec::new()).await?;
+    Ok(key)
+}
+
+async fn has_entry(node: &TestNode, key: Vec<u8>) -> TestResult<bool> {
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+        other => Err(format!("unexpected fixture read event: {other:?}").into()),
+    }
 }
 
 async fn write_entry(
