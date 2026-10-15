@@ -12,6 +12,7 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendRef, BlobTimeoutConfig, ResolvedBackend,
 };
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
+use aruna_core::structs::storage::group_backend::DEFAULT_BUCKET;
 use aruna_core::structs::storage::routing::{BackendCatalog, NodeRouting, NodeRoutingRule};
 use opendal::Operator;
 use std::collections::{BTreeMap, HashMap};
@@ -189,6 +190,7 @@ impl BackendRegistry {
     ) -> Result<Operator, BlobError> {
         let entry = self.backend(backend)?;
         let mut config = entry.config.service_config.clone();
+        config.remove(DEFAULT_BUCKET);
         config.insert("root".to_string(), root.to_string());
         let split = splits(&entry.config);
         if split && bucket.is_empty() {

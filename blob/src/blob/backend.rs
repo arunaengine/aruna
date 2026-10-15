@@ -14,7 +14,7 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendBucket, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork,
     HIDDEN_BLOB_PREFIX, HiddenBlobKey, MULTIPART_PART_PREFIX, ensure_confined_path,
 };
-use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
+use aruna_core::structs::storage::group_backend::{DEFAULT_BUCKET, MAX_KEY_LEN};
 use aruna_core::types::TxnId;
 use aruna_storage::storage::TransactionOwner;
 use byteview::ByteView;
@@ -1251,7 +1251,7 @@ fn stats_prefix(backend: &BackendRef, bucket_prefix: Option<&str>) -> Vec<u8> {
 }
 
 /// The one bucket a group storage writes Aruna's layout to: its container or its default
-/// bucket. Node backends answer `None` unless their config pins a bucket.
+/// bucket, never a linked bucket. Node backends answer `None` unless their config pins one.
 fn fixed_bucket(config: &BackendConfig) -> Result<Option<String>, BlobError> {
     if let Some(bucket) = config.service_config.get("bucket") {
         return Ok(Some(bucket.clone()));
@@ -1259,7 +1259,8 @@ fn fixed_bucket(config: &BackendConfig) -> Result<Option<String>, BlobError> {
     if !matches!(config.backend_type, Backend::Group(_)) {
         return Ok(None);
     }
-    config.multipart_bucket.clone().map(Some).ok_or_else(|| {
+    let default = config.service_config.get(DEFAULT_BUCKET);
+    default.cloned().map(Some).ok_or_else(|| {
         BlobError::WriteError("this storage has no default bucket for Aruna's files".to_string())
     })
 }
@@ -1386,10 +1387,12 @@ pub(super) fn rebuild_backend_path(
 
 #[cfg(test)]
 mod split_tests {
-    use super::{object_key, split_bucket};
+    use super::{fixed_bucket, object_key, split_bucket};
     use aruna_core::errors::BlobError;
+    use aruna_core::structs::storage::blob::{Backend, BackendConfig, BlobTimeoutConfig};
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::structs::storage::group_backend::GroupBackendKind;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -1427,6 +1430,26 @@ mod split_tests {
         assert_eq!(object_key(&tenant, false).unwrap(), "lab-raw/2024/a.csv");
         assert!(object_key(&location("", "a.csv"), true).is_err());
         assert!(split_bucket("/a.csv").is_err());
+    }
+
+    #[test]
+    fn layout_skips_parts() {
+        // Parts may wait in a linked bucket; Aruna's own layout never goes there.
+        let config = |public: &[(&str, &str)]| BackendConfig {
+            backend_type: Backend::Group(GroupBackendKind::S3),
+            root: String::new(),
+            service_config: public
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            bucket_prefix: None,
+            max_bucket_size: None,
+            multipart_bucket: Some("lab-raw".to_string()),
+            timeouts: BlobTimeoutConfig::default(),
+        };
+        assert!(fixed_bucket(&config(&[])).is_err());
+        let chosen = fixed_bucket(&config(&[("default_bucket", "lab-default")])).unwrap();
+        assert_eq!(chosen.as_deref(), Some("lab-default"));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
 use aruna_core::structs::storage::group_backend::{
-    BUCKET_STATE, DEFAULT_BUCKET, GroupStorage, GroupStorageSecret, PROBE_PREFIX,
+    BUCKET_STATE, GroupStorage, GroupStorageSecret, LAYOUT_BUCKET, PROBE_PREFIX,
 };
 use aruna_core::types::Key;
 use opendal::ErrorKind;
@@ -33,11 +33,13 @@ pub(super) fn group_entry(
     timeouts: aruna_core::structs::storage::blob::BlobTimeoutConfig,
 ) -> Result<NodeBackend, BlobError> {
     let mut service_config: HashMap<String, String> = record.public_config.clone();
-    service_config.retain(|key, _| key != DEFAULT_BUCKET && !key.starts_with(BUCKET_STATE));
+    // The default bucket stays for bucket selection; `operator_for` drops it.
+    service_config
+        .retain(|key, _| !key.starts_with(BUCKET_STATE) && !key.starts_with(LAYOUT_BUCKET));
     service_config.extend(secret.secret_config.clone());
     let root = service_config.remove("root").unwrap_or_default();
-    // Without a container each path names its bucket; Aruna's layout and parts go to the
-    // default bucket.
+    // Without a container each path names its bucket; Aruna's layout goes to the default
+    // bucket and parts to the bucket `parts_bucket` names.
     let container = match record.container() {
         Some(container) => Some(container.to_string()),
         None if record.splits() => None,
@@ -53,7 +55,7 @@ pub(super) fn group_entry(
     if let Some(container) = &container {
         service_config.insert("bucket".to_string(), container.clone());
     }
-    let multipart_bucket = container.or_else(|| record.default_bucket().map(str::to_string));
+    let multipart_bucket = container.or_else(|| record.parts_bucket().map(str::to_string));
 
     // Invariant: the kind stays `Backend::Group`; `Backend::S3` would build
     // through the unguarded operator and bypass the egress guard.
@@ -574,19 +576,29 @@ mod tests {
         assert!(!entry.config.service_config.contains_key("bucket"));
         assert_eq!(entry.config.multipart_bucket, None);
 
+        // Without a default rule the parts wait in a checked rule bucket.
+        storage
+            .public_config
+            .insert("bucket:lab-raw".to_string(), "created".to_string());
+        let entry = group_entry(&storage, &secret(), BlobTimeoutConfig::default()).unwrap();
+        assert_eq!(entry.config.multipart_bucket.as_deref(), Some("lab-raw"));
         storage
             .public_config
             .insert("default_bucket".to_string(), "lab-default".to_string());
         storage
             .public_config
-            .insert("bucket:lab-raw".to_string(), "created".to_string());
+            .insert("layout:lab-old".to_string(), "true".to_string());
         let entry = group_entry(&storage, &secret(), BlobTimeoutConfig::default()).unwrap();
         assert_eq!(
             entry.config.multipart_bucket.as_deref(),
             Some("lab-default")
         );
         let keys = entry.config.service_config.keys().collect::<Vec<_>>();
-        assert!(keys.iter().all(|key| !key.contains("bucket")), "{keys:?}");
+        assert!(
+            keys.iter()
+                .all(|key| !key.contains("bucket") || *key == "default_bucket"),
+            "{keys:?}"
+        );
         // Other kinds still need their container.
         let azure = record(GroupBackendKind::Azblob, &[("endpoint", "https://az")]);
         assert!(group_entry(&azure, &secret(), BlobTimeoutConfig::default()).is_err());
