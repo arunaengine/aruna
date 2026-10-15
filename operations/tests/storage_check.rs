@@ -203,7 +203,7 @@ fn template(context: &TestContext) -> DeleteObjectInput {
 }
 
 #[tokio::test]
-async fn finds_and_cleans_broken() {
+async fn cleans_broken_files() {
     let context = setup_context().await;
     let healthy = put(&context, "a.txt", b"healthy research data").await;
     let lost = put(&context, "genes/b.faa.gz", b"lost research data").await;

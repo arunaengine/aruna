@@ -238,15 +238,15 @@ impl DeleteObjectOperation {
         self
     }
 
-    /// The deleter's credential restrictions. They are persisted on the durable
-    /// replication obligation, so a scoped delete cannot escalate to unscoped
-    /// when the obligation repair path enqueues replication instead.
     /// Deletes the version only while its record still equals `version`.
     pub fn with_expected(mut self, version: BlobVersion) -> Self {
         self.expected = Some(version);
         self
     }
 
+    /// The deleter's credential restrictions. They are persisted on the durable
+    /// replication obligation, so a scoped delete cannot escalate to unscoped
+    /// when the obligation repair path enqueues replication instead.
     pub fn with_restrictions(mut self, restrictions: Option<Vec<PathRestriction>>) -> Self {
         self.restrictions = restrictions;
         self

@@ -10,8 +10,8 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BROKEN_VERSION_KEYSPACE, STORAGE_BACKEND_KEYSPACE, STORAGE_CHECK_KEYSPACE,
-    STORAGE_CHECK_QUEUE_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BROKEN_VERSION_KEYSPACE, CHECK_QUEUE_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    STORAGE_CHECK_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{
@@ -258,7 +258,7 @@ impl Operation for CheckVersionOperation {
 pub async fn process_checks(context: &DriverContext) -> Result<Option<Duration>, String> {
     let (rows, more) = crate::jobs::store::iter_prefix_page(
         &context.storage_handle,
-        STORAGE_CHECK_QUEUE_KEYSPACE,
+        CHECK_QUEUE_KEYSPACE,
         None,
         None,
         BUCKET_PAGE,
@@ -387,7 +387,7 @@ async fn store_check(
     let left = match finished {
         true => {
             let delete = StorageEffect::Delete {
-                key_space: STORAGE_CHECK_QUEUE_KEYSPACE.to_string(),
+                key_space: CHECK_QUEUE_KEYSPACE.to_string(),
                 key,
                 txn_id: Some(txn_id),
             };
@@ -453,10 +453,9 @@ pub struct Cleaned {
     pub exhausted: bool,
 }
 
-/// Deletes up to `limit` recorded broken versions of `template.bucket` after `after` through
-/// the object delete. Each object path is authorized for `auth` like an S3 bulk delete, and a
-/// version is deleted only while its record in the delete's transaction is the recorded one.
-/// Denied rows do not count toward `limit` and never name `next`; at most `scan` rows are read.
+/// Deletes up to `limit` recorded broken versions after `after`, authorized for `auth` per path,
+/// each only while its record is still the recorded one. At most `scan` rows are read;
+/// denied rows do not count toward `limit` and never name `next`.
 pub async fn clean_broken(
     context: &DriverContext,
     template: &crate::s3::object::delete::DeleteObjectInput,

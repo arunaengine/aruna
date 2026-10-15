@@ -5,9 +5,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    S3_BUCKET_KEYSPACE, STORAGE_CHECK_KEYSPACE, STORAGE_CHECK_QUEUE_KEYSPACE,
-};
+use aruna_core::keyspaces::{CHECK_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_CHECK_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::broken::StorageCheck;
@@ -89,7 +87,7 @@ impl StartCheckOperation {
             writes: vec![
                 (STORAGE_CHECK_KEYSPACE.to_string(), self.key(), value.into()),
                 (
-                    STORAGE_CHECK_QUEUE_KEYSPACE.to_string(),
+                    CHECK_QUEUE_KEYSPACE.to_string(),
                     self.key(),
                     Vec::<u8>::new().into()
                 ),

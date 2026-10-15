@@ -101,7 +101,7 @@ pub const COMPRESSION_QUEUE_KEYSPACE: &str = "compression_migration_queue";
 /// Node-local progress of checking a bucket's current versions for copies that cannot serve.
 pub const STORAGE_CHECK_KEYSPACE: &str = "storage_checks";
 /// Buckets whose check is unfinished; the migration worker scans only these.
-pub const STORAGE_CHECK_QUEUE_KEYSPACE: &str = "storage_check_queue";
+pub const CHECK_QUEUE_KEYSPACE: &str = "storage_check_queue";
 /// Versions a check found broken, keyed by version key so one bucket is one prefix.
 pub const BROKEN_VERSION_KEYSPACE: &str = "broken_versions";
 pub const HIDDEN_RESERVATION_KEYSPACE: &str = "blob_hidden_reservations";
@@ -428,7 +428,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     COMPRESSION_MIGRATION_KEYSPACE,
     COMPRESSION_QUEUE_KEYSPACE,
     STORAGE_CHECK_KEYSPACE,
-    STORAGE_CHECK_QUEUE_KEYSPACE,
+    CHECK_QUEUE_KEYSPACE,
     BROKEN_VERSION_KEYSPACE,
     ABE_PARAMETERS_KEYSPACE,
     ABE_EPOCH_KEYSPACE,

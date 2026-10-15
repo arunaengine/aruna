@@ -468,5 +468,5 @@ pub async fn clean_bucket_check(
 }
 
 #[cfg(test)]
-#[path = "storage_check_tests.rs"]
+#[path = "checks_tests.rs"]
 mod tests;

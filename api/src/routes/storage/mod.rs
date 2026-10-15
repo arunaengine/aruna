@@ -6,12 +6,12 @@
 pub mod abe;
 pub mod blobs;
 pub mod bucket;
+pub mod checks;
 pub mod compression;
 pub mod connectors;
 pub mod deletion;
 pub mod encryption;
 pub mod group_backends;
 pub mod imports;
+pub mod moves;
 pub mod routing;
-pub mod storage_check;
-pub mod storage_move;

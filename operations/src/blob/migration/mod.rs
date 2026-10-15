@@ -1974,7 +1974,7 @@ mod tests {
         }
 
         #[test]
-        fn missing_target_keeps_source() {
+        fn skips_missing_target() {
             // A row on the target whose bytes are gone is never adopted.
             let mut operation = operation("k", Vec::new());
             operation.start();
@@ -2060,7 +2060,7 @@ mod tests {
         }
 
         #[test]
-        fn retry_takes_fresh_path() {
+        fn never_overwrites_path() {
             // A file an earlier attempt or a user left at the path is never overwritten.
             let mut operation = operation("in/x/one.csv", vec![rule()]);
             copied(&mut operation, &raw_version(), true);
@@ -2105,7 +2105,7 @@ mod tests {
         }
 
         #[test]
-        fn links_copy_in_place() {
+        fn links_existing_copy() {
             // A copy already on the rule's storage still gets its file, as an upload does,
             // and the version keeps the copy it names.
             let mut operation = operation("in/x/one.csv", vec![rule()]);
