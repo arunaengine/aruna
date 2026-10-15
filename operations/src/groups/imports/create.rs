@@ -455,7 +455,8 @@ impl CreateImportOperation {
 }
 
 /// A folder on a storage without a bucket starts with a bucket that never held the default
-/// rule; any folder leaves room for a file below it. Answers the bucket to check.
+/// rule; no folder lies in Aruna's own folders or leaves no room for a file. Answers the
+/// bucket to check.
 fn check_folder(storage: &GroupStorage, folder: &str) -> Result<Option<String>, ImportRuleError> {
     let (bucket, rest) = match storage.splits() {
         true => match path_bucket(folder).filter(|bucket| valid_bucket(bucket)) {
@@ -475,7 +476,18 @@ fn check_folder(storage: &GroupStorage, folder: &str) -> Result<Option<String>, 
             "Bucket `{bucket}` holds Aruna's files of a default rule. Pick another bucket."
         )));
     }
-    if rest.len() + NAME_ROOM > MAX_KEY_LEN {
+    if storage.is_reserved(folder) {
+        return Err(ImportRuleError::Invalid(
+            "The folder lies inside a folder Aruna uses for its own files.".to_string(),
+        ));
+    }
+    // The storage root goes in front of every key, with a separator.
+    let root = storage
+        .public_config
+        .get("root")
+        .map_or("", |root| root.trim_matches('/'));
+    let root = if root.is_empty() { 0 } else { root.len() + 1 };
+    if root + rest.len() + NAME_ROOM > MAX_KEY_LEN {
         return Err(ImportRuleError::Invalid(
             "The folder is too long: paths on this storage are at most 1024 bytes.".to_string(),
         ));
@@ -706,11 +718,21 @@ mod tests {
             ("layout:lab-old", "true"),
         ]);
         let long = format!("lab-raw/{}/", "a".repeat(1000));
+        let mut rooted = record.clone();
+        rooted
+            .public_config
+            .insert("root".to_string(), format!("/{}/", "r".repeat(900)));
+        let folder = format!("lab-raw/{}/", "a".repeat(200));
+        let (operation, effects) = on_split(input(&folder, "imported/"), &rooted);
+        assert!(effects.is_empty(), "the root leaves no room: {effects:?}");
+        assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
         for (folder, conflict) in [
             ("", false),
             ("Raw/", false),
             ("lab-default/x/", true),
             ("lab-old/", true),
+            ("lab-raw/_aruna_parts/", false),
+            ("lab-raw/_aruna_backend_probe/", false),
             (long.as_str(), false),
         ] {
             let (operation, effects) = on_split(input(folder, "imported/"), &record);
@@ -849,7 +871,9 @@ mod tests {
         let (operation, _) = after_reads(input("", ""), bucket(Vec::new(), compressed));
         assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
 
-        let (operation, _) = after_reads(input("data/", ""), bucket(Vec::new(), Compression::Off));
+        // Aruna's own folder is refused before any bucket or transaction is touched.
+        let (operation, effects) = on_split(input("data/", ""), &storage(&[("bucket", "data")]));
+        assert!(effects.is_empty(), "{effects:?}");
         assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
 
         let (operation, _) = after_reads(input("", ""), None);
