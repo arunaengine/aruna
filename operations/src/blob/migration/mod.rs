@@ -11,6 +11,7 @@ pub mod rewrite;
 use crate::blob::cleanup::schedule_cleanup_effect;
 use crate::blob::managed_copy::{ManagedCopyError, check_serveable, read_effect};
 use crate::blob::records::{blob_location_read, read_version_effect};
+use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::groups::storage_routing::routing_key;
 use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use crate::s3::bucket::key::rows::settings_read;
@@ -21,11 +22,13 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
-    COMPRESSION_QUEUE_KEYSPACE, MANAGED_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
-    STORAGE_ROUTING_KEYSPACE,
+    COMPRESSION_QUEUE_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, MANAGED_COPY_KEYSPACE,
+    S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::storage::backend_import::{BackendImport, PlainPath, import_key};
+use aruna_core::structs::storage::backend_import::{
+    BackendImport, ImportedObject, PlainPath, import_key, object_key,
+};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
     ManagedCopyKey, ManagedCopyRecord, ResolvedBackend, VersionKey,
@@ -40,6 +43,7 @@ use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
+use ulid::Ulid;
 
 /// Steps of one version migration; errors name the step they stopped in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,11 +52,14 @@ pub enum MigrateState {
     ReadVersion,
     ReadLocation,
     FindTarget,
+    ProbeTarget,
+    CheckLinked,
     StatPlain,
     ReadBlob,
     WriteBlob,
     StartTransaction,
     ReadBucket,
+    FenceTarget,
     CheckVersion,
     CheckCopy,
     ReadTarget,
@@ -88,6 +95,8 @@ pub enum MigrateVersionError {
     ManagedCopy(#[from] ManagedCopyError),
     #[error(transparent)]
     Routing(#[from] RoutingError),
+    #[error(transparent)]
+    Fence(#[from] BackendFenceError),
     #[error("the copy in the target encoding disappeared before it was adopted")]
     TargetMissing,
     #[error("the re-encoded copy does not match the original bytes")]
@@ -116,6 +125,8 @@ pub struct MigrateVersionOperation {
     plain_path: Option<PlainPath>,
     /// The backend's id of the bytes a plain write stored.
     backend_version: Option<String>,
+    /// A finished copy found at the target row; on another backend it is probed before use.
+    found: Option<BackendLocation>,
     state: MigrateState,
     txn_id: Option<TxnId>,
     version: Option<BlobVersion>,
@@ -140,6 +151,7 @@ impl MigrateVersionOperation {
             plain: None,
             plain_path: None,
             backend_version: None,
+            found: None,
             state: MigrateState::Init,
             txn_id: None,
             version: None,
@@ -234,7 +246,8 @@ impl MigrateVersionOperation {
                 Err(error) => return self.fail(error.into()),
             }
         }
-        let Some(key) = source_key(&version, |current| self.wanted(current)) else {
+        let linked = self.plain.is_some();
+        let Some(key) = source_key(&version, |current| self.wanted(current), linked) else {
             return self.skip();
         };
         self.version = Some(version);
@@ -256,7 +269,23 @@ impl MigrateVersionOperation {
         if stays(&old, self.routing.is_some()) {
             return self.skip();
         }
+        let in_place = self
+            .target_key_of(&old)
+            .is_ok_and(|key| old.location_key() == Ok(key));
         self.old = Some(old);
+        // A copy already on the rule's backend only needs its file in the linked folder.
+        if let Some(plain) = self.plain.as_ref().filter(|_| in_place) {
+            self.state = MigrateState::CheckLinked;
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
+                key: object_key(plain.import_id, &plain.path),
+                txn_id: None,
+            })];
+        }
+        self.find_target()
+    }
+
+    fn find_target(&mut self) -> Effects {
         match self.target_key() {
             Ok(key) => {
                 self.state = MigrateState::FindTarget;
@@ -269,62 +298,100 @@ impl MigrateVersionOperation {
     /// The row of this content in the target encoding, on the target backend.
     fn target_key(&self) -> Result<BlobLocationKey, MigrateVersionError> {
         let old = self.old.as_ref().ok_or(MigrateVersionError::NotFinished)?;
+        self.target_key_of(old)
+    }
+
+    fn target_key_of(&self, old: &BackendLocation) -> Result<BlobLocationKey, MigrateVersionError> {
         let mut key = old.location_key()?;
         (key.backend, key.encoding) = self.wanted(&old.backend);
         Ok(key)
     }
 
-    /// A finished copy in the target encoding is adopted; only without one is the old copy read.
+    /// Whether the target lies on another backend than the copy the version names now.
+    fn crosses(&self) -> bool {
+        let old = self.old.as_ref();
+        old.is_some_and(|old| self.wanted(&old.backend).0 != old.backend)
+    }
+
+    /// A linked-folder file this version already has needs no second one.
+    fn handle_linked(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected(event);
+        };
+        let row = value.map(|value| ImportedObject::from_bytes(value.as_ref()));
+        match row.transpose() {
+            Ok(Some(row)) if row.version_id == self.version_key.version_id => self.skip(),
+            Ok(_) => self.find_target(),
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
+    /// A finished copy in the target encoding is adopted; on another backend only after a probe
+    /// shows its bytes exist. A linked target writes its file first, as an upload does.
     fn handle_found(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected(event);
         };
         let found = match value.map(|value| BackendLocation::from_bytes(value.as_ref())) {
-            Some(Ok(found)) => !found.staging && !found.partial,
+            Some(Ok(found)) => Some(found).filter(|found| !found.staging && !found.partial),
             Some(Err(error)) => return self.fail(error.into()),
-            None => false,
+            None => None,
         };
-        if found {
-            self.state = MigrateState::StartTransaction;
-            return smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
+        self.found = found.clone();
+        match found {
+            Some(location) if self.crosses() => {
+                self.state = MigrateState::ProbeTarget;
+                smallvec![Effect::Blob(BlobEffect::StatCopy { location })]
+            }
+            _ => self.after_found(),
+        }
+    }
+
+    fn handle_probe(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Blob(BlobEvent::CopyStat { exists: true }) => self.after_found(),
+            Event::Blob(BlobEvent::CopyStat { exists: false }) => {
+                self.fail(MigrateVersionError::TargetMissing)
+            }
+            Event::Blob(BlobEvent::Error(error)) => self.fail(error.into()),
+            other => self.unexpected(other),
+        }
+    }
+
+    fn after_found(&mut self) -> Effects {
+        if let Some(plain) = self.plain.as_ref() {
+            self.state = MigrateState::StatPlain;
+            return smallvec![Effect::Blob(BlobEffect::StatPlain {
+                backend: plain.backend.clone(),
+                path: plain.path.clone(),
             })];
         }
-        let Some(plain) = self.plain.as_ref() else {
-            return self.read_blob();
-        };
-        let path = plain.path.clone();
-        let id = self.version_key.version_id;
-        if !plain.same_name {
-            self.plain_path = Some(PlainPath {
-                path,
-                ulid: id,
-                if_not_exists: false,
-            });
+        if self.found.is_none() {
             return self.read_blob();
         }
-        self.state = MigrateState::StatPlain;
-        smallvec![Effect::Blob(BlobEffect::StatPlain {
-            backend: plain.backend.clone(),
-            path,
+        self.state = MigrateState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
         })]
     }
 
-    /// A same-name path takes the file as an upload would: free, versioned, or tagged.
+    /// The path takes the file as an upload would: free, versioned, or tagged. Each attempt
+    /// names its own id, so a retry never overwrites a file an earlier attempt left there.
     fn handle_stat(&mut self, event: Event) -> Effects {
-        let (exists, versioned) = match event {
-            Event::Blob(BlobEvent::PlainStat { exists, version }) => (exists, version.is_some()),
+        let (exists, version) = match event {
+            Event::Blob(BlobEvent::PlainStat { exists, version }) => (exists, version),
             Event::Blob(BlobEvent::Error(error)) => return self.fail(error.into()),
             other => return self.unexpected(other),
         };
         let Some(plain) = self.plain.as_ref() else {
             return self.fail(MigrateVersionError::NotFinished);
         };
-        let id = self.version_key.version_id;
-        let (path, if_not_exists) = same_name_path(&plain.path, id, exists, versioned);
+        let attempt = Ulid::generate();
+        let versioned = plain.same_name && version.is_some();
+        let (path, if_not_exists) = same_name_path(&plain.path, attempt, exists, versioned);
         self.plain_path = Some(PlainPath {
             path,
-            ulid: id,
+            ulid: attempt,
             if_not_exists,
         });
         self.read_blob()
@@ -473,7 +540,7 @@ impl MigrateVersionOperation {
         if self.routing.is_some() {
             let values = values.into_iter().map(|(_, value)| value);
             return match self.still_chosen(values.collect()) {
-                Ok(true) => self.read_version(),
+                Ok(true) => self.fence_target(),
                 Ok(false) => self.skip(),
                 Err(error) => self.fail(error),
             };
@@ -494,6 +561,26 @@ impl MigrateVersionOperation {
             return self.skip();
         }
         self.read_version()
+    }
+
+    /// A group storage disabled during the copy keeps the version where it is.
+    fn fence_target(&mut self) -> Effects {
+        let backend = self.resolved.as_ref().map(|resolved| &resolved.backend);
+        match backend.and_then(|backend| fence_backend(backend, self.txn_id)) {
+            Some(effect) => {
+                self.state = MigrateState::FenceTarget;
+                smallvec![effect]
+            }
+            None => self.read_version(),
+        }
+    }
+
+    fn handle_fence(&mut self, event: Event) -> Effects {
+        match check_fence(event) {
+            Ok(()) => self.read_version(),
+            Err(BackendFenceError::Unavailable) => self.skip(),
+            Err(error) => self.fail(error.into()),
+        }
     }
 
     fn read_version(&mut self) -> Effects {
@@ -590,6 +677,11 @@ impl MigrateVersionOperation {
             Some(value) => {
                 let existing = BackendLocation::from_bytes(&value)?;
                 self.owns_row = (self.new.as_ref()).is_some_and(|new| existing.same_object(new));
+                // Another backend's row is adopted only as the copy the probe found.
+                let probed = (self.found.as_ref()).is_some_and(|found| existing.same_object(found));
+                if self.crosses() && !self.owns_row && !probed {
+                    return Err(MigrateVersionError::TargetMissing);
+                }
                 existing
             }
             None => {
@@ -607,6 +699,8 @@ impl MigrateVersionOperation {
                 new
             }
         };
+        // A linked file added next to the copy the version keeps reclaims nothing.
+        let unchanged = published.location_key()? == old_key;
         let mut migrated = version.clone();
         if let BlobVersionState::Materialized {
             backend, encoding, ..
@@ -641,6 +735,9 @@ impl MigrateVersionOperation {
             self.version_key.to_bytes()?.into(),
             migrated.to_bytes()?.into(),
         ));
+        if unchanged {
+            return Ok(writes);
+        }
         let candidate =
             ReclaimCandidateKey::new(old_key.backend, old_key.encoding, old_key.blake3_hash);
         let enqueued = ReclaimCandidate {
@@ -730,11 +827,14 @@ impl Operation for MigrateVersionOperation {
             MigrateState::ReadVersion => self.handle_version(event),
             MigrateState::ReadLocation => self.handle_location(event),
             MigrateState::FindTarget => self.handle_found(event),
+            MigrateState::ProbeTarget => self.handle_probe(event),
+            MigrateState::CheckLinked => self.handle_linked(event),
             MigrateState::StatPlain => self.handle_stat(event),
             MigrateState::ReadBlob => self.handle_read(event),
             MigrateState::WriteBlob => self.handle_written(event),
             MigrateState::StartTransaction => self.handle_started(event),
             MigrateState::ReadBucket => self.handle_bucket(event),
+            MigrateState::FenceTarget => self.handle_fence(event),
             MigrateState::CheckVersion => self.handle_check(event),
             MigrateState::CheckCopy => self.handle_copy(event),
             MigrateState::ReadTarget => self.handle_target(event),
@@ -788,9 +888,11 @@ pub fn place(
 }
 
 /// The row a version moves away from, or `None` when it already sits at `wanted`.
+/// A linked target also takes a version that already sits at `wanted`, for its file.
 fn source_key(
     version: &BlobVersion,
     wanted: impl Fn(&BackendRef) -> (BackendRef, EncodingClass),
+    linked: bool,
 ) -> Option<BlobLocationKey> {
     let BlobVersionState::Materialized {
         backend, encoding, ..
@@ -801,7 +903,7 @@ fn source_key(
     let wanted = wanted(backend);
     // The gate admitted a governed version for its backend only.
     let governed = !version.placement_policies.is_empty() && wanted.0 != *backend;
-    let moves = wanted != (backend.clone(), *encoding) && !governed;
+    let moves = (linked || wanted != (backend.clone(), *encoding)) && !governed;
     moves.then(|| version.location_key()).flatten()
 }
 
@@ -974,17 +1076,18 @@ async fn migrate_page(
         let routing = routing
             .clone()
             .filter(|_| version_key.key.starts_with(&record.prefix));
+        let moving = routing.is_some();
         let mut operation =
             MigrateVersionOperation::new(version_key, record.target, SystemTime::now());
         if let Some(routing) = routing {
             operation = operation.with_routing(routing);
         }
         let moved = crate::driver::drive(operation, context).await;
-        let broken = moved.is_err() && is_broken(context, key).await;
+        let broken = moved.is_err() && moving && is_broken(context, key).await;
         match moved {
             Ok(MigrateOutcome::Migrated) => record.migrated += 1,
             Ok(MigrateOutcome::Skipped) => record.skipped += 1,
-            // A copy that cannot be read is recorded as broken instead of retried.
+            // A move records a copy that cannot be read as broken instead of retrying it.
             Err(_) if broken => record.skipped += 1,
             Err(error) => {
                 record.failed += 1;
@@ -1549,7 +1652,7 @@ mod tests {
     mod moving {
         use super::*;
         use aruna_core::keyspaces::IMPORTED_OBJECT_KEYSPACE;
-        use aruna_core::structs::storage::backend_import::{DEFAULT_PATTERN, object_key};
+        use aruna_core::structs::storage::backend_import::{DEFAULT_PATTERN, tagged_path};
         use aruna_core::structs::storage::routing::{
             BackendCatalog, GroupRoutingInputs, RoutingTarget,
         };
@@ -1634,8 +1737,52 @@ mod tests {
             Event::Storage(StorageEvent::BatchReadResult { values })
         }
 
-        /// Drives a move of `version` up to its publication reads.
-        fn copied(operation: &mut MigrateVersionOperation, version: &BlobVersion) -> Effects {
+        fn storage_record(disabled: bool) -> Event {
+            let record = aruna_core::structs::storage::group_backend::GroupStorage {
+                backend_id: STORAGE,
+                group_id: GROUP,
+                name: "tenant".to_string(),
+                kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
+                public_config: HashMap::new(),
+                created_at: SystemTime::UNIX_EPOCH,
+                updated_at: SystemTime::UNIX_EPOCH,
+                created_by: Default::default(),
+                disabled,
+                cleanup: Default::default(),
+            };
+            read_result(Some(record.to_bytes().unwrap()))
+        }
+
+        /// Answers the rule reads and the target storage fence, up to the version read.
+        fn published(operation: &mut MigrateVersionOperation, rule: Option<BackendImport>) {
+            let default = Some(RoutingTarget::Backend(storage()));
+            let effects = operation.step(rules_read(default, rule));
+            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
+            else {
+                panic!("expected the storage fence, got {effects:?}")
+            };
+            assert_eq!(key_space, aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE);
+            operation.step(storage_record(false));
+        }
+
+        /// Answers the file's write with the location the adapter reports.
+        fn plain_written(plain: &PlainPath) -> Event {
+            let mut written = on_storage(location(false));
+            (written.storage_bucket, written.backend_path) = (String::new(), plain.path.clone());
+            written.ulid = plain.ulid;
+            Event::Blob(BlobEvent::PlainWritten {
+                location: written,
+                version: None,
+            })
+        }
+
+        /// Drives a move of `version` from Aruna storage up to its publication reads; a linked
+        /// target finds its path taken when `taken`.
+        fn copied(
+            operation: &mut MigrateVersionOperation,
+            version: &BlobVersion,
+            taken: bool,
+        ) -> Effects {
             operation.start();
             operation.step(read_result(Some(version.to_bytes().unwrap())));
             let effects = operation.step(read_result(Some(location(false).to_bytes().unwrap())));
@@ -1643,7 +1790,17 @@ mod tests {
                 panic!("expected the target row read, got {effects:?}")
             };
             assert_eq!(BlobLocationKey::from_bytes(key).unwrap().backend, storage());
-            operation.step(read_result(None));
+            let mut effects = operation.step(read_result(None));
+            if let [Effect::Blob(BlobEffect::StatPlain { .. })] = effects.as_slice() {
+                effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+                    exists: taken,
+                    version: None,
+                }));
+            }
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::Read { .. })]
+            ));
             let effects = operation.step(empty_blob());
             let new = match effects.as_slice() {
                 [Effect::Blob(BlobEffect::Write { resolved, .. })] => {
@@ -1652,15 +1809,7 @@ mod tests {
                         location: on_storage(location(false)),
                     })
                 }
-                [Effect::Blob(BlobEffect::WritePlain { plain, .. })] => {
-                    let mut written = on_storage(location(false));
-                    (written.storage_bucket, written.backend_path) =
-                        (String::new(), plain.path.clone());
-                    Event::Blob(BlobEvent::PlainWritten {
-                        location: written,
-                        version: None,
-                    })
-                }
+                [Effect::Blob(BlobEffect::WritePlain { plain, .. })] => plain_written(plain),
                 other => panic!("expected a write, got {other:?}"),
             };
             operation.step(new);
@@ -1669,22 +1818,33 @@ mod tests {
             }))
         }
 
+        fn batch(effects: &Effects) -> &Vec<(String, Key, Value)> {
+            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
+            else {
+                panic!("expected the row writes, got {effects:?}")
+            };
+            writes
+        }
+
+        fn aborted(effects: &Effects) -> bool {
+            matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+            )
+        }
+
         #[test]
         fn moves_to_storage() {
             // The version names the copy on the group's storage; the old copy is reclaimed.
             let mut operation = operation("k", Vec::new());
             let version = raw_version();
-            copied(&mut operation, &version);
-            let default = Some(RoutingTarget::Backend(storage()));
-            operation.step(rules_read(default, None));
+            copied(&mut operation, &version, false);
+            published(&mut operation, None);
             operation.step(read_result(Some(version.to_bytes().unwrap())));
 
             let effects = operation.step(read_result(None));
 
-            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
-            else {
-                panic!("expected the row writes, got {effects:?}")
-            };
+            let writes = batch(&effects);
             let spaces: Vec<&str> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
             let expected = [
                 BLOB_LOCATIONS_KEYSPACE,
@@ -1717,14 +1877,11 @@ mod tests {
         fn discards_changed_rule() {
             // The default rule went back to Aruna storage during the copy.
             let mut operation = operation("k", Vec::new());
-            copied(&mut operation, &raw_version());
+            copied(&mut operation, &raw_version(), false);
 
             let effects = operation.step(rules_read(None, None));
 
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-            ));
+            assert!(aborted(&effects));
             operation.step(Event::Storage(StorageEvent::TransactionAborted {
                 txn_id: TxnId::default(),
             }));
@@ -1737,32 +1894,96 @@ mod tests {
         }
 
         #[test]
+        fn disabled_target_discards() {
+            // A storage disabled during the copy never takes the version, so nothing is reclaimed.
+            let mut operation = operation("k", Vec::new());
+            copied(&mut operation, &raw_version(), false);
+            operation.step(rules_read(Some(RoutingTarget::Backend(storage())), None));
+
+            let effects = operation.step(storage_record(true));
+
+            assert!(aborted(&effects));
+        }
+
+        #[test]
+        fn missing_target_keeps_source() {
+            // A row on the target whose bytes are gone is never adopted.
+            let mut operation = operation("k", Vec::new());
+            operation.start();
+            operation.step(read_result(Some(raw_version().to_bytes().unwrap())));
+            operation.step(read_result(Some(location(false).to_bytes().unwrap())));
+            let target = on_storage(location(false));
+
+            let effects = operation.step(read_result(Some(target.to_bytes().unwrap())));
+            let [Effect::Blob(BlobEffect::StatCopy { location })] = effects.as_slice() else {
+                panic!("expected the target probe, got {effects:?}")
+            };
+            assert!(location.same_object(&target));
+            let effects = operation.step(Event::Blob(BlobEvent::CopyStat { exists: false }));
+
+            assert!(effects.is_empty());
+            assert_eq!(
+                operation.finalize(),
+                Err(MigrateVersionError::TargetMissing)
+            );
+        }
+
+        #[test]
+        fn probed_target_revalidated() {
+            // The adopted row must still be the probed copy when the version moves to it.
+            let mut operation = operation("k", Vec::new());
+            let version = raw_version();
+            operation.start();
+            operation.step(read_result(Some(version.to_bytes().unwrap())));
+            operation.step(read_result(Some(location(false).to_bytes().unwrap())));
+            operation.step(read_result(Some(
+                on_storage(location(false)).to_bytes().unwrap(),
+            )));
+            let effects = operation.step(Event::Blob(BlobEvent::CopyStat { exists: true }));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::StartTransaction { .. })]
+            ));
+            operation.step(Event::Storage(StorageEvent::TransactionStarted {
+                txn_id: TxnId::default(),
+            }));
+            published(&mut operation, None);
+            operation.step(read_result(Some(version.to_bytes().unwrap())));
+
+            let replaced = on_storage(location(false));
+            let effects = operation.step(read_result(Some(replaced.to_bytes().unwrap())));
+
+            assert!(aborted(&effects));
+        }
+
+        #[test]
         fn writes_linked_file() {
             // The file lands where an upload goes and its importer skips it later.
             let mut operation = operation("in/x/one.csv", vec![rule()]);
             let version = raw_version();
-            let effects = copied(&mut operation, &version);
+            let effects = copied(&mut operation, &version, false);
             let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
             else {
                 panic!("expected the publication reads, got {effects:?}")
             };
             assert_eq!(reads.len(), 4);
-            let path = operation.plain_path.clone().unwrap().path;
-            assert_eq!(path, format!("raw/x/{}_one.csv", Ulid::from_bytes([2; 16])));
-            let default = Some(RoutingTarget::Backend(storage()));
-            operation.step(rules_read(default, Some(rule())));
+            let plain = operation.plain_path.clone().unwrap();
+            assert_eq!(
+                plain.path,
+                format!("raw/x/{}_one.csv", Ulid::from_bytes([2; 16]))
+            );
+            // Only a free path is taken, so an outside file is never replaced.
+            assert!(plain.if_not_exists);
+            published(&mut operation, Some(rule()));
             operation.step(read_result(Some(version.to_bytes().unwrap())));
 
             let effects = operation.step(read_result(None));
 
-            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
-            else {
-                panic!("expected the row writes, got {effects:?}")
-            };
+            let writes = batch(&effects);
             let (_, key, _) = (writes.iter())
                 .find(|(space, ..)| space == IMPORTED_OBJECT_KEYSPACE)
                 .expect("the import row");
-            assert_eq!(key, &object_key(IMPORT, &path));
+            assert_eq!(key, &object_key(IMPORT, &plain.path));
             let (_, _, moved) = (writes.iter())
                 .find(|(space, ..)| space == BLOB_VERSIONS_KEYSPACE)
                 .unwrap();
@@ -1771,17 +1992,93 @@ mod tests {
         }
 
         #[test]
+        fn retry_takes_fresh_path() {
+            // A file an earlier attempt or a user left at the path is never overwritten.
+            let mut operation = operation("in/x/one.csv", vec![rule()]);
+            copied(&mut operation, &raw_version(), true);
+
+            let plain = operation.plain_path.clone().unwrap();
+            let path = format!("raw/x/{}_one.csv", Ulid::from_bytes([2; 16]));
+            assert_eq!(plain.path, tagged_path(&path, plain.ulid));
+            assert_ne!(plain.ulid, Ulid::from_bytes([2; 16]));
+            assert!(plain.if_not_exists);
+        }
+
+        #[test]
         fn removed_rule_discards() {
             let mut operation = operation("in/x/one.csv", vec![rule()]);
-            copied(&mut operation, &raw_version());
+            copied(&mut operation, &raw_version(), false);
             let default = Some(RoutingTarget::Backend(storage()));
 
             let effects = operation.step(rules_read(default, None));
 
+            assert!(aborted(&effects));
+        }
+
+        /// A version whose copy is in Aruna's layout on the rule's storage.
+        fn in_place() -> (BlobVersion, BackendLocation) {
+            let mut version = raw_version();
+            if let BlobVersionState::Materialized { backend, .. } = &mut version.state {
+                *backend = storage();
+            }
+            (version, on_storage(location(false)))
+        }
+
+        #[test]
+        fn links_copy_in_place() {
+            // A copy already on the rule's storage still gets its file, as an upload does,
+            // and the version keeps the copy it names.
+            let mut operation = operation("in/x/one.csv", vec![rule()]);
+            let (version, old) = in_place();
+            operation.start();
+            operation.step(read_result(Some(version.to_bytes().unwrap())));
+            let effects = operation.step(read_result(Some(old.to_bytes().unwrap())));
+            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
+            else {
+                panic!("expected the import row read, got {effects:?}")
+            };
+            assert_eq!(key_space, IMPORTED_OBJECT_KEYSPACE);
+            operation.step(read_result(None));
+            let effects = operation.step(read_result(Some(old.to_bytes().unwrap())));
             assert!(matches!(
                 effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+                [Effect::Blob(BlobEffect::StatPlain { .. })]
             ));
+            operation.step(Event::Blob(BlobEvent::PlainStat {
+                exists: false,
+                version: None,
+            }));
+            let effects = operation.step(empty_blob());
+            let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
+                panic!("expected the file write, got {effects:?}")
+            };
+            operation.step(plain_written(plain));
+            operation.step(Event::Storage(StorageEvent::TransactionStarted {
+                txn_id: TxnId::default(),
+            }));
+            published(&mut operation, Some(rule()));
+            operation.step(read_result(Some(version.to_bytes().unwrap())));
+
+            let effects = operation.step(read_result(Some(old.to_bytes().unwrap())));
+
+            let spaces: Vec<&str> = batch(&effects).iter().map(|(s, ..)| s.as_str()).collect();
+            assert_eq!(spaces, [IMPORTED_OBJECT_KEYSPACE, BLOB_VERSIONS_KEYSPACE]);
+        }
+
+        #[test]
+        fn linked_copy_done() {
+            // Once the version's file is recorded, a later move leaves it alone.
+            let mut operation = operation("in/x/one.csv", vec![rule()]);
+            let (version, old) = in_place();
+            operation.start();
+            operation.step(read_result(Some(version.to_bytes().unwrap())));
+            operation.step(read_result(Some(old.to_bytes().unwrap())));
+            let row = ImportedObject::written(Ulid::from_bytes([2; 16]), "in/x/one.csv".into(), 40);
+
+            let effects = operation.step(read_result(Some(row.to_bytes().unwrap())));
+
+            assert!(effects.is_empty());
+            assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
         }
 
         #[test]

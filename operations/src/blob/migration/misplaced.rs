@@ -6,7 +6,10 @@ use super::{encrypting, move_routing, place, source_key, stays};
 use crate::blob::records::blob_location_read;
 use crate::driver::DriverContext;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, BROKEN_VERSION_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_VERSIONS_KEYSPACE, BROKEN_VERSION_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
+};
+use aruna_core::structs::storage::backend_import::{ImportedObject, object_key};
 use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKey};
 use aruna_core::types::Key;
 
@@ -47,7 +50,7 @@ pub async fn count_misplaced(
             BLOB_VERSIONS_KEYSPACE,
             Some(scan.clone().into()),
             after.take(),
-            COUNT_PAGE,
+            COUNT_PAGE.min(COUNT_LIMIT - seen),
             None,
         )
         .await?;
@@ -59,16 +62,34 @@ pub async fn count_misplaced(
             }
             let version = BlobVersion::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
             // A key the rules cannot place now fails its move; it is not counted.
-            let Ok((resolved, _)) = place(&routing, &version_key) else {
+            let Ok((resolved, plain)) = place(&routing, &version_key) else {
                 continue;
             };
-            let wanted = |_: &_| (resolved.backend.clone(), resolved.compression.into());
-            let Some(source) = source_key(&version, wanted) else {
+            let target = (resolved.backend.clone(), resolved.compression.into());
+            let wanted = |_: &_| target.clone();
+            let Some(source) = source_key(&version, wanted, plain.is_some()) else {
                 continue;
             };
-            if !recorded(context, &key).await? && moves(context, &source).await? {
-                misplaced.count += 1;
+            if read(context, BROKEN_VERSION_KEYSPACE, key.clone())
+                .await?
+                .is_some()
+                || !moves(context, &source).await?
+            {
+                continue;
             }
+            // A copy in place with its linked file recorded for this version is done.
+            if let Some(plain) =
+                plain.filter(|_| (source.backend.clone(), source.encoding) == target)
+            {
+                let row = object_key(plain.import_id, &plain.path);
+                let row = read(context, IMPORTED_OBJECT_KEYSPACE, row).await?;
+                let row = row.map(|row| ImportedObject::from_bytes(&row)).transpose();
+                let row = row.map_err(|error| error.to_string())?;
+                if row.is_some_and(|row| row.version_id == version_key.version_id) {
+                    continue;
+                }
+            }
+            misplaced.count += 1;
         }
         match next {
             Some(_) if seen >= COUNT_LIMIT => {
@@ -81,16 +102,19 @@ pub async fn count_misplaced(
     }
 }
 
-/// Whether a check recorded the version as broken; a move skips it.
-async fn recorded(context: &DriverContext, key: &Key) -> Result<bool, String> {
+async fn read(
+    context: &DriverContext,
+    key_space: &str,
+    key: Key,
+) -> Result<Option<Vec<u8>>, String> {
     let read = aruna_core::effects::StorageEffect::Read {
-        key_space: BROKEN_VERSION_KEYSPACE.to_string(),
-        key: key.clone(),
+        key_space: key_space.to_string(),
+        key,
         txn_id: None,
     };
     match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
-        other => Err(format!("could not read a broken version: {other:?}")),
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.map(|v| v.to_vec())),
+        other => Err(format!("could not read {key_space}: {other:?}")),
     }
 }
 
