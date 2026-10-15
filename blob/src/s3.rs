@@ -460,7 +460,7 @@ fn bucket_error<E>(bucket: &str, call: &str, error: &aws_sdk_s3::error::SdkError
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    tracing::warn!(bucket, call, code = ?error.code(), status = ?status(error), "tenant bucket check failed");
+    tracing::warn!(bucket, call, status = ?status(error), "tenant bucket check failed");
     let message = match status(error) {
         Some(403) => format!("No access to bucket `{bucket}`. Check that the key may use it."),
         Some(301) => format!("The bucket `{bucket}` is in another region."),
