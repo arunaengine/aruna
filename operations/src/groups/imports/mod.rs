@@ -14,7 +14,7 @@ use crate::jobs::store::{iter_prefix_page, read_job_record};
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
-use aruna_core::structs::execution::job::{JobId, JobState};
+use aruna_core::structs::execution::job::{JobError, JobId, JobState};
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportCheckpoint, import_key,
@@ -58,6 +58,25 @@ pub struct LastRun {
     pub state: JobState,
     pub started_ms: u64,
     pub checkpoint: BackendImportCheckpoint,
+    /// Why the run as a whole did not finish, such as a bucket it could not list.
+    pub error: Option<String>,
+}
+
+/// Longest run error shown; the node log keeps the full text.
+const RUN_ERROR_LEN: usize = 200;
+
+/// The job's own error, only for a run that ended without success: its first line, cut short
+/// so request details of the storage stay in the node log.
+pub fn run_error(state: JobState, error: Option<&JobError>) -> Option<String> {
+    if !matches!(state, JobState::Failed | JobState::Indeterminate) {
+        return None;
+    }
+    let line = error?.message.lines().next()?.trim();
+    let mut short: String = line.chars().take(RUN_ERROR_LEN).collect();
+    if short.len() < line.len() {
+        short.push('…');
+    }
+    (!short.is_empty()).then_some(short)
 }
 
 /// `None` before the first run and after the run's job record was pruned.
@@ -83,6 +102,7 @@ pub async fn last_run(
         state: record.state,
         started_ms,
         checkpoint,
+        error: run_error(record.state, record.last_error.as_ref()),
     }))
 }
 
@@ -168,6 +188,22 @@ pub async fn read_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortens_run_errors() {
+        let long = JobError::retryable(format!(
+            "List error: {}\ncontext: uri=https://s3",
+            "x".repeat(300)
+        ));
+        let shown = run_error(JobState::Failed, Some(&long)).unwrap();
+        assert!(shown.starts_with("List error: ") && shown.ends_with('…'));
+        assert!(!shown.contains("https://"));
+        assert_eq!(shown.chars().count(), RUN_ERROR_LEN + 1);
+        // A retry that later succeeded leaves its old error behind.
+        assert_eq!(run_error(JobState::Succeeded, Some(&long)), None);
+        assert_eq!(run_error(JobState::Running, Some(&long)), None);
+        assert_eq!(run_error(JobState::Failed, None), None);
+    }
 
     #[test]
     fn checks_folders() {
