@@ -6,7 +6,7 @@
 use super::BlobHandler;
 use super::io::reader_at;
 use crate::bao_tree::OpenDalReader;
-use crate::codec::{self, FrameIndex};
+use crate::codec::{self, FrameIndex, Guard};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -85,6 +85,8 @@ pub(super) struct FrameReader {
     decoded: Option<(u64, Vec<Bytes>)>,
     ahead: Option<(Range<u64>, Fetch)>,
     idle: Duration,
+    /// Reservation each decode task keeps until it ends, also after a cancelled read.
+    guard: Option<Guard>,
 }
 
 /// Walks the frames of one range.
@@ -161,13 +163,18 @@ impl FrameReader {
     /// Checks and decodes each frame of one fetched batch on the blocking pool,
     /// at most `DECODE_TASKS` at a time.
     async fn decode(&self, frames: &Range<u64>, stored: Bytes) -> Result<Vec<Bytes>, BlobError> {
-        let index = self.index.clone();
+        let (index, guard) = (self.index.clone(), self.guard.clone());
         let base = index.frames_range(frames).start;
         let tasks = frames.clone().map(move |frame| {
             let range = index.frame_range(frame);
             let bytes = stored.slice((range.start - base) as usize..(range.end - base) as usize);
             let (length, digest) = (index.original_len(frame), *index.digest(frame));
-            tokio::task::spawn_blocking(move || codec::decode_frame(length, &digest, bytes))
+            let guard = guard.clone();
+            tokio::task::spawn_blocking(move || {
+                let decoded = codec::decode_frame(length, &digest, bytes);
+                drop(guard);
+                decoded
+            })
         });
         let mut tasks = stream::iter(tasks).buffered(DECODE_TASKS);
         let mut decoded = Vec::new();
@@ -282,18 +289,22 @@ impl BlobHandler {
         }
     }
 
-    /// The original bytes in `range` of a framed copy as a stream.
+    /// The original bytes in `range` of a framed copy as a stream. Its decode tasks hold `guard`.
     pub(super) async fn frames_stream(
         &self,
         location: &BackendLocation,
         layout: &FrameLayout,
         range: Range<u64>,
+        guard: Option<Guard>,
     ) -> Result<BackendStream<Result<Bytes, StreamError>>, BlobError> {
-        match Box::pin(self.read_frames(location, layout, range)).await {
-            BlobEvent::ReadFinished { blob, .. } => Ok(blob),
-            BlobEvent::Error(error) => Err(error),
-            _ => Err(BlobError::ReadError("unexpected frame read".to_string())),
-        }
+        let mut cursor = self.open_frames(location, layout, range).await?;
+        cursor.reader.guard = guard;
+        Ok(BackendStream::new(stream::try_unfold(
+            cursor,
+            |mut cursor| async move {
+                Ok::<_, BlobError>(cursor.next().await?.map(|bytes| (bytes, cursor)))
+            },
+        )))
     }
 
     async fn open_frames(
@@ -336,6 +347,7 @@ impl BlobHandler {
             decoded: None,
             ahead: None,
             idle,
+            guard: None,
         })
     }
 
@@ -386,5 +398,56 @@ impl BlobHandler {
             blob_size: location.blob_size,
             idle_timeout: self.transfer_idle_timeout(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameReader;
+    use crate::codec::{FRAME_SIZE, FrameEncoder, FrameIndex, Guard};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn cancel_keeps_guard() {
+        // One blocking thread, held busy, so the decode tasks wait in the queue.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let data = vec![7u8; 2 * FRAME_SIZE as usize];
+            let mut encoder = FrameEncoder::new(3);
+            let mut stored = encoder.push(&data).await.unwrap().concat();
+            let (tail, layout) = encoder.finish().await.unwrap();
+            let table = tail.concat();
+            stored.extend_from_slice(&table);
+            let size = data.len() as u64;
+            let index = Arc::new(FrameIndex::parse(size, &layout, &table).unwrap());
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let busy = tokio::task::spawn_blocking(move || wait.recv());
+            let guard: Guard = Arc::new(());
+            let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+            let reader = FrameReader {
+                operator,
+                path: "framed".to_string(),
+                index,
+                size,
+                decoded: None,
+                ahead: None,
+                idle: Duration::from_secs(60),
+                guard: Some(guard.clone()),
+            };
+            let mut decode = Box::pin(reader.decode(&(0..2), bytes::Bytes::from(stored)));
+            assert!(futures::poll!(&mut decode).is_pending());
+            drop(decode);
+            drop(reader);
+            // Both cancelled decode tasks still keep the guard while they wait in the queue.
+            assert_eq!(Arc::strong_count(&guard), 3);
+            release.send(()).unwrap();
+            busy.await.unwrap().unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert_eq!(Arc::strong_count(&guard), 1);
+        });
     }
 }

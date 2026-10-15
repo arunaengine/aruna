@@ -5,6 +5,7 @@
 use super::BlobHandler;
 use super::backend::{build_backend_path, intent_key};
 use super::framed_parts::{Finished, part_level, streams_now};
+use crate::codec::Guard;
 use crate::hash::Hasher;
 use crate::part_chain::{PartAttempt, PartChain};
 use crate::s3::{NativeMultipart, multipart_etag};
@@ -567,7 +568,9 @@ impl BlobHandler {
         if offset < total {
             let mut stream = match &location.format.layout {
                 StoredLayout::Frames(layout) => {
-                    self.frames_stream(&location, layout, offset..total).await?
+                    let guard = share.clone().map(|share| -> Guard { share });
+                    self.frames_stream(&location, layout, offset..total, guard)
+                        .await?
                 }
                 _ => {
                     let late = |what: &str| BlobError::ReadError(format!("timed out {what}"));

@@ -8,7 +8,7 @@ use super::backend::{
 };
 use super::group::GROUP_WRITE_CHUNK;
 use super::pithos::{ArchiveEncoder, Share, working_set};
-use crate::codec::FrameEncoder;
+use crate::codec::{FrameEncoder, Guard};
 use crate::hash::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
 use crate::s3::NativeMultipart;
@@ -1391,16 +1391,17 @@ impl BlobHandler {
                 (part, range)
             })
             .collect();
-        Box::pin(self.compose_into(template, resolved, sources)).await
+        Box::pin(self.compose_into(template, resolved, sources, None)).await
     }
 
     /// Composes `parts`, each a byte range of a part's original bytes, into a new copy at the
-    /// template's path.
+    /// template's path. Its compression and decode tasks hold `guard`.
     pub(super) async fn compose_into(
         &self,
         template: BackendLocation,
         resolved: ResolvedBackend,
         parts: Vec<(BackendLocation, Range<u64>)>,
+        guard: Option<Guard>,
     ) -> BlobEvent {
         let Some(mut reservation) = self.hold_reservation(template.ulid) else {
             return BlobEvent::Error(BlobError::WriteError(
@@ -1443,6 +1444,7 @@ impl BlobHandler {
             chunk,
             resolved.compression,
             false,
+            guard,
         );
         match Box::pin(composed).await {
             BlobEvent::WriteFinished { location } => {
@@ -1482,11 +1484,19 @@ impl BlobHandler {
                 (part, range)
             })
             .collect();
-        let composed =
-            self.compose_ranges(location, operator, parts, chunk, compression, if_not_exists);
+        let composed = self.compose_ranges(
+            location,
+            operator,
+            parts,
+            chunk,
+            compression,
+            if_not_exists,
+            None,
+        );
         Box::pin(composed).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn compose_ranges(
         &self,
         mut location: BackendLocation,
@@ -1495,10 +1505,14 @@ impl BlobHandler {
         chunk: Option<usize>,
         compression: Compression,
         if_not_exists: bool,
+        guard: Option<Guard>,
     ) -> BlobEvent {
-        let mut encoder = match compression {
-            Compression::Off => None,
-            Compression::Zstd { level } => Some(FrameEncoder::new(level)),
+        let mut encoder = match (compression, guard.clone()) {
+            (Compression::Off, _) => None,
+            (Compression::Zstd { level }, None) => Some(FrameEncoder::new(level)),
+            (Compression::Zstd { level }, Some(guard)) => {
+                Some(FrameEncoder::new(level).holding(guard))
+            }
         };
         let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
@@ -1548,7 +1562,8 @@ impl BlobHandler {
                 // A framed part is read as its original bytes, never as stored frames.
                 let mut reader = match &part.format.layout {
                     StoredLayout::Frames(layout) => {
-                        self.frames_stream(&part, layout, range).await?
+                        self.frames_stream(&part, layout, range, guard.clone())
+                            .await?
                     }
                     _ => self.compose_reader(&part, range).await?,
                 };

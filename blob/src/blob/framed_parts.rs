@@ -9,7 +9,7 @@ use super::frames::{READ_MEMORY, read_range};
 use super::io::compose_chunk;
 use super::pithos::Share;
 use crate::codec::{
-    FRAME_SIZE, FrameEncoder, FrameWriter, PART_MIN, compressor_memory, padding, padding_len,
+    FRAME_SIZE, FrameEncoder, FrameWriter, Guard, PART_MIN, compressor_memory, padding, padding_len,
 };
 use crate::s3::NativeMultipart;
 use aruna_core::errors::BlobError;
@@ -344,7 +344,7 @@ impl BlobHandler {
         let (table, layout) = writer.finish()?;
         let table = Bytes::from(table);
         if !plan_runs(&mut steps, &table, &occupied) {
-            let fallback = self.compose_fallback(upload, parts, level, compression);
+            let fallback = self.compose_fallback(upload, parts, level, compression, &share);
             let composed = Box::pin(fallback).await?;
             return Ok(Finished::Composed(Box::new(composed)));
         }
@@ -392,6 +392,7 @@ impl BlobHandler {
         parts: &[MultipartPart],
         level: u8,
         compression: Compression,
+        share: &Share,
     ) -> Result<BackendLocation, BlobError> {
         let mut writer = FrameWriter::new(level);
         let mut etags = Vec::new();
@@ -464,7 +465,8 @@ impl BlobHandler {
         let backend = upload.location.backend.clone();
         let resolved = ResolvedBackend::new(backend, upload.location.storage_class.clone())
             .with_compression(compression);
-        match Box::pin(self.compose_into(template, resolved, sources)).await {
+        let guard: Guard = share.clone();
+        match Box::pin(self.compose_into(template, resolved, sources, Some(guard))).await {
             BlobEvent::WriteFinished { location } => Ok(location),
             BlobEvent::Error(error) => Err(error),
             other => Err(BlobError::WriteError(format!(
