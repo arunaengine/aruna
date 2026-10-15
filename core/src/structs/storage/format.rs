@@ -263,7 +263,7 @@ impl From<Compression> for EncodingClass {
     }
 }
 
-/// This node's progress re-encoding one bucket's versions to `target`.
+/// This node's progress re-encoding one bucket's versions to `target`, or moving them.
 /// Keyed by bucket name; a later setting change replaces it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompressionMigration {
@@ -282,6 +282,10 @@ pub struct CompressionMigration {
     pub retry_at_ms: Option<u64>,
     pub started_at_ms: u64,
     pub finished_at_ms: Option<u64>,
+    /// Also moves each version to the storage the bucket's rules choose for a new write now.
+    pub moving: bool,
+    /// A move handles only keys under this prefix; empty handles the whole bucket.
+    pub prefix: String,
 }
 
 impl CompressionMigration {
@@ -296,6 +300,8 @@ impl CompressionMigration {
             retry_at_ms: None,
             started_at_ms,
             finished_at_ms: None,
+            moving: false,
+            prefix: String::new(),
         }
     }
 

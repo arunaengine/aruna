@@ -264,10 +264,16 @@ impl PutCompressionOperation {
 
     fn write_bucket(&mut self, value: Option<Vec<u8>>) -> Effects {
         let stored = match value.map(|value| CompressionMigration::from_bytes(&value)) {
-            Some(Ok(record)) => Some(record).filter(|record| record.target == self.compression),
+            Some(Ok(record)) => Some(record),
             Some(Err(error)) => return self.fail(error.into()),
             None => None,
         };
+        // An unfinished move continues with the new setting.
+        let moving = stored
+            .as_ref()
+            .filter(|record| record.moving && record.finished_at_ms.is_none())
+            .map(|record| record.prefix.clone());
+        let stored = stored.filter(|record| record.target == self.compression);
         let Some(mut info) = self.info.take() else {
             return self.fail(PutCompressionError::NotFinished);
         };
@@ -284,7 +290,10 @@ impl PutCompressionOperation {
         });
         let migration = match previous != self.compression || retry {
             true => {
-                let record = CompressionMigration::new(self.compression, self.now_ms);
+                let mut record = CompressionMigration::new(self.compression, self.now_ms);
+                if let Some(prefix) = moving {
+                    (record.moving, record.prefix) = (true, prefix);
+                }
                 match record.to_bytes() {
                     Ok(value) => writes.push((
                         COMPRESSION_MIGRATION_KEYSPACE.to_string(),
