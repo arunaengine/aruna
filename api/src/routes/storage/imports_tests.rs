@@ -66,6 +66,7 @@ fn request(test: &TestState, backend_id: Ulid, backend_prefix: &str) -> CreateIm
         write_backend_id: None,
         write_prefix: None,
         write_pattern: None,
+        move_existing: false,
     }
 }
 

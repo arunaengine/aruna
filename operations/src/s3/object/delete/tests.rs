@@ -1490,3 +1490,32 @@ async fn marker_releases_observation() {
 
     assert_eq!(delete_then_recount(context, &offer, None).await, (0, 0));
 }
+
+#[test]
+fn changed_version_kept() {
+    // A delete bound to the record a check saw refuses one that changed, in its transaction.
+    let seen = aruna_core::structs::storage::blob::BlobVersion::materialized(
+        [4u8; 32],
+        aruna_core::structs::storage::blob::BackendRef::node_default(),
+        aruna_core::structs::storage::format::EncodingClass::Raw,
+        std::time::SystemTime::UNIX_EPOCH,
+        test_user_id(),
+        None,
+    );
+    let mut changed = seen.clone();
+    changed
+        .metadata
+        .insert("note".to_string(), "edited".to_string());
+    let mut op = sized_delete_op().with_expected(seen);
+
+    let effects = op.target_version_read(Event::Storage(StorageEvent::ReadResult {
+        key: Vec::new().into(),
+        value: Some(changed.to_bytes().unwrap().into()),
+    }));
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    assert_eq!(op.finalize(), Err(DeleteObjectError::VersionChanged));
+}

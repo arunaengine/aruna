@@ -98,6 +98,12 @@ pub const BLOB_RECLAIM_KEYSPACE: &str = "blob_reclaim_candidates";
 pub const COMPRESSION_MIGRATION_KEYSPACE: &str = "compression_migrations";
 /// Buckets whose compression migration is unfinished; the worker scans only these.
 pub const COMPRESSION_QUEUE_KEYSPACE: &str = "compression_migration_queue";
+/// Node-local progress of checking a bucket's current versions for copies that cannot serve.
+pub const STORAGE_CHECK_KEYSPACE: &str = "storage_checks";
+/// Buckets whose check is unfinished; the migration worker scans only these.
+pub const CHECK_QUEUE_KEYSPACE: &str = "storage_check_queue";
+/// Versions a check found broken, keyed by version key so one bucket is one prefix.
+pub const BROKEN_VERSION_KEYSPACE: &str = "broken_versions";
 pub const HIDDEN_RESERVATION_KEYSPACE: &str = "blob_hidden_reservations";
 /// Key generations of encrypted buckets, keyed by bucket id and generation. Public keys only.
 pub const BUCKET_KEY_KEYSPACE: &str = "bucket_keys";
@@ -421,6 +427,9 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BLOB_RECLAIM_KEYSPACE,
     COMPRESSION_MIGRATION_KEYSPACE,
     COMPRESSION_QUEUE_KEYSPACE,
+    STORAGE_CHECK_KEYSPACE,
+    CHECK_QUEUE_KEYSPACE,
+    BROKEN_VERSION_KEYSPACE,
     ABE_PARAMETERS_KEYSPACE,
     ABE_EPOCH_KEYSPACE,
     ABE_ENVELOPE_KEYSPACE,

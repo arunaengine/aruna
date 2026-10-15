@@ -6,6 +6,7 @@ use super::schedule::parse_schedule;
 use super::{ImportRuleError, folders_overlap, validate_folder};
 use crate::groups::backends::{backend_key, record_writes};
 use crate::groups::fence::group_fence_key;
+use crate::s3::bucket::storage_move::{check_movable, move_reads, move_record, move_rows};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -18,14 +19,15 @@ use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::storage::backend_import::{BackendImport, valid_pattern};
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::encryption::BucketEncryption;
-use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::{Compression, CompressionMigration};
 use aruna_core::structs::storage::group_backend::{
     BUCKET_STATE, GroupStorage, MAX_KEY_LEN, path_bucket, valid_bucket,
 };
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule};
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
 
 const SCAN_PAGE: usize = 256;
@@ -46,6 +48,8 @@ pub struct CreateImportInput {
     pub write_prefix: Option<String>,
     pub write_pattern: String,
     pub now: SystemTime,
+    /// Also moves the bucket's stored copies under `key_prefix` to where the rule sends writes.
+    pub move_existing: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +81,8 @@ pub struct CreateImportOperation {
     checked: Vec<(Ulid, String, bool)>,
     /// Both storage records as the transaction read them.
     backends: Vec<GroupStorage>,
+    /// The move record committed with the rule when `move_existing` is set.
+    moving: Option<CompressionMigration>,
     output: Option<Result<BackendImport, ImportRuleError>>,
 }
 
@@ -90,6 +96,7 @@ impl CreateImportOperation {
             pending: Vec::new(),
             checked: Vec::new(),
             backends: Vec::new(),
+            moving: None,
             output: None,
         }
     }
@@ -222,25 +229,61 @@ impl CreateImportOperation {
         self.txn_id = Some(txn_id);
         self.state = CreateState::Read;
         let bucket: Key = self.input.bucket.as_bytes().to_vec().into();
+        let mut reads = vec![
+            (S3_BUCKET_KEYSPACE.to_string(), bucket.clone()),
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket),
+            (
+                STORAGE_BACKEND_KEYSPACE.to_string(),
+                backend_key(self.input.backend_id),
+            ),
+            group_fence_key(self.input.group_id),
+            (
+                STORAGE_BACKEND_KEYSPACE.to_string(),
+                backend_key(self.write_backend()),
+            ),
+        ];
+        if self.input.move_existing {
+            reads.extend(move_reads(&self.input.bucket).into_iter().skip(2));
+        }
         smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (S3_BUCKET_KEYSPACE.to_string(), bucket.clone()),
-                (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket),
-                (
-                    STORAGE_BACKEND_KEYSPACE.to_string(),
-                    backend_key(self.input.backend_id)
-                ),
-                group_fence_key(self.input.group_id),
-                (
-                    STORAGE_BACKEND_KEYSPACE.to_string(),
-                    backend_key(self.write_backend())
-                ),
-            ],
+            reads,
             txn_id: Some(txn_id),
         })]
     }
 
-    fn checked(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    /// The move of the folder's stored copies, from the transition and move rows read last.
+    fn plan_move(
+        &mut self,
+        encryption: Option<&[u8]>,
+        rows: Vec<(Key, Option<Value>)>,
+    ) -> Result<(), ImportRuleError> {
+        let Ok([transition, stored]) = <[_; 2]>::try_from(rows).map(|rows| rows.map(|(_, v)| v))
+        else {
+            return Err(ImportRuleError::Unexpected("Read"));
+        };
+        let stored = check_movable(encryption, transition.as_deref(), stored.as_deref())
+            .map_err(|error| ImportRuleError::Invalid(error.to_string()))?;
+        let now_ms = self
+            .input
+            .now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let prefix = &self.input.key_prefix;
+        let now_ms = now_ms.as_millis() as u64;
+        match move_record(stored, Compression::Off, prefix, now_ms) {
+            Ok(record) => self.moving = Some(record),
+            Err(error) => return Err(ImportRuleError::Conflict(error.to_string())),
+        }
+        Ok(())
+    }
+
+    fn checked(&mut self, mut values: Vec<(Key, Option<Value>)>) -> Effects {
+        let rows = values.split_off(values.len().min(5));
+        if self.input.move_existing
+            && let Err(error) = self.plan_move(values.get(1).and_then(|(_, v)| v.as_deref()), rows)
+        {
+            return self.fail(error);
+        }
         let [bucket, encryption, backend, fence, write_backend] = match <[_; 5]>::try_from(values) {
             Ok(values) => values.map(|(_, value)| value),
             Err(_) => return self.fail(ImportRuleError::Unexpected("Read")),
@@ -412,6 +455,12 @@ impl CreateImportOperation {
             Ok(records) => writes.extend(records),
             Err(error) => return self.fail(error),
         }
+        if let Some(record) = self.moving.as_ref() {
+            match move_rows(&self.input.bucket, record) {
+                Ok(rows) => writes.extend(rows),
+                Err(error) => return self.fail(error.into()),
+            }
+        }
         self.output = Some(Ok(record));
         self.state = CreateState::Write;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
@@ -534,7 +583,13 @@ impl Operation for CreateImportOperation {
             (CreateState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
                 self.txn_id = None;
                 self.state = CreateState::Finish;
-                smallvec![]
+                match self.moving.is_some() {
+                    true => smallvec![Effect::Task(TaskEffect::ShortenTimer {
+                        key: TaskKey::MigrateCompression,
+                        after: Duration::ZERO,
+                    })],
+                    false => smallvec![],
+                }
             }
             _ => self.fail(ImportRuleError::Unexpected("CreateImport")),
         }
@@ -587,6 +642,7 @@ mod tests {
             write_prefix: None,
             write_pattern: DEFAULT_PATTERN.to_string(),
             now: SystemTime::UNIX_EPOCH,
+            move_existing: false,
         }
     }
 
@@ -816,6 +872,85 @@ mod tests {
             txn_id: TxnId::default(),
         }));
         assert_eq!(operation.finalize().unwrap(), rule);
+    }
+
+    #[test]
+    fn starts_folder_move() {
+        let mut input = input("raw/", "imported/");
+        input.move_existing = true;
+        let mut operation = CreateImportOperation::new(input);
+        operation.start();
+        operation.step(values(vec![backend(), backend()]));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        let reads = vec![
+            bucket(Vec::new(), Compression::Off),
+            None,
+            backend(),
+            None,
+            backend(),
+            None,
+            None,
+        ];
+        operation.step(values(reads));
+        let effects = scan_page(&mut operation, &[]);
+
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one batch write, got {effects:?}")
+        };
+        let (_, _, record) = (writes.iter())
+            .find(|(space, ..)| space == aruna_core::keyspaces::COMPRESSION_MIGRATION_KEYSPACE)
+            .expect("the move record");
+        let record = CompressionMigration::from_bytes(record).unwrap();
+        assert!(record.moving);
+        assert_eq!(record.prefix, "imported/");
+        let queued = writes
+            .iter()
+            .any(|(space, ..)| space == aruna_core::keyspaces::COMPRESSION_QUEUE_KEYSPACE);
+        assert!(queued);
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: TxnId::default(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Task(TaskEffect::ShortenTimer { .. })]
+        ));
+    }
+
+    #[test]
+    fn running_move_refuses() {
+        // An unfinished move of another folder fails the rule before anything is written.
+        let mut input = input("raw/", "imported/");
+        input.move_existing = true;
+        let mut operation = CreateImportOperation::new(input);
+        operation.start();
+        operation.step(values(vec![backend(), backend()]));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        let mut running = CompressionMigration::new(Compression::Off, 1);
+        (running.moving, running.prefix) = (true, "other/".to_string());
+        let reads = vec![
+            bucket(Vec::new(), Compression::Off),
+            None,
+            backend(),
+            None,
+            backend(),
+            None,
+            Some(running.to_bytes().unwrap().into()),
+        ];
+
+        let effects = operation.step(values(reads));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert!(matches!(failure(operation), ImportRuleError::Conflict(_)));
     }
 
     #[test]

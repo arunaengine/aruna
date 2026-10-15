@@ -122,6 +122,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::HashExternal { .. } => (EffectClass::Transfer, "hash_external"),
         BlobEffect::WritePlain { .. } => (EffectClass::Transfer, "write_plain"),
         BlobEffect::StatPlain { .. } => (EffectClass::Control, "stat_plain"),
+        BlobEffect::StatCopy { .. } => (EffectClass::Control, "stat_copy"),
         BlobEffect::EnsureBucket { .. } => (EffectClass::Control, "ensure_bucket"),
     }
 }
@@ -896,6 +897,7 @@ impl BlobHandler {
                 created_by,
                 blob,
             } => Box::pin(self.write_plain(resolved, plain, created_by, blob)).await,
+            BlobEffect::StatCopy { location } => Box::pin(self.stat_copy(location)).await,
             BlobEffect::StatPlain { backend, path } => {
                 Box::pin(self.stat_plain(backend, path)).await
             }

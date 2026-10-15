@@ -349,6 +349,10 @@ pub enum BlobEffect {
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
+    /// Answers `CopyStat`: whether the backend still has the object of `location`.
+    StatCopy {
+        location: BackendLocation,
+    },
     /// Answers `PlainStat` for `path` on `backend`.
     StatPlain {
         backend: BackendRef,

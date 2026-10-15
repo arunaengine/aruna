@@ -59,6 +59,8 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::blobs::router())
         .merge(storage::bucket::usage::router())
         .merge(storage::compression::router())
+        .merge(storage::moves::router())
+        .merge(storage::checks::router())
         .merge(storage::encryption::router())
         .merge(storage::abe::router())
         .merge(storage::bucket::keys::router())
@@ -255,12 +257,14 @@ pub(crate) mod tests {
         ("GET", "/data/buckets/{bucket}/placement"),
         ("GET", "/data/buckets/{bucket}/placement/coverage"),
         ("GET", "/data/buckets/{bucket}/placement/objects"),
+        ("GET", "/data/buckets/{bucket}/storage/check"),
         ("GET", "/data/buckets/{bucket}/storage/compression"),
         ("GET", "/data/buckets/{bucket}/storage/encryption"),
         ("GET", "/data/buckets/{bucket}/storage/encryption/audit"),
         ("GET", "/data/buckets/{bucket}/storage/encryption/copies/me"),
         ("GET", "/data/buckets/{bucket}/storage/encryption/holders"),
         ("GET", "/data/buckets/{bucket}/storage/encryption/tokens"),
+        ("GET", "/data/buckets/{bucket}/storage/move"),
         ("GET", "/data/buckets/{bucket}/storage/routing"),
         ("GET", "/data/buckets/{bucket}/usage"),
         ("GET", "/data/sync/relationships"),
@@ -539,6 +543,9 @@ pub(crate) mod tests {
         ("POST", "/data/buckets/{bucket}/storage/encryption/lock"),
         ("POST", "/data/buckets/{bucket}/storage/encryption/rotate"),
         ("POST", "/data/buckets/{bucket}/storage/encryption/unlock"),
+        ("POST", "/data/buckets/{bucket}/storage/move"),
+        ("POST", "/data/buckets/{bucket}/storage/check"),
+        ("POST", "/data/buckets/{bucket}/storage/check/cleanup"),
         (
             "DELETE",
             "/data/buckets/{bucket}/storage/encryption/holders/{user}",
