@@ -91,8 +91,8 @@ pub struct ImportRunResponse {
     pub failed: u64,
     /// The first failures of the run; `failed` counts all of them.
     pub errors: Vec<ImportFailureResponse>,
-    /// Why a failed or indeterminate run stopped as a whole, such as a bucket it could not
-    /// list; a short first line. Omitted otherwise.
+    /// Why a failed or indeterminate run stopped as a whole, as a short fixed reason such as
+    /// `No access to the bucket`; never the provider's text. Omitted otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

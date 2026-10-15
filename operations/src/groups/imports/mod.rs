@@ -62,21 +62,31 @@ pub struct LastRun {
     pub error: Option<String>,
 }
 
-/// Longest run error shown; the node log keeps the full text.
-const RUN_ERROR_LEN: usize = 200;
-
-/// The job's own error, only for a run that ended without success: its first line, cut short
-/// so request details of the storage stay in the node log.
+/// A short fixed reason why a run stopped as a whole, only for a run that ended without
+/// success. Provider text can carry signed URLs, so it never leaves the job record.
 pub fn run_error(state: JobState, error: Option<&JobError>) -> Option<String> {
     if !matches!(state, JobState::Failed | JobState::Indeterminate) {
         return None;
     }
-    let line = error?.message.lines().next()?.trim();
-    let mut short: String = line.chars().take(RUN_ERROR_LEN).collect();
-    if short.len() < line.len() {
-        short.push('…');
-    }
-    (!short.is_empty()).then_some(short)
+    let text = error?.message.to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|word| text.contains(word));
+    let reason = if has(&["permission", "denied", "forbidden", "unauthorized"]) {
+        "No access to the bucket"
+    } else if has(&["not found", "nosuchbucket", "does not exist"]) {
+        "Bucket not found"
+    } else if has(&[
+        "timed out",
+        "timeout",
+        "connect",
+        "unreachable",
+        "dns",
+        "unavailable",
+    ]) {
+        "Storage could not be reached"
+    } else {
+        "The run stopped with an error"
+    };
+    Some(reason.to_string())
 }
 
 /// `None` before the first run and after the run's job record was pruned.
@@ -190,18 +200,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shortens_run_errors() {
-        let long = JobError::retryable(format!(
-            "List error: {}\ncontext: uri=https://s3",
-            "x".repeat(300)
-        ));
-        let shown = run_error(JobState::Failed, Some(&long)).unwrap();
-        assert!(shown.starts_with("List error: ") && shown.ends_with('…'));
-        assert!(!shown.contains("https://"));
-        assert_eq!(shown.chars().count(), RUN_ERROR_LEN + 1);
+    fn hides_provider_text() {
+        let signed = "List error: PermissionDenied at list => GET \
+                      https://acct.blob.core.windows.net/c?sv=2024&sig=SECRET (persistent)";
+        let shown = run_error(JobState::Failed, Some(&JobError::retryable(signed))).unwrap();
+        assert_eq!(shown, "No access to the bucket");
+        assert!(!shown.contains("SECRET") && !shown.contains("https://"));
+        let lost = JobError::retryable("Read error: timed out reading the listing");
+        assert_eq!(
+            run_error(JobState::Indeterminate, Some(&lost)).as_deref(),
+            Some("Storage could not be reached")
+        );
+        let odd = JobError::permanent("sig=SECRET");
+        assert_eq!(
+            run_error(JobState::Failed, Some(&odd)).as_deref(),
+            Some("The run stopped with an error")
+        );
         // A retry that later succeeded leaves its old error behind.
-        assert_eq!(run_error(JobState::Succeeded, Some(&long)), None);
-        assert_eq!(run_error(JobState::Running, Some(&long)), None);
+        assert_eq!(run_error(JobState::Succeeded, Some(&odd)), None);
+        assert_eq!(run_error(JobState::Running, Some(&odd)), None);
         assert_eq!(run_error(JobState::Failed, None), None);
     }
 
