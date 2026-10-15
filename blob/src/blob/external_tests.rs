@@ -144,6 +144,10 @@ async fn writes_plain_paths() {
     };
     assert!(location.storage_bucket.is_empty());
     assert_eq!(location.ulid, first.ulid);
+    // A key over the provider limit is refused before the storage is asked.
+    let long = format!("raw/{}", "a".repeat(1100));
+    let refused = handler.stat_plain(backend.clone(), long).await;
+    assert_eq!(refused, BlobEvent::Error(BlobError::KeyTooLong));
     let stat = handler.stat_plain(backend, path.clone()).await;
     assert!(matches!(
         stat,

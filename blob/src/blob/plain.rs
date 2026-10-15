@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::BlobHandler;
-use super::backend::split_bucket;
+use super::backend::{key_fits, split_bucket};
 use super::io::{backend_version, compose_chunk};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -126,6 +126,14 @@ impl BlobHandler {
             },
             false => (String::new(), path),
         };
+        // A key the provider would refuse is answered before any request.
+        let fits = self
+            .registry
+            .config_for(&backend)
+            .and_then(|config| key_fits(&config.root, &path));
+        if let Err(error) = fits {
+            return BlobEvent::Error(error);
+        }
         let operator = match self
             .registry
             .bucket_operator(&backend, &bucket, &self.egress)

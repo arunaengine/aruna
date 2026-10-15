@@ -1272,12 +1272,20 @@ pub(super) fn object_key(location: &BackendLocation, split: bool) -> Result<Stri
         true => split_location(location)?.1,
         false => path,
     };
-    let root = location.root.trim_matches('/');
-    let length = path.len() + if root.is_empty() { 0 } else { root.len() + 1 };
-    if matches!(location.backend, BackendRef::Group(_)) && length > MAX_KEY_LEN {
-        return Err(BlobError::KeyTooLong);
+    if matches!(location.backend, BackendRef::Group(_)) {
+        key_fits(&location.root, &path)?;
     }
     Ok(path)
+}
+
+/// Refuses a group storage key over the provider limit, counted with the root in front.
+pub(super) fn key_fits(root: &str, path: &str) -> Result<(), BlobError> {
+    let root = root.trim_matches('/');
+    let length = path.len() + if root.is_empty() { 0 } else { root.len() + 1 };
+    match length > MAX_KEY_LEN {
+        true => Err(BlobError::KeyTooLong),
+        false => Ok(()),
+    }
 }
 
 /// The bucket and key of a location on a storage that names the bucket in each path: the
