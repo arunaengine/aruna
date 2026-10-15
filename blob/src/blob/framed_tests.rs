@@ -298,7 +298,7 @@ async fn s3_framed_fallback() {
     let handler = context.blob_handle.handler.clone();
     let upload = open(&handler, "fallback.bin").await;
     let [(one, first), (two, second), (three, third)] =
-        staged_around(&handler, &upload, [20 * MIB, 6 * MIB]).await;
+        staged_around(&handler, &upload, [12 * MIB, 6 * MIB]).await;
 
     // The bucket level changed since the upload opened: the new copy takes the current one.
     let current = Compression::Zstd { level: 5 };
@@ -325,7 +325,7 @@ async fn s3_omitted_part() {
     let handler = context.blob_handle.handler.clone();
     let upload = open(&handler, "omitted.bin").await;
     let [(one, first), (two, second), (three, third)] =
-        staged_around(&handler, &upload, [10 * MIB, 10 * MIB]).await;
+        staged_around(&handler, &upload, [6 * MIB, 6 * MIB]).await;
 
     // Compression was turned off since the upload opened: the new copy keeps original bytes.
     let listed = vec![one.clone(), three.clone()];
@@ -353,4 +353,35 @@ async fn s3_omitted_part() {
     let borders = [first.len() as u64, (first.len() + second.len()) as u64];
     assert_reads(&handler, &location, &expected, &borders).await;
     assert_part_sizes(&handler, &upload, &location, &[1, 2, 3]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_completion_budget() {
+    // A completion waits for its working set before it frames anything, and returns all of it.
+    use crate::blob::pithos::budget_permits;
+    use futures::FutureExt;
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let upload = open(&handler, "budget.bin").await;
+    let data = text(6 * MIB, b"budget ");
+    let tail = b"tail".to_vec();
+    let one = put(&handler, &upload, 1, &data).await;
+    let two = put(&handler, &upload, 2, &tail).await;
+    let held = handler
+        .pithos_budget
+        .clone()
+        .acquire_many_owned(budget_permits() as u32)
+        .await
+        .unwrap();
+
+    let mut completing = Box::pin(handler.complete_upload(upload, vec![one, two], &[1], ZSTD));
+    assert!((&mut completing).now_or_never().is_none());
+    drop(held);
+    let BlobEvent::WriteFinished { location } = completing.await else {
+        panic!("the completion must finish once the budget has room")
+    };
+    assert_eq!(read_back(&handler, location).await, [data, tail].concat());
+    assert_eq!(handler.pithos_budget.available_permits(), budget_permits());
 }
