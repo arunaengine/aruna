@@ -416,13 +416,13 @@ async fn probe(
 ) -> Result<(), BlobError> {
     let probe = format!("{PROBE_PREFIX}/{}", Ulid::generate());
     if let Err(error) = operator.write(&probe, b"aruna".to_vec()).await {
-        tracing::warn!(%backend_id, kind = ?error.kind(), %error, "group backend test write failed");
+        tracing::warn!(%backend_id, kind = ?error.kind(), "group backend test write failed");
         return Err(BlobError::WriteError(probe_message(
             label, name, &error, false,
         )));
     }
     if let Err(error) = operator.delete(&probe).await {
-        tracing::warn!(%backend_id, kind = ?error.kind(), %error, "group backend test delete failed");
+        tracing::warn!(%backend_id, kind = ?error.kind(), "group backend test delete failed");
         return Err(BlobError::DeleteError(probe_message(
             label, name, &error, true,
         )));
