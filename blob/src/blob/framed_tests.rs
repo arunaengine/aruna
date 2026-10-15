@@ -161,7 +161,7 @@ async fn s3_framed_parts() {
     let listed = vec![one, two, three];
 
     let event = handler
-        .complete_upload(upload.clone(), listed.clone())
+        .complete_upload(upload.clone(), listed.clone(), &[])
         .await;
     let BlobEvent::WriteFinished { location } = event else {
         panic!("compressed completion failed: {event:?}")
@@ -173,7 +173,7 @@ async fn s3_framed_parts() {
 
     // A repeated completion whose first answer was lost finds the object by its seek table.
     let BlobEvent::WriteFinished { location: again } =
-        handler.complete_upload(upload, listed).await
+        handler.complete_upload(upload, listed, &[]).await
     else {
         panic!("repeated completion failed")
     };
@@ -205,7 +205,7 @@ async fn s3_framed_table() {
     assert!(three.location.partial);
 
     let event = handler
-        .complete_upload(upload.clone(), vec![one, two, three])
+        .complete_upload(upload.clone(), vec![one, two, three], &[])
         .await;
     let BlobEvent::WriteFinished { location } = event else {
         panic!("compressed completion failed: {event:?}")
@@ -228,7 +228,7 @@ async fn s3_decoded_compose() {
     let data = text(20 * MIB, b"decoded part ");
     let part = put(&handler, &upload, 1, &data).await;
     let BlobEvent::WriteFinished { location: framed } =
-        handler.complete_upload(upload, vec![part]).await
+        handler.complete_upload(upload, vec![part], &[]).await
     else {
         panic!("compressed completion failed")
     };
@@ -252,4 +252,95 @@ async fn s3_decoded_compose() {
         .part_sizes(&location.get_storage_path().unwrap())
         .await;
     assert_eq!(parts.len(), 3, "{parts:?}");
+}
+
+/// Seeded xorshift bytes, which do not compress.
+fn noise(len: usize, mut seed: u64) -> Vec<u8> {
+    (0..len)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        })
+        .collect()
+}
+
+/// Streams parts 1 to 3, then replaces parts 1 and 3 with staged blobs of `sizes`.
+async fn staged_around(
+    handler: &BlobHandler,
+    upload: &BackendUpload,
+    sizes: [usize; 2],
+) -> [(MultipartPart, Vec<u8>); 3] {
+    let mut streamed = Vec::new();
+    for number in 1..=3 {
+        let payload = noise(6 * MIB, u64::from(number));
+        let part = put(handler, upload, number, &payload).await;
+        assert!(part.location.partial);
+        streamed.push((part, payload));
+    }
+    let (first, third) = (noise(sizes[0], 11), noise(sizes[1], 13));
+    let one = put(handler, upload, 1, &first).await;
+    let three = put(handler, upload, 3, &third).await;
+    assert!(!one.location.partial && !three.location.partial);
+    let (two, second) = streamed.swap_remove(1);
+    [(one, first), (two, second), (three, third)]
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_framed_fallback() {
+    // Staged part 1 needs two provider parts, but streamed part 2 holds the next number:
+    // part 2 is assembled alone and composed with the staged parts into a new copy.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let upload = open(&handler, "fallback.bin").await;
+    let [(one, first), (two, second), (three, third)] =
+        staged_around(&handler, &upload, [20 * MIB, 6 * MIB]).await;
+
+    let event = handler
+        .complete_upload(upload.clone(), vec![one, two, three], &[2])
+        .await;
+    let BlobEvent::WriteFinished { location } = event else {
+        panic!("fallback completion failed: {event:?}")
+    };
+    assert!(!location.same_object(&upload.location));
+    let expected = [first.as_slice(), &second, &third].concat();
+    let borders = [first.len() as u64, (first.len() + second.len()) as u64];
+    assert_reads(&handler, &location, &expected, &borders).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_omitted_part() {
+    // Staged parts 1 and 3 need two provider parts, but omitted part 2 holds the number
+    // between them: they are composed instead, and part 2 stays for a later completion.
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let upload = open(&handler, "omitted.bin").await;
+    let [(one, first), (two, second), (three, third)] =
+        staged_around(&handler, &upload, [10 * MIB, 10 * MIB]).await;
+
+    let listed = vec![one.clone(), three.clone()];
+    let event = handler.complete_upload(upload.clone(), listed, &[2]).await;
+    let BlobEvent::WriteFinished { location } = event else {
+        panic!("fallback completion failed: {event:?}")
+    };
+    assert!(!location.same_object(&upload.location));
+    let expected = [first.as_slice(), &third].concat();
+    assert_reads(&handler, &location, &expected, &[first.len() as u64]).await;
+
+    let event = handler
+        .complete_upload(upload.clone(), vec![one, two, three], &[2])
+        .await;
+    let BlobEvent::WriteFinished { location } = event else {
+        panic!("completion with the omitted part failed: {event:?}")
+    };
+    assert!(location.same_object(&upload.location));
+    let expected = [first.as_slice(), &second, &third].concat();
+    let borders = [first.len() as u64, (first.len() + second.len()) as u64];
+    assert_reads(&handler, &location, &expected, &borders).await;
+    assert_part_sizes(&handler, &upload, &location, &[1, 2, 3]).await;
 }
