@@ -7,9 +7,9 @@ use crate::auth::require_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::bucket_permission_path;
+use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::broken::{BrokenReason, StorageCheck};
-use aruna_operations::blob::migration::check::{clean_broken, list_broken, read_check};
+use aruna_operations::blob::migration::check::{clean_broken, is_current, list_broken, read_check};
 use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::storage_check::{StartCheckError, StartCheckOperation};
@@ -181,6 +181,9 @@ async fn ensure_bucket(
   storage has no file at its path (`missing_blob`).
 - The list is kept until the next check or a cleanup. A storage move also records a version it
   cannot read because its copy is broken.
+- Only versions that are still the current version of their key are listed, and only for
+  objects the caller may read (object READ and request policies). A page can therefore hold
+  fewer than `limit` files while `next` is still set.
 - `progress.broken` counts what the last check found; the list also shrinks with cleanups.
 
 **Limits**
@@ -241,15 +244,32 @@ pub async fn get_bucket_check(
     let (rows, next) = list_broken(&ctx, &bucket, after, limit)
         .await
         .map_err(ServerError::InternalError)?;
-    let broken = rows
-        .into_iter()
-        .map(|(key, row)| BrokenFile {
+    let mut broken = Vec::with_capacity(rows.len());
+    for (key, row) in rows {
+        // Only current versions, and only objects the caller may read, are listed.
+        if !is_current(&ctx, &key)
+            .await
+            .map_err(ServerError::InternalError)?
+        {
+            continue;
+        }
+        let path = object_permission_path(
+            state.get_realm_id(),
+            group_id,
+            state.get_node_id(),
+            &bucket,
+            &key.key,
+        );
+        if !crate::auth::permission_granted(&state, &auth, path, Permission::READ).await? {
+            continue;
+        }
+        broken.push(BrokenFile {
             key: key.key,
             version_id: key.version_id.to_string(),
             reason: row.reason.into(),
             found_at_ms: row.found_at_ms,
-        })
-        .collect();
+        });
+    }
     Ok(Json(BucketCheckResponse {
         bucket,
         progress: progress.map(Into::into),
@@ -324,7 +344,8 @@ on the owning group's admin path, as for the bucket's storage settings.
 - Each file also needs WRITE on its own object path and must pass the request policies, as in an
   S3 `DeleteObjects`; denied files stay listed and count in `denied`.
 - Only versions whose record did not change since the check are deleted, decided in the delete's
-  own transaction. Others stay listed until the next check.
+  own transaction. Others stay recorded until the next check. A version already deleted
+  otherwise only loses its record and does not count in `deleted`.
 - A deleted current version makes the key show its previous version, if one exists.
 - One request handles up to 1000 recorded versions after `after`; pass `next` to go on."#,
     params(

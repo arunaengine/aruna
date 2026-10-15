@@ -508,24 +508,50 @@ pub async fn clean_broken(
         let operation = DeleteObjectOperation::new(input)
             .with_restrictions(auth.path_restrictions.clone())
             .with_expected(row.version);
-        if let Err(error) = crate::driver::drive(operation, context).await {
-            if error != DeleteObjectError::VersionChanged {
-                tracing::warn!(bucket = %key.bucket, %error, "Failed to delete a broken version");
+        // A version deleted meanwhile only leaves its row behind.
+        let deleted = match crate::driver::drive(operation, context).await {
+            Ok(_) => true,
+            Err(DeleteObjectError::NoSuchVersion) => false,
+            Err(error) => {
+                if error != DeleteObjectError::VersionChanged {
+                    tracing::warn!(bucket = %key.bucket, %error, "Failed to delete a broken version");
+                }
+                cleaned.kept += 1;
+                continue;
             }
-            cleaned.kept += 1;
-            continue;
-        }
+        };
         let delete = StorageEffect::Delete {
             key_space: BROKEN_VERSION_KEYSPACE.to_string(),
             key: key.to_bytes().map_err(|error| error.to_string())?.into(),
             txn_id: None,
         };
         match context.storage_handle.send_storage_effect(delete).await {
-            Event::Storage(StorageEvent::DeleteResult { .. }) => cleaned.deleted += 1,
+            Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                cleaned.deleted += u64::from(deleted)
+            }
             other => return Err(format!("could not clear a broken version: {other:?}")),
         }
     }
     Ok(cleaned)
+}
+
+/// Whether `key` names the current version of its object.
+pub async fn is_current(context: &DriverContext, key: &VersionKey) -> Result<bool, String> {
+    let head = BlobHeadKey::new(key.bucket.clone(), key.key.clone());
+    let read = StorageEffect::Read {
+        key_space: BLOB_HEAD_KEYSPACE.to_string(),
+        key: head.to_bytes().map_err(|error| error.to_string())?.into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => match value {
+            Some(value) => CurrentVersionPointer::from_bytes(value.as_ref())
+                .map(|pointer| pointer.version_id == key.version_id)
+                .map_err(|error| error.to_string()),
+            None => Ok(false),
+        },
+        other => Err(format!("could not read a head: {other:?}")),
+    }
 }
 
 #[cfg(test)]

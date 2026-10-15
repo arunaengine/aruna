@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{CleanupQuery, clean_bucket_check};
+use super::{BucketCheckQuery, CleanupQuery, clean_bucket_check, get_bucket_check};
 use crate::error::ServerError;
 use crate::tests::storage_routing::{TestState, setup_state};
 use aruna_core::effects::StorageEffect;
@@ -148,4 +148,91 @@ async fn cleanup_checks_objects() {
     )
     .await;
     assert!(matches!(refused, Err(ServerError::Forbidden)));
+}
+
+#[tokio::test]
+async fn listing_hides_rows() {
+    // A denied object and a version that is no longer current never show up.
+    let test = setup_state().await;
+    broken(&test, "open/a.gz", 1, None).await;
+    broken(&test, "private/b.gz", 2, None).await;
+    broken(&test, "old/c.gz", 3, None).await;
+    let head = BlobHeadKey::new(&test.bucket, "old/c.gz")
+        .to_bytes()
+        .unwrap();
+    let newer = CurrentVersionPointer::new(Ulid::from_bytes([9; 16]));
+    write(&test, BLOB_HEAD_KEYSPACE, head, newer.to_bytes().unwrap()).await;
+    let realm = test.state.get_realm_id();
+    let node = test.state.get_node_id();
+    let private = object_permission_path(realm, test.group_id, node, &test.bucket, "private/**");
+    let restricted = AuthContext {
+        path_restrictions: Some(vec![
+            PathRestriction {
+                pattern: format!("/{realm}/g/{}/**", test.group_id),
+                permission: Permission::WRITE,
+            },
+            PathRestriction {
+                pattern: private,
+                permission: Permission::DENY,
+            },
+        ]),
+        ..test.auth.clone()
+    };
+
+    let response = get_bucket_check(
+        State(test.state.clone()),
+        Extension(Some(restricted)),
+        Path(test.bucket.clone()),
+        Query(BucketCheckQuery::default()),
+    )
+    .await
+    .unwrap()
+    .0;
+
+    let keys: Vec<_> = response
+        .broken
+        .iter()
+        .map(|file| file.key.as_str())
+        .collect();
+    assert_eq!(keys, ["open/a.gz"]);
+}
+
+#[tokio::test]
+async fn cleanup_clears_vanished() {
+    // A version deleted after the check only loses its record.
+    let test = setup_state().await;
+    let gone = broken(&test, "a/gone.gz", 1, None).await;
+    let event = (test.state.get_ctx().storage_handle)
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: gone.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::DeleteResult { .. })
+    ));
+
+    let response = clean_bucket_check(
+        State(test.state.clone()),
+        Extension(Some(test.auth.clone())),
+        Path(test.bucket.clone()),
+        Query(CleanupQuery::default()),
+    )
+    .await
+    .unwrap()
+    .0;
+
+    assert_eq!((response.deleted, response.kept), (0, 0));
+    let listed = get_bucket_check(
+        State(test.state.clone()),
+        Extension(Some(test.auth.clone())),
+        Path(test.bucket.clone()),
+        Query(BucketCheckQuery::default()),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert!(listed.broken.is_empty());
 }
