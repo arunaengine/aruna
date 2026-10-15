@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::BlobHandler;
+use super::backend::split_bucket;
 use super::io::{backend_version, compose_chunk};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -118,7 +119,17 @@ impl BlobHandler {
     }
 
     pub(super) async fn stat_plain(&self, backend: BackendRef, path: String) -> BlobEvent {
-        let operator = match self.registry.bucket_operator(&backend, "", &self.egress) {
+        let (bucket, path) = match self.registry.splits(&backend) {
+            true => match split_bucket(&path) {
+                Ok(parts) => parts,
+                Err(error) => return BlobEvent::Error(error),
+            },
+            false => (String::new(), path),
+        };
+        let operator = match self
+            .registry
+            .bucket_operator(&backend, &bucket, &self.egress)
+        {
             Ok(operator) => operator,
             Err(error) => return BlobEvent::Error(error),
         };

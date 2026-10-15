@@ -4,12 +4,15 @@
 
 use super::{BlobHandler, NodeBackend};
 use crate::opendal::build_group_service;
+use crate::s3::{self, check_keys};
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
-use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret, PROBE_PREFIX};
+use aruna_core::structs::storage::group_backend::{
+    BUCKET_STATE, DEFAULT_BUCKET, GroupStorage, GroupStorageSecret, PROBE_PREFIX,
+};
 use aruna_core::types::Key;
 use opendal::ErrorKind;
 use std::collections::HashMap;
@@ -22,7 +25,7 @@ use ulid::Ulid;
 pub(super) const GROUP_WRITE_CHUNK: usize = 8 * 1024 * 1024;
 
 /// Synthesizes the registry entry a stored `BackendRef::Group` resolves to.
-/// `multipart_bucket` names the tenant's own container, which also keeps the
+/// `multipart_bucket` names the tenant's container or default bucket, which also keeps the
 /// backend out of the minted-bucket stats accounting.
 pub(super) fn group_entry(
     record: &GroupStorage,
@@ -30,20 +33,27 @@ pub(super) fn group_entry(
     timeouts: aruna_core::structs::storage::blob::BlobTimeoutConfig,
 ) -> Result<NodeBackend, BlobError> {
     let mut service_config: HashMap<String, String> = record.public_config.clone();
+    service_config.retain(|key, _| key != DEFAULT_BUCKET && !key.starts_with(BUCKET_STATE));
     service_config.extend(secret.secret_config.clone());
     let root = service_config.remove("root").unwrap_or_default();
-    let container = service_config
-        .get(record.kind.container_key())
-        .cloned()
-        .ok_or_else(|| {
-            BlobError::OperatorCreationFailed(format!(
+    // Without a container each path names its bucket; Aruna's layout and parts go to the
+    // default bucket.
+    let container = match record.container() {
+        Some(container) => Some(container.to_string()),
+        None if record.splits() => None,
+        None => {
+            return Err(BlobError::OperatorCreationFailed(format!(
                 "group backend {} is missing its container",
                 record.backend_id
-            ))
-        })?;
+            )));
+        }
+    };
     // Bucket selection reads this key for every kind; opendal drops it where the
     // service does not know it.
-    service_config.insert("bucket".to_string(), container.clone());
+    if let Some(container) = &container {
+        service_config.insert("bucket".to_string(), container.clone());
+    }
+    let multipart_bucket = container.or_else(|| record.default_bucket().map(str::to_string));
 
     // Invariant: the kind stays `Backend::Group`; `Backend::S3` would build
     // through the unguarded operator and bypass the egress guard.
@@ -54,7 +64,7 @@ pub(super) fn group_entry(
             service_config,
             bucket_prefix: None,
             max_bucket_size: None,
-            multipart_bucket: Some(container),
+            multipart_bucket,
             timeouts,
         },
         None,
@@ -146,6 +156,7 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         BlobEffect::HashExternal { resolved, .. } => push(&mut ids, &resolved.backend),
         BlobEffect::WritePlain { resolved, .. } => push(&mut ids, &resolved.backend),
         BlobEffect::StatPlain { backend, .. } => push(&mut ids, backend),
+        BlobEffect::EnsureBucket { backend, .. } => push(&mut ids, backend),
     }
     ids
 }
@@ -343,6 +354,13 @@ impl BlobHandler {
             Ok(entry) => entry,
             Err(error) => return BlobEvent::Error(error),
         };
+        // Without a bucket only the keys are checked; each rule's bucket is checked at save.
+        if record.splits() {
+            return match check_keys(&entry.config.service_config, &self.egress).await {
+                Ok(()) => BlobEvent::GroupBackendChecked,
+                Err(error) => BlobEvent::Error(error),
+            };
+        }
         let mut config = entry.config.service_config.clone();
         config.insert("root".to_string(), entry.config.root.clone());
         let operator = match build_group_service(record.kind, config, &self.egress) {
@@ -350,24 +368,69 @@ impl BlobHandler {
             Err(error) => return BlobEvent::Error(BlobError::OperatorCreationFailed(error)),
         };
 
-        let probe = format!("{PROBE_PREFIX}/{}", Ulid::generate());
-        if let Err(error) = operator.write(&probe, b"aruna".to_vec()).await {
-            tracing::warn!(backend_id = %record.backend_id, kind = ?error.kind(), %error, "group backend test write failed");
-            return BlobEvent::Error(BlobError::WriteError(probe_message(&record, &error, false)));
+        let (label, name) = container_label(&record);
+        match probe(&operator, record.backend_id, label, name).await {
+            Ok(()) => BlobEvent::GroupBackendChecked,
+            Err(error) => BlobEvent::Error(error),
         }
-        // Credentials that cannot delete break object deletion, multipart abort
-        // and cleanup later, and leak the probe object now.
-        if let Err(error) = operator.delete(&probe).await {
-            tracing::warn!(backend_id = %record.backend_id, kind = ?error.kind(), %error, "group backend test delete failed");
-            return BlobEvent::Error(BlobError::DeleteError(probe_message(&record, &error, true)));
+    }
+
+    /// Finds or creates a rule's bucket on a storage without a bucket, then proves that
+    /// Aruna may write and delete there.
+    pub(super) async fn ensure_bucket(&self, backend: &BackendRef, bucket: &str) -> BlobEvent {
+        let (BackendRef::Group(backend_id), true) = (backend, self.registry.splits(backend)) else {
+            let message = "only a storage without a fixed bucket takes rule buckets";
+            return BlobEvent::Error(BlobError::OperatorCreationFailed(message.to_string()));
+        };
+        let config = match self.registry.config_for(backend) {
+            Ok(config) => config,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let created = match s3::ensure_bucket(&config.service_config, bucket, &self.egress).await {
+            Ok(created) => created,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let operator = match self
+            .registry
+            .operator_for(backend, &config.root, bucket, &self.egress)
+        {
+            Ok(operator) => operator,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        match probe(&operator, *backend_id, "bucket", bucket).await {
+            Ok(()) => BlobEvent::BucketReady { created },
+            Err(error) => BlobEvent::Error(error),
         }
-        BlobEvent::GroupBackendChecked
     }
 }
 
-/// A short user-facing reason for a failed probe; the full error goes to the node log.
-fn probe_message(record: &GroupStorage, error: &opendal::Error, delete: bool) -> String {
-    let (label, name) = ["bucket", "container", "filesystem"]
+/// Writes and removes a sentinel object. Credentials that cannot delete break object
+/// deletion, multipart abort and cleanup later, and leak the probe object now.
+async fn probe(
+    operator: &opendal::Operator,
+    backend_id: Ulid,
+    label: &str,
+    name: &str,
+) -> Result<(), BlobError> {
+    let probe = format!("{PROBE_PREFIX}/{}", Ulid::generate());
+    if let Err(error) = operator.write(&probe, b"aruna".to_vec()).await {
+        tracing::warn!(%backend_id, kind = ?error.kind(), %error, "group backend test write failed");
+        return Err(BlobError::WriteError(probe_message(
+            label, name, &error, false,
+        )));
+    }
+    if let Err(error) = operator.delete(&probe).await {
+        tracing::warn!(%backend_id, kind = ?error.kind(), %error, "group backend test delete failed");
+        return Err(BlobError::DeleteError(probe_message(
+            label, name, &error, true,
+        )));
+    }
+    Ok(())
+}
+
+/// The config key and name of a storage's fixed container.
+fn container_label(record: &GroupStorage) -> (&'static str, &str) {
+    ["bucket", "container", "filesystem"]
         .into_iter()
         .find_map(|key| {
             record
@@ -375,7 +438,11 @@ fn probe_message(record: &GroupStorage, error: &opendal::Error, delete: bool) ->
                 .get(key)
                 .map(|name| (key, name.as_str()))
         })
-        .unwrap_or(("bucket", ""));
+        .unwrap_or(("bucket", ""))
+}
+
+/// A short user-facing reason for a failed probe; the full error goes to the node log.
+fn probe_message(label: &str, name: &str, error: &opendal::Error, delete: bool) -> String {
     match (error.kind(), delete) {
         (ErrorKind::PermissionDenied, false) => format!(
             "The storage refused a test write to {label} `{name}`: access denied. Check that the \
@@ -402,7 +469,7 @@ fn probe_message(record: &GroupStorage, error: &opendal::Error, delete: bool) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{group_entry, group_ids, probe_message};
+    use super::{container_label, group_entry, group_ids, probe_message};
     use aruna_core::effects::BlobEffect;
     use aruna_core::structs::storage::blob::{
         Backend, BackendRef, BlobTimeoutConfig, ResolvedBackend,
@@ -445,9 +512,10 @@ mod tests {
         let record = record(GroupBackendKind::Azblob, &[("container", "data")]);
         let raw = "PUT https://acct.blob.core.windows.net/data <Error>AuthorizationFailure</Error>";
         let denied = opendal::Error::new(opendal::ErrorKind::PermissionDenied, raw);
+        let (label, name) = container_label(&record);
 
-        let write = probe_message(&record, &denied, false);
-        let delete = probe_message(&record, &denied, true);
+        let write = probe_message(label, name, &denied, false);
+        let delete = probe_message(label, name, &denied, true);
 
         assert!(write.contains("container `data`: access denied"), "{write}");
         assert!(delete.contains("not delete objects"), "{delete}");
@@ -496,6 +564,32 @@ mod tests {
         );
         let rendered = format!("{entry:?}");
         assert!(!rendered.contains("canary"), "{rendered}");
+    }
+
+    #[test]
+    fn entry_without_bucket() {
+        // Aruna's own keys never reach the service config.
+        let mut storage = record(GroupBackendKind::S3, &[("endpoint", "https://s3.lab")]);
+        let entry = group_entry(&storage, &secret(), BlobTimeoutConfig::default()).unwrap();
+        assert!(!entry.config.service_config.contains_key("bucket"));
+        assert_eq!(entry.config.multipart_bucket, None);
+
+        storage
+            .public_config
+            .insert("default_bucket".to_string(), "lab-default".to_string());
+        storage
+            .public_config
+            .insert("bucket:lab-raw".to_string(), "created".to_string());
+        let entry = group_entry(&storage, &secret(), BlobTimeoutConfig::default()).unwrap();
+        assert_eq!(
+            entry.config.multipart_bucket.as_deref(),
+            Some("lab-default")
+        );
+        let keys = entry.config.service_config.keys().collect::<Vec<_>>();
+        assert!(keys.iter().all(|key| !key.contains("bucket")), "{keys:?}");
+        // Other kinds still need their container.
+        let azure = record(GroupBackendKind::Azblob, &[("endpoint", "https://az")]);
+        assert!(group_entry(&azure, &secret(), BlobTimeoutConfig::default()).is_err());
     }
 
     #[test]

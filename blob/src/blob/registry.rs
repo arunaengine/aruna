@@ -19,6 +19,12 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use ulid::Ulid;
 
+/// A group storage without a pinned bucket: the first folder of each path is the bucket.
+pub(super) fn splits(config: &BackendConfig) -> bool {
+    matches!(config.backend_type, Backend::Group(_))
+        && !config.service_config.contains_key("bucket")
+}
+
 /// One operator-registered backend plus its own health state.
 #[derive(Clone, Debug)]
 pub struct NodeBackend {
@@ -184,10 +190,22 @@ impl BackendRegistry {
         let entry = self.backend(backend)?;
         let mut config = entry.config.service_config.clone();
         config.insert("root".to_string(), root.to_string());
-        if entry.config.backend_type == Backend::S3 {
+        let split = splits(&entry.config);
+        if split && bucket.is_empty() {
+            return Err(BlobError::OperatorCreationFailed(
+                "the storage path names no bucket".to_string(),
+            ));
+        }
+        if entry.config.backend_type == Backend::S3 || split {
             config.insert("bucket".to_string(), bucket.to_string());
         }
         init_operator(entry.config.backend_type.clone(), config, guard)
+    }
+
+    /// Whether `backend` is a group storage that names the bucket in each path.
+    pub fn splits(&self, backend: &BackendRef) -> bool {
+        self.backend(backend)
+            .is_ok_and(|entry| splits(&entry.config))
     }
 
     pub fn bucket_operator(

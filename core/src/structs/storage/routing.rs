@@ -106,7 +106,7 @@ pub struct GroupRoutingInputs {
     pub backend_ids: BTreeSet<Ulid>,
     /// The group's backend import rules on this node.
     pub imports: Vec<BackendImport>,
-    /// The tenant container of each enabled group backend, by backend id.
+    /// Where Aruna writes its own layout on each enabled group backend, by backend id.
     pub containers: BTreeMap<Ulid, String>,
 }
 

@@ -5,6 +5,7 @@
 use super::BlobHandler;
 use super::backend::{
     build_backend_path, build_hidden_path, build_part_path, intent_key, intent_value,
+    split_location,
 };
 use super::group::GROUP_WRITE_CHUNK;
 use super::pithos::{ArchiveEncoder, Share, working_set};
@@ -593,7 +594,7 @@ impl BlobHandler {
         let mut plain = HiddenReservation::new(self.clone());
         let reservation = reservation.unwrap_or(&mut plain);
         reservation.set_location(location.clone());
-        let storage_path = match location.get_storage_path() {
+        let storage_path = match self.object_path(&location) {
             Ok(storage_path) => storage_path,
             Err(e) => return reservation.fail(e).await,
         };
@@ -926,16 +927,14 @@ impl BlobHandler {
         let entry = self.registry.backend(&location.backend)?;
         let config = &entry.config.service_config;
         let (bucket, guard) = match entry.config.backend_type {
-            Backend::S3 => (location.storage_bucket.as_str(), None),
-            Backend::Group(GroupBackendKind::S3) => {
-                let bucket = config.get("bucket").ok_or_else(|| {
-                    BlobError::OperatorCreationFailed("group backend has no bucket".to_string())
-                })?;
-                (bucket.as_str(), Some(&self.egress))
-            }
+            Backend::S3 => (location.storage_bucket.clone(), None),
+            Backend::Group(GroupBackendKind::S3) => match config.get("bucket") {
+                Some(bucket) => (bucket.clone(), Some(&self.egress)),
+                None => (split_location(location)?.0, Some(&self.egress)),
+            },
             _ => return Ok(None),
         };
-        NativeMultipart::from_config(config, bucket, &location.root, guard).map(Some)
+        NativeMultipart::from_config(config, &bucket, &location.root, guard).map(Some)
     }
 
     /// An abandoned writer took its provider upload id along, so deleting the path leaves the
@@ -1027,7 +1026,7 @@ impl BlobHandler {
             None => {
                 // Metadata is admitted only after the finalized marker is durable.
                 let operator = self.operator_from_location(&location)?;
-                let storage_path = location.get_storage_path()?;
+                let storage_path = self.object_path(&location)?;
                 let _claim = self.claim_archive(&location)?;
                 self.delete_path(&operator, &storage_path).await?;
                 self.release_reservation(&location).await?;
@@ -1035,7 +1034,7 @@ impl BlobHandler {
             }
         };
         let operator = self.operator_from_location(&location)?;
-        let storage_path = location.get_storage_path()?;
+        let storage_path = self.object_path(&location)?;
         match timeout(self.io_timeout(), operator.stat(&storage_path)).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) if error.kind() == ErrorKind::NotFound => {
@@ -1457,7 +1456,7 @@ impl BlobHandler {
             Compression::Off => None,
             Compression::Zstd { level } => Some(FrameEncoder::new(level)),
         };
-        let storage_path = match location.get_storage_path() {
+        let storage_path = match self.object_path(&location) {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
@@ -1503,7 +1502,7 @@ impl BlobHandler {
             let mut bytes_written = 0u64;
             for part in parts {
                 let part_operator = self.operator_from_location(&part)?;
-                let part_storage_path = part.get_storage_path()?;
+                let part_storage_path = self.object_path(&part)?;
                 let reader = timeout(self.io_timeout(), part_operator.reader(&part_storage_path))
                     .await
                     .map_err(|_| {
@@ -1672,7 +1671,7 @@ impl BlobHandler {
             Err(err) => return BlobEvent::Error(err),
         };
 
-        let storage_path = match location.get_storage_path() {
+        let storage_path = match self.object_path(&location) {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
@@ -1758,7 +1757,7 @@ impl BlobHandler {
             Err(err) => return BlobEvent::Error(err),
         };
 
-        let storage_path = match location.get_storage_path() {
+        let storage_path = match self.object_path(&location) {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
@@ -2175,7 +2174,7 @@ impl BlobHandler {
             Err(err) => return BlobEvent::Error(err),
         };
 
-        let storage_path = match location.get_storage_path() {
+        let storage_path = match self.object_path(&location) {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };

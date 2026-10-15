@@ -111,7 +111,7 @@ impl BlobHandler {
 
     /// Removes an in-place target, every provider upload under its path and its reservation.
     pub(super) async fn discard_target(&self, location: &BackendLocation) -> Result<(), BlobError> {
-        let path = location.get_storage_path()?;
+        let path = self.object_path(&location)?;
         let operator = self.operator_from_location(location)?;
         self.delete_path(&operator, &path).await?;
         Box::pin(self.abort_uploads(location, &path)).await?;
@@ -177,7 +177,7 @@ impl BlobHandler {
         }
         let opened = async {
             let native = self.native_upload(&location)?;
-            let path = location.get_storage_path()?;
+            let path = self.object_path(&location)?;
             timeout(self.io_timeout(), native.create(&path))
                 .await
                 .map_err(|_| BlobError::WriteError("timed out opening the upload".to_string()))?
@@ -337,7 +337,7 @@ impl BlobHandler {
         });
         let sent = async {
             let native = self.native_upload(&upload.location)?;
-            let path = upload.location.get_storage_path()?;
+            let path = self.object_path(&upload.location)?;
             native
                 .upload_part(
                     &path,
@@ -404,7 +404,7 @@ impl BlobHandler {
     async fn abort_again(&self, upload: &BackendUpload) {
         let aborted = async {
             let native = self.native_upload(&upload.location)?;
-            let path = upload.location.get_storage_path()?;
+            let path = self.object_path(&upload.location)?;
             timeout(self.io_timeout(), native.abort(&path, &upload.upload_id))
                 .await
                 .map_err(|_| BlobError::DeleteError("timed out aborting the upload".into()))?
@@ -499,7 +499,7 @@ impl BlobHandler {
         }
         let total: u64 = listed.iter().map(|part| part.size).sum();
         let native = self.native_upload(&upload.location)?;
-        let path = upload.location.get_storage_path()?;
+        let path = self.object_path(&upload.location)?;
         let operator = self.operator_from_location(&upload.location)?;
         if let Err(error) = self
             .assemble(&native, &path, upload, parts, etags.clone())
@@ -570,7 +570,7 @@ impl BlobHandler {
                 continue;
             }
             let source = self.native_upload(&part.location)?;
-            let source_path = part.location.get_storage_path()?;
+            let source_path = self.object_path(&part.location)?;
             slot.1 = native
                 .copy_part(
                     path,
@@ -593,7 +593,7 @@ impl BlobHandler {
             .aborted = true;
         let aborted = async {
             let native = self.native_upload(&upload.location)?;
-            let path = upload.location.get_storage_path()?;
+            let path = self.object_path(&upload.location)?;
             timeout(self.io_timeout(), native.abort(&path, &upload.upload_id))
                 .await
                 .map_err(|_| BlobError::DeleteError("timed out aborting the upload".into()))??;

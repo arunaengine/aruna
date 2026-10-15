@@ -101,6 +101,9 @@ pub enum BlobError {
     /// This one object cannot be read: it is gone, or its key cannot be read exactly.
     #[error("Object cannot be read: {0}")]
     Unreadable(String),
+    /// The backend key would be longer than group storages accept.
+    #[error("The path is too long for this storage: keys are at most 1024 bytes")]
+    KeyTooLong,
 }
 
 #[derive(Debug, Error, PartialEq)]

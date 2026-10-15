@@ -307,7 +307,7 @@ impl BlobHandler {
     ) -> Result<FrameReader, BlobError> {
         let size = location.blob_size;
         let operator = self.operator_from_location(location)?;
-        let path = location.get_storage_path()?;
+        let path = self.object_path(&location)?;
         let idle = self.transfer_idle_timeout();
         let index = self
             .frame_index(&operator, &path, size, layout, idle)
@@ -359,7 +359,7 @@ impl BlobHandler {
             return Ok(SliceReader::Framed(reader));
         }
         let operator = self.operator_from_location(location)?;
-        let path = location.get_storage_path()?;
+        let path = self.object_path(&location)?;
         let version = self.read_version(location).await?;
         let failed = |error: opendal::Error| BlobError::OperatorCreationFailed(error.to_string());
         let reader = reader_at(&operator, &path, version.as_deref())

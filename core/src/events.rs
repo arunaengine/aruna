@@ -263,6 +263,10 @@ pub enum BlobEvent {
         location: BackendLocation,
         version: Option<String>,
     },
+    /// The bucket is ready; `created` when Aruna created it.
+    BucketReady {
+        created: bool,
+    },
 }
 
 #[derive(Debug, PartialEq)]

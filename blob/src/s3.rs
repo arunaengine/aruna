@@ -10,7 +10,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{
     BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
-use aws_sdk_s3::error::DisplayErrorContext;
+use aws_sdk_s3::error::{DisplayErrorContext, ProvideErrorMetadata};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketLocationConstraint, CompletedMultipartUpload, CompletedPart, CreateBucketConfiguration,
@@ -136,38 +136,8 @@ impl NativeMultipart {
         root: &str,
         guard: Option<&EgressGuard>,
     ) -> Result<Self, BlobError> {
-        let endpoint = required_key(config, "endpoint")?;
-        let credentials = Credentials::new(
-            required_key(config, "access_key_id")?,
-            required_key(config, "secret_access_key")?,
-            None,
-            None,
-            "Aruna_v3",
-        );
-        // The same region the backend's opendal operator signs with.
-        let region = s3_region(config, environment_variable).ok_or_else(|| {
-            BlobError::OperatorCreationFailed("the S3 backend names no region".to_string())
-        })?;
-        let path_style = config
-            .get("force_path_style")
-            .is_none_or(|value| value.trim().parse::<bool>().unwrap_or(true));
-        // Built without the shared config loader, so no environment or profile setting applies.
-        let mut builder = aws_sdk_s3::config::Builder::new()
-            .behavior_version(BehaviorVersion::latest())
-            .region(Region::new(region))
-            .credentials_provider(credentials)
-            .endpoint_url(endpoint)
-            .force_path_style(path_style)
-            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-            .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
-        if let Some(guard) = guard {
-            let client = guard
-                .sdk_client(endpoint)
-                .map_err(|error| BlobError::OperatorCreationFailed(error.to_string()))?;
-            builder = builder.http_client(client);
-        }
         Ok(Self {
-            client: Client::from_conf(builder.build()),
+            client: config_client(config, guard)?,
             bucket: bucket.to_string(),
             root: root.to_string(),
         })
@@ -384,6 +354,122 @@ pub fn multipart_etag(etags: &[(u16, String)]) -> Option<String> {
     }
     let digest = md5::compute(&digests);
     Some(format!("{}-{}", hex::encode(digest.0), etags.len()))
+}
+
+/// A client from an S3 backend's service config; tenant backends pass their guard.
+fn config_client(
+    config: &HashMap<String, String>,
+    guard: Option<&EgressGuard>,
+) -> Result<Client, BlobError> {
+    let endpoint = required_key(config, "endpoint")?;
+    let credentials = Credentials::new(
+        required_key(config, "access_key_id")?,
+        required_key(config, "secret_access_key")?,
+        None,
+        None,
+        "Aruna_v3",
+    );
+    // The same region the backend's opendal operator signs with.
+    let region = s3_region(config, environment_variable).ok_or_else(|| {
+        BlobError::OperatorCreationFailed("the S3 backend names no region".to_string())
+    })?;
+    let path_style = config
+        .get("force_path_style")
+        .is_none_or(|value| value.trim().parse::<bool>().unwrap_or(true));
+    // Built without the shared config loader, so no environment or profile setting applies.
+    let mut builder = aws_sdk_s3::config::Builder::new()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new(region))
+        .credentials_provider(credentials)
+        .endpoint_url(endpoint)
+        .force_path_style(path_style)
+        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+        .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
+    if let Some(guard) = guard {
+        let client = guard
+            .sdk_client(endpoint)
+            .map_err(|error| BlobError::OperatorCreationFailed(error.to_string()))?;
+        builder = builder.http_client(client);
+    }
+    Ok(Client::from_conf(builder.build()))
+}
+
+/// Finds `bucket` on a tenant S3 storage or creates it in the storage's region; `true` when
+/// Aruna created it.
+pub async fn ensure_bucket(
+    config: &HashMap<String, String>,
+    bucket: &str,
+    guard: &EgressGuard,
+) -> Result<bool, BlobError> {
+    let client = config_client(config, Some(guard))?;
+    match client.head_bucket().bucket(bucket).send().boxed().await {
+        Ok(_) => return Ok(false),
+        Err(error) if status(&error) == Some(404) => {}
+        Err(error) => return Err(bucket_error(bucket, "check", &error)),
+    }
+    let region = s3_region(config, environment_variable).unwrap_or_default();
+    let mut request = client.create_bucket().bucket(bucket);
+    if let Some(constraint) = location_constraint(&region) {
+        request = request.create_bucket_configuration(
+            CreateBucketConfiguration::builder()
+                .location_constraint(constraint)
+                .build(),
+        );
+    }
+    match request.send().boxed().await {
+        Ok(_) => Ok(true),
+        Err(error) => match error.as_service_error() {
+            Some(service) if service.is_bucket_already_owned_by_you() => Ok(false),
+            Some(service) if service.is_bucket_already_exists() => Err(BlobError::WriteError(
+                format!("The bucket name `{bucket}` is taken by another account."),
+            )),
+            _ => Err(bucket_error(bucket, "create", &error)),
+        },
+    }
+}
+
+/// Proves the keys of a tenant S3 storage without a bucket. A key may lack the right to
+/// list buckets; a wrong key or secret is refused.
+pub async fn check_keys(
+    config: &HashMap<String, String>,
+    guard: &EgressGuard,
+) -> Result<(), BlobError> {
+    let client = config_client(config, Some(guard))?;
+    let Err(error) = client.list_buckets().send().boxed().await else {
+        return Ok(());
+    };
+    tracing::warn!(error = %DisplayErrorContext(&error), "tenant storage key check failed");
+    let message = match error.code() {
+        Some("AccessDenied") => return Ok(()),
+        Some("InvalidAccessKeyId") => "The storage does not know this access key.",
+        Some("SignatureDoesNotMatch") => "The secret key does not match the access key.",
+        Some(_) => "The storage refused the keys. The node log has details.",
+        None => "The storage could not be reached. Check the endpoint.",
+    };
+    Err(BlobError::WriteError(message.to_string()))
+}
+
+fn status<E>(error: &aws_sdk_s3::error::SdkError<E>) -> Option<u16> {
+    error
+        .raw_response()
+        .map(|response| response.status().as_u16())
+}
+
+/// A short reason for a failed bucket check; the full error goes to the node log.
+fn bucket_error<E>(bucket: &str, call: &str, error: &aws_sdk_s3::error::SdkError<E>) -> BlobError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    tracing::warn!(bucket, call, error = %DisplayErrorContext(error), "tenant bucket check failed");
+    let message = match status(error) {
+        Some(403) => format!("No access to bucket `{bucket}`. Check that the key may use it."),
+        Some(301) => format!("The bucket `{bucket}` is in another region."),
+        Some(_) => {
+            format!("The storage refused to {call} bucket `{bucket}`. The node log has details.")
+        }
+        None => "The storage could not be reached. Check the endpoint.".to_string(),
+    };
+    BlobError::WriteError(message)
 }
 
 fn write_error<E>(call: &str, error: aws_sdk_s3::error::SdkError<E>) -> BlobError

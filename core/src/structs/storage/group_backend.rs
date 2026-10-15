@@ -52,6 +52,35 @@ impl GroupBackendKind {
 /// Where registration writes and removes its probe object.
 pub const PROBE_PREFIX: &str = "_aruna_backend_probe";
 
+/// Public config key Aruna sets: the bucket of the default rule on a storage without a bucket.
+pub const DEFAULT_BUCKET: &str = "default_bucket";
+
+/// Public config key prefix Aruna sets per checked bucket: `created` or `found`.
+pub const BUCKET_STATE: &str = "bucket:";
+
+/// Object keys longer than this are refused by S3, GCS, Azure and B2.
+pub const MAX_KEY_LEN: usize = 1024;
+
+/// The bucket a path names on a storage without a bucket: its first folder.
+pub fn path_bucket(path: &str) -> Option<&str> {
+    path.split_once('/')
+        .map(|(bucket, _)| bucket)
+        .filter(|bucket| !bucket.is_empty())
+}
+
+/// S3 bucket naming: 3 to 63 lowercase letters, digits, dots and hyphens, starting and
+/// ending with a letter or digit, without `..`.
+pub fn valid_bucket(name: &str) -> bool {
+    let edge = |byte: Option<&u8>| byte.is_some_and(|byte| byte.is_ascii_alphanumeric());
+    (3..=63).contains(&name.len())
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'-'
+        })
+        && edge(name.as_bytes().first())
+        && edge(name.as_bytes().last())
+        && !name.contains("..")
+}
+
 /// Whether `key` lies where Aruna keeps its own objects on a backend with `container`.
 pub fn reserved_path(container: Option<&str>, key: &str) -> bool {
     [Some(PROBE_PREFIX), container]
@@ -110,7 +139,7 @@ pub struct GroupStorage {
 impl GroupStorage {
     /// Whether `key` lies where Aruna writes its own objects on this backend.
     pub fn is_reserved(&self, key: &str) -> bool {
-        reserved_path(self.container(), key)
+        reserved_path(self.layout_folder(), key)
     }
 
     /// The tenant's own container, which also holds Aruna's own layout.
@@ -118,6 +147,29 @@ impl GroupStorage {
         self.public_config
             .get(self.kind.container_key())
             .map(String::as_str)
+    }
+
+    /// An S3 storage without a bucket: the first folder of each path names the bucket.
+    pub fn splits(&self) -> bool {
+        self.kind == GroupBackendKind::S3 && self.container().is_none()
+    }
+
+    /// The bucket of the default rule on a storage without a bucket.
+    pub fn default_bucket(&self) -> Option<&str> {
+        self.public_config.get(DEFAULT_BUCKET).map(String::as_str)
+    }
+
+    /// The public config entries Aruna sets itself; a replaced record keeps them.
+    pub fn managed_config(&self) -> impl Iterator<Item = (String, String)> + '_ {
+        self.public_config
+            .iter()
+            .filter(|(key, _)| key.as_str() == DEFAULT_BUCKET || key.starts_with(BUCKET_STATE))
+            .map(|(key, value)| (key.clone(), value.clone()))
+    }
+
+    /// Where Aruna writes its own layout: the container, or the default bucket.
+    pub fn layout_folder(&self) -> Option<&str> {
+        self.container().or_else(|| self.default_bucket())
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -256,5 +308,51 @@ mod tests {
         assert!(record.is_reserved("_aruna_backend_probe/01"));
         assert!(!record.is_reserved("database/a.csv"));
         assert!(!record.is_reserved("raw/data/a.csv"));
+    }
+
+    #[test]
+    fn reserves_default_bucket() {
+        let mut record = GroupStorage {
+            backend_id: Ulid::from_bytes([1u8; 16]),
+            group_id: Ulid::from_bytes([2u8; 16]),
+            name: "lab".to_string(),
+            kind: GroupBackendKind::S3,
+            public_config: HashMap::from([("endpoint".to_string(), "https://s3".to_string())]),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: UserId::default(),
+            disabled: false,
+            cleanup: CleanupStrategy::Retain,
+        };
+        assert!(record.splits());
+        assert!(!record.is_reserved("lab-default/a.csv"));
+        record
+            .public_config
+            .insert(super::DEFAULT_BUCKET.to_string(), "lab-default".to_string());
+        assert!(record.is_reserved("lab-default/a.csv"));
+        assert!(!record.is_reserved("lab-raw/a.csv"));
+        record
+            .public_config
+            .insert("bucket".to_string(), "fixed".to_string());
+        assert!(!record.splits());
+    }
+
+    #[test]
+    fn checks_bucket_names() {
+        for name in ["abc", "aruna-lab-default", "a.b-1", &"a".repeat(63)] {
+            assert!(super::valid_bucket(name), "{name}");
+        }
+        for name in [
+            "ab",
+            "Lab",
+            "-lab",
+            "lab-",
+            "a..b",
+            "a_b",
+            "a/b",
+            &"a".repeat(64),
+        ] {
+            assert!(!super::valid_bucket(name), "{name}");
+        }
     }
 }

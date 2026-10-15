@@ -100,8 +100,9 @@ pub const fn rules_for_kind(kind: GroupBackendKind) -> GroupBackendRules {
     match kind {
         // `role_arn`, `session_token` and every `disable_*` toggle are absent on
         // purpose: they hand the request back to the node's ambient chain.
+        // Without `bucket` each rule names its own bucket.
         GroupBackendKind::S3 => GroupBackendRules {
-            required_public: &["endpoint", "bucket"],
+            required_public: &["endpoint"],
             allowed_public: &["endpoint", "bucket", "region", "root", "force_path_style"],
             allowed_secret: &["access_key_id", "secret_access_key"],
             required_secret: &["access_key_id", "secret_access_key"],
@@ -290,6 +291,23 @@ mod pure_tests {
             validate_backend_input("tenant", GroupBackendKind::S3, &public, &s3_secret()).unwrap();
 
         assert_eq!(normalized.public, public);
+    }
+
+    #[test]
+    fn accepts_bucketless_s3() {
+        let public = config(&[("endpoint", "https://s3.example.com")]);
+        assert!(validate_backend_input("lab", GroupBackendKind::S3, &public, &s3_secret()).is_ok());
+
+        // Aruna sets the default bucket itself, never from a request.
+        let mut managed = public.clone();
+        managed.insert("default_bucket".to_string(), "lab".to_string());
+        assert_eq!(
+            validate_backend_input("lab", GroupBackendKind::S3, &managed, &s3_secret()),
+            Err(GroupBackendError::UnknownPublicKey {
+                kind: GroupBackendKind::S3,
+                key: "default_bucket".to_string(),
+            })
+        );
     }
 
     #[test]

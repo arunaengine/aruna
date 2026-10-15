@@ -349,6 +349,12 @@ pub enum BlobEffect {
         backend: BackendRef,
         path: String,
     },
+    /// Finds or creates `bucket` on a group storage without a bucket and proves that Aruna
+    /// may write and delete there; answers `BucketReady`.
+    EnsureBucket {
+        backend: BackendRef,
+        bucket: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -86,7 +86,7 @@ impl BlobHandler {
         // Covers the decoded view, the raw directory and the replacement held at once.
         let _budget = self.reserve_pithos(working_set(source.blob_size)).await?;
         let operator = self.operator_from_location(source)?;
-        let path = source.get_storage_path()?;
+        let path = self.object_path(&source)?;
         let idle = self.transfer_idle_timeout();
         let stored = StoredBytes {
             operator: operator.clone(),
