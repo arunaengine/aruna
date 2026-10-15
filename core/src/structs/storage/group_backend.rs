@@ -6,7 +6,6 @@ use crate::UserId;
 use crate::compute::SecretBytes;
 use crate::errors::ConversionError;
 use crate::node_vault::{VaultEntry, VaultPurpose};
-use crate::structs::storage::blob::MULTIPART_PART_PREFIX;
 use crate::structs::storage::cleanup::CleanupStrategy;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
@@ -53,6 +52,9 @@ impl GroupBackendKind {
 /// Where registration writes and removes its probe object.
 pub const PROBE_PREFIX: &str = "_aruna_backend_probe";
 
+/// Where the parts of an upload wait in a bucket of a storage without a fixed bucket.
+pub const PARTS_PREFIX: &str = "_aruna_parts";
+
 /// Public config key Aruna sets: the bucket of the default rule on a storage without a bucket.
 pub const DEFAULT_BUCKET: &str = "default_bucket";
 
@@ -86,15 +88,18 @@ pub fn valid_bucket(name: &str) -> bool {
         && !name.contains("..")
 }
 
-/// Whether `key` lies where Aruna keeps its own objects: below a probe folder or one of
-/// `folders`.
+/// Whether `key` lies where Aruna keeps its own objects: below one of `folders`, or below
+/// a probe or parts folder at the top or right below a bucket.
 pub fn reserved_path(folders: &[String], key: &str) -> bool {
-    std::iter::once(PROBE_PREFIX)
-        .chain(folders.iter().map(String::as_str))
-        .any(|folder| {
-            key.strip_prefix(folder)
-                .is_some_and(|rest| rest.starts_with('/'))
-        })
+    let below = |key: &str, folder: &str| {
+        key.strip_prefix(folder)
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
+    let in_bucket = key.split_once('/').map_or("", |(_, rest)| rest);
+    folders.iter().any(|folder| below(key, folder))
+        || [PROBE_PREFIX, PARTS_PREFIX]
+            .into_iter()
+            .any(|own| below(key, own) || below(in_bucket, own))
 }
 
 impl fmt::Display for GroupBackendKind {
@@ -202,20 +207,16 @@ impl GroupStorage {
     }
 
     /// Folders where Aruna keeps its own objects: the container, or on a storage without a
-    /// bucket every default bucket and the probe and parts folders of each checked bucket.
+    /// bucket every bucket that held the default rule.
     pub fn reserved_folders(&self) -> Vec<String> {
-        if let Some(container) = self.container() {
-            return vec![container.to_string()];
+        match self.container() {
+            Some(container) => vec![container.to_string()],
+            None => self
+                .layout_buckets()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
         }
-        let own = [PROBE_PREFIX, MULTIPART_PART_PREFIX];
-        let checked = self
-            .checked_buckets()
-            .flat_map(|bucket| own.map(|folder| format!("{bucket}/{folder}")));
-        self.layout_buckets()
-            .into_iter()
-            .map(str::to_string)
-            .chain(checked)
-            .collect()
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -385,8 +386,10 @@ mod tests {
             .public_config
             .insert("bucket:lab-raw".to_string(), "found".to_string());
         assert!(record.is_reserved("lab-old/a.csv"));
-        assert!(record.is_reserved("lab-raw/_parts/01/00001_01"));
-        assert!(!record.is_reserved("lab-raw/parts/a.csv"));
+        assert!(record.is_reserved("lab-raw/_aruna_parts/01/00001_01"));
+        // Users keep their own `_parts` folder; Aruna's folders count in any bucket.
+        assert!(!record.is_reserved("lab-raw/_parts/a.csv"));
+        assert!(record.is_reserved("lab-new/_aruna_backend_probe/01"));
         assert_eq!(record.parts_bucket(), Some("lab-default"));
         record
             .public_config

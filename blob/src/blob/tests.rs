@@ -2624,7 +2624,7 @@ fn reserved_bucket_rejected() {
 fn isolates_tenant_parts() {
     // In-flight parts must not share the container namespace with objects.
     let upload_id = Ulid::generate();
-    let path = build_part_path(upload_id, 1, Ulid::generate());
+    let path = build_part_path(false, upload_id, 1, Ulid::generate());
 
     assert!(path.starts_with(&format!("_parts/{upload_id}/")));
     assert!(matches!(

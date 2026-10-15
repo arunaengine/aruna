@@ -14,7 +14,7 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendBucket, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork,
     HIDDEN_BLOB_PREFIX, HiddenBlobKey, MULTIPART_PART_PREFIX, ensure_confined_path,
 };
-use aruna_core::structs::storage::group_backend::{DEFAULT_BUCKET, MAX_KEY_LEN};
+use aruna_core::structs::storage::group_backend::{DEFAULT_BUCKET, MAX_KEY_LEN, PARTS_PREFIX};
 use aruna_core::types::TxnId;
 use aruna_storage::storage::TransactionOwner;
 use byteview::ByteView;
@@ -1363,8 +1363,20 @@ pub(super) fn build_hidden_path(
         .map_err(|_| ConversionError::OsStringError)
 }
 
-pub(super) fn build_part_path(upload_id: Ulid, part_number: u16, ulid: Ulid) -> String {
-    PathBuf::from(MULTIPART_PART_PREFIX)
+/// A part path; on a storage without a bucket the parts wait in a tenant bucket, so their
+/// folder is named as Aruna's own.
+pub(super) fn build_part_path(
+    split: bool,
+    upload_id: Ulid,
+    part_number: u16,
+    ulid: Ulid,
+) -> String {
+    let prefix = if split {
+        PARTS_PREFIX
+    } else {
+        MULTIPART_PART_PREFIX
+    };
+    PathBuf::from(prefix)
         .join(upload_id.to_string())
         .join(format!("{:05}_{}", part_number, ulid))
         .into_os_string()

@@ -1299,7 +1299,12 @@ impl BlobHandler {
             storage_class: resolved.storage_class.clone(),
             root,
             storage_bucket: multipart_bucket.clone(),
-            backend_path: build_part_path(part.upload_id, part.part_number, ulid),
+            backend_path: build_part_path(
+                self.registry.splits(&resolved.backend),
+                part.upload_id,
+                part.part_number,
+                ulid,
+            ),
             ulid,
             format: StoredFormat::default(),
             created_by,
