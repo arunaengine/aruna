@@ -201,42 +201,31 @@ impl EmptyCheck {
         if self.table < TABLES.len() {
             return Ok(Some(self.start(txn_id)));
         }
-        let named = format!(
-            "S3 buckets ({}{})",
-            self.buckets.join(", "),
-            if self.more { ", and more" } else { "" }
-        );
-        let found: Vec<&str> = self
-            .found
-            .iter()
-            .map(|kind| {
-                if *kind == "S3 buckets" {
-                    named.as_str()
-                } else {
-                    kind
-                }
-            })
-            .collect();
-        match found.split_last() {
-            None => Ok(None),
-            Some((last, [])) => Err(GroupDeletionError::NotEmpty((*last).to_string())),
-            Some((last, rest)) => Err(GroupDeletionError::NotEmpty(format!(
-                "{} and {last}",
-                rest.join(", ")
-            ))),
-        }
+        let (kinds, buckets, more) = (self.found.clone(), self.buckets.clone(), self.more);
+        let kinds = match kinds.split_last() {
+            None => return Ok(None),
+            Some((last, [])) => (*last).to_string(),
+            Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        };
+        Err(GroupDeletionError::NotEmpty {
+            kinds,
+            buckets,
+            more,
+        })
     }
 }
 
-/// Drops the bucket names from a reason, for callers who may not read the group's data.
-pub(super) fn coarse(reason: &str) -> String {
-    match reason.split_once("S3 buckets (") {
-        Some((head, rest)) => match rest.split_once(')') {
-            Some((_, tail)) => format!("{head}S3 buckets{tail}"),
-            None => reason.to_string(),
-        },
-        None => reason.to_string(),
+/// Puts the visible bucket names after the `S3 buckets` kind.
+pub(super) fn render(kinds: &str, names: &[String], more: bool) -> String {
+    if names.is_empty() {
+        return kinds.to_string();
     }
+    let more = if more { ", and more" } else { "" };
+    kinds.replacen(
+        "S3 buckets",
+        &format!("S3 buckets ({}{more})", names.join(", ")),
+        1,
+    )
 }
 
 #[cfg(test)]
@@ -261,10 +250,10 @@ mod tests {
             });
             result = check.step(event, txn_id);
         }
-        let Err(GroupDeletionError::NotEmpty(reason)) = result else {
+        let Err(GroupDeletionError::NotEmpty { kinds, .. }) = result else {
             panic!("expected a non-empty group, got {result:?}");
         };
-        assert_eq!(reason, "metadata documents and source connectors");
+        assert_eq!(kinds, "metadata documents and source connectors");
     }
 
     fn bucket(group_id: GroupId) -> aruna_core::types::Value {
@@ -293,7 +282,11 @@ mod tests {
         })
     }
 
-    fn run(first: &[(&str, GroupId)], second: &[(&str, GroupId)], paged: bool) -> String {
+    fn run(
+        first: &[(&str, GroupId)],
+        second: &[(&str, GroupId)],
+        paged: bool,
+    ) -> (Vec<String>, bool) {
         let group_id = ulid::Ulid::from_bytes([1u8; 16]);
         let txn_id = TxnId::default();
         let mut check = EmptyCheck::new(group_id, SystemTime::UNIX_EPOCH);
@@ -308,17 +301,17 @@ mod tests {
         for event in events {
             result = check.step(event, txn_id);
         }
-        let Err(GroupDeletionError::NotEmpty(reason)) = result else {
+        let Err(GroupDeletionError::NotEmpty { buckets, more, .. }) = result else {
             panic!("expected a non-empty group, got {result:?}");
         };
-        reason
+        (buckets, more)
     }
 
     #[test]
     fn names_buckets() {
         let mine = ulid::Ulid::from_bytes([1u8; 16]);
         let other = ulid::Ulid::from_bytes([2u8; 16]);
-        let first = [("a", mine), ("x", other), ("b", mine), ("c", mine)];
+        let first = [("a)x", mine), ("x", other), ("b", mine), ("c", mine)];
         let second = [
             ("d", mine),
             ("y", other),
@@ -326,20 +319,18 @@ mod tests {
             ("f", mine),
             ("g", mine),
         ];
-        assert_eq!(
-            run(&first, &second, true),
-            "S3 buckets (a, b, c, d, e, and more)"
-        );
-        assert_eq!(run(&first, &[], false), "S3 buckets (a, b, c)");
+        let names = ["a)x", "b", "c", "d", "e"].map(String::from);
+        assert_eq!(run(&first, &second, true), (names.to_vec(), true));
+        assert_eq!(run(&first, &[], false), (names[..3].to_vec(), false));
     }
 
     #[test]
-    fn hides_names() {
-        assert_eq!(coarse("S3 buckets (a, b, and more)"), "S3 buckets");
+    fn renders_names() {
+        let names = ["a)x".to_string(), "b".to_string()];
         assert_eq!(
-            coarse("metadata documents and S3 buckets (a, b)"),
-            "metadata documents and S3 buckets"
+            render("metadata documents and S3 buckets", &names, true),
+            "metadata documents and S3 buckets (a)x, b, and more)"
         );
-        assert_eq!(coarse("storage backends"), "storage backends");
+        assert_eq!(render("S3 buckets", &[], true), "S3 buckets");
     }
 }
