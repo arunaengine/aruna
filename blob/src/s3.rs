@@ -178,6 +178,18 @@ impl NativeMultipart {
         self.client.config().region().map(ToString::to_string)
     }
 
+    /// Size of each named part of a completed object.
+    #[cfg(test)]
+    pub(crate) async fn part_sizes(&self, path: &str, numbers: &[i32]) -> Vec<u64> {
+        let mut sizes = Vec::new();
+        for number in numbers {
+            let request = self.client.head_object().bucket(&self.bucket);
+            let head = request.key(self.key(path)).part_number(*number).send();
+            sizes.push(head.await.unwrap().content_length().unwrap() as u64);
+        }
+        sizes
+    }
+
     /// The object key OpenDAL uses for `path` under this backend's root.
     fn key(&self, path: &str) -> String {
         let path = path.trim_start_matches('/');
