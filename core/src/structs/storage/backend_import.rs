@@ -7,6 +7,7 @@ use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::execution::job::JobId;
 use crate::structs::identity::auth::AuthContext;
+use crate::structs::storage::group_backend::path_bucket;
 use crate::types::{GroupId, Key};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
@@ -60,6 +61,13 @@ impl BackendImport {
 
     pub fn write_folder(&self) -> &str {
         self.write_prefix.as_deref().unwrap_or(&self.backend_prefix)
+    }
+
+    /// Whether this rule reads or writes `bucket` on `backend_id`, a storage without a bucket.
+    pub fn uses_bucket(&self, backend_id: Ulid, bucket: &str) -> bool {
+        let names = |folder: &str| path_bucket(folder) == Some(bucket);
+        (self.backend_id == backend_id && names(&self.backend_prefix))
+            || (self.write_backend() == backend_id && names(self.write_folder()))
     }
 
     /// Without `{id}` a write replaces the file of the same name.
@@ -410,6 +418,17 @@ mod tests {
         };
         assert_eq!(written.first_listing(&resized), None);
         assert!(!ImportedObject::new(Ulid::nil(), &object(None, None)).unlisted());
+    }
+
+    #[test]
+    fn finds_used_buckets() {
+        let mut rule = rule(DEFAULT_PATTERN);
+        rule.backend_prefix = "lab-raw/2024/".to_string();
+        assert!(rule.uses_bucket(Ulid::nil(), "lab-raw"));
+        assert!(!rule.uses_bucket(Ulid::nil(), "lab"));
+        assert!(!rule.uses_bucket(Ulid::from_parts(1, 1), "lab-raw"));
+        rule.write_prefix = Some("lab-new/".to_string());
+        assert!(rule.uses_bucket(Ulid::nil(), "lab-new"));
     }
 
     #[test]
