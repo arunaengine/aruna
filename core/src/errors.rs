@@ -106,6 +106,22 @@ pub enum BlobError {
     KeyTooLong,
 }
 
+impl BlobError {
+    /// The message without the error kind in front, for short reasons shown to users.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::WriteError(message)
+            | Self::DeleteError(message)
+            | Self::ReadError(message)
+            | Self::ListError(message)
+            | Self::MakeBucketError(message)
+            | Self::OperatorCreationFailed(message)
+            | Self::UnknownBackend(message) => message.clone(),
+            other => other.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum StagingSourceError {
     #[error("Channel closed")]
