@@ -36,6 +36,13 @@ pub(super) fn streams_now(part_number: u16, size: Option<u64>) -> bool {
     part_number < TABLE_PART && size.is_some_and(|size| (PART_MIN..=BUFFER_MAX).contains(&size))
 }
 
+/// Memory one framed part may hold: its frames or padding, a received chunk of up to the
+/// part size, and the frame being encoded.
+fn framed_charge(size: u64) -> u64 {
+    let stored = (size + size / 1024 + FRAME_SIZE).max(PART_MIN);
+    stored + size + 2 * FRAME_SIZE
+}
+
 impl BlobHandler {
     /// Frames one part in memory, pads it to the part minimum and sends it as one provider part.
     pub(super) async fn upload_framed(
@@ -46,7 +53,7 @@ impl BlobHandler {
         level: u8,
         mut body: BackendStream<Result<Bytes, StreamError>>,
     ) -> Result<(String, PartLayout), BlobError> {
-        let _share = self.reserve_pithos(size + size / 1024 + FRAME_SIZE).await?;
+        let _share = self.reserve_pithos(framed_charge(size)).await?;
         let mut encoder = FrameEncoder::new(level);
         let mut pieces = Vec::new();
         let mut received = 0u64;

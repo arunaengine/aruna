@@ -202,12 +202,17 @@ impl FrameEncoder {
         }
     }
 
-    pub(crate) async fn push(&mut self, bytes: &[u8]) -> Result<Vec<Bytes>, BlobError> {
-        self.pending.extend_from_slice(bytes);
+    /// Copies at most one frame of input at a time, so a large chunk is never held twice.
+    pub(crate) async fn push(&mut self, mut bytes: &[u8]) -> Result<Vec<Bytes>, BlobError> {
         let mut out = Vec::new();
-        while self.pending.len() as u64 >= FRAME_SIZE {
-            let frame = self.pending.split_to(FRAME_SIZE as usize).freeze();
-            out.push(self.encode(frame).await?);
+        while !bytes.is_empty() {
+            let take = (FRAME_SIZE as usize - self.pending.len()).min(bytes.len());
+            self.pending.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.pending.len() as u64 == FRAME_SIZE {
+                let frame = self.pending.split().freeze();
+                out.push(self.encode(frame).await?);
+            }
         }
         Ok(out)
     }
@@ -752,5 +757,16 @@ mod tests {
         assert_eq!((stored.clone(), layout.clone()), encode(&data, 3));
         let size = data.len() as u64;
         assert_eq!(decode(&stored, &layout, size, 0..size).unwrap(), data);
+
+        // One large chunk gives the same frames and never buffers more than one frame of it.
+        let mut encoder = FrameEncoder::new(3);
+        let mut whole = Vec::new();
+        for piece in encoder.push(&data).await.unwrap() {
+            assert!(encoder.pending.capacity() <= FRAME_SIZE as usize);
+            whole.extend_from_slice(&piece);
+        }
+        let (rest, _) = encoder.finish().await.unwrap();
+        whole.extend(rest.concat());
+        assert_eq!(whole, stored);
     }
 }
