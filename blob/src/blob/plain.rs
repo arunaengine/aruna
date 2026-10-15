@@ -155,6 +155,25 @@ impl BlobHandler {
         }
     }
 
+    /// Whether the backend still has the object of `location`.
+    pub(super) async fn stat_copy(&self, location: BackendLocation) -> BlobEvent {
+        let (operator, path) = match self
+            .operator_from_location(&location)
+            .and_then(|operator| Ok((operator, self.object_path(&location)?)))
+        {
+            Ok(found) => found,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        match timeout(self.io_timeout(), operator.stat(&path)).await {
+            Ok(Ok(_)) => BlobEvent::CopyStat { exists: true },
+            Ok(Err(error)) if error.kind() == ErrorKind::NotFound => {
+                BlobEvent::CopyStat { exists: false }
+            }
+            Ok(Err(error)) => BlobEvent::Error(BlobError::ReadError(error.to_string())),
+            Err(_) => BlobEvent::Error(BlobError::ReadError("timed out reading the path".into())),
+        }
+    }
+
     /// The backend version a write recorded for a tenant path; `None` reads the newest bytes.
     pub(super) async fn read_version(
         &self,

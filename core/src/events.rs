@@ -258,6 +258,9 @@ pub enum BlobEvent {
         exists: bool,
         version: Option<String>,
     },
+    CopyStat {
+        exists: bool,
+    },
     /// `version` is the backend's id of the bytes written, on a backend that keeps versions.
     PlainWritten {
         location: BackendLocation,
