@@ -19,6 +19,8 @@ use aruna_core::structs::storage::routing::GroupStorageRouting;
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use smallvec::smallvec;
 
+const MAX_NAMED: usize = 5;
+
 const TABLES: &[(&str, &str, bool)] = &[
     (METADATA_INDEX_KEYSPACE, "metadata documents", true),
     (SOURCE_INDEX_KEYSPACE, "source connectors", true),
@@ -50,6 +52,9 @@ pub(super) struct EmptyCheck {
     next: Option<Key>,
     /// Every kind of resource found so far; the check names them all.
     found: Vec<&'static str>,
+    /// Names of the first blocking buckets, and how many more were seen.
+    buckets: Vec<String>,
+    more: usize,
 }
 
 impl EmptyCheck {
@@ -61,6 +66,8 @@ impl EmptyCheck {
             pending: false,
             next: None,
             found: Vec::new(),
+            buckets: Vec::new(),
+            more: 0,
         }
     }
 
@@ -124,7 +131,7 @@ impl EmptyCheck {
                     txn_id: Some(txn_id),
                 })]));
             }
-            for (_, value) in values {
+            for (key, value) in values {
                 let owned = match space {
                     JOB_KEYSPACE => {
                         crate::jobs::store::decode_job_record(&value)?
@@ -170,7 +177,17 @@ impl EmptyCheck {
                         .is_some(),
                     _ => prefix,
                 };
-                if owned {
+                if owned && space == S3_BUCKET_KEYSPACE {
+                    if self.buckets.is_empty() {
+                        self.found.push(reason);
+                    }
+                    match self.buckets.len() < MAX_NAMED {
+                        true => self
+                            .buckets
+                            .push(String::from_utf8_lossy(&key).into_owned()),
+                        false => self.more += 1,
+                    }
+                } else if owned {
                     self.found.push(reason);
                     self.next = None;
                     break;
@@ -183,9 +200,28 @@ impl EmptyCheck {
         if self.table < TABLES.len() {
             return Ok(Some(self.start(txn_id)));
         }
-        match self.found.split_last() {
+        let named = format!(
+            "S3 buckets: {}{}",
+            self.buckets.join(", "),
+            match self.more {
+                0 => String::new(),
+                more => format!(" (+{more} more)"),
+            }
+        );
+        let found: Vec<&str> = self
+            .found
+            .iter()
+            .map(|kind| {
+                if *kind == "S3 buckets" {
+                    named.as_str()
+                } else {
+                    kind
+                }
+            })
+            .collect();
+        match found.split_last() {
             None => Ok(None),
-            Some((last, [])) => Err(GroupDeletionError::NotEmpty((*last).into())),
+            Some((last, [])) => Err(GroupDeletionError::NotEmpty((*last).to_string())),
             Some((last, rest)) => Err(GroupDeletionError::NotEmpty(format!(
                 "{} and {last}",
                 rest.join(", ")
@@ -220,5 +256,47 @@ mod tests {
             panic!("expected a non-empty group, got {result:?}");
         };
         assert_eq!(reason, "metadata documents and source connectors");
+    }
+
+    #[test]
+    fn names_buckets() {
+        let group_id = ulid::Ulid::from_bytes([1u8; 16]);
+        let txn_id = TxnId::default();
+        let mut check = EmptyCheck::new(group_id, SystemTime::UNIX_EPOCH);
+        let bucket: Vec<u8> = BucketInfo {
+            group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+        }
+        .to_bytes()
+        .unwrap();
+        let mut result = Ok(None);
+        for table in 0..TABLES.len() {
+            let values = match TABLES[table].0 == S3_BUCKET_KEYSPACE {
+                true => (0..7)
+                    .map(|n| {
+                        (
+                            Key::from(format!("b{n}").into_bytes()),
+                            bucket.clone().into(),
+                        )
+                    })
+                    .collect(),
+                false => Vec::new(),
+            };
+            let event = Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after: None,
+            });
+            result = check.step(event, txn_id);
+        }
+        let Err(GroupDeletionError::NotEmpty(reason)) = result else {
+            panic!("expected a non-empty group, got {result:?}");
+        };
+        assert_eq!(reason, "S3 buckets: b0, b1, b2, b3, b4 (+2 more)");
     }
 }
