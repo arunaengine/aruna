@@ -7,6 +7,7 @@ pub mod abe_access;
 pub mod backend_import;
 pub mod backends;
 pub mod blob;
+pub mod broken;
 pub mod cleanup;
 pub mod data_identity;
 pub mod dataset_location;

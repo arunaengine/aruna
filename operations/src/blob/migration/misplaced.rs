@@ -6,7 +6,7 @@ use super::{encrypting, move_routing, place, source_key, stays};
 use crate::blob::records::blob_location_read;
 use crate::driver::DriverContext;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, BROKEN_VERSION_KEYSPACE};
 use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKey};
 use aruna_core::types::Key;
 
@@ -23,7 +23,7 @@ pub struct Misplaced {
 }
 
 /// Counts what a move of `prefix` would move, with the move's own skips: an encrypted bucket
-/// moves nothing, and linked-folder files and unfinished copies stay.
+/// moves nothing; linked-folder files, unfinished copies and recorded broken versions stay.
 pub async fn count_misplaced(
     context: &DriverContext,
     bucket: &str,
@@ -66,7 +66,7 @@ pub async fn count_misplaced(
             let Some(source) = source_key(&version, wanted) else {
                 continue;
             };
-            if moves(context, &source).await? {
+            if !recorded(context, &key).await? && moves(context, &source).await? {
                 misplaced.count += 1;
             }
         }
@@ -78,6 +78,19 @@ pub async fn count_misplaced(
             Some(next) => after = Some(next),
             None => return Ok(misplaced),
         }
+    }
+}
+
+/// Whether a check recorded the version as broken; a move skips it.
+async fn recorded(context: &DriverContext, key: &Key) -> Result<bool, String> {
+    let read = aruna_core::effects::StorageEffect::Read {
+        key_space: BROKEN_VERSION_KEYSPACE.to_string(),
+        key: key.clone(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+        other => Err(format!("could not read a broken version: {other:?}")),
     }
 }
 

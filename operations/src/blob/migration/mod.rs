@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod check;
 pub mod misplaced;
 pub mod queue;
 pub mod rewrite;
@@ -878,6 +879,10 @@ pub async fn process_migrations(
     {
         soon(after);
     }
+    // Storage checks share this task too.
+    if !resumed && let Some(after) = check::process_checks(context).await? {
+        soon(after);
+    }
     // Queued buckets after this page, or before it when the run resumed mid-queue.
     if cursor.is_some() || resumed {
         soon(MIGRATION_CONTINUE);
@@ -974,9 +979,13 @@ async fn migrate_page(
         if let Some(routing) = routing {
             operation = operation.with_routing(routing);
         }
-        match crate::driver::drive(operation, context).await {
+        let moved = crate::driver::drive(operation, context).await;
+        let broken = moved.is_err() && is_broken(context, key).await;
+        match moved {
             Ok(MigrateOutcome::Migrated) => record.migrated += 1,
             Ok(MigrateOutcome::Skipped) => record.skipped += 1,
+            // A copy that cannot be read is recorded as broken instead of retried.
+            Err(_) if broken => record.skipped += 1,
             Err(error) => {
                 record.failed += 1;
                 tracing::warn!(bucket, %error, "Failed to re-encode a version");
@@ -1001,6 +1010,17 @@ async fn migrate_page(
     };
     store_progress(context, bucket, &record).await?;
     Ok(after)
+}
+
+/// Whether a version whose move failed is broken; a check records it.
+async fn is_broken(context: &crate::driver::DriverContext, key: &Key) -> bool {
+    let Ok(version_key) = VersionKey::from_bytes(key.as_ref()) else {
+        return false;
+    };
+    let now_ms = crate::effect_adapters::routing::now_ms();
+    let operation = check::CheckVersionOperation::new(version_key, now_ms);
+    let outcome = crate::driver::drive(operation, context).await;
+    matches!(outcome, Ok(check::CheckOutcome::Broken(_)))
 }
 
 /// The routing a move resolves against, read once per page; `None` once the bucket is gone.
