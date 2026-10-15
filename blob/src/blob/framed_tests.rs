@@ -385,3 +385,101 @@ async fn s3_completion_budget() {
     assert_eq!(read_back(&handler, location).await, [data, tail].concat());
     assert_eq!(handler.pithos_budget.available_permits(), budget_permits());
 }
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_bucketless_framed() {
+    // A group storage without a fixed bucket: parts stream into its default bucket, and the
+    // short last part waits in that bucket's own parts folder.
+    use super::{s3_config, unique_name};
+    use crate::blob::NodeBackend;
+    use crate::s3::make_bucket;
+    use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
+    use aruna_core::structs::storage::group_backend::{
+        DEFAULT_BUCKET, GroupBackendKind, PARTS_PREFIX,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let bucket = unique_name("tenant-");
+    make_bucket(&bucket, &s3_config(&env, None)).await.unwrap();
+    let mut service_config = s3_config(&env, None);
+    service_config.insert(DEFAULT_BUCKET.to_string(), bucket.clone());
+    let backend_id = Ulid::generate();
+    let entry = NodeBackend::new(
+        BackendConfig {
+            backend_type: Backend::Group(GroupBackendKind::S3),
+            root: String::new(),
+            service_config,
+            bucket_prefix: None,
+            max_bucket_size: None,
+            multipart_bucket: Some(bucket.clone()),
+            timeouts: Default::default(),
+        },
+        None,
+    );
+    let groups = HashMap::from([(backend_id, Arc::new(entry))]);
+    let handler = BlobHandler {
+        registry: context.blob_handle.handler.registry.with_groups(groups),
+        ..context.blob_handle.handler.clone()
+    };
+    let resolved = ResolvedBackend::new(BackendRef::Group(backend_id), None).with_compression(ZSTD);
+    let event = handler
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            "group.bin",
+            resolved.clone(),
+            test_user_id(),
+        )
+        .await;
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = event
+    else {
+        panic!("group upload did not open: {event:?}")
+    };
+    let data = text(6 * MIB, b"group part ");
+    let tail = b"tail".to_vec();
+    let mut parts = Vec::new();
+    for (number, payload) in [(1, &data), (2, &tail)] {
+        let event = handler
+            .write_part(
+                upload.clone(),
+                MultipartPartKey::new(upload.record_id, number),
+                resolved.clone(),
+                test_user_id(),
+                Some(payload.len() as u64),
+                stream_from_bytes(payload),
+            )
+            .await;
+        let (location, backend_etag) = match event {
+            BlobEvent::PartWritten {
+                location,
+                backend_etag,
+            } => (location, Some(backend_etag)),
+            BlobEvent::WriteFinished { location } => (location, None),
+            other => panic!("group part write failed: {other:?}"),
+        };
+        parts.push(MultipartPart {
+            part_number: number,
+            location,
+            created_at: SystemTime::now(),
+            backend_etag,
+            piece: None,
+        });
+    }
+    assert!(parts[0].location.partial);
+    let staged = &parts[1].location;
+    assert_eq!(staged.storage_bucket, bucket);
+    assert!(staged.backend_path.starts_with(PARTS_PREFIX), "{staged:?}");
+
+    let event = handler.complete_upload(upload, parts, &[1], ZSTD).await;
+    let BlobEvent::WriteFinished { location } = event else {
+        panic!("group completion failed: {event:?}")
+    };
+    assert_eq!(location.storage_bucket, bucket);
+    let expected = [data.as_slice(), &tail].concat();
+    assert_reads(&handler, &location, &expected, &[data.len() as u64]).await;
+}
