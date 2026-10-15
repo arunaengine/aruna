@@ -128,15 +128,17 @@ A group admin can turn on encryption for a bucket, in the portal or with
 `PUT /data/buckets/{bucket}/storage/encryption`. The node then stores new files of that bucket
 encrypted.
 
-- **Two modes.** With `node_managed`, the node can open the bucket key after a restart. With
-  `vault_locked`, a key holder must unlock the bucket in the portal; the key stays only in the
-  node's memory, until it is locked again, a time limit ends, or the node restarts.
+- **Two modes.** `node_managed` is the simple choice: the node keeps the bucket key and opens it
+  after a restart, so everything works without unlocking. Use `vault_locked` when the node should
+  hold no key: a key holder must unlock the bucket in the portal, and the key stays only in the
+  node's memory until it is locked again, a time limit ends, or the node restarts.
 - **Key holders.** The bucket creator, the group admins and users granted explicitly hold a sealed
   copy of the bucket key. Keep at least two holders, or one with a recovery key, so the data is not
   lost with one person's key.
-- **While locked.** Uploads, listings and object info still work. Reading content, copying it to
-  another bucket and jobs that need it wait or are refused. S3 answers `403 AccessDenied` with the
-  header `x-aruna-bucket-locked: true`.
+- **While locked.** Uploads, listings and object info still work. People with a key grant for a
+  folder or file can read it in the portal while the bucket stays locked. Plain S3 tools, jobs,
+  copies to another bucket and moves to other storage need an unlock; S3 answers
+  `403 AccessDenied` with the header `x-aruna-bucket-locked: true`.
 - **Token credentials.** A key holder can create an S3 credential that reads chosen buckets while
   they are locked: list them in `encrypted_buckets` of `POST /access/credentials`. Each bucket
   must be unlocked at that moment. The answer contains a `session_token` once; the node does not
@@ -162,6 +164,24 @@ encrypted.
   checks the content of such a copy when its own bucket is next unlocked. A target bucket without
   encryption gets copies of an encrypted bucket only when the request sets `plaintext: true` and
   the requester holds the key of the source bucket.
+
+## Your Own Storage
+
+A group can keep its files in its own S3 storage instead of Aruna's storage on the node. Add it in
+the group's Storage tab with the endpoint and keys; it needs no bucket. Then add rules:
+
+- **Default rule.** New uploads of all the group's buckets go into one bucket of your storage, in
+  Aruna's own layout. Aruna finds or creates the bucket when you save the rule and never reads it
+  back. A group has at most one default rule. "Use as default" on Aruna storage sends new uploads
+  to the node again; files already in your storage stay there.
+- **Linked buckets.** A bucket (or folder) in Aruna and a bucket (or folder) in your storage show
+  the same files both ways: a run imports files found there, and new uploads are stored there
+  under their own names. Aruna never deletes them.
+- **No overlaps.** Two linked rules may not share folders of one bucket, and no linked rule may use
+  the default rule's bucket. Paths in your storage are at most 1024 bytes long.
+
+`PUT /data/groups/{group_id}/storage/routing` sets the default rule; linked rules live under
+`/data/groups/{group_id}/storage/imports`.
 
 ## Realm Registry
 
