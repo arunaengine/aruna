@@ -621,3 +621,50 @@ async fn filters_names() {
         vec!["a".to_string()]
     );
 }
+
+#[tokio::test]
+async fn renders_refusals() {
+    let fixture = Fixture::new(&[1, 2]).await;
+    let group_id = fixture.plan.group_id;
+    let key = group_id.to_bytes().to_vec();
+    let bytes = read(&fixture.context, AUTH_KEYSPACE, key.clone())
+        .await
+        .unwrap();
+    let mut document = GroupAuthorizationDocument::from_bytes(&bytes).unwrap();
+    for node in [node(1), node(2)] {
+        let path = aruna_core::structs::storage::blob::bucket_permission_path(
+            fixture.auth.realm_id,
+            group_id,
+            node,
+            "hidden",
+        );
+        for role in document.roles.values_mut() {
+            role.permissions.insert(
+                path.clone(),
+                aruna_core::structs::identity::auth::Permission::DENY,
+            );
+        }
+    }
+    let bytes = document.to_bytes(&fixture.actor).unwrap();
+    write(&fixture.context, AUTH_KEYSPACE, key, bytes).await;
+    let reply = GroupDeletionError::NotEmpty {
+        kinds: "S3 buckets".into(),
+        buckets: vec!["shown".into(), "hidden".into()],
+        more: false,
+    };
+    // The local refusal and a peer refusal both pass through the coordinator filter.
+    for node in [node(1), node(2)] {
+        let error = super::coordinator::blocked(
+            &fixture.context,
+            &fixture.auth,
+            group_id,
+            node,
+            reply.clone(),
+        )
+        .await;
+        let GroupDeletionError::NotEmpty { kinds, .. } = error else {
+            panic!("expected a refusal, got {error:?}");
+        };
+        assert_eq!(kinds, format!("node {node}: S3 buckets (shown)"));
+    }
+}

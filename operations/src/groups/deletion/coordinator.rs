@@ -143,7 +143,7 @@ pub(super) async fn visible(
     kept
 }
 
-async fn blocked(
+pub(super) async fn blocked(
     context: &DriverContext,
     auth: &AuthContext,
     group_id: GroupId,
