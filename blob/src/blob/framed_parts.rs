@@ -5,7 +5,9 @@
 
 use super::BlobHandler;
 use super::frames::read_range;
-use crate::codec::{FRAME_SIZE, FrameEncoder, FrameWriter, PART_MIN, padding, padding_len};
+use crate::codec::{
+    FRAME_SIZE, FrameEncoder, FrameWriter, PART_MIN, compressor_memory, padding, padding_len,
+};
 use crate::s3::NativeMultipart;
 use aruna_core::errors::BlobError;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -166,11 +168,11 @@ pub(super) fn streams_now(part_number: u16, size: Option<u64>) -> bool {
     part_number < TABLE_PART && size.is_some_and(|size| (PART_MIN..=BUFFER_MAX).contains(&size))
 }
 
-/// Memory one framed part may hold: its frames or padding, a received chunk of up to the
-/// part size, and the frame being encoded.
-fn framed_charge(size: u64) -> u64 {
+/// Memory one framed part may hold: its frames or padding, a received chunk of up to the part
+/// size, the frame being encoded with its buffers, and the compressor workspace.
+fn framed_charge(size: u64, level: u8) -> u64 {
     let stored = (size + size / 1024 + FRAME_SIZE).max(PART_MIN);
-    stored + size + 2 * FRAME_SIZE
+    stored + size + 4 * FRAME_SIZE + compressor_memory(level)
 }
 
 impl BlobHandler {
@@ -183,7 +185,7 @@ impl BlobHandler {
         level: u8,
         mut body: BackendStream<Result<Bytes, StreamError>>,
     ) -> Result<(String, PartLayout), BlobError> {
-        let _share = self.reserve_pithos(framed_charge(size)).await?;
+        let _share = self.reserve_pithos(framed_charge(size, level)).await?;
         let mut encoder = FrameEncoder::new(level);
         let mut pieces = Vec::new();
         let mut received = 0u64;

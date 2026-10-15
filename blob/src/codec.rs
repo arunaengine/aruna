@@ -61,6 +61,20 @@ fn read_u32(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(value)
 }
 
+/// Memory the zstd compressor of `level` uses for a 1 MiB frame, rounded up to whole MiB.
+pub(crate) fn compressor_memory(level: u8) -> u64 {
+    let mib = match level {
+        0..=2 => 1,
+        3 => 2,
+        4..=6 => 3,
+        7..=8 => 6,
+        9..=12 => 11,
+        13..=17 => 17,
+        _ => 18,
+    };
+    mib << 20
+}
+
 /// Compresses one frame with a zstd checksum. A frame that saves less than
 /// max(1 KiB, 5 percent) is stored as raw blocks instead.
 pub(crate) fn encode_frame(raw: Bytes, level: u8) -> Result<Bytes, BlobError> {
@@ -70,7 +84,9 @@ pub(crate) fn encode_frame(raw: Bytes, level: u8) -> Result<Bytes, BlobError> {
     compressor
         .set_parameter(CParameter::ChecksumFlag(true))
         .map_err(failed)?;
-    let compressed = compressor.compress(&raw).map_err(failed)?;
+    let mut compressed = compressor.compress(&raw).map_err(failed)?;
+    // The output buffer is sized for the worst case; a kept frame holds only its bytes.
+    compressed.shrink_to_fit();
     let wanted = 1024.max(raw.len() / 20);
     match raw.len().saturating_sub(compressed.len()) >= wanted {
         true => Ok(Bytes::from(compressed)),
@@ -706,6 +722,30 @@ mod tests {
         assert_eq!(index.fetch_frames(2, 4, u64::MAX), 3..5);
         assert_eq!(padding_len(PART_MIN - 3), HEADER_LEN as u32);
         assert_eq!(padding_len(PART_MIN), 0);
+    }
+
+    use aruna_core::structs::storage::format::Compression;
+
+    #[test]
+    fn workspace_covers_levels() {
+        // The compressor of each level fits its charge after framing 1 MiB.
+        let data = random(FRAME_SIZE as usize, 3);
+        for level in 1..=Compression::MAX_LEVEL {
+            let mut cctx = zstd::zstd_safe::CCtx::create();
+            let params = [
+                CParameter::CompressionLevel(i32::from(level)),
+                CParameter::ChecksumFlag(true),
+            ];
+            for param in params {
+                cctx.set_parameter(param).unwrap();
+            }
+            let mut out = Vec::with_capacity(zstd::zstd_safe::compress_bound(data.len()));
+            cctx.compress2(&mut out, &data).unwrap();
+            assert!(
+                cctx.sizeof() as u64 <= compressor_memory(level),
+                "level {level}"
+            );
+        }
     }
 
     #[test]
