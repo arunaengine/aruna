@@ -11,16 +11,146 @@ use aruna_core::errors::BlobError;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::format::{FrameLayout, PartFrame, PartLayout, StoredLayout};
-use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart};
+use aruna_core::structs::storage::multipart::{BackendUpload, MAX_PART_SIZE, MultipartPart};
 use bytes::Bytes;
 use futures::channel::mpsc;
 use futures::{SinkExt, StreamExt, stream};
+use std::collections::VecDeque;
 use tokio::time::timeout;
 
 /// Largest part framed in memory to learn its stored size; a larger one waits in a blob.
 const BUFFER_MAX: u64 = 64 << 20;
 /// The provider part that takes the seek table when the last listed part was streamed.
 const TABLE_PART: u16 = 10_000;
+
+/// One staged part of a run: its frames from the first framing and its padding.
+struct Staged<'a> {
+    part: &'a MultipartPart,
+    frames: Vec<PartFrame>,
+    padding: u32,
+}
+
+/// Staged parts listed one after another. They are sent again as provider parts of at most
+/// 5 GiB, cut at frame boundaries and numbered from the run's first part number.
+struct Run<'a> {
+    parts: Vec<Staged<'a>>,
+    first: u16,
+    /// Stored length of each frame, padding and table, in order.
+    units: Vec<u64>,
+    /// Units in each provider part.
+    counts: Vec<usize>,
+    /// The seek table, when the run holds the last listed part.
+    table: Option<Bytes>,
+}
+
+impl<'a> Run<'a> {
+    fn new(staged: Staged<'a>) -> Self {
+        Self {
+            first: staged.part.part_number,
+            parts: vec![staged],
+            units: Vec::new(),
+            counts: Vec::new(),
+            table: None,
+        }
+    }
+}
+
+/// A completion step in part order: a streamed part, or a run of staged parts.
+enum Step<'a> {
+    Direct(u16, String),
+    Run(Run<'a>),
+}
+
+/// Sends stored bytes to the provider parts of a run in turn, each for its number of units.
+struct Router {
+    pieces: VecDeque<(usize, mpsc::Sender<Result<Bytes, StreamError>>)>,
+    /// Set once a provider part stopped taking bytes.
+    stopped: bool,
+}
+
+impl Router {
+    /// Returns `false` once the provider part being written stopped taking bytes.
+    async fn send(&mut self, bytes: Bytes) -> bool {
+        let Some((left, sink)) = self.pieces.front_mut() else {
+            self.stopped = true;
+            return false;
+        };
+        if sink.send(Ok(bytes)).await.is_err() {
+            self.stopped = true;
+            return false;
+        }
+        *left -= 1;
+        if *left == 0 {
+            self.pieces.pop_front();
+        }
+        true
+    }
+}
+
+fn stopped() -> BlobError {
+    BlobError::WriteError("the part upload stopped".to_string())
+}
+
+/// Cuts each run into provider parts. A run may use the part numbers up to the next streamed
+/// part, or up to 10000 when it ends the upload; unlisted provider parts there are replaced.
+fn plan_runs(steps: &mut [Step<'_>], table: &Bytes) -> Result<(), BlobError> {
+    let ends = steps.len();
+    for index in 0..ends {
+        let limit = match steps.get(index + 1) {
+            Some(Step::Direct(number, _)) => number - 1,
+            _ => TABLE_PART,
+        };
+        let Step::Run(run) = &mut steps[index] else {
+            continue;
+        };
+        for staged in &run.parts {
+            run.units
+                .extend(staged.frames.iter().map(|frame| u64::from(frame.stored)));
+            if staged.padding > 0 {
+                run.units.push(u64::from(staged.padding));
+            }
+        }
+        if index + 1 == ends {
+            run.units.push(table.len() as u64);
+            run.table = Some(table.clone());
+        }
+        run.counts = cut_pieces(&run.units, MAX_PART_SIZE, PART_MIN);
+        if run.counts.len() > usize::from(limit - run.first) + 1 {
+            return Err(BlobError::WriteError(format!(
+                "parts from {} need {} provider parts, but only part numbers up to {limit} are free",
+                run.first,
+                run.counts.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Cuts units into pieces of at most `max` bytes, filling each in turn. A short last piece takes
+/// units from the piece before until it holds `min`. Returns the units in each piece.
+fn cut_pieces(units: &[u64], max: u64, min: u64) -> Vec<usize> {
+    let mut pieces: Vec<(usize, u64)> = Vec::new();
+    for unit in units {
+        match pieces.last_mut() {
+            Some((count, bytes)) if *bytes + unit <= max => {
+                *count += 1;
+                *bytes += unit;
+            }
+            _ => pieces.push((1, *unit)),
+        }
+    }
+    if let [.., before, last] = pieces.as_mut_slice() {
+        while last.1 < min && before.0 > 1 {
+            let unit = units[units.len() - last.0 - 1];
+            if last.1 + unit > max {
+                break;
+            }
+            (before.0, before.1) = (before.0 - 1, before.1 - unit);
+            (last.0, last.1) = (last.0 + 1, last.1 + unit);
+        }
+    }
+    pieces.into_iter().map(|(count, _)| count).collect()
+}
 
 /// The zstd level of a compressed provider upload; `None` for an upload of raw parts.
 pub(super) fn part_level(upload: &BackendUpload) -> Option<u8> {
@@ -106,8 +236,7 @@ impl BlobHandler {
             ));
         };
         let mut writer = FrameWriter::new(level);
-        let mut etags = Vec::with_capacity(parts.len() + 1);
-        let mut staged = Vec::new();
+        let mut steps = Vec::with_capacity(parts.len());
         for part in parts {
             let number = part.part_number;
             match (&part.location.format.layout, part.location.partial) {
@@ -121,23 +250,30 @@ impl BlobHandler {
                     if layout.padding > 0 {
                         writer.pad(layout.padding)?;
                     }
-                    etags.push((number, etag));
+                    steps.push(Step::Direct(number, etag));
                 }
                 (StoredLayout::Raw, false) => {
                     let frames = self.frame_blob(&part.location, level, None).await?;
                     let stored = frames.iter().map(|frame| u64::from(frame.stored)).sum();
-                    let pad = match std::ptr::eq(part, last) {
+                    let padding = match std::ptr::eq(part, last) {
                         true => 0,
                         false => padding_len(stored),
                     };
                     for frame in &frames {
                         writer.entry(frame.clone())?;
                     }
-                    if pad > 0 {
-                        writer.pad(pad)?;
+                    if padding > 0 {
+                        writer.pad(padding)?;
                     }
-                    staged.push((etags.len(), part, frames, pad));
-                    etags.push((number, String::new()));
+                    let staged = Staged {
+                        part,
+                        frames,
+                        padding,
+                    };
+                    match steps.last_mut() {
+                        Some(Step::Run(run)) => run.parts.push(staged),
+                        _ => steps.push(Step::Run(Run::new(staged))),
+                    }
                 }
                 _ => {
                     return Err(BlobError::WriteError(format!(
@@ -148,19 +284,19 @@ impl BlobHandler {
         }
         let (table, layout) = writer.finish()?;
         let table = Bytes::from(table);
+        plan_runs(&mut steps, &table)?;
         let native = self.native_upload(&upload.location)?;
         let path = upload.location.get_storage_path()?;
         let sent = async {
-            for (slot, part, frames, pad) in &staged {
-                let mut tail = Vec::new();
-                if *pad > 0 {
-                    tail.push(padding(*pad));
+            let mut etags = Vec::with_capacity(parts.len() + 1);
+            for step in &steps {
+                match step {
+                    Step::Direct(number, etag) => etags.push((*number, etag.clone())),
+                    Step::Run(run) => {
+                        let id = &upload.upload_id;
+                        etags.extend(self.send_run(&native, &path, id, level, run).await?);
+                    }
                 }
-                if std::ptr::eq(*part, last) {
-                    tail.push(table.clone());
-                }
-                let send = self.send_staged(&native, &path, upload, part, level, frames, tail);
-                etags[*slot].1 = send.await?;
             }
             if last.location.partial {
                 let body = BackendStream(Box::pin(stream::iter([Ok(table.clone())])));
@@ -184,51 +320,82 @@ impl BlobHandler {
         Ok(layout)
     }
 
-    /// Sends a staged part framed again, then `tail`, and checks it framed as before.
-    #[allow(clippy::too_many_arguments)]
-    async fn send_staged(
+    /// Frames the staged parts of a run again and sends them as its provider parts, checking
+    /// that they framed as before. Returns the number and ETag of each provider part.
+    async fn send_run(
         &self,
         native: &NativeMultipart,
         path: &str,
-        upload: &BackendUpload,
-        part: &MultipartPart,
+        upload_id: &str,
         level: u8,
-        frames: &[PartFrame],
-        tail: Vec<Bytes>,
-    ) -> Result<String, BlobError> {
-        let stored = frames
-            .iter()
-            .map(|frame| u64::from(frame.stored))
-            .sum::<u64>()
-            + tail.iter().map(|piece| piece.len() as u64).sum::<u64>();
-        let (sink, receiver) = mpsc::channel(4);
-        let body = receiver.chain(stream::iter(tail.into_iter().map(Ok)));
-        let send = native.upload_part(
-            path,
-            &upload.upload_id,
-            part.part_number,
-            stored,
-            BackendStream(Box::pin(body)),
-        );
-        let (framed, sent) = tokio::join!(self.frame_blob(&part.location, level, Some(sink)), send);
-        if framed? != frames {
-            return Err(BlobError::IntegrityCheckFailed(
-                "a staged part framed differently".to_string(),
-            ));
+        run: &Run<'_>,
+    ) -> Result<Vec<(u16, String)>, BlobError> {
+        let mut router = Router {
+            pieces: VecDeque::new(),
+            stopped: false,
+        };
+        let mut receivers = Vec::with_capacity(run.counts.len());
+        for count in &run.counts {
+            let (sink, receiver) = mpsc::channel(4);
+            router.pieces.push_back((*count, sink));
+            receivers.push(receiver);
         }
-        sent
+        let produce = async {
+            let produced = async {
+                for staged in &run.parts {
+                    let location = &staged.part.location;
+                    let frames = self.frame_blob(location, level, Some(&mut router)).await?;
+                    if frames != staged.frames {
+                        return Err(BlobError::IntegrityCheckFailed(
+                            "a staged part framed differently".to_string(),
+                        ));
+                    }
+                    if staged.padding > 0 && !router.send(padding(staged.padding)).await {
+                        return Err(stopped());
+                    }
+                }
+                match &run.table {
+                    Some(table) if !router.send(table.clone()).await => Err(stopped()),
+                    _ => Ok(()),
+                }
+            }
+            .await;
+            // Ends every body still open, so no provider part waits for bytes that never come.
+            router.pieces.clear();
+            produced
+        };
+        let consume = async {
+            let mut etags = Vec::with_capacity(receivers.len());
+            let mut units = run.units.iter();
+            for ((index, receiver), count) in receivers.into_iter().enumerate().zip(&run.counts) {
+                let number = run.first + index as u16;
+                let length = units.by_ref().take(*count).sum();
+                let body = BackendStream(Box::pin(receiver));
+                let etag = native
+                    .upload_part(path, upload_id, number, length, body)
+                    .await?;
+                etags.push((number, etag));
+            }
+            Ok::<_, BlobError>(etags)
+        };
+        let (produced, sent) = tokio::join!(produce, consume);
+        match (produced, sent) {
+            (Ok(()), sent) => sent,
+            (Err(error), _) if !router.stopped => Err(error),
+            (_, Err(error)) => Err(error),
+            (Err(error), Ok(_)) => Err(error),
+        }
     }
 
-    /// Frames the raw bytes of a staged part and sends the stored bytes to `sink` when given.
+    /// Frames the raw bytes of a staged part and sends each stored frame to `sink` when given.
     async fn frame_blob(
         &self,
         location: &BackendLocation,
         level: u8,
-        mut sink: Option<mpsc::Sender<Result<Bytes, StreamError>>>,
+        mut sink: Option<&mut Router>,
     ) -> Result<Vec<PartFrame>, BlobError> {
         let read = |error: opendal::Error| BlobError::ReadError(error.to_string());
         let late = || BlobError::ReadError("timed out reading a staged part".to_string());
-        let stopped = |_| BlobError::WriteError("the part upload stopped".to_string());
         let operator = self.operator_from_location(location)?;
         let path = location.get_storage_path()?;
         let reader = timeout(self.io_timeout(), operator.reader(&path))
@@ -246,14 +413,18 @@ impl BlobHandler {
         {
             let chunk = chunk.map_err(|error| BlobError::ReadError(error.to_string()))?;
             for piece in encoder.push(&chunk).await? {
-                if let Some(sink) = sink.as_mut() {
-                    sink.send(Ok(piece)).await.map_err(stopped)?;
+                if let Some(sink) = sink.as_mut()
+                    && !sink.send(piece).await
+                {
+                    return Err(stopped());
                 }
             }
         }
         let (last, frames) = encoder.finish_part().await?;
-        if let (Some(sink), Some(last)) = (sink.as_mut(), last) {
-            sink.send(Ok(last)).await.map_err(stopped)?;
+        if let (Some(sink), Some(last)) = (sink.as_mut(), last)
+            && !sink.send(last).await
+        {
+            return Err(stopped());
         }
         let original: u64 = frames.iter().map(|frame| u64::from(frame.original)).sum();
         if original != location.blob_size {
@@ -284,5 +455,24 @@ impl BlobHandler {
         read_range(&operator, path, range, idle)
             .await
             .is_ok_and(|tail| tail == *table)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cut_pieces;
+
+    #[test]
+    fn cuts_fill_pieces() {
+        // Parts of incompressible frames: each grows a little, so a run needs one more piece.
+        let units = [40, 40, 40, 40, 40];
+        assert_eq!(cut_pieces(&units, 100, 10), vec![2, 2, 1]);
+        assert_eq!(cut_pieces(&units, 200, 10), vec![5]);
+        // A short last piece takes units from the one before until it holds the minimum.
+        assert_eq!(cut_pieces(&[30, 30, 30, 5], 90, 20), vec![2, 2]);
+        assert_eq!(cut_pieces(&[50, 20, 20, 9, 2], 100, 25), vec![2, 3]);
+        // A last piece may stay short when the piece before has a single unit.
+        assert_eq!(cut_pieces(&[95, 6], 100, 10), vec![1, 1]);
+        assert_eq!(cut_pieces(&[], 100, 10), Vec::<usize>::new());
     }
 }
