@@ -246,7 +246,7 @@ async fn finds_and_cleans_broken() {
         path_restrictions: None,
         session: None,
     };
-    let cleaned = clean_broken(&context.driver, &template(&context), &auth, None, 10)
+    let cleaned = clean_broken(&context.driver, &template(&context), &auth, None, 10, 100)
         .await
         .unwrap();
     assert_eq!(
@@ -258,7 +258,7 @@ async fn finds_and_cleans_broken() {
         .unwrap();
     assert_eq!(rows.len(), 2);
     // Denied rows never count toward the limit nor name the cursor.
-    let paged = clean_broken(&context.driver, &template(&context), &auth, None, 1)
+    let paged = clean_broken(&context.driver, &template(&context), &auth, None, 1, 100)
         .await
         .unwrap();
     assert_eq!((paged.denied, paged.next), (2, None));

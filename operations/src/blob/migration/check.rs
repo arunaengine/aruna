@@ -449,29 +449,39 @@ pub struct Cleaned {
     pub denied: u64,
     /// The key the next request starts after; `None` after the last page.
     pub next: Option<Key>,
+    /// The scan budget ran out before one row the caller may delete was found.
+    pub exhausted: bool,
 }
 
 /// Deletes up to `limit` recorded broken versions of `template.bucket` after `after` through
 /// the object delete. Each object path is authorized for `auth` like an S3 bulk delete, and a
 /// version is deleted only while its record in the delete's transaction is the recorded one.
-/// Denied rows do not count toward `limit` and never name `next`; the scan reads past them.
+/// Denied rows do not count toward `limit` and never name `next`; at most `scan` rows are read.
 pub async fn clean_broken(
     context: &DriverContext,
     template: &crate::s3::object::delete::DeleteObjectInput,
     auth: &aruna_core::structs::identity::auth::AuthContext,
     after: Option<Key>,
     limit: usize,
+    scan: usize,
 ) -> Result<Cleaned, String> {
-    let (mut after, mut handled) = (after, 0);
+    let (mut after, mut handled, mut examined) = (after, 0, 0);
     let mut last = None;
     let mut cleaned = Cleaned::default();
     loop {
-        let (rows, next) = list_broken(context, &template.bucket, after.take(), limit).await?;
+        if examined == scan {
+            cleaned.exhausted = handled == 0;
+            cleaned.next = last;
+            return Ok(cleaned);
+        }
+        let page = limit.min(scan - examined);
+        let (rows, next) = list_broken(context, &template.bucket, after.take(), page).await?;
         for (key, row) in rows {
             if handled == limit {
                 cleaned.next = last;
                 return Ok(cleaned);
             }
+            examined += 1;
             if clean_one(context, template, auth, &key, row, &mut cleaned).await? {
                 handled += 1;
                 last = Some(key.to_bytes().map_err(|error| error.to_string())?.into());

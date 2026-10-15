@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{BucketCheckQuery, CleanupQuery, clean_bucket_check, get_bucket_check};
+use super::{BucketCheckQuery, CleanupQuery, clean_bucket_check, get_bucket_check, visible_page};
 use crate::error::ServerError;
 use crate::tests::storage_routing::{TestState, setup_state};
 use aruna_core::effects::StorageEffect;
@@ -301,10 +301,12 @@ async fn cursor_names_visible() {
         deleted_by: test.auth.user_id,
     };
     let (ctx, auth) = (test.state.get_ctx(), hiding(&test));
-    let first = clean_broken(&ctx, &template, &auth, None, 1).await.unwrap();
+    let first = clean_broken(&ctx, &template, &auth, None, 1, 100)
+        .await
+        .unwrap();
     let next = first.next.clone().unwrap();
     assert_eq!(VersionKey::from_bytes(&next).unwrap().key, "b/y.gz");
-    let second = clean_broken(&ctx, &template, &auth, Some(next), 1)
+    let second = clean_broken(&ctx, &template, &auth, Some(next), 1, 100)
         .await
         .unwrap();
     assert!(
@@ -313,4 +315,62 @@ async fn cursor_names_visible() {
             .is_none_or(|next| VersionKey::from_bytes(&next).unwrap().key == "d/w.gz")
     );
     assert_eq!(first.deleted + second.deleted, 2);
+}
+
+#[tokio::test]
+async fn scan_budget_bounds() {
+    // A request stops after its row budget: refused if it found nothing to show, else it
+    // returns what it found with the cursor at the last shown file.
+    let test = setup_state().await;
+    for (key, seed) in [("a/x.gz", 1), ("b/y.gz", 2), ("c/z.gz", 3), ("d/w.gz", 4)] {
+        broken(&test, key, seed, None).await;
+    }
+    let auth = hiding(&test);
+    let page = |scan| {
+        visible_page(
+            &test.state,
+            &auth,
+            test.group_id,
+            &test.bucket,
+            None,
+            10,
+            scan,
+        )
+    };
+
+    assert!(matches!(
+        page(1).await,
+        Err(ServerError::ServiceUnavailableReason(_))
+    ));
+    let (files, next) = page(2).await.unwrap();
+    let keys: Vec<_> = files.iter().map(|file| file.key.as_str()).collect();
+    assert_eq!(keys, ["b/y.gz"]);
+    assert_eq!(
+        VersionKey::from_bytes(&next.unwrap()).unwrap().key,
+        "b/y.gz"
+    );
+
+    let template = aruna_operations::s3::object::delete::DeleteObjectInput {
+        bucket: test.bucket.clone(),
+        key: String::new(),
+        version_id: None,
+        group_id: test.group_id,
+        realm_id: test.state.get_realm_id(),
+        node_id: test.state.get_node_id(),
+        deleted_by: test.auth.user_id,
+    };
+    let ctx = test.state.get_ctx();
+    let spent = clean_broken(&ctx, &template, &auth, None, 10, 1)
+        .await
+        .unwrap();
+    assert!(spent.exhausted && spent.next.is_none() && spent.deleted == 0);
+    let cleaned = clean_broken(&ctx, &template, &auth, None, 10, 2)
+        .await
+        .unwrap();
+    assert!(!cleaned.exhausted);
+    assert_eq!(cleaned.deleted, 1);
+    assert_eq!(
+        VersionKey::from_bytes(&cleaned.next.unwrap()).unwrap().key,
+        "b/y.gz"
+    );
 }

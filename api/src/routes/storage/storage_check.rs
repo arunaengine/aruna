@@ -25,6 +25,8 @@ use utoipa_axum::routes;
 
 /// Broken versions one listing or cleanup request handles at most.
 const PAGE_MAX: usize = 1000;
+/// Recorded rows one request reads at most, hidden ones included.
+const SCAN_MAX: usize = 10_000;
 
 #[derive(OpenApi)]
 #[openapi()]
@@ -184,6 +186,7 @@ async fn ensure_bucket(
 - Only versions that are still the current version of their key are listed, and only for
   objects the caller may read (object READ and request policies). Hidden rows are skipped
   until `limit` files are found; `next` always names the last listed file.
+- One request reads at most 10000 recorded files. If none of them can be listed it answers 503.
 - `progress.broken` counts what the last check found; the list also shrinks with cleanups.
 
 **Limits**
@@ -217,7 +220,8 @@ async fn ensure_bucket(
         (status = 400, description = "Invalid `after` or `limit`", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
-        (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
+        (status = 503, description = "10000 recorded files were read without one this caller may see", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -241,17 +245,46 @@ pub async fn get_bucket_check(
     let progress = read_check(&ctx, &bucket)
         .await
         .map_err(ServerError::InternalError)?;
-    // Reads past hidden rows until `limit` visible ones; broken rows are few per bucket.
-    let (mut after, mut broken, mut next) = (after, Vec::new(), None);
-    'scan: loop {
-        let (rows, more) = list_broken(&ctx, &bucket, after.take(), limit)
+    let (broken, next) =
+        visible_page(&state, &auth, group_id, &bucket, after, limit, SCAN_MAX).await?;
+    Ok(Json(BucketCheckResponse {
+        bucket,
+        progress: progress.map(Into::into),
+        broken,
+        next: next.map(hex::encode),
+    }))
+}
+
+/// Up to `limit` listed files after `after`, reading past hidden rows but at most `scan` rows.
+/// `next` names the last listed file; a budget spent before any file is listed is refused.
+async fn visible_page(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: ulid::Ulid,
+    bucket: &str,
+    after: Option<aruna_core::types::Key>,
+    limit: usize,
+    scan: usize,
+) -> ServerResult<(Vec<BrokenFile>, Option<Vec<u8>>)> {
+    let ctx = state.get_ctx();
+    let (mut after, mut broken, mut next, mut examined) = (after, Vec::new(), None, 0);
+    loop {
+        if examined == scan {
+            if broken.is_empty() {
+                return Err(scan_limit());
+            }
+            return Ok((broken, next));
+        }
+        let page = limit.min(scan - examined);
+        let (rows, more) = list_broken(&ctx, bucket, after.take(), page)
             .await
             .map_err(ServerError::InternalError)?;
         for (key, row) in rows {
             if broken.len() == limit {
-                break 'scan;
+                return Ok((broken, next));
             }
-            if !visible(&state, &auth, group_id, &key).await? {
+            examined += 1;
+            if !visible(state, auth, group_id, &key).await? {
                 continue;
             }
             next = Some(
@@ -267,18 +300,16 @@ pub async fn get_bucket_check(
         }
         match more {
             Some(more) => after = Some(more),
-            None => {
-                next = None;
-                break;
-            }
+            None => return Ok((broken, None)),
         }
     }
-    Ok(Json(BucketCheckResponse {
-        bucket,
-        progress: progress.map(Into::into),
-        broken,
-        next: next.map(hex::encode),
-    }))
+}
+
+/// The answer when a request read its whole row budget without finding a row it may show.
+fn scan_limit() -> ServerError {
+    ServerError::ServiceUnavailableReason(
+        "scan limit reached: too many recorded files this caller may not see".to_string(),
+    )
 }
 
 /// Only current versions, and only objects the caller may read, are listed.
@@ -373,7 +404,8 @@ on the owning group's admin path, as for the bucket's storage settings.
   own transaction. Others stay recorded until the next check. A version already deleted
   otherwise only loses its record and does not count in `deleted`.
 - A deleted current version makes the key show its previous version, if one exists.
-- One request handles up to 1000 recorded versions after `after`; pass `next` to go on."#,
+- One request handles up to 1000 recorded versions after `after`; pass `next` to go on. It
+  reads at most 10000 recorded files and answers 503 if it may delete none of them."#,
     params(
         ("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash"),
         CleanupQuery
@@ -388,7 +420,8 @@ on the owning group's admin path, as for the bucket's storage settings.
         (status = 400, description = "Invalid `after`", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the bucket or the group admin path", body = ErrorResponse),
-        (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
+        (status = 503, description = "10000 recorded files were read without one this caller may see", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -412,9 +445,19 @@ pub async fn clean_bucket_check(
         node_id: state.get_node_id(),
         deleted_by: auth.user_id,
     };
-    let cleaned = clean_broken(&state.get_ctx(), &template, &auth, after, PAGE_MAX)
-        .await
-        .map_err(ServerError::InternalError)?;
+    let cleaned = clean_broken(
+        &state.get_ctx(),
+        &template,
+        &auth,
+        after,
+        PAGE_MAX,
+        SCAN_MAX,
+    )
+    .await
+    .map_err(ServerError::InternalError)?;
+    if cleaned.exhausted {
+        return Err(scan_limit());
+    }
     Ok(Json(BucketCleanupResponse {
         bucket,
         deleted: cleaned.deleted,
