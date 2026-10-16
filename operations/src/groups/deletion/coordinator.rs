@@ -158,7 +158,9 @@ pub(super) async fn blocked(
     else {
         return error;
     };
+    let count = buckets.len();
     let names = visible(context, auth, group_id, node, buckets).await;
+    let more = more || names.len() < count;
     GroupDeletionError::NotEmpty {
         kinds: vec![format!("node {node}: {}", render(&kinds, &names, more))],
         buckets: Vec::new(),

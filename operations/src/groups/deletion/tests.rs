@@ -665,6 +665,21 @@ async fn renders_refusals() {
         let GroupDeletionError::NotEmpty { kinds, .. } = error else {
             panic!("expected a refusal, got {error:?}");
         };
-        assert_eq!(kinds, [format!("node {node}: S3 buckets (shown)")]);
+        assert_eq!(
+            kinds,
+            [format!("node {node}: S3 buckets (shown, and more)")]
+        );
     }
+    let readable = GroupDeletionError::NotEmpty {
+        kinds: vec!["S3 buckets".into()],
+        buckets: vec!["shown".into()],
+        more: false,
+    };
+    let error =
+        super::coordinator::blocked(&fixture.context, &fixture.auth, group_id, node(1), readable)
+            .await;
+    assert_eq!(
+        error.to_string(),
+        format!("group is not empty: node {}: S3 buckets (shown)", node(1))
+    );
 }
