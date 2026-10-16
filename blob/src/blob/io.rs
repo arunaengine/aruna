@@ -1006,11 +1006,17 @@ impl BlobHandler {
         &self,
         location: BackendLocation,
     ) -> Result<bool, BlobError> {
-        if !self.marker_present(&location).await? {
-            self.clear_active(location.ulid);
-            return Ok(true);
-        }
+        // Read before the row: a write commits its own row before it releases the reservation.
         let active = self.reservation_active(location.ulid);
+        match self.marker_matches(&location).await? {
+            None => {
+                self.clear_active(location.ulid);
+                return Ok(true);
+            }
+            // The committed writer's row replaced this one and settles the copy itself.
+            Some(false) => return Ok(false),
+            Some(true) => {}
+        }
         // A pending archive has no hash, so its own records prove the commit.
         if let StoredLayout::Pithos(_) = location.format.layout
             && self.archive_owned(&location).await?

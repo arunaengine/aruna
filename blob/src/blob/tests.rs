@@ -703,6 +703,73 @@ async fn copies_across_backends() {
     assert_eq!(read_back(&handler, source).await, b"copied bytes");
 }
 
+#[tokio::test]
+async fn committed_part_survives() {
+    // A cleanup pass still holding the replaced reservation row must not delete the part.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let upload_id = Ulid::generate();
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob_part(
+            MultipartPartKey::new(upload_id, 1),
+            cold_backend(),
+            test_user_id(),
+            stream_from_bytes(b"part bytes"),
+        )
+        .await
+    else {
+        panic!("part write failed")
+    };
+    let committed = BlobCleanupWork::ReconcileWrite {
+        location: location.clone(),
+        owner: WriteOwner::UploadPart {
+            upload_id,
+            part_number: 1,
+        },
+    };
+    let key: Vec<u8> = location.ulid.to_bytes().to_vec();
+    assert!(matches!(
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE.to_string(),
+                key: key.clone().into(),
+                value: committed.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+    assert!(matches!(
+        context
+            .blob_handle
+            .send_blob_effect(BlobEffect::ReleaseReservation { id: location.ulid })
+            .await,
+        Event::Blob(BlobEvent::ReservationReleased { .. })
+    ));
+
+    let mut stale = location.clone();
+    stale.hashes.clear();
+    stale.blob_size = 0;
+    assert!(!handler.reconcile_reservation(stale).await.unwrap());
+    assert_eq!(read_back(&handler, location).await, b"part bytes");
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("cleanup row read failed")
+    };
+    assert_eq!(
+        BlobCleanupWork::from_bytes(value.unwrap().as_ref()).unwrap(),
+        committed
+    );
+}
+
 #[test]
 fn registry_reads_config() {
     // The parsed backends file is the only source of names, classes and rules.

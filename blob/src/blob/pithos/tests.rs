@@ -446,7 +446,7 @@ async fn reservations_keep_pending() {
                 .await
                 .unwrap()
         );
-        assert!(!handler.marker_present(&location).await.unwrap());
+        assert!(handler.marker_matches(&location).await.unwrap().is_none());
         let operator = handler.operator_from_location(&location).unwrap();
         let path = location.get_storage_path().unwrap();
         assert_eq!(
