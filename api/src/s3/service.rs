@@ -348,7 +348,8 @@ impl S3 for ArunaS3Service {
                 placement_policy_generation: 0,
                 compression: Compression::Off,
             },
-        );
+        )
+        .mapped();
 
         drive(operation, &self.state)
             .await

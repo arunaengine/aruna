@@ -83,6 +83,8 @@ pub struct CreateImportOperation {
     backends: Vec<GroupStorage>,
     /// The move record committed with the rule when `move_existing` is set.
     moving: Option<CompressionMigration>,
+    /// Runs in a caller's transaction, which the caller commits or aborts.
+    nested: bool,
     output: Option<Result<BackendImport, ImportRuleError>>,
 }
 
@@ -97,7 +99,17 @@ impl CreateImportOperation {
             checked: Vec::new(),
             backends: Vec::new(),
             moving: None,
+            nested: false,
             output: None,
+        }
+    }
+
+    /// Writes the rule in the open transaction `txn_id` and leaves its commit to the caller.
+    pub fn within(input: CreateImportInput, txn_id: TxnId) -> Self {
+        Self {
+            txn_id: Some(txn_id),
+            nested: true,
+            ..Self::new(input)
         }
     }
 
@@ -199,6 +211,9 @@ impl CreateImportOperation {
 
     fn ensure_next(&mut self) -> Effects {
         let Some((backend_id, bucket)) = self.pending.first().cloned() else {
+            if let (true, Some(txn_id)) = (self.nested, self.txn_id) {
+                return self.read(txn_id);
+            }
             self.state = CreateState::Start;
             return smallvec![Effect::Storage(StorageEffect::StartTransaction {
                 read: false
@@ -577,6 +592,12 @@ impl Operation for CreateImportOperation {
                     next_start_after,
                 }),
             ) => self.scanned(values, next_start_after),
+            (CreateState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
+                if self.nested =>
+            {
+                self.state = CreateState::Finish;
+                smallvec![]
+            }
             (CreateState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
                 self.commit()
             }
@@ -605,6 +626,9 @@ impl Operation for CreateImportOperation {
     }
 
     fn abort(&mut self) -> Effects {
+        if self.nested {
+            return smallvec![];
+        }
         self.txn_id
             .take()
             .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])

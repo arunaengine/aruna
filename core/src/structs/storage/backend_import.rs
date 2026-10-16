@@ -19,6 +19,9 @@ pub const MAX_IMPORT_ERRORS: usize = 100;
 /// Write pattern of a rule that names none: a unique file per version.
 pub const DEFAULT_PATTERN: &str = "{dir}{id}_{name}";
 
+/// Write pattern of a provider bucket linked to a bucket: the bucket key, unchanged.
+pub const PLAIN_PATTERN: &str = "{dir}{name}";
+
 /// Registers the objects under `backend_prefix` of a group backend in `bucket` under
 /// `key_prefix`. The bytes stay where they are and Aruna never deletes them.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -68,6 +71,17 @@ impl BackendImport {
         let names = |folder: &str| path_bucket(folder) == Some(bucket);
         (self.backend_id == backend_id && names(&self.backend_prefix))
             || (self.write_backend() == backend_id && names(self.write_folder()))
+    }
+
+    /// The provider bucket this rule links whole to its whole bucket, with plain keys.
+    pub fn mapped_bucket(&self) -> Option<&str> {
+        let bucket = path_bucket(&self.backend_prefix)?;
+        (self.key_prefix.is_empty()
+            && self.backend_prefix.len() == bucket.len() + 1
+            && self.write_backend() == self.backend_id
+            && self.write_folder() == self.backend_prefix
+            && self.write_pattern == PLAIN_PATTERN)
+            .then_some(bucket)
     }
 
     /// Without `{id}` a write replaces the file of the same name.

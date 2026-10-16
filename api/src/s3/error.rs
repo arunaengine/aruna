@@ -9,6 +9,7 @@ use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::routing::RoutingError;
 use aruna_operations::blob::managed_copy::ManagedCopyError;
 use aruna_operations::driver::{GateContextError, RoutingInputsError};
+use aruna_operations::groups::imports::ImportRuleError;
 use aruna_operations::placement::policy::PolicyGateError;
 use aruna_operations::s3::bucket::cors::{DeleteCorsError, GetCorsError, PutCorsError};
 use aruna_operations::s3::bucket::create::CreateBucketError;
@@ -294,6 +295,12 @@ impl IntoS3Error for CreateBucketError {
     fn into_s3_error(self) -> S3Error {
         match self {
             CreateBucketError::BucketAlreadyExists => existing_bucket_error(),
+            CreateBucketError::ProviderBucket(
+                ImportRuleError::Invalid(reason) | ImportRuleError::Conflict(reason),
+            ) => s3_error!(
+                InvalidRequest,
+                "The provider bucket was not linked: {reason}"
+            ),
             err => internal_error(err),
         }
     }
