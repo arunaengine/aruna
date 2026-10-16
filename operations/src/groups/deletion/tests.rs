@@ -56,6 +56,14 @@ pub(super) fn context(path: &std::path::Path) -> DriverContext {
     }
 }
 
+pub(super) fn empty(kinds: &str) -> GroupDeletionError {
+    GroupDeletionError::NotEmpty {
+        kinds: kinds.into(),
+        buckets: Vec::new(),
+        more: false,
+    }
+}
+
 pub(super) fn node(seed: u8) -> aruna_core::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
@@ -333,7 +341,11 @@ async fn occupied_peer_refuses() {
     first.prepare(1).await.unwrap();
     assert_eq!(
         second.prepare(2).await,
-        Err(GroupDeletionError::NotEmpty("S3 buckets".into()))
+        Err(GroupDeletionError::NotEmpty {
+            kinds: "S3 buckets".into(),
+            buckets: vec!["owned".into()],
+            more: false,
+        })
     );
     for fixture in [&first, &second] {
         assert!(
@@ -524,10 +536,7 @@ async fn retained_backend_removed() {
         assert!(!matches!(event, Event::Storage(StorageEvent::Error { .. })));
     }
     // A reclaiming backend still has bytes to drain, so it blocks the deletion.
-    assert_eq!(
-        fixture.prepare(1).await,
-        Err(GroupDeletionError::NotEmpty("storage backends".into()))
-    );
+    assert_eq!(fixture.prepare(1).await, Err(empty("storage backends")));
 
     record.cleanup = CleanupStrategy::Retain;
     let writes = record_writes(&record).unwrap();
@@ -549,5 +558,113 @@ async fn retained_backend_removed() {
         (NODE_VAULT_KEYSPACE, entry.key().into()),
     ] {
         assert!(read(&fixture.context, space, key.to_vec()).await.is_none());
+    }
+}
+
+async fn seen(fixture: &Fixture, auth: &AuthContext, group_id: Ulid) -> Vec<String> {
+    let names = ["a", "b)x"].map(String::from).to_vec();
+    super::coordinator::visible(
+        &fixture.context,
+        auth,
+        group_id,
+        fixture.actor.node_id,
+        names,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn filters_names() {
+    let fixture = Fixture::new(&[1]).await;
+    let group_id = fixture.plan.group_id;
+    let both = ["a", "b)x"].map(String::from).to_vec();
+    assert_eq!(seen(&fixture, &fixture.auth, group_id).await, both);
+
+    // A caller without any role in the group sees no names.
+    let stranger = AuthContext {
+        user_id: UserId::local(Ulid::from_bytes([7; 16]), fixture.auth.realm_id),
+        ..fixture.auth.clone()
+    };
+    assert!(seen(&fixture, &stranger, group_id).await.is_empty());
+
+    // A group that no longer has an authorization document drops every name.
+    assert!(
+        seen(&fixture, &fixture.auth, Ulid::from_bytes([8; 16]))
+            .await
+            .is_empty()
+    );
+
+    // Group-wide READ does not reveal a bucket with its own DENY.
+    let key = group_id.to_bytes().to_vec();
+    let bytes = read(&fixture.context, AUTH_KEYSPACE, key.clone())
+        .await
+        .unwrap();
+    let mut document = GroupAuthorizationDocument::from_bytes(&bytes).unwrap();
+    let path = aruna_core::structs::storage::blob::bucket_permission_path(
+        fixture.auth.realm_id,
+        group_id,
+        fixture.actor.node_id,
+        "b)x",
+    );
+    for role in document.roles.values_mut() {
+        if role.assigned_users.contains(&fixture.auth.user_id) {
+            role.permissions.insert(
+                path.clone(),
+                aruna_core::structs::identity::auth::Permission::DENY,
+            );
+        }
+    }
+    let bytes = document.to_bytes(&fixture.actor).unwrap();
+    write(&fixture.context, AUTH_KEYSPACE, key, bytes).await;
+    assert_eq!(
+        seen(&fixture, &fixture.auth, group_id).await,
+        vec!["a".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn renders_refusals() {
+    let fixture = Fixture::new(&[1, 2]).await;
+    let group_id = fixture.plan.group_id;
+    let key = group_id.to_bytes().to_vec();
+    let bytes = read(&fixture.context, AUTH_KEYSPACE, key.clone())
+        .await
+        .unwrap();
+    let mut document = GroupAuthorizationDocument::from_bytes(&bytes).unwrap();
+    for node in [node(1), node(2)] {
+        let path = aruna_core::structs::storage::blob::bucket_permission_path(
+            fixture.auth.realm_id,
+            group_id,
+            node,
+            "hidden",
+        );
+        for role in document.roles.values_mut() {
+            role.permissions.insert(
+                path.clone(),
+                aruna_core::structs::identity::auth::Permission::DENY,
+            );
+        }
+    }
+    let bytes = document.to_bytes(&fixture.actor).unwrap();
+    write(&fixture.context, AUTH_KEYSPACE, key, bytes).await;
+    let reply = GroupDeletionError::NotEmpty {
+        kinds: "S3 buckets".into(),
+        buckets: vec!["shown".into(), "hidden".into()],
+        more: false,
+    };
+    // The local refusal and a peer refusal both pass through the coordinator filter.
+    for node in [node(1), node(2)] {
+        let error = super::coordinator::blocked(
+            &fixture.context,
+            &fixture.auth,
+            group_id,
+            node,
+            reply.clone(),
+        )
+        .await;
+        let GroupDeletionError::NotEmpty { kinds, .. } = error else {
+            panic!("expected a refusal, got {error:?}");
+        };
+        assert_eq!(kinds, format!("node {node}: S3 buckets (shown)"));
     }
 }

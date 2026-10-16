@@ -9,18 +9,20 @@ use std::time::SystemTime;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE};
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::group_delete::{
     GroupDeleteAction, GroupDeleteCertificate, GroupDeletePhase, GroupDeletePlan, GroupDeleteProof,
     GroupDeleteRecord, GroupDeletionError,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, admin_documents::AdminDocumentEvent};
 use futures_util::{StreamExt, stream};
 use ulid::Ulid;
 
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{ForwardAuthError, authorize_write};
 use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
@@ -28,6 +30,7 @@ use crate::placement::process_placements::load_realm_config;
 
 use super::commit::CommitOperation;
 use super::prepare::PrepareOperation;
+use super::resources::render;
 
 pub(super) fn coordinator(config: &RealmConfigDocument) -> Result<NodeId, GroupDeletionError> {
     config
@@ -110,6 +113,57 @@ async fn authorize(
         }
     }
     Err(GroupDeletionError::Unauthorized)
+}
+
+/// Keeps the bucket names the caller may read, as the S3 bucket listing does.
+/// Any authorization error drops the name.
+pub(super) async fn visible(
+    context: &DriverContext,
+    auth: &AuthContext,
+    group_id: GroupId,
+    node: NodeId,
+    names: Vec<String>,
+) -> Vec<String> {
+    let mut kept = Vec::new();
+    for name in names {
+        let path = bucket_permission_path(auth.realm_id, group_id, node, &name);
+        let read = crate::auth::request_authorization::authorize(
+            context,
+            auth.realm_id,
+            auth,
+            &path,
+            &Permission::READ,
+            PolicyRequestExtras::rest(),
+        )
+        .await;
+        if read.is_ok() {
+            kept.push(name);
+        }
+    }
+    kept
+}
+
+pub(super) async fn blocked(
+    context: &DriverContext,
+    auth: &AuthContext,
+    group_id: GroupId,
+    node: NodeId,
+    error: GroupDeletionError,
+) -> GroupDeletionError {
+    let GroupDeletionError::NotEmpty {
+        kinds,
+        buckets,
+        more,
+    } = error
+    else {
+        return error;
+    };
+    let names = visible(context, auth, group_id, node, buckets).await;
+    GroupDeletionError::NotEmpty {
+        kinds: format!("node {node}: {}", render(&kinds, &names, more)),
+        buckets: Vec::new(),
+        more: false,
+    }
 }
 
 pub async fn delete_group(
@@ -202,7 +256,7 @@ pub async fn delete_group(
     .await
     {
         cancel_plan(context, &plan).await?;
-        return Err(error);
+        return Err(blocked(context.as_ref(), &auth, group_id, net.node_id(), error).await);
     }
     let replies = stream::iter(plan.nodes.iter().copied().map(|node| {
         let plan = plan.clone();
@@ -234,12 +288,9 @@ pub async fn delete_group(
                     "node {node} did not confirm emptiness"
                 )))
             }
-            Err(GroupDeletionError::NotEmpty(reason)) => {
-                failure = Some(GroupDeletionError::NotEmpty(format!(
-                    "node {node}: {reason}"
-                )))
+            Err(error) => {
+                failure = Some(blocked(context.as_ref(), &auth, group_id, node, error).await)
             }
-            Err(error) => failure = Some(error),
         }
     }
     if let Some(error) = failure {

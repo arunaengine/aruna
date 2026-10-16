@@ -1046,8 +1046,9 @@ pub async fn delete_group(
             match error {
                 GroupDeletionError::Unauthorized => ServerError::Forbidden,
                 GroupDeletionError::NotFound => ServerError::NotFound,
-                GroupDeletionError::NotEmpty(reason) => {
-                    ServerError::Conflict(format!("group is not empty: {reason}"))
+                GroupDeletionError::NotEmpty { kinds, .. } => {
+                    warn!(%group_id, reason = %kinds, "group delete refused");
+                    ServerError::Conflict(format!("group is not empty: {kinds}"))
                 }
                 GroupDeletionError::Conflict(reason) => ServerError::Conflict(reason),
                 GroupDeletionError::Invalid(reason) => ServerError::BadRequestMessage(reason),

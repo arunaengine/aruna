@@ -149,8 +149,13 @@ pub enum GroupDeletionError {
     Unauthorized,
     #[error("group not found")]
     NotFound,
-    #[error("group is not empty: {0}")]
-    NotEmpty(String),
+    #[error("group is not empty: {kinds}")]
+    NotEmpty {
+        kinds: String,
+        /// Up to five blocking bucket names; `more` is set when others exist.
+        buckets: Vec<String>,
+        more: bool,
+    },
     #[error("group deletion unavailable: {0}")]
     Unavailable(String),
     #[error("group deletion conflict: {0}")]

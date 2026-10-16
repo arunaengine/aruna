@@ -322,9 +322,7 @@ async fn pending_metadata_refuses() {
     .await;
     assert_eq!(
         fixture.prepare(1).await,
-        Err(GroupDeletionError::NotEmpty(
-            "pending metadata creation".into()
-        ))
+        Err(super::tests::empty("pending metadata creation"))
     );
 }
 
