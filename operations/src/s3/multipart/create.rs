@@ -8,6 +8,7 @@ use crate::placement::policy::{
 };
 use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::object::put::abe::{abe_reads, parse_abe};
+use crate::s3::object::put::same_name_path;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -20,6 +21,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::abe::{AbeEffect, AbeEvent, EnvelopePlan, ObjectEnvelope};
+use aruna_core::structs::storage::backend_import::PlainPath;
 use aruna_core::structs::storage::blob::{BucketInfo, ResolvedBackend};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
@@ -43,6 +45,7 @@ pub enum CreateMultipartState {
     ReadBucketKey,
     PolicyGate,
     CheckOpenFence,
+    StatPlain,
     OpenUpload,
     ReadAbe,
     CreateEnvelope,
@@ -129,6 +132,8 @@ pub struct CreateMultipartOperation {
     stored_subject: u64,
     /// The provider upload opened for this record; aborted unless a commit may own it.
     backend_upload: Option<BackendUpload>,
+    /// The plain path and version id a same-name upload checks before it opens.
+    plain: Option<PlainPath>,
     /// Bucket and settings read before the gate, kept until the key record completes the plan.
     settings: Option<(Option<BucketInfo>, BucketEncryption)>,
     encryption: Option<UploadEncryption>,
@@ -153,6 +158,7 @@ impl CreateMultipartOperation {
             stored_policies: Vec::new(),
             stored_subject: 0,
             backend_upload: None,
+            plain: None,
             settings: None,
             encryption: None,
             envelope: None,
@@ -225,13 +231,61 @@ impl CreateMultipartOperation {
         let Some(resolved) = self.resolved.clone() else {
             return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
-        // A provider upload ends in Aruna's own layout; completion composes the plain path.
-        let (bucket, key) = (&self.input.bucket, &self.input.key);
-        if let Some(target) = self.input.routing.plain_target(bucket, key, Ulid::nil())
-            && target.backend == resolved.backend
-        {
-            return self.start_transaction();
+        // Under an import rule the provider upload ends at the plain path its version id names.
+        let (bucket, key, id) = (&self.input.bucket, &self.input.key, Ulid::generate());
+        let Some(target) = self
+            .input
+            .routing
+            .plain_target(bucket, key, id)
+            .filter(|target| target.backend == resolved.backend)
+        else {
+            return self.open_native(None);
+        };
+        let plain = PlainPath {
+            path: target.path.clone(),
+            ulid: id,
+            if_not_exists: false,
+        };
+        if !target.same_name {
+            return self.open_native(Some(plain));
         }
+        // A same-name upload picks its path as a single write does; completion checks it again.
+        self.plain = Some(plain);
+        self.state = CreateMultipartState::StatPlain;
+        smallvec![Effect::Blob(BlobEffect::StatPlain {
+            backend: target.backend,
+            path: target.path,
+        })]
+    }
+
+    fn plain_stat(&mut self, event: Event) -> Effects {
+        let Some(plain) = self.plain.take() else {
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+        };
+        match event {
+            Event::Blob(BlobEvent::PlainStat { exists, version }) => {
+                let (path, if_not_exists) =
+                    same_name_path(&plain.path, plain.ulid, exists, version.is_some());
+                self.open_native(Some(PlainPath {
+                    path,
+                    if_not_exists,
+                    ..plain
+                }))
+            }
+            Event::Blob(BlobEvent::Error(error)) => self.emit_error(error.into()),
+            event => self.emit_error(CreateMultipartError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Blob(BlobEvent::PlainStat)",
+                received: event,
+            }),
+        }
+    }
+
+    /// Backends without a provider upload answer `None`; their parts are composed instead.
+    fn open_native(&mut self, plain: Option<PlainPath>) -> Effects {
+        let Some(resolved) = self.resolved.clone() else {
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+        };
         self.state = CreateMultipartState::OpenUpload;
         smallvec![Effect::Blob(BlobEffect::OpenUpload {
             record_id: self.upload_id,
@@ -239,6 +293,7 @@ impl CreateMultipartOperation {
             key: self.input.key.clone(),
             resolved,
             created_by: self.input.created_by,
+            plain,
         })]
     }
 
@@ -651,6 +706,7 @@ impl Operation for CreateMultipartOperation {
             CreateMultipartState::ReadBucketKey => self.handle_bucket_key(event),
             CreateMultipartState::PolicyGate => self.handle_policy_gate(event),
             CreateMultipartState::CheckOpenFence => self.open_upload(event),
+            CreateMultipartState::StatPlain => self.plain_stat(event),
             CreateMultipartState::OpenUpload => self.upload_opened(event),
             CreateMultipartState::ReadAbe => self.abe_read(event),
             CreateMultipartState::CreateEnvelope => self.envelope_created(event),
@@ -704,6 +760,7 @@ mod pure_tests {
     use super::{CreateMultipartError, CreateMultipartInput, CreateMultipartOperation};
     use crate::groups::backends::BackendFenceError;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::errors::BlobError;
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::{
         ABE_PENDING_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE,
@@ -711,6 +768,7 @@ mod pure_tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::ChecksumAlgorithm;
     use aruna_core::structs::storage::abe::ObjectEnvelope;
+    use aruna_core::structs::storage::backend_import::{PlainPath, tagged_path};
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::encryption::{
         BucketEncryption, BucketKeyRecord, EncryptionMode, SealPlan,
@@ -1247,6 +1305,98 @@ mod pure_tests {
             Err(CreateMultipartError::BackendFenceError(
                 BackendFenceError::Unavailable
             ))
+        ));
+    }
+
+    /// An import rule writing `archive/` keys of `bucket` to `raw/` with `pattern`.
+    fn plain_create(pattern: &str) -> (CreateMultipartOperation, Effects) {
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let rule = aruna_core::structs::storage::backend_import::BackendImport {
+            import_id: Ulid::from_bytes([4u8; 16]),
+            group_id: Ulid::from_parts(1, 1),
+            backend_id,
+            backend_prefix: "raw/".to_string(),
+            bucket: "bucket".to_string(),
+            key_prefix: "archive/".to_string(),
+            schedule: None,
+            created_by: aruna_core::UserId::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: pattern.to_string(),
+        };
+        let snapshot = snapshot().with_group_inputs(GroupRoutingInputs {
+            default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+            backend_ids: BTreeSet::from([backend_id]),
+            imports: vec![rule],
+            ..Default::default()
+        });
+        let mut operation = CreateMultipartOperation::new(input(snapshot));
+        operation.start();
+        operation.step(ungoverned_bucket());
+        let effects = operation.step(fence_clear());
+        (operation, effects)
+    }
+
+    fn opened_plain(effects: &Effects) -> PlainPath {
+        match effects.as_slice() {
+            [
+                Effect::Blob(BlobEffect::OpenUpload {
+                    plain: Some(plain), ..
+                }),
+            ] => plain.clone(),
+            _ => panic!("expected a plain provider upload, got {effects:?}"),
+        }
+    }
+
+    #[test]
+    fn opens_plain_path() {
+        // A same-name upload looks at the path first and opens where a single write would go.
+        // A foreign file without versions keeps its path; the upload takes its tagged path.
+        let cases = [
+            (false, None, false, true),
+            (true, Some("v1".to_string()), false, false),
+            (true, None, true, true),
+        ];
+        for (exists, version, tagged, if_not_exists) in cases {
+            let (mut operation, effects) = plain_create("{dir}{name}");
+            assert!(
+                matches!(
+                    effects.as_slice(),
+                    [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "raw/one"
+                ),
+                "expected the path stat, got {effects:?}"
+            );
+            let effects = operation.step(Event::Blob(BlobEvent::PlainStat { exists, version }));
+            let plain = opened_plain(&effects);
+            let expected = match tagged {
+                true => tagged_path("raw/one", plain.ulid),
+                false => "raw/one".to_string(),
+            };
+            assert_eq!(plain.path, expected);
+            assert_eq!(plain.if_not_exists, if_not_exists);
+        }
+    }
+
+    #[test]
+    fn opens_versioned_path() {
+        // An `{id}` pattern names a path of its own, fixed by the version id picked now.
+        let (_, effects) = plain_create("{id}_{name}");
+        let plain = opened_plain(&effects);
+        assert_eq!(plain.path, format!("raw/{}_one", plain.ulid));
+    }
+
+    #[test]
+    fn plain_stat_fails() {
+        let (mut operation, _) = plain_create("{dir}{name}");
+        let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::KeyTooLong)));
+        assert!(effects.is_empty(), "nothing was opened yet: {effects:?}");
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateMultipartError::BlobError(BlobError::KeyTooLong))
         ));
     }
 
