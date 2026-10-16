@@ -178,6 +178,8 @@ pub enum IncomingVersionError {
     HopLimitExceeded,
     #[error("encrypted versions are not replicated")]
     EncryptedVersion,
+    #[error("A bucket stored 1:1 in a provider bucket cannot receive replicas yet.")]
+    MappedDestination,
     #[error("Reference replication manifest is missing source metadata")]
     MissingReferenceMetadata,
     #[error("Reference replication manifest is missing source binding")]
@@ -1126,6 +1128,11 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::MissingBlobInfo);
         };
         let hash = blob.hash;
+        let bucket = &self.manifest.bucket;
+        let mut imports = self.destination_inputs.imports.iter();
+        if imports.any(|rule| &rule.bucket == bucket && rule.mapped_bucket().is_some()) {
+            return self.reject_negotiation(IncomingVersionError::MappedDestination);
+        }
         // A full destination still probes, because a copy it already holds
         // costs it nothing; the cap only refuses the transfer itself.
         let backend = match self.resolve_destination() {

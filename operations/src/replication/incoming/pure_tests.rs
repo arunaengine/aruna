@@ -4178,3 +4178,54 @@ fn encrypted_replacement_quota() {
     op.start_commit_quota();
     assert_eq!(op.state, IncomingVersionState::UpdateUsage);
 }
+
+#[test]
+fn mapped_refuses_replicas() {
+    use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN};
+    let rule = BackendImport {
+        import_id: Ulid::from_parts(58, 58),
+        group_id: test_group_id(),
+        backend_id: Ulid::from_parts(59, 59),
+        backend_prefix: "team-a-bucket/".to_string(),
+        bucket: "bucket".to_string(),
+        key_prefix: String::new(),
+        schedule: None,
+        created_by: Default::default(),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        updated_at: std::time::SystemTime::UNIX_EPOCH,
+        last_job: None,
+        last_started_ms: None,
+        write_backend_id: None,
+        write_prefix: None,
+        write_pattern: PLAIN_PATTERN.to_string(),
+    };
+    let inputs = GroupRoutingInputs {
+        imports: vec![rule],
+        ..Default::default()
+    };
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(57, 57),
+        iroh::SecretKey::from_bytes(&[96; 32]).public(),
+        test_realm_id(),
+        make_manifest(ReplicationItemKind::Materialized),
+    );
+    let bucket_info = make_bucket_info(test_group_id());
+    op.manifest_policy = Some(op.target_authorization_path(bucket_info.group_id));
+    op.writer_policy = Some(op.target_authorization_path(bucket_info.group_id));
+    op.start();
+    op.step(bucket_read(Some(bucket_info.to_bytes().unwrap().into())));
+    load_routing(&mut op, inputs);
+    let mut effects = Default::default();
+    for _ in 0..2 {
+        effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+    }
+    // The refusal comes before any copy is probed or any byte is invited.
+    assert_eq!(op.state, IncomingVersionState::SendNegotiation);
+    expect_rejected_negotiation(
+        &effects[0],
+        "A bucket stored 1:1 in a provider bucket cannot receive replicas yet.",
+    );
+}
