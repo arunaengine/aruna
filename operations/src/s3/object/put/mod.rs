@@ -698,7 +698,7 @@ impl PutObjectOperation {
                     "the adopted blob sits on another backend".to_string(),
                 ));
             }
-            if location.format.encoding() != EncodingClass::from(resolved.compression) {
+            if location.format.encoding().setting() != EncodingClass::from(resolved.compression) {
                 return self.emit_error(PutObjectError::WriteFailed(
                     "the adopted blob uses another encoding".to_string(),
                 ));
@@ -885,7 +885,7 @@ impl PutObjectOperation {
         // migration may already have passed this key.
         let written = self
             .get_written_location()
-            .map(|location| location.format.encoding());
+            .map(|location| location.format.encoding().setting());
         if self.seal_plan.is_none()
             && current
                 .as_ref()
@@ -968,10 +968,6 @@ impl PutObjectOperation {
                     Ok(location) => location,
                     Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
                 };
-                if self.keeps_own(&existing_location, &written_location) {
-                    self.output = Some(Ok(written_location));
-                    return self.create_blob_location();
-                }
 
                 if !self.adopted && existing_location != written_location {
                     self.cleanup_location = Some(written_location);

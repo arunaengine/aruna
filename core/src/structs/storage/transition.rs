@@ -124,7 +124,8 @@ impl EncryptionTransition {
         let format = &location.format;
         let Some(plan) = self.target.plan else {
             let wanted = EncodingClass::from(self.target.compression);
-            return format.encryption != StoredEncryption::None || format.encoding() != wanted;
+            let encoding = format.encoding().setting();
+            return format.encryption != StoredEncryption::None || encoding != wanted;
         };
         if format.bucket_key() != Some(plan.key) {
             return true;

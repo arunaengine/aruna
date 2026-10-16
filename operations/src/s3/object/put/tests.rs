@@ -2296,28 +2296,39 @@ mod sealed {
     }
 }
 
-#[test]
-fn plain_keeps_own_copy() {
+#[tokio::test]
+async fn plain_owns_copy() {
+    use aruna_core::handle::Handle as _;
+    use aruna_core::structs::storage::blob::{BlobVersionState, ResolvedBackend};
+    use aruna_core::structs::storage::format::StoredLayout;
     use aruna_core::structs::storage::routing::PlainTarget;
+    let temp = tempdir().unwrap();
+    let storage = storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
     let backend = BackendRef::Group(Ulid::from_parts(2, 2));
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let node_id = iroh::SecretKey::generate().public();
-    let copy = |path: &str| BackendLocation {
-        backend: backend.clone(),
-        storage_bucket: String::new(),
-        backend_path: path.to_string(),
-        hashes: HashMap::from([(
-            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
-            vec![5; 32],
-        )]),
-        ..test_location(aruna_core::UserId::default())
+    // Two provider buckets on one storage hold the same bytes, each at its own tenant path.
+    let copy = |path: &str| {
+        let ulid = Ulid::generate();
+        BackendLocation {
+            backend: backend.clone(),
+            storage_bucket: String::new(),
+            backend_path: path.to_string(),
+            ulid,
+            format: StoredFormat {
+                layout: StoredLayout::Plain(ulid),
+                ..StoredFormat::default()
+            },
+            hashes: HashMap::from([(
+                aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+                vec![5; 32],
+            )]),
+            ..test_location(aruna_core::UserId::default())
+        }
     };
-    let written = copy("team-a-x/data/a.csv");
-    // A copy in another provider bucket stays its own; one in the same bucket is shared.
-    for (existing, keeps) in [
-        (copy("team-a-y/a.csv"), true),
-        (copy("team-a-x/b.csv"), false),
-    ] {
+    let mut committed = Vec::new();
+    for path in ["team-a-y/a.csv", "team-a-x/data/a.csv"] {
+        let written = copy(path);
         let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
         let target = PlainTarget {
             import_id: Ulid::generate(),
@@ -2327,20 +2338,43 @@ fn plain_keeps_own_copy() {
             listed: true,
         };
         op.version_id = Some(Ulid::generate());
-        let resolved =
-            aruna_core::structs::storage::blob::ResolvedBackend::new(backend.clone(), None);
-        op.start_plain(target, resolved);
-        op.state = PutObjectState::CheckHashLookup;
-        op.txn_id = Some(Ulid::generate());
+        op.start_plain(target, ResolvedBackend::new(backend.clone(), None));
+        op.txn_id = None;
         op.written_location = Some(written.clone());
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(existing.to_bytes().unwrap().into()),
-        }));
-        let kept = if keeps { &written } else { &existing };
+        // The lookup and the location row go through the storage, as in the commit.
+        let mut effects = op.start_hash_lookup();
+        while let Some(effect @ Effect::Storage(_)) = effects.pop() {
+            let event = storage.send_effect(effect).await;
+            if op.state != PutObjectState::CheckHashLookup {
+                break;
+            }
+            effects = op.step(event);
+        }
+        assert!(op.new_blob, "{path} must not adopt another copy");
         assert_eq!(
-            op.output.as_ref().map(|output| output.as_ref().ok()),
-            Some(Some(kept))
+            op.output.as_ref().and_then(|o| o.as_ref().ok()),
+            Some(&written)
         );
+        committed.push(written);
+    }
+    // Each version reads its own copy back; the other bucket's copy stays where it was.
+    for written in &committed {
+        let state = BlobVersionState::Materialized {
+            blob_hash: [5; 32],
+            backend: backend.clone(),
+            encoding: written.format.encoding(),
+            source: None,
+        };
+        let key = state.location_key().unwrap();
+        let event = storage
+            .send_effect(crate::blob::records::blob_location_read(&key, None))
+            .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = event
+        else {
+            panic!("missing location row: {event:?}");
+        };
+        assert_eq!(&BackendLocation::from_bytes(&value).unwrap(), written);
     }
 }

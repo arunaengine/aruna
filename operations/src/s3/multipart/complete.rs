@@ -1092,7 +1092,7 @@ impl CompleteUploadOperation {
         };
         // The compression changed after the provider upload opened: its original bytes are
         // composed again. The target row keeps the provider object until the upload is gone.
-        if EncodingClass::from(self.compression) != location.format.encoding()
+        if EncodingClass::from(self.compression) != location.format.encoding().setting()
             && self.in_place_target(&location)
         {
             return self.compose_parts(vec![location]);
@@ -1179,7 +1179,7 @@ impl CompleteUploadOperation {
         // migration may already have passed this key. A sealed copy checks its plan instead.
         if location.format.bucket_key().is_none()
             && bucket.as_ref().is_some_and(|bucket| {
-                EncodingClass::from(bucket.compression) != location.format.encoding()
+                EncodingClass::from(bucket.compression) != location.format.encoding().setting()
             })
         {
             return self.schedule_error(StorageError::TransactionConflict.into());

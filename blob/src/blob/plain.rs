@@ -14,7 +14,7 @@ use aruna_core::keyspaces::BACKEND_VERSION_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::storage::backend_import::{PlainPath, tagged_path, version_key};
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, ResolvedBackend};
-use aruna_core::structs::storage::format::{Compression, StoredFormat};
+use aruna_core::structs::storage::format::{Compression, StoredFormat, StoredLayout};
 use bytes::Bytes;
 use opendal::{ErrorKind, Operator};
 use std::collections::HashMap;
@@ -54,7 +54,10 @@ impl BlobHandler {
             storage_bucket: String::new(),
             backend_path: plain.path.clone(),
             ulid: plain.ulid,
-            format: StoredFormat::default(),
+            format: StoredFormat {
+                layout: StoredLayout::Plain(plain.ulid),
+                ..StoredFormat::default()
+            },
             created_by,
             created_at: SystemTime::now(),
             staging: false,
