@@ -687,7 +687,7 @@ dependencies = [
  "ulid 3.0.0",
  "unicode-normalization",
  "url",
- "zip 9.0.1",
+ "zip 9.0.3",
 ]
 
 [[package]]
@@ -10717,9 +10717,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.0.1"
+version = "9.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e49ade69c4434c55dd651d36fe05f38e0578db948b773cbc01c48c4b5e560692"
+checksum = "c2d98561b612a84ae525331a7a094429ef8a5772514ed507ff6db5f54badc971"
 dependencies = [
  "crc32fast",
  "indexmap",

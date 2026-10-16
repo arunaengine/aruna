@@ -17,6 +17,8 @@ ignore = [
     "RUSTSEC-2026-0194", # quick-xml quadratic parse via RDF stack (upstream craqle)
     "RUSTSEC-2026-0195", # quick-xml namespace allocation via RDF stack (upstream craqle)
     "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained via rudof_rdf/tabled (upstream craqle)
+    # Yanked; via ro-crate-rs (craqle) and the utoipa-swagger-ui build script, no zip 9 upstream yet
+    { crate = "zip@8.6.0", reason = "yanked; waiting for upstream to move to zip 9" },
 ]
 
 [licenses]
