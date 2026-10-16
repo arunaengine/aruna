@@ -293,6 +293,9 @@ async fn keeps_tenant_paths() {
     let cleanup = handler.clean_partial(None, true, Some(&operator), path, Some(&tenant));
     assert_eq!(cleanup.await, Ok(()));
     assert!(root.join("raw/a.txt").exists());
+    // Discarding an upload target at a tenant path keeps the file there.
+    assert_eq!(handler.discard_target(&tenant).await, Ok(()));
+    assert!(root.join("raw/a.txt").exists());
 }
 
 #[test]

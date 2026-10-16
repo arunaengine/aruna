@@ -5,6 +5,7 @@
 use super::BlobHandler;
 use super::backend::{build_backend_path, intent_key};
 use super::framed_parts::{Finished, part_level, streams_now};
+use super::io::backend_version;
 use crate::codec::Guard;
 use crate::hash::Hasher;
 use crate::part_chain::{PartAttempt, PartChain};
@@ -17,6 +18,7 @@ use aruna_core::handle::Handle as _;
 use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
+use aruna_core::structs::storage::backend_import::PlainPath;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, ResolvedBackend, WriteOwner,
 };
@@ -115,7 +117,11 @@ impl BlobHandler {
     }
 
     /// Removes an in-place target, every provider upload under its path and its reservation.
+    /// A tenant path may hold other files and uploads, so only its row goes.
     pub(super) async fn discard_target(&self, location: &BackendLocation) -> Result<(), BlobError> {
+        if location.is_external() {
+            return self.release_reservation(location).await;
+        }
         let path = self.object_path(location)?;
         let operator = self.operator_from_location(location)?;
         self.delete_path(&operator, &path).await?;
@@ -130,15 +136,22 @@ impl BlobHandler {
         key: &str,
         resolved: ResolvedBackend,
         created_by: UserId,
+        plain: Option<PlainPath>,
     ) -> BlobEvent {
         let root = match self.registry.config_for(&resolved.backend) {
             Ok(config) => config.root.clone(),
             Err(error) => return BlobEvent::Error(error),
         };
-        let ulid = Ulid::generate();
-        let backend_path = match build_backend_path(bucket, key, ulid) {
-            Ok(path) => path,
-            Err(error) => return BlobEvent::Error(BlobError::ConversionError(error)),
+        // An upload under an import rule ends at its tenant path, which takes no reservation.
+        let (ulid, backend_path) = match &plain {
+            Some(plain) => (plain.ulid, plain.path.clone()),
+            None => {
+                let ulid = Ulid::generate();
+                match build_backend_path(bucket, key, ulid) {
+                    Ok(path) => (ulid, path),
+                    Err(error) => return BlobEvent::Error(BlobError::ConversionError(error)),
+                }
+            }
         };
         let mut template = BackendLocation {
             backend: resolved.backend.clone(),
@@ -156,8 +169,8 @@ impl BlobHandler {
             hashes: HashMap::new(),
         };
         // Only S3 backends have a provider upload; the others keep one blob per part. The parts
-        // of a compressed upload record their frames in this layout.
-        if let Compression::Zstd { level } = resolved.compression {
+        // of a compressed upload record their frames in this layout; a tenant path keeps raw bytes.
+        if let (Compression::Zstd { level }, None) = (resolved.compression, &plain) {
             template.format.layout = StoredLayout::FramedPart(Box::new(PartLayout {
                 level,
                 frames: Vec::new(),
@@ -173,7 +186,11 @@ impl BlobHandler {
             }
             Err(error) => return BlobEvent::Error(error),
         }
-        let location = match self.reserve_bucket(&resolved.backend, &template).await {
+        let reserved = match plain {
+            Some(_) => Ok(template),
+            None => self.reserve_bucket(&resolved.backend, &template).await,
+        };
+        let location = match reserved {
             Ok(location) => location,
             Err(error) => return BlobEvent::Error(error),
         };
@@ -463,15 +480,16 @@ impl BlobHandler {
         parts: Vec<MultipartPart>,
         streamed: &[u16],
         compression: Compression,
+        if_not_exists: bool,
     ) -> BlobEvent {
         let Some(mut reservation) = self.hold_reservation(upload.location.ulid) else {
             return BlobEvent::Error(BlobError::WriteError(
                 "too many active blob reservations".to_string(),
             ));
         };
-        let finished = self.finish_upload(&upload, &parts, streamed, compression);
+        let finished = self.finish_upload(&upload, &parts, streamed, compression, if_not_exists);
         match Box::pin(finished).await {
-            Ok(location) => {
+            Ok((location, version)) => {
                 self.chains().remove(&upload.upload_id);
                 reservation.retain();
                 // A composed copy keeps its own reservation; the target row discards the target.
@@ -480,6 +498,9 @@ impl BlobHandler {
                 }
                 // The object is the only copy of the parts: its row keeps it for a retry.
                 match self.write_target_row(&location, upload.record_id).await {
+                    Ok(()) if location.is_external() => {
+                        BlobEvent::PlainWritten { location, version }
+                    }
                     Ok(()) => BlobEvent::WriteFinished { location },
                     Err(error) => BlobEvent::Error(error),
                 }
@@ -494,7 +515,8 @@ impl BlobHandler {
         parts: &[MultipartPart],
         streamed: &[u16],
         compression: Compression,
-    ) -> Result<BackendLocation, BlobError> {
+        if_not_exists: bool,
+    ) -> Result<(BackendLocation, Option<String>), BlobError> {
         let mut listed = Vec::with_capacity(parts.len());
         let mut etags = Vec::with_capacity(parts.len());
         for part in parts {
@@ -534,6 +556,7 @@ impl BlobHandler {
         };
         // The completion's reservation also covers the hash read of the framed object.
         let mut share = None;
+        let mut version = None;
         if let Some(level) = part_level(upload) {
             let finished = self.finish_framed(upload, parts, level, streamed, compression);
             match Box::pin(finished).await? {
@@ -541,22 +564,32 @@ impl BlobHandler {
                     location.format.layout = StoredLayout::Frames(Box::new(layout));
                     share = Some(held);
                 }
-                Finished::Composed(composed) => return Ok(*composed),
+                Finished::Composed(composed) => return Ok((*composed, None)),
             }
-        } else if let Err(error) = self
-            .assemble(&native, &path, upload, parts, etags.clone())
-            .await
-        {
-            // A completion whose answer was lost leaves the object. Only the ETag of exactly
-            // these parts proves it is this selection, not an earlier one of the same size.
-            let expected = multipart_etag(&etags);
-            match timeout(self.io_timeout(), operator.stat(&path)).await {
-                Ok(Ok(metadata))
-                    if metadata.content_length() == total
-                        && expected.is_some()
-                        && metadata.etag().map(|etag| etag.trim_matches('"'))
-                            == expected.as_deref() => {}
-                _ => return Err(error),
+        } else {
+            let assembled =
+                self.assemble(&native, &path, upload, parts, etags.clone(), if_not_exists);
+            match assembled.await {
+                Ok(id) => {
+                    let versioned = operator.info().capability().read_with_version;
+                    version = id.filter(|id| versioned && id != "null");
+                }
+                Err(error) => {
+                    // A completion whose answer was lost leaves the object. Only the ETag of
+                    // exactly these parts proves it is this selection, not an earlier one.
+                    let expected = multipart_etag(&etags);
+                    match timeout(self.io_timeout(), operator.stat(&path)).await {
+                        Ok(Ok(metadata))
+                            if metadata.content_length() == total
+                                && expected.is_some()
+                                && metadata.etag().map(|etag| etag.trim_matches('"'))
+                                    == expected.as_deref() =>
+                        {
+                            version = backend_version(&operator, &metadata);
+                        }
+                        _ => return Err(error),
+                    }
+                }
             }
         }
 
@@ -604,7 +637,7 @@ impl BlobHandler {
         }
         location.hashes = state.to_map();
         drop(share);
-        Ok(location)
+        Ok((location, version))
     }
 
     /// Copies staged replacements into the provider upload, then completes it.
@@ -615,7 +648,8 @@ impl BlobHandler {
         upload: &BackendUpload,
         parts: &[MultipartPart],
         mut etags: Vec<(u16, String)>,
-    ) -> Result<(), BlobError> {
+        if_not_exists: bool,
+    ) -> Result<Option<String>, BlobError> {
         for (slot, part) in etags.iter_mut().zip(parts) {
             if part.location.partial {
                 continue;
@@ -632,7 +666,9 @@ impl BlobHandler {
                 )
                 .await?;
         }
-        native.complete(path, &upload.upload_id, &etags).await
+        native
+            .complete(path, &upload.upload_id, &etags, if_not_exists)
+            .await
     }
 
     /// Frees the provider's parts and any object a lost completion left at the target. Parts
@@ -648,8 +684,11 @@ impl BlobHandler {
             timeout(self.io_timeout(), native.abort(&path, &upload.upload_id))
                 .await
                 .map_err(|_| BlobError::DeleteError("timed out aborting the upload".into()))??;
-            let operator = self.operator_from_location(&upload.location)?;
-            self.delete_path(&operator, &path).await?;
+            // A tenant path keeps what it holds; only Aruna's own target is deleted.
+            if !upload.location.is_external() {
+                let operator = self.operator_from_location(&upload.location)?;
+                self.delete_path(&operator, &path).await?;
+            }
             self.release_reservation(&upload.location).await?;
             // After the release, which removes the reservation row, so this work stays queued.
             self.queue_discard(&upload).await

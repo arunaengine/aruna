@@ -486,6 +486,7 @@ impl IntoS3Error for CompleteUploadError {
             CompleteUploadError::ManagedCopyError(ref error) => managed_copy_error(error),
             CompleteUploadError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
             CompleteUploadError::BlobError(BlobError::KeyTooLong) => long_key_error(),
+            CompleteUploadError::BlobError(BlobError::PathTaken) => path_taken_error(),
             CompleteUploadError::BlobError(ref error) => {
                 compose_failed_error(error, matches!(error, BlobError::ReadError(_)))
             }
