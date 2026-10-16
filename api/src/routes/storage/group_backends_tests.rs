@@ -4,7 +4,8 @@
 
 use super::{
     CleanupPolicy, CleanupStrategy, CreateBackendRequest, backend_reclaim_status,
-    create_group_backend, delete_group_backend, enable_group_backend, list_group_backends,
+    check_provider_bucket, create_group_backend, delete_group_backend, enable_group_backend,
+    list_group_backends,
 };
 use crate::error::ServerError;
 use crate::tests::storage_routing::setup_state;
@@ -59,7 +60,7 @@ async fn requires_group_admin() {
 async fn openapi_lists_enable() {
     let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
 
-    for path in ["enable", "reclaim/status"] {
+    for path in ["enable", "reclaim/status", "buckets/{bucket}"] {
         assert!(
             openapi["paths"]
                 .get(format!(
@@ -180,4 +181,51 @@ fn request_hides_secrets() {
     let text = format!("{request:?}");
     assert!(!text.contains("canary-8d4f"), "{text}");
     assert!(text.contains("secret_access_key"), "{text}");
+}
+
+#[tokio::test]
+async fn bucket_check_refuses() {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
+    let test = setup_state().await;
+    let check = |auth, backend_id: Ulid, bucket: &str| {
+        check_provider_bucket(
+            State(test.state.clone()),
+            Extension(Some(auth)),
+            Path((
+                test.group_id.to_string(),
+                backend_id.to_string(),
+                bucket.to_string(),
+            )),
+        )
+    };
+    let fixed = GroupStorage {
+        backend_id: Ulid::generate(),
+        group_id: test.group_id,
+        name: "fixed".to_string(),
+        kind: GroupBackendKind::S3,
+        public_config: HashMap::from([("bucket".to_string(), "data".to_string())]),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        updated_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: test.auth.user_id,
+        disabled: false,
+        cleanup: CleanupStrategy::Retain,
+    };
+    let writes = aruna_operations::groups::backends::record_writes(&fixed).unwrap();
+    test.state
+        .get_ctx()
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })
+        .await;
+
+    let other = check(test.other_auth.clone(), fixed.backend_id, "raw").await;
+    assert!(matches!(other, Err(ServerError::Forbidden)));
+    let missing = check(test.auth.clone(), Ulid::generate(), "raw").await;
+    assert!(matches!(missing, Err(ServerError::NotFound)));
+    // A fixed bucket holds every path, so there is no provider bucket to check.
+    let fixed = check(test.auth.clone(), fixed.backend_id, "raw").await;
+    assert!(matches!(fixed, Err(ServerError::BadRequestMessage(_))));
 }

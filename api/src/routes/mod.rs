@@ -323,6 +323,10 @@ pub(crate) mod tests {
             "GET",
             "/data/groups/{group_id}/storage/backends/{backend_id}/reclaim/status",
         ),
+        (
+            "GET",
+            "/data/groups/{group_id}/storage/backends/{backend_id}/buckets/{bucket}",
+        ),
         ("GET", "/data/groups/{group_id}/storage/routing"),
         ("GET", "/data/groups/{group_id}/storage/imports"),
         ("GET", "/data/groups/{group_id}/storage/imports/{import_id}"),
