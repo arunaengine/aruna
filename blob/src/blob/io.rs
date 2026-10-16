@@ -1716,6 +1716,9 @@ impl BlobHandler {
     }
 
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
+        if let Some(event) = super::plain::folder_read(&location) {
+            return event;
+        }
         if let StoredLayout::Pithos(_) = &location.format.layout {
             return BlobEvent::Error(super::pithos::needs_bucket_key());
         }
@@ -1818,6 +1821,9 @@ impl BlobHandler {
         location: BackendLocation,
         range: impl RangeBounds<u64>,
     ) -> BlobEvent {
+        if let Some(event) = super::plain::folder_read(&location) {
+            return event;
+        }
         if let StoredLayout::Pithos(_) = &location.format.layout {
             return BlobEvent::Error(super::pithos::needs_bucket_key());
         }

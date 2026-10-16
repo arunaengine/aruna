@@ -499,7 +499,7 @@ impl RoutingSnapshot {
         Some(PlainTarget {
             import_id: rule.import_id,
             backend: BackendRef::Group(backend),
-            same_name: rule.same_name(),
+            same_name: rule.same_name() && !path.ends_with('/'),
             listed: backend == rule.backend_id && path.starts_with(&rule.backend_prefix),
             path,
         })

@@ -178,6 +178,54 @@ async fn writes_plain_paths() {
 }
 
 #[tokio::test]
+async fn writes_folder_objects() {
+    use super::stream_from_bytes;
+    use aruna_core::structs::storage::backend_import::PlainPath;
+    use ulid::Ulid;
+
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let root = context._temp_dir.path().join("hot");
+    let resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
+    let plain = |path: &str| PlainPath {
+        path: path.to_string(),
+        ulid: Ulid::generate(),
+        if_not_exists: false,
+    };
+    let event = handler
+        .write_plain(
+            resolved.clone(),
+            plain("raw/reports/"),
+            test_user_id(),
+            stream_from_bytes(b""),
+        )
+        .await;
+    let BlobEvent::WriteFinished { location } = event else {
+        panic!("folder write failed: {event:?}")
+    };
+    assert!(root.join("raw/reports").is_dir());
+    assert_eq!(location.blob_size, 0);
+    assert!(location.hashes.contains_key(HASH_BLAKE3));
+    let BlobEvent::ReadFinished { stream_size, .. } = handler.read_blob(location).await else {
+        panic!("folder read failed")
+    };
+    assert_eq!(stream_size, 0);
+    // A folder object holds no bytes.
+    let event = handler
+        .write_plain(
+            resolved,
+            plain("raw/notes/"),
+            test_user_id(),
+            stream_from_bytes(b"x"),
+        )
+        .await;
+    assert!(
+        matches!(event, BlobEvent::Error(BlobError::WriteError(_))),
+        "{event:?}"
+    );
+}
+
+#[tokio::test]
 async fn reads_recorded_version() {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::handle::Handle as _;

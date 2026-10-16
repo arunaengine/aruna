@@ -372,8 +372,14 @@ mod tests {
             panic!("expected a plain path, got {effects:?}")
         };
         assert_eq!(path, "raw/data/a.csv");
+        // A folder key is written at its exact key, without looking first.
+        let (_, effects) = mapped("reports/");
+        let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
+            panic!("expected a folder write, got {effects:?}")
+        };
+        assert_eq!(plain.path, "raw/reports/");
         // Keys without a plain path are refused before any byte is written.
-        for key in ["reports/", "reports//a.csv"] {
+        for key in ["reports//a.csv", "reports//"] {
             let (operation, effects) = mapped(key);
             assert!(effects.is_empty(), "{key}: {effects:?}");
             assert!(

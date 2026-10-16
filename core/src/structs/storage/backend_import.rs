@@ -90,15 +90,19 @@ impl BackendImport {
     }
 
     /// The backend path of a write of `key` as version `id`; `None` outside `key_prefix`,
-    /// for a key without a file name and for a path that is not a plain relative path.
+    /// for a key without a file name except a folder key, and for a path that is not plain.
     pub fn plain_path(&self, key: &str, id: Ulid) -> Option<String> {
         let rest = key.strip_prefix(&self.key_prefix)?;
         let (dir, name) = match rest.rfind('/') {
             Some(slash) => rest.split_at(slash + 1),
             None => ("", rest),
         };
+        // A folder key, like `reports/`, keeps its exact name under the plain pattern only.
         if name.is_empty() {
-            return None;
+            let path = format!("{}{rest}", self.write_folder());
+            path.strip_suffix('/').filter(|folder| plain_safe(folder))?;
+            let plain = self.write_pattern == PLAIN_PATTERN && !rest.is_empty();
+            return plain.then_some(path);
         }
         let expanded = expand_pattern(&self.write_pattern, dir, name, id)?;
         let path = format!("{}{expanded}", self.write_folder());
@@ -395,6 +399,14 @@ mod tests {
             "imported/x//a.csv",
         ] {
             assert_eq!(path(DEFAULT_PATTERN, key), None, "{key}");
+        }
+        // Under the plain pattern a folder key keeps its exact name.
+        assert_eq!(
+            path(PLAIN_PATTERN, "imported/x/").as_deref(),
+            Some("raw/x/")
+        );
+        for key in ["imported/", "imported/x//"] {
+            assert_eq!(path(PLAIN_PATTERN, key), None, "{key}");
         }
         assert_eq!(path("{dir}{name}", "imported/../a.csv"), None);
         // A trimmed path would name another file.
