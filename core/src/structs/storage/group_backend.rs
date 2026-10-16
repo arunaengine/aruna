@@ -58,8 +58,12 @@ pub const PARTS_PREFIX: &str = "_aruna_parts";
 /// Public config key Aruna sets: the bucket of the default rule on a storage without a bucket.
 pub const DEFAULT_BUCKET: &str = "default_bucket";
 
-/// Public config key prefix Aruna sets per checked bucket: `created` or `found`.
+/// Public config key prefix Aruna sets per checked bucket: `created`, `found`, or
+/// `deleting` while Aruna removes a bucket it created.
 pub const BUCKET_STATE: &str = "bucket:";
+
+/// Bucket state while Aruna removes a provider bucket it created; no new rule may use it.
+pub const BUCKET_DELETING: &str = "deleting";
 
 /// Public config key prefix Aruna sets per bucket that ever held the default rule; Aruna's
 /// own files may still live there.
@@ -184,9 +188,14 @@ impl GroupStorage {
 
     /// Whether a deleted bucket also deletes its empty provider bucket, when Aruna created it.
     pub fn deletes_empty(&self, bucket: &str) -> bool {
-        let state = self.public_config.get(&format!("{BUCKET_STATE}{bucket}"));
         self.public_config.get(BUCKET_DELETE).map(String::as_str) == Some("delete_empty")
-            && state.map(String::as_str) == Some("created")
+            && self.bucket_state(bucket) == Some("created")
+    }
+
+    /// The recorded state of a checked bucket.
+    pub fn bucket_state(&self, bucket: &str) -> Option<&str> {
+        let state = self.public_config.get(&format!("{BUCKET_STATE}{bucket}"));
+        state.map(String::as_str)
     }
 
     /// The public config entries Aruna sets itself; a replaced record keeps them.

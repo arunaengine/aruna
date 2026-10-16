@@ -295,12 +295,18 @@ impl IntoS3Error for CreateBucketError {
     fn into_s3_error(self) -> S3Error {
         match self {
             CreateBucketError::BucketAlreadyExists => existing_bucket_error(),
-            CreateBucketError::ProviderBucket(
-                ImportRuleError::Invalid(reason) | ImportRuleError::Conflict(reason),
-            ) => s3_error!(
-                InvalidRequest,
-                "The provider bucket was not linked: {reason}"
-            ),
+            CreateBucketError::ProviderBucket(ImportRuleError::Invalid(reason)) => {
+                s3_error!(
+                    InvalidRequest,
+                    "The provider bucket was not linked: {reason}"
+                )
+            }
+            CreateBucketError::ProviderBucket(ImportRuleError::Conflict(reason)) => {
+                s3_error!(
+                    OperationAborted,
+                    "The provider bucket was not linked: {reason}"
+                )
+            }
             err => internal_error(err),
         }
     }

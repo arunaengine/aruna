@@ -21,7 +21,7 @@ use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
 use aruna_core::structs::storage::group_backend::{
-    BUCKET_STATE, GroupStorage, MAX_KEY_LEN, path_bucket, valid_bucket,
+    BUCKET_DELETING, BUCKET_STATE, GroupStorage, MAX_KEY_LEN, path_bucket, valid_bucket,
 };
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule};
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -495,7 +495,11 @@ impl CreateImportOperation {
                 .iter()
                 .filter(|(backend_id, ..)| *backend_id == record.backend_id)
                 .map(|(_, bucket, created)| {
-                    let state = if *created { "created" } else { "found" };
+                    // A bucket Aruna created stays its own when a later check finds it.
+                    let state = match *created || record.bucket_state(bucket) == Some("created") {
+                        true => "created",
+                        false => "found",
+                    };
                     (format!("{BUCKET_STATE}{bucket}"), state.to_string())
                 })
                 .collect::<Vec<_>>();
@@ -538,6 +542,13 @@ fn check_folder(storage: &GroupStorage, folder: &str) -> Result<Option<String>, 
     if let Some(bucket) = bucket.filter(|bucket| storage.layout_buckets().contains(bucket)) {
         return Err(ImportRuleError::Conflict(format!(
             "Bucket `{bucket}` holds Aruna's files of a default rule. Pick another bucket."
+        )));
+    }
+    if let Some(bucket) =
+        bucket.filter(|bucket| storage.bucket_state(bucket) == Some(BUCKET_DELETING))
+    {
+        return Err(ImportRuleError::Conflict(format!(
+            "Bucket `{bucket}` is still being removed. Try again in a minute."
         )));
     }
     if storage.is_reserved(folder) {
@@ -784,6 +795,44 @@ mod tests {
                 .map(String::as_str),
             Some("found")
         );
+    }
+
+    #[test]
+    fn deleting_bucket_refuses() {
+        let record = storage(&[
+            ("endpoint", "https://s3.lab"),
+            ("bucket:lab-raw", "deleting"),
+        ]);
+        let (operation, _) = on_split(input("lab-raw/2024/", "imported/"), &record);
+        assert!(matches!(failure(operation), ImportRuleError::Conflict(_)));
+    }
+
+    #[test]
+    fn keeps_created_state() {
+        // A bucket Aruna created stays its own when a later link finds it again.
+        let record = storage(&[
+            ("endpoint", "https://s3.lab"),
+            ("bucket:lab-raw", "created"),
+        ]);
+        let (mut operation, _) = on_split(input("lab-raw/2024/", "imported/"), &record);
+        operation.step(Event::Blob(BlobEvent::BucketReady { created: false }));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        let stored: Option<Value> = Some(record.to_bytes().unwrap().into());
+        operation.step(values(vec![
+            bucket_row(),
+            None,
+            stored.clone(),
+            None,
+            stored,
+        ]));
+        let effects = scan_page(&mut operation, &[]);
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one batch write, got {effects:?}")
+        };
+        let noted = GroupStorage::from_bytes(&writes[2].2).unwrap();
+        assert_eq!(noted.bucket_state("lab-raw"), Some("created"));
     }
 
     fn bucket_row() -> Option<Value> {

@@ -191,6 +191,27 @@ pub struct PlainPath {
     pub if_not_exists: bool,
 }
 
+/// What a removal mark does after the rows: delete this provider bucket while it is empty.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderCleanup {
+    pub backend_id: Ulid,
+    pub bucket: String,
+}
+
+impl ProviderCleanup {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    /// `None` for the empty value of a mark without a provider bucket.
+    pub fn from_mark(value: &[u8]) -> Result<Option<Self>, ConversionError> {
+        match value.is_empty() {
+            true => Ok(None),
+            false => Ok(Some(postcard::from_bytes(value)?)),
+        }
+    }
+}
+
 /// One object of a backend listing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExternalObject {

@@ -1,6 +1,6 @@
 //! Deletes a bucket only when it holds no objects, uploads or sync links, and fixes usage.
 //! Its bucket keys, holders and node vault keys go with it, and its unlocked keys are locked.
-//! Its provider bucket links go too; an empty provider bucket Aruna created may follow.
+//! Its provider bucket links go too; their removal marks may delete an empty provider bucket.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -17,10 +17,10 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
-use aruna_core::structs::storage::backend_import::BackendImport;
-use aruna_core::structs::storage::blob::{BackendRef, BlobHeadKey, BucketInfo, VersionKey};
+use aruna_core::structs::storage::backend_import::{BackendImport, ProviderCleanup};
+use aruna_core::structs::storage::blob::{BlobHeadKey, BucketInfo, VersionKey};
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRecord};
-use aruna_core::structs::storage::group_backend::{BUCKET_STATE, GroupStorage};
+use aruna_core::structs::storage::group_backend::{BUCKET_DELETING, BUCKET_STATE, GroupStorage};
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
@@ -95,8 +95,6 @@ pub struct DeleteBucketOperation {
     key_deletes: Vec<(String, Key)>,
     /// Rules that link this bucket whole to a provider bucket; they go with it.
     links: Vec<BackendImport>,
-    /// Empty provider buckets to delete after the commit.
-    providers: Vec<(ulid::Ulid, String)>,
     output: Option<Result<(), DeleteBucketError>>,
 }
 
@@ -116,7 +114,6 @@ impl DeleteBucketOperation {
             key_spaces: Vec::new(),
             key_deletes: Vec::new(),
             links: Vec::new(),
-            providers: Vec::new(),
             output: None,
         }
     }
@@ -483,8 +480,8 @@ impl DeleteBucketOperation {
         })]
     }
 
-    /// Drops the links with a removal mark for their rows. A provider bucket that Aruna
-    /// created on a `delete_empty` storage leaves the record and is deleted after the commit.
+    /// Drops the links with a removal mark for their rows. A provider bucket that Aruna created
+    /// on a `delete_empty` storage turns `deleting`, and its mark deletes it once it is empty.
     fn storages_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
@@ -494,6 +491,7 @@ impl DeleteBucketOperation {
             });
         };
         let mut writes: Vec<(String, Key, Value)> = Vec::new();
+        let mut providers = Vec::new();
         for (_, value) in values {
             let Some(value) = value else { continue };
             let mut record = match GroupStorage::from_bytes(&value) {
@@ -513,10 +511,14 @@ impl DeleteBucketOperation {
                 continue;
             }
             for bucket in buckets {
+                let state = format!("{BUCKET_STATE}{bucket}");
                 record
                     .public_config
-                    .remove(&format!("{BUCKET_STATE}{bucket}"));
-                self.providers.push((record.backend_id, bucket));
+                    .insert(state, BUCKET_DELETING.to_string());
+                providers.push(ProviderCleanup {
+                    backend_id: record.backend_id,
+                    bucket,
+                });
             }
             match crate::groups::backends::record_writes(&record) {
                 Ok(rows) => writes.extend(rows),
@@ -525,7 +527,15 @@ impl DeleteBucketOperation {
         }
         for rule in &self.links {
             let mark: Key = rule.import_id.to_bytes().to_vec().into();
-            writes.push((IMPORT_REMOVAL_KEYSPACE.to_string(), mark, Vec::new().into()));
+            let cleanup = providers.iter().find(|cleanup| {
+                cleanup.backend_id == rule.backend_id
+                    && rule.mapped_bucket() == Some(cleanup.bucket.as_str())
+            });
+            let value = match cleanup.map(ProviderCleanup::to_bytes).transpose() {
+                Ok(value) => value.unwrap_or_default(),
+                Err(error) => return self.emit_error(error.into()),
+            };
+            writes.push((IMPORT_REMOVAL_KEYSPACE.to_string(), mark, value.into()));
             self.key_deletes
                 .push((BACKEND_IMPORT_KEYSPACE.to_string(), rule.key()));
         }
@@ -652,12 +662,6 @@ impl DeleteBucketOperation {
                 after: std::time::Duration::ZERO,
             }));
         }
-        effects.extend(self.providers.drain(..).map(|(backend_id, bucket)| {
-            Effect::Blob(BlobEffect::DeleteEmptyBucket {
-                backend: BackendRef::Group(backend_id),
-                bucket,
-            })
-        }));
         effects
     }
 }
@@ -865,45 +869,52 @@ mod link_tests {
         (writes, deletes, effects)
     }
 
-    fn removes_provider(effects: &Effects) -> bool {
-        effects.iter().any(|effect| {
-            effect
-                == &Effect::Blob(BlobEffect::DeleteEmptyBucket {
-                    backend: BackendRef::Group(BACKEND),
-                    bucket: "team-a-x".to_string(),
-                })
-        })
+    /// The provider bucket the link's removal mark still has to delete.
+    fn mark_cleanup(writes: &[(String, Key, Value)]) -> Option<ProviderCleanup> {
+        let (_, _, value) = writes
+            .iter()
+            .find(|(space, ..)| space == IMPORT_REMOVAL_KEYSPACE)
+            .unwrap();
+        ProviderCleanup::from_mark(value).unwrap()
     }
 
     #[test]
     fn deletes_empty_provider() {
         let (writes, deletes, effects) = delete("delete_empty");
         assert!(deletes.contains(&(BACKEND_IMPORT_KEYSPACE.to_string(), rule().key())));
-        assert!(
-            writes
-                .iter()
-                .any(|(space, ..)| space == IMPORT_REMOVAL_KEYSPACE)
-        );
         let record = writes
             .iter()
             .find(|(space, ..)| space == STORAGE_BACKEND_KEYSPACE)
             .map(|(_, _, value)| GroupStorage::from_bytes(value).unwrap())
             .unwrap();
-        assert!(!record.public_config.contains_key("bucket:team-a-x"));
-        assert!(removes_provider(&effects));
+        // The state fences new links until the mark deleted the bucket.
+        assert_eq!(record.bucket_state("team-a-x"), Some(BUCKET_DELETING));
+        let cleanup = ProviderCleanup {
+            backend_id: BACKEND,
+            bucket: "team-a-x".to_string(),
+        };
+        assert_eq!(mark_cleanup(&writes), Some(cleanup));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Task(TaskEffect::ShortenTimer {
+                key: TaskKey::RunBackendImports,
+                ..
+            })
+        )));
     }
 
     #[test]
     fn keeps_provider_bucket() {
-        let (writes, deletes, effects) = delete("keep");
+        let (writes, deletes, _) = delete("keep");
         // The link goes either way; the provider bucket and its record stay.
         assert!(deletes.contains(&(BACKEND_IMPORT_KEYSPACE.to_string(), rule().key())));
+        let rows = writes.iter();
         assert!(
-            !writes
-                .iter()
+            !rows
+                .clone()
                 .any(|(space, ..)| space == STORAGE_BACKEND_KEYSPACE)
         );
-        assert!(!removes_provider(&effects));
+        assert_eq!(mark_cleanup(&writes), None);
     }
 }
 
