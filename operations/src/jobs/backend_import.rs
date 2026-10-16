@@ -27,6 +27,7 @@ use aruna_core::types::{Effects, Key, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use ulid::Ulid;
 
 use super::executor::{JobContext, JobRunOutcome};
@@ -136,11 +137,15 @@ async fn persist(ctx: &JobContext, checkpoint: &BackendImportCheckpoint) -> Resu
     .map_err(|error| error.to_string())
 }
 
+/// Longest time a run of skips goes without a persisted checkpoint.
+const SKIP_PERSIST: Duration = Duration::from_secs(2);
+
 pub async fn run_backend_import(ctx: &JobContext, spec: &BackendImportSpec) -> JobRunOutcome {
     let mut checkpoint = match read_checkpoint(&ctx.driver, ctx.job_id).await {
         Ok(checkpoint) => checkpoint.unwrap_or_default(),
         Err(error) => return retryable(error),
     };
+    let mut last = Instant::now();
     loop {
         let run = match prepare(ctx, spec).await {
             Ok(run) => run,
@@ -162,9 +167,12 @@ pub async fn run_backend_import(ctx: &JobContext, spec: &BackendImportSpec) -> J
                 Ok(counted) => counted,
                 Err(error) => return retryable(error),
             };
-            // Skips are cheap to repeat after a restart, so only real work is persisted at once.
-            if counted && let Err(error) = persist(ctx, &checkpoint).await {
-                return retryable(error);
+            // Real work is persisted at once; skips only every few seconds, to show progress.
+            if counted || last.elapsed() >= SKIP_PERSIST {
+                if let Err(error) = persist(ctx, &checkpoint).await {
+                    return retryable(error);
+                }
+                last = Instant::now();
             }
         }
         let done = next.is_none();
@@ -174,6 +182,7 @@ pub async fn run_backend_import(ctx: &JobContext, spec: &BackendImportSpec) -> J
         if let Err(error) = persist(ctx, &checkpoint).await {
             return retryable(error);
         }
+        last = Instant::now();
         if done {
             return JobRunOutcome::Succeeded(JobResultPayload::BackendImport {
                 imported: checkpoint.imported,
