@@ -162,7 +162,7 @@ pub struct ReclaimStatusResponse {
 
 /// Whether a provider bucket exists, and whether Aruna may write there.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct BucketCheckResponse {
+pub struct ProviderBucketResponse {
     pub bucket: String,
     pub exists: bool,
     /// A test write and delete worked; `null` when the bucket does not exist yet.
@@ -829,7 +829,7 @@ pub async fn backend_reclaim_status(
         (
             status = 200,
             description = "Whether the bucket exists and whether Aruna may write there",
-            body = BucketCheckResponse,
+            body = ProviderBucketResponse,
             example = json!({"bucket": "team-a-raw", "exists": true, "writable": true})
         ),
         (
@@ -855,7 +855,7 @@ pub async fn check_provider_bucket(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path((group_id, backend_id, bucket)): Path<(String, String, String)>,
-) -> ServerResult<Json<BucketCheckResponse>> {
+) -> ServerResult<Json<ProviderBucketResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
     let backend_id = Ulid::from_str(&backend_id).map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
@@ -877,7 +877,7 @@ pub async fn check_provider_bucket(
     let (exists, writable) = check_bucket(&context, backend_id, &bucket)
         .await
         .map_err(|error| ServerError::BadRequestMessage(error.reason()))?;
-    Ok(Json(BucketCheckResponse {
+    Ok(Json(ProviderBucketResponse {
         bucket,
         exists,
         writable,

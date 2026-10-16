@@ -695,9 +695,7 @@ mod tests {
     async fn checks_bucket_access() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
-        let operator = opendal::Operator::new(opendal::services::Fs::default().root(root))
-            .unwrap()
-            .finish();
+        let operator = opendal::Operator::new(opendal::services::Fs::default().root(root)).unwrap();
         let probed = probe(&operator, Ulid::nil(), "bucket", "team-a-raw").await;
         let answer = |exists, writable| BlobEvent::BucketExists { exists, writable };
         assert_eq!(bucket_answer(Some(probed)), answer(true, Some(true)));
