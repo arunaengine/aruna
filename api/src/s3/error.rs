@@ -486,7 +486,11 @@ impl IntoS3Error for CompleteUploadError {
             CompleteUploadError::ManagedCopyError(ref error) => managed_copy_error(error),
             CompleteUploadError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
             CompleteUploadError::BlobError(BlobError::KeyTooLong) => long_key_error(),
-            CompleteUploadError::BlobError(BlobError::PathTaken) => path_taken_error(),
+            // The parts cannot move to another path, so only a new upload can succeed.
+            CompleteUploadError::BlobError(BlobError::PathTaken) => s3_error!(
+                OperationAborted,
+                "Another file took this path first. Start a new upload."
+            ),
             CompleteUploadError::BlobError(ref error) => {
                 compose_failed_error(error, matches!(error, BlobError::ReadError(_)))
             }
@@ -775,6 +779,16 @@ mod tests {
                     .is_some_and(|text| text.contains("1024 bytes"))
             );
         }
+    }
+
+    #[test]
+    fn maps_taken_path() {
+        // A single write may retry; a multipart upload has to start over.
+        let put = PutObjectError::BlobWriteFailed(BlobError::PathTaken).into_s3_error();
+        assert_eq!(*put.code(), S3ErrorCode::ServiceUnavailable);
+        let complete = CompleteUploadError::BlobError(BlobError::PathTaken).into_s3_error();
+        assert_eq!(*complete.code(), S3ErrorCode::OperationAborted);
+        assert_eq!(complete.status_code(), Some(http::StatusCode::CONFLICT));
     }
 
     // A failed blob write maps to BadDigest (400) so SDKs do not retry it.
