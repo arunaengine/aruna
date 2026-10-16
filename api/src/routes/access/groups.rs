@@ -76,6 +76,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_group, update_group, delete_group))
         .routes(routes!(set_group_location))
         .routes(routes!(get_group_usage))
+        .routes(routes!(get_deletion_blockers))
         .routes(routes!(list_data_paths))
         .routes(routes!(list_group_members, add_group_member))
         .routes(routes!(remove_group_member))
@@ -1046,9 +1047,9 @@ pub async fn delete_group(
             match error {
                 GroupDeletionError::Unauthorized => ServerError::Forbidden,
                 GroupDeletionError::NotFound => ServerError::NotFound,
-                GroupDeletionError::NotEmpty { kinds, .. } => {
-                    warn!(%group_id, reason = %kinds, "group delete refused");
-                    ServerError::Conflict(format!("group is not empty: {kinds}"))
+                error @ GroupDeletionError::NotEmpty { .. } => {
+                    warn!(%group_id, reason = %error, "group delete refused");
+                    ServerError::Conflict(error.to_string())
                 }
                 GroupDeletionError::Conflict(reason) => ServerError::Conflict(reason),
                 GroupDeletionError::Invalid(reason) => ServerError::BadRequestMessage(reason),
@@ -1058,6 +1059,115 @@ pub async fn delete_group(
             }
         })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeletionBlockersResponse {
+    /// One entry per current realm node, ordered by node id.
+    pub nodes: Vec<NodeBlockers>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct NodeBlockers {
+    pub node_id: String,
+    /// Kinds of resources on this node that block the deletion; empty when none do.
+    pub kinds: Vec<String>,
+    /// Up to five blocking S3 bucket names the caller may read.
+    pub buckets: Vec<String>,
+    /// More blocking buckets exist than the names listed.
+    pub more: bool,
+    /// Set when the node did not answer the check; its kinds are then unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/access/groups/{id}/deletion-blockers",
+    tag = "access/groups",
+    summary = "List what blocks deleting a group",
+    description = r#"Asks every current realm node which resources would block deleting the group.
+
+**Authentication**: the same as deleting the group: realm bearer token without path restrictions,
+carrying WRITE on the group's administrative path or on the realm group-administration path.
+
+**Behavior**
+- Read-only: the check changes no state and does not start a deletion.
+- Each node lists the blocking resource kinds and the bucket names the caller may read.
+- A node that does not answer is listed with an `error` instead of failing the request."#,
+    params(("id" = String, Path, description = "Group id as a 26-character ULID")),
+    responses(
+        (
+            status = 200,
+            description = "Blocking resources per realm node",
+            body = DeletionBlockersResponse,
+            example = json!({
+                "nodes": [
+                    {
+                        "node_id": "k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga",
+                        "kinds": ["metadata documents", "S3 buckets"],
+                        "buckets": ["lab-data", "raw-scans"],
+                        "more": false
+                    },
+                    {
+                        "node_id": "pqcrmr2vpxjqx3nvxfvbxvvrgak5r2gmr7qeqfhqxhbpcpqoa2xh",
+                        "kinds": [],
+                        "buckets": [],
+                        "more": false,
+                        "error": "group deletion unavailable: node unreachable"
+                    }
+                ]
+            })
+        ),
+        (status = 400, description = "Invalid group identifier", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Caller may not administer this group", body = ErrorResponse),
+        (status = 404, description = "Group not found", body = ErrorResponse),
+        (status = 503, description = "This node cannot run the check", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_deletion_blockers(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+) -> ServerResult<Json<DeletionBlockersResponse>> {
+    use aruna_core::structs::identity::group_delete::GroupDeletionError;
+    let auth = require_unrestricted(auth)?;
+    if auth.realm_id != state.get_realm_id() {
+        return Err(ServerError::Forbidden);
+    }
+    let group_id = parse_group_id(&group_id)?;
+    let replies = aruna_operations::groups::deletion::check_group(&state.get_ctx(), auth, group_id)
+        .await
+        .map_err(|error| match error {
+            GroupDeletionError::Unauthorized => ServerError::Forbidden,
+            GroupDeletionError::NotFound => ServerError::NotFound,
+            error => ServerError::ServiceUnavailableReason(error.to_string()),
+        })?;
+    let nodes = replies
+        .into_iter()
+        .map(|(node, result)| {
+            let mut entry = NodeBlockers {
+                node_id: node.to_string(),
+                kinds: Vec::new(),
+                buckets: Vec::new(),
+                more: false,
+                error: None,
+            };
+            match result {
+                Ok(()) => {}
+                Err(GroupDeletionError::NotEmpty {
+                    kinds,
+                    buckets,
+                    more,
+                }) => (entry.kinds, entry.buckets, entry.more) = (kinds, buckets, more),
+                Err(error) => entry.error = Some(error.to_string()),
+            }
+            entry
+        })
+        .collect();
+    Ok(Json(DeletionBlockersResponse { nodes }))
 }
 
 fn map_rename_error(error: UpdateGroupError) -> ServerError {
