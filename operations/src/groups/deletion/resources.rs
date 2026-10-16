@@ -10,7 +10,6 @@ use aruna_core::keyspaces::*;
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::structs::execution::job::{JobFamilyRecord, JobRecordEnvelope};
 use aruna_core::structs::identity::group_delete::GroupDeletionError;
-use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
@@ -29,7 +28,6 @@ const TABLES: &[(&str, &str, bool)] = &[
     (S3_BUCKET_KEYSPACE, "S3 buckets", false),
     (STORAGE_BACKEND_KEYSPACE, "storage backends", false),
     (USER_ACCESS_KEYSPACE, "active S3 access keys", false),
-    (S3_SESSION_KEYSPACE, "active S3 sessions", false),
     (PLACEMENT_POLICY_KEYSPACE, "owned placement policies", false),
     (STORAGE_ROUTING_KEYSPACE, "default storage routing", true),
     (BACKEND_IMPORT_KEYSPACE, "backend imports", true),
@@ -133,11 +131,11 @@ impl EmptyCheck {
             }
             for (key, value) in values {
                 let owned = match space {
+                    // A finished job only waits for its retention purge, so it does not block.
                     JOB_KEYSPACE => {
-                        crate::jobs::store::decode_job_record(&value)?
-                            .payload
-                            .owner_group()
-                            == Some(self.group_id)
+                        let record = crate::jobs::store::decode_job_record(&value)?;
+                        record.payload.owner_group() == Some(self.group_id)
+                            && !record.state.is_terminal()
                     }
                     FAMILY_RECORD_KEYSPACE => {
                         let envelope: JobRecordEnvelope =
@@ -161,10 +159,6 @@ impl EmptyCheck {
                         record.group_id == self.group_id
                             && record.revoked_at.is_none()
                             && record.expiry > self.now
-                    }
-                    S3_SESSION_KEYSPACE => {
-                        let record = S3Session::from_bytes(&value)?;
-                        record.group_id == self.group_id && record.expiry > self.now
                     }
                     PLACEMENT_POLICY_KEYSPACE => {
                         PlacementPolicyDocument::from_bytes(&value)?

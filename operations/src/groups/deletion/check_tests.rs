@@ -187,3 +187,68 @@ fn check_finishes_first() {
         Err(GroupDeletionError::Unavailable(_))
     ));
 }
+
+#[tokio::test]
+async fn finished_jobs_pass() {
+    // A purge job a bucket delete leaves behind must not block the group until it expires.
+    use aruna_core::keyspaces::JOB_KEYSPACE;
+    use aruna_core::structs::execution::job::{
+        ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId,
+        JobPayload, JobRecord, JobState, RoCrateLimits,
+    };
+    use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
+    let fixture = Fixture::new(&[1]).await;
+    let group_id = fixture.plan.group_id;
+    let job_id = JobId::from_parts(
+        1_000,
+        PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
+        BucketId::new(0).unwrap(),
+        0,
+    )
+    .unwrap();
+    let payload = JobPayload::ImportRoCrate(ImportRoCrateSpec {
+        auth_context: fixture.auth.clone(),
+        source: ImportRoCrateSource::Upload {
+            upload_id: Ulid::from_bytes([3; 16]),
+        },
+        target: ImportRoCrateTarget {
+            bucket: "target".to_string(),
+            prefix: "crate".to_string(),
+        },
+        metadata: ImportMetadataTarget {
+            group_id,
+            path: "crate".to_string(),
+            public: false,
+        },
+        limits: RoCrateLimits::default(),
+        document_id: Ulid::from_bytes([5; 16]),
+    });
+    let mut record = JobRecord::new(
+        job_id,
+        payload,
+        fixture.auth.user_id,
+        node(1),
+        1_000,
+        1_000,
+        None,
+    );
+    let key = job_id.to_bytes().to_vec();
+    for (state, expected) in [
+        (JobState::Queued, Err(super::tests::empty("job records"))),
+        (JobState::Succeeded, Ok(())),
+    ] {
+        record.state = state;
+        write(
+            &fixture.context,
+            JOB_KEYSPACE,
+            key.clone(),
+            record.to_bytes().unwrap(),
+        )
+        .await;
+        assert_eq!(
+            scan(&fixture.context, &fixture.auth, group_id, node(1)).await,
+            expected
+        );
+    }
+}
