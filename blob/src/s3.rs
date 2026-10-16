@@ -462,7 +462,8 @@ async fn head_bucket(client: &Client, bucket: &str) -> Result<bool, BlobError> {
     }
 }
 
-/// Deletes `bucket` only while it holds no object; answers whether it was deleted.
+/// Deletes `bucket` only while it holds no object; answers whether it is gone. A missing
+/// bucket counts as deleted, since an earlier attempt may have deleted it already.
 pub async fn delete_empty(
     config: &HashMap<String, String>,
     bucket: &str,
@@ -474,11 +475,13 @@ pub async fn delete_empty(
     match listed {
         Ok(listed) if !listed.contents().is_empty() => return Ok(false),
         Ok(_) => {}
+        Err(error) if status(&error) == Some(404) => return Ok(true),
         Err(error) => return Err(bucket_error(bucket, "list", &error)),
     }
     // A bucket with old object versions answers 409 and stays.
     match client.delete_bucket().bucket(bucket).send().boxed().await {
         Ok(_) => Ok(true),
+        Err(error) if status(&error) == Some(404) => Ok(true),
         Err(error) if status(&error) == Some(409) => Ok(false),
         Err(error) => Err(bucket_error(bucket, "delete", &error)),
     }
@@ -597,6 +600,46 @@ mod tests {
             .expect_err("handshake against a closed socket must fail");
 
         assert!(matches!(err, SdkError::DispatchFailure(_)), "{err:?}");
+    }
+
+    /// Answers every request with `status` and an S3 error `code`.
+    async fn answering(status: &'static str, code: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = vec![0u8; 8192];
+                let _ = stream.read(&mut buffer).await;
+                let body = format!("<Error><Code>{code}</Code></Error>");
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn missing_bucket_deleted() {
+        let guard = EgressGuard::new(aruna_core::egress::EgressPolicy::loopback()).unwrap();
+        let config = |endpoint: String| {
+            HashMap::from([
+                ("endpoint".to_string(), endpoint),
+                ("region".to_string(), "us-east-1".to_string()),
+                ("access_key_id".to_string(), "key".to_string()),
+                ("secret_access_key".to_string(), "secret".to_string()),
+            ])
+        };
+        // An earlier attempt deleted the bucket, so the cleanup is done.
+        let gone = config(answering("404 Not Found", "NoSuchBucket").await);
+        assert_eq!(delete_empty(&gone, "team-a-x", &guard).await, Ok(true));
+        // Any other refusal stays an error, so the cleanup is tried again.
+        let denied = config(answering("403 Forbidden", "AccessDenied").await);
+        assert!(delete_empty(&denied, "team-a-x", &guard).await.is_err());
     }
 
     #[test]
