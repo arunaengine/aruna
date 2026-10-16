@@ -476,8 +476,8 @@ async fn register_dht(
 }
 
 async fn delete_blob(context: &DriverContext, location: BackendLocation) -> bool {
-    // An imported object is never Aruna's to delete; the row is settled without it.
-    if location.is_external() {
+    // An imported object is never Aruna's to delete; a part still ends its provider part claim.
+    if location.is_external() && !location.partial {
         return true;
     }
     let Some(blob_handle) = context.blob_handle.as_ref() else {
