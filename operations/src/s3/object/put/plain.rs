@@ -229,12 +229,11 @@ impl PlainRecord<'_> {
         &self,
         rule_exists: bool,
     ) -> Result<Vec<(String, Key, Value)>, ConversionError> {
-        let mut writes = Vec::new();
-        if let Some(version) = self.version {
-            let key = version_key(self.written.ulid);
-            let value = version.as_bytes().to_vec().into();
-            writes.push((BACKEND_VERSION_KEYSPACE.to_string(), key, value));
-        }
+        let mut writes: Vec<_> = self
+            .version
+            .map(|version| version_row(self.written, version))
+            .into_iter()
+            .collect();
         if self.target.listed && rule_exists {
             let row = ImportedObject::written(
                 self.version_id,
@@ -250,6 +249,16 @@ impl PlainRecord<'_> {
         }
         Ok(writes)
     }
+}
+
+/// Pins a plain object to the backend version it was written as.
+pub(crate) fn version_row(written: &BackendLocation, version: &str) -> (String, Key, Value) {
+    let value = version.as_bytes().to_vec().into();
+    (
+        BACKEND_VERSION_KEYSPACE.to_string(),
+        version_key(written.ulid),
+        value,
+    )
 }
 
 #[cfg(test)]

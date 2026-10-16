@@ -2615,7 +2615,7 @@ mod decision_tests {
 
 mod plain;
 
-pub(crate) use plain::{PlainRecord, same_name_path};
+pub(crate) use plain::{PlainRecord, same_name_path, version_row};
 
 #[path = "abe.rs"]
 pub(crate) mod abe;
