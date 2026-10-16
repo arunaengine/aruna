@@ -61,6 +61,7 @@ pub(super) fn empty(kinds: &str) -> GroupDeletionError {
         kinds: vec![kinds.into()],
         buckets: Vec::new(),
         more: false,
+        hidden: 0,
     }
 }
 
@@ -345,6 +346,7 @@ async fn occupied_peer_refuses() {
             kinds: vec!["S3 buckets".into()],
             buckets: vec!["owned".into()],
             more: false,
+            hidden: 0,
         })
     );
     for fixture in [&first, &second] {
@@ -651,6 +653,7 @@ async fn renders_refusals() {
         kinds: vec!["S3 buckets".into()],
         buckets: vec!["shown".into(), "hidden".into()],
         more: false,
+        hidden: 0,
     };
     // The local refusal and a peer refusal both pass through the coordinator filter.
     for node in [node(1), node(2)] {
@@ -667,13 +670,16 @@ async fn renders_refusals() {
         };
         assert_eq!(
             kinds,
-            [format!("node {node}: S3 buckets (shown, and more)")]
+            [format!(
+                "node {node}: S3 buckets (shown, 1 you cannot read)"
+            )]
         );
     }
     let readable = GroupDeletionError::NotEmpty {
         kinds: vec!["S3 buckets".into()],
         buckets: vec!["shown".into()],
         more: false,
+        hidden: 0,
     };
     let error =
         super::coordinator::blocked(&fixture.context, &fixture.auth, group_id, node(1), readable)

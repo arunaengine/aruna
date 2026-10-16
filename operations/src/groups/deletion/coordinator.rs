@@ -154,17 +154,22 @@ pub(super) async fn blocked(
         kinds,
         buckets,
         more,
+        hidden,
     } = error
     else {
         return error;
     };
     let count = buckets.len();
     let names = visible(context, auth, group_id, node, buckets).await;
-    let more = more || names.len() < count;
+    let hidden = hidden + (count - names.len()) as u64;
     GroupDeletionError::NotEmpty {
-        kinds: vec![format!("node {node}: {}", render(&kinds, &names, more))],
+        kinds: vec![format!(
+            "node {node}: {}",
+            render(&kinds, &names, hidden, more)
+        )],
         buckets: Vec::new(),
         more: false,
+        hidden: 0,
     }
 }
 

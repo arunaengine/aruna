@@ -59,11 +59,12 @@ fn stranger(fixture: &Fixture) -> AuthContext {
     auth
 }
 
-fn blocked(names: &[&str], more: bool) -> Result<(), GroupDeletionError> {
+fn blocked(names: &[&str], more: bool, hidden: u64) -> Result<(), GroupDeletionError> {
     Err(GroupDeletionError::NotEmpty {
         kinds: vec!["S3 buckets".into()],
         buckets: names.iter().map(|name| name.to_string()).collect(),
         more,
+        hidden,
     })
 }
 
@@ -79,10 +80,10 @@ async fn check_changes_nothing() {
     assert_eq!(keyspaces(&fixture), before);
     buckets(&fixture, 1, &["shown", "hidden"]).await;
     let before = keyspaces(&fixture);
-    // The denied name is dropped, so `more` says a blocking bucket stays unnamed.
+    // The denied name is dropped and counted as hidden.
     assert_eq!(
         scan(&fixture.context, &fixture.auth, group_id, node(1)).await,
-        blocked(&["shown"], true)
+        blocked(&["shown"], false, 1)
     );
     let fence = MembershipFence::key(fixture.plan.realm_id).to_vec();
     for key in [group_id.to_bytes().to_vec(), fence] {
@@ -102,12 +103,12 @@ async fn check_names_buckets() {
     buckets(&fixture, 1, &["b-1", "b-2"]).await;
     assert_eq!(
         scan(&fixture.context, &fixture.auth, group_id, node(1)).await,
-        blocked(&["b-1", "b-2"], false)
+        blocked(&["b-1", "b-2"], false, 0)
     );
     buckets(&fixture, 1, &["b-3", "b-4", "b-5", "b-6"]).await;
     assert_eq!(
         scan(&fixture.context, &fixture.auth, group_id, node(1)).await,
-        blocked(&["b-1", "b-2", "b-3", "b-4", "b-5"], true)
+        blocked(&["b-1", "b-2", "b-3", "b-4", "b-5"], true, 0)
     );
 }
 
@@ -161,7 +162,7 @@ async fn check_scans_devices() {
     // A device without the row still scans; the stranger may not read the name.
     assert_eq!(
         check_node(&context, &config, &auth, group_id, node(1)).await,
-        blocked(&[], true)
+        blocked(&[], false, 1)
     );
 }
 

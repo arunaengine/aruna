@@ -121,7 +121,8 @@ async fn check_reports_nodes() {
         Err(GroupDeletionError::NotEmpty {
             kinds: vec!["S3 buckets".into()],
             buckets: vec!["owned".into()],
-            more: true,
+            more: false,
+            hidden: 1,
         })
     );
     assert!(matches!(reply(3), Err(GroupDeletionError::Unavailable(_))));
