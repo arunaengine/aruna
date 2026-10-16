@@ -609,11 +609,9 @@ async fn owns_write(
         }
         WriteOwner::UploadPart { .. } => MultipartPart::from_bytes(&value).ok()?.location,
         WriteOwner::Upload { .. } | WriteOwner::CompletedUpload { .. } => {
+            // An aborting upload still owns its target: a failed abort reopens it for a
+            // completion, and the abort itself, also when resumed, removes the target.
             let record = MultipartUpload::from_bytes(&value).ok()?;
-            // An aborting upload gives its target up, so late provider parts are aborted too.
-            if record.status == MultipartUploadStatus::Aborting {
-                return Some(false);
-            }
             match record.backend_upload {
                 Some(upload) => upload.location,
                 None => return Some(false),
@@ -874,11 +872,8 @@ mod tests {
 
     #[tokio::test]
     async fn upload_keeps_target() {
-        // An open upload keeps its in-place target for a retry; an aborting one gives it up.
-        for (status, kept) in [
-            (MultipartUploadStatus::Open, true),
-            (MultipartUploadStatus::Aborting, false),
-        ] {
+        // An upload keeps its in-place target, also while aborting: a failed abort reopens it.
+        for status in [MultipartUploadStatus::Open, MultipartUploadStatus::Aborting] {
             let (_dir, storage, context) = setup_context();
             let BlobCleanupWork::DeleteBlob { mut location } =
                 BlobCleanupWork::from_bytes(&delete_work()).unwrap()
@@ -930,11 +925,10 @@ mod tests {
 
             let outcome = process_cleanup_batch(&context).await.unwrap();
 
-            // A kept row is the target's reservation and stays; a discard needs the blob handle
-            // this context lacks, so it fails and the row waits.
+            // A kept row is the target's reservation and stays.
             assert_eq!(outcome.processed, 0);
-            assert_eq!(outcome.kept, usize::from(kept));
-            assert_eq!(outcome.failed, usize::from(!kept));
+            assert_eq!(outcome.kept, 1);
+            assert_eq!(outcome.failed, 0);
             assert_eq!(remaining_rows(&storage).await, 1);
         }
     }
