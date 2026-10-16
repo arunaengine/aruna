@@ -596,6 +596,12 @@ impl BlobHandler {
                         {
                             version = backend_version(&operator, &metadata);
                         }
+                        // A later write at a tenant path may have replaced it as newest bytes.
+                        _ if upload.location.is_external() => {
+                            let etag = expected.as_deref().unwrap_or_default();
+                            let found = self.completed_version(&operator, &path, etag, total);
+                            version = Some(found.await.ok_or(error)?);
+                        }
                         _ => return Err(error),
                     }
                 }
@@ -649,6 +655,32 @@ impl BlobHandler {
         location.hashes = state.to_map();
         drop(share);
         Ok((location, version))
+    }
+
+    /// The provider version of `path` assembled from the parts with `etag`, found among all
+    /// versions. `None` where the backend lists no versions.
+    async fn completed_version(
+        &self,
+        operator: &opendal::Operator,
+        path: &str,
+        etag: &str,
+        size: u64,
+    ) -> Option<String> {
+        let capability = operator.info().capability();
+        if etag.is_empty() || !capability.list_with_versions || !capability.read_with_version {
+            return None;
+        }
+        let listed = operator.list_with(path).versions(true);
+        let entries = timeout(self.io_timeout(), listed).await.ok()?.ok()?;
+        entries.into_iter().find_map(|entry| {
+            let metadata = entry.metadata();
+            let found = entry.path() == path
+                && metadata.content_length() == size
+                && metadata.etag().map(|tag| tag.trim_matches('"')) == Some(etag);
+            found
+                .then(|| metadata.version().map(str::to_string))
+                .flatten()
+        })
     }
 
     /// Copies staged replacements into the provider upload, then completes it.
