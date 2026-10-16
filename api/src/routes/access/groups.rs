@@ -1074,7 +1074,7 @@ pub struct NodeBlockers {
     pub kinds: Vec<String>,
     /// Up to five blocking S3 bucket names the caller may read.
     pub buckets: Vec<String>,
-    /// More blocking buckets exist than the names listed.
+    /// Some blocking bucket is not named: more than five exist, or the caller may not read it.
     pub more: bool,
     /// Set when the node did not answer the check; its kinds are then unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1094,7 +1094,11 @@ carrying WRITE on the group's administrative path or on the realm group-administ
 **Behavior**
 - Read-only: the check changes no state and does not start a deletion.
 - Each node lists the blocking resource kinds and the bucket names the caller may read.
-- A node that does not answer is listed with an `error` instead of failing the request."#,
+- `more` is true when some blocking bucket is not named.
+- A node that does not answer is listed with an `error` instead of failing the request.
+
+**Limits**
+- Only server and management nodes run the check; a device returns 503."#,
     params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
         (
