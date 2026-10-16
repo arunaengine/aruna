@@ -817,7 +817,9 @@ mod link_tests {
 
     /// Deletes bucket `x` linked to `team-a-x`; answers the link writes, the deletes and the
     /// effects after the commit.
-    fn delete(mode: &str) -> (Vec<(String, Key, Value)>, Vec<(String, Key)>, Effects) {
+    type Deleted = (Vec<(String, Key, Value)>, Vec<(String, Key)>, Effects);
+
+    fn delete(mode: &str) -> Deleted {
         let txn_id = TxnId::default();
         let mut operation = DeleteBucketOperation::new("x".to_string());
         operation.start();
