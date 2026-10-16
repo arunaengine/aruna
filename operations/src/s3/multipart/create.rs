@@ -229,6 +229,10 @@ impl CreateMultipartOperation {
         };
         // A provider upload ends in Aruna's own layout; completion composes the plain path.
         let (bucket, key) = (&self.input.bucket, &self.input.key);
+        // A folder object holds no bytes, so no upload can compose one.
+        if key.ends_with('/') && self.input.routing.mapped(bucket) {
+            return self.emit_error(CreateMultipartError::Unmapped);
+        }
         if let Some(target) = self.input.routing.plain_target(bucket, key, Ulid::nil())
             && target.backend == resolved.backend
         {
@@ -811,11 +815,11 @@ mod pure_tests {
     #[test]
     fn mapped_refuses_layout() {
         use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN};
-        let mut snapshot = snapshot();
-        snapshot.imports = vec![BackendImport {
+        let backend_id = Ulid::from_parts(6, 6);
+        let rule = BackendImport {
             import_id: Ulid::from_parts(5, 5),
-            group_id: snapshot.group_id,
-            backend_id: Ulid::from_parts(6, 6),
+            group_id: snapshot().group_id,
+            backend_id,
             backend_prefix: "team-a-bucket/".to_string(),
             bucket: "bucket".to_string(),
             key_prefix: String::new(),
@@ -828,19 +832,38 @@ mod pure_tests {
             write_backend_id: None,
             write_prefix: None,
             write_pattern: PLAIN_PATTERN.to_string(),
-        }];
-        let mut input = input(snapshot);
-        input.key = "reports/".to_string();
-        let mut operation = CreateMultipartOperation::new(input);
-        operation.start();
-        operation.step(ungoverned_bucket());
-        // No provider upload opens for a key the mapped bucket cannot store 1:1.
-        let effects = operation.step(fence_clear());
-        assert!(effects.is_empty(), "{effects:?}");
+        };
+        // The upload resolves to the mapped storage itself, as a real mapped bucket does.
+        let created = |key: &str| {
+            let snapshot = snapshot().with_group_inputs(GroupRoutingInputs {
+                default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+                backend_ids: BTreeSet::from([backend_id]),
+                imports: vec![rule.clone()],
+                ..Default::default()
+            });
+            let mut input = input(snapshot);
+            input.key = key.to_string();
+            let mut operation = CreateMultipartOperation::new(input);
+            operation.start();
+            operation.step(ungoverned_bucket());
+            let effects = operation.step(fence_clear());
+            (operation, effects)
+        };
+        // A plain key composes at its exact key without a provider upload.
+        let (_, effects) = created("data/a.csv");
         assert!(matches!(
-            operation.finalize(),
-            Err(CreateMultipartError::Unmapped)
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
         ));
+        // A folder key or a key without a plain path never opens an upload.
+        for key in ["reports/", "reports//a.csv"] {
+            let (operation, effects) = created(key);
+            assert!(effects.is_empty(), "{key}: {effects:?}");
+            assert!(matches!(
+                operation.finalize(),
+                Err(CreateMultipartError::Unmapped)
+            ));
+        }
     }
 
     #[test]
