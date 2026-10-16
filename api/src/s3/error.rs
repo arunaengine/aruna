@@ -350,6 +350,7 @@ impl IntoS3Error for ListVersionsError {
 impl IntoS3Error for PutObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
+            error @ PutObjectError::Unmapped => s3_error!(InvalidArgument, "{error}"),
             PutObjectError::ChecksumMismatch(algorithm) => {
                 checksum_mismatch_logged(algorithm, "PutObject")
             }
@@ -376,6 +377,7 @@ impl IntoS3Error for PutObjectError {
 impl IntoS3Error for CreateMultipartError {
     fn into_s3_error(self) -> S3Error {
         match self {
+            error @ CreateMultipartError::Unmapped => s3_error!(InvalidArgument, "{error}"),
             CreateMultipartError::RoutingFailed(RoutingError::BackendFull(backend)) => {
                 backend_full_error(&backend.to_string())
             }
@@ -431,6 +433,7 @@ impl IntoS3Error for PartCopyError {
 impl IntoS3Error for CompleteUploadError {
     fn into_s3_error(self) -> S3Error {
         match self {
+            error @ CompleteUploadError::Unmapped => s3_error!(InvalidArgument, "{error}"),
             CompleteUploadError::NoSuchUpload
             | CompleteUploadError::UploadTargetMismatch
             | CompleteUploadError::UploadNotOpen => missing_upload_error(),

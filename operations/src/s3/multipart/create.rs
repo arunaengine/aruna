@@ -62,6 +62,8 @@ pub enum CreateMultipartState {
 pub enum CreateMultipartError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
+    #[error("{}", aruna_core::structs::storage::routing::UNMAPPED_KEY)]
+    Unmapped,
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error("Transaction id missing")]
@@ -231,6 +233,9 @@ impl CreateMultipartOperation {
             && target.backend == resolved.backend
         {
             return self.start_transaction();
+        }
+        if self.input.routing.mapped(bucket) {
+            return self.emit_error(CreateMultipartError::Unmapped);
         }
         self.state = CreateMultipartState::OpenUpload;
         smallvec![Effect::Blob(BlobEffect::OpenUpload {
@@ -801,6 +806,41 @@ mod pure_tests {
         let record = MultipartUpload::from_bytes(value.as_ref()).unwrap();
         assert_eq!(record.backend, BackendRef::Node("tape".to_string()));
         assert_eq!(record.storage_class.as_deref(), Some("archive"));
+    }
+
+    #[test]
+    fn mapped_refuses_layout() {
+        use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN};
+        let mut snapshot = snapshot();
+        snapshot.imports = vec![BackendImport {
+            import_id: Ulid::from_parts(5, 5),
+            group_id: snapshot.group_id,
+            backend_id: Ulid::from_parts(6, 6),
+            backend_prefix: "team-a-bucket/".to_string(),
+            bucket: "bucket".to_string(),
+            key_prefix: String::new(),
+            schedule: None,
+            created_by: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: PLAIN_PATTERN.to_string(),
+        }];
+        let mut input = input(snapshot);
+        input.key = "reports/".to_string();
+        let mut operation = CreateMultipartOperation::new(input);
+        operation.start();
+        operation.step(ungoverned_bucket());
+        // No provider upload opens for a key the mapped bucket cannot store 1:1.
+        let effects = operation.step(fence_clear());
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateMultipartError::Unmapped)
+        ));
     }
 
     #[test]

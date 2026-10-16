@@ -126,6 +126,8 @@ pub enum CompleteUploadState {
 pub enum CompleteUploadError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
+    #[error("{}", aruna_core::structs::storage::routing::UNMAPPED_KEY)]
+    Unmapped,
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
@@ -1032,6 +1034,14 @@ impl CompleteUploadOperation {
         }
         if let Some(effects) = self.plain_compose() {
             return effects;
+        }
+        let bucket = &self.input.bucket;
+        if self
+            .routing
+            .as_ref()
+            .is_some_and(|routing| routing.mapped(bucket))
+        {
+            return self.schedule_error(CompleteUploadError::Unmapped);
         }
         let Some(upload) = self.upload_record.as_ref() else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);

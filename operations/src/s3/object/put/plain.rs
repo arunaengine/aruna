@@ -357,6 +357,33 @@ mod tests {
     }
 
     #[test]
+    fn mapped_needs_path() {
+        let mapped = |key: &str| {
+            let mut operation = operation("{dir}{name}");
+            let rule = &mut operation.config.routing.imports[0];
+            rule.key_prefix = String::new();
+            operation.config.request.key = key.to_string();
+            let effects = begin(&mut operation);
+            (operation, effects)
+        };
+        let (_, effects) = mapped("data/a.csv");
+        // The same-name write first looks at the exact key in the provider bucket.
+        let [Effect::Blob(BlobEffect::StatPlain { path, .. })] = effects.as_slice() else {
+            panic!("expected a plain path, got {effects:?}")
+        };
+        assert_eq!(path, "raw/data/a.csv");
+        // Keys without a plain path are refused before any byte is written.
+        for key in ["reports/", "reports//a.csv"] {
+            let (operation, effects) = mapped(key);
+            assert!(effects.is_empty(), "{key}: {effects:?}");
+            assert!(
+                matches!(operation.finalize(), Err(PutObjectError::Unmapped)),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
     fn writes_unique_path() {
         let mut operation = operation(DEFAULT_PATTERN);
         let effects = begin(&mut operation);

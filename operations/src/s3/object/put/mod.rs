@@ -124,6 +124,8 @@ pub enum PutObjectState {
 pub enum PutObjectError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
+    #[error("{}", aruna_core::structs::storage::routing::UNMAPPED_KEY)]
+    Unmapped,
     #[error("Invalid operation state")]
     InvalidOperationState,
     #[error("No transaction found")]
@@ -712,6 +714,10 @@ impl PutObjectOperation {
         }
         if let Some(target) = self.plain_target(&resolved) {
             return self.start_plain(target, resolved);
+        }
+        // A mapped bucket stores every key 1:1 or not at all.
+        if self.config.routing.mapped(&self.config.request.bucket) {
+            return self.emit_error(PutObjectError::Unmapped);
         }
         self.state = PutObjectState::WriteBlob;
         if let Some(blob) = self.config.request.body.take() {
