@@ -963,7 +963,7 @@ mod tests {
             },
         };
         persist_node_state(&storage, &node_state).await.unwrap();
-        drop(storage);
+        storage.close().await;
 
         let env = settings_env(&[
             ("STORAGE_PATH", tempdir.path().to_str().unwrap()),
@@ -1000,7 +1000,7 @@ mod tests {
             },
         };
         persist_node_state(&storage, &node_state).await.unwrap();
-        drop(storage);
+        storage.close().await;
 
         // No ONBOARDING_SECRET: a phase past the bootstrap refresh must not
         // require one.

@@ -420,7 +420,7 @@ mod tests {
         assert!(matches!(capabilities, NodeCapabilities::Management { .. }));
 
         drop(store);
-        drop(storage);
+        storage.close().await;
         let reopened = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let store = IdentityStore::from_storage(reopened);
         let loaded = store
