@@ -239,7 +239,7 @@ wasm-bindgen = "=0.2.127"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
 zeroize = "1.9.1"
-zip = { version = "9.0.1", default-features = false }
+zip = { version = "9.0.3", default-features = false }
 zstd = "0.14.2"
 
 [profile.release]
