@@ -2945,6 +2945,7 @@ async fn s3_native_multipart() {
             path,
             &upload_id,
             &[(1, etags[&1].clone()), (3, etags[&3].clone())],
+            false,
         )
         .await
         .unwrap();
@@ -3084,6 +3085,7 @@ async fn s3_provider_upload() {
             "in-place.bin",
             cold_backend(),
             test_user_id(),
+            None,
         )
         .await
     else {
@@ -3108,7 +3110,7 @@ async fn s3_provider_upload() {
         .concat();
 
     let BlobEvent::WriteFinished { location } = handler
-        .complete_upload(upload.clone(), listed.clone(), &[], Compression::Off)
+        .complete_upload(upload.clone(), listed.clone(), &[], Compression::Off, false)
         .await
     else {
         panic!("in-place completion failed")
@@ -3119,7 +3121,7 @@ async fn s3_provider_upload() {
 
     // A repeated completion whose first answer was lost finds the object and hashes it again.
     let BlobEvent::WriteFinished { location: again } = handler
-        .complete_upload(upload.clone(), listed, &[], Compression::Off)
+        .complete_upload(upload.clone(), listed, &[], Compression::Off, false)
         .await
     else {
         panic!("repeated completion failed")
@@ -3130,7 +3132,7 @@ async fn s3_provider_upload() {
     let other = vec![parts[&1].clone(), parts[&3].clone(), parts[&4].clone()];
     assert!(matches!(
         handler
-            .complete_upload(upload, other, &[], Compression::Off)
+            .complete_upload(upload, other, &[], Compression::Off, false)
             .await,
         BlobEvent::Error(_)
     ));
@@ -3151,6 +3153,7 @@ async fn s3_provider_abort() {
             "aborted.bin",
             cold_backend(),
             test_user_id(),
+            None,
         )
         .await
     else {
@@ -3195,6 +3198,7 @@ async fn s3_staged_replacement() {
             "staged.bin",
             cold_backend(),
             test_user_id(),
+            None,
         )
         .await
     else {
@@ -3224,7 +3228,7 @@ async fn s3_staged_replacement() {
     };
 
     let BlobEvent::WriteFinished { location } = handler
-        .complete_upload(upload, vec![staged, last], &[], Compression::Off)
+        .complete_upload(upload, vec![staged, last], &[], Compression::Off, false)
         .await
     else {
         panic!("completion with a staged part failed")
@@ -3251,6 +3255,7 @@ async fn s3_abort_streaming() {
             "streaming.bin",
             cold_backend(),
             test_user_id(),
+            None,
         )
         .await
     else {
@@ -3324,6 +3329,7 @@ async fn s3_cancelled_write() {
             "cancelled.bin",
             cold_backend(),
             test_user_id(),
+            None,
         )
         .await
     else {
@@ -3410,6 +3416,7 @@ async fn s3_overlapping_writes() {
             "overlap.bin",
             cold_backend(),
             test_user_id(),
+            None,
         )
         .await
     else {
@@ -3473,7 +3480,7 @@ async fn s3_overlapping_writes() {
     };
 
     let BlobEvent::WriteFinished { location } = handler
-        .complete_upload(upload, vec![staged, last], &[], Compression::Off)
+        .complete_upload(upload, vec![staged, last], &[], Compression::Off, false)
         .await
     else {
         panic!("completion failed")
@@ -3500,6 +3507,7 @@ async fn s3_delayed_write() {
             "delayed.bin",
             cold_backend(),
             test_user_id(),
+            None,
         )
         .await
     else {
@@ -3536,7 +3544,7 @@ async fn s3_delayed_write() {
 
     let last = in_place_part(&handler, &upload, 2, b"tail").await;
     let BlobEvent::WriteFinished { location } = handler
-        .complete_upload(upload, vec![accepted, last], &[], Compression::Off)
+        .complete_upload(upload, vec![accepted, last], &[], Compression::Off, false)
         .await
     else {
         panic!("completion of the acknowledged parts failed")
@@ -3560,6 +3568,7 @@ async fn filesystem_keeps_parts() {
             "key",
             ResolvedBackend::node_default(),
             test_user_id(),
+            None,
         )
         .await;
 
@@ -3897,6 +3906,91 @@ async fn s3_group_backend() {
     assert_eq!(location.backend, BackendRef::Group(backend_id));
     assert_eq!(location.storage_bucket, bucket);
     assert_eq!(read_back(&handler, location).await, b"tenant bytes");
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_plain_upload() {
+    // A provider upload at a tenant path completes there and never replaces another file.
+    use aruna_core::structs::storage::backend_import::PlainPath;
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let bucket = unique_name("plain-");
+    make_bucket(&bucket, &s3_config(&env, None)).await.unwrap();
+    let backend_id = Ulid::generate();
+    let entry = NodeBackend::new(
+        BackendConfig {
+            backend_type: Backend::Group(GroupBackendKind::S3),
+            root: String::new(),
+            service_config: s3_config(&env, Some(&bucket)),
+            bucket_prefix: None,
+            max_bucket_size: None,
+            multipart_bucket: Some(bucket.clone()),
+            timeouts: Default::default(),
+        },
+        None,
+    );
+    let handler = BlobHandler {
+        registry: context
+            .blob_handle
+            .handler
+            .registry
+            .with_groups(HashMap::from([(backend_id, Arc::new(entry))])),
+        ..context.blob_handle.handler.clone()
+    };
+    let resolved = ResolvedBackend::new(BackendRef::Group(backend_id), None);
+    let open = |ulid| {
+        let plain = PlainPath {
+            path: "raw/a.bin".to_string(),
+            ulid,
+            if_not_exists: true,
+        };
+        let event = handler.open_upload(
+            Ulid::generate(),
+            "bucket",
+            "a.bin",
+            resolved.clone(),
+            test_user_id(),
+            Some(plain),
+        );
+        async move {
+            let BlobEvent::UploadOpened {
+                backend_upload: Some(upload),
+            } = event.await
+            else {
+                panic!("plain upload did not open")
+            };
+            upload
+        }
+    };
+    let first = open(Ulid::generate()).await;
+    assert!(first.location.is_external());
+    assert_eq!(first.location.backend_path, "raw/a.bin");
+    let mib = 1024 * 1024;
+    let parts = vec![
+        in_place_part(&handler, &first, 1, &vec![1u8; 5 * mib]).await,
+        in_place_part(&handler, &first, 2, b"tail").await,
+    ];
+    let BlobEvent::PlainWritten { location, .. } = handler
+        .complete_upload(first, parts, &[], Compression::Off, true)
+        .await
+    else {
+        panic!("plain completion failed")
+    };
+    assert_eq!(location.blob_size, 5 * mib as u64 + 4);
+
+    // A second upload that must find the path free fails and its abort keeps the file.
+    let second = open(Ulid::generate()).await;
+    let parts = vec![in_place_part(&handler, &second, 1, b"other").await];
+    let event = handler
+        .complete_upload(second.clone(), parts, &[], Compression::Off, true)
+        .await;
+    assert_eq!(event, BlobEvent::Error(BlobError::PathTaken));
+    assert_eq!(handler.abort_upload(second).await, BlobEvent::UploadAborted);
+    assert_eq!(
+        read_back(&handler, location.clone()).await.len(),
+        5 * mib + 4
+    );
 }
 
 #[tokio::test]

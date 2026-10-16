@@ -29,7 +29,14 @@ fn text(len: usize, word: &[u8]) -> Vec<u8> {
 
 async fn open(handler: &BlobHandler, key: &str) -> BackendUpload {
     let event = handler
-        .open_upload(Ulid::generate(), "bucket", key, framed(), test_user_id())
+        .open_upload(
+            Ulid::generate(),
+            "bucket",
+            key,
+            framed(),
+            test_user_id(),
+            None,
+        )
         .await;
     let BlobEvent::UploadOpened {
         backend_upload: Some(upload),
@@ -162,7 +169,7 @@ async fn s3_framed_parts() {
     let listed = vec![one, two, three];
 
     let event = handler
-        .complete_upload(upload.clone(), listed.clone(), &[], ZSTD)
+        .complete_upload(upload.clone(), listed.clone(), &[], ZSTD, false)
         .await;
     let BlobEvent::WriteFinished { location } = event else {
         panic!("compressed completion failed: {event:?}")
@@ -173,8 +180,9 @@ async fn s3_framed_parts() {
     assert_part_sizes(&handler, &upload, &location, &[1, 2, 3]).await;
 
     // A repeated completion whose first answer was lost finds the object by its seek table.
-    let BlobEvent::WriteFinished { location: again } =
-        handler.complete_upload(upload, listed, &[], ZSTD).await
+    let BlobEvent::WriteFinished { location: again } = handler
+        .complete_upload(upload, listed, &[], ZSTD, false)
+        .await
     else {
         panic!("repeated completion failed")
     };
@@ -206,7 +214,7 @@ async fn s3_framed_table() {
     assert!(three.location.partial);
 
     let event = handler
-        .complete_upload(upload.clone(), vec![one, two, three], &[], ZSTD)
+        .complete_upload(upload.clone(), vec![one, two, three], &[], ZSTD, false)
         .await;
     let BlobEvent::WriteFinished { location } = event else {
         panic!("compressed completion failed: {event:?}")
@@ -228,8 +236,9 @@ async fn s3_decoded_compose() {
     let upload = open(&handler, "decoded.bin").await;
     let data = text(20 * MIB, b"decoded part ");
     let part = put(&handler, &upload, 1, &data).await;
-    let BlobEvent::WriteFinished { location: framed } =
-        handler.complete_upload(upload, vec![part], &[], ZSTD).await
+    let BlobEvent::WriteFinished { location: framed } = handler
+        .complete_upload(upload, vec![part], &[], ZSTD, false)
+        .await
     else {
         panic!("compressed completion failed")
     };
@@ -303,7 +312,7 @@ async fn s3_framed_fallback() {
     // The bucket level changed since the upload opened: the new copy takes the current one.
     let current = Compression::Zstd { level: 5 };
     let event = handler
-        .complete_upload(upload.clone(), vec![one, two, three], &[2], current)
+        .complete_upload(upload.clone(), vec![one, two, three], &[2], current, false)
         .await;
     let BlobEvent::WriteFinished { location } = event else {
         panic!("fallback completion failed: {event:?}")
@@ -331,7 +340,7 @@ async fn s3_omitted_part() {
     let listed = vec![one.clone(), three.clone()];
     let off = Compression::Off;
     let event = handler
-        .complete_upload(upload.clone(), listed, &[2], off)
+        .complete_upload(upload.clone(), listed, &[2], off, false)
         .await;
     let BlobEvent::WriteFinished { location } = event else {
         panic!("fallback completion failed: {event:?}")
@@ -343,7 +352,7 @@ async fn s3_omitted_part() {
     assert_eq!(read_back(&handler, location.clone()).await, expected);
 
     let event = handler
-        .complete_upload(upload.clone(), vec![one, two, three], &[2], ZSTD)
+        .complete_upload(upload.clone(), vec![one, two, three], &[2], ZSTD, false)
         .await;
     let BlobEvent::WriteFinished { location } = event else {
         panic!("completion with the omitted part failed: {event:?}")
@@ -376,7 +385,8 @@ async fn s3_completion_budget() {
         .await
         .unwrap();
 
-    let mut completing = Box::pin(handler.complete_upload(upload, vec![one, two], &[1], ZSTD));
+    let mut completing =
+        Box::pin(handler.complete_upload(upload, vec![one, two], &[1], ZSTD, false));
     assert!((&mut completing).now_or_never().is_none());
     drop(held);
     let BlobEvent::WriteFinished { location } = completing.await else {
@@ -432,6 +442,7 @@ async fn s3_bucketless_framed() {
             "group.bin",
             resolved.clone(),
             test_user_id(),
+            None,
         )
         .await;
     let BlobEvent::UploadOpened {
@@ -475,7 +486,9 @@ async fn s3_bucketless_framed() {
     assert_eq!(staged.storage_bucket, bucket);
     assert!(staged.backend_path.starts_with(PARTS_PREFIX), "{staged:?}");
 
-    let event = handler.complete_upload(upload, parts, &[1], ZSTD).await;
+    let event = handler
+        .complete_upload(upload, parts, &[1], ZSTD, false)
+        .await;
     let BlobEvent::WriteFinished { location } = event else {
         panic!("group completion failed: {event:?}")
     };

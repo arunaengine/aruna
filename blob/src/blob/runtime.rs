@@ -741,14 +741,21 @@ impl BlobHandler {
                 key,
                 resolved,
                 created_by,
-            } => Box::pin(self.open_upload(record_id, &bucket, &key, resolved, created_by)).await,
+                plain,
+            } => {
+                let open = self.open_upload(record_id, &bucket, &key, resolved, created_by, plain);
+                Box::pin(open).await
+            }
             BlobEffect::CompleteUpload {
                 backend_upload,
                 parts,
                 streamed,
                 compression,
+                if_not_exists,
             } => {
-                let complete = self.complete_upload(*backend_upload, parts, &streamed, compression);
+                let upload = *backend_upload;
+                let complete =
+                    self.complete_upload(upload, parts, &streamed, compression, if_not_exists);
                 Box::pin(complete).await
             }
             BlobEffect::AbortUpload { backend_upload } => {

@@ -256,13 +256,15 @@ impl NativeMultipart {
             .ok_or_else(|| BlobError::WriteError("backend returned no copied part ETag".into()))
     }
 
-    /// Assembles the listed parts, in order, under the backend ETags recorded for them.
+    /// Assembles the listed parts, in order, under the backend ETags recorded for them, and
+    /// answers the object's version id. `if_not_exists` fails with `PathTaken` on a taken key.
     pub async fn complete(
         &self,
         path: &str,
         upload_id: &str,
         parts: &[(u16, String)],
-    ) -> Result<(), BlobError> {
+        if_not_exists: bool,
+    ) -> Result<Option<String>, BlobError> {
         let parts = parts
             .iter()
             .map(|(part_number, etag)| {
@@ -272,21 +274,27 @@ impl NativeMultipart {
                     .build()
             })
             .collect();
-        self.client
+        let request = self
+            .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
             .key(self.key(path))
             .upload_id(upload_id)
+            .set_if_none_match(if_not_exists.then(|| "*".to_string()))
             .multipart_upload(
                 CompletedMultipartUpload::builder()
                     .set_parts(Some(parts))
                     .build(),
-            )
+            );
+        let output = request
             .send()
             .boxed()
             .await
-            .map_err(|error| write_error("complete", error))?;
-        Ok(())
+            .map_err(|error| match status(&error) {
+                Some(412) => BlobError::PathTaken,
+                _ => write_error("complete", error),
+            })?;
+        Ok(output.version_id().map(str::to_string))
     }
 
     /// Frees the stored parts of one upload; an upload the backend no longer has is gone already.
