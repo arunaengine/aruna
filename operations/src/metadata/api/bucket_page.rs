@@ -57,7 +57,8 @@ pub(super) fn encode_cursor(positions: &[NodePosition]) -> Option<String> {
 
 /// Orders all node pages by bucket name and node, cuts them to `limit` and moves each node
 /// past the hits it gave to this page. A node that gave fewer than `limit` hits, all on this
-/// page, is done; a failed node keeps its position.
+/// page, is done; a failed node keeps its position. Positions of nodes this page did not ask
+/// are dropped, so the cursor follows the current membership and its node cap.
 pub(super) fn merge_pages(
     parts: Vec<(NodeId, Vec<BucketSearchHit>)>,
     failed: &[NodeId],
@@ -70,10 +71,12 @@ pub(super) fn merge_pages(
         (&left.bucket, node(left)).cmp(&(&right.bucket, node(right)))
     });
     hits.truncate(limit);
-    let nodes = parts
+    let nodes: Vec<NodeId> = parts
         .iter()
         .map(|(node, _)| *node)
-        .chain(failed.iter().copied());
+        .chain(failed.iter().copied())
+        .collect();
+    positions.retain(|entry| nodes.iter().any(|node| entry.node_id == *node.as_bytes()));
     for node in nodes {
         if NodePosition::of(&positions, node).is_none() {
             positions.push(NodePosition {
@@ -179,5 +182,29 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(encode_cursor(&positions), None);
         assert!(decode_cursor(Some("not a cursor")).is_err());
+    }
+
+    #[test]
+    fn drops_departed_nodes() {
+        // A node that left the realm ends its listing instead of keeping the cursor open.
+        let gone = NodePosition {
+            node_id: *node(9).as_bytes(),
+            after: Some("m".to_string()),
+            done: false,
+        };
+        let stores = [(node(1), vec!["a"])];
+        let positions = vec![gone];
+        let (hits, positions) = merge_pages(page(&stores, &positions, 5), &[], positions, 5);
+        assert_eq!(hits.len(), 1);
+        assert!(NodePosition::of(&positions, node(9)).is_none());
+        assert_eq!(encode_cursor(&positions), None);
+        // A failed node that is still a member keeps its position for the next page.
+        let failed = NodePosition {
+            node_id: *node(2).as_bytes(),
+            after: Some("c".to_string()),
+            done: false,
+        };
+        let (_, positions) = merge_pages(Vec::new(), &[node(2)], vec![failed.clone()], 5);
+        assert_eq!(positions, [failed]);
     }
 }
