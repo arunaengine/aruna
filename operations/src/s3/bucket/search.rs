@@ -34,6 +34,8 @@ pub struct SearchBucketsInput {
     pub node_id: NodeId,
     pub query: String,
     pub limit: usize,
+    /// Keeps only the buckets of this group.
+    pub group_id: Option<GroupId>,
     /// Resumes the raw bucket scan after this key so a filtering caller can fill
     /// one page across several drives.
     pub start_after: Option<Key>,
@@ -197,10 +199,15 @@ impl SearchBucketsOperation {
             if bucket.starts_with("ws-") || !bucket.to_lowercase().contains(&self.input.query) {
                 continue;
             }
-            self.candidates.push_back(BucketCandidate {
-                bucket,
-                info: BucketInfo::from_bytes(value.as_ref())?,
-            });
+            let info = BucketInfo::from_bytes(value.as_ref())?;
+            if self
+                .input
+                .group_id
+                .is_some_and(|group_id| group_id != info.group_id)
+            {
+                continue;
+            }
+            self.candidates.push_back(BucketCandidate { bucket, info });
         }
         Ok(())
     }
@@ -470,6 +477,7 @@ mod tests {
             node_id: iroh::SecretKey::from_bytes(&[10u8; 32]).public(),
             query: query.to_string(),
             limit,
+            group_id: None,
             start_after: None,
         }
     }
@@ -549,6 +557,37 @@ mod tests {
             Some("data-a".as_bytes().to_vec().into())
         );
         assert_eq!(output.scanned_rows, 2);
+    }
+
+    #[test]
+    fn lists_group_buckets() {
+        // An empty query lists every bucket; the group filter keeps one group's buckets.
+        let (mine, other) = (Ulid::from_bytes([11u8; 16]), Ulid::from_bytes([12u8; 16]));
+        let mut input = scan_input("", 10);
+        input.group_id = Some(mine);
+        let mut operation = SearchBucketsOperation::new(input);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![
+                bucket_entry("alpha", mine),
+                bucket_entry("beta", other),
+                bucket_entry("gamma", mine),
+            ],
+            next_start_after: None,
+        }));
+        for _ in 0..2 {
+            operation.step(Event::SubOperation(
+                SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+            ));
+            operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: mine.to_bytes().to_vec().into(),
+                value: None,
+            }));
+        }
+        let output = operation.finalize().unwrap();
+        let names: Vec<_> = output.hits.iter().map(|hit| hit.bucket.as_str()).collect();
+        assert_eq!(names, ["alpha", "gamma"]);
+        assert_eq!(output.next_start_after, None);
     }
 
     async fn write_value(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
@@ -692,6 +731,7 @@ mod tests {
                 node_id,
                 query: "DATA".to_string(),
                 limit: 50,
+                group_id: None,
                 start_after: None,
             },
         )

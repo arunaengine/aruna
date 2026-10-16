@@ -384,18 +384,58 @@ async fn selects_types() {
 }
 
 async fn bucket_hits(fx: &Fixture, query: &str, limit: usize) -> Vec<String> {
+    let params = BucketSearchParams {
+        q: query.to_string(),
+        limit: Some(limit),
+        ..Default::default()
+    };
+    let section = bucket_page(fx, params).await;
+    section.hits.into_iter().map(|hit| hit.bucket).collect()
+}
+
+async fn bucket_page(fx: &Fixture, params: BucketSearchParams) -> BucketsSection {
     let (_, Json(section)) = bucket_search(
         State(fx.state.clone()),
         Extension(Some(fx.auth.clone())),
         Extension(None),
-        Query(BucketSearchParams {
-            q: query.to_string(),
-            limit: Some(limit),
-        }),
+        Query(params),
     )
     .await
     .unwrap();
-    section.hits.into_iter().map(|hit| hit.bucket).collect()
+    section
+}
+
+#[tokio::test]
+async fn lists_bucket_pages() {
+    let fx = setup().await;
+    seed_bucket(&fx.state, &fx.actor, "beta-bucket", fx.groups[1]).await;
+    seed_bucket(&fx.state, &fx.actor, "gamma-bucket", fx.groups[1]).await;
+    // An empty query lists every readable bucket, page by page.
+    let mut listed = Vec::new();
+    let mut cursor = None;
+    loop {
+        let params = BucketSearchParams {
+            limit: Some(2),
+            cursor: cursor.take(),
+            ..Default::default()
+        };
+        let page = bucket_page(&fx, params).await;
+        assert!(page.hits.len() <= 2);
+        listed.extend(page.hits.into_iter().map(|hit| hit.bucket));
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(listed, ["alpha-bucket", "beta-bucket", "gamma-bucket"]);
+    let params = BucketSearchParams {
+        group_id: Some(fx.groups[1].to_string()),
+        ..Default::default()
+    };
+    let group = bucket_page(&fx, params).await;
+    let names: Vec<_> = group.hits.into_iter().map(|hit| hit.bucket).collect();
+    assert_eq!(names, ["beta-bucket", "gamma-bucket"]);
+    assert!(group.next_cursor.is_none());
 }
 
 #[tokio::test]
@@ -474,6 +514,7 @@ async fn searches_buckets() {
         Query(BucketSearchParams {
             q: "bucket".to_string(),
             limit: Some(10),
+            ..Default::default()
         }),
     )
     .await

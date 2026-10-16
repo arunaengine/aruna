@@ -418,6 +418,8 @@ impl MetadataHandle {
                 auth_token,
                 query,
                 limit,
+                group_id,
+                start_after,
             } => {
                 Box::pin(async {
                     match bucket_search_auth(
@@ -438,7 +440,8 @@ impl MetadataHandle {
                                     node_id: net_handle.node_id(),
                                     query,
                                     limit,
-                                    start_after: None,
+                                    group_id,
+                                    start_after: start_after.map(|after| after.into_bytes().into()),
                                 },
                             )
                             .await

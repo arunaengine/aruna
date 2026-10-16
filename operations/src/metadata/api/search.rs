@@ -51,14 +51,21 @@ pub struct MetadataSearchExecution {
 pub struct BucketSearchRequest {
     pub auth: AuthContext,
     pub bearer_token: Option<String>,
+    /// An empty query lists every readable bucket.
     pub query: String,
     pub limit: usize,
+    /// Only buckets of this group.
+    pub group_id: Option<GroupId>,
+    /// `next_cursor` of the previous page.
+    pub cursor: Option<String>,
     pub target_nodes: Option<Vec<NodeId>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BucketSearchExecution {
     pub hits: Vec<BucketSearchHit>,
+    /// Continues the listing; `None` once every node reached its end.
+    pub next_cursor: Option<String>,
     pub fanout_stats: MetadataFanoutStats,
 }
 

@@ -96,6 +96,10 @@ pub struct BucketSearchParams {
     pub q: String,
     #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -218,6 +222,9 @@ pub struct ObjectResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BucketsSection {
     pub hits: Vec<BucketHit>,
+    /// Continues the listing; absent on the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     pub nodes_queried: usize,
     pub nodes_failed: usize,
     pub failed_nodes: Vec<String>,
@@ -333,15 +340,20 @@ fn parse_search_types(types: Option<&str>) -> ServerResult<SearchTypes> {
     path = "/search/buckets",
     tag = "search",
     summary = "Search buckets across the realm",
-    description = r#"Searches bucket names across the realm's serving nodes and merges the authorized matches.
+    description = r#"Searches or lists bucket names across the realm's serving nodes and merges the authorized matches.
 
 **Authentication**: realm bearer token. Every node applies its own authorization and deny policies
 to its own buckets, so a bucket the caller may not read never appears.
 
 **Behavior**
 - The search fans out over the realm's serving nodes under one shared deadline of about 12 seconds.
-- There is no continuation token: answers are merged and cut to the page size, so a broader result
-  set is reached by narrowing the query.
+- An empty or missing `q` lists every bucket the caller may read; `group_id` keeps only the
+  buckets of that group.
+- Hits are ordered by bucket name, then node id. `next_cursor` continues the listing and is absent
+  on the last page. It is opaque, holds a scan position per node and is only valid with the same
+  `q` and `group_id`; every page checks authorization again.
+- A node that fails on a page keeps its position, so a later page asks it again from there; the
+  listing then ends only once every node answered to its end.
 - A node that fails, times out or is dropped by the node cap does not fail the request. The answer
   is partial and reports it through `nodes_queried`, `nodes_failed` and `failed_nodes`, which names
   the nodes that did not answer and carries `partition-discovery` when node discovery itself
@@ -349,11 +361,13 @@ to its own buckets, so a bucket the caller may not read never appears.
 - A partial answer is still 200 and means matching buckets may be missing rather than absent.
 
 **Limits**
-- The query is trimmed and must keep at least 2 characters.
+- A non-empty query is trimmed and must keep at least 2 characters.
 - At most 32 nodes are queried per request."#,
     params(
-        ("q" = String, Query, description = "Case-insensitive bucket-name substring; trimmed, minimum 2 characters, no wildcards"),
-        ("limit" = Option<usize>, Query, description = "Maximum number of merged hits (default 10, clamped to 1..=50)")
+        ("q" = Option<String>, Query, description = "Case-insensitive bucket-name substring; trimmed, empty or at least 2 characters, no wildcards"),
+        ("group_id" = Option<String>, Query, description = "Only buckets of this group, as a 26-character ULID"),
+        ("limit" = Option<usize>, Query, description = "Maximum number of merged hits (default 10, clamped to 1..=50)"),
+        ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` of the previous page, with the same `q` and `group_id`")
     ),
     responses(
         (
@@ -371,6 +385,7 @@ to its own buckets, so a bucket the caller may not read never appears.
                         "created_at": "2026-04-09T14:23:11.123+00:00"
                     }
                 ],
+                "next_cursor": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIg",
                 "nodes_queried": 3,
                 "nodes_failed": 1,
                 "failed_nodes": [
@@ -378,7 +393,7 @@ to its own buckets, so a bucket the caller may not read never appears.
                 ]
             })
         ),
-        (status = 400, description = "Query shorter than 2 characters or otherwise malformed", body = ErrorResponse),
+        (status = 400, description = "Query of 1 character, invalid group id or cursor, or otherwise malformed", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse)
     ),
@@ -392,9 +407,10 @@ pub async fn bucket_search(
 ) -> ServerResult<(StatusCode, Json<BucketsSection>)> {
     let auth = require_realm_auth(&state, auth)?;
     let query = params.q.trim();
-    if query.chars().count() < MIN_QUERY_CHARS {
+    if !query.is_empty() && query.chars().count() < MIN_QUERY_CHARS {
         return Err(ServerError::BadRequest);
     }
+    let group_id = params.group_id.as_deref().map(parse_group_id).transpose()?;
     let result = search_buckets_distributed(
         state.get_ctx().as_ref(),
         state.get_realm_id(),
@@ -407,6 +423,8 @@ pub async fn bucket_search(
                 .limit
                 .unwrap_or(DEFAULT_SEARCH_LIMIT)
                 .clamp(1, MAX_BUCKET_LIMIT),
+            group_id,
+            cursor: params.cursor,
             target_nodes: None,
         },
     )
@@ -811,6 +829,8 @@ async fn run_buckets(
             bearer_token,
             query: query.to_string(),
             limit: limit.min(MAX_BUCKET_LIMIT),
+            group_id: None,
+            cursor: None,
             target_nodes: None,
         },
     )
@@ -842,6 +862,7 @@ fn map_bucket_section(result: BucketSearchExecution) -> BucketsSection {
                 created_at: chrono::DateTime::<chrono::Utc>::from(hit.created_at).to_rfc3339(),
             })
             .collect(),
+        next_cursor: result.next_cursor,
         nodes_queried: result.fanout_stats.nodes_queried,
         nodes_failed: result.fanout_stats.nodes_failed,
         failed_nodes,

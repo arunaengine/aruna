@@ -655,6 +655,8 @@ impl MetadataHandle {
         auth_token: Option<AuthToken>,
         query: String,
         limit: usize,
+        group_id: Option<GroupId>,
+        start_after: Option<String>,
     ) -> Result<Vec<BucketSearchHit>, MetadataReadError> {
         let started = Instant::now();
         let span = Span::current();
@@ -666,6 +668,8 @@ impl MetadataHandle {
                 auth_token,
                 query,
                 limit,
+                group_id,
+                start_after,
             },
         )
         .await

@@ -155,6 +155,9 @@ pub enum MetadataTransportMessage {
         auth_token: Option<AuthToken>,
         query: String,
         limit: usize,
+        group_id: Option<GroupId>,
+        /// Continues after this bucket name.
+        start_after: Option<String>,
     },
     BucketSearchResults {
         result: Result<Vec<BucketSearchHit>, MetadataReadError>,
@@ -902,6 +905,8 @@ mod tests {
             auth_token: Some(AuthToken::bearer("bucket-token").unwrap()),
             query: "dataset".to_string(),
             limit: 10,
+            group_id: None,
+            start_after: None,
         });
         assert_auth_token(MetadataTransportMessage::SearchObjects {
             auth_token: Some(AuthToken::bearer("object-token").unwrap()),
@@ -1105,9 +1110,11 @@ mod tests {
                 auth_token: None,
                 query: String::new(),
                 limit: 0,
+                group_id: None,
+                start_after: None,
             })
             .unwrap(),
-            vec![12, 0, 0, 0]
+            vec![12, 0, 0, 0, 0, 0]
         );
     }
 
