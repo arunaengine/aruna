@@ -201,24 +201,26 @@ impl EmptyCheck {
         if self.table < TABLES.len() {
             return Ok(Some(self.start(txn_id)));
         }
-        let (kinds, buckets, more) = (self.found.clone(), self.buckets.clone(), self.more);
-        let kinds = match kinds.split_last() {
-            None => return Ok(None),
-            Some((last, [])) => (*last).to_string(),
-            Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
-        };
+        if self.found.is_empty() {
+            return Ok(None);
+        }
         Err(GroupDeletionError::NotEmpty {
-            kinds,
-            buckets,
-            more,
+            kinds: self.found.iter().map(|kind| kind.to_string()).collect(),
+            buckets: self.buckets.clone(),
+            more: self.more,
         })
     }
 }
 
-/// Puts the visible bucket names after the `S3 buckets` kind.
-pub(super) fn render(kinds: &str, names: &[String], more: bool) -> String {
+/// Joins the kinds and puts the visible bucket names after the `S3 buckets` kind.
+pub(super) fn render(kinds: &[String], names: &[String], more: bool) -> String {
+    let kinds = match kinds.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    };
     if names.is_empty() {
-        return kinds.to_string();
+        return kinds;
     }
     let more = if more { ", and more" } else { "" };
     kinds.replacen(
@@ -253,7 +255,7 @@ mod tests {
         let Err(GroupDeletionError::NotEmpty { kinds, .. }) = result else {
             panic!("expected a non-empty group, got {result:?}");
         };
-        assert_eq!(kinds, "metadata documents and source connectors");
+        assert_eq!(kinds, ["metadata documents", "source connectors"]);
     }
 
     fn bucket(group_id: GroupId) -> aruna_core::types::Value {
@@ -327,10 +329,11 @@ mod tests {
     #[test]
     fn renders_names() {
         let names = ["a)x".to_string(), "b".to_string()];
+        let kinds = ["metadata documents", "job records", "S3 buckets"].map(String::from);
         assert_eq!(
-            render("metadata documents and S3 buckets", &names, true),
-            "metadata documents and S3 buckets (a)x, b, and more)"
+            render(&kinds, &names, true),
+            "metadata documents, job records and S3 buckets (a)x, b, and more)"
         );
-        assert_eq!(render("S3 buckets", &[], true), "S3 buckets");
+        assert_eq!(render(&kinds[2..], &[], true), "S3 buckets");
     }
 }

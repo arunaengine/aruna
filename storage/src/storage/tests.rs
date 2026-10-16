@@ -1741,6 +1741,68 @@ async fn batch_read_ordered() {
 }
 
 #[tokio::test]
+async fn reads_skip_absent() {
+    let dir = tempdir().unwrap();
+    let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let count = || {
+        std::fs::read_dir(dir.path().join("keyspaces"))
+            .unwrap()
+            .count()
+    };
+    let before = count();
+    let empty = || StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: None,
+    };
+    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = handle
+        .send_storage_effect(StorageEffect::StartTransaction { read: true })
+        .await
+    else {
+        panic!("read transaction did not start");
+    };
+    for txn_id in [None, Some(txn_id)] {
+        let key_space = "absent".to_string();
+        let read = StorageEffect::Read {
+            key_space: key_space.clone(),
+            key: b"k".to_vec().into(),
+            txn_id,
+        };
+        assert!(matches!(
+            handle.send_storage_effect(read).await,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
+        assert_batch_read(
+            handle
+                .send_storage_effect(StorageEffect::BatchRead {
+                    reads: vec![(key_space.clone(), b"k".to_vec().into())],
+                    txn_id,
+                })
+                .await,
+            &[(b"k", None)],
+        );
+        let iter = StorageEffect::Iter {
+            key_space: key_space.clone(),
+            prefix: None,
+            start: None,
+            limit: 8,
+            txn_id,
+        };
+        let last = StorageEffect::Last {
+            key_space,
+            prefix: None,
+            txn_id,
+        };
+        for effect in [iter, last] {
+            assert_eq!(
+                handle.send_storage_effect(effect).await,
+                Event::Storage(empty())
+            );
+        }
+    }
+    assert_eq!(count(), before);
+}
+
+#[tokio::test]
 async fn transaction_reads_pending() {
     let dir = tempdir().unwrap();
     let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();

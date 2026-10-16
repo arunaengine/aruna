@@ -136,6 +136,13 @@ pub(super) async fn apply_control(
             .await?;
             Ok(None)
         }
+        GroupDeleteAction::Check { group_id, caller } => {
+            if caller.realm_id != *net.realm_id() {
+                return Err(GroupDeletionError::Unauthorized);
+            }
+            super::check::check_node(context, &config, &caller, group_id, net.node_id()).await?;
+            Ok(None)
+        }
         GroupDeleteAction::Start { .. } => Err(GroupDeletionError::Invalid(
             "start requires caller authorization".into(),
         )),

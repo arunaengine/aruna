@@ -141,6 +141,12 @@ pub enum GroupDeleteAction {
     Commit {
         event: Box<crate::admin_documents::AdminDocumentEvent>,
     },
+    /// Reports what blocks the deletion, without changing any state.
+    /// Only infrastructure nodes send it, after authorizing `caller` for the deletion.
+    Check {
+        group_id: Ulid,
+        caller: Box<crate::structs::identity::auth::AuthContext>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error, Serialize, Deserialize)]
@@ -149,9 +155,9 @@ pub enum GroupDeletionError {
     Unauthorized,
     #[error("group not found")]
     NotFound,
-    #[error("group is not empty: {kinds}")]
+    #[error("group is not empty: {}", kinds.join(", "))]
     NotEmpty {
-        kinds: String,
+        kinds: Vec<String>,
         /// Up to five blocking bucket names; `more` is set when others exist.
         buckets: Vec<String>,
         more: bool,

@@ -331,6 +331,7 @@ pub(crate) mod tests {
         ("GET", "/access/groups/{id}/service-accounts"),
         ("GET", "/access/groups/{id}/members"),
         ("GET", "/access/groups/{id}/usage"),
+        ("GET", "/access/groups/{id}/deletion-blockers"),
         ("PATCH", "/access/groups/{id}"),
         ("GET", "/system/info"),
         ("GET", "/system/realm"),

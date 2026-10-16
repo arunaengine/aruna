@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE};
-use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
+use aruna_core::structs::identity::group_delete::{
+    GroupDeletePhase, GroupDeleteRecord, GroupDeletionError,
+};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 
 use super::tests::{Fixture, read};
@@ -81,6 +83,57 @@ async fn peers_delete_together() {
         assert_eq!(record.phase, GroupDeletePhase::Deleted);
         assert!(record.event.is_some());
     }
+    assert!(first_handler.stop(Duration::from_secs(60)).await);
+    assert!(second_handler.stop(Duration::from_secs(60)).await);
+    first_net.shutdown().await;
+    second_net.shutdown().await;
+}
+
+#[tokio::test]
+async fn check_reports_nodes() {
+    let mut first = Fixture::new(&[1, 2, 3]).await;
+    let mut second = Fixture::new(&[1, 2, 3]).await;
+    let first_net = connect_fixture(&mut first, 1).await;
+    let second_net = connect_fixture(&mut second, 2).await;
+    first_net.add_peer_addr(second_net.endpoint_addr()).await;
+    second_net.add_peer_addr(first_net.endpoint_addr()).await;
+    super::check_tests::buckets(&second, 2, &["owned", "hidden"]).await;
+    let auth = first.auth.clone();
+    let group_id = first.plan.group_id;
+    let first_context = Arc::new(first.context);
+    let second_context = Arc::new(second.context);
+    let first_handler = initialize_incoming_fixture(first_context.clone()).unwrap();
+    let second_handler = initialize_incoming_fixture(second_context.clone()).unwrap();
+    let replies = super::check_group(&first_context, auth, group_id)
+        .await
+        .unwrap();
+    let reply = |seed| {
+        replies
+            .iter()
+            .find(|(node, _)| *node == super::tests::node(seed))
+            .map(|(_, result)| result.clone())
+            .unwrap()
+    };
+    assert_eq!(replies.len(), 3);
+    assert_eq!(reply(1), Ok(()));
+    assert_eq!(
+        reply(2),
+        Err(GroupDeletionError::NotEmpty {
+            kinds: vec!["S3 buckets".into()],
+            buckets: vec!["owned".into()],
+            more: true,
+        })
+    );
+    assert!(matches!(reply(3), Err(GroupDeletionError::Unavailable(_))));
+    assert!(
+        read(
+            &second_context,
+            GROUP_DELETE_KEYSPACE,
+            group_id.to_bytes().to_vec()
+        )
+        .await
+        .is_none()
+    );
     assert!(first_handler.stop(Duration::from_secs(60)).await);
     assert!(second_handler.stop(Duration::from_secs(60)).await);
     first_net.shutdown().await;

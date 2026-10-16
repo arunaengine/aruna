@@ -127,6 +127,22 @@ impl Store {
             Err(error) => Err(StorageError::KeyspaceError(error.to_string())),
         }
     }
+
+    /// Finds a keyspace without creating it; a read outside a write transaction sees none as empty.
+    pub(super) fn existing_keyspace(
+        &self,
+        name: &str,
+    ) -> Result<Option<OptimisticTxKeyspace>, StorageError> {
+        let cached = self
+            .keyspaces
+            .lock()
+            .expect("storage keyspace cache mutex poisoned")
+            .contains_key(name);
+        match cached || self.db.keyspace_exists(name) {
+            true => self.resolve_keyspace(name).map(Some),
+            false => Ok(None),
+        }
+    }
 }
 
 pub struct FjallStorage {
@@ -683,11 +699,20 @@ pub(super) fn batch_read_with<R: Readable>(
     store: &Store,
     reader: &R,
     reads: Vec<(String, ByteView)>,
+    create: bool,
 ) -> StorageEvent {
     let mut values = Vec::with_capacity(reads.len());
     for (key_space, key) in reads {
-        let keyspace = match store.resolve_keyspace(&key_space) {
-            Ok(ks) => ks,
+        let keyspace = match create {
+            true => store.resolve_keyspace(&key_space).map(Some),
+            false => store.existing_keyspace(&key_space),
+        };
+        let keyspace = match keyspace {
+            Ok(Some(ks)) => ks,
+            Ok(None) => {
+                values.push((key, None));
+                continue;
+            }
             Err(error) => return StorageEvent::Error { error },
         };
         match reader.get(&keyspace, &key) {
@@ -704,7 +729,7 @@ pub(super) fn batch_read_with<R: Readable>(
 
 pub(super) fn store_batch_read(store: &Store, reads: Vec<(String, ByteView)>) -> StorageEvent {
     let snapshot = store.db.read_tx();
-    batch_read_with(store, &snapshot, reads)
+    batch_read_with(store, &snapshot, reads, false)
 }
 
 pub(super) fn read_last_with<R: Readable>(
@@ -1091,16 +1116,21 @@ fn read_pool_loop(store: Store, receiver: EffectReceiver) {
                 key_space,
                 key,
                 txn_id: None,
-            } => match store.resolve_keyspace(&key_space) {
-                Ok(keyspace) => store_read(&store, keyspace, key),
+            } => match store.existing_keyspace(&key_space) {
+                Ok(Some(keyspace)) => store_read(&store, keyspace, key),
+                Ok(None) => StorageEvent::ReadResult { key, value: None },
                 Err(error) => StorageEvent::Error { error },
             },
             StorageEffect::Last {
                 key_space,
                 prefix,
                 txn_id: None,
-            } => match store.resolve_keyspace(&key_space) {
-                Ok(keyspace) => store_last(&store, keyspace, prefix),
+            } => match store.existing_keyspace(&key_space) {
+                Ok(Some(keyspace)) => store_last(&store, keyspace, prefix),
+                Ok(None) => StorageEvent::IterResult {
+                    values: Vec::new(),
+                    next_start_after: None,
+                },
                 Err(error) => StorageEvent::Error { error },
             },
             StorageEffect::BatchRead {
@@ -1113,8 +1143,12 @@ fn read_pool_loop(store: Store, receiver: EffectReceiver) {
                 start,
                 limit,
                 txn_id: None,
-            } => match store.resolve_keyspace(&key_space) {
-                Ok(keyspace) => {
+            } => match store.existing_keyspace(&key_space) {
+                Ok(None) => StorageEvent::IterResult {
+                    values: Vec::new(),
+                    next_start_after: None,
+                },
+                Ok(Some(keyspace)) => {
                     if limit == 0 {
                         StorageEvent::IterResult {
                             values: Vec::new(),

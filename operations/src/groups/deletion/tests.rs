@@ -58,7 +58,7 @@ pub(super) fn context(path: &std::path::Path) -> DriverContext {
 
 pub(super) fn empty(kinds: &str) -> GroupDeletionError {
     GroupDeletionError::NotEmpty {
-        kinds: kinds.into(),
+        kinds: vec![kinds.into()],
         buckets: Vec::new(),
         more: false,
     }
@@ -342,7 +342,7 @@ async fn occupied_peer_refuses() {
     assert_eq!(
         second.prepare(2).await,
         Err(GroupDeletionError::NotEmpty {
-            kinds: "S3 buckets".into(),
+            kinds: vec!["S3 buckets".into()],
             buckets: vec!["owned".into()],
             more: false,
         })
@@ -648,7 +648,7 @@ async fn renders_refusals() {
     let bytes = document.to_bytes(&fixture.actor).unwrap();
     write(&fixture.context, AUTH_KEYSPACE, key, bytes).await;
     let reply = GroupDeletionError::NotEmpty {
-        kinds: "S3 buckets".into(),
+        kinds: vec!["S3 buckets".into()],
         buckets: vec!["shown".into(), "hidden".into()],
         more: false,
     };
@@ -665,6 +665,21 @@ async fn renders_refusals() {
         let GroupDeletionError::NotEmpty { kinds, .. } = error else {
             panic!("expected a refusal, got {error:?}");
         };
-        assert_eq!(kinds, format!("node {node}: S3 buckets (shown)"));
+        assert_eq!(
+            kinds,
+            [format!("node {node}: S3 buckets (shown, and more)")]
+        );
     }
+    let readable = GroupDeletionError::NotEmpty {
+        kinds: vec!["S3 buckets".into()],
+        buckets: vec!["shown".into()],
+        more: false,
+    };
+    let error =
+        super::coordinator::blocked(&fixture.context, &fixture.auth, group_id, node(1), readable)
+            .await;
+    assert_eq!(
+        error.to_string(),
+        format!("group is not empty: node {}: S3 buckets (shown)", node(1))
+    );
 }
