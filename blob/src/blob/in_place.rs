@@ -5,7 +5,7 @@
 use super::BlobHandler;
 use super::backend::{build_backend_path, intent_key};
 use super::framed_parts::{Finished, part_level, streams_now};
-use super::io::backend_version;
+use super::io::{backend_version, reader_at};
 use crate::codec::Guard;
 use crate::hash::Hasher;
 use crate::part_chain::{PartAttempt, PartChain};
@@ -607,7 +607,9 @@ impl BlobHandler {
                 }
                 _ => {
                     let late = |what: &str| BlobError::ReadError(format!("timed out {what}"));
-                    let reader = timeout(self.io_timeout(), operator.reader(&path))
+                    // The bytes of the completed version, not of a later write at a tenant path.
+                    let opened = reader_at(&operator, &path, version.as_deref());
+                    let reader = timeout(self.io_timeout(), opened)
                         .await
                         .map_err(|_| late("opening the object"))?
                         .map_err(|error| BlobError::ReadError(error.to_string()))?;
