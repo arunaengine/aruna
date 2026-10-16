@@ -10,6 +10,7 @@ use aruna_core::structs::storage::backend_import::{
     ImportedObject, PlainPath, import_key, object_key, tagged_path, version_key,
 };
 use aruna_core::structs::storage::blob::ResolvedBackend;
+use aruna_core::structs::storage::group_backend::path_bucket;
 use aruna_core::structs::storage::routing::PlainTarget;
 use aruna_core::types::{Key, Value};
 
@@ -111,6 +112,16 @@ impl PutObjectOperation {
             created_by: self.config.user_id,
             blob,
         })]
+    }
+
+    /// A plain write never takes over a copy in another provider bucket; its own copy then
+    /// replaces that one as the copy of the content hash on this backend.
+    pub(super) fn keeps_own(&self, existing: &BackendLocation, written: &BackendLocation) -> bool {
+        let bucket = |location: &BackendLocation| match location.storage_bucket.as_str() {
+            "" => path_bucket(&location.backend_path).map(str::to_string),
+            bucket => Some(bucket.to_string()),
+        };
+        self.plain.is_some() && bucket(existing) != bucket(written)
     }
 
     /// Rows committed with the version only while the import rule `import_id` exists.

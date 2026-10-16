@@ -968,6 +968,10 @@ impl PutObjectOperation {
                     Ok(location) => location,
                     Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
                 };
+                if self.keeps_own(&existing_location, &written_location) {
+                    self.output = Some(Ok(written_location));
+                    return self.create_blob_location();
+                }
 
                 if !self.adopted && existing_location != written_location {
                     self.cleanup_location = Some(written_location);

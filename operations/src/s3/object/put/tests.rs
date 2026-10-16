@@ -2295,3 +2295,52 @@ mod sealed {
         assert!(!refused(quota_charge(1, 1)));
     }
 }
+
+#[test]
+fn plain_keeps_own_copy() {
+    use aruna_core::structs::storage::routing::PlainTarget;
+    let backend = BackendRef::Group(Ulid::from_parts(2, 2));
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let node_id = iroh::SecretKey::generate().public();
+    let copy = |path: &str| BackendLocation {
+        backend: backend.clone(),
+        storage_bucket: String::new(),
+        backend_path: path.to_string(),
+        hashes: HashMap::from([(
+            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+            vec![5; 32],
+        )]),
+        ..test_location(aruna_core::UserId::default())
+    };
+    let written = copy("team-a-x/data/a.csv");
+    // A copy in another provider bucket stays its own; one in the same bucket is shared.
+    for (existing, keeps) in [
+        (copy("team-a-y/a.csv"), true),
+        (copy("team-a-x/b.csv"), false),
+    ] {
+        let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
+        let target = PlainTarget {
+            import_id: Ulid::generate(),
+            backend: backend.clone(),
+            path: written.backend_path.clone(),
+            same_name: false,
+            listed: true,
+        };
+        op.version_id = Some(Ulid::generate());
+        let resolved =
+            aruna_core::structs::storage::blob::ResolvedBackend::new(backend.clone(), None);
+        op.start_plain(target, resolved);
+        op.state = PutObjectState::CheckHashLookup;
+        op.txn_id = Some(Ulid::generate());
+        op.written_location = Some(written.clone());
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(existing.to_bytes().unwrap().into()),
+        }));
+        let kept = if keeps { &written } else { &existing };
+        assert_eq!(
+            op.output.as_ref().map(|output| output.as_ref().ok()),
+            Some(Some(kept))
+        );
+    }
+}
