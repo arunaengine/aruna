@@ -124,6 +124,8 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::StatPlain { .. } => (EffectClass::Control, "stat_plain"),
         BlobEffect::StatCopy { .. } => (EffectClass::Control, "stat_copy"),
         BlobEffect::EnsureBucket { .. } => (EffectClass::Control, "ensure_bucket"),
+        BlobEffect::HeadBucket { .. } => (EffectClass::Control, "head_bucket"),
+        BlobEffect::DeleteEmptyBucket { .. } => (EffectClass::Control, "delete_empty_bucket"),
     }
 }
 
@@ -141,6 +143,7 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::AbortUpload { .. }
             | BlobEffect::SpoolHidden { .. }
             | BlobEffect::EnsureBucket { .. }
+            | BlobEffect::DeleteEmptyBucket { .. }
             | BlobEffect::Replicate { .. }
             | BlobEffect::HandleReplication { .. }
             | BlobEffect::ReceiveRead { .. }
@@ -903,6 +906,12 @@ impl BlobHandler {
             }
             BlobEffect::EnsureBucket { backend, bucket } => {
                 Box::pin(self.ensure_bucket(&backend, &bucket)).await
+            }
+            BlobEffect::HeadBucket { backend, bucket } => {
+                Box::pin(self.head_bucket(&backend, &bucket)).await
+            }
+            BlobEffect::DeleteEmptyBucket { backend, bucket } => {
+                Box::pin(self.delete_bucket(&backend, &bucket)).await
             }
             BlobEffect::HashArchive { location, lease } => {
                 Box::pin(self.hash_archive(location, *lease)).await

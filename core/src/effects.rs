@@ -364,6 +364,18 @@ pub enum BlobEffect {
         backend: BackendRef,
         bucket: String,
     },
+    /// Answers `BucketExists` for `bucket` on a group storage without a bucket; an existing
+    /// bucket gets a test write and delete. Nothing is created.
+    HeadBucket {
+        backend: BackendRef,
+        bucket: String,
+    },
+    /// Deletes `bucket` on a group storage without a bucket while it holds no object;
+    /// answers `BucketDeleted`.
+    DeleteEmptyBucket {
+        backend: BackendRef,
+        bucket: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -270,6 +270,15 @@ pub enum BlobEvent {
     BucketReady {
         created: bool,
     },
+    /// `writable` says whether a test write and delete worked; `None` for a missing bucket.
+    BucketExists {
+        exists: bool,
+        writable: Option<bool>,
+    },
+    /// `deleted` is false when the bucket still held objects and stays.
+    BucketDeleted {
+        deleted: bool,
+    },
 }
 
 #[derive(Debug, PartialEq)]

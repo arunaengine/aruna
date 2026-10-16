@@ -421,10 +421,8 @@ pub async fn ensure_bucket(
     guard: &EgressGuard,
 ) -> Result<bool, BlobError> {
     let client = config_client(config, Some(guard))?;
-    match client.head_bucket().bucket(bucket).send().boxed().await {
-        Ok(_) => return Ok(false),
-        Err(error) if status(&error) == Some(404) => {}
-        Err(error) => return Err(bucket_error(bucket, "check", &error)),
+    if head_bucket(&client, bucket).await? {
+        return Ok(false);
     }
     let region = s3_region(config, environment_variable).unwrap_or_default();
     let mut request = client.create_bucket().bucket(bucket);
@@ -444,6 +442,45 @@ pub async fn ensure_bucket(
             )),
             _ => Err(bucket_error(bucket, "create", &error)),
         },
+    }
+}
+
+/// Whether `bucket` exists; nothing is created.
+pub async fn bucket_exists(
+    config: &HashMap<String, String>,
+    bucket: &str,
+    guard: &EgressGuard,
+) -> Result<bool, BlobError> {
+    head_bucket(&config_client(config, Some(guard))?, bucket).await
+}
+
+async fn head_bucket(client: &Client, bucket: &str) -> Result<bool, BlobError> {
+    match client.head_bucket().bucket(bucket).send().boxed().await {
+        Ok(_) => Ok(true),
+        Err(error) if status(&error) == Some(404) => Ok(false),
+        Err(error) => Err(bucket_error(bucket, "check", &error)),
+    }
+}
+
+/// Deletes `bucket` only while it holds no object; answers whether it was deleted.
+pub async fn delete_empty(
+    config: &HashMap<String, String>,
+    bucket: &str,
+    guard: &EgressGuard,
+) -> Result<bool, BlobError> {
+    let client = config_client(config, Some(guard))?;
+    let listed = client.list_objects_v2().bucket(bucket).max_keys(1);
+    let listed = listed.send().boxed().await;
+    match listed {
+        Ok(listed) if !listed.contents().is_empty() => return Ok(false),
+        Ok(_) => {}
+        Err(error) => return Err(bucket_error(bucket, "list", &error)),
+    }
+    // A bucket with old object versions answers 409 and stays.
+    match client.delete_bucket().bucket(bucket).send().boxed().await {
+        Ok(_) => Ok(true),
+        Err(error) if status(&error) == Some(409) => Ok(false),
+        Err(error) => Err(bucket_error(bucket, "delete", &error)),
     }
 }
 
