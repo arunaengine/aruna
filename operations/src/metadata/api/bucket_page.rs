@@ -55,10 +55,9 @@ pub(super) fn encode_cursor(positions: &[NodePosition]) -> Option<String> {
     Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
-/// Orders all node pages by bucket name and node, cuts them to `limit` and moves each node
-/// past the hits it gave to this page. A node that gave fewer than `limit` hits, all on this
-/// page, is done; a failed node keeps its position. Positions of nodes this page did not ask
-/// are dropped, so the cursor follows the current membership and its node cap.
+/// Orders node pages by bucket name and node, cuts them to `limit` and moves each node past
+/// its hits on this page. A node with fewer than `limit` hits, all shown, is done; a failed
+/// node keeps its position, and nodes this page did not ask are dropped from the cursor.
 pub(super) fn merge_pages(
     parts: Vec<(NodeId, Vec<BucketSearchHit>)>,
     failed: &[NodeId],

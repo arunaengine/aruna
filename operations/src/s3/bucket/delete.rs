@@ -1,6 +1,5 @@
 //! Deletes a bucket only when it holds no objects, uploads or sync links, and fixes usage.
-//! Its bucket keys, holders and node vault keys go with it, and its unlocked keys are locked.
-//! Its provider bucket links go too; their removal marks may delete an empty provider bucket.
+//! Its keys, holders and provider bucket links go with it; an empty provider bucket may go too.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
