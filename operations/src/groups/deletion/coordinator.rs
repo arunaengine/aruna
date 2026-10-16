@@ -45,7 +45,7 @@ pub(super) fn coordinator(config: &RealmConfigDocument) -> Result<NodeId, GroupD
         .ok_or_else(|| GroupDeletionError::Unavailable("realm has no group coordinator".into()))
 }
 
-async fn load_group(
+pub(super) async fn load_group(
     context: &DriverContext,
     group_id: GroupId,
 ) -> Result<(Option<Group>, Option<GroupDeleteRecord>), GroupDeletionError> {
@@ -80,7 +80,7 @@ async fn load_group(
     }
 }
 
-async fn authorize(
+pub(super) async fn authorize(
     context: &Arc<DriverContext>,
     auth: &AuthContext,
     group_id: GroupId,
@@ -160,7 +160,7 @@ pub(super) async fn blocked(
     };
     let names = visible(context, auth, group_id, node, buckets).await;
     GroupDeletionError::NotEmpty {
-        kinds: format!("node {node}: {}", render(&kinds, &names, more)),
+        kinds: vec![format!("node {node}: {}", render(&kinds, &names, more))],
         buckets: Vec::new(),
         more: false,
     }
