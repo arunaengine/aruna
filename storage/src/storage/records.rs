@@ -6,7 +6,7 @@ use aruna_core::effects::IterStart;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
 use byteview::ByteView;
-use fjall::Readable;
+use fjall::{OptimisticTxKeyspace, Readable};
 use ulid::Ulid;
 
 use super::{
@@ -15,6 +15,19 @@ use super::{
 };
 
 impl FjallStorage {
+    /// A write transaction creates the keyspace it reads; other reads see an absent one as empty.
+    fn read_keyspace(
+        &self,
+        key_space: &str,
+        txn_id: Option<Ulid>,
+    ) -> Result<Option<OptimisticTxKeyspace>, StorageError> {
+        match txn_id.map(|txn_id| self.txns.get(&txn_id)) {
+            Some(None) => Err(StorageError::TransactionNotFound),
+            Some(Some(Txn::Write(_))) => self.store.resolve_keyspace(key_space).map(Some),
+            _ => self.store.existing_keyspace(key_space),
+        }
+    }
+
     #[tracing::instrument(
         name = "storage.read",
         level = "debug",
@@ -27,8 +40,9 @@ impl FjallStorage {
         key: ByteView,
         txn_id: Option<Ulid>,
     ) -> StorageEvent {
-        let keyspace = match self.store.resolve_keyspace(&key_space) {
-            Ok(keyspace) => keyspace,
+        let keyspace = match self.read_keyspace(&key_space, txn_id) {
+            Ok(Some(keyspace)) => keyspace,
+            Ok(None) => return StorageEvent::ReadResult { key, value: None },
             Err(error) => return StorageEvent::Error { error },
         };
         if let Some(txn_id) = txn_id {
@@ -66,8 +80,8 @@ impl FjallStorage {
     ) -> StorageEvent {
         if let Some(txn_id) = txn_id {
             return match self.txns.get(&txn_id) {
-                Some(Txn::Read(txn)) => batch_read_with(&self.store, txn, reads),
-                Some(Txn::Write(txn)) => batch_read_with(&self.store, txn.as_ref(), reads),
+                Some(Txn::Read(txn)) => batch_read_with(&self.store, txn, reads, false),
+                Some(Txn::Write(txn)) => batch_read_with(&self.store, txn.as_ref(), reads, true),
                 None => StorageEvent::Error {
                     error: StorageError::TransactionNotFound,
                 },
@@ -274,8 +288,14 @@ impl FjallStorage {
         limit: usize,
         txn_id: Option<Ulid>,
     ) -> StorageEvent {
-        let keyspace = match self.store.resolve_keyspace(&key_space) {
-            Ok(keyspace) => keyspace,
+        let keyspace = match self.read_keyspace(&key_space, txn_id) {
+            Ok(Some(keyspace)) => keyspace,
+            Ok(None) => {
+                return StorageEvent::IterResult {
+                    values: Vec::new(),
+                    next_start_after: None,
+                };
+            }
             Err(error) => return StorageEvent::Error { error },
         };
         if limit == 0 {
@@ -320,8 +340,14 @@ impl FjallStorage {
         prefix: Option<ByteView>,
         txn_id: Option<Ulid>,
     ) -> StorageEvent {
-        let keyspace = match self.store.resolve_keyspace(&key_space) {
-            Ok(keyspace) => keyspace,
+        let keyspace = match self.read_keyspace(&key_space, txn_id) {
+            Ok(Some(keyspace)) => keyspace,
+            Ok(None) => {
+                return StorageEvent::IterResult {
+                    values: Vec::new(),
+                    next_start_after: None,
+                };
+            }
             Err(error) => return StorageEvent::Error { error },
         };
         if let Some(txn_id) = txn_id {
