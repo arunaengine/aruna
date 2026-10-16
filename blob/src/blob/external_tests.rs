@@ -181,6 +181,7 @@ async fn writes_plain_paths() {
 async fn writes_folder_objects() {
     use super::stream_from_bytes;
     use aruna_core::structs::storage::backend_import::PlainPath;
+    use iroh_io::AsyncSliceReader;
     use ulid::Ulid;
 
     let context = setup_two_backends().await;
@@ -206,6 +207,11 @@ async fn writes_folder_objects() {
     assert!(root.join("raw/reports").is_dir());
     assert_eq!(location.blob_size, 0);
     assert!(location.hashes.contains_key(HASH_BLAKE3));
+    // Replication and peer reads open the same empty folder copy.
+    let mut reader = handler.slice_reader(&location).await.unwrap();
+    assert_eq!(reader.size().await.unwrap(), 0);
+    assert!(reader.read_exact_at(0, 0).await.unwrap().is_empty());
+    assert!(reader.read_exact_at(0, 1).await.is_err());
     let BlobEvent::ReadFinished { stream_size, .. } = handler.read_blob(location).await else {
         panic!("folder read failed")
     };

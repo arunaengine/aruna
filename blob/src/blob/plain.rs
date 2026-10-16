@@ -256,12 +256,15 @@ impl BlobHandler {
     }
 }
 
-/// The empty read of a folder object, whose key ends in `/` and which holds no bytes.
+/// A folder object: its key ends in `/` and it holds no bytes.
+pub(super) fn is_folder(location: &BackendLocation) -> bool {
+    location.blob_size == 0 && location.backend_path.ends_with('/')
+}
+
+/// The empty read of a folder object.
 pub(super) fn folder_read(location: &BackendLocation) -> Option<BlobEvent> {
-    (location.blob_size == 0 && location.backend_path.ends_with('/')).then(|| {
-        BlobEvent::ReadFinished {
-            blob: BackendStream::new(futures::stream::empty::<Result<Bytes, BlobError>>()),
-            stream_size: 0,
-        }
+    is_folder(location).then(|| BlobEvent::ReadFinished {
+        blob: BackendStream::new(futures::stream::empty::<Result<Bytes, BlobError>>()),
+        stream_size: 0,
     })
 }
