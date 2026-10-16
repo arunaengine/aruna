@@ -179,12 +179,17 @@ impl BlobHandler {
         };
         // Only S3 backends have a provider upload; the others keep one blob per part. The parts
         // of a compressed upload record their frames in this layout; a tenant path keeps raw bytes.
-        if let (Compression::Zstd { level }, None) = (resolved.compression, &plain) {
-            template.format.layout = StoredLayout::FramedPart(Box::new(PartLayout {
-                level,
-                frames: Vec::new(),
-                padding: 0,
-            }));
+        match (resolved.compression, &plain) {
+            // A tenant path copy keeps its own location row, as a single plain write does.
+            (_, Some(plain)) => template.format.layout = StoredLayout::Plain(plain.ulid),
+            (Compression::Zstd { level }, None) => {
+                template.format.layout = StoredLayout::FramedPart(Box::new(PartLayout {
+                    level,
+                    frames: Vec::new(),
+                    padding: 0,
+                }))
+            }
+            (Compression::Off, None) => {}
         }
         match self.native_for(&template) {
             Ok(Some(_)) => {}

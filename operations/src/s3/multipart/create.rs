@@ -907,11 +907,11 @@ mod pure_tests {
             let effects = operation.step(fence_clear());
             (operation, effects)
         };
-        // A plain key composes at its exact key without a provider upload.
+        // A plain key checks its exact key before the provider upload opens there.
         let (_, effects) = created("data/a.csv");
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+            [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "team-a-bucket/data/a.csv"
         ));
         // A folder key or a key without a plain path never opens an upload.
         for key in ["reports/", "reports//a.csv"] {

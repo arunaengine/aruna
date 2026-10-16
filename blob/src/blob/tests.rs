@@ -32,7 +32,7 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork, BlobTimeoutConfig,
     HiddenBlobKey, ResolvedBackend, WriteOwner,
 };
-use aruna_core::structs::storage::format::{Compression, StoredFormat};
+use aruna_core::structs::storage::format::{Compression, StoredFormat, StoredLayout};
 use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
@@ -3978,6 +3978,7 @@ async fn s3_plain_upload() {
         panic!("plain completion failed")
     };
     assert_eq!(location.blob_size, 5 * mib as u64 + 4);
+    assert!(matches!(location.format.layout, StoredLayout::Plain(_)));
 
     // A second upload that must find the path free fails and its abort keeps the file.
     let second = open(Ulid::generate()).await;
