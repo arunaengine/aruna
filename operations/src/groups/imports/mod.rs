@@ -11,7 +11,7 @@ use crate::driver::DriverContext;
 use crate::groups::backends::{RecordReadError, parse_read};
 use crate::jobs::backend_import::read_checkpoint;
 use crate::jobs::store::{iter_prefix_page, read_job_record};
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
 use aruna_core::structs::execution::job::{JobError, JobId, JobState};
@@ -20,7 +20,8 @@ use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportCheckpoint, import_key,
 };
 use aruna_core::structs::storage::blob::ensure_confined_path;
-use aruna_core::types::{GroupId, Key};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
+use smallvec::smallvec;
 use std::path::Path;
 use thiserror::Error;
 use ulid::Ulid;
@@ -138,6 +139,55 @@ pub fn validate_folder(field: &str, folder: &str) -> Result<(), ImportRuleError>
 /// Whether two folders of one bucket share keys.
 pub fn folders_overlap(left: &str, right: &str) -> bool {
     left.starts_with(right) || right.starts_with(left)
+}
+
+/// Why a bucket linked whole to a provider bucket keeps raw bytes.
+pub const MAPPED_REASON: &str =
+    "This bucket is stored 1:1 in a provider bucket, so it cannot be compressed or encrypted.";
+
+/// Pages through a group's rules, in the caller's transaction, for a whole-bucket provider
+/// link of one bucket.
+#[derive(Debug, PartialEq)]
+pub(crate) struct LinkScan {
+    group_id: GroupId,
+    bucket: String,
+    pub(crate) linked: bool,
+}
+
+impl LinkScan {
+    pub(crate) fn new(group_id: GroupId, bucket: &str) -> Self {
+        Self {
+            group_id,
+            bucket: bucket.to_string(),
+            linked: false,
+        }
+    }
+
+    pub(crate) fn page(&self, start: Option<Key>, txn_id: Option<TxnId>) -> Effects {
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            prefix: Some(self.group_id.to_bytes().to_vec().into()),
+            start: start.map(IterStart::After),
+            limit: RULE_PAGE,
+            txn_id,
+        })]
+    }
+
+    /// The next page while one is left and no link is found; `None` once `linked` is final.
+    pub(crate) fn scanned(
+        &mut self,
+        values: Vec<(Key, Value)>,
+        next: Option<Key>,
+        txn_id: Option<TxnId>,
+    ) -> Result<Option<Effects>, ConversionError> {
+        for (_, value) in values {
+            let rule = BackendImport::from_bytes(&value)?;
+            self.linked |= rule.bucket == self.bucket && rule.mapped_bucket().is_some();
+        }
+        Ok(next
+            .filter(|_| !self.linked)
+            .map(|next| self.page(Some(next), txn_id)))
+    }
 }
 
 pub async fn list_imports(

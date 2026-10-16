@@ -72,6 +72,7 @@ fn generated(operation: &mut EnableEncryptionOperation) -> (Effects, [u8; 32]) {
     operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
     let values = authority_rows(&bucket(), None, &[user(2)]);
     operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    no_versions(operation);
     operation.step(Event::Storage(StorageEvent::IterResult {
         values: Vec::new(),
         next_start_after: None,
@@ -238,7 +239,8 @@ fn locked_needs_recovery() {
     assert_eq!(record.vault_entry, None);
 }
 
-/// Starts the operation and answers the bucket read with `settings`.
+/// Starts the operation and answers the bucket read with `settings` and the link scan with no
+/// rules.
 fn bucket_read(
     operation: &mut EnableEncryptionOperation,
     settings: Option<BucketEncryption>,
@@ -248,7 +250,50 @@ fn bucket_read(
         txn_id: Ulid::from_bytes([9; 16]),
     }));
     let values = authority_rows(&bucket(), settings.as_ref(), &[user(2)]);
-    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    match operation.state {
+        EnableState::CheckLinks => no_versions(operation),
+        _ => effects,
+    }
+}
+
+#[test]
+fn mapped_refuses_encryption() {
+    use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN};
+    let mut operation =
+        EnableEncryptionOperation::new(input(EncryptionMode::NodeManaged, BTreeMap::new()));
+    operation.start();
+    operation.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: Ulid::from_bytes([9; 16]),
+    }));
+    let values = authority_rows(&bucket(), None, &[user(2)]);
+    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    let rule = BackendImport {
+        import_id: Ulid::from_bytes([5; 16]),
+        group_id: Ulid::from_bytes([3; 16]),
+        backend_id: Ulid::from_bytes([4; 16]),
+        backend_prefix: "team-a-bucket/".to_string(),
+        bucket: "bucket".to_string(),
+        key_prefix: String::new(),
+        schedule: None,
+        created_by: user(1),
+        created_at: SystemTime::UNIX_EPOCH,
+        updated_at: SystemTime::UNIX_EPOCH,
+        last_job: None,
+        last_started_ms: None,
+        write_backend_id: None,
+        write_prefix: None,
+        write_pattern: PLAIN_PATTERN.to_string(),
+    };
+    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+        values: vec![(rule.key(), rule.to_bytes().unwrap().into())],
+        next_start_after: None,
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    assert_eq!(operation.finalize(), Err(EnableError::Mapped));
 }
 
 #[test]

@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::groups::imports::LinkScan;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -30,6 +31,7 @@ enum PutCompressionState {
     Init,
     StartTransaction,
     ReadBucket,
+    CheckLinks,
     ReadMigration,
     CheckUnlocked,
     ReadKey,
@@ -54,6 +56,8 @@ pub enum PutCompressionError {
     /// Replacing an unfinished encryption transition would strand its source key.
     #[error("the bucket's stored copies are still moving to a new encryption")]
     TransitionRunning,
+    #[error("{}", crate::groups::imports::MAPPED_REASON)]
+    Mapped,
     #[error("PutBucketCompression did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
@@ -76,6 +80,7 @@ pub struct PutCompressionOperation {
     settings: Option<BucketEncryption>,
     /// Set when the commit must wake the migration task.
     wake: bool,
+    links: Option<LinkScan>,
     state: PutCompressionState,
     txn_id: Option<TxnId>,
     output: Option<Result<Option<CompressionMigration>, PutCompressionError>>,
@@ -91,6 +96,7 @@ impl PutCompressionOperation {
             info: None,
             settings: None,
             wake: false,
+            links: None,
             state: PutCompressionState::Init,
             txn_id: None,
             output: None,
@@ -112,6 +118,7 @@ impl PutCompressionOperation {
             PutCompressionState::Init => "Init",
             PutCompressionState::StartTransaction => "StartTransaction",
             PutCompressionState::ReadBucket => "ReadBucket",
+            PutCompressionState::CheckLinks => "CheckLinks",
             PutCompressionState::ReadMigration => "ReadMigration",
             PutCompressionState::CheckUnlocked => "CheckUnlocked",
             PutCompressionState::ReadKey => "ReadKey",
@@ -139,6 +146,30 @@ impl PutCompressionOperation {
             return self.fail(PutCompressionError::GroupMismatch);
         }
         self.info = Some(info);
+        if self.compression != Compression::Off {
+            let links = LinkScan::new(self.group_id, &self.bucket);
+            self.state = PutCompressionState::CheckLinks;
+            let effects = links.page(None, self.txn_id);
+            self.links = Some(links);
+            return effects;
+        }
+        self.read_settings()
+    }
+
+    /// A bucket linked whole to a provider bucket keeps its bytes raw.
+    fn links_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+        let Some(links) = self.links.as_mut() else {
+            return self.fail(PutCompressionError::NotFinished);
+        };
+        match links.scanned(values, next, self.txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) if links.linked => self.fail(PutCompressionError::Mapped),
+            Ok(None) => self.read_settings(),
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
+    fn read_settings(&mut self) -> Effects {
         self.state = PutCompressionState::ReadMigration;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![
@@ -363,6 +394,16 @@ impl Operation for PutCompressionOperation {
                 };
                 self.read_migration(value.map(|value| value.to_vec()))
             }
+            PutCompressionState::CheckLinks => {
+                let Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) = event
+                else {
+                    return self.unexpected("IterResult", event);
+                };
+                self.links_scanned(values, next_start_after)
+            }
             PutCompressionState::ReadMigration => {
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     return self.unexpected("BatchReadResult", event);
@@ -529,15 +570,70 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+        let mut effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"b".to_vec().into(),
             value: info.map(|info| info.to_bytes().unwrap().into()),
         }));
+        if operation.state == PutCompressionState::CheckLinks {
+            effects = operation.step(Event::Storage(StorageEvent::IterResult {
+                values: Vec::new(),
+                next_start_after: None,
+            }));
+        }
         if operation.state != PutCompressionState::ReadMigration {
             return effects;
         }
         let migration = migration.map(|record| record.to_bytes().unwrap().into());
         operation.step(rows(migration, None, None))
+    }
+
+    /// Answers the link scan of a compressing change with no rules.
+    fn no_links(operation: &mut PutCompressionOperation) {
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+    }
+
+    #[test]
+    fn mapped_refuses_compression() {
+        use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN};
+        let compression = Compression::Zstd { level: 3 };
+        let mut operation = PutCompressionOperation::new("b".to_string(), group(), compression, 1);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"b".to_vec().into(),
+            value: Some(bucket(group()).to_bytes().unwrap().into()),
+        }));
+        let rule = BackendImport {
+            import_id: Ulid::from_bytes([5; 16]),
+            group_id: group(),
+            backend_id: Ulid::from_bytes([4; 16]),
+            backend_prefix: "team-a-b/".to_string(),
+            bucket: "b".to_string(),
+            key_prefix: String::new(),
+            schedule: None,
+            created_by: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: PLAIN_PATTERN.to_string(),
+        };
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(rule.key(), rule.to_bytes().unwrap().into())],
+            next_start_after: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert_eq!(operation.finalize(), Err(PutCompressionError::Mapped));
     }
 
     /// The answer to the read of migration, encryption settings and transition rows.
@@ -596,6 +692,7 @@ mod tests {
             key: b"b".to_vec().into(),
             value: Some(bucket(group()).to_bytes().unwrap().into()),
         }));
+        no_links(&mut operation);
         let (settings, record) = encrypted();
         operation.step(rows(None, Some(settings.to_bytes().unwrap().into()), None));
 
@@ -622,6 +719,7 @@ mod tests {
             key: b"b".to_vec().into(),
             value: Some(bucket(group()).to_bytes().unwrap().into()),
         }));
+        no_links(&mut operation);
         let (settings, record) = encrypted();
         let effects = operation.step(rows(None, Some(settings.to_bytes().unwrap().into()), None));
         assert!(matches!(
@@ -678,6 +776,7 @@ mod tests {
             key: b"b".to_vec().into(),
             value: Some(bucket(group()).to_bytes().unwrap().into()),
         }));
+        no_links(&mut operation);
         let target = TransitionTarget {
             compression: Compression::Off,
             plan: None,
