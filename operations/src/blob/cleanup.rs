@@ -439,15 +439,20 @@ async fn reconcile_target(
         return RowOutcome::Kept;
     }
     // Read after the upload: a completion replaces this row in the commit that removes it.
-    match target_current(context, &location).await {
+    let own_row = match target_current(context, &location).await {
         None => return RowOutcome::Failed,
-        Some(false) => return RowOutcome::Kept,
-        Some(true) => {}
-    }
+        Some(Some(false)) => return RowOutcome::Kept,
+        Some(row) => row.is_some(),
+    };
     let Some(blob_handle) = context.blob_handle.as_ref() else {
         return RowOutcome::Failed;
     };
-    match blob_handle.discard_target(location).await {
+    // Only the target's own row may delete it; a later abort's row may outlive a completion.
+    let settled = match own_row {
+        true => blob_handle.discard_target(location).await,
+        false => blob_handle.abort_target(location).await,
+    };
+    match settled {
         Ok(()) => RowOutcome::Done,
         Err(error) => {
             warn!(%error, "Discarding an in-place upload target failed");
@@ -456,9 +461,12 @@ async fn reconcile_target(
     }
 }
 
-/// Whether the target row still names an upload or is gone. A committed version replaced
-/// it with its own row, which settles the object instead.
-async fn target_current(context: &DriverContext, location: &BackendLocation) -> Option<bool> {
+/// Whether the target's own row still names an upload; `Some(None)` when it is gone. A
+/// committed version replaced it with its own row, which settles the object instead.
+async fn target_current(
+    context: &DriverContext,
+    location: &BackendLocation,
+) -> Option<Option<bool>> {
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -471,7 +479,7 @@ async fn target_current(context: &DriverContext, location: &BackendLocation) -> 
         warn!(?event, "Upload target row could not be read");
         return None;
     };
-    Some(value.is_none_or(|value| {
+    Some(value.map(|value| {
         matches!(
             BlobCleanupWork::from_bytes(&value),
             Ok(BlobCleanupWork::ReconcileWrite {

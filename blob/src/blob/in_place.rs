@@ -129,6 +129,15 @@ impl BlobHandler {
         self.release_reservation(location).await
     }
 
+    /// Aborts the provider uploads under an in-place target and keeps any object there.
+    pub(super) async fn abort_target(&self, location: &BackendLocation) -> Result<(), BlobError> {
+        if location.is_external() {
+            return Ok(());
+        }
+        let path = self.object_path(location)?;
+        Box::pin(self.abort_uploads(location, &path)).await
+    }
+
     pub(super) async fn open_upload(
         &self,
         record_id: Ulid,

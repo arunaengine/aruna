@@ -390,6 +390,19 @@ impl BlobHandle {
         handler.discard_target(&location).await
     }
 
+    /// Aborts the provider uploads of an in-place target and keeps its object.
+    pub async fn abort_target(
+        &self,
+        location: aruna_core::structs::storage::blob::BackendLocation,
+    ) -> Result<(), BlobError> {
+        let effect = BlobEffect::Delete {
+            location: location.clone(),
+        };
+        let _hold = self.handler.hold_backends(&effect)?;
+        let handler = self.handler.with_group_backends(&effect).await?;
+        handler.abort_target(&location).await
+    }
+
     pub fn clear_reservation(&self, id: Ulid) {
         self.handler.clear_active(id);
     }
