@@ -215,7 +215,7 @@ pub async fn check_group(
                 None,
                 GroupDeleteAction::Check {
                     group_id,
-                    caller: auth.clone(),
+                    caller: Box::new(auth.clone()),
                 },
             )
             .await

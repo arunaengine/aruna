@@ -145,7 +145,7 @@ pub enum GroupDeleteAction {
     /// Only infrastructure nodes send it, after authorizing `caller` for the deletion.
     Check {
         group_id: Ulid,
-        caller: crate::structs::identity::auth::AuthContext,
+        caller: Box<crate::structs::identity::auth::AuthContext>,
     },
 }
 
