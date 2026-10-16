@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::s3::object::put::{PlainRecord, same_name_path};
+use crate::s3::object::put::{PlainRecord, same_name_path, version_row};
 use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
 use aruna_core::structs::storage::backend_import::{import_key, tagged_path};
 use aruna_core::structs::storage::multipart::BackendUpload;
@@ -174,8 +174,7 @@ impl CompleteUploadOperation {
         &self,
         rule_exists: bool,
     ) -> Result<Vec<(String, Key, Value)>, aruna_core::errors::ConversionError> {
-        let (Some(target), Some(written), Some(output), Some(version_id)) = (
-            self.plain.as_ref(),
+        let (Some(written), Some(output), Some(version_id)) = (
             self.composed_location.as_ref(),
             self.final_location.as_ref(),
             self.version_id,
@@ -184,10 +183,16 @@ impl CompleteUploadOperation {
         };
         // A deduplicated version reads the older location, so it needs no version row.
         let version = self.plain_version.as_deref();
+        let version = version.filter(|_| output.ulid == written.ulid);
+        // An object completed in place after its rule was removed still keeps its version.
+        let Some(target) = self.plain.as_ref() else {
+            let row = version.map(|version| version_row(written, version));
+            return Ok(row.into_iter().collect());
+        };
         let record = PlainRecord {
             target,
             written,
-            version: version.filter(|_| output.ulid == written.ulid),
+            version,
             version_id,
             key: &self.input.key,
         };
@@ -474,6 +479,32 @@ mod tests {
 
         // The object written in place gets the records of a plain write.
         let mut operation = in_place(id);
+        written_in_place(&mut operation);
+        let writes = finalize_writes(&mut operation, true);
+        assert_eq!(count(&writes, BACKEND_VERSION_KEYSPACE), 1);
+        assert_eq!(count(&writes, IMPORTED_OBJECT_KEYSPACE), 1);
+    }
+
+    #[test]
+    fn pins_without_rule() {
+        // The rule was removed before completion: no import row, but the version stays pinned.
+        let mut operation = in_place(Ulid::from_parts(6, 6));
+        operation.plain = None;
+        written_in_place(&mut operation);
+        operation.txn_id = Some(Ulid::nil());
+        operation.state = CompleteUploadState::DeleteUploadRecords;
+        let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the records, got {effects:?}")
+        };
+        assert_eq!(count(writes, BACKEND_VERSION_KEYSPACE), 1);
+        assert_eq!(count(writes, IMPORTED_OBJECT_KEYSPACE), 0);
+    }
+
+    /// Completes a stat-checked in-place upload with backend version `v1`.
+    fn written_in_place(operation: &mut CompleteUploadOperation) {
         operation.step(Event::Blob(BlobEvent::PlainStat {
             exists: false,
             version: None,
@@ -497,9 +528,6 @@ mod tests {
         );
         assert_eq!(operation.composed_location.as_ref(), Some(&location));
         operation.final_location = operation.composed_location.clone();
-        let writes = finalize_writes(&mut operation, true);
-        assert_eq!(count(&writes, BACKEND_VERSION_KEYSPACE), 1);
-        assert_eq!(count(&writes, IMPORTED_OBJECT_KEYSPACE), 1);
     }
 
     #[test]
