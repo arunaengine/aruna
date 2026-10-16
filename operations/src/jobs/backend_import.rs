@@ -20,6 +20,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
     ResolvedBackend, VersionKey, bucket_permission_path, ensure_confined_path,
 };
+use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{RoutingSnapshot, RoutingTarget, RuleSource};
 use aruna_core::types::{Effects, Key, Value};
@@ -446,6 +447,15 @@ fn hash_failure(error: BlobError) -> ItemError {
     }
 }
 
+/// A discovery of a whole-bucket provider link is its version's own copy; one of an ordinary
+/// rule may share the raw copy of its content on the backend.
+fn discovered_copy(rule: &BackendImport, mut location: BackendLocation) -> BackendLocation {
+    if rule.mapped_bucket().is_some() {
+        location.format.layout = StoredLayout::Plain(location.ulid);
+    }
+    location
+}
+
 async fn put_version(
     ctx: &JobContext,
     spec: &BackendImportSpec,
@@ -490,7 +500,7 @@ async fn put_version(
         routing: run.routing.clone(),
     })
     .without_envelope()
-    .with_adopted(location)
+    .with_adopted(discovered_copy(&run.rule, location))
     .with_bucket_guard(run.bucket.clone())
     .with_restrictions(spec.auth_context.path_restrictions.clone())
     .with_expected_head(head)
@@ -737,6 +747,55 @@ impl Operation for BlobRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mapped_discovery_owned() {
+        use aruna_core::structs::storage::backend_import::PLAIN_PATTERN;
+        use aruna_core::structs::storage::format::EncodingClass;
+        let mut rule = BackendImport {
+            import_id: Ulid::nil(),
+            group_id: Ulid::nil(),
+            backend_id: Ulid::nil(),
+            backend_prefix: "team-a-x/".to_string(),
+            bucket: "x".to_string(),
+            key_prefix: String::new(),
+            schedule: None,
+            created_by: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: PLAIN_PATTERN.to_string(),
+        };
+        let location = BackendLocation {
+            backend: BackendRef::Group(Ulid::nil()),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: "team-a-x/a.csv".to_string(),
+            ulid: Ulid::from_parts(7, 7),
+            format: Default::default(),
+            created_by: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 4,
+            hashes: Default::default(),
+        };
+        let owned = discovered_copy(&rule, location.clone()).format.encoding();
+        assert_eq!(
+            owned,
+            EncodingClass::Plain {
+                location: location.ulid
+            }
+        );
+        // An ordinary rule keeps sharing identical bytes on its backend.
+        rule.write_pattern = "{dir}{id}_{name}".to_string();
+        let shared = discovered_copy(&rule, location).format.encoding();
+        assert_eq!(shared, EncodingClass::Raw);
+    }
 
     fn object(etag: &str) -> ExternalObject {
         ExternalObject {
