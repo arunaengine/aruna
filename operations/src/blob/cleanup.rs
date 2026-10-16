@@ -438,6 +438,12 @@ async fn reconcile_target(
     if now_ms().saturating_sub(opened_ms) < BLOB_CLEANUP_AFTER.as_millis() as u64 {
         return RowOutcome::Kept;
     }
+    // Read after the upload: a completion replaces this row in the commit that removes it.
+    match target_current(context, &location).await {
+        None => return RowOutcome::Failed,
+        Some(false) => return RowOutcome::Kept,
+        Some(true) => {}
+    }
     let Some(blob_handle) = context.blob_handle.as_ref() else {
         return RowOutcome::Failed;
     };
@@ -448,6 +454,32 @@ async fn reconcile_target(
             RowOutcome::Failed
         }
     }
+}
+
+/// Whether the target row still names an upload or is gone. A committed version replaced
+/// it with its own row, which settles the object instead.
+async fn target_current(context: &DriverContext, location: &BackendLocation) -> Option<bool> {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: location.ulid.to_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await;
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        warn!(?event, "Upload target row could not be read");
+        return None;
+    };
+    Some(value.is_none_or(|value| {
+        matches!(
+            BlobCleanupWork::from_bytes(&value),
+            Ok(BlobCleanupWork::ReconcileWrite {
+                location: row,
+                owner: WriteOwner::Upload { .. } | WriteOwner::CompletedUpload { .. },
+            }) if row.same_object(location)
+        )
+    }))
 }
 
 async fn register_dht(
@@ -897,6 +929,36 @@ mod tests {
             assert_eq!(outcome.failed, usize::from(!kept));
             assert_eq!(remaining_rows(&storage).await, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn replaced_target_kept() {
+        // A completion removed the upload and replaced its target row after this row was
+        // scanned: the committed object is left to the new row.
+        let (_dir, storage, context) = setup_context();
+        let BlobCleanupWork::DeleteBlob { mut location } =
+            BlobCleanupWork::from_bytes(&delete_work()).unwrap()
+        else {
+            panic!("expected a delete row")
+        };
+        location.ulid = Ulid::from_parts(1, 3);
+        let event = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+                key: location.ulid.to_bytes().to_vec().into(),
+                value: reconcile_work(&location).into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        let outcome = super::reconcile_target(&context, Ulid::generate(), None, location).await;
+
+        // Without the recheck the discard runs and fails here for want of a blob handle.
+        assert!(matches!(outcome, super::RowOutcome::Kept));
     }
 
     #[tokio::test]
