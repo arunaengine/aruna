@@ -682,6 +682,7 @@ fn completes_at_provider() {
             parts,
             streamed,
             compression,
+            if_not_exists,
         }),
     ] = effects.as_slice()
     else {
@@ -691,6 +692,7 @@ fn completes_at_provider() {
     assert_eq!(parts, &op.resolved_parts);
     assert_eq!(streamed, &vec![2]);
     assert_eq!(compression, &op.compression);
+    assert!(!if_not_exists);
 }
 
 #[test]

@@ -1,16 +1,26 @@
-//! Creates a bucket record and counts the new bucket in the node usage stats.
+//! Creates a bucket record and counts the new bucket in the node usage stats. A mapped create
+//! also links the bucket to its own provider bucket on the group default storage.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::groups::backends::backend_key;
+use crate::groups::imports::ImportRuleError;
+use crate::groups::imports::create::{CreateImportInput, CreateImportOperation};
+use crate::groups::storage_routing::routing_key;
 use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+use aruna_core::keyspaces::{
+    S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+};
 use aruna_core::operation::Operation;
-use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::backend_import::PLAIN_PATTERN;
+use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
+use aruna_core::structs::storage::group_backend::GroupStorage;
+use aruna_core::structs::storage::routing::{GroupStorageRouting, RoutingTarget};
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::Effects;
+use aruna_core::types::{Effects, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -19,8 +29,11 @@ pub enum CreateBucketState {
     Init,
     StartTransaction,
     CheckExists,
+    ReadRouting,
+    ReadStorage,
     CreateBucket,
     UpdateUsage,
+    Link,
     CommitTransaction,
     Finish,
     Error,
@@ -36,6 +49,8 @@ pub enum CreateBucketError {
     ConversionError(#[from] ConversionError),
     #[error("Bucket already exists")]
     BucketAlreadyExists,
+    #[error("the provider bucket could not be linked: {0}")]
+    ProviderBucket(ImportRuleError),
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("Invalid state [{current:?}] - expected [{expected:?}]")]
@@ -64,6 +79,9 @@ pub struct CreateBucketOperation {
     state: CreateBucketState,
     txn_id: Option<ulid::Ulid>,
     usage_update: Option<UsageCounterUpdate>,
+    /// Looks for a provider bucket to link; only user creates opt in, never mirrors.
+    mapped: bool,
+    link: Option<CreateImportOperation>,
     output: Option<Result<BucketInfo, CreateBucketError>>,
 }
 
@@ -75,8 +93,17 @@ impl CreateBucketOperation {
             state: CreateBucketState::Init,
             txn_id: None,
             usage_update: None,
+            mapped: false,
+            link: None,
             output: None,
         }
+    }
+
+    /// Links a new bucket to the provider bucket `<bucket_prefix><bucket>` when the group
+    /// default storage sets a `bucket_prefix`.
+    pub fn mapped(mut self) -> Self {
+        self.mapped = true;
+        self
     }
 
     fn emit_error(&mut self, error: CreateBucketError) -> Effects {
@@ -127,7 +154,85 @@ impl CreateBucketOperation {
         if value.is_some() {
             return self.emit_error(CreateBucketError::BucketAlreadyExists);
         }
+        if self.mapped {
+            self.state = CreateBucketState::ReadRouting;
+            let key = routing_key(self.bucket_info.group_id);
+            return self.read(STORAGE_ROUTING_KEYSPACE, key);
+        }
+        self.write_bucket()
+    }
 
+    fn read(&self, key_space: &str, key: aruna_core::types::Key) -> Effects {
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn read_value(&mut self, event: Event) -> Result<Option<Value>, CreateBucketError> {
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+            received => Err(CreateBucketError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received,
+            }),
+        }
+    }
+
+    fn routing_read(&mut self, event: Event) -> Effects {
+        let routing = self.read_value(event).and_then(|value| {
+            let routing = value.map(|value| GroupStorageRouting::from_bytes(&value));
+            Ok(routing.transpose()?)
+        });
+        match routing.map(|routing| routing.and_then(|routing| routing.default_target)) {
+            Ok(Some(RoutingTarget::Backend(BackendRef::Group(backend_id)))) => {
+                self.state = CreateBucketState::ReadStorage;
+                self.read(STORAGE_BACKEND_KEYSPACE, backend_key(backend_id))
+            }
+            Ok(_) => self.write_bucket(),
+            Err(error) => self.emit_error(error),
+        }
+    }
+
+    fn storage_read(&mut self, event: Event) -> Effects {
+        let storage = self.read_value(event).and_then(|value| {
+            let storage = value.map(|value| GroupStorage::from_bytes(&value));
+            Ok(storage.transpose()?)
+        });
+        let storage = match storage {
+            Ok(storage) => storage,
+            Err(error) => return self.emit_error(error),
+        };
+        let (Some(storage), Some(txn_id)) = (storage, self.txn_id) else {
+            return self.write_bucket();
+        };
+        if let (Some(prefix), false, true) = (
+            storage.bucket_prefix(),
+            storage.disabled,
+            storage.group_id == self.bucket_info.group_id,
+        ) {
+            let input = CreateImportInput {
+                group_id: storage.group_id,
+                created_by: self.bucket_info.created_by,
+                backend_id: storage.backend_id,
+                backend_prefix: format!("{prefix}{}/", self.bucket),
+                bucket: self.bucket.clone(),
+                key_prefix: String::new(),
+                schedule: None,
+                write_backend_id: None,
+                write_prefix: None,
+                write_pattern: PLAIN_PATTERN.to_string(),
+                now: self.bucket_info.created_at,
+                move_existing: false,
+            };
+            self.link = Some(CreateImportOperation::within(input, txn_id));
+        }
+        self.write_bucket()
+    }
+
+    fn write_bucket(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(CreateBucketError::NoTransactionFound);
         };
@@ -179,11 +284,33 @@ impl CreateBucketOperation {
         };
         match update.step(event, txn_id) {
             Ok(Some(effects)) => effects,
-            Ok(None) => {
-                self.state = CreateBucketState::CommitTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
+            Ok(None) => match self.link.as_mut() {
+                Some(link) => {
+                    self.state = CreateBucketState::Link;
+                    let effects = link.start();
+                    self.linked(effects)
+                }
+                None => self.commit(txn_id),
+            },
             Err(err) => self.emit_error(err.into()),
+        }
+    }
+
+    fn commit(&mut self, txn_id: ulid::Ulid) -> Effects {
+        self.state = CreateBucketState::CommitTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    /// Passes the link's effects on until it is done; its failure aborts the whole create.
+    fn linked(&mut self, effects: Effects) -> Effects {
+        let (Some(link), Some(txn_id)) =
+            (self.link.take_if(|link| link.is_complete()), self.txn_id)
+        else {
+            return effects;
+        };
+        match link.finalize() {
+            Ok(_) => self.commit(txn_id),
+            Err(error) => self.emit_error(CreateBucketError::ProviderBucket(error)),
         }
     }
 
@@ -219,8 +346,17 @@ impl Operation for CreateBucketOperation {
             CreateBucketState::Init => self.handle_init(),
             CreateBucketState::StartTransaction => self.handle_transaction_started(event),
             CreateBucketState::CheckExists => self.handle_bucket_checked(event),
+            CreateBucketState::ReadRouting => self.routing_read(event),
+            CreateBucketState::ReadStorage => self.storage_read(event),
             CreateBucketState::CreateBucket => self.handle_bucket_created(event),
             CreateBucketState::UpdateUsage => self.handle_usage_update(event),
+            CreateBucketState::Link => match self.link.as_mut() {
+                Some(link) => {
+                    let effects = link.step(event);
+                    self.linked(effects)
+                }
+                None => self.emit_error(CreateBucketError::CreateBucketFailed),
+            },
             CreateBucketState::CommitTransaction => self.handle_transaction_committed(event),
             CreateBucketState::Finish => smallvec![],
             CreateBucketState::Error => self.abort(),
@@ -248,6 +384,208 @@ impl Operation for CreateBucketOperation {
             .map_or_else(smallvec::SmallVec::new, |txn_id| {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             })
+    }
+}
+
+#[cfg(test)]
+mod mapped_tests {
+    use super::*;
+    use aruna_core::UserId;
+    use aruna_core::effects::BlobEffect;
+    use aruna_core::errors::BlobError;
+    use aruna_core::events::BlobEvent;
+    use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
+    use aruna_core::structs::storage::backend_import::BackendImport;
+    use aruna_core::structs::storage::cleanup::CleanupStrategy;
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::group_backend::GroupBackendKind;
+    use aruna_core::types::{Key, TxnId};
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+    use ulid::Ulid;
+
+    const GROUP: Ulid = Ulid::from_parts(1, 1);
+    const BACKEND: Ulid = Ulid::from_parts(2, 2);
+
+    fn info() -> BucketInfo {
+        BucketInfo {
+            group_id: GROUP,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: UserId::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+        }
+    }
+
+    fn storage() -> Value {
+        let public = [
+            ("endpoint", "https://s3.example.test"),
+            ("bucket_prefix", "team-a-"),
+        ];
+        let record = GroupStorage {
+            backend_id: BACKEND,
+            group_id: GROUP,
+            name: "tenant".to_string(),
+            kind: GroupBackendKind::S3,
+            public_config: public
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<HashMap<_, _>>(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: UserId::default(),
+            disabled: false,
+            cleanup: CleanupStrategy::Retain,
+        };
+        record.to_bytes().unwrap().into()
+    }
+
+    fn routing() -> Value {
+        let routing = GroupStorageRouting {
+            group_id: GROUP,
+            default_target: Some(RoutingTarget::Backend(BackendRef::Group(BACKEND))),
+            updated_at: SystemTime::UNIX_EPOCH,
+            updated_by: UserId::default(),
+        };
+        routing.to_bytes().unwrap().into()
+    }
+
+    fn read(value: Option<Value>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(Vec::new()),
+            value,
+        })
+    }
+
+    fn batch(values: Vec<Option<Value>>) -> Event {
+        let values = values
+            .into_iter()
+            .map(|v| (Key::from(Vec::new()), v))
+            .collect();
+        Event::Storage(StorageEvent::BatchReadResult { values })
+    }
+
+    fn written() -> Event {
+        Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        })
+    }
+
+    /// Runs a mapped create up to the ensure of the provider bucket.
+    fn until_ensure(txn_id: TxnId) -> (CreateBucketOperation, Effects) {
+        let mut operation = CreateBucketOperation::new("x".to_string(), info()).mapped();
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(batch(vec![None, None]));
+        operation.step(read(Some(routing())));
+        operation.step(read(Some(storage())));
+        operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: Key::from(Vec::new()),
+        }));
+        operation.step(written());
+        operation.step(written());
+        let effects = operation.step(batch(vec![Some(storage()), Some(storage())]));
+        (operation, effects)
+    }
+
+    #[test]
+    fn links_provider_bucket() {
+        let txn_id = TxnId::default();
+        let (mut operation, effects) = until_ensure(txn_id);
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::EnsureBucket {
+                backend: BackendRef::Group(BACKEND),
+                bucket: "team-a-x".to_string(),
+            })]
+        );
+        operation.step(Event::Blob(BlobEvent::BucketReady { created: true }));
+        let bucket: Value = info().to_bytes().unwrap().into();
+        operation.step(batch(vec![
+            Some(bucket),
+            None,
+            Some(storage()),
+            None,
+            Some(storage()),
+        ]));
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        let [
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(_),
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the link writes, got {effects:?}");
+        };
+        let rule = writes
+            .iter()
+            .find(|(space, ..)| space == BACKEND_IMPORT_KEYSPACE)
+            .map(|(_, _, value)| BackendImport::from_bytes(value).unwrap())
+            .unwrap();
+        assert_eq!(rule.mapped_bucket(), Some("team-a-x"));
+        assert_eq!((rule.bucket.as_str(), rule.schedule), ("x", None));
+        let record = writes
+            .iter()
+            .find(|(space, ..)| space == STORAGE_BACKEND_KEYSPACE)
+            .map(|(_, _, value)| GroupStorage::from_bytes(value).unwrap())
+            .unwrap();
+        assert_eq!(
+            record
+                .public_config
+                .get("bucket:team-a-x")
+                .map(String::as_str),
+            Some("created")
+        );
+        // The link writes join the bucket's own transaction, which commits last.
+        let effects = operation.step(written());
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        );
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert_eq!(operation.finalize(), Ok(info()));
+    }
+
+    #[test]
+    fn ensure_failure_aborts() {
+        let txn_id = TxnId::default();
+        let (mut operation, _) = until_ensure(txn_id);
+        let refused = BlobError::WriteError("No access to bucket `team-a-x`.".to_string());
+        let effects = operation.step(Event::Blob(BlobEvent::Error(refused)));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        );
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateBucketError::ProviderBucket(ImportRuleError::Invalid(
+                _
+            )))
+        ));
+    }
+
+    #[test]
+    fn mirrors_skip_mapping() {
+        let mut operation = CreateBucketOperation::new("x".to_string(), info());
+        operation.start();
+        let txn_id = TxnId::default();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = operation.step(batch(vec![None, None]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == S3_BUCKET_KEYSPACE
+        ));
     }
 }
 

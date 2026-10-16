@@ -10,7 +10,6 @@ use aruna_core::keyspaces::*;
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::structs::execution::job::{JobFamilyRecord, JobRecordEnvelope};
 use aruna_core::structs::identity::group_delete::GroupDeletionError;
-use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
@@ -29,7 +28,6 @@ const TABLES: &[(&str, &str, bool)] = &[
     (S3_BUCKET_KEYSPACE, "S3 buckets", false),
     (STORAGE_BACKEND_KEYSPACE, "storage backends", false),
     (USER_ACCESS_KEYSPACE, "active S3 access keys", false),
-    (S3_SESSION_KEYSPACE, "active S3 sessions", false),
     (PLACEMENT_POLICY_KEYSPACE, "owned placement policies", false),
     (STORAGE_ROUTING_KEYSPACE, "default storage routing", true),
     (BACKEND_IMPORT_KEYSPACE, "backend imports", true),
@@ -133,11 +131,11 @@ impl EmptyCheck {
             }
             for (key, value) in values {
                 let owned = match space {
+                    // A finished job only waits for its retention purge, so it does not block.
                     JOB_KEYSPACE => {
-                        crate::jobs::store::decode_job_record(&value)?
-                            .payload
-                            .owner_group()
-                            == Some(self.group_id)
+                        let record = crate::jobs::store::decode_job_record(&value)?;
+                        record.payload.owner_group() == Some(self.group_id)
+                            && !record.state.is_terminal()
                     }
                     FAMILY_RECORD_KEYSPACE => {
                         let envelope: JobRecordEnvelope =
@@ -161,10 +159,6 @@ impl EmptyCheck {
                         record.group_id == self.group_id
                             && record.revoked_at.is_none()
                             && record.expiry > self.now
-                    }
-                    S3_SESSION_KEYSPACE => {
-                        let record = S3Session::from_bytes(&value)?;
-                        record.group_id == self.group_id && record.expiry > self.now
                     }
                     PLACEMENT_POLICY_KEYSPACE => {
                         PlacementPolicyDocument::from_bytes(&value)?
@@ -208,24 +202,29 @@ impl EmptyCheck {
             kinds: self.found.iter().map(|kind| kind.to_string()).collect(),
             buckets: self.buckets.clone(),
             more: self.more,
+            hidden: 0,
         })
     }
 }
 
-/// Joins the kinds and puts the visible bucket names after the `S3 buckets` kind.
-pub(super) fn render(kinds: &[String], names: &[String], more: bool) -> String {
+/// Joins the kinds and puts the visible bucket names and the hidden count after `S3 buckets`.
+pub(super) fn render(kinds: &[String], names: &[String], hidden: u64, more: bool) -> String {
     let kinds = match kinds.split_last() {
         None => String::new(),
         Some((last, [])) => last.clone(),
         Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     };
-    if names.is_empty() {
+    let mut shown = names.to_vec();
+    if hidden > 0 {
+        shown.push(format!("{hidden} you cannot read"));
+    }
+    if shown.is_empty() {
         return kinds;
     }
     let more = if more { ", and more" } else { "" };
     kinds.replacen(
         "S3 buckets",
-        &format!("S3 buckets ({}{more})", names.join(", ")),
+        &format!("S3 buckets ({}{more})", shown.join(", ")),
         1,
     )
 }
@@ -331,9 +330,13 @@ mod tests {
         let names = ["a)x".to_string(), "b".to_string()];
         let kinds = ["metadata documents", "job records", "S3 buckets"].map(String::from);
         assert_eq!(
-            render(&kinds, &names, true),
+            render(&kinds, &names, 0, true),
             "metadata documents, job records and S3 buckets (a)x, b, and more)"
         );
-        assert_eq!(render(&kinds[2..], &[], true), "S3 buckets");
+        assert_eq!(render(&kinds[2..], &[], 0, true), "S3 buckets");
+        assert_eq!(
+            render(&kinds[2..], &names[..1], 2, false),
+            "S3 buckets (a)x, 2 you cannot read)"
+        );
     }
 }

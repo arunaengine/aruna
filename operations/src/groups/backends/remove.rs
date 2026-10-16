@@ -12,7 +12,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork, BlobLocationKey};
-use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
+use aruna_core::structs::storage::group_backend::{
+    BUCKET_DELETING, GroupStorage, GroupStorageSecret,
+};
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
@@ -215,6 +217,9 @@ pub enum RemoveBackendError {
     Read(#[from] RecordReadError),
     #[error("storage backend is not removable")]
     NotRemovable,
+    /// The removal mark still needs the storage's keys to delete the bucket.
+    #[error("a provider bucket of this storage is still being removed")]
+    CleanupPending,
     #[error("remove failed")]
     Failed,
     #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
@@ -284,6 +289,10 @@ impl RemoveBackendOperation {
             Ok(_) => return self.fail(RemoveBackendError::NotRemovable),
             Err(error) => return self.fail(error.into()),
         };
+        let mut buckets = record.checked_buckets();
+        if buckets.any(|bucket| record.bucket_state(bucket) == Some(BUCKET_DELETING)) {
+            return self.fail(RemoveBackendError::CleanupPending);
+        }
 
         self.state = RemoveState::DeleteRecords;
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
@@ -676,6 +685,32 @@ mod tests {
             txn_id: Ulid::from_bytes([9u8; 16]),
         }));
         assert_eq!(operation.finalize(), Err(RemoveBackendError::NotRemovable));
+    }
+
+    #[test]
+    fn pending_cleanup_refuses() {
+        let backend_id = Ulid::from_bytes([8u8; 16]);
+        let mut operation = RemoveBackendOperation::new(Ulid::from_bytes([1u8; 16]), backend_id);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([9u8; 16]),
+        }));
+        let mut drained = record(backend_id, true);
+        let state = ("bucket:team-a-x".to_string(), "deleting".to_string());
+        drained.public_config.extend([state]);
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(drained.to_bytes().unwrap().into()),
+        }));
+        // The secret stays while a removal mark still deletes a provider bucket with it.
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert_eq!(
+            operation.finalize(),
+            Err(RemoveBackendError::CleanupPending)
+        );
     }
 
     // A state that expects no event must reject one instead of ignoring it.

@@ -9,6 +9,7 @@ use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::routing::RoutingError;
 use aruna_operations::blob::managed_copy::ManagedCopyError;
 use aruna_operations::driver::{GateContextError, RoutingInputsError};
+use aruna_operations::groups::imports::ImportRuleError;
 use aruna_operations::placement::policy::PolicyGateError;
 use aruna_operations::s3::bucket::cors::{DeleteCorsError, GetCorsError, PutCorsError};
 use aruna_operations::s3::bucket::create::CreateBucketError;
@@ -294,6 +295,18 @@ impl IntoS3Error for CreateBucketError {
     fn into_s3_error(self) -> S3Error {
         match self {
             CreateBucketError::BucketAlreadyExists => existing_bucket_error(),
+            CreateBucketError::ProviderBucket(ImportRuleError::Invalid(reason)) => {
+                s3_error!(
+                    InvalidRequest,
+                    "The provider bucket was not linked: {reason}"
+                )
+            }
+            CreateBucketError::ProviderBucket(ImportRuleError::Conflict(reason)) => {
+                s3_error!(
+                    OperationAborted,
+                    "The provider bucket was not linked: {reason}"
+                )
+            }
             err => internal_error(err),
         }
     }
@@ -337,6 +350,7 @@ impl IntoS3Error for ListVersionsError {
 impl IntoS3Error for PutObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
+            error @ PutObjectError::Unmapped => s3_error!(InvalidArgument, "{error}"),
             PutObjectError::ChecksumMismatch(algorithm) => {
                 checksum_mismatch_logged(algorithm, "PutObject")
             }
@@ -363,6 +377,7 @@ impl IntoS3Error for PutObjectError {
 impl IntoS3Error for CreateMultipartError {
     fn into_s3_error(self) -> S3Error {
         match self {
+            error @ CreateMultipartError::Unmapped => s3_error!(InvalidArgument, "{error}"),
             CreateMultipartError::RoutingFailed(RoutingError::BackendFull(backend)) => {
                 backend_full_error(&backend.to_string())
             }
@@ -418,6 +433,7 @@ impl IntoS3Error for PartCopyError {
 impl IntoS3Error for CompleteUploadError {
     fn into_s3_error(self) -> S3Error {
         match self {
+            error @ CompleteUploadError::Unmapped => s3_error!(InvalidArgument, "{error}"),
             CompleteUploadError::NoSuchUpload
             | CompleteUploadError::UploadTargetMismatch
             | CompleteUploadError::UploadNotOpen => missing_upload_error(),
@@ -470,6 +486,11 @@ impl IntoS3Error for CompleteUploadError {
             CompleteUploadError::ManagedCopyError(ref error) => managed_copy_error(error),
             CompleteUploadError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
             CompleteUploadError::BlobError(BlobError::KeyTooLong) => long_key_error(),
+            // The parts cannot move to another path, so only a new upload can succeed.
+            CompleteUploadError::BlobError(BlobError::PathTaken) => s3_error!(
+                OperationAborted,
+                "Another file took this path first. Start a new upload."
+            ),
             CompleteUploadError::BlobError(ref error) => {
                 compose_failed_error(error, matches!(error, BlobError::ReadError(_)))
             }
@@ -758,6 +779,16 @@ mod tests {
                     .is_some_and(|text| text.contains("1024 bytes"))
             );
         }
+    }
+
+    #[test]
+    fn maps_taken_path() {
+        // A single write may retry; a multipart upload has to start over.
+        let put = PutObjectError::BlobWriteFailed(BlobError::PathTaken).into_s3_error();
+        assert_eq!(*put.code(), S3ErrorCode::ServiceUnavailable);
+        let complete = CompleteUploadError::BlobError(BlobError::PathTaken).into_s3_error();
+        assert_eq!(*complete.code(), S3ErrorCode::OperationAborted);
+        assert_eq!(complete.status_code(), Some(http::StatusCode::CONFLICT));
     }
 
     // A failed blob write maps to BadDigest (400) so SDKs do not retry it.

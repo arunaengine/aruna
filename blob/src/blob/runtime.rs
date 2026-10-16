@@ -124,6 +124,8 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::StatPlain { .. } => (EffectClass::Control, "stat_plain"),
         BlobEffect::StatCopy { .. } => (EffectClass::Control, "stat_copy"),
         BlobEffect::EnsureBucket { .. } => (EffectClass::Control, "ensure_bucket"),
+        BlobEffect::HeadBucket { .. } => (EffectClass::Control, "head_bucket"),
+        BlobEffect::DeleteEmptyBucket { .. } => (EffectClass::Control, "delete_empty_bucket"),
     }
 }
 
@@ -141,6 +143,7 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::AbortUpload { .. }
             | BlobEffect::SpoolHidden { .. }
             | BlobEffect::EnsureBucket { .. }
+            | BlobEffect::DeleteEmptyBucket { .. }
             | BlobEffect::Replicate { .. }
             | BlobEffect::HandleReplication { .. }
             | BlobEffect::ReceiveRead { .. }
@@ -385,6 +388,19 @@ impl BlobHandle {
         let _hold = self.handler.hold_backends(&effect)?;
         let handler = self.handler.with_group_backends(&effect).await?;
         handler.discard_target(&location).await
+    }
+
+    /// Aborts the provider uploads of an in-place target and keeps its object.
+    pub async fn abort_target(
+        &self,
+        location: aruna_core::structs::storage::blob::BackendLocation,
+    ) -> Result<(), BlobError> {
+        let effect = BlobEffect::Delete {
+            location: location.clone(),
+        };
+        let _hold = self.handler.hold_backends(&effect)?;
+        let handler = self.handler.with_group_backends(&effect).await?;
+        handler.abort_target(&location).await
     }
 
     pub fn clear_reservation(&self, id: Ulid) {
@@ -741,14 +757,21 @@ impl BlobHandler {
                 key,
                 resolved,
                 created_by,
-            } => Box::pin(self.open_upload(record_id, &bucket, &key, resolved, created_by)).await,
+                plain,
+            } => {
+                let open = self.open_upload(record_id, &bucket, &key, resolved, created_by, plain);
+                Box::pin(open).await
+            }
             BlobEffect::CompleteUpload {
                 backend_upload,
                 parts,
                 streamed,
                 compression,
+                if_not_exists,
             } => {
-                let complete = self.complete_upload(*backend_upload, parts, &streamed, compression);
+                let upload = *backend_upload;
+                let complete =
+                    self.complete_upload(upload, parts, &streamed, compression, if_not_exists);
                 Box::pin(complete).await
             }
             BlobEffect::AbortUpload { backend_upload } => {
@@ -903,6 +926,12 @@ impl BlobHandler {
             }
             BlobEffect::EnsureBucket { backend, bucket } => {
                 Box::pin(self.ensure_bucket(&backend, &bucket)).await
+            }
+            BlobEffect::HeadBucket { backend, bucket } => {
+                Box::pin(self.head_bucket(&backend, &bucket)).await
+            }
+            BlobEffect::DeleteEmptyBucket { backend, bucket } => {
+                Box::pin(self.delete_bucket(&backend, &bucket)).await
             }
             BlobEffect::HashArchive { location, lease } => {
                 Box::pin(self.hash_archive(location, *lease)).await

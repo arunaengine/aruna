@@ -1249,7 +1249,8 @@ fn map_put_error(error: PutObjectError) -> CallToolResult {
         error @ (PutObjectError::MissingBody
         | PutObjectError::IncompleteBody
         | PutObjectError::MissingExpectedChecksum(_)
-        | PutObjectError::ChecksumMismatch(_)) => bad_request(error),
+        | PutObjectError::ChecksumMismatch(_)
+        | PutObjectError::Unmapped) => bad_request(error),
         error @ PutObjectError::QuotaExceeded { .. } => {
             server_error(crate::error::ServerError::Conflict(error.to_string()))
         }

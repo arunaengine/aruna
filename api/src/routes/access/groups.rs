@@ -1074,8 +1074,11 @@ pub struct NodeBlockers {
     pub kinds: Vec<String>,
     /// Up to five blocking S3 bucket names the caller may read.
     pub buckets: Vec<String>,
-    /// Some blocking bucket is not named: more than five exist, or the caller may not read it.
+    /// The scan stopped after five blocking buckets, so more of them exist on this node.
     pub more: bool,
+    /// Blocking buckets the scan found that the caller may not read; a lower bound when
+    /// `more` is set.
+    pub hidden: u64,
     /// Set when the node did not answer the check; its kinds are then unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -1094,7 +1097,9 @@ carrying WRITE on the group's administrative path or on the realm group-administ
 **Behavior**
 - Read-only: the check changes no state and does not start a deletion.
 - Each node lists the blocking resource kinds and the bucket names the caller may read.
-- `more` is true when some blocking bucket is not named.
+- `hidden` counts the blocking buckets the caller may not read, so they are not named.
+- `more` is true when the node has more than five blocking buckets; the scan stops there, so
+  `buckets` and `hidden` then cover only the first five and `hidden` is a lower bound.
 - A node that does not answer is listed with an `error` instead of failing the request.
 
 **Limits**
@@ -1111,13 +1116,15 @@ carrying WRITE on the group's administrative path or on the realm group-administ
                         "node_id": "k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga",
                         "kinds": ["metadata documents", "S3 buckets"],
                         "buckets": ["lab-data", "raw-scans"],
-                        "more": false
+                        "more": false,
+                        "hidden": 2
                     },
                     {
                         "node_id": "pqcrmr2vpxjqx3nvxfvbxvvrgak5r2gmr7qeqfhqxhbpcpqoa2xh",
                         "kinds": [],
                         "buckets": [],
                         "more": false,
+                        "hidden": 0,
                         "error": "group deletion unavailable: node unreachable"
                     }
                 ]
@@ -1157,6 +1164,7 @@ pub async fn get_deletion_blockers(
                 kinds: Vec::new(),
                 buckets: Vec::new(),
                 more: false,
+                hidden: 0,
                 error: None,
             };
             match result {
@@ -1165,7 +1173,11 @@ pub async fn get_deletion_blockers(
                     kinds,
                     buckets,
                     more,
-                }) => (entry.kinds, entry.buckets, entry.more) = (kinds, buckets, more),
+                    hidden,
+                }) => {
+                    (entry.kinds, entry.buckets) = (kinds, buckets);
+                    (entry.more, entry.hidden) = (more, hidden);
+                }
                 Err(error) => entry.error = Some(error.to_string()),
             }
             entry

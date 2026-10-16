@@ -1061,6 +1061,11 @@ pub(crate) fn enable_refusal(error: EnableError) -> ServerError {
             "recovery_unmet",
             "the key holders do not meet the recovery rule",
         ),
+        EnableError::Mapped => refused(
+            StatusCode::CONFLICT,
+            "mapped_bucket",
+            aruna_operations::groups::imports::MAPPED_REASON,
+        ),
         other => ServerError::InternalError(other.to_string()),
     }
 }

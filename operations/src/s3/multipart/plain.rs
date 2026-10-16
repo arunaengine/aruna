@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::s3::object::put::{PlainRecord, same_name_path};
+use crate::s3::object::put::{PlainRecord, same_name_path, version_row};
 use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
 use aruna_core::structs::storage::backend_import::{import_key, tagged_path};
+use aruna_core::structs::storage::multipart::BackendUpload;
 
 impl CompleteUploadOperation {
     /// Routing inputs that may name a plain path for the completed object.
@@ -17,6 +18,9 @@ impl CompleteUploadOperation {
     /// A plain path only for raw parts composed on the rule's write backend. A same-name
     /// object first looks at the path; no lock is held.
     pub(super) fn plain_compose(&mut self) -> Option<Effects> {
+        if let Some(location) = self.plain_upload().map(|upload| upload.location.clone()) {
+            return Some(self.stat_in_place(location));
+        }
         let upload = self.upload_record.as_ref()?;
         if self.compression != Compression::Off || upload.backend_upload.is_some() {
             return None;
@@ -42,7 +46,44 @@ impl CompleteUploadOperation {
         Some(smallvec![Effect::Blob(stat)])
     }
 
+    /// The provider upload of an upload that opened at its plain path.
+    fn plain_upload(&self) -> Option<&BackendUpload> {
+        let upload = self.upload_record.as_ref()?.backend_upload.as_ref()?;
+        upload.location.is_external().then_some(upload)
+    }
+
+    /// The object completes where its parts streamed to; the version id is the one the path
+    /// was chosen with. The path is looked at again, since the provider completes in place.
+    fn stat_in_place(&mut self, location: BackendLocation) -> Effects {
+        let id = location.ulid;
+        let (bucket, key) = (&self.input.bucket, &self.input.key);
+        self.plain = self
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.plain_target(bucket, key, id))
+            .filter(|target| target.backend == location.backend);
+        self.version_id = Some(id);
+        self.state = CompleteUploadState::StatPlain;
+        smallvec![Effect::Blob(BlobEffect::StatPlain {
+            backend: location.backend,
+            path: location.backend_path,
+        })]
+    }
+
     pub(super) fn plain_stat(&mut self, event: Event) -> Effects {
+        // Only a backend with versions keeps a file that appeared meanwhile; else it conflicts.
+        if self.plain_upload().is_some() {
+            return match event {
+                Event::Blob(BlobEvent::PlainStat { exists, version }) => {
+                    let replaces = exists && version.is_some();
+                    self.complete_provider(!replaces).unwrap_or_else(|| {
+                        self.schedule_error(CompleteUploadError::InvalidOperationState)
+                    })
+                }
+                Event::Blob(BlobEvent::Error(error)) => self.schedule_error(error.into()),
+                _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
+            };
+        }
         let (Some(target), Some(id)) = (self.plain.as_ref(), self.version_id) else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
@@ -60,6 +101,10 @@ impl CompleteUploadOperation {
     /// Another writer took the free path first; the parts are still there, so the object
     /// takes its tagged path instead.
     pub(super) fn plain_taken(&mut self) -> Effects {
+        // Parts in a provider upload cannot move to another path; the client uploads again.
+        if self.plain_upload().is_some() {
+            return self.schedule_error(BlobError::PathTaken.into());
+        }
         let (Some(target), Some(id)) = (self.plain.as_ref(), self.version_id) else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
@@ -129,8 +174,7 @@ impl CompleteUploadOperation {
         &self,
         rule_exists: bool,
     ) -> Result<Vec<(String, Key, Value)>, aruna_core::errors::ConversionError> {
-        let (Some(target), Some(written), Some(output), Some(version_id)) = (
-            self.plain.as_ref(),
+        let (Some(written), Some(output), Some(version_id)) = (
             self.composed_location.as_ref(),
             self.final_location.as_ref(),
             self.version_id,
@@ -139,10 +183,16 @@ impl CompleteUploadOperation {
         };
         // A deduplicated version reads the older location, so it needs no version row.
         let version = self.plain_version.as_deref();
+        let version = version.filter(|_| output.ulid == written.ulid);
+        // An object completed in place after its rule was removed still keeps its version.
+        let Some(target) = self.plain.as_ref() else {
+            let row = version.map(|version| version_row(written, version));
+            return Ok(row.into_iter().collect());
+        };
         let record = PlainRecord {
             target,
             written,
-            version: version.filter(|_| output.ulid == written.ulid),
+            version,
             version_id,
             key: &self.input.key,
         };
@@ -257,6 +307,14 @@ mod tests {
         if let (Some(location), Some(ulid)) = (operation.final_location.as_mut(), committed) {
             location.ulid = ulid;
         }
+        finalize_writes(&mut operation, exists)
+    }
+
+    /// Drives a composed upload through its finalize records, with or without the rule.
+    fn finalize_writes(
+        operation: &mut CompleteUploadOperation,
+        exists: bool,
+    ) -> Vec<(String, Key, Value)> {
         operation.txn_id = Some(Ulid::nil());
         operation.state = CompleteUploadState::DeleteUploadRecords;
         let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
@@ -354,6 +412,139 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::Blob(BlobEffect::Compose { .. }))),
             "a taken tagged path is not tried again: {effects:?}"
+        );
+        assert_eq!(
+            operation.cleanup.take_error(),
+            Some(CompleteUploadError::BlobError(BlobError::PathTaken))
+        );
+    }
+
+    /// An upload whose provider upload opened at `raw/object` as version `id`.
+    fn in_place(id: Ulid) -> CompleteUploadOperation {
+        let mut operation = operation("{dir}{name}");
+        let location = BackendLocation {
+            backend: BackendRef::Group(backend_id()),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: "raw/object".to_string(),
+            ulid: id,
+            format: Default::default(),
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 0,
+            hashes: HashMap::new(),
+        };
+        if let Some(upload) = operation.upload_record.as_mut() {
+            upload.backend_upload = Some(BackendUpload {
+                location,
+                upload_id: "provider".to_string(),
+                record_id: Ulid::from_parts(1, 1),
+            });
+        }
+        let effects = operation.compose_blob();
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "raw/object"
+            ),
+            "expected the path stat, got {effects:?}"
+        );
+        assert_eq!(operation.version_id, Some(id));
+        operation
+    }
+
+    fn provider_condition(effects: &Effects) -> bool {
+        match effects.as_slice() {
+            [Effect::Blob(BlobEffect::CompleteUpload { if_not_exists, .. })] => *if_not_exists,
+            _ => panic!("expected the provider completion, got {effects:?}"),
+        }
+    }
+
+    #[test]
+    fn completes_in_place() {
+        // Only a backend with versions keeps a file that appeared meanwhile at the path.
+        let id = Ulid::from_parts(6, 6);
+        for (exists, version, if_not_exists) in [
+            (false, None, true),
+            (true, None, true),
+            (true, Some("v0".to_string()), false),
+        ] {
+            let mut operation = in_place(id);
+            let effects = operation.step(Event::Blob(BlobEvent::PlainStat { exists, version }));
+            assert_eq!(provider_condition(&effects), if_not_exists);
+        }
+
+        // The object written in place gets the records of a plain write.
+        let mut operation = in_place(id);
+        written_in_place(&mut operation);
+        let writes = finalize_writes(&mut operation, true);
+        assert_eq!(count(&writes, BACKEND_VERSION_KEYSPACE), 1);
+        assert_eq!(count(&writes, IMPORTED_OBJECT_KEYSPACE), 1);
+    }
+
+    #[test]
+    fn pins_without_rule() {
+        // The rule was removed before completion: no import row, but the version stays pinned.
+        let mut operation = in_place(Ulid::from_parts(6, 6));
+        operation.plain = None;
+        written_in_place(&mut operation);
+        operation.txn_id = Some(Ulid::nil());
+        operation.state = CompleteUploadState::DeleteUploadRecords;
+        let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the records, got {effects:?}")
+        };
+        assert_eq!(count(writes, BACKEND_VERSION_KEYSPACE), 1);
+        assert_eq!(count(writes, IMPORTED_OBJECT_KEYSPACE), 0);
+    }
+
+    /// Completes a stat-checked in-place upload with backend version `v1`.
+    fn written_in_place(operation: &mut CompleteUploadOperation) {
+        operation.step(Event::Blob(BlobEvent::PlainStat {
+            exists: false,
+            version: None,
+        }));
+        let mut location = operation.plain_upload().unwrap().location.clone();
+        location.blob_size = 3;
+        location.hashes = HashMap::from([(
+            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+            vec![7u8; 32],
+        )]);
+        let effects = operation.step(Event::Blob(BlobEvent::PlainWritten {
+            location: location.clone(),
+            version: Some("v1".to_string()),
+        }));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::StartTransaction { .. })]
+            ),
+            "expected the finalize transaction, got {effects:?}"
+        );
+        assert_eq!(operation.composed_location.as_ref(), Some(&location));
+        operation.final_location = operation.composed_location.clone();
+    }
+
+    #[test]
+    fn taken_in_place() {
+        // A file that took the free path first fails the upload; its parts cannot move.
+        let mut operation = in_place(Ulid::from_parts(6, 6));
+        operation.step(Event::Blob(BlobEvent::PlainStat {
+            exists: false,
+            version: None,
+        }));
+        let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Blob(BlobEffect::Compose { .. } | BlobEffect::CompleteUpload { .. })
+            )),
+            "a taken path is not tried again: {effects:?}"
         );
         assert_eq!(
             operation.cleanup.take_error(),

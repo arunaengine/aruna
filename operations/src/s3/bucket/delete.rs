@@ -1,5 +1,5 @@
 //! Deletes a bucket only when it holds no objects, uploads or sync links, and fixes usage.
-//! Its bucket keys, holders and node vault keys go with it, and its unlocked keys are locked.
+//! Its keys, holders and provider bucket links go with it; an empty provider bucket may go too.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,20 +8,23 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    ABE_DUE_KEYSPACE, ABE_REISSUE_KEYSPACE, ABE_REKEY_KEYSPACE, BLOB_HEAD_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE,
-    BUCKET_KEY_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, KEY_COPY_KEYSPACE, NODE_VAULT_KEYSPACE,
-    RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+    ABE_DUE_KEYSPACE, ABE_REISSUE_KEYSPACE, ABE_REKEY_KEYSPACE, BACKEND_IMPORT_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE,
+    BUCKET_KEY_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, IMPORT_REMOVAL_KEYSPACE, KEY_COPY_KEYSPACE,
+    NODE_VAULT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
+use aruna_core::structs::storage::backend_import::{BackendImport, ProviderCleanup};
 use aruna_core::structs::storage::blob::{BlobHeadKey, BucketInfo, VersionKey};
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRecord};
+use aruna_core::structs::storage::group_backend::{BUCKET_DELETING, BUCKET_STATE, GroupStorage};
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -40,6 +43,9 @@ pub enum DeleteBucketState {
     WriteRepairs,
     ReadEncryption,
     ScanKeyRows,
+    ScanLinks,
+    ReadStorages,
+    WriteLinks,
     DeleteBucket,
     UpdateUsage,
     CommitTransaction,
@@ -86,6 +92,8 @@ pub struct DeleteBucketOperation {
     bucket_id: Option<ulid::Ulid>,
     key_spaces: Vec<&'static str>,
     key_deletes: Vec<(String, Key)>,
+    /// Rules that link this bucket whole to a provider bucket; they go with it.
+    links: Vec<BackendImport>,
     output: Option<Result<(), DeleteBucketError>>,
 }
 
@@ -104,6 +112,7 @@ impl DeleteBucketOperation {
             bucket_id: None,
             key_spaces: Vec::new(),
             key_deletes: Vec::new(),
+            links: Vec::new(),
             output: None,
         }
     }
@@ -365,7 +374,7 @@ impl DeleteBucketOperation {
 
     fn scan_key_rows(&mut self, start: Option<Key>) -> Effects {
         let (Some(bucket_id), Some(key_space)) = (self.bucket_id, self.key_spaces.last()) else {
-            return self.delete_bucket_records();
+            return self.scan_links(None);
         };
         self.state = DeleteBucketState::ScanKeyRows;
         smallvec![Effect::Storage(StorageEffect::Iter {
@@ -413,6 +422,127 @@ impl DeleteBucketOperation {
             self.key_spaces.pop();
         }
         self.scan_key_rows(next_start_after)
+    }
+
+    fn scan_links(&mut self, start: Option<Key>) -> Effects {
+        let Some(group_id) = self.group_id else {
+            return self.emit_error(DeleteBucketError::DeleteBucketFailed);
+        };
+        self.state = DeleteBucketState::ScanLinks;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            prefix: Some(group_id.to_bytes().to_vec().into()),
+            start: start.map(aruna_core::effects::IterStart::After),
+            limit: Self::SCAN_LIMIT,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn links_scanned(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return self.emit_error(DeleteBucketError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::IterResult)",
+                received: event,
+            });
+        };
+        for (_, value) in values {
+            match BackendImport::from_bytes(&value) {
+                Ok(rule) if rule.bucket == self.bucket && rule.mapped_bucket().is_some() => {
+                    self.links.push(rule);
+                }
+                Ok(_) => {}
+                Err(error) => return self.emit_error(error.into()),
+            }
+        }
+        if next_start_after.is_some() {
+            return self.scan_links(next_start_after);
+        }
+        if self.links.is_empty() {
+            return self.delete_bucket_records();
+        }
+        let mut backends: Vec<_> = self.links.iter().map(|rule| rule.backend_id).collect();
+        backends.sort_unstable();
+        backends.dedup();
+        self.state = DeleteBucketState::ReadStorages;
+        let reads = backends.into_iter().map(|backend_id| {
+            let key = crate::groups::backends::backend_key(backend_id);
+            (STORAGE_BACKEND_KEYSPACE.to_string(), key)
+        });
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: reads.collect(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// Drops the links with a removal mark for their rows. A provider bucket that Aruna created
+    /// on a `delete_empty` storage turns `deleting`, and its mark deletes it once it is empty.
+    fn storages_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.emit_error(DeleteBucketError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                received: event,
+            });
+        };
+        let mut writes: Vec<(String, Key, Value)> = Vec::new();
+        let mut providers = Vec::new();
+        for (_, value) in values {
+            let Some(value) = value else { continue };
+            let mut record = match GroupStorage::from_bytes(&value) {
+                Ok(record) => record,
+                Err(error) => return self.emit_error(error.into()),
+            };
+            let links = self
+                .links
+                .iter()
+                .filter(|rule| rule.backend_id == record.backend_id);
+            let buckets: Vec<String> = links
+                .filter_map(|rule| rule.mapped_bucket())
+                .filter(|bucket| record.deletes_empty(bucket))
+                .map(str::to_string)
+                .collect();
+            if buckets.is_empty() {
+                continue;
+            }
+            for bucket in buckets {
+                let state = format!("{BUCKET_STATE}{bucket}");
+                record
+                    .public_config
+                    .insert(state, BUCKET_DELETING.to_string());
+                providers.push(ProviderCleanup {
+                    backend_id: record.backend_id,
+                    bucket,
+                });
+            }
+            match crate::groups::backends::record_writes(&record) {
+                Ok(rows) => writes.extend(rows),
+                Err(error) => return self.emit_error(error.into()),
+            }
+        }
+        for rule in &self.links {
+            let mark: Key = rule.import_id.to_bytes().to_vec().into();
+            let cleanup = providers.iter().find(|cleanup| {
+                cleanup.backend_id == rule.backend_id
+                    && rule.mapped_bucket() == Some(cleanup.bucket.as_str())
+            });
+            let value = match cleanup.map(ProviderCleanup::to_bytes).transpose() {
+                Ok(value) => value.unwrap_or_default(),
+                Err(error) => return self.emit_error(error.into()),
+            };
+            writes.push((IMPORT_REMOVAL_KEYSPACE.to_string(), mark, value.into()));
+            self.key_deletes
+                .push((BACKEND_IMPORT_KEYSPACE.to_string(), rule.key()));
+        }
+        self.state = DeleteBucketState::WriteLinks;
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: self.txn_id,
+        })]
     }
 
     fn delete_bucket_records(&mut self) -> Effects {
@@ -524,6 +654,13 @@ impl DeleteBucketOperation {
                 after: std::time::Duration::ZERO,
             }));
         }
+        // The import schedule purges the object rows of the removed links.
+        if !self.links.is_empty() {
+            effects.push(Effect::Task(TaskEffect::ShortenTimer {
+                key: TaskKey::RunBackendImports,
+                after: std::time::Duration::ZERO,
+            }));
+        }
         effects
     }
 }
@@ -553,6 +690,18 @@ impl Operation for DeleteBucketOperation {
             DeleteBucketState::WriteRepairs => self.handle_repairs_written(event),
             DeleteBucketState::ReadEncryption => self.encryption_read(event),
             DeleteBucketState::ScanKeyRows => self.key_rows_scanned(event),
+            DeleteBucketState::ScanLinks => self.links_scanned(event),
+            DeleteBucketState::ReadStorages => self.storages_read(event),
+            DeleteBucketState::WriteLinks => match event {
+                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                    self.delete_bucket_records()
+                }
+                received => self.emit_error(DeleteBucketError::InvalidStateEvent {
+                    state: self.state.clone(),
+                    expected: "Event::Storage(StorageEvent::BatchWriteResult)",
+                    received,
+                }),
+            },
             DeleteBucketState::DeleteBucket => self.handle_bucket_deleted(event),
             DeleteBucketState::UpdateUsage => self.handle_usage_update(event),
             DeleteBucketState::CommitTransaction => self.handle_transaction_committed(event),
@@ -580,6 +729,191 @@ impl Operation for DeleteBucketOperation {
         self.txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
             smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         })
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use aruna_core::UserId;
+    use aruna_core::structs::storage::backend_import::PLAIN_PATTERN;
+    use aruna_core::structs::storage::cleanup::CleanupStrategy;
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::group_backend::GroupBackendKind;
+    use std::time::SystemTime;
+    use ulid::Ulid;
+
+    const GROUP: Ulid = Ulid::from_parts(1, 1);
+    const BACKEND: Ulid = Ulid::from_parts(2, 2);
+
+    fn bucket() -> Value {
+        let info = BucketInfo {
+            group_id: GROUP,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: UserId::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+        };
+        info.to_bytes().unwrap().into()
+    }
+
+    fn rule() -> BackendImport {
+        BackendImport {
+            import_id: Ulid::from_parts(3, 3),
+            group_id: GROUP,
+            backend_id: BACKEND,
+            backend_prefix: "team-a-x/".to_string(),
+            bucket: "x".to_string(),
+            key_prefix: String::new(),
+            schedule: None,
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: PLAIN_PATTERN.to_string(),
+        }
+    }
+
+    fn storage(mode: &str) -> Value {
+        let public = [
+            ("endpoint", "https://s3.example.test"),
+            ("bucket_prefix", "team-a-"),
+            ("bucket_delete", mode),
+            ("bucket:team-a-x", "created"),
+        ];
+        let record = GroupStorage {
+            backend_id: BACKEND,
+            group_id: GROUP,
+            name: "tenant".to_string(),
+            kind: GroupBackendKind::S3,
+            public_config: public
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: UserId::default(),
+            disabled: false,
+            cleanup: CleanupStrategy::Retain,
+        };
+        record.to_bytes().unwrap().into()
+    }
+
+    fn empty() -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        })
+    }
+
+    fn written() -> Event {
+        Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        })
+    }
+
+    /// Deletes bucket `x` linked to `team-a-x`; answers the link writes, the deletes and the
+    /// effects after the commit.
+    type Deleted = (Vec<(String, Key, Value)>, Vec<(String, Key)>, Effects);
+
+    fn delete(mode: &str) -> Deleted {
+        let txn_id = TxnId::default();
+        let mut operation = DeleteBucketOperation::new("x".to_string());
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(Vec::new()),
+            value: Some(bucket()),
+        }));
+        for _ in 0..5 {
+            operation.step(empty());
+        }
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(Vec::new()),
+            value: None,
+        }));
+        let link = (rule().key(), rule().to_bytes().unwrap().into());
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![link],
+            next_start_after: None,
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(Key::from(Vec::new()), Some(storage(mode)))],
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the link writes, got {effects:?}");
+        };
+        let writes = writes.clone();
+        let effects = operation.step(written());
+        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice()
+        else {
+            panic!("expected the deletes, got {effects:?}");
+        };
+        let deletes = deletes.clone();
+        operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        operation.step(written());
+        operation.step(written());
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert_eq!(operation.finalize(), Ok(()));
+        (writes, deletes, effects)
+    }
+
+    /// The provider bucket the link's removal mark still has to delete.
+    fn mark_cleanup(writes: &[(String, Key, Value)]) -> Option<ProviderCleanup> {
+        let (_, _, value) = writes
+            .iter()
+            .find(|(space, ..)| space == IMPORT_REMOVAL_KEYSPACE)
+            .unwrap();
+        ProviderCleanup::from_mark(value).unwrap()
+    }
+
+    #[test]
+    fn deletes_empty_provider() {
+        let (writes, deletes, effects) = delete("delete_empty");
+        assert!(deletes.contains(&(BACKEND_IMPORT_KEYSPACE.to_string(), rule().key())));
+        let record = writes
+            .iter()
+            .find(|(space, ..)| space == STORAGE_BACKEND_KEYSPACE)
+            .map(|(_, _, value)| GroupStorage::from_bytes(value).unwrap())
+            .unwrap();
+        // The state fences new links until the mark deleted the bucket.
+        assert_eq!(record.bucket_state("team-a-x"), Some(BUCKET_DELETING));
+        let cleanup = ProviderCleanup {
+            backend_id: BACKEND,
+            bucket: "team-a-x".to_string(),
+        };
+        assert_eq!(mark_cleanup(&writes), Some(cleanup));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Task(TaskEffect::ShortenTimer {
+                key: TaskKey::RunBackendImports,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn keeps_provider_bucket() {
+        let (writes, deletes, _) = delete("keep");
+        // The link goes either way; the provider bucket and its record stay.
+        assert!(deletes.contains(&(BACKEND_IMPORT_KEYSPACE.to_string(), rule().key())));
+        let rows = writes.iter();
+        assert!(
+            !rows
+                .clone()
+                .any(|(space, ..)| space == STORAGE_BACKEND_KEYSPACE)
+        );
+        assert_eq!(mark_cleanup(&writes), None);
     }
 }
 

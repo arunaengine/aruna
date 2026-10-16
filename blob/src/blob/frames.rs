@@ -226,6 +226,8 @@ pub(super) enum SliceReader {
     Raw(OpenDalReader),
     Framed(FrameReader),
     Sealed(super::pithos::SealedReader),
+    /// A folder object, whose key ends in `/`, holds no bytes.
+    Empty,
 }
 
 impl AsyncSliceReader for SliceReader {
@@ -234,6 +236,7 @@ impl AsyncSliceReader for SliceReader {
             Self::Raw(reader) => reader.read_at(offset, len).await,
             Self::Framed(reader) => reader.read_at(offset, len).await,
             Self::Sealed(reader) => reader.read_at(offset, len).await,
+            Self::Empty => Ok(Bytes::new()),
         }
     }
 
@@ -242,6 +245,8 @@ impl AsyncSliceReader for SliceReader {
             Self::Raw(reader) => reader.read_exact_at(offset, len).await,
             Self::Framed(reader) => reader.read_exact_at(offset, len).await,
             Self::Sealed(reader) => reader.read_exact_at(offset, len).await,
+            Self::Empty if len == 0 => Ok(Bytes::new()),
+            Self::Empty => Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
         }
     }
 
@@ -250,6 +255,7 @@ impl AsyncSliceReader for SliceReader {
             Self::Raw(reader) => reader.size().await,
             Self::Framed(reader) => reader.size().await,
             Self::Sealed(reader) => reader.size().await,
+            Self::Empty => Ok(0),
         }
     }
 }
@@ -385,6 +391,9 @@ impl BlobHandler {
         if let StoredLayout::Frames(layout) = &location.format.layout {
             let reader = self.frame_reader(location, layout).await?;
             return Ok(SliceReader::Framed(reader));
+        }
+        if super::plain::is_folder(location) {
+            return Ok(SliceReader::Empty);
         }
         let operator = self.operator_from_location(location)?;
         let path = self.object_path(location)?;

@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::migration::queue::encrypt_rows;
+use crate::groups::imports::LinkScan;
 use crate::s3::bucket::key::rows::{
     SettingsError, audit_row, authority_read, copy_targets, generation_rows, group_bucket_key,
     parse_authority, uploads_open,
@@ -48,6 +49,7 @@ enum EnableState {
     Init,
     StartTransaction,
     ReadBucket,
+    CheckLinks,
     CheckUploads,
     /// Pages through the bucket's versions and reads their copies' sizes.
     ScanVersions,
@@ -91,6 +93,8 @@ pub enum EnableError {
     /// `vault_locked` needs two ready holders, or one whose key declares a recovery code.
     #[error("the key holders do not meet the recovery rule")]
     RecoveryUnmet,
+    #[error("{}", crate::groups::imports::MAPPED_REASON)]
+    Mapped,
     #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: String,
@@ -148,6 +152,7 @@ pub struct EnableEncryptionOperation {
     /// Last version key of the current size page, and whether another page may follow.
     size_cursor: Option<Key>,
     more_sizes: bool,
+    links: Option<LinkScan>,
 }
 
 impl EnableEncryptionOperation {
@@ -168,6 +173,7 @@ impl EnableEncryptionOperation {
             output: None,
             size_cursor: None,
             more_sizes: false,
+            links: None,
         }
     }
 
@@ -202,8 +208,27 @@ impl EnableEncryptionOperation {
         self.creator = Some(info.created_by);
         self.compression = info.compression;
         self.settings = settings;
-        self.state = EnableState::CheckUploads;
-        self.scan(UPLOAD_KEYSPACE, None)
+        self.state = EnableState::CheckLinks;
+        let links = LinkScan::new(self.input.group_id, &self.input.bucket);
+        let effects = links.page(None, self.txn_id);
+        self.links = Some(links);
+        effects
+    }
+
+    /// A bucket linked whole to a provider bucket keeps its bytes raw.
+    fn links_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+        let Some(links) = self.links.as_mut() else {
+            return self.fail(EnableError::NotFinished);
+        };
+        match links.scanned(values, next, self.txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) if links.linked => self.fail(EnableError::Mapped),
+            Ok(None) => {
+                self.state = EnableState::CheckUploads;
+                self.scan(UPLOAD_KEYSPACE, None)
+            }
+            Err(error) => self.fail(error),
+        }
     }
 
     fn scan(&self, key_space: &str, prefix: Option<Key>) -> Effects {
@@ -547,6 +572,13 @@ impl Operation for EnableEncryptionOperation {
             (EnableState::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.read_bucket(values)
             }
+            (
+                EnableState::CheckLinks,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => self.links_scanned(values, next_start_after),
             (
                 EnableState::CheckUploads,
                 Event::Storage(StorageEvent::IterResult { values, .. }),

@@ -125,8 +125,8 @@ impl Operation for CheckOperation {
     }
 }
 
-/// Scans this node and keeps only the bucket names the caller may read.
-/// `more` is set when any blocking bucket stays unnamed.
+/// Scans this node and keeps only the bucket names the caller may read; `hidden` counts the
+/// others. `more` stays the scan's own flag: more blocking buckets than it named.
 pub(super) async fn scan(
     context: &DriverContext,
     auth: &AuthContext,
@@ -138,12 +138,14 @@ pub(super) async fn scan(
             kinds,
             buckets,
             more,
+            hidden,
         }) => {
             let count = buckets.len();
             let names = visible(context, auth, group_id, node, buckets).await;
             Err(GroupDeletionError::NotEmpty {
                 kinds,
-                more: more || names.len() < count,
+                more,
+                hidden: hidden + (count - names.len()) as u64,
                 buckets: names,
             })
         }

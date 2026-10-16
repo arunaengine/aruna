@@ -59,6 +59,8 @@ pub enum StoredLayout {
     Pithos(Box<PithosLayout>),
     /// Frames of one compressed part in a provider upload; completion adds the seek table.
     FramedPart(Box<PartLayout>),
+    /// The original bytes at a tenant path; the location id gives the copy its own location row.
+    Plain(ulid::Ulid),
 }
 
 /// Record of a framed copy. The index hash covers the frame digests and seek table at its end.
@@ -156,7 +158,10 @@ impl StoredFormat {
     pub fn checked(&self) -> Result<(), ConversionError> {
         match (&self.layout, &self.encryption) {
             (
-                StoredLayout::Raw | StoredLayout::Frames(_) | StoredLayout::FramedPart(_),
+                StoredLayout::Raw
+                | StoredLayout::Frames(_)
+                | StoredLayout::FramedPart(_)
+                | StoredLayout::Plain(_),
                 StoredEncryption::None,
             )
             | (StoredLayout::Pithos(_), StoredEncryption::Pithos(_)) => Ok(()),
@@ -187,6 +192,9 @@ impl StoredFormat {
             StoredLayout::Pithos(layout) => EncodingClass::Pithos {
                 digest: layout.metadata_digest,
             },
+            StoredLayout::Plain(location) => EncodingClass::Plain {
+                location: *location,
+            },
         }
     }
 }
@@ -203,12 +211,18 @@ pub enum EncodingClass {
     Pithos {
         digest: [u8; 32],
     },
+    /// Raw bytes at a tenant path are never shared: each copy has its own location row.
+    Plain {
+        location: ulid::Ulid,
+    },
 }
 
 /// Tag of the zstd class in keys; backend keys start with `n` or `g` instead.
 const ZSTD_TAG: u8 = b'z';
 /// Tag of the Pithos class in keys, followed by the 32-byte metadata digest.
 const PITHOS_TAG: u8 = b'p';
+/// Tag of the plain class in keys, followed by the 16-byte location id.
+const PLAIN_TAG: u8 = b'l';
 
 impl EncodingClass {
     /// Bytes placed between hash and backend in a location key. Raw adds none,
@@ -218,6 +232,15 @@ impl EncodingClass {
             Self::Raw => Vec::new(),
             Self::Zstd { level } => vec![ZSTD_TAG, *level],
             Self::Pithos { digest } => [&[PITHOS_TAG], &digest[..]].concat(),
+            Self::Plain { location } => [&[PLAIN_TAG], &location.to_bytes()[..]].concat(),
+        }
+    }
+
+    /// The compression setting this class stores: a plain copy holds raw bytes.
+    pub fn setting(self) -> Self {
+        match self {
+            Self::Plain { .. } => Self::Raw,
+            other => other,
         }
     }
 
@@ -228,6 +251,9 @@ impl EncodingClass {
             [ZSTD_TAG, level] => Ok(Self::Zstd { level: *level }),
             [PITHOS_TAG, digest @ ..] if digest.len() == 32 => Ok(Self::Pithos {
                 digest: digest.try_into()?,
+            }),
+            [PLAIN_TAG, location @ ..] if location.len() == 16 => Ok(Self::Plain {
+                location: ulid::Ulid::from_bytes(location.try_into()?),
             }),
             _ => Err(ConversionError::InvalidLength(
                 "unknown encoding class in key".to_string(),
@@ -245,6 +271,12 @@ impl EncodingClass {
                     digest: bytes[1..33].try_into()?,
                 },
                 &bytes[33..],
+            )),
+            Some(&PLAIN_TAG) if bytes.len() > 17 => Ok((
+                Self::Plain {
+                    location: ulid::Ulid::from_bytes(bytes[1..17].try_into()?),
+                },
+                &bytes[17..],
             )),
             _ => Err(ConversionError::InvalidLength(
                 "unknown encoding class in location key".to_string(),
@@ -349,7 +381,16 @@ mod tests {
             sealed.backend.clone(),
         );
         assert_ne!(second.to_bytes(), sealed.to_bytes());
-        for class in [zstd, first] {
+        // Plain copies of the same bytes on one backend never share a row.
+        let plain = |seed| EncodingClass::Plain {
+            location: ulid::Ulid::from_parts(seed, seed.into()),
+        };
+        let mine = BlobLocationKey::new([2; 32], plain(1), BackendRef::node_default());
+        let theirs = BlobLocationKey::new([2; 32], plain(2), BackendRef::node_default());
+        assert_ne!(mine.to_bytes(), theirs.to_bytes());
+        assert_eq!(BlobLocationKey::from_bytes(&mine.to_bytes()).unwrap(), mine);
+        assert_eq!(plain(1).setting(), EncodingClass::Raw);
+        for class in [zstd, first, plain(3)] {
             let candidate = ReclaimCandidateKey::new(BackendRef::node_default(), class, [5; 32]);
             assert_eq!(
                 ReclaimCandidateKey::from_bytes(&candidate.to_bytes()).unwrap(),

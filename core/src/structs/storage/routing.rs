@@ -110,6 +110,10 @@ pub struct GroupRoutingInputs {
     pub containers: BTreeMap<Ulid, Vec<String>>,
 }
 
+/// Why a write to a bucket linked whole to a provider bucket is refused.
+pub const UNMAPPED_KEY: &str =
+    "This key cannot be stored 1:1 in the provider bucket, like a key that ends in `/`.";
+
 /// Where a write under a backend import rule is stored instead of Aruna's own layout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlainTarget {
@@ -466,6 +470,12 @@ impl RoutingSnapshot {
 
     /// The backend path a write of `key` as version `id` takes under an import rule. A
     /// compressing bucket keeps Aruna's own layout, as does a key without a file name.
+    /// Whether `bucket` is linked whole to a provider bucket, so every write needs a plain path.
+    pub fn mapped(&self, bucket: &str) -> bool {
+        let mut imports = self.imports.iter();
+        imports.any(|rule| rule.bucket == bucket && rule.mapped_bucket().is_some())
+    }
+
     pub fn plain_target(&self, bucket: &str, key: &str, id: Ulid) -> Option<PlainTarget> {
         let rule = self
             .imports
@@ -489,7 +499,7 @@ impl RoutingSnapshot {
         Some(PlainTarget {
             import_id: rule.import_id,
             backend: BackendRef::Group(backend),
-            same_name: rule.same_name(),
+            same_name: rule.same_name() && !path.ends_with('/'),
             listed: backend == rule.backend_id && path.starts_with(&rule.backend_prefix),
             path,
         })

@@ -161,6 +161,8 @@ pub enum GroupDeletionError {
         /// Up to five blocking bucket names; `more` is set when others exist.
         buckets: Vec<String>,
         more: bool,
+        /// Scanned blocking buckets the caller may not read, left out of `buckets`.
+        hidden: u64,
     },
     #[error("group deletion unavailable: {0}")]
     Unavailable(String),

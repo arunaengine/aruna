@@ -4,7 +4,9 @@
 
 use crate::endpoint_screening;
 use aruna_core::structs::storage::blob::ensure_confined_path;
-use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
+use aruna_core::structs::storage::group_backend::{
+    BUCKET_DELETE, BUCKET_PREFIX, GroupBackendKind, GroupStorage, valid_bucket,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
@@ -54,6 +56,12 @@ pub enum GroupBackendError {
     UnsafeRoot(String),
     #[error("`force_path_style` must be `true` or `false`")]
     InvalidBool,
+    #[error("`{0}` needs an S3 storage without a fixed bucket")]
+    SplitOnly(String),
+    #[error("`bucket_prefix` `{0}` must give valid bucket names, like `{0}data`")]
+    InvalidPrefix(String),
+    #[error("`bucket_delete` must be `keep` or `delete_empty`")]
+    InvalidDelete,
     #[error("`{0}` is fixed after create; register a new backend instead")]
     Immutable(String),
 }
@@ -103,7 +111,15 @@ pub const fn rules_for_kind(kind: GroupBackendKind) -> GroupBackendRules {
         // Without `bucket` each rule names its own bucket.
         GroupBackendKind::S3 => GroupBackendRules {
             required_public: &["endpoint"],
-            allowed_public: &["endpoint", "bucket", "region", "root", "force_path_style"],
+            allowed_public: &[
+                "endpoint",
+                "bucket",
+                "region",
+                "root",
+                "force_path_style",
+                BUCKET_PREFIX,
+                BUCKET_DELETE,
+            ],
             allowed_secret: &["access_key_id", "secret_access_key"],
             required_secret: &["access_key_id", "secret_access_key"],
             one_of_secret: &[],
@@ -221,6 +237,23 @@ pub fn validate_backend_input(
     {
         return Err(GroupBackendError::InvalidBool);
     }
+    let splits = kind == GroupBackendKind::S3 && !public.contains_key("bucket");
+    if let Some(key) = [BUCKET_PREFIX, BUCKET_DELETE]
+        .into_iter()
+        .find(|key| !splits && public.contains_key(*key))
+    {
+        return Err(GroupBackendError::SplitOnly(key.to_string()));
+    }
+    if let Some(prefix) = public.get(BUCKET_PREFIX)
+        && !valid_bucket(&format!("{prefix}data"))
+    {
+        return Err(GroupBackendError::InvalidPrefix(prefix.clone()));
+    }
+    if let Some(mode) = public.get(BUCKET_DELETE)
+        && !matches!(mode.as_str(), "keep" | "delete_empty")
+    {
+        return Err(GroupBackendError::InvalidDelete);
+    }
 
     Ok(NormalizedConfig { public, secret })
 }
@@ -307,6 +340,36 @@ mod pure_tests {
                 kind: GroupBackendKind::S3,
                 key: "default_bucket".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn checks_bucket_mapping() {
+        let mut public = config(&[
+            ("endpoint", "https://s3.example.com"),
+            ("bucket_prefix", "team-a-"),
+            ("bucket_delete", "delete_empty"),
+        ]);
+        assert!(validate_backend_input("lab", GroupBackendKind::S3, &public, &s3_secret()).is_ok());
+
+        public.insert("bucket_delete".to_string(), "always".to_string());
+        assert_eq!(
+            validate_backend_input("lab", GroupBackendKind::S3, &public, &s3_secret()),
+            Err(GroupBackendError::InvalidDelete)
+        );
+        public.insert("bucket_delete".to_string(), "keep".to_string());
+        public.insert("bucket_prefix".to_string(), "Team_".to_string());
+        assert_eq!(
+            validate_backend_input("lab", GroupBackendKind::S3, &public, &s3_secret()),
+            Err(GroupBackendError::InvalidPrefix("Team_".to_string()))
+        );
+
+        // A fixed bucket holds every path, so there is no provider bucket to map.
+        let mut fixed = s3_public();
+        fixed.insert("bucket_prefix".to_string(), "team-a-".to_string());
+        assert_eq!(
+            validate_backend_input("lab", GroupBackendKind::S3, &fixed, &s3_secret()),
+            Err(GroupBackendError::SplitOnly("bucket_prefix".to_string()))
         );
     }
 

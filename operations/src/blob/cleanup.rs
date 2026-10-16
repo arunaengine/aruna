@@ -438,16 +438,56 @@ async fn reconcile_target(
     if now_ms().saturating_sub(opened_ms) < BLOB_CLEANUP_AFTER.as_millis() as u64 {
         return RowOutcome::Kept;
     }
+    // Read after the upload: a completion replaces this row in the commit that removes it.
+    let own_row = match target_current(context, &location).await {
+        None => return RowOutcome::Failed,
+        Some(Some(false)) => return RowOutcome::Kept,
+        Some(row) => row.is_some(),
+    };
     let Some(blob_handle) = context.blob_handle.as_ref() else {
         return RowOutcome::Failed;
     };
-    match blob_handle.discard_target(location).await {
+    // Only the target's own row may delete it; a later abort's row may outlive a completion.
+    let settled = match own_row {
+        true => blob_handle.discard_target(location).await,
+        false => blob_handle.abort_target(location).await,
+    };
+    match settled {
         Ok(()) => RowOutcome::Done,
         Err(error) => {
             warn!(%error, "Discarding an in-place upload target failed");
             RowOutcome::Failed
         }
     }
+}
+
+/// Whether the target's own row still names an upload; `Some(None)` when it is gone. A
+/// committed version replaced it with its own row, which settles the object instead.
+async fn target_current(
+    context: &DriverContext,
+    location: &BackendLocation,
+) -> Option<Option<bool>> {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: location.ulid.to_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await;
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        warn!(?event, "Upload target row could not be read");
+        return None;
+    };
+    Some(value.map(|value| {
+        matches!(
+            BlobCleanupWork::from_bytes(&value),
+            Ok(BlobCleanupWork::ReconcileWrite {
+                location: row,
+                owner: WriteOwner::Upload { .. } | WriteOwner::CompletedUpload { .. },
+            }) if row.same_object(location)
+        )
+    }))
 }
 
 async fn register_dht(
@@ -476,8 +516,8 @@ async fn register_dht(
 }
 
 async fn delete_blob(context: &DriverContext, location: BackendLocation) -> bool {
-    // An imported object is never Aruna's to delete; the row is settled without it.
-    if location.is_external() {
+    // An imported object is never Aruna's to delete; a part still ends its provider part claim.
+    if location.is_external() && !location.partial {
         return true;
     }
     let Some(blob_handle) = context.blob_handle.as_ref() else {
@@ -569,11 +609,9 @@ async fn owns_write(
         }
         WriteOwner::UploadPart { .. } => MultipartPart::from_bytes(&value).ok()?.location,
         WriteOwner::Upload { .. } | WriteOwner::CompletedUpload { .. } => {
+            // An aborting upload still owns its target: a failed abort reopens it for a
+            // completion, and the abort itself, also when resumed, removes the target.
             let record = MultipartUpload::from_bytes(&value).ok()?;
-            // An aborting upload gives its target up, so late provider parts are aborted too.
-            if record.status == MultipartUploadStatus::Aborting {
-                return Some(false);
-            }
             match record.backend_upload {
                 Some(upload) => upload.location,
                 None => return Some(false),
@@ -834,11 +872,8 @@ mod tests {
 
     #[tokio::test]
     async fn upload_keeps_target() {
-        // An open upload keeps its in-place target for a retry; an aborting one gives it up.
-        for (status, kept) in [
-            (MultipartUploadStatus::Open, true),
-            (MultipartUploadStatus::Aborting, false),
-        ] {
+        // An upload keeps its in-place target, also while aborting: a failed abort reopens it.
+        for status in [MultipartUploadStatus::Open, MultipartUploadStatus::Aborting] {
             let (_dir, storage, context) = setup_context();
             let BlobCleanupWork::DeleteBlob { mut location } =
                 BlobCleanupWork::from_bytes(&delete_work()).unwrap()
@@ -890,13 +925,42 @@ mod tests {
 
             let outcome = process_cleanup_batch(&context).await.unwrap();
 
-            // A kept row is the target's reservation and stays; a discard needs the blob handle
-            // this context lacks, so it fails and the row waits.
+            // A kept row is the target's reservation and stays.
             assert_eq!(outcome.processed, 0);
-            assert_eq!(outcome.kept, usize::from(kept));
-            assert_eq!(outcome.failed, usize::from(!kept));
+            assert_eq!(outcome.kept, 1);
+            assert_eq!(outcome.failed, 0);
             assert_eq!(remaining_rows(&storage).await, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn replaced_target_kept() {
+        // A completion removed the upload and replaced its target row after this row was
+        // scanned: the committed object is left to the new row.
+        let (_dir, storage, context) = setup_context();
+        let BlobCleanupWork::DeleteBlob { mut location } =
+            BlobCleanupWork::from_bytes(&delete_work()).unwrap()
+        else {
+            panic!("expected a delete row")
+        };
+        location.ulid = Ulid::from_parts(1, 3);
+        let event = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+                key: location.ulid.to_bytes().to_vec().into(),
+                value: reconcile_work(&location).into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        let outcome = super::reconcile_target(&context, Ulid::generate(), None, location).await;
+
+        // Without the recheck the discard runs and fails here for want of a blob handle.
+        assert!(matches!(outcome, super::RowOutcome::Kept));
     }
 
     #[tokio::test]

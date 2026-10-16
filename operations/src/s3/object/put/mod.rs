@@ -124,6 +124,8 @@ pub enum PutObjectState {
 pub enum PutObjectError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
+    #[error("{}", aruna_core::structs::storage::routing::UNMAPPED_KEY)]
+    Unmapped,
     #[error("Invalid operation state")]
     InvalidOperationState,
     #[error("No transaction found")]
@@ -698,7 +700,7 @@ impl PutObjectOperation {
                     "the adopted blob sits on another backend".to_string(),
                 ));
             }
-            if location.format.encoding() != EncodingClass::from(resolved.compression) {
+            if location.format.encoding().setting() != EncodingClass::from(resolved.compression) {
                 return self.emit_error(PutObjectError::WriteFailed(
                     "the adopted blob uses another encoding".to_string(),
                 ));
@@ -712,6 +714,10 @@ impl PutObjectOperation {
         }
         if let Some(target) = self.plain_target(&resolved) {
             return self.start_plain(target, resolved);
+        }
+        // A mapped bucket stores every key 1:1 or not at all.
+        if self.config.routing.mapped(&self.config.request.bucket) {
+            return self.emit_error(PutObjectError::Unmapped);
         }
         self.state = PutObjectState::WriteBlob;
         if let Some(blob) = self.config.request.body.take() {
@@ -885,7 +891,7 @@ impl PutObjectOperation {
         // migration may already have passed this key.
         let written = self
             .get_written_location()
-            .map(|location| location.format.encoding());
+            .map(|location| location.format.encoding().setting());
         if self.seal_plan.is_none()
             && current
                 .as_ref()
@@ -2615,7 +2621,7 @@ mod decision_tests {
 
 mod plain;
 
-pub(crate) use plain::{PlainRecord, same_name_path};
+pub(crate) use plain::{PlainRecord, same_name_path, version_row};
 
 #[path = "abe.rs"]
 pub(crate) mod abe;

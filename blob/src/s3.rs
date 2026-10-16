@@ -256,13 +256,15 @@ impl NativeMultipart {
             .ok_or_else(|| BlobError::WriteError("backend returned no copied part ETag".into()))
     }
 
-    /// Assembles the listed parts, in order, under the backend ETags recorded for them.
+    /// Assembles the listed parts, in order, under the backend ETags recorded for them, and
+    /// answers the object's version id. `if_not_exists` fails with `PathTaken` on a taken key.
     pub async fn complete(
         &self,
         path: &str,
         upload_id: &str,
         parts: &[(u16, String)],
-    ) -> Result<(), BlobError> {
+        if_not_exists: bool,
+    ) -> Result<Option<String>, BlobError> {
         let parts = parts
             .iter()
             .map(|(part_number, etag)| {
@@ -272,21 +274,27 @@ impl NativeMultipart {
                     .build()
             })
             .collect();
-        self.client
+        let request = self
+            .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
             .key(self.key(path))
             .upload_id(upload_id)
+            .set_if_none_match(if_not_exists.then(|| "*".to_string()))
             .multipart_upload(
                 CompletedMultipartUpload::builder()
                     .set_parts(Some(parts))
                     .build(),
-            )
+            );
+        let output = request
             .send()
             .boxed()
             .await
-            .map_err(|error| write_error("complete", error))?;
-        Ok(())
+            .map_err(|error| match status(&error) {
+                Some(412) => BlobError::PathTaken,
+                _ => write_error("complete", error),
+            })?;
+        Ok(output.version_id().map(str::to_string))
     }
 
     /// Frees the stored parts of one upload; an upload the backend no longer has is gone already.
@@ -421,10 +429,8 @@ pub async fn ensure_bucket(
     guard: &EgressGuard,
 ) -> Result<bool, BlobError> {
     let client = config_client(config, Some(guard))?;
-    match client.head_bucket().bucket(bucket).send().boxed().await {
-        Ok(_) => return Ok(false),
-        Err(error) if status(&error) == Some(404) => {}
-        Err(error) => return Err(bucket_error(bucket, "check", &error)),
+    if head_bucket(&client, bucket).await? {
+        return Ok(false);
     }
     let region = s3_region(config, environment_variable).unwrap_or_default();
     let mut request = client.create_bucket().bucket(bucket);
@@ -444,6 +450,48 @@ pub async fn ensure_bucket(
             )),
             _ => Err(bucket_error(bucket, "create", &error)),
         },
+    }
+}
+
+/// Whether `bucket` exists; nothing is created.
+pub async fn bucket_exists(
+    config: &HashMap<String, String>,
+    bucket: &str,
+    guard: &EgressGuard,
+) -> Result<bool, BlobError> {
+    head_bucket(&config_client(config, Some(guard))?, bucket).await
+}
+
+async fn head_bucket(client: &Client, bucket: &str) -> Result<bool, BlobError> {
+    match client.head_bucket().bucket(bucket).send().boxed().await {
+        Ok(_) => Ok(true),
+        Err(error) if status(&error) == Some(404) => Ok(false),
+        Err(error) => Err(bucket_error(bucket, "check", &error)),
+    }
+}
+
+/// Deletes `bucket` only while it holds no object; answers whether it is gone. A missing
+/// bucket counts as deleted, since an earlier attempt may have deleted it already.
+pub async fn delete_empty(
+    config: &HashMap<String, String>,
+    bucket: &str,
+    guard: &EgressGuard,
+) -> Result<bool, BlobError> {
+    let client = config_client(config, Some(guard))?;
+    let listed = client.list_objects_v2().bucket(bucket).max_keys(1);
+    let listed = listed.send().boxed().await;
+    match listed {
+        Ok(listed) if !listed.contents().is_empty() => return Ok(false),
+        Ok(_) => {}
+        Err(error) if status(&error) == Some(404) => return Ok(true),
+        Err(error) => return Err(bucket_error(bucket, "list", &error)),
+    }
+    // A bucket with old object versions answers 409 and stays.
+    match client.delete_bucket().bucket(bucket).send().boxed().await {
+        Ok(_) => Ok(true),
+        Err(error) if status(&error) == Some(404) => Ok(true),
+        Err(error) if status(&error) == Some(409) => Ok(false),
+        Err(error) => Err(bucket_error(bucket, "delete", &error)),
     }
 }
 
@@ -560,6 +608,46 @@ mod tests {
             .expect_err("handshake against a closed socket must fail");
 
         assert!(matches!(err, SdkError::DispatchFailure(_)), "{err:?}");
+    }
+
+    /// Answers every request with `status` and an S3 error `code`.
+    async fn answering(status: &'static str, code: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = vec![0u8; 8192];
+                let _ = stream.read(&mut buffer).await;
+                let body = format!("<Error><Code>{code}</Code></Error>");
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn missing_bucket_deleted() {
+        let guard = EgressGuard::new(aruna_core::egress::EgressPolicy::loopback()).unwrap();
+        let config = |endpoint: String| {
+            HashMap::from([
+                ("endpoint".to_string(), endpoint),
+                ("region".to_string(), "us-east-1".to_string()),
+                ("access_key_id".to_string(), "key".to_string()),
+                ("secret_access_key".to_string(), "secret".to_string()),
+            ])
+        };
+        // An earlier attempt deleted the bucket, so the cleanup is done.
+        let gone = config(answering("404 Not Found", "NoSuchBucket").await);
+        assert_eq!(delete_empty(&gone, "team-a-x", &guard).await, Ok(true));
+        // Any other refusal stays an error, so the cleanup is tried again.
+        let denied = config(answering("403 Forbidden", "AccessDenied").await);
+        assert!(delete_empty(&denied, "team-a-x", &guard).await.is_err());
     }
 
     #[test]

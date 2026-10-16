@@ -2037,12 +2037,19 @@ async fn orphan_target_discarded() {
     let stale = stored_blob(&context, "stale.bin").await;
     let mut old = stale.clone();
     old.ulid = Ulid::from_parts(1, 7);
-    write_target_row(&context, stale.ulid, &old).await;
+    write_target_row(&context, old.ulid, &old).await;
+    // A row an abort queued under its own key outlives the target's row, as after a
+    // completion, so it only aborts provider uploads and keeps the object.
+    let late = stored_blob(&context, "late.bin").await;
+    let mut completed = late.clone();
+    completed.ulid = Ulid::from_parts(1, 8);
+    write_target_row(&context, Ulid::generate(), &completed).await;
 
     process_cleanup_batch(&context.driver).await.unwrap();
 
     assert!(exists(fresh.get_full_path().unwrap()).unwrap());
     assert!(!exists(stale.get_full_path().unwrap()).unwrap());
+    assert!(exists(late.get_full_path().unwrap()).unwrap());
     let rows = read_value(
         &context.driver,
         BLOB_CLEANUP_KEYSPACE,
@@ -2053,7 +2060,7 @@ async fn orphan_target_discarded() {
     let gone = read_value(
         &context.driver,
         BLOB_CLEANUP_KEYSPACE,
-        stale.ulid.to_bytes().to_vec(),
+        old.ulid.to_bytes().to_vec(),
     )
     .await;
     assert!(gone.is_none());

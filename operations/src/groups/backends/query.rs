@@ -3,10 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{RecordReadError, backend_key, index_prefix, parse_iter, parse_read};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::events::Event;
+use crate::driver::DriverContext;
+use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
+use aruna_core::errors::BlobError;
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
@@ -185,6 +188,31 @@ impl Operation for ListBackendsOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+/// Whether `bucket` exists on the storage without a bucket `backend_id`, and for an existing
+/// bucket whether Aruna may write and delete there. Nothing is created.
+pub async fn check_bucket(
+    context: &DriverContext,
+    backend_id: Ulid,
+    bucket: &str,
+) -> Result<(bool, Option<bool>), BlobError> {
+    let Some(blob_handle) = context.blob_handle.as_ref() else {
+        return Err(BlobError::UnknownBackend(
+            "blob handle unavailable".to_string(),
+        ));
+    };
+    let effect = BlobEffect::HeadBucket {
+        backend: BackendRef::Group(backend_id),
+        bucket: bucket.to_string(),
+    };
+    match blob_handle.send_blob_effect(effect).await {
+        Event::Blob(BlobEvent::BucketExists { exists, writable }) => Ok((exists, writable)),
+        Event::Blob(BlobEvent::Error(error)) => Err(error),
+        other => Err(BlobError::UnknownBackend(format!(
+            "unexpected bucket check answer: {other:?}"
+        ))),
     }
 }
 

@@ -9,14 +9,16 @@ use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
-use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
+use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage, valid_bucket};
 use aruna_operations::blob::reclaim::backend_status;
 use aruna_operations::driver::drive;
 use aruna_operations::groups::backends::create::{
     CreateBackendError, CreateBackendInput, CreateBackendOperation,
 };
 use aruna_operations::groups::backends::disable::{SetDisabledError, SetDisabledOperation};
-use aruna_operations::groups::backends::query::{GetBackendOperation, ListBackendsOperation};
+use aruna_operations::groups::backends::query::{
+    GetBackendOperation, ListBackendsOperation, check_bucket,
+};
 use aruna_operations::groups::backends::replace::ReplaceBackendOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -50,6 +52,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         ))
         .routes(routes!(enable_group_backend))
         .routes(routes!(backend_reclaim_status))
+        .routes(routes!(check_provider_bucket))
 }
 
 #[derive(Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -155,6 +158,15 @@ pub struct ReclaimStatusResponse {
     pub oldest_enqueued_at: Option<String>,
     /// A scan hit its cap, so the counts are lower bounds.
     pub truncated: bool,
+}
+
+/// Whether a provider bucket exists, and whether Aruna may write there.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ProviderBucketResponse {
+    pub bucket: String,
+    pub exists: bool,
+    /// A test write and delete worked; `null` when the bucket does not exist yet.
+    pub writable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -792,6 +804,83 @@ pub async fn backend_reclaim_status(
             .oldest_enqueued_at
             .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()),
         truncated: status.truncated,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/groups/{group_id}/storage/backends/{backend_id}/buckets/{bucket}",
+    tag = "data/storage",
+    summary = "Check a provider bucket",
+    description = r#"Reports whether a bucket exists on an S3 storage without a fixed bucket.
+
+**Authentication**: realm bearer token with WRITE on the group's admin path.
+
+**Behavior**
+- Never creates a bucket. An existing bucket gets a test object that is written and deleted
+  again, which sets `writable`.
+- `writable` is `null` for a missing bucket: saving a link creates the bucket and tests it then."#,
+    params(
+        ("group_id" = String, Path, description = "Group that owns the backend, as a 26-character ULID"),
+        ("backend_id" = String, Path, description = "S3 storage without a fixed bucket, as a 26-character ULID"),
+        ("bucket" = String, Path, description = "Provider bucket name to check")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Whether the bucket exists and whether Aruna may write there",
+            body = ProviderBucketResponse,
+            example = json!({"bucket": "team-a-raw", "exists": true, "writable": true})
+        ),
+        (
+            status = 400,
+            description = "An id is not a ULID, the name is no valid bucket name, the storage has a fixed bucket, or the storage could not be reached",
+            body = ErrorResponse
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no WRITE on the group admin path",
+            body = ErrorResponse
+        ),
+        (
+            status = 404,
+            description = "No backend with that id belongs to this group on this node",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn check_provider_bucket(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, backend_id, bucket)): Path<(String, String, String)>,
+) -> ServerResult<Json<ProviderBucketResponse>> {
+    let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
+    let backend_id = Ulid::from_str(&backend_id).map_err(|_| ServerError::BadRequest)?;
+    let context = state.get_ctx();
+    let record = drive(GetBackendOperation::new(backend_id), &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .filter(|record| record.group_id == group_id)
+        .ok_or(ServerError::NotFound)?;
+    if !record.splits() {
+        return Err(ServerError::BadRequestMessage(
+            "This storage has a fixed bucket.".to_string(),
+        ));
+    }
+    if !valid_bucket(&bucket) {
+        return Err(ServerError::BadRequestMessage(
+            "A bucket name has 3 to 63 lowercase letters, digits, dots or hyphens.".to_string(),
+        ));
+    }
+    let (exists, writable) = check_bucket(&context, backend_id, &bucket)
+        .await
+        .map_err(|error| ServerError::BadRequestMessage(error.reason()))?;
+    Ok(Json(ProviderBucketResponse {
+        bucket,
+        exists,
+        writable,
     }))
 }
 

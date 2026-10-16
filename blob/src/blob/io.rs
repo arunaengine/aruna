@@ -1006,11 +1006,17 @@ impl BlobHandler {
         &self,
         location: BackendLocation,
     ) -> Result<bool, BlobError> {
-        if !self.marker_present(&location).await? {
-            self.clear_active(location.ulid);
-            return Ok(true);
-        }
+        // Read before the row: a write commits its own row before it releases the reservation.
         let active = self.reservation_active(location.ulid);
+        match self.marker_matches(&location).await? {
+            None => {
+                self.clear_active(location.ulid);
+                return Ok(true);
+            }
+            // The committed writer's row replaced this one and settles the copy itself.
+            Some(false) => return Ok(false),
+            Some(true) => {}
+        }
         // A pending archive has no hash, so its own records prove the commit.
         if let StoredLayout::Pithos(_) = location.format.layout
             && self.archive_owned(&location).await?
@@ -1716,6 +1722,9 @@ impl BlobHandler {
     }
 
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
+        if let Some(event) = super::plain::folder_read(&location) {
+            return event;
+        }
         if let StoredLayout::Pithos(_) = &location.format.layout {
             return BlobEvent::Error(super::pithos::needs_bucket_key());
         }
@@ -1818,6 +1827,9 @@ impl BlobHandler {
         location: BackendLocation,
         range: impl RangeBounds<u64>,
     ) -> BlobEvent {
+        if let Some(event) = super::plain::folder_read(&location) {
+            return event;
+        }
         if let StoredLayout::Pithos(_) = &location.format.layout {
             return BlobEvent::Error(super::pithos::needs_bucket_key());
         }
@@ -2232,14 +2244,14 @@ impl BlobHandler {
             Err(error) => return BlobEvent::Error(error),
         };
         self.clear_active(location.ulid);
-        // A path in the tenant's own folders is never Aruna's to delete.
-        if location.is_external() {
-            return BlobEvent::DeleteFinished;
-        }
         // An in-place part is no object: its provider upload holds the bytes until it settles.
         // Deleting it ends its claim: it was rolled back, or a staged record replaced it.
         if location.partial {
             self.release_claim(location.ulid);
+            return BlobEvent::DeleteFinished;
+        }
+        // A path in the tenant's own folders is never Aruna's to delete.
+        if location.is_external() {
             return BlobEvent::DeleteFinished;
         }
         let operator = match self.operator_from_location(&location) {

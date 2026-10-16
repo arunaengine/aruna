@@ -126,6 +126,8 @@ pub enum CompleteUploadState {
 pub enum CompleteUploadError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
+    #[error("{}", aruna_core::structs::storage::routing::UNMAPPED_KEY)]
+    Unmapped,
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
@@ -1033,21 +1035,16 @@ impl CompleteUploadOperation {
         if let Some(effects) = self.plain_compose() {
             return effects;
         }
-        let Some(upload) = self.upload_record.as_ref() else {
-            return self.schedule_error(CompleteUploadError::InvalidOperationState);
-        };
-        if let Some(backend_upload) = upload.backend_upload.clone() {
-            self.state = CompleteUploadState::ComposeBlob;
-            let streamed = self
-                .upload_parts
-                .iter()
-                .filter(|part| part.location.partial);
-            return smallvec![Effect::Blob(BlobEffect::CompleteUpload {
-                backend_upload: Box::new(backend_upload),
-                parts: self.resolved_parts.clone(),
-                streamed: streamed.map(|part| part.part_number).collect(),
-                compression: self.compression,
-            })];
+        let bucket = &self.input.bucket;
+        if self
+            .routing
+            .as_ref()
+            .is_some_and(|routing| routing.mapped(bucket))
+        {
+            return self.schedule_error(CompleteUploadError::Unmapped);
+        }
+        if let Some(effects) = self.complete_provider(false) {
+            return effects;
         }
         let parts = self
             .resolved_parts
@@ -1055,6 +1052,23 @@ impl CompleteUploadOperation {
             .map(|part| part.location.clone())
             .collect();
         self.compose_parts(parts)
+    }
+
+    /// Completes the provider upload the parts streamed into, where the record has one.
+    fn complete_provider(&mut self, if_not_exists: bool) -> Option<Effects> {
+        let backend_upload = self.upload_record.as_ref()?.backend_upload.clone()?;
+        self.state = CompleteUploadState::ComposeBlob;
+        let streamed = self
+            .upload_parts
+            .iter()
+            .filter(|part| part.location.partial);
+        Some(smallvec![Effect::Blob(BlobEffect::CompleteUpload {
+            backend_upload: Box::new(backend_upload),
+            parts: self.resolved_parts.clone(),
+            streamed: streamed.map(|part| part.part_number).collect(),
+            compression: self.compression,
+            if_not_exists,
+        })])
     }
 
     fn compose_parts(&mut self, parts: Vec<BackendLocation>) -> Effects {
@@ -1090,10 +1104,11 @@ impl CompleteUploadOperation {
             Event::Blob(BlobEvent::Error(error)) => return self.schedule_error(error.into()),
             _ => return self.schedule_error(CompleteUploadError::InvalidOperationState),
         };
-        // The compression changed after the provider upload opened: its original bytes are
-        // composed again. The target row keeps the provider object until the upload is gone.
-        if EncodingClass::from(self.compression) != location.format.encoding()
+        // A compression changed since the upload opened composes the bytes again, except at a
+        // tenant path. The target row keeps the provider object until the upload is gone.
+        if EncodingClass::from(self.compression) != location.format.encoding().setting()
             && self.in_place_target(&location)
+            && !location.is_external()
         {
             return self.compose_parts(vec![location]);
         }
@@ -1179,7 +1194,7 @@ impl CompleteUploadOperation {
         // migration may already have passed this key. A sealed copy checks its plan instead.
         if location.format.bucket_key().is_none()
             && bucket.as_ref().is_some_and(|bucket| {
-                EncodingClass::from(bucket.compression) != location.format.encoding()
+                EncodingClass::from(bucket.compression) != location.format.encoding().setting()
             })
         {
             return self.schedule_error(StorageError::TransactionConflict.into());

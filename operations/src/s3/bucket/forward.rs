@@ -97,12 +97,16 @@ pub(super) async fn create_remote_bucket(
                 placement_policy_generation: 0,
                 compression: Compression::Off,
             },
-        ),
+        )
+        .mapped(),
         context.as_ref(),
     )
     .await;
     match created {
         Ok(_) => Ok(()),
+        Err(error @ CreateBucketError::ProviderBucket(_)) => {
+            Err(SyncRefusal::Invalid(error.to_string()))
+        }
         Err(CreateBucketError::BucketAlreadyExists) => {
             match drive(
                 GetBucketOperation::new(bucket.to_string()),

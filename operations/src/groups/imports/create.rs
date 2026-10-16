@@ -21,7 +21,7 @@ use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
 use aruna_core::structs::storage::group_backend::{
-    BUCKET_STATE, GroupStorage, MAX_KEY_LEN, path_bucket, valid_bucket,
+    BUCKET_DELETING, BUCKET_STATE, GroupStorage, MAX_KEY_LEN, path_bucket, valid_bucket,
 };
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule};
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -83,6 +83,8 @@ pub struct CreateImportOperation {
     backends: Vec<GroupStorage>,
     /// The move record committed with the rule when `move_existing` is set.
     moving: Option<CompressionMigration>,
+    /// Runs in a caller's transaction, which the caller commits or aborts.
+    nested: bool,
     output: Option<Result<BackendImport, ImportRuleError>>,
 }
 
@@ -97,7 +99,17 @@ impl CreateImportOperation {
             checked: Vec::new(),
             backends: Vec::new(),
             moving: None,
+            nested: false,
             output: None,
+        }
+    }
+
+    /// Writes the rule in the open transaction `txn_id` and leaves its commit to the caller.
+    pub fn within(input: CreateImportInput, txn_id: TxnId) -> Self {
+        Self {
+            txn_id: Some(txn_id),
+            nested: true,
+            ..Self::new(input)
         }
     }
 
@@ -199,6 +211,9 @@ impl CreateImportOperation {
 
     fn ensure_next(&mut self) -> Effects {
         let Some((backend_id, bucket)) = self.pending.first().cloned() else {
+            if let (true, Some(txn_id)) = (self.nested, self.txn_id) {
+                return self.read(txn_id);
+            }
             self.state = CreateState::Start;
             return smallvec![Effect::Storage(StorageEffect::StartTransaction {
                 read: false
@@ -480,7 +495,11 @@ impl CreateImportOperation {
                 .iter()
                 .filter(|(backend_id, ..)| *backend_id == record.backend_id)
                 .map(|(_, bucket, created)| {
-                    let state = if *created { "created" } else { "found" };
+                    // A bucket Aruna created stays its own when a later check finds it.
+                    let state = match *created || record.bucket_state(bucket) == Some("created") {
+                        true => "created",
+                        false => "found",
+                    };
                     (format!("{BUCKET_STATE}{bucket}"), state.to_string())
                 })
                 .collect::<Vec<_>>();
@@ -523,6 +542,13 @@ fn check_folder(storage: &GroupStorage, folder: &str) -> Result<Option<String>, 
     if let Some(bucket) = bucket.filter(|bucket| storage.layout_buckets().contains(bucket)) {
         return Err(ImportRuleError::Conflict(format!(
             "Bucket `{bucket}` holds Aruna's files of a default rule. Pick another bucket."
+        )));
+    }
+    if let Some(bucket) =
+        bucket.filter(|bucket| storage.bucket_state(bucket) == Some(BUCKET_DELETING))
+    {
+        return Err(ImportRuleError::Conflict(format!(
+            "Bucket `{bucket}` is still being removed. Try again in a minute."
         )));
     }
     if storage.is_reserved(folder) {
@@ -577,6 +603,12 @@ impl Operation for CreateImportOperation {
                     next_start_after,
                 }),
             ) => self.scanned(values, next_start_after),
+            (CreateState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
+                if self.nested =>
+            {
+                self.state = CreateState::Finish;
+                smallvec![]
+            }
             (CreateState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
                 self.commit()
             }
@@ -605,6 +637,9 @@ impl Operation for CreateImportOperation {
     }
 
     fn abort(&mut self) -> Effects {
+        if self.nested {
+            return smallvec![];
+        }
         self.txn_id
             .take()
             .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])
@@ -760,6 +795,44 @@ mod tests {
                 .map(String::as_str),
             Some("found")
         );
+    }
+
+    #[test]
+    fn deleting_bucket_refuses() {
+        let record = storage(&[
+            ("endpoint", "https://s3.lab"),
+            ("bucket:lab-raw", "deleting"),
+        ]);
+        let (operation, _) = on_split(input("lab-raw/2024/", "imported/"), &record);
+        assert!(matches!(failure(operation), ImportRuleError::Conflict(_)));
+    }
+
+    #[test]
+    fn keeps_created_state() {
+        // A bucket Aruna created stays its own when a later link finds it again.
+        let record = storage(&[
+            ("endpoint", "https://s3.lab"),
+            ("bucket:lab-raw", "created"),
+        ]);
+        let (mut operation, _) = on_split(input("lab-raw/2024/", "imported/"), &record);
+        operation.step(Event::Blob(BlobEvent::BucketReady { created: false }));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        let stored: Option<Value> = Some(record.to_bytes().unwrap().into());
+        operation.step(values(vec![
+            bucket_row(),
+            None,
+            stored.clone(),
+            None,
+            stored,
+        ]));
+        let effects = scan_page(&mut operation, &[]);
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one batch write, got {effects:?}")
+        };
+        let noted = GroupStorage::from_bytes(&writes[2].2).unwrap();
+        assert_eq!(noted.bucket_state("lab-raw"), Some("created"));
     }
 
     fn bucket_row() -> Option<Value> {

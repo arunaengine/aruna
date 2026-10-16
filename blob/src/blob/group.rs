@@ -11,7 +11,8 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
 use aruna_core::structs::storage::group_backend::{
-    BUCKET_STATE, GroupStorage, GroupStorageSecret, LAYOUT_BUCKET, PROBE_PREFIX,
+    BUCKET_DELETE, BUCKET_PREFIX, BUCKET_STATE, GroupStorage, GroupStorageSecret, LAYOUT_BUCKET,
+    PROBE_PREFIX,
 };
 use aruna_core::types::Key;
 use opendal::ErrorKind;
@@ -34,8 +35,11 @@ pub(super) fn group_entry(
 ) -> Result<NodeBackend, BlobError> {
     let mut service_config: HashMap<String, String> = record.public_config.clone();
     // The default bucket stays for bucket selection; `operator_for` drops it.
-    service_config
-        .retain(|key, _| !key.starts_with(BUCKET_STATE) && !key.starts_with(LAYOUT_BUCKET));
+    service_config.retain(|key, _| {
+        !key.starts_with(BUCKET_STATE)
+            && !key.starts_with(LAYOUT_BUCKET)
+            && ![BUCKET_PREFIX, BUCKET_DELETE].contains(&key.as_str())
+    });
     service_config.extend(secret.secret_config.clone());
     let root = service_config.remove("root").unwrap_or_default();
     // Without a container each path names its bucket; Aruna's layout goes to the default
@@ -159,7 +163,9 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         BlobEffect::WritePlain { resolved, .. } => push(&mut ids, &resolved.backend),
         BlobEffect::StatPlain { backend, .. } => push(&mut ids, backend),
         BlobEffect::StatCopy { location } => push(&mut ids, &location.backend),
-        BlobEffect::EnsureBucket { backend, .. } => push(&mut ids, backend),
+        BlobEffect::EnsureBucket { backend, .. }
+        | BlobEffect::HeadBucket { backend, .. }
+        | BlobEffect::DeleteEmptyBucket { backend, .. } => push(&mut ids, backend),
     }
     ids
 }
@@ -381,12 +387,8 @@ impl BlobHandler {
     /// Finds or creates a rule's bucket on a storage without a bucket, then proves that
     /// Aruna may write and delete there.
     pub(super) async fn ensure_bucket(&self, backend: &BackendRef, bucket: &str) -> BlobEvent {
-        let (BackendRef::Group(backend_id), true) = (backend, self.registry.splits(backend)) else {
-            let message = "only a storage without a fixed bucket takes rule buckets";
-            return BlobEvent::Error(BlobError::OperatorCreationFailed(message.to_string()));
-        };
-        let config = match self.registry.config_for(backend) {
-            Ok(config) => config,
+        let (backend_id, config) = match self.split_config(backend) {
+            Ok(found) => found,
             Err(error) => return BlobEvent::Error(error),
         };
         let created = match s3::ensure_bucket(&config.service_config, bucket, &self.egress).await {
@@ -400,10 +402,71 @@ impl BlobHandler {
             Ok(operator) => operator,
             Err(error) => return BlobEvent::Error(error),
         };
-        match probe(&operator, *backend_id, "bucket", bucket).await {
+        match probe(&operator, backend_id, "bucket", bucket).await {
             Ok(()) => BlobEvent::BucketReady { created },
             Err(error) => BlobEvent::Error(error),
         }
+    }
+
+    /// Whether `bucket` exists on a storage without a bucket and, if so, whether Aruna may
+    /// write and delete there; nothing is created.
+    pub(super) async fn head_bucket(&self, backend: &BackendRef, bucket: &str) -> BlobEvent {
+        let (backend_id, config) = match self.split_config(backend) {
+            Ok(found) => found,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        match s3::bucket_exists(&config.service_config, bucket, &self.egress).await {
+            Ok(true) => {}
+            Ok(false) => return bucket_answer(None),
+            Err(error) => return BlobEvent::Error(error),
+        }
+        let operator = match self
+            .registry
+            .operator_for(backend, &config.root, bucket, &self.egress)
+        {
+            Ok(operator) => operator,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        bucket_answer(Some(probe(&operator, backend_id, "bucket", bucket).await))
+    }
+
+    /// Deletes `bucket` on a storage without a bucket; a bucket with objects stays.
+    pub(super) async fn delete_bucket(&self, backend: &BackendRef, bucket: &str) -> BlobEvent {
+        let (backend_id, config) = match self.split_config(backend) {
+            Ok(found) => found,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        match s3::delete_empty(&config.service_config, bucket, &self.egress).await {
+            Ok(true) => {
+                tracing::info!(%backend_id, bucket, "deleted empty provider bucket");
+                BlobEvent::BucketDeleted { deleted: true }
+            }
+            Ok(false) => {
+                tracing::info!(%backend_id, bucket, "kept provider bucket that holds objects");
+                BlobEvent::BucketDeleted { deleted: false }
+            }
+            Err(error) => {
+                tracing::warn!(%backend_id, bucket, error = %error, "provider bucket not deleted");
+                BlobEvent::Error(error)
+            }
+        }
+    }
+
+    fn split_config(&self, backend: &BackendRef) -> Result<(Ulid, BackendConfig), BlobError> {
+        let (BackendRef::Group(backend_id), true) = (backend, self.registry.splits(backend)) else {
+            let message = "only a storage without a fixed bucket takes rule buckets";
+            return Err(BlobError::OperatorCreationFailed(message.to_string()));
+        };
+        Ok((*backend_id, self.registry.config_for(backend)?))
+    }
+}
+
+/// The answer of a bucket check: no probe for a missing bucket, and a refused probe write or
+/// delete makes an existing bucket not writable.
+fn bucket_answer(probed: Option<Result<(), BlobError>>) -> BlobEvent {
+    BlobEvent::BucketExists {
+        exists: probed.is_some(),
+        writable: probed.map(|result| result.is_ok()),
     }
 }
 
@@ -472,8 +535,10 @@ fn probe_message(label: &str, name: &str, error: &opendal::Error, delete: bool) 
 
 #[cfg(test)]
 mod tests {
-    use super::{container_label, group_entry, group_ids, probe_message};
+    use super::{bucket_answer, container_label, group_entry, group_ids, probe, probe_message};
     use aruna_core::effects::BlobEffect;
+    use aruna_core::errors::BlobError;
+    use aruna_core::events::BlobEvent;
     use aruna_core::structs::storage::blob::{
         Backend, BackendRef, BlobTimeoutConfig, ResolvedBackend,
     };
@@ -624,5 +689,33 @@ mod tests {
             })
             .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn checks_bucket_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let operator = opendal::Operator::new(opendal::services::Fs::default().root(root)).unwrap();
+        let probed = probe(&operator, Ulid::nil(), "bucket", "team-a-raw").await;
+        let answer = |exists, writable| BlobEvent::BucketExists { exists, writable };
+        assert_eq!(bucket_answer(Some(probed)), answer(true, Some(true)));
+        // The probe leaves no file behind.
+        let left = files_below(dir.path());
+        assert!(left.is_empty(), "{left:?}");
+        let refused = Err(BlobError::WriteError("denied".to_string()));
+        assert_eq!(bucket_answer(Some(refused)), answer(true, Some(false)));
+        assert_eq!(bucket_answer(None), answer(false, None));
+    }
+
+    fn files_below(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            match path.is_dir() {
+                true => files.extend(files_below(&path)),
+                false => files.push(path),
+            }
+        }
+        files
     }
 }

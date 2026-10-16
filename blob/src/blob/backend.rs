@@ -924,10 +924,11 @@ impl BlobHandler {
         }
     }
 
-    pub(super) async fn marker_present(
+    /// `None` when no row is left; `Some(false)` when a newer row reuses the key.
+    pub(super) async fn marker_matches(
         &self,
         location: &BackendLocation,
-    ) -> Result<bool, BlobError> {
+    ) -> Result<Option<bool>, BlobError> {
         let event = self
             .storage
             .send_effect(Effect::Storage(StorageEffect::Read {
@@ -937,7 +938,13 @@ impl BlobHandler {
             }))
             .await;
         match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.map(|value| {
+                matches!(
+                    BlobCleanupWork::from_bytes(value.as_ref()),
+                    Ok(BlobCleanupWork::ReconcileReservation { location: marked })
+                        if marked.same_object(location)
+                )
+            })),
             _ => Err(BlobError::ReadError(
                 "failed to read bucket reservation".to_string(),
             )),

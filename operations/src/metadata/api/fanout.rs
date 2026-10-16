@@ -13,6 +13,7 @@ use super::{
     record_elapsed_ms, search_local_buckets, select_fanout_nodes, short_display_id, stream, warn,
 };
 
+use super::bucket_page::{NodePosition, decode_cursor, encode_cursor, merge_pages};
 use super::distributed::record_bucket_result;
 use futures_util::StreamExt;
 use futures_util::future::FutureExt;
@@ -598,6 +599,8 @@ pub async fn search_buckets_distributed(
         .clone()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
     let remote_auth_token = fanout_bearer(request.bearer_token.as_deref());
+    let positions = decode_cursor(request.cursor.as_deref())?;
+    let group_id = request.group_id;
     let local_call: MetadataNodeCall<Vec<BucketSearchHit>> = metadata_node_call(
         (
             context.clone(),
@@ -605,8 +608,12 @@ pub async fn search_buckets_distributed(
             realm_id,
             request.query.clone(),
             limit,
+            positions.clone(),
         ),
-        |(context, auth, realm_id, query, limit), node_id| async move {
+        move |(context, auth, realm_id, query, limit, positions), node_id| async move {
+            let Some(start_after) = start_after(&positions, node_id) else {
+                return Ok(Vec::new());
+            };
             search_local_buckets(
                 &context,
                 SearchBucketsInput {
@@ -615,7 +622,8 @@ pub async fn search_buckets_distributed(
                     node_id,
                     query,
                     limit,
-                    start_after: None,
+                    group_id,
+                    start_after: start_after.map(|after| after.into_bytes().into()),
                 },
             )
             .await
@@ -623,10 +631,19 @@ pub async fn search_buckets_distributed(
         },
     );
     let remote_call: MetadataNodeCall<Vec<BucketSearchHit>> = metadata_node_call(
-        (handle, remote_auth_token, request.query, limit),
-        |(handle, auth_token, query, limit), node_id| async move {
+        (
+            handle,
+            remote_auth_token,
+            request.query,
+            limit,
+            positions.clone(),
+        ),
+        move |(handle, auth_token, query, limit, positions), node_id| async move {
+            let Some(start_after) = start_after(&positions, node_id) else {
+                return Ok(Vec::new());
+            };
             handle
-                .request_bucket_search(node_id, auth_token, query, limit)
+                .request_bucket_search(node_id, auth_token, query, limit, group_id, start_after)
                 .await
         },
     );
@@ -644,12 +661,21 @@ pub async fn search_buckets_distributed(
         map_read_error,
     )
     .await?;
-    let mut hits = parts
-        .into_iter()
-        .flat_map(|(_, hits)| hits)
-        .collect::<Vec<_>>();
-    hits.truncate(limit);
-    Ok(BucketSearchExecution { hits, fanout_stats })
+    let failed = &fanout_stats.failed_partitions;
+    let (hits, positions) = merge_pages(parts, failed, positions, limit);
+    Ok(BucketSearchExecution {
+        hits,
+        next_cursor: encode_cursor(&positions),
+        fanout_stats,
+    })
+}
+
+/// Where a node's next page starts; `None` for a node that already reached its end.
+fn start_after(positions: &[NodePosition], node_id: NodeId) -> Option<Option<String>> {
+    match NodePosition::of(positions, node_id) {
+        Some(entry) if entry.done => None,
+        entry => Some(entry.and_then(|entry| entry.after.clone())),
+    }
 }
 
 type Matches = Vec<crate::metadata::secondary_ids::IdentifierMatch>;

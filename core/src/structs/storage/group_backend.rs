@@ -58,12 +58,23 @@ pub const PARTS_PREFIX: &str = "_aruna_parts";
 /// Public config key Aruna sets: the bucket of the default rule on a storage without a bucket.
 pub const DEFAULT_BUCKET: &str = "default_bucket";
 
-/// Public config key prefix Aruna sets per checked bucket: `created` or `found`.
+/// Public config key prefix Aruna sets per checked bucket: `created`, `found`, or
+/// `deleting` while Aruna removes a bucket it created.
 pub const BUCKET_STATE: &str = "bucket:";
+
+/// Bucket state while Aruna removes a provider bucket it created; no new rule may use it.
+pub const BUCKET_DELETING: &str = "deleting";
 
 /// Public config key prefix Aruna sets per bucket that ever held the default rule; Aruna's
 /// own files may still live there.
 pub const LAYOUT_BUCKET: &str = "layout:";
+
+/// Public config key a tenant sets: each new bucket gets the provider bucket `<prefix><name>`.
+pub const BUCKET_PREFIX: &str = "bucket_prefix";
+
+/// Public config key a tenant sets: `keep` or `delete_empty`, for the provider bucket of a
+/// deleted bucket.
+pub const BUCKET_DELETE: &str = "bucket_delete";
 
 /// Object keys longer than this are refused by S3, GCS, Azure and B2.
 pub const MAX_KEY_LEN: usize = 1024;
@@ -167,6 +178,24 @@ impl GroupStorage {
     /// The bucket of the default rule on a storage without a bucket.
     pub fn default_bucket(&self) -> Option<&str> {
         self.public_config.get(DEFAULT_BUCKET).map(String::as_str)
+    }
+
+    /// The prefix of the provider bucket each new bucket gets, on a storage without a bucket.
+    pub fn bucket_prefix(&self) -> Option<&str> {
+        let prefix = self.public_config.get(BUCKET_PREFIX).map(String::as_str);
+        prefix.filter(|_| self.splits())
+    }
+
+    /// Whether a deleted bucket also deletes its empty provider bucket, when Aruna created it.
+    pub fn deletes_empty(&self, bucket: &str) -> bool {
+        self.public_config.get(BUCKET_DELETE).map(String::as_str) == Some("delete_empty")
+            && self.bucket_state(bucket) == Some("created")
+    }
+
+    /// The recorded state of a checked bucket.
+    pub fn bucket_state(&self, bucket: &str) -> Option<&str> {
+        let state = self.public_config.get(&format!("{BUCKET_STATE}{bucket}"));
+        state.map(String::as_str)
     }
 
     /// The public config entries Aruna sets itself; a replaced record keeps them.

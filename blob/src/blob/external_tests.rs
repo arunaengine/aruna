@@ -178,6 +178,60 @@ async fn writes_plain_paths() {
 }
 
 #[tokio::test]
+async fn writes_folder_objects() {
+    use super::stream_from_bytes;
+    use aruna_core::structs::storage::backend_import::PlainPath;
+    use iroh_io::AsyncSliceReader;
+    use ulid::Ulid;
+
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let root = context._temp_dir.path().join("hot");
+    let resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
+    let plain = |path: &str| PlainPath {
+        path: path.to_string(),
+        ulid: Ulid::generate(),
+        if_not_exists: false,
+    };
+    let event = handler
+        .write_plain(
+            resolved.clone(),
+            plain("raw/reports/"),
+            test_user_id(),
+            stream_from_bytes(b""),
+        )
+        .await;
+    let BlobEvent::WriteFinished { location } = event else {
+        panic!("folder write failed: {event:?}")
+    };
+    assert!(root.join("raw/reports").is_dir());
+    assert_eq!(location.blob_size, 0);
+    assert!(location.hashes.contains_key(HASH_BLAKE3));
+    // Replication and peer reads open the same empty folder copy.
+    let mut reader = handler.slice_reader(&location).await.unwrap();
+    assert_eq!(reader.size().await.unwrap(), 0);
+    assert!(reader.read_exact_at(0, 0).await.unwrap().is_empty());
+    assert!(reader.read_exact_at(0, 1).await.is_err());
+    let BlobEvent::ReadFinished { stream_size, .. } = handler.read_blob(location).await else {
+        panic!("folder read failed")
+    };
+    assert_eq!(stream_size, 0);
+    // A folder object holds no bytes.
+    let event = handler
+        .write_plain(
+            resolved,
+            plain("raw/notes/"),
+            test_user_id(),
+            stream_from_bytes(b"x"),
+        )
+        .await;
+    assert!(
+        matches!(event, BlobEvent::Error(BlobError::WriteError(_))),
+        "{event:?}"
+    );
+}
+
+#[tokio::test]
 async fn reads_recorded_version() {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::handle::Handle as _;
@@ -238,6 +292,9 @@ async fn keeps_tenant_paths() {
     let path = Some("raw/a.txt");
     let cleanup = handler.clean_partial(None, true, Some(&operator), path, Some(&tenant));
     assert_eq!(cleanup.await, Ok(()));
+    assert!(root.join("raw/a.txt").exists());
+    // Discarding an upload target at a tenant path keeps the file there.
+    assert_eq!(handler.discard_target(&tenant).await, Ok(()));
     assert!(root.join("raw/a.txt").exists());
 }
 

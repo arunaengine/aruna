@@ -453,7 +453,7 @@ impl BackendLocation {
     /// Bytes this copy occupies on its backend.
     pub fn stored_size(&self) -> u64 {
         match &self.format.layout {
-            StoredLayout::Raw => self.blob_size,
+            StoredLayout::Raw | StoredLayout::Plain(_) => self.blob_size,
             StoredLayout::Frames(layout) => layout.stored_size,
             StoredLayout::Pithos(layout) => layout.stored_size,
             StoredLayout::FramedPart(layout) => {

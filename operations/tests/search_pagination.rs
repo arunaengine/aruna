@@ -156,6 +156,8 @@ async fn distributed_search_routes() -> TestResult<()> {
             bearer_token: Some(realm.bearer_string()),
             query: "data".to_string(),
             limit: 10,
+            group_id: None,
+            cursor: None,
             target_nodes: Some(vec![origin.node_id()]),
         },
     )

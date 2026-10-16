@@ -229,12 +229,11 @@ impl PlainRecord<'_> {
         &self,
         rule_exists: bool,
     ) -> Result<Vec<(String, Key, Value)>, ConversionError> {
-        let mut writes = Vec::new();
-        if let Some(version) = self.version {
-            let key = version_key(self.written.ulid);
-            let value = version.as_bytes().to_vec().into();
-            writes.push((BACKEND_VERSION_KEYSPACE.to_string(), key, value));
-        }
+        let mut writes: Vec<_> = self
+            .version
+            .map(|version| version_row(self.written, version))
+            .into_iter()
+            .collect();
         if self.target.listed && rule_exists {
             let row = ImportedObject::written(
                 self.version_id,
@@ -250,6 +249,16 @@ impl PlainRecord<'_> {
         }
         Ok(writes)
     }
+}
+
+/// Pins a plain object to the backend version it was written as.
+pub(crate) fn version_row(written: &BackendLocation, version: &str) -> (String, Key, Value) {
+    let value = version.as_bytes().to_vec().into();
+    (
+        BACKEND_VERSION_KEYSPACE.to_string(),
+        version_key(written.ulid),
+        value,
+    )
 }
 
 #[cfg(test)]
@@ -353,6 +362,39 @@ mod tests {
                 aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
                 vec![7u8; 32],
             )]),
+        }
+    }
+
+    #[test]
+    fn mapped_needs_path() {
+        let mapped = |key: &str| {
+            let mut operation = operation("{dir}{name}");
+            let rule = &mut operation.config.routing.imports[0];
+            rule.key_prefix = String::new();
+            operation.config.request.key = key.to_string();
+            let effects = begin(&mut operation);
+            (operation, effects)
+        };
+        let (_, effects) = mapped("data/a.csv");
+        // The same-name write first looks at the exact key in the provider bucket.
+        let [Effect::Blob(BlobEffect::StatPlain { path, .. })] = effects.as_slice() else {
+            panic!("expected a plain path, got {effects:?}")
+        };
+        assert_eq!(path, "raw/data/a.csv");
+        // A folder key is written at its exact key, without looking first.
+        let (_, effects) = mapped("reports/");
+        let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
+            panic!("expected a folder write, got {effects:?}")
+        };
+        assert_eq!(plain.path, "raw/reports/");
+        // Keys without a plain path are refused before any byte is written.
+        for key in ["reports//a.csv", "reports//"] {
+            let (operation, effects) = mapped(key);
+            assert!(effects.is_empty(), "{key}: {effects:?}");
+            assert!(
+                matches!(operation.finalize(), Err(PutObjectError::Unmapped)),
+                "{key}"
+            );
         }
     }
 

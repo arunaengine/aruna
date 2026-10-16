@@ -14,8 +14,9 @@ use aruna_core::keyspaces::BACKEND_VERSION_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::storage::backend_import::{PlainPath, tagged_path, version_key};
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, ResolvedBackend};
-use aruna_core::structs::storage::format::{Compression, StoredFormat};
+use aruna_core::structs::storage::format::{Compression, StoredFormat, StoredLayout};
 use bytes::Bytes;
+use futures::StreamExt;
 use opendal::{ErrorKind, Operator};
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -54,7 +55,10 @@ impl BlobHandler {
             storage_bucket: String::new(),
             backend_path: plain.path.clone(),
             ulid: plain.ulid,
-            format: StoredFormat::default(),
+            format: StoredFormat {
+                layout: StoredLayout::Plain(plain.ulid),
+                ..StoredFormat::default()
+            },
             created_by,
             created_at: SystemTime::now(),
             staging: false,
@@ -81,8 +85,52 @@ impl BlobHandler {
             Ok(operator) => operator,
             Err(error) => return BlobEvent::Error(error),
         };
+        if plain.path.ends_with('/') {
+            return self.write_folder(location, operator, blob).await;
+        }
         let conditional = conditional(&operator, &mut location, &plain);
         Box::pin(self.write_tenant(location, operator, blob, conditional)).await
+    }
+
+    /// A key that ends in `/` is an empty folder object at that exact key.
+    async fn write_folder(
+        &self,
+        mut location: BackendLocation,
+        operator: Operator,
+        mut blob: BackendStream<Result<Bytes, StreamError>>,
+    ) -> BlobEvent {
+        while let Some(chunk) = blob.next().await {
+            match chunk {
+                Ok(bytes) if bytes.is_empty() => {}
+                Ok(_) => {
+                    let message = "A key that ends in `/` cannot hold bytes in a provider bucket.";
+                    return BlobEvent::Error(BlobError::WriteError(message.to_string()));
+                }
+                Err(error) => return BlobEvent::Error(BlobError::WriteError(error.to_string())),
+            }
+        }
+        let path = match self.object_path(&location) {
+            Ok(path) => path,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let created = timeout(self.io_timeout(), operator.create_dir(&path)).await;
+        match created {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return BlobEvent::Error(BlobError::WriteError(error.to_string())),
+            Err(_) => {
+                let message = "timed out writing the folder object".to_string();
+                return BlobEvent::Error(BlobError::WriteError(message));
+            }
+        }
+        location.blob_size = 0;
+        location.hashes = crate::hash::Hasher::new().to_map();
+        match location.is_external() {
+            true => BlobEvent::PlainWritten {
+                location,
+                version: None,
+            },
+            false => BlobEvent::WriteFinished { location },
+        }
     }
 
     pub(super) async fn compose_plain(
@@ -206,4 +254,17 @@ impl BlobHandler {
             ))),
         }
     }
+}
+
+/// A folder object: its key ends in `/` and it holds no bytes.
+pub(super) fn is_folder(location: &BackendLocation) -> bool {
+    location.blob_size == 0 && location.backend_path.ends_with('/')
+}
+
+/// The empty read of a folder object.
+pub(super) fn folder_read(location: &BackendLocation) -> Option<BlobEvent> {
+    is_folder(location).then(|| BlobEvent::ReadFinished {
+        blob: BackendStream::new(futures::stream::empty::<Result<Bytes, BlobError>>()),
+        stream_size: 0,
+    })
 }

@@ -312,6 +312,9 @@ fn put_refusal(error: PutCompressionError) -> ServerError {
                 .to_string(),
         ),
         PutCompressionError::Key(error) => super::encryption::key_refusal(&error),
+        error @ PutCompressionError::Mapped => {
+            ServerError::Refused(StatusCode::CONFLICT, "mapped_bucket", error.to_string())
+        }
         other => ServerError::InternalError(other.to_string()),
     }
 }

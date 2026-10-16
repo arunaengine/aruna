@@ -111,6 +111,7 @@ use crate::s3::object::search::{
     ObjectInventoryHit, ObjectKeyMatch, SearchNodePage, SearchObjectsInput, search_local_objects,
 };
 
+mod bucket_page;
 mod distributed;
 mod export;
 mod fanout;

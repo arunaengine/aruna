@@ -370,7 +370,10 @@ impl BlobHandler {
                     .await?;
                 etags.push((TABLE_PART, etag));
             }
-            native.complete(&path, &upload.upload_id, &etags).await
+            native
+                .complete(&path, &upload.upload_id, &etags, false)
+                .await
+                .map(drop)
         }
         .await;
         // A completion whose answer was lost leaves the object; its seek table names every frame.
@@ -432,7 +435,10 @@ impl BlobHandler {
                     .upload_part(&path, &upload.upload_id, TABLE_PART, length, body)
                     .await?;
                 etags.push((TABLE_PART, etag));
-                native.complete(&path, &upload.upload_id, &etags).await
+                native
+                    .complete(&path, &upload.upload_id, &etags, false)
+                    .await
+                    .map(drop)
             }
             .await;
             if let Err(error) = sent

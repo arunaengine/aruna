@@ -87,6 +87,8 @@ pub enum BlobEffect {
         key: String,
         resolved: ResolvedBackend,
         created_by: UserId,
+        /// The tenant path and version id an upload under an import rule ends at.
+        plain: Option<PlainPath>,
     },
     /// Assembles the listed in-place parts and hashes the finished object.
     CompleteUpload {
@@ -96,6 +98,8 @@ pub enum BlobEffect {
         streamed: Vec<u16>,
         /// The bucket's setting at completion, which a copy composed instead applies.
         compression: Compression,
+        /// Fails with `PathTaken` when a file is already at the target path.
+        if_not_exists: bool,
     },
     AbortUpload {
         backend_upload: Box<BackendUpload>,
@@ -361,6 +365,18 @@ pub enum BlobEffect {
     /// Finds or creates `bucket` on a group storage without a bucket and proves that Aruna
     /// may write and delete there; answers `BucketReady`.
     EnsureBucket {
+        backend: BackendRef,
+        bucket: String,
+    },
+    /// Answers `BucketExists` for `bucket` on a group storage without a bucket; an existing
+    /// bucket gets a test write and delete. Nothing is created.
+    HeadBucket {
+        backend: BackendRef,
+        bucket: String,
+    },
+    /// Deletes `bucket` on a group storage without a bucket while it holds no object;
+    /// answers `BucketDeleted`.
+    DeleteEmptyBucket {
         backend: BackendRef,
         bucket: String,
     },
