@@ -142,8 +142,10 @@ pub enum GroupDeleteAction {
         event: Box<crate::admin_documents::AdminDocumentEvent>,
     },
     /// Reports what blocks the deletion, without changing any state.
+    /// Only infrastructure nodes send it, after authorizing `caller` for the deletion.
     Check {
         group_id: Ulid,
+        caller: crate::structs::identity::auth::AuthContext,
     },
 }
 

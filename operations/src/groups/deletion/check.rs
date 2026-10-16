@@ -12,6 +12,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::group_delete::{GroupDeleteAction, GroupDeletionError};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use futures_util::{StreamExt, stream};
 use smallvec::smallvec;
@@ -19,7 +20,7 @@ use smallvec::smallvec;
 use super::coordinator::{authorize, load_group, request_node, visible};
 use super::resources::EmptyCheck;
 use crate::driver::{DriverContext, drive};
-use crate::metadata::protocol::AuthToken;
+use crate::forward::authorize::is_sync_eligible;
 use crate::placement::process_placements::load_realm_config;
 
 #[derive(Debug, PartialEq)]
@@ -108,11 +109,12 @@ impl Operation for CheckOperation {
     }
 
     fn finalize(self) -> Result<(), GroupDeletionError> {
-        self.result.unwrap_or_else(|| {
-            Err(GroupDeletionError::Unavailable(
+        match (self.state, self.result) {
+            (State::Finish, Some(result)) => result,
+            _ => Err(GroupDeletionError::Unavailable(
                 "deletion check did not finish".into(),
-            ))
-        })
+            )),
+        }
     }
 
     fn abort(&mut self) -> Effects {
@@ -124,6 +126,7 @@ impl Operation for CheckOperation {
 }
 
 /// Scans this node and keeps only the bucket names the caller may read.
+/// `more` is set when any blocking bucket stays unnamed.
 pub(super) async fn scan(
     context: &DriverContext,
     auth: &AuthContext,
@@ -135,24 +138,36 @@ pub(super) async fn scan(
             kinds,
             buckets,
             more,
-        }) => Err(GroupDeletionError::NotEmpty {
-            kinds,
-            buckets: visible(context, auth, group_id, node, buckets).await,
-            more,
-        }),
+        }) => {
+            let count = buckets.len();
+            let names = visible(context, auth, group_id, node, buckets).await;
+            Err(GroupDeletionError::NotEmpty {
+                kinds,
+                more: more || names.len() < count,
+                buckets: names,
+            })
+        }
         result => result,
     }
 }
 
-/// Answers a peer's check with the same authorization as the deletion itself.
+/// Answers an infrastructure peer's check. Like Prepare, a node that holds the group
+/// authorizes the caller again, and a device without the group row still scans.
 pub(super) async fn check_node(
     context: &Arc<DriverContext>,
+    config: &RealmConfigDocument,
     auth: &AuthContext,
     group_id: GroupId,
     node: NodeId,
 ) -> Result<(), GroupDeletionError> {
     let (group, record) = load_group(context, group_id).await?;
-    authorize(context, auth, group_id, record.as_ref(), group.is_some()).await?;
+    if group.is_some() {
+        authorize(context, auth, group_id, record.as_ref(), true).await?;
+    } else if is_sync_eligible(config, node) {
+        return Err(GroupDeletionError::Unavailable(
+            "group has not synchronized to this node".into(),
+        ));
+    }
     scan(context, auth, group_id, node).await
 }
 
@@ -177,13 +192,19 @@ pub async fn check_group(
     if group.is_none() {
         return Err(GroupDeletionError::NotFound);
     }
+    let local = net.node_id();
+    // Peers answer a check only from infrastructure nodes, as they do for Prepare.
+    if !is_sync_eligible(&config, local) {
+        return Err(GroupDeletionError::Unavailable(
+            "run the deletion check on a server node".into(),
+        ));
+    }
     let nodes = config
         .nodes
         .iter()
         .map(|node| node.node_id.parse::<NodeId>())
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(|error| GroupDeletionError::Unavailable(error.to_string()))?;
-    let local = net.node_id();
     let auth = &auth;
     let mut replies = stream::iter(nodes.into_iter().map(|node| async move {
         let result = match node == local {
@@ -191,8 +212,11 @@ pub async fn check_group(
             false => request_node(
                 context,
                 node,
-                Some(AuthToken::internal(auth.clone())),
-                GroupDeleteAction::Check { group_id },
+                None,
+                GroupDeleteAction::Check {
+                    group_id,
+                    caller: auth.clone(),
+                },
             )
             .await
             .map(|_| ()),

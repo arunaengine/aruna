@@ -32,29 +32,26 @@ pub(crate) async fn apply_request(
         let MetadataTransportMessage::GroupDeletion { auth_token, action } = &message else {
             return Err(GroupDeletionError::Invalid("invalid group request".into()));
         };
-        let (GroupDeleteAction::Start { group_id } | GroupDeleteAction::Check { group_id }) =
-            action
-        else {
-            return apply_control(context, peer, action.clone()).await;
-        };
-        let auth = authorize_forwarded_caller(context, peer, *net.realm_id(), &message)
-            .await
-            .map_err(|error| match error {
-                ForwardAuthError::Unavailable(reason) => GroupDeletionError::Unavailable(reason),
-                _ => GroupDeletionError::Unauthorized,
-            })?;
-        if matches!(action, GroupDeleteAction::Check { .. }) {
-            super::check::check_node(context, &auth, *group_id, net.node_id()).await?;
-            return Ok(None);
+        if let GroupDeleteAction::Start { group_id } = action {
+            let auth = authorize_forwarded_caller(context, peer, *net.realm_id(), &message)
+                .await
+                .map_err(|error| match error {
+                    ForwardAuthError::Unavailable(reason) => {
+                        GroupDeletionError::Unavailable(reason)
+                    }
+                    _ => GroupDeletionError::Unauthorized,
+                })?;
+            Box::pin(super::coordinator::delete_group(
+                context,
+                auth,
+                auth_token.clone(),
+                *group_id,
+            ))
+            .await?;
+            Ok(None)
+        } else {
+            apply_control(context, peer, action.clone()).await
         }
-        Box::pin(super::coordinator::delete_group(
-            context,
-            auth,
-            auth_token.clone(),
-            *group_id,
-        ))
-        .await?;
-        Ok(None)
     }
     .await;
     MetadataTransportMessage::GroupDeletionResult { result }
@@ -139,8 +136,15 @@ pub(super) async fn apply_control(
             .await?;
             Ok(None)
         }
-        GroupDeleteAction::Start { .. } | GroupDeleteAction::Check { .. } => Err(
-            GroupDeletionError::Invalid("this request requires caller authorization".into()),
-        ),
+        GroupDeleteAction::Check { group_id, caller } => {
+            if caller.realm_id != *net.realm_id() {
+                return Err(GroupDeletionError::Unauthorized);
+            }
+            super::check::check_node(context, &config, &caller, group_id, net.node_id()).await?;
+            Ok(None)
+        }
+        GroupDeleteAction::Start { .. } => Err(GroupDeletionError::Invalid(
+            "start requires caller authorization".into(),
+        )),
     }
 }
