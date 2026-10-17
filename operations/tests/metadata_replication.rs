@@ -790,6 +790,13 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn history_passes_cap() -> Result<(), Box<dyn std::error::Error>> {
+    // Bounds the whole test, setup and shutdown included, below the five minute test limit.
+    tokio::time::timeout(Duration::from_secs(285), long_history())
+        .await
+        .map_err(|_| "the long history test exceeded its deadline")?
+}
+
+async fn long_history() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([43u8; 32]);
     let (nodes, config) = build_realm_nodes(&realm_id, 3).await?;
     let group_id = Ulid::generate();
@@ -835,9 +842,11 @@ async fn history_passes_cap() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .filter(|node| created.record.holder_node_ids.contains(&node.net.node_id()))
         .collect();
-    // Every origin writes more than its share of one window, so only checkpoints keep
-    // the document writable.
-    let edits = aruna_core::metadata::EVENT_LIMIT as usize + 76;
+    // One origin writes more than its share of one window, so only a checkpoint keeps
+    // the document writable. The other origins edit before and after that checkpoint.
+    let writer = origins[0];
+    let share = (aruna_core::metadata::EVENT_LIMIT as usize - 1) / origins.len();
+    let edits = share + 76;
     let write = async |node: &TestNode, name: String| -> Result<(), Box<dyn std::error::Error>> {
         let jsonld = format!(
             r#"{{"@context":"https://w3id.org/ro/crate/1.2/context","@graph":[
@@ -845,8 +854,7 @@ async fn history_passes_cap() -> Result<(), Box<dyn std::error::Error>> {
 {{"@id":"https://w3id.org/aruna/{document_id}","@type":"Dataset","name":"{name}","description":"Long history","datePublished":"2026-02-01","license":{{"@id":"https://creativecommons.org/licenses/by/4.0/"}}}}]}}"#
         );
         // A burst can outrun materialization; the window opens again once it catches up.
-        // Short polls follow the catch-up closely; the attempts still allow five minutes.
-        for _ in 0..15_000 {
+        loop {
             let operation = UpdateDocumentOperation::new(UpdateDocumentConfig {
                 actor: actor(node),
                 group_id,
@@ -869,65 +877,82 @@ async fn history_passes_cap() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => return Err(error.into()),
             }
         }
-        Err(format!("{name} stayed refused").into())
     };
-    for edit in 0..edits {
-        write(origins[edit % origins.len()], format!("Edit {edit}")).await?;
-    }
-    // The last edits are concurrent, so one more edit follows once every node merged them all.
-    let mut dots = Vec::new();
-    for node in &origins {
-        let event = node
-            .context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: aruna_core::keyspaces::METADATA_ACTOR_KEYSPACE.to_string(),
-                key: aruna_core::storage_entries::metadata_actor_key(document_id),
-                txn_id: None,
-            })
-            .await;
-        let Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) = event
-        else {
-            return Err("metadata actor unreadable".into());
-        };
-        let own: aruna_core::metadata::MetadataActor = postcard::from_bytes(&bytes)?;
-        dots.push((craqle::ActorId(own.actor), own.counter));
-    }
-    wait_for_convergence("edits did not reach every node", || async {
-        let mut pending = 0;
-        for node in &nodes {
+    let written = std::sync::atomic::AtomicUsize::new(0);
+    let history = async {
+        for edit in 0..edits {
+            write(writer, format!("Edit {edit}")).await?;
+            written.store(edit + 1, std::sync::atomic::Ordering::Relaxed);
+            if edit == 0 || edit == share {
+                for (index, other) in origins.iter().enumerate().skip(1) {
+                    write(other, format!("Edit {edit} by {index}")).await?;
+                }
+            }
+        }
+        // Edits planned ahead of materialization are concurrent, so one more edit follows
+        // once every node merged them all.
+        let mut dots = Vec::new();
+        for node in &origins {
             let event = node
                 .context
-                .metadata_handle
-                .as_ref()
-                .ok_or("metadata handle missing")?
-                .send_effect(Effect::Metadata(MetadataEffect::GraphSnapshot {
-                    graph_iri: created.record.graph_iri.clone(),
-                }))
+                .storage_handle
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: aruna_core::keyspaces::METADATA_ACTOR_KEYSPACE.to_string(),
+                    key: aruna_core::storage_entries::metadata_actor_key(document_id),
+                    txn_id: None,
+                })
                 .await;
-            let Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) = event else {
-                return Err("graph state unreadable".into());
+            let Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) = event
+            else {
+                return Err("metadata actor unreadable".into());
             };
-            pending += dots
-                .iter()
-                .filter(|(actor, counter)| snapshot.clock.0.get(actor) < Some(counter))
-                .count();
+            let own: aruna_core::metadata::MetadataActor = postcard::from_bytes(&bytes)?;
+            dots.push((craqle::ActorId(own.actor), own.counter));
         }
-        Ok::<_, Box<dyn std::error::Error>>(pending)
-    })
-    .await?;
-    write(origins[0], "Final edit".to_string()).await?;
-    wait_metadata_state(
-        &nodes,
-        group_id,
-        document_id,
-        &created.record.graph_iri,
-        3,
-        "Final edit",
-    )
-    .await?;
+        wait_for_convergence("edits did not reach every node", || async {
+            let mut pending = 0;
+            for node in &nodes {
+                let event = node
+                    .context
+                    .metadata_handle
+                    .as_ref()
+                    .ok_or("metadata handle missing")?
+                    .send_effect(Effect::Metadata(MetadataEffect::GraphSnapshot {
+                        graph_iri: created.record.graph_iri.clone(),
+                    }))
+                    .await;
+                let Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) = event
+                else {
+                    return Err("graph state unreadable".into());
+                };
+                pending += dots
+                    .iter()
+                    .filter(|(actor, counter)| snapshot.clock.0.get(actor) < Some(counter))
+                    .count();
+            }
+            Ok::<_, Box<dyn std::error::Error>>(pending)
+        })
+        .await?;
+        write(writer, "Final edit".to_string()).await?;
+        wait_metadata_state(
+            &nodes,
+            group_id,
+            document_id,
+            &created.record.graph_iri,
+            3,
+            "Final edit",
+        )
+        .await
+    };
+    // Bounds a stalled history well inside the five minute test limit.
+    tokio::time::timeout(Duration::from_secs(240), history)
+        .await
+        .map_err(|_| {
+            let written = written.load(std::sync::atomic::Ordering::Relaxed);
+            format!("history stalled after {written} of {edits} edits")
+        })??;
     let checkpoints = nodes[0]
         .context
         .storage_handle
