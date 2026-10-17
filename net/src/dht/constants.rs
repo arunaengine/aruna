@@ -17,7 +17,7 @@ pub const MAX_CLOCK_SKEW: u64 = 5 * 60;
 pub const MAX_VALUE_SIZE: usize = 48 * 1024;
 pub const ENTRIES_PER_KEY: usize = 256;
 pub const MAX_STORED_SIZE: usize = 56 * 1024;
-pub const MAX_STORED_KEYS: u64 = 65_536;
+pub const MAX_STORED_KEYS: u64 = u64::MAX;
 pub const STORAGE_MUTATION_RETRIES: usize = 8;
 
 pub const DHT_META_KEYSPACE: &str = "dht_meta_v2";
