@@ -1930,11 +1930,6 @@ async fn reserve_key_slot(
         .await?;
         return Ok(None);
     }
-    if count > MAX_STORED_KEYS {
-        return Err(TransactionFailure::Failed(DhtIoError::storage(
-            "DHT key-count metadata exceeds its limit",
-        )));
-    }
     if index == DeadlineIndex::Floor {
         return Err(TransactionFailure::Failed(DhtIoError::StorageFull));
     }
@@ -3459,6 +3454,32 @@ mod tests {
         second_worker.await.expect("second revision worker");
 
         assert_eq!(storage.snapshot_metrics().requests_total, 8);
+    }
+
+    #[tokio::test]
+    async fn large_keyspace_admits() {
+        let (_directory, storage) = open_storage();
+        let count = 65_536;
+        write_count(&storage, count).await;
+        let key = DhtKeyId::from_data(b"past-former-key-limit");
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(1, key, now_unix_secs().saturating_add(200))],
+        };
+
+        mutate_storage_entries(&storage, 12, StorageStage::InboundPutMerge, key, &mutation)
+            .await
+            .expect("admit beyond the former key limit");
+
+        assert!(row_exists(&storage, key).await);
+        assert_eq!(read_count(&storage).await, count + 1);
+        assert_eq!(
+            index_entries(&storage, DeadlineIndex::Active)
+                .await
+                .into_iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>(),
+            vec![key]
+        );
     }
 
     #[tokio::test]
