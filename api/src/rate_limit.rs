@@ -22,10 +22,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const IP_REQUESTS_MINUTE: u32 = 6_000;
-const IP_BURST: u32 = 1_000;
-const PRINCIPAL_REQUESTS_MINUTE: u32 = 3_000;
-const PRINCIPAL_BURST: u32 = 500;
+const IP_REQUESTS_MINUTE: u32 = 24_000;
+const IP_BURST: u32 = 4_000;
+const PRINCIPAL_REQUESTS_MINUTE: u32 = 12_000;
+const PRINCIPAL_BURST: u32 = 2_000;
 /// Every N checks the keyed stores drop entries that are fully replenished.
 const MAINTENANCE_INTERVAL: u64 = 4_096;
 const LOCAL_PERMITS: usize = 16;

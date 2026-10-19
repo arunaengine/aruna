@@ -69,10 +69,10 @@ const CONTROL_REQUEST_LIMIT: usize = 64;
 
 /// Concurrent S3 connections served at once; connections at capacity are
 /// dropped so a flood cannot spawn unbounded connection tasks.
-pub const S3_MAX_CONNECTIONS: usize = 1_024;
+pub const S3_MAX_CONNECTIONS: usize = 4_096;
 /// Concurrent S3 requests processed at once, acquired before the expensive
 /// s3s parse/body/storage work.
-pub const MAX_CONCURRENT_REQUESTS: usize = 512;
+pub const MAX_CONCURRENT_REQUESTS: usize = 2_048;
 
 /// Listener deadlines of the S3 plane: how long a connection may stay silent
 /// before its first request, how long a request or response may make no I/O
