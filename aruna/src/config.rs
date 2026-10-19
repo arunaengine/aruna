@@ -117,12 +117,12 @@ impl Default for RateLimitSettings {
     fn default() -> Self {
         // Mirrors the api-layer defaults: generous and identical for every caller.
         Self {
-            ip_per_minute: 6_000,
-            ip_burst: 1_000,
-            principal_per_minute: 3_000,
-            principal_burst: 500,
-            s3_max_connections: 1_024,
-            s3_max_requests: 512,
+            ip_per_minute: 24_000,
+            ip_burst: 4_000,
+            principal_per_minute: 12_000,
+            principal_burst: 2_000,
+            s3_max_connections: 4_096,
+            s3_max_requests: 2_048,
         }
     }
 }
