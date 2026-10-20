@@ -692,7 +692,7 @@ pub struct ImportRenamesResponse {
     /// Files of the rule that an earlier pattern named and that a rename would give their
     /// current name.
     pub count: u64,
-    /// `false` when the count stopped at 10000 versions; `count` is then a lower bound.
+    /// `false` when the count stopped at its limit; `count` is then a lower bound.
     pub complete: bool,
     /// The first 100 of them.
     pub files: Vec<RenameFileResponse>,
@@ -717,7 +717,8 @@ pub struct ImportRenamesResponse {
 - Changing the pattern renames nothing; only `POST` on this path does.
 
 **Limits**
-- One request reads at most 10000 version rows and lists the first 100 files."#,
+- One request reads at most 10000 version rows under the folder, passes over at most 200000
+  rows of the bucket, and lists the first 100 files."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
         ("import_id" = String, Path, description = "Rule to check, as a 26-character ULID")

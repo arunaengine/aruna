@@ -14,8 +14,10 @@ use aruna_core::structs::storage::backend_import::{ImportedObject, object_key};
 use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKey};
 use aruna_core::types::Key;
 
-/// Versions one count reads at most, so a request stays bounded.
+/// Versions under the prefix one count reads at most, so a request stays bounded.
 const COUNT_LIMIT: usize = 10_000;
+/// Version rows of the bucket one count passes over at most, under the prefix or not.
+const SCAN_LIMIT: usize = 200_000;
 const COUNT_PAGE: usize = 256;
 /// Renames one count lists by name; `renamed` counts all of them.
 const RENAME_LIST: usize = 100;
@@ -51,23 +53,28 @@ pub async fn count_misplaced(
     };
     let earlier = read_earlier(context, &routing).await?;
     let scan = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
-    let (mut after, mut seen) = (None::<Key>, 0);
+    let (mut after, mut seen, mut scanned) = (None::<Key>, 0, 0);
     loop {
         let (versions, next) = crate::jobs::store::iter_prefix_page(
             &context.storage_handle,
             BLOB_VERSIONS_KEYSPACE,
             Some(scan.clone().into()),
             after.take(),
-            COUNT_PAGE.min(COUNT_LIMIT - seen),
+            COUNT_PAGE,
             None,
         )
         .await?;
         for (key, value) in versions {
-            seen += 1;
+            if seen >= COUNT_LIMIT || scanned >= SCAN_LIMIT {
+                misplaced.complete = false;
+                return Ok(misplaced);
+            }
+            scanned += 1;
             let version_key = VersionKey::from_bytes(key.as_ref()).map_err(|e| e.to_string())?;
             if !version_key.key.starts_with(prefix) {
                 continue;
             }
+            seen += 1;
             let version = BlobVersion::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
             // A key the rules cannot place now fails its move; it is not counted.
             let Ok((resolved, plain)) = place(&routing, &version_key) else {
@@ -117,11 +124,11 @@ pub async fn count_misplaced(
             misplaced.count += 1;
         }
         match next {
-            Some(_) if seen >= COUNT_LIMIT => {
+            Some(next) if seen < COUNT_LIMIT && scanned < SCAN_LIMIT => after = Some(next),
+            Some(_) => {
                 misplaced.complete = false;
                 return Ok(misplaced);
             }
-            Some(next) => after = Some(next),
             None => return Ok(misplaced),
         }
     }

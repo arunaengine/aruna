@@ -52,7 +52,7 @@ pub struct BucketMoveResponse {
     pub bucket: String,
     /// Stored versions under `prefix` that a move would move now.
     pub misplaced: u64,
-    /// `false` when the count stopped at 10000 versions; `misplaced` is then a lower bound.
+    /// `false` when the count stopped at its limit; `misplaced` is then a lower bound.
     pub complete: bool,
     /// The prefix of this node's last move; absent before any move.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,7 +101,8 @@ async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<ulid::U
 - `prefix` limits the count to keys under it, such as the folder of a linked rule.
 
 **Limits**
-- One request reads at most 10000 version rows and one location row for each counted candidate;
+- One request reads at most 10000 version rows under `prefix`, passes over at most 200000
+  rows of the bucket, and reads one location row for each counted candidate;
   `complete` is `false` when it stopped there."#,
     params(
         ("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash"),
