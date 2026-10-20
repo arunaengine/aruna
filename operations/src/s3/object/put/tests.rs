@@ -1616,6 +1616,55 @@ fn generation_increments() {
 }
 
 #[test]
+fn dedup_keeps_writer() {
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let (first, writer) = (
+        aruna_core::UserId::local(Ulid::generate(), realm_id),
+        aruna_core::UserId::local(Ulid::generate(), realm_id),
+    );
+    let mut op = PutObjectOperation::new(PutObjectConfig {
+        user_id: writer,
+        group_id: Ulid::generate(),
+        realm_id,
+        node_id: iroh::SecretKey::generate().public(),
+        request: PutObjectInput {
+            bucket: "mybucket".to_string(),
+            key: "some-file.txt".to_string(),
+            content_length: None,
+            body: None,
+        },
+        expected_checksums: vec![],
+        checksum_type: None,
+        exists: false,
+        version_source: None,
+        preassigned_version_id: None,
+        quota_ceiling: None,
+        routing: RoutingSnapshot::single(Ulid::generate()),
+    });
+    let with_hash = |created_by| {
+        let mut location = test_location(created_by);
+        location.hashes.insert(
+            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+            [3u8; 32].to_vec(),
+        );
+        location
+    };
+    // The deduplicated location keeps the earlier copy, written by someone else.
+    op.output = Some(Ok(with_hash(first)));
+    op.written_location = Some(with_hash(writer));
+    op.version_id = Some(Ulid::generate());
+    op.state = PutObjectState::WritePathIndex;
+    let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+        key: vec![0].into(),
+    }));
+    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        panic!("expected the version record, got {effects:?}")
+    };
+    let version = BlobVersion::from_bytes(value).unwrap();
+    assert_eq!(version.created_by, writer);
+}
+
+#[test]
 fn history_keeps_head() {
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let mut op = PutObjectOperation::new(PutObjectConfig {

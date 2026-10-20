@@ -1235,6 +1235,10 @@ impl PutObjectOperation {
                 return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
             };
             let version_created_at = UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms());
+            // A deduplicated location keeps its first writer; the version keeps its own.
+            let created_by = self
+                .get_written_location()
+                .map_or(output.created_by, |written| written.created_by);
             let version = BlobVersion::materialized(
                 match blake3_hash.try_into() {
                     Ok(hash) => hash,
@@ -1245,7 +1249,7 @@ impl PutObjectOperation {
                 output.backend.clone(),
                 output.format.encoding(),
                 version_created_at,
-                output.created_by,
+                created_by,
                 self.config.version_source.clone(),
             )
             .with_metadata(self.metadata.clone());
