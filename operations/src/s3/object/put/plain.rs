@@ -31,6 +31,8 @@ pub(super) struct ImportRows {
     writes: Vec<(String, Key, Value)>,
     /// Values the transaction must still read, or the write fails with `HeadChanged`.
     guards: Vec<(String, Key, Option<Value>)>,
+    /// Write intents the committed version makes obsolete.
+    retired: Vec<Key>,
 }
 
 impl PutObjectOperation {
@@ -160,8 +162,58 @@ impl PutObjectOperation {
             import_id,
             writes,
             guards,
+            retired: Vec::new(),
         });
         self
+    }
+
+    /// Deletes the write intent `key` in the version transaction that registers its file.
+    pub fn with_retired_intent(mut self, key: Key) -> Self {
+        if let Some(rows) = self.import_rows.as_mut() {
+            rows.retired.push(key);
+        }
+        self
+    }
+
+    /// The intents of this write and its import rows, gone once the version commits.
+    fn retired_intents(&self) -> Vec<(String, Key)> {
+        let rows = self
+            .import_rows
+            .iter()
+            .flat_map(|rows| rows.retired.clone());
+        let own = self.plain.as_ref().zip(self.get_written_location());
+        let own = own.zip(self.version_id).and_then(|((plain, written), id)| {
+            let listed = plain.target.listed;
+            listed.then(|| intent_key(plain.target.import_id, &written.backend_path, id))
+        });
+        let keys = rows.chain(own);
+        keys.map(|key| (IMPORT_INTENT_KEYSPACE.to_string(), key))
+            .collect()
+    }
+
+    /// The import rows are written; the obsolete intents go in the same transaction.
+    pub(super) fn plain_written(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(PutObjectError::NoTransactionFound);
+        };
+        let retiring = self.state == PutObjectState::RetireIntents;
+        let deletes = match event {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) if !retiring => {
+                self.retired_intents()
+            }
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) if retiring => Vec::new(),
+            Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
+            _ => return self.emit_error(PutObjectError::InvalidOperationState),
+        };
+        if !deletes.is_empty() {
+            self.state = PutObjectState::RetireIntents;
+            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                deletes,
+                txn_id: Some(txn_id),
+            })];
+        }
+        self.state = PutObjectState::CommitTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     /// Values the version transaction must still read before it writes the import rows.
@@ -682,6 +734,49 @@ mod tests {
             *row_key,
             object_key(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv")
         );
+    }
+
+    #[test]
+    fn retires_own_intent() {
+        let mut put = operation("{dir}{name}");
+        begin(&mut put);
+        let id = put.version_id.unwrap();
+        let location = written("raw/x/one.csv".to_string(), id);
+        put.written_location = Some(location.clone());
+        put.output = Some(Ok(location));
+        put.txn_id = Some(Ulid::nil());
+        put.plain_records(Ulid::nil());
+        put.step(read(Some(vec![0u8])));
+
+        // The committed version makes its intent obsolete in the same transaction.
+        let effects = put.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        let [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id })] = effects.as_slice()
+        else {
+            panic!("expected the intent delete, got {effects:?}")
+        };
+        let key = intent_key(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv", id);
+        assert_eq!(*deletes, vec![(IMPORT_INTENT_KEYSPACE.to_string(), key)]);
+        assert_eq!(*txn_id, Some(Ulid::nil()));
+        // A second write answer is not what the delete waits for.
+        let mut stray = operation(DEFAULT_PATTERN);
+        stray.state = PutObjectState::RetireIntents;
+        stray.txn_id = Some(Ulid::nil());
+        stray.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            stray.output,
+            Some(Err(PutObjectError::InvalidOperationState))
+        ));
+        let effects = put.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        ));
     }
 
     #[test]

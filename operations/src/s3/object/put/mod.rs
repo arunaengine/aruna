@@ -122,6 +122,8 @@ pub enum PutObjectState {
     WriteIntent,
     /// Reads the version a history write registers, inside the version transaction.
     ReadHistory,
+    /// Deletes the write intents the committed version makes obsolete.
+    RetireIntents,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -1863,17 +1865,9 @@ impl Operation for PutObjectOperation {
             },
             PutObjectState::WriteBlob => self.handle_write_finished(event),
             PutObjectState::StatPlain => self.plain_stat(event),
-            PutObjectState::WritePlainRecords => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => match self.txn_id {
-                    Some(txn_id) => {
-                        self.state = PutObjectState::CommitTransaction;
-                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                    }
-                    None => self.emit_error(PutObjectError::NoTransactionFound),
-                },
-                Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
-                _ => self.emit_error(PutObjectError::InvalidOperationState),
-            },
+            PutObjectState::WritePlainRecords | PutObjectState::RetireIntents => {
+                self.plain_written(event)
+            }
             PutObjectState::ReadImportRule => self.import_rule_read(event),
             PutObjectState::WriteIntent => self.intent_written(event),
             PutObjectState::ReadHistory => self.history_read(event),

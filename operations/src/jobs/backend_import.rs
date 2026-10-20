@@ -350,7 +350,6 @@ async fn import_object(
         && !etag_differs(object.etag.as_deref(), md5.as_deref())
     {
         note_listing(&ctx.driver, rule, row_key, Some(&seen), encode(&listed)?).await?;
-        drop_intents(&ctx.driver, rule, &object.key, listed.version_id).await?;
         return Ok(Outcome::Skipped);
     }
     let head_key = BlobHeadKey::new(&rule.bucket, &key)
@@ -389,6 +388,7 @@ async fn import_object(
         head,
         keep_head: false,
         guards: Vec::new(),
+        retired: None,
     };
     let put = put_version(
         ctx,
@@ -601,6 +601,7 @@ async fn recover(
         head,
         keep_head: head.is_some(),
         guards,
+        retired: intent.as_ref().map(|(key, _)| key.clone()),
     };
     let size = location.blob_size;
     let put = put_version(
@@ -620,7 +621,6 @@ async fn recover(
         }
         Err(error) => return Err(put_failure(error)),
     }
-    drop_intent(&ctx.driver, intent).await?;
     if head.is_none() {
         let auth = spec.auth_context.clone();
         let (realm_id, group_id, bucket) = (auth.realm_id, rule.group_id, rule.bucket.clone());
@@ -745,21 +745,6 @@ async fn drop_intent(
     }
 }
 
-/// Removes the intent of the committed write `version_id` at `path` once it is listed.
-async fn drop_intents(
-    context: &DriverContext,
-    rule: &BackendImport,
-    path: &str,
-    version_id: Ulid,
-) -> Result<(), ItemError> {
-    let key = intent_key(rule.import_id, path, version_id);
-    let [value] = read_values(context, [(IMPORT_INTENT_KEYSPACE, key.clone())]).await?;
-    match value {
-        Some(_) => drop_intent(context, Some((key, UserId::default()))).await,
-        None => Ok(()),
-    }
-}
-
 /// The row an equal size updates without reading the bytes: the first listing of Aruna's own
 /// write, or any listing without ETag and time.
 fn trusted_listing(
@@ -871,6 +856,8 @@ struct Fence {
     head: Option<Ulid>,
     keep_head: bool,
     guards: Vec<(String, Key, Option<Value>)>,
+    /// The write intent the version makes obsolete, deleted in its transaction.
+    retired: Option<Key>,
 }
 
 async fn put_version(
@@ -925,6 +912,9 @@ async fn put_version(
     .with_import_guards(fence.guards);
     if fence.keep_head {
         operation = operation.keep_head();
+    }
+    if let Some(key) = fence.retired {
+        operation = operation.with_retired_intent(key);
     }
     if let Some(gate) = run.gate.clone() {
         operation = operation.with_gate(gate);
@@ -1627,15 +1617,6 @@ mod tests {
         let mut expected = vec![open.clone(), done.clone()];
         expected.sort_by_key(|(_, intent, _)| intent.version_id);
         assert_eq!(claims, expected);
-
-        // A listed write drops only its own intent.
-        let dropped = drop_intents(&context, &rule, "raw/a.csv", done.1.version_id);
-        assert!(dropped.await.is_ok());
-        let claims = read_claims(&context, &rule, "raw/a.csv")
-            .await
-            .ok()
-            .unwrap();
-        assert_eq!(claims, vec![open]);
     }
 
     #[test]

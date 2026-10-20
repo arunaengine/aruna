@@ -105,6 +105,8 @@ pub enum CompleteUploadState {
     ReadImportRule,
     /// Records what a plain object will be before its bytes reach the path.
     WriteIntent,
+    /// Deletes that record in the version transaction.
+    RetireIntent,
     WriteCleanupRecords,
     WriteReplicationObligation,
     EnforceQuota,
@@ -1856,6 +1858,9 @@ impl CompleteUploadOperation {
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
+        if let Some(effects) = self.retire_intent() {
+            return effects;
+        }
         self.write_obligation()
     }
 
@@ -2306,6 +2311,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::DeleteUploadRecords => self.records_deleted(event),
             CompleteUploadState::ReadImportRule => self.import_rule_read(event),
             CompleteUploadState::WriteIntent => self.intent_written(event),
+            CompleteUploadState::RetireIntent => self.intent_retired(event),
             CompleteUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
             CompleteUploadState::WriteReplicationObligation => self.obligation_written(event),
             CompleteUploadState::EnforceQuota => self.handle_enforce_quota(event),

@@ -4,8 +4,10 @@
 
 use super::*;
 use crate::s3::object::put::{PlainRecord, intent_write, same_name_path, version_row};
-use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
-use aruna_core::structs::storage::backend_import::{WriteIntent, import_key, tagged_path};
+use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, IMPORT_INTENT_KEYSPACE};
+use aruna_core::structs::storage::backend_import::{
+    WriteIntent, import_key, intent_key, tagged_path,
+};
 use aruna_core::structs::storage::multipart::BackendUpload;
 
 impl CompleteUploadOperation {
@@ -191,6 +193,26 @@ impl CompleteUploadOperation {
         }
     }
 
+    /// The committed version holds the identity its intent recorded, so the intent goes.
+    pub(super) fn retire_intent(&mut self) -> Option<Effects> {
+        let target = self.plain.as_ref().filter(|target| target.listed)?;
+        let path = &self.composed_location.as_ref()?.backend_path;
+        let key = intent_key(target.import_id, path, self.version_id?);
+        self.state = CompleteUploadState::RetireIntent;
+        Some(smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes: vec![(IMPORT_INTENT_KEYSPACE.to_string(), key)],
+            txn_id: self.txn_id,
+        })])
+    }
+
+    pub(super) fn intent_retired(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.write_obligation(),
+            Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
+            _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
+        }
+    }
+
     /// Reads the rule of a listed plain object in the finalize transaction, so its import
     /// row is written only while the rule exists.
     pub(super) fn plain_fence(&mut self) -> Option<Effects> {
@@ -328,6 +350,13 @@ mod tests {
     }
 
     fn record_writes(exists: bool, committed: Option<Ulid>) -> Vec<(String, Key, Value)> {
+        recorded(exists, committed).1
+    }
+
+    fn recorded(
+        exists: bool,
+        committed: Option<Ulid>,
+    ) -> (CompleteUploadOperation, Vec<(String, Key, Value)>) {
         let mut operation = operation("{dir}{name}");
         operation.compose_blob();
         operation.plain_version = Some("v1".to_string());
@@ -354,7 +383,8 @@ mod tests {
         if let (Some(location), Some(ulid)) = (operation.final_location.as_mut(), committed) {
             location.ulid = ulid;
         }
-        finalize_writes(&mut operation, exists)
+        let writes = finalize_writes(&mut operation, exists);
+        (operation, writes)
     }
 
     /// Drives a composed upload through its finalize records, with or without the rule.
@@ -386,6 +416,28 @@ mod tests {
             .iter()
             .filter(|(key_space, _, _)| key_space == keyspace)
             .count()
+    }
+
+    #[test]
+    fn retires_intent() {
+        let (mut operation, _) = recorded(true, None);
+        let id = operation.version_id.unwrap();
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        // The intent goes in the version transaction, before the replication obligation.
+        let [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id })] = effects.as_slice()
+        else {
+            panic!("expected the intent delete, got {effects:?}")
+        };
+        let key = intent_key(Ulid::from_bytes([4u8; 16]), "raw/object", id);
+        assert_eq!(*deletes, vec![(IMPORT_INTENT_KEYSPACE.to_string(), key)]);
+        assert_eq!(*txn_id, Some(Ulid::nil()));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        assert!(!effects.is_empty());
+        assert_ne!(operation.state, CompleteUploadState::RetireIntent);
     }
 
     #[test]
