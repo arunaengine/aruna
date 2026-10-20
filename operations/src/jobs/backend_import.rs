@@ -2,12 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::UserId;
+use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, DELETE_AUDIT_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
+    JOB_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::HASH_MD5;
@@ -15,12 +17,13 @@ use aruna_core::structs::execution::job::{JobError, JobId, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportCheckpoint, BackendImportSpec, ExternalObject, ImportedObject,
-    object_key, version_key,
+    PathIdentity, WriteIntent, intent_key, intent_prefix, object_key, version_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
     ResolvedBackend, VersionKey, bucket_permission_path, ensure_confined_path,
 };
+use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobAuditRecord, BlobPurgeKind};
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{RoutingSnapshot, RoutingTarget, RuleSource};
@@ -318,6 +321,18 @@ async fn import_object(
         Ok(None) => return Err(ItemError::Item("the backend is not usable".to_string())),
         Err(error) => return Err(ItemError::Item(error.to_string())),
     };
+    let recovery = recover(
+        ctx,
+        spec,
+        run,
+        object,
+        row.as_ref(),
+        stored.as_ref(),
+        &resolved,
+    );
+    if let Some(outcome) = recovery.await? {
+        return Ok(outcome);
+    }
     let key = match row.as_ref().and_then(|row| row.key.clone()) {
         Some(key) => key,
         None => rule.aruna_key(&object.key).unwrap_or_default(),
@@ -334,7 +349,8 @@ async fn import_object(
         && let Some(md5) = committed_md5(&ctx.driver, &rule.bucket, &key, &listed, object).await?
         && !etag_differs(object.etag.as_deref(), md5.as_deref())
     {
-        note_listing(&ctx.driver, rule, row_key, &seen, encode(&listed)?).await?;
+        note_listing(&ctx.driver, rule, row_key, Some(&seen), encode(&listed)?).await?;
+        drop_intents(&ctx.driver, rule, &object.key, listed.version_id).await?;
         return Ok(Outcome::Skipped);
     }
     let head_key = BlobHeadKey::new(&rule.bucket, &key)
@@ -369,6 +385,11 @@ async fn import_object(
         ));
     }
     let size = location.blob_size;
+    let fence = Fence {
+        head,
+        keep_head: false,
+        guards: Vec::new(),
+    };
     let put = put_version(
         ctx,
         spec,
@@ -376,7 +397,7 @@ async fn import_object(
         key.clone(),
         (location, version),
         committed,
-        head,
+        fence,
     );
     match put.await {
         Ok(()) => {}
@@ -400,6 +421,343 @@ async fn import_object(
     )
     .await;
     Ok(Outcome::Imported)
+}
+
+/// The key and version a file was written as, from its write intent or its path.
+#[derive(Debug, PartialEq)]
+struct Identity {
+    key: String,
+    version_id: Ulid,
+    /// The intent that names it, and who wrote the file.
+    intent: Option<(Key, UserId)>,
+}
+
+/// One stored intent of a write to the file's path, and whether its version committed.
+type Claim = (Key, WriteIntent, bool);
+
+/// Prefers the one write whose version never committed; else the path itself. Several open
+/// writes or a path that does not tell the folder of its key are reported, never guessed.
+fn choose_identity(
+    rule: &BackendImport,
+    path: &str,
+    claims: Vec<Claim>,
+) -> Result<Option<Identity>, ItemError> {
+    let backend = BackendRef::Group(rule.backend_id);
+    let claims = claims
+        .into_iter()
+        .filter(|(_, intent, _)| intent.backend == backend);
+    let claims: Vec<Claim> = claims.collect();
+    let open: Vec<&Claim> = claims.iter().filter(|(.., committed)| !committed).collect();
+    let chosen = match (open.as_slice(), claims.as_slice()) {
+        ([one], _) => Some(*one),
+        ([], [one]) => Some(one),
+        ([], []) => None,
+        _ => return Err(item("several writes claim this file")),
+    };
+    if let Some((key, intent, _)) = chosen {
+        return Ok(Some(Identity {
+            key: intent.key.clone(),
+            version_id: intent.version_id,
+            intent: Some((key.clone(), intent.created_by)),
+        }));
+    }
+    match rule.decode_path(path) {
+        PathIdentity::Unmatched => Ok(None),
+        PathIdentity::Ambiguous => Err(item("the file name fits more than one key or version")),
+        PathIdentity::Decoded { key: None, id, .. } => Err(item(format!(
+            "the file names version {id}, but not the folder of its key"
+        ))),
+        PathIdentity::Decoded {
+            key: Some(key), id, ..
+        } => Ok(Some(Identity {
+            key,
+            version_id: id,
+            intent: None,
+        })),
+    }
+}
+
+fn item(message: impl Into<String>) -> ItemError {
+    ItemError::Item(message.into())
+}
+
+/// What the delete trail says about one version of a key.
+#[derive(Debug, PartialEq)]
+enum Trail {
+    Clean,
+    /// Some version of the key was deleted, so its head may have been removed on purpose.
+    Touched,
+    /// The version was deleted, or a purge after its creation covered the key.
+    Removed,
+}
+
+fn read_trail(records: &[BlobAuditRecord], bucket: &str, key: &str, id: Ulid) -> Trail {
+    let mut trail = Trail::Clean;
+    for record in records.iter().filter(|record| record.bucket == bucket) {
+        let removed = match record.kind {
+            BlobAuditKind::Purge(scope) => {
+                let covers = match scope {
+                    BlobPurgeKind::File => record.key == key,
+                    BlobPurgeKind::Prefix => key.starts_with(&record.key),
+                    BlobPurgeKind::Bucket => true,
+                };
+                covers && record.occurred_at_ms >= id.timestamp_ms()
+            }
+            BlobAuditKind::DeleteVersion | BlobAuditKind::DeleteMarker if record.key == key => {
+                trail = Trail::Touched;
+                record.version_id == Some(id)
+            }
+            _ => false,
+        };
+        if removed {
+            return Trail::Removed;
+        }
+    }
+    trail
+}
+
+/// Registers a file whose version never committed as the key and version its write intent or
+/// path names. `None` leaves the file to the ordinary import, as for any row Aruna wrote.
+async fn recover(
+    ctx: &JobContext,
+    spec: &BackendImportSpec,
+    run: &ImportRun,
+    object: &ExternalObject,
+    row: Option<&ImportedObject>,
+    stored: Option<&Value>,
+    resolved: &ResolvedBackend,
+) -> Result<Option<Outcome>, ItemError> {
+    let rule = &run.rule;
+    if row.is_some_and(|row| row.key.is_some()) {
+        return Ok(None);
+    }
+    let claims = match row {
+        None => read_claims(&ctx.driver, rule, &object.key).await?,
+        Some(_) => Vec::new(),
+    };
+    let Some(identity) = choose_identity(rule, &object.key, claims)? else {
+        return Ok(None);
+    };
+    let Identity {
+        key,
+        version_id,
+        intent,
+    } = identity;
+    ensure_confined_path(Path::new(&key)).map_err(|error| item(error.to_string()))?;
+    let (mut location, version) = hash_object(ctx, spec, resolved.clone(), &object.key).await?;
+    if location.blob_size != object.size {
+        return Err(item("the object changed while it was read"));
+    }
+    if let Some((_, writer)) = &intent {
+        location.created_by = *writer;
+    }
+    let committed = ImportedObject {
+        key: Some(key.clone()),
+        ..ImportedObject::new(version_id, object)
+    };
+    let row_key = object_key(rule.import_id, &object.key);
+    // An existing version only gets its missing row, and only for the same bytes.
+    if let Some(hash) = committed_hash(&ctx.driver, &rule.bucket, &key, version_id).await? {
+        if location.get_blake3() != Some(&hash[..]) {
+            return Err(item(format!(
+                "the file differs from version {version_id} of {key}"
+            )));
+        }
+        let repaired = encode(&committed)?;
+        note_listing(&ctx.driver, rule, row_key, stored, repaired).await?;
+        drop_intent(&ctx.driver, intent).await?;
+        return Ok(Some(Outcome::Imported));
+    }
+    let records = audit_records(&ctx.driver, rule.group_id).await?;
+    let trail = read_trail(&records, &rule.bucket, &key, version_id);
+    let head = read_head(&ctx.driver, &rule.bucket, &key).await?;
+    match (&trail, head) {
+        (Trail::Removed, _) => {
+            return Err(item(format!(
+                "version {version_id} of {key} was deleted and is not restored"
+            )));
+        }
+        (Trail::Touched, None) => {
+            return Err(item(format!(
+                "{key} has no current version after a delete; {version_id} is not restored"
+            )));
+        }
+        _ => {}
+    }
+    let guards = vec![
+        (
+            BACKEND_IMPORT_KEYSPACE.to_string(),
+            rule.key(),
+            Some(encode_rule(rule)?),
+        ),
+        (
+            IMPORTED_OBJECT_KEYSPACE.to_string(),
+            row_key,
+            stored.cloned(),
+        ),
+    ];
+    // Older history joins below a head; a key that never had one gets the file as its head.
+    let fence = Fence {
+        head,
+        keep_head: head.is_some(),
+        guards,
+    };
+    let size = location.blob_size;
+    let put = put_version(
+        ctx,
+        spec,
+        run,
+        key.clone(),
+        (location, version),
+        committed,
+        fence,
+    );
+    match put.await {
+        Ok(()) => {}
+        // Another write or recovery came first; the next run looks again.
+        Err(PutObjectError::HeadChanged | PutObjectError::VersionExists) => {
+            return Ok(Some(Outcome::Skipped));
+        }
+        Err(error) => return Err(put_failure(error)),
+    }
+    drop_intent(&ctx.driver, intent).await?;
+    if head.is_none() {
+        let auth = spec.auth_context.clone();
+        let (realm_id, group_id, bucket) = (auth.realm_id, rule.group_id, rule.bucket.clone());
+        complete_put(
+            &ctx.driver,
+            realm_id,
+            spec.node_id,
+            auth,
+            group_id,
+            bucket,
+            key,
+            version_id,
+            size,
+        )
+        .await;
+    }
+    Ok(Some(Outcome::Imported))
+}
+
+fn encode_rule(rule: &BackendImport) -> Result<Value, ItemError> {
+    let bytes = rule.to_bytes();
+    bytes
+        .map(Value::from)
+        .map_err(|error| ItemError::System(error.to_string()))
+}
+
+async fn read_head(
+    context: &DriverContext,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<Ulid>, ItemError> {
+    let head_key = BlobHeadKey::new(bucket, key)
+        .to_bytes()
+        .map_err(|error| ItemError::Item(error.to_string()))?;
+    let [head] = read_values(context, [(BLOB_HEAD_KEYSPACE, head_key.into())]).await?;
+    Ok(parse(head, CurrentVersionPointer::from_bytes)?.map(|head| head.version_id))
+}
+
+/// The intents stored for a path, each with whether its version committed.
+async fn read_claims(
+    context: &DriverContext,
+    rule: &BackendImport,
+    path: &str,
+) -> Result<Vec<Claim>, ItemError> {
+    let prefix = intent_prefix(rule.import_id, path);
+    let mut claims = Vec::new();
+    for (key, value) in iterate(context, IMPORT_INTENT_KEYSPACE, prefix).await? {
+        let intent = WriteIntent::from_bytes(&value);
+        let intent = intent.map_err(|error| ItemError::System(error.to_string()))?;
+        let found = committed_hash(context, &rule.bucket, &intent.key, intent.version_id).await?;
+        claims.push((key, intent, found.is_some()));
+    }
+    Ok(claims)
+}
+
+/// The delete trail of a group, read only for the rare file that needs recovery.
+async fn audit_records(
+    context: &DriverContext,
+    group_id: Ulid,
+) -> Result<Vec<BlobAuditRecord>, ItemError> {
+    let prefix = Key::from(group_id.to_bytes().to_vec());
+    let entries = iterate(context, DELETE_AUDIT_KEYSPACE, prefix).await?;
+    let records = entries
+        .iter()
+        .map(|(_, value)| BlobAuditRecord::from_bytes(value));
+    let records = records.collect::<Result<Vec<_>, _>>();
+    records.map_err(|error| ItemError::System(error.to_string()))
+}
+
+/// Every entry under `prefix`, read in pages.
+async fn iterate(
+    context: &DriverContext,
+    key_space: &str,
+    prefix: Key,
+) -> Result<Vec<(Key, Value)>, ItemError> {
+    let mut entries = Vec::new();
+    let mut start = None;
+    loop {
+        let effect = StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix: Some(prefix.clone()),
+            start: start.take().map(IterStart::After),
+            limit: LIST_PAGE,
+            txn_id: None,
+        };
+        match context.storage_handle.send_storage_effect(effect).await {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => {
+                entries.extend(values);
+                match next_start_after {
+                    Some(next) => start = Some(next),
+                    None => return Ok(entries),
+                }
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(ItemError::System(error.to_string()));
+            }
+            other => return Err(ItemError::System(format!("unexpected answer {other:?}"))),
+        }
+    }
+}
+
+/// An intent whose version committed is done; the version and its row now hold the identity.
+async fn drop_intent(
+    context: &DriverContext,
+    intent: Option<(Key, UserId)>,
+) -> Result<(), ItemError> {
+    let Some((key, _)) = intent else {
+        return Ok(());
+    };
+    let effect = StorageEffect::Delete {
+        key_space: IMPORT_INTENT_KEYSPACE.to_string(),
+        key,
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(ItemError::System(error.to_string())),
+        other => Err(ItemError::System(format!("unexpected answer {other:?}"))),
+    }
+}
+
+/// Removes the intent of the committed write `version_id` at `path` once it is listed.
+async fn drop_intents(
+    context: &DriverContext,
+    rule: &BackendImport,
+    path: &str,
+    version_id: Ulid,
+) -> Result<(), ItemError> {
+    let key = intent_key(rule.import_id, path, version_id);
+    let [value] = read_values(context, [(IMPORT_INTENT_KEYSPACE, key.clone())]).await?;
+    match value {
+        Some(_) => drop_intent(context, Some((key, UserId::default()))).await,
+        None => Ok(()),
+    }
 }
 
 /// The row an equal size updates without reading the bytes: the first listing of Aruna's own
@@ -493,6 +851,13 @@ fn discovered_copy(rule: &BackendImport, mut location: BackendLocation) -> Backe
     location
 }
 
+/// What the version transaction must still find, and whether the version only joins history.
+struct Fence {
+    head: Option<Ulid>,
+    keep_head: bool,
+    guards: Vec<(String, Key, Option<Value>)>,
+}
+
 async fn put_version(
     ctx: &JobContext,
     spec: &BackendImportSpec,
@@ -500,7 +865,7 @@ async fn put_version(
     key: String,
     (location, version): (BackendLocation, Option<String>),
     row: ImportedObject,
-    head: Option<Ulid>,
+    fence: Fence,
 ) -> Result<(), PutObjectError> {
     let row_key = object_key(run.rule.import_id, &location.backend_path);
     let mut rows = vec![(
@@ -540,8 +905,12 @@ async fn put_version(
     .with_adopted(discovered_copy(&run.rule, location))
     .with_bucket_guard(run.bucket.clone())
     .with_restrictions(spec.auth_context.path_restrictions.clone())
-    .with_expected_head(head)
-    .with_import_rows(run.rule.import_id, rows);
+    .with_expected_head(fence.head)
+    .with_import_rows(run.rule.import_id, rows)
+    .with_import_guards(fence.guards);
+    if fence.keep_head {
+        operation = operation.keep_head();
+    }
     if let Some(gate) = run.gate.clone() {
         operation = operation.with_gate(gate);
     }
@@ -631,13 +1000,13 @@ async fn write_value(
     }
 }
 
-/// Replaces the row only while the rule exists and the row still holds `seen`, in one
-/// transaction. Otherwise nothing is written and the next run looks at the object again.
+/// Replaces the row only while the rule exists and the row still holds `seen` (`None`: no row),
+/// in one transaction. Otherwise nothing is written and the next run looks at the object again.
 async fn note_listing(
     context: &DriverContext,
     rule: &BackendImport,
     row_key: Key,
-    seen: &Value,
+    seen: Option<&Value>,
     row: Vec<u8>,
 ) -> Result<(), ItemError> {
     let storage = &context.storage_handle;
@@ -663,7 +1032,7 @@ async fn note_listing(
             return Err(unexpected(other));
         }
     };
-    if !matches!(values.as_slice(), [(_, Some(_)), (_, Some(value))] if value == seen) {
+    if !matches!(values.as_slice(), [(_, Some(_)), (_, value)] if value.as_ref() == seen) {
         storage.send_storage_effect(abort).await;
         return Ok(());
     }
@@ -973,7 +1342,13 @@ mod tests {
         assert!(row.await.is_ok());
 
         // A removed rule gets no row update.
-        let note = note_listing(&context, &rule, row_key.clone(), &seen, update.clone());
+        let note = note_listing(
+            &context,
+            &rule,
+            row_key.clone(),
+            Some(&seen),
+            update.clone(),
+        );
         assert!(note.await.is_ok());
         assert_eq!(stored().await, written);
 
@@ -985,11 +1360,17 @@ mod tests {
         );
         // A row another write replaced meanwhile stays as that write left it.
         let other = Value::from(listed.to_bytes().unwrap());
-        let note = note_listing(&context, &rule, row_key.clone(), &other, update.clone());
+        let note = note_listing(
+            &context,
+            &rule,
+            row_key.clone(),
+            Some(&other),
+            update.clone(),
+        );
         assert!(note.await.is_ok());
         assert_eq!(stored().await, written);
 
-        let note = note_listing(&context, &rule, row_key.clone(), &seen, update);
+        let note = note_listing(&context, &rule, row_key.clone(), Some(&seen), update);
         assert!(note.await.is_ok());
         assert_eq!(stored().await, listed);
     }
@@ -1061,6 +1442,185 @@ mod tests {
         assert!(!etag_differs(Some(&multipart), Some(&md5)));
         assert!(!etag_differs(Some(&etag), None));
         assert!(!etag_differs(None, Some(&md5)));
+    }
+
+    fn recovery_rule(pattern: &str) -> BackendImport {
+        BackendImport {
+            import_id: Ulid::from_parts(4, 4),
+            group_id: Ulid::from_parts(3, 3),
+            backend_id: Ulid::from_parts(5, 5),
+            backend_prefix: "raw/".to_string(),
+            bucket: "bucket".to_string(),
+            key_prefix: "in/".to_string(),
+            schedule: None,
+            created_by: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: pattern.to_string(),
+        }
+    }
+
+    fn claim(rule: &BackendImport, key: &str, committed: bool) -> Claim {
+        let intent = WriteIntent {
+            key: key.to_string(),
+            version_id: Ulid::generate(),
+            backend: BackendRef::Group(rule.backend_id),
+            created_by: Default::default(),
+        };
+        let stored = intent_key(rule.import_id, "raw/a.csv", intent.version_id);
+        (stored, intent, committed)
+    }
+
+    #[test]
+    fn chooses_identity() {
+        let rule = recovery_rule("{dir}{id}_{name}");
+        let id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let path = format!("raw/x/{id}_a.csv");
+        let decoded = choose_identity(&rule, &path, Vec::new()).ok().flatten();
+        let expected = Identity {
+            key: "in/x/a.csv".to_string(),
+            version_id: id,
+            intent: None,
+        };
+        assert_eq!(decoded, Some(expected));
+        assert!(matches!(
+            choose_identity(&rule, "raw/x/a.csv", Vec::new()),
+            Ok(None)
+        ));
+        // A path without the folder of its key is reported, never imported under a guess.
+        let stripped = recovery_rule("{id}_{name}");
+        let path = format!("raw/{id}_a.csv");
+        assert!(matches!(
+            choose_identity(&stripped, &path, Vec::new()),
+            Err(ItemError::Item(_))
+        ));
+        // The intent of the write that never committed names the full key.
+        let open = claim(&stripped, "in/deep/a.csv", false);
+        let done = claim(&stripped, "in/other/a.csv", true);
+        let chosen = choose_identity(&stripped, &path, vec![done.clone(), open.clone()]);
+        let chosen = chosen.ok().flatten().unwrap();
+        assert_eq!(
+            (chosen.key.as_str(), chosen.version_id),
+            ("in/deep/a.csv", open.1.version_id)
+        );
+        assert_eq!(chosen.intent.map(|(key, _)| key), Some(open.0.clone()));
+        let only = choose_identity(&stripped, &path, vec![done.clone()])
+            .ok()
+            .flatten();
+        assert_eq!(
+            only.map(|identity| identity.version_id),
+            Some(done.1.version_id)
+        );
+        let second = claim(&stripped, "in/b.csv", false);
+        assert!(choose_identity(&stripped, &path, vec![open.clone(), second]).is_err());
+        // An intent for another backend says nothing about this file.
+        let mut foreign = open;
+        foreign.1.backend = BackendRef::Group(Ulid::from_parts(9, 9));
+        assert!(choose_identity(&stripped, &path, vec![foreign]).is_err());
+    }
+
+    fn audit(kind: BlobAuditKind, key: &str, version_id: Option<Ulid>, at: u64) -> BlobAuditRecord {
+        BlobAuditRecord {
+            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]),
+            group_id: Ulid::from_parts(3, 3),
+            node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
+            user_id: Default::default(),
+            kind,
+            bucket: "bucket".to_string(),
+            key: key.to_string(),
+            version_id,
+            occurred_at_ms: at,
+        }
+    }
+
+    #[test]
+    fn respects_delete_trail() {
+        let id = Ulid::from_parts(1_000, 1);
+        let trail = |records: &[BlobAuditRecord]| read_trail(records, "bucket", "in/a.csv", id);
+        assert_eq!(trail(&[]), Trail::Clean);
+        let other = audit(
+            BlobAuditKind::DeleteVersion,
+            "in/a.csv",
+            Some(Ulid::nil()),
+            2_000,
+        );
+        assert_eq!(trail(&[other.clone()]), Trail::Touched);
+        let exact = audit(BlobAuditKind::DeleteVersion, "in/a.csv", Some(id), 2_000);
+        assert_eq!(trail(&[other, exact]), Trail::Removed);
+        // A purge removes what existed when it ran, not what was written after it.
+        let purge = |at| audit(BlobAuditKind::Purge(BlobPurgeKind::Prefix), "in/", None, at);
+        assert_eq!(trail(&[purge(2_000)]), Trail::Removed);
+        assert_eq!(trail(&[purge(500)]), Trail::Clean);
+        let bucket = audit(BlobAuditKind::Purge(BlobPurgeKind::Bucket), "", None, 2_000);
+        assert_eq!(trail(&[bucket.clone()]), Trail::Removed);
+        let elsewhere = BlobAuditRecord {
+            bucket: "other".to_string(),
+            ..bucket
+        };
+        let file = audit(
+            BlobAuditKind::Purge(BlobPurgeKind::File),
+            "in/b.csv",
+            None,
+            2_000,
+        );
+        assert_eq!(trail(&[elsewhere, file]), Trail::Clean);
+    }
+
+    #[tokio::test]
+    async fn reads_write_claims() {
+        let (_directory, storage) = crate::tests::s3::test_storage();
+        let context = crate::tests::s3::test_context(storage);
+        let rule = recovery_rule("{dir}{id}_{name}");
+        let (open, done) = (
+            claim(&rule, "in/a.csv", false),
+            claim(&rule, "in/a.csv", true),
+        );
+        // Another path that only starts like this one holds no claim on it.
+        let longer = intent_key(rule.import_id, "raw/a.csv2", Ulid::generate());
+        for (key, intent) in [(&open.0, &open.1), (&done.0, &done.1), (&longer, &open.1)] {
+            let value = intent.to_bytes().unwrap();
+            let write = write_value(&context, IMPORT_INTENT_KEYSPACE, key.clone(), value);
+            assert!(write.await.is_ok());
+        }
+        let version = BlobVersion::materialized(
+            [7; 32],
+            BackendRef::Group(rule.backend_id),
+            aruna_core::structs::storage::format::EncodingClass::Raw,
+            std::time::SystemTime::UNIX_EPOCH,
+            Default::default(),
+            None,
+        );
+        let key = VersionKey::new("bucket", "in/a.csv", done.1.version_id);
+        let key = Key::from(key.to_bytes().unwrap());
+        let write = write_value(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            key,
+            version.to_bytes().unwrap(),
+        );
+        assert!(write.await.is_ok());
+
+        let mut claims = read_claims(&context, &rule, "raw/a.csv")
+            .await
+            .ok()
+            .unwrap();
+        claims.sort_by_key(|(_, intent, _)| intent.version_id);
+        let mut expected = vec![open.clone(), done.clone()];
+        expected.sort_by_key(|(_, intent, _)| intent.version_id);
+        assert_eq!(claims, expected);
+
+        // A listed write drops only its own intent.
+        let dropped = drop_intents(&context, &rule, "raw/a.csv", done.1.version_id);
+        assert!(dropped.await.is_ok());
+        let claims = read_claims(&context, &rule, "raw/a.csv")
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(claims, vec![open]);
     }
 
     #[test]
