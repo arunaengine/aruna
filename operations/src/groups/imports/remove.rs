@@ -9,8 +9,8 @@ use crate::groups::fence::{parse_group_record, read_group_record};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORT_REMOVAL_KEYSPACE,
-    IMPORTED_OBJECT_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORT_PATTERN_KEYSPACE,
+    IMPORT_REMOVAL_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{ProviderCleanup, import_key, object_prefix};
@@ -113,6 +113,10 @@ impl RemoveImportOperation {
     fn purge(&mut self, values: Vec<(Key, Value)>) -> Effects {
         if values.is_empty() && self.space == IMPORTED_OBJECT_KEYSPACE {
             self.space = IMPORT_INTENT_KEYSPACE;
+            return self.scan();
+        }
+        if values.is_empty() && self.space == IMPORT_INTENT_KEYSPACE {
+            self.space = IMPORT_PATTERN_KEYSPACE;
             return self.scan();
         }
         if let (true, Some(cleanup)) = (values.is_empty(), self.cleanup.as_ref()) {
@@ -370,9 +374,11 @@ mod tests {
                 [Effect::Storage(StorageEffect::BatchDelete { .. })]
             ));
         }
-        // The write intents of the rule go after its rows.
+        // The write intents and earlier patterns of the rule go after its rows.
         if let [Effect::Storage(StorageEffect::Iter { key_space, .. })] = effects.as_slice() {
-            assert_eq!(key_space, IMPORT_INTENT_KEYSPACE);
+            assert!(
+                [IMPORT_INTENT_KEYSPACE, IMPORT_PATTERN_KEYSPACE].contains(&key_space.as_str())
+            );
             return drain(operation, 0);
         }
         effects

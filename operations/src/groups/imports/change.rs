@@ -9,11 +9,14 @@ use crate::jobs::store::decode_job_record;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, JOB_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, IMPORT_PATTERN_KEYSPACE, JOB_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::job_record_key;
-use aruna_core::structs::storage::backend_import::{BackendImport, import_key, valid_pattern};
+use aruna_core::structs::storage::backend_import::{
+    BackendImport, import_key, object_prefix, read_patterns, retire_pattern, valid_pattern,
+    write_patterns,
+};
 use aruna_core::structs::storage::format::CompressionMigration;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -49,8 +52,8 @@ pub struct ChangeImportOperation {
     now: SystemTime,
     state: ChangeState,
     txn_id: Option<TxnId>,
-    /// The changed rule, written once the last run is known to have ended.
-    changed: Option<BackendImport>,
+    /// The changed rule and the pattern it replaces, written once no run or move uses it.
+    changed: Option<(BackendImport, String)>,
     output: Option<Result<BackendImport, ImportRuleError>>,
 }
 
@@ -86,7 +89,7 @@ impl ChangeImportOperation {
         record.schedule = self.change.schedule.clone();
         record.updated_at = self.now;
         let Some(pattern) = self.change.write_pattern.clone() else {
-            return self.write(record);
+            return self.write(record, None);
         };
         record.write_pattern = pattern;
         // A whole-bucket link keeps its plain names, and no rule becomes one.
@@ -96,19 +99,25 @@ impl ChangeImportOperation {
             ));
         }
         if record.write_pattern == before.write_pattern {
-            return self.write(record);
+            return self.write(record, None);
         }
         let Some(txn_id) = self.txn_id else {
             return self.fail(ImportRuleError::Unexpected("Read"));
         };
-        let mut reads = vec![(
-            COMPRESSION_MIGRATION_KEYSPACE.to_string(),
-            record.bucket.as_bytes().to_vec().into(),
-        )];
+        let mut reads = vec![
+            (
+                COMPRESSION_MIGRATION_KEYSPACE.to_string(),
+                record.bucket.as_bytes().to_vec().into(),
+            ),
+            (
+                IMPORT_PATTERN_KEYSPACE.to_string(),
+                object_prefix(record.import_id),
+            ),
+        ];
         if let Some(last_job) = record.last_job {
             reads.push((JOB_KEYSPACE.to_string(), job_record_key(last_job)));
         }
-        self.changed = Some(record);
+        self.changed = Some((record, before.write_pattern));
         self.state = ChangeState::Run;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads,
@@ -117,13 +126,14 @@ impl ChangeImportOperation {
     }
 
     /// A move still running would publish files named by the old pattern; a pruned last run
-    /// has ended.
+    /// has ended. The old pattern stays to read the files it named.
     fn run_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let Some(record) = self.changed.take() else {
+        let Some((record, old)) = self.changed.take() else {
             return self.fail(ImportRuleError::Unexpected("Run"));
         };
         let mut values = values.into_iter().map(|(_, value)| value);
-        let (moving, run) = (values.next().flatten(), values.next().flatten());
+        let (moving, earlier) = (values.next().flatten(), values.next().flatten());
+        let run = values.next().flatten();
         let moving = moving.as_deref().map(CompressionMigration::from_bytes);
         match moving.transpose() {
             Ok(Some(found)) if found.moving && found.finished_at_ms.is_none() => {
@@ -135,28 +145,50 @@ impl ChangeImportOperation {
             Err(error) => return self.fail(error.into()),
         }
         match run.as_deref().map(decode_job_record).transpose() {
-            Ok(Some(last)) if is_running(last.state) => self.fail(ImportRuleError::Conflict(
-                "the last run of this import has not finished".to_string(),
-            )),
-            Ok(_) => self.write(record),
-            Err(error) => self.fail(error.into()),
+            Ok(Some(last)) if is_running(last.state) => {
+                return self.fail(ImportRuleError::Conflict(
+                    "the last run of this import has not finished".to_string(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => return self.fail(error.into()),
         }
+        let earlier = match read_patterns(earlier.as_deref()) {
+            Ok(earlier) => retire_pattern(&earlier, &old, &record.write_pattern),
+            Err(error) => return self.fail(error.into()),
+        };
+        let (key, value) = match write_patterns(&earlier) {
+            Ok(value) => (object_prefix(record.import_id), value.into()),
+            Err(error) => return self.fail(error.into()),
+        };
+        self.write(record, Some((key, value)))
     }
 
-    fn write(&mut self, record: BackendImport) -> Effects {
+    /// Writes the rule, with the earlier patterns of a pattern change in the same batch.
+    fn write(&mut self, record: BackendImport, earlier: Option<(Key, Value)>) -> Effects {
         let value = match record.to_bytes() {
             Ok(value) => value,
             Err(error) => return self.fail(error.into()),
         };
         self.state = ChangeState::Write;
-        let effect = Effect::Storage(StorageEffect::Write {
-            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
-            key: record.key(),
-            value: value.into(),
-            txn_id: self.txn_id,
-        });
+        let (key, value) = (record.key(), value.into());
+        let effect = match earlier {
+            None => StorageEffect::Write {
+                key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+                key,
+                value,
+                txn_id: self.txn_id,
+            },
+            Some((patterns, earlier)) => StorageEffect::BatchWrite {
+                writes: vec![
+                    (BACKEND_IMPORT_KEYSPACE.to_string(), key, value),
+                    (IMPORT_PATTERN_KEYSPACE.to_string(), patterns, earlier),
+                ],
+                txn_id: self.txn_id,
+            },
+        };
         self.output = Some(Ok(record));
-        smallvec![effect]
+        smallvec![Effect::Storage(effect)]
     }
 }
 
@@ -204,7 +236,12 @@ impl Operation for ChangeImportOperation {
             (ChangeState::Run, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.run_read(values)
             }
-            (ChangeState::Write, Event::Storage(StorageEvent::WriteResult { .. })) => {
+            (
+                ChangeState::Write,
+                Event::Storage(
+                    StorageEvent::WriteResult { .. } | StorageEvent::BatchWriteResult { .. },
+                ),
+            ) => {
                 let Some(txn_id) = self.txn_id else {
                     return self.fail(ImportRuleError::Unexpected("Write"));
                 };
@@ -321,10 +358,33 @@ mod tests {
     }
 
     fn written(effects: &Effects) -> BackendImport {
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("expected the rule write, got {effects:?}")
+        match effects.as_slice() {
+            [Effect::Storage(StorageEffect::Write { value, .. })] => {
+                BackendImport::from_bytes(value).unwrap()
+            }
+            [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] => {
+                BackendImport::from_bytes(&writes[0].2).unwrap()
+            }
+            _ => panic!("expected the rule write, got {effects:?}"),
+        }
+    }
+
+    /// The earlier patterns a pattern change stores with the rule.
+    fn earlier(effects: &Effects) -> Vec<String> {
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the rule and its patterns, got {effects:?}")
         };
-        BackendImport::from_bytes(value).unwrap()
+        let [_, (space, key, value)] = writes.as_slice() else {
+            panic!("expected two writes, got {writes:?}")
+        };
+        assert_eq!(
+            (space.as_str(), key),
+            (
+                IMPORT_PATTERN_KEYSPACE,
+                &object_prefix(Ulid::from_parts(2, 2))
+            )
+        );
+        read_patterns(Some(value)).unwrap()
     }
 
     fn finish(mut operation: ChangeImportOperation, key: Key) -> BackendImport {
@@ -346,13 +406,13 @@ mod tests {
             panic!("expected the checks, got {effects:?}")
         };
         let spaces: Vec<&str> = reads.iter().map(|(space, _)| space.as_str()).collect();
-        let expected = match run.is_some() {
-            true => vec![COMPRESSION_MIGRATION_KEYSPACE, JOB_KEYSPACE],
-            false => vec![COMPRESSION_MIGRATION_KEYSPACE],
-        };
+        let mut expected = vec![COMPRESSION_MIGRATION_KEYSPACE, IMPORT_PATTERN_KEYSPACE];
+        if run.is_some() {
+            expected.push(JOB_KEYSPACE);
+        }
         assert_eq!(spaces, expected);
         let moving = moving.map(|record| record.to_bytes().unwrap().into());
-        let answers = [moving, run];
+        let answers = [moving, None, run];
         let values = reads
             .iter()
             .zip(answers)
@@ -384,6 +444,8 @@ mod tests {
         assert_eq!(changed.import_id, stored.import_id);
         assert_eq!(changed.write_pattern, DEFAULT_PATTERN);
         assert_eq!(changed.schedule, None);
+        // The replaced pattern stays, so files it named keep their versions.
+        assert_eq!(earlier(&effects), ["{dir}{id}_{name}"]);
         assert_eq!(finish(operation, stored.key()), changed);
 
         // Without a pattern only the schedule changes.

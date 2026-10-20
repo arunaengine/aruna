@@ -13,11 +13,11 @@ use crate::jobs::backend_import::read_checkpoint;
 use crate::jobs::store::{iter_prefix_page, read_job_record};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
+use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, IMPORT_PATTERN_KEYSPACE};
 use aruna_core::structs::execution::job::{JobError, JobId, JobState};
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, BackendImportCheckpoint, import_key,
+    BackendImport, BackendImportCheckpoint, import_key, object_prefix, read_patterns,
 };
 use aruna_core::structs::storage::blob::ensure_confined_path;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -243,6 +243,23 @@ pub async fn read_import(
         })
         .await;
     Ok(parse_read(event, BackendImport::from_bytes)?)
+}
+
+/// The earlier write patterns of a rule, which still name some of its files.
+pub async fn read_earlier(
+    context: &DriverContext,
+    import_id: Ulid,
+) -> Result<Vec<String>, ImportRuleError> {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: IMPORT_PATTERN_KEYSPACE.to_string(),
+            key: object_prefix(import_id),
+            txn_id: None,
+        })
+        .await;
+    let stored = parse_read(event, |bytes| read_patterns(Some(bytes)))?;
+    Ok(stored.unwrap_or_default())
 }
 
 #[cfg(test)]

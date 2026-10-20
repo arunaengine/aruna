@@ -153,6 +153,31 @@ impl BackendImport {
         }
     }
 
+    /// Like [`Self::decode_path`]; a path the current pattern does not match is read with the
+    /// rule's `earlier` patterns, and different readings are ambiguous.
+    pub fn decode_any(&self, path: &str, earlier: &[String]) -> PathIdentity {
+        let current = self.decode_path(path);
+        if current != PathIdentity::Unmatched {
+            return current;
+        }
+        let mut found = Vec::new();
+        for pattern in earlier {
+            let rule = BackendImport {
+                write_pattern: pattern.clone(),
+                ..self.clone()
+            };
+            let decoded = rule.decode_path(path);
+            if decoded != PathIdentity::Unmatched && !found.contains(&decoded) {
+                found.push(decoded);
+            }
+        }
+        match found.len() {
+            0 => PathIdentity::Unmatched,
+            1 => found.remove(0),
+            _ => PathIdentity::Ambiguous,
+        }
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
@@ -160,6 +185,28 @@ impl BackendImport {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
     }
+}
+
+/// The earlier patterns after `old` is replaced by `new`, newest first. Only a pattern with
+/// `{id}` tells a version, so only such a pattern is kept.
+pub fn retire_pattern(earlier: &[String], old: &str, new: &str) -> Vec<String> {
+    let kept = earlier
+        .iter()
+        .filter(|pattern| *pattern != old && *pattern != new);
+    let old = (old != new && old.contains("{id}")).then(|| old.to_string());
+    old.into_iter().chain(kept.cloned()).collect()
+}
+
+/// The stored earlier patterns of a rule; none without a record.
+pub fn read_patterns(stored: Option<&[u8]>) -> Result<Vec<String>, ConversionError> {
+    Ok(stored
+        .map(postcard::from_bytes)
+        .transpose()?
+        .unwrap_or_default())
+}
+
+pub fn write_patterns(earlier: &[String]) -> Result<Vec<u8>, ConversionError> {
+    Ok(postcard::to_allocvec(earlier)?)
 }
 
 /// The identity a backend path encodes under its rule's write pattern.
@@ -695,6 +742,49 @@ mod tests {
         let path = format!("raw/axxb/{id}");
         let identity = rule("{name}x{dir}{id}").decode_path(&path);
         assert_eq!(identity, PathIdentity::Ambiguous);
+    }
+
+    #[test]
+    fn decodes_earlier_patterns() {
+        let id = Ulid::from_parts(1, 2);
+        let prefix = "{dir}{id}_{name}".to_string();
+        let decoded = PathIdentity::Decoded {
+            key: Some("imported/a.csv".to_string()),
+            name: "a.csv".to_string(),
+            id,
+        };
+        // A file of the replaced pattern keeps its identity; the current pattern comes first.
+        let current = rule(DEFAULT_PATTERN);
+        let old = format!("raw/{id}_a.csv");
+        assert_eq!(current.decode_path(&old), PathIdentity::Unmatched);
+        assert_eq!(current.decode_any(&old, &[prefix.clone()]), decoded);
+        let new = format!("raw/a.csv~{id}");
+        assert_eq!(current.decode_any(&new, &[prefix.clone()]), decoded);
+        // Two earlier patterns that read one path differently name no single version.
+        let path = format!("raw/{id}_{}", Ulid::from_parts(3, 4));
+        let both = [
+            "{dir}{id}_{name}".to_string(),
+            "{dir}{name}_{id}".to_string(),
+        ];
+        assert_eq!(
+            rule(PLAIN_PATTERN).decode_any(&path, &both),
+            PathIdentity::Ambiguous
+        );
+    }
+
+    #[test]
+    fn retires_patterns() {
+        let earlier = vec!["{dir}{name}_{id}".to_string()];
+        let retired = retire_pattern(&earlier, "{dir}{id}_{name}", DEFAULT_PATTERN);
+        assert_eq!(retired, ["{dir}{id}_{name}", "{dir}{name}_{id}"]);
+        // A plain pattern tells no version; the current pattern is no earlier one.
+        assert_eq!(
+            retire_pattern(&retired, PLAIN_PATTERN, "{dir}{name}_{id}"),
+            ["{dir}{id}_{name}"]
+        );
+        let stored = write_patterns(&retired).unwrap();
+        assert_eq!(read_patterns(Some(&stored)).unwrap(), retired);
+        assert!(read_patterns(None).unwrap().is_empty());
     }
 
     #[test]

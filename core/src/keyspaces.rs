@@ -228,6 +228,8 @@ pub const IMPORTED_OBJECT_KEYSPACE: &str = "backend_import_objects";
 pub const BACKEND_VERSION_KEYSPACE: &str = "backend_versions";
 /// What a write to an import folder will be, recorded before its bytes, keyed like its row.
 pub const IMPORT_INTENT_KEYSPACE: &str = "backend_import_intents";
+/// Earlier write patterns of an import rule that may still name its files, keyed by import id.
+pub const IMPORT_PATTERN_KEYSPACE: &str = "backend_import_patterns";
 /// Removed import rules whose object rows are not all deleted yet, keyed by import id.
 pub const IMPORT_REMOVAL_KEYSPACE: &str = "backend_import_removals";
 
@@ -494,6 +496,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     IMPORTED_OBJECT_KEYSPACE,
     BACKEND_VERSION_KEYSPACE,
     IMPORT_INTENT_KEYSPACE,
+    IMPORT_PATTERN_KEYSPACE,
     IMPORT_REMOVAL_KEYSPACE,
     OFFERED_DIRECTORY_KEYSPACE,
     DEVICE_INTAKE_KEYSPACE,

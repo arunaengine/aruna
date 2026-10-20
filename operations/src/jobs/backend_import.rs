@@ -40,7 +40,7 @@ use super::store::{put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive, gate_context, now_ms, routing_snapshot};
 use crate::groups::backends::query::GetBackendOperation;
-use crate::groups::imports::read_import;
+use crate::groups::imports::{read_earlier, read_import};
 use crate::placement::policy::{GateContext, PolicyGateError};
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::complete_put;
@@ -98,6 +98,8 @@ enum ItemError {
 /// What every object of one listing page is checked against.
 struct ImportRun {
     rule: BackendImport,
+    /// Patterns the rule wrote with before, read for files its pattern does not match.
+    earlier: Vec<String>,
     backend: GroupStorage,
     bucket: BucketInfo,
     routing: RoutingSnapshot,
@@ -242,6 +244,9 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
         Ok(None) => return Err(permanent("the import rule was removed")),
         Err(error) => return Err(retryable(error)),
     };
+    let earlier = read_earlier(&ctx.driver, rule.import_id)
+        .await
+        .map_err(retryable)?;
     let backend = match drive(GetBackendOperation::new(rule.backend_id), &ctx.driver).await {
         Ok(Some(backend)) if backend.group_id == rule.group_id && !backend.disabled => backend,
         Ok(_) => return Err(permanent("the storage backend is missing or disabled")),
@@ -281,6 +286,7 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
         .map_err(retryable)?;
     Ok(ImportRun {
         rule,
+        earlier,
         backend,
         bucket,
         routing,
@@ -473,6 +479,7 @@ type Claim = (Key, WriteIntent, bool);
 /// writes or a path that does not tell the folder of its key are reported, never guessed.
 fn choose_identity(
     rule: &BackendImport,
+    earlier: &[String],
     path: &str,
     claims: Vec<Claim>,
     hash: Option<&[u8; 32]>,
@@ -509,7 +516,7 @@ fn choose_identity(
             intent: Some((key.clone(), intent.created_by)),
         }));
     }
-    match rule.decode_path(path) {
+    match rule.decode_any(path, earlier) {
         PathIdentity::Unmatched => Ok(None),
         PathIdentity::Ambiguous => Err(item("the file name fits more than one key or version")),
         PathIdentity::Decoded { key: None, id, .. } => Err(item(format!(
@@ -596,7 +603,8 @@ async fn recover(
         .as_ref()
         .and_then(|(location, _)| location.get_blake3());
     let hash = hash.and_then(|hash| <[u8; 32]>::try_from(hash).ok());
-    let Some(identity) = choose_identity(rule, &object.key, claims, hash.as_ref())? else {
+    let Some(identity) = choose_identity(rule, &run.earlier, &object.key, claims, hash.as_ref())?
+    else {
         return Ok(None);
     };
     let Identity {
@@ -1969,7 +1977,7 @@ mod tests {
         let rule = recovery_rule("{dir}{id}_{name}");
         let id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         let path = format!("raw/x/{id}_a.csv");
-        let decoded = choose_identity(&rule, &path, Vec::new(), None)
+        let decoded = choose_identity(&rule, &[], &path, Vec::new(), None)
             .ok()
             .flatten();
         let expected = Identity {
@@ -1978,15 +1986,29 @@ mod tests {
             intent: None,
         };
         assert_eq!(decoded, Some(expected));
+        // After a switch to suffix names the replaced pattern still reads the file.
+        let suffix = recovery_rule("{dir}{name}~{id}");
         assert!(matches!(
-            choose_identity(&rule, "raw/x/a.csv", Vec::new(), None),
+            choose_identity(&suffix, &[], &path, Vec::new(), None),
+            Ok(None)
+        ));
+        let earlier = ["{dir}{id}_{name}".to_string()];
+        let found = choose_identity(&suffix, &earlier, &path, Vec::new(), None)
+            .ok()
+            .flatten();
+        assert_eq!(
+            found.map(|found| (found.key, found.version_id)),
+            Some(("in/x/a.csv".to_string(), id))
+        );
+        assert!(matches!(
+            choose_identity(&rule, &[], "raw/x/a.csv", Vec::new(), None),
             Ok(None)
         ));
         // A path without the folder of its key is reported, never imported under a guess.
         let stripped = recovery_rule("{id}_{name}");
         let path = format!("raw/{id}_a.csv");
         assert!(matches!(
-            choose_identity(&stripped, &path, Vec::new(), None),
+            choose_identity(&stripped, &[], &path, Vec::new(), None),
             Err(ItemError::Item(_))
         ));
         // The intent of the write that never committed names the full key.
@@ -1994,6 +2016,7 @@ mod tests {
         let done = claim(&stripped, "in/other/a.csv", true);
         let chosen = choose_identity(
             &stripped,
+            &[],
             &path,
             vec![done.clone(), open.clone()],
             Some(&HASH),
@@ -2004,7 +2027,7 @@ mod tests {
             ("in/deep/a.csv", open.1.version_id)
         );
         assert_eq!(chosen.intent.map(|(key, _)| key), Some(open.0.clone()));
-        let only = choose_identity(&stripped, &path, vec![done.clone()], Some(&HASH))
+        let only = choose_identity(&stripped, &[], &path, vec![done.clone()], Some(&HASH))
             .ok()
             .flatten();
         assert_eq!(
@@ -2013,24 +2036,33 @@ mod tests {
         );
         let second = claim(&stripped, "in/b.csv", false);
         assert!(
-            choose_identity(&stripped, &path, vec![open.clone(), second], Some(&HASH)).is_err()
+            choose_identity(
+                &stripped,
+                &[],
+                &path,
+                vec![open.clone(), second],
+                Some(&HASH)
+            )
+            .is_err()
         );
         // An intent for another backend says nothing about this file.
         let mut foreign = open;
         foreign.1.backend = BackendRef::Group(Ulid::from_parts(9, 9));
-        assert!(choose_identity(&stripped, &path, vec![foreign], Some(&HASH)).is_err());
+        assert!(choose_identity(&stripped, &[], &path, vec![foreign], Some(&HASH)).is_err());
         // An open write without a record of these bytes proves nothing; it is reported.
         let mut unproven = claim(&stripped, "in/deep/a.csv", false);
         let other = [8u8; 32];
-        assert!(choose_identity(&stripped, &path, vec![unproven.clone()], Some(&other)).is_err());
+        assert!(
+            choose_identity(&stripped, &[], &path, vec![unproven.clone()], Some(&other)).is_err()
+        );
         unproven.1.written = None;
         let claims = vec![unproven, done.clone()];
-        assert!(choose_identity(&stripped, &path, claims, Some(&HASH)).is_err());
+        assert!(choose_identity(&stripped, &[], &path, claims, Some(&HASH)).is_err());
         // A committed write without a record of these bytes never takes over the file.
         let mut sibling = done;
         sibling.1.written = None;
         let named = recovery_rule("{dir}{name}");
-        let chosen = choose_identity(&named, "raw/a", vec![sibling], Some(&HASH));
+        let chosen = choose_identity(&named, &[], "raw/a", vec![sibling], Some(&HASH));
         assert!(matches!(chosen, Ok(None)));
     }
 
