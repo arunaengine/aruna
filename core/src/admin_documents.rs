@@ -370,6 +370,11 @@ pub enum AdminDocumentOperation {
     UserAliasRemoved {
         alias: UserId,
     },
+    /// Replaces the realm default on/off state of optional portal features.
+    #[serde(rename = "RealmConfigPortalFeaturesSet")]
+    ConfigPortalSet {
+        features: BTreeMap<String, bool>,
+    },
 }
 
 impl AdminDocumentOperation {
@@ -560,6 +565,9 @@ mod tests {
             },
             AdminDocumentOperation::ConfigComputeSet {
                 compute: RealmComputeConfig::default(),
+            },
+            AdminDocumentOperation::ConfigPortalSet {
+                features: BTreeMap::from([("compute".to_string(), false)]),
             },
             AdminDocumentOperation::NodePlacementSet {
                 entry: placement_entry(node(1)),

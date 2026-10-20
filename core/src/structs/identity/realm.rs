@@ -215,6 +215,38 @@ pub struct RealmConfigDocument {
     pub compute: crate::structs::placement::compute_config::RealmComputeConfig,
     /// Realm-wide federation settings and the descriptor signed from them.
     pub federation: Option<crate::federation::FederationSettings>,
+    /// Realm default on/off state of optional portal features; a missing name means on.
+    pub portal_features: BTreeMap<String, bool>,
+}
+
+pub const MAX_PORTAL_FEATURES: usize = 64;
+pub const MAX_FEATURE_NAME: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PortalFeatureError {
+    #[error("at most {MAX_PORTAL_FEATURES} portal features are allowed")]
+    TooMany,
+    #[error("portal feature names need 1 to {MAX_FEATURE_NAME} characters of a-z, 0-9 or '-'")]
+    InvalidName,
+}
+
+/// Bounds the realm portal feature defaults that every node replicates.
+pub fn validate_portal_features(
+    features: &BTreeMap<String, bool>,
+) -> Result<(), PortalFeatureError> {
+    if features.len() > MAX_PORTAL_FEATURES {
+        return Err(PortalFeatureError::TooMany);
+    }
+    let valid = |name: &String| {
+        (1..=MAX_FEATURE_NAME).contains(&name.len())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    };
+    if !features.keys().all(valid) {
+        return Err(PortalFeatureError::InvalidName);
+    }
+    Ok(())
 }
 
 /// One realm-wide bearer token revocation. The expiry is the revoked token's
@@ -470,8 +502,9 @@ impl RealmConfigDocument {
         // Exclude request policies because they do not route requests; each receiver enforces its local set,
         // and nodes without a realm-config bucket may never observe them.
         canonical.request_policies.clear();
-        // Exclude federation settings for the same reason: they never route requests.
+        // Exclude federation settings and portal features: they never route requests.
         canonical.federation = None;
+        canonical.portal_features.clear();
         let encoded = postcard::to_allocvec(&canonical)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"aruna-realm-config-v1");
@@ -509,6 +542,7 @@ impl RealmConfigDocument {
             placement_transitions: Vec::new(),
             compute: crate::structs::placement::compute_config::RealmComputeConfig::default(),
             federation: None,
+            portal_features: BTreeMap::new(),
         }
     }
 
@@ -1136,9 +1170,10 @@ mod test {
     };
     use crate::structs::placement::transition::CandidatePlacementMap;
     use crate::structs::storage::node_info::{KIND_LABEL_KEY, NODE_LABEL_KEY};
+    use std::collections::BTreeMap;
     use ulid::Ulid;
 
-    use super::JobFamilyError;
+    use super::{JobFamilyError, PortalFeatureError, validate_portal_features};
 
     #[test]
     pub fn realm_auth_roundtrip() {
@@ -1204,6 +1239,7 @@ mod test {
             placement_activations: Vec::new(),
             placement_transitions: Vec::new(),
             federation: None,
+            portal_features: BTreeMap::new(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -1763,6 +1799,7 @@ mod test {
             placement_activations: Vec::new(),
             placement_transitions: Vec::new(),
             federation: None,
+            portal_features: BTreeMap::new(),
         };
 
         assert_eq!(document.replication_factor_for(other_group_id, None), 3);
@@ -2164,7 +2201,8 @@ mod test {
         let config = RealmConfigDocument::new(RealmId([7u8; 32]), Vec::new(), 2);
         let encoded = config.to_bytes(&actor).expect("config encodes");
         let tail =
-            postcard::to_allocvec(&(&config.compute, &config.federation)).expect("tail encodes");
+            postcard::to_allocvec(&(&config.compute, &config.federation, &config.portal_features))
+                .expect("tail encodes");
         assert!(encoded.ends_with(&tail));
 
         let truncated = &encoded[..encoded.len() - tail.len()];
@@ -2173,6 +2211,24 @@ mod test {
         assert_eq!(
             RealmConfigDocument::from_bytes(&encoded).expect("full record decodes"),
             config
+        );
+    }
+
+    #[test]
+    fn portal_feature_names() {
+        let named = |name: &str| BTreeMap::from([(name.to_string(), false)]);
+        assert_eq!(validate_portal_features(&named("dataset-export2")), Ok(()));
+        assert_eq!(validate_portal_features(&named(&"a".repeat(64))), Ok(()));
+        for name in ["", "Compute", "a_b", "a.b", "ü", &"a".repeat(65)] {
+            assert_eq!(
+                validate_portal_features(&named(name)),
+                Err(PortalFeatureError::InvalidName)
+            );
+        }
+        let many = (0..65).map(|index| (format!("f{index}"), true)).collect();
+        assert_eq!(
+            validate_portal_features(&many),
+            Err(PortalFeatureError::TooMany)
         );
     }
 }

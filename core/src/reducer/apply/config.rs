@@ -43,6 +43,9 @@ impl AdminDocumentState {
                     federation_value(settings),
                 );
             }
+            AdminDocumentOperation::ConfigPortalSet { features } => {
+                self.apply_config_setting(event, CONFIG_PORTAL_PATH, portal_value(features));
+            }
             AdminDocumentOperation::ConfigPoliciesSet { policies } => {
                 self.apply_config_setting(event, CONFIG_POLICIES_PATH, policies_value(policies));
             }
