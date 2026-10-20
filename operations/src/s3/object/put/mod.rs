@@ -118,6 +118,10 @@ pub enum PutObjectState {
     WritePlainRecords,
     /// Reads the import rule that the version's import rows belong to.
     ReadImportRule,
+    /// Records what a write to an import folder will be before its bytes move.
+    WriteIntent,
+    /// Reads the version a history write registers, inside the version transaction.
+    ReadHistory,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -176,6 +180,8 @@ pub enum PutObjectError {
     HeadChanged,
     #[error("the import rule was removed")]
     ImportRemoved,
+    #[error("the version already exists")]
+    VersionExists,
 }
 
 #[derive(Debug, PartialEq)]
@@ -276,6 +282,10 @@ pub struct PutObjectOperation {
     import_rows: Option<plain::ImportRows>,
     /// Whether the import rule exists, read in the current version transaction.
     rule_exists: Option<bool>,
+    /// Registers the version as history: the head and its generation stay as they are.
+    keep_head: bool,
+    /// The plain write that waits for its intent record.
+    pending_write: Option<Effects>,
 }
 
 impl PutObjectOperation {
@@ -324,6 +334,8 @@ impl PutObjectOperation {
             expected_head: None,
             import_rows: None,
             rule_exists: None,
+            keep_head: false,
+            pending_write: None,
         }
     }
 
@@ -360,6 +372,13 @@ impl PutObjectOperation {
     /// Refuses the write with `HeadChanged` unless the key's head is still `head`.
     pub fn with_expected_head(mut self, head: Option<Ulid>) -> Self {
         self.expected_head = Some(head);
+        self
+    }
+
+    /// Registers an older version below the current head, with no replication obligation.
+    /// The head, its generation and the live object count stay as they are.
+    pub fn keep_head(mut self) -> Self {
+        self.keep_head = true;
         self
     }
 
@@ -1099,7 +1118,9 @@ impl PutObjectOperation {
         let head = value.and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok());
         self.was_live = head.as_ref().is_some_and(|version| !version.is_deleted());
         let request = &self.config.request;
+        // A history write leaves the head charged as it is.
         self.released_bytes = head
+            .filter(|_| !self.keep_head)
             .and_then(|version| version.offered_size(&request.bucket, &request.key))
             .unwrap_or(0);
         if self.create_only && self.was_live {
@@ -1112,6 +1133,9 @@ impl PutObjectOperation {
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
         let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
+        if self.keep_head {
+            return self.read_history(version_id);
+        }
         let pointer = match CurrentVersionPointer::next_for(existing, version_id) {
             Ok(pointer) => pointer,
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
@@ -1123,6 +1147,30 @@ impl PutObjectOperation {
 
         self.state = PutObjectState::WriteBlobHead;
         smallvec![effect]
+    }
+
+    /// A concurrent registration of the same version makes this transaction conflict.
+    fn read_history(&mut self, version_id: Ulid) -> Effects {
+        let key = match self.version_key(version_id).to_bytes() {
+            Ok(key) => key.into(),
+            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+        };
+        self.state = PutObjectState::ReadHistory;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn history_read(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => self.write_path_index(),
+            Event::Storage(StorageEvent::ReadResult { .. }) => {
+                self.emit_error(PutObjectError::VersionExists)
+            }
+            _ => self.emit_error(PutObjectError::InvalidOperationState),
+        }
     }
 
     fn location_created(&mut self, event: Event) -> Effects {
@@ -1288,6 +1336,9 @@ impl PutObjectOperation {
 
     fn handle_copy_registered(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
+            if self.keep_head {
+                return self.charge_usage();
+            }
             self.write_obligation()
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
@@ -1321,51 +1372,58 @@ impl PutObjectOperation {
 
     fn obligation_written(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
-            if let Some(txn_id) = self.txn_id {
-                let Some(location) = self.get_output().cloned() else {
-                    return self.emit_error(PutObjectError::MissingOutput);
-                };
-                let size = i128::from(location.blob_size);
-                let group_delta = UsageDelta {
-                    objects: if self.was_live { 0 } else { 1 },
-                    logical_bytes: size + i128::from(self.envelope_bytes),
-                    referenced_bytes: -i128::from(self.released_bytes),
-                    ..Default::default()
-                };
-                let Some(stored) = StoredDelta::for_location(&location, self.new_blob) else {
-                    return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
-                };
-                self.usage_update = Some(UsageCounterUpdate::with_stored(
-                    self.config.group_id,
-                    group_delta,
-                    stored,
-                ));
-
-                // Enforce the hard quota before counters commit; only a
-                // positive logical delta can breach it, so deletes pass.
-                let charged = location.blob_size.saturating_add(self.envelope_bytes);
-                if let Some(ceiling) = self.config.quota_ceiling
-                    && charged > 0
-                {
-                    let mut gate = QuotaGate::new_for_realm(
-                        ceiling,
-                        charged,
-                        self.config.group_id,
-                        self.config.node_id,
-                        self.config.realm_id,
-                    );
-                    self.state = PutObjectState::EnforceQuota;
-                    let effects = gate.start(txn_id);
-                    self.quota_gate = Some(gate);
-                    effects
-                } else {
-                    self.start_usage_update(txn_id)
-                }
-            } else {
-                self.emit_error(PutObjectError::NoTransactionFound)
-            }
+            self.charge_usage()
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
+        }
+    }
+
+    fn charge_usage(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(PutObjectError::NoTransactionFound);
+        };
+        let Some(location) = self.get_output().cloned() else {
+            return self.emit_error(PutObjectError::MissingOutput);
+        };
+        let size = i128::from(location.blob_size);
+        let group_delta = UsageDelta {
+            objects: if self.was_live || self.keep_head {
+                0
+            } else {
+                1
+            },
+            logical_bytes: size + i128::from(self.envelope_bytes),
+            referenced_bytes: -i128::from(self.released_bytes),
+            ..Default::default()
+        };
+        let Some(stored) = StoredDelta::for_location(&location, self.new_blob) else {
+            return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
+        };
+        self.usage_update = Some(UsageCounterUpdate::with_stored(
+            self.config.group_id,
+            group_delta,
+            stored,
+        ));
+
+        // Enforce the hard quota before counters commit; only a
+        // positive logical delta can breach it, so deletes pass.
+        let charged = location.blob_size.saturating_add(self.envelope_bytes);
+        if let Some(ceiling) = self.config.quota_ceiling
+            && charged > 0
+        {
+            let mut gate = QuotaGate::new_for_realm(
+                ceiling,
+                charged,
+                self.config.group_id,
+                self.config.node_id,
+                self.config.realm_id,
+            );
+            self.state = PutObjectState::EnforceQuota;
+            let effects = gate.start(txn_id);
+            self.quota_gate = Some(gate);
+            effects
+        } else {
+            self.start_usage_update(txn_id)
         }
     }
 
@@ -1817,6 +1875,8 @@ impl Operation for PutObjectOperation {
                 _ => self.emit_error(PutObjectError::InvalidOperationState),
             },
             PutObjectState::ReadImportRule => self.import_rule_read(event),
+            PutObjectState::WriteIntent => self.intent_written(event),
+            PutObjectState::ReadHistory => self.history_read(event),
             PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
             PutObjectState::WriteCleanupRow => self.handle_cleanup_row(event),
@@ -2626,7 +2686,7 @@ mod decision_tests {
 
 mod plain;
 
-pub(crate) use plain::{PlainRecord, same_name_path, version_row};
+pub(crate) use plain::{PlainRecord, intent_write, same_name_path, version_row};
 
 #[path = "abe.rs"]
 pub(crate) mod abe;

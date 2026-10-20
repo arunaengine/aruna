@@ -1615,6 +1615,96 @@ fn generation_increments() {
     );
 }
 
+#[test]
+fn history_keeps_head() {
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let mut op = PutObjectOperation::new(PutObjectConfig {
+        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        group_id: Ulid::generate(),
+        realm_id,
+        node_id: iroh::SecretKey::generate().public(),
+        request: PutObjectInput {
+            bucket: "mybucket".to_string(),
+            key: "some-file.txt".to_string(),
+            content_length: None,
+            body: None,
+        },
+        expected_checksums: vec![],
+        checksum_type: None,
+        exists: false,
+        version_source: None,
+        preassigned_version_id: None,
+        quota_ceiling: None,
+        routing: RoutingSnapshot::single(Ulid::generate()),
+    })
+    .keep_head();
+    op.version_id = Some(Ulid::generate());
+    let mut location = test_location(op.config.user_id);
+    location.blob_size = 7;
+    location.hashes.insert(
+        aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+        [3u8; 32].to_vec(),
+    );
+    op.output = Some(Ok(location));
+    op.txn_id = Some(Ulid::generate());
+    let head = CurrentVersionPointer::new_with_generation(Ulid::generate(), 4);
+    op.object_lookup_read(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0].into(),
+        value: Some(head.to_bytes().unwrap().into()),
+    }));
+    let live = BlobVersion::materialized(
+        [9; 32],
+        BackendRef::node_default(),
+        EncodingClass::Raw,
+        std::time::SystemTime::UNIX_EPOCH,
+        op.config.user_id,
+        None,
+    );
+    // The head is not written; the version itself is read inside the transaction.
+    let effects = op.liveness_read(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0].into(),
+        value: Some(live.to_bytes().unwrap().into()),
+    }));
+    let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+        panic!("expected the version read, got {effects:?}")
+    };
+    assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
+    assert_eq!(op.state, PutObjectState::ReadHistory);
+    let effects = op.history_read(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0].into(),
+        value: None,
+    }));
+    let [Effect::Storage(StorageEffect::Write { key_space, .. })] = effects.as_slice() else {
+        panic!("expected the path index, got {effects:?}")
+    };
+    assert_eq!(key_space, PATHS_INDEX_KEYSPACE);
+
+    // No replication obligation, no new live object and the head keeps its charge.
+    op.state = PutObjectState::RegisterManagedCopy;
+    let effects = op.handle_copy_registered(Event::Storage(StorageEvent::WriteResult {
+        key: vec![0].into(),
+    }));
+    let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
+        panic!("expected the counter deltas, got {effects:?}")
+    };
+    let expected = UsageDelta {
+        logical_bytes: 7,
+        ..Default::default()
+    };
+    assert_eq!(deltas[0].1, expected);
+
+    // A version that appeared meanwhile is never overwritten.
+    op.state = PutObjectState::ReadHistory;
+    op.history_read(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0].into(),
+        value: Some(live.to_bytes().unwrap().into()),
+    }));
+    assert!(matches!(
+        op.output,
+        Some(Err(PutObjectError::VersionExists))
+    ));
+}
+
 #[tokio::test]
 pub async fn overwrite_retains_index() {
     let temp_handle = tempdir().unwrap();
