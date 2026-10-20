@@ -17,7 +17,7 @@ use aruna_core::structs::execution::job::{JobError, JobId, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportCheckpoint, BackendImportSpec, ExternalObject, ImportedObject,
-    PathIdentity, WriteIntent, intent_key, intent_prefix, object_key, version_key,
+    PathIdentity, WriteIntent, intent_key, object_key, object_prefix, version_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
@@ -30,6 +30,7 @@ use aruna_core::structs::storage::routing::{RoutingSnapshot, RoutingTarget, Rule
 use aruna_core::types::{Effects, Key, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use ulid::Ulid;
@@ -101,6 +102,8 @@ struct ImportRun {
     routing: RoutingSnapshot,
     quota: Option<u64>,
     gate: Option<GateContext>,
+    /// The write intents of the listed page by path, read in one range.
+    intents: BTreeMap<String, Vec<(Key, WriteIntent)>>,
 }
 
 fn permanent(message: impl Into<String>) -> JobRunOutcome {
@@ -153,13 +156,17 @@ pub async fn run_backend_import(ctx: &JobContext, spec: &BackendImportSpec) -> J
     };
     let mut last = Instant::now();
     loop {
-        let run = match prepare(ctx, spec).await {
+        let mut run = match prepare(ctx, spec).await {
             Ok(run) => run,
             Err(outcome) => return outcome,
         };
         let (objects, next) = match list_page(&ctx.driver, &run, checkpoint.cursor.clone()).await {
             Ok(page) => page,
             Err(error) => return retryable(error),
+        };
+        run.intents = match page_intents(&ctx.driver, &run.rule, &objects).await {
+            Ok(intents) => intents,
+            Err(ItemError::Item(error) | ItemError::System(error)) => return retryable(error),
         };
         for object in objects {
             if ctx.cancel.is_cancelled() {
@@ -278,6 +285,7 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
         routing,
         quota,
         gate,
+        intents: BTreeMap::new(),
     })
 }
 
@@ -537,13 +545,13 @@ fn needs_lookup(
     rule: &BackendImport,
     object: &ExternalObject,
     row: Option<&ImportedObject>,
+    intents: bool,
 ) -> bool {
     let Some(row) = row else {
         return true;
     };
-    let changed = !row.matches(object) && trusted_listing(Some(row), object).is_none();
     let decoded = rule.decode_path(&object.key) != PathIdentity::Unmatched;
-    changed || (row.key.is_none() && decoded)
+    intents || (row.key.is_none() && decoded)
 }
 
 /// Registers a file whose version never committed as the key and version its write intent or
@@ -558,10 +566,11 @@ async fn recover(
     resolved: &ResolvedBackend,
 ) -> Result<Option<Outcome>, ItemError> {
     let rule = &run.rule;
-    if !needs_lookup(rule, object, row) {
+    let intents = run.intents.get(&object.key).map_or(&[][..], Vec::as_slice);
+    if !needs_lookup(rule, object, row, !intents.is_empty()) {
         return Ok(None);
     }
-    let claims = read_claims(&ctx.driver, rule, &object.key).await?;
+    let claims = read_claims(&ctx.driver, rule, intents).await?;
     // A row of Aruna's own write names it; only the open intent of a later write overrides it.
     let keyed = row.is_some_and(|row| row.key.is_some());
     if keyed && claims.iter().all(|(.., committed)| *committed) {
@@ -712,17 +721,76 @@ async fn read_head(
 async fn read_claims(
     context: &DriverContext,
     rule: &BackendImport,
-    path: &str,
+    intents: &[(Key, WriteIntent)],
 ) -> Result<Vec<Claim>, ItemError> {
-    let prefix = intent_prefix(rule.import_id, path);
     let mut claims = Vec::new();
-    for (key, value) in iterate(context, IMPORT_INTENT_KEYSPACE, prefix).await? {
-        let intent = WriteIntent::from_bytes(&value);
-        let intent = intent.map_err(|error| ItemError::System(error.to_string()))?;
+    for (key, intent) in intents {
         let found = exact_version(context, &rule.bucket, &intent.key, intent.version_id).await?;
-        claims.push((key, intent, found.1 != Exact::Absent));
+        claims.push((key.clone(), intent.clone(), found.1 != Exact::Absent));
     }
     Ok(claims)
+}
+
+/// The write intents of every path from the first to the last object of a listing page, read
+/// as one range, so a page of known files costs one read however many objects it has.
+async fn page_intents(
+    context: &DriverContext,
+    rule: &BackendImport,
+    objects: &[ExternalObject],
+) -> Result<BTreeMap<String, Vec<(Key, WriteIntent)>>, ItemError> {
+    let mut intents: BTreeMap<String, Vec<(Key, WriteIntent)>> = BTreeMap::new();
+    let paths = objects.iter().map(|object| object.key.as_str());
+    let (Some(first), Some(last)) = (paths.clone().min(), paths.max()) else {
+        return Ok(intents);
+    };
+    let mut start = IterStart::At(object_key(rule.import_id, first));
+    loop {
+        let effect = StorageEffect::Iter {
+            key_space: IMPORT_INTENT_KEYSPACE.to_string(),
+            prefix: Some(object_prefix(rule.import_id)),
+            start: Some(start),
+            limit: LIST_PAGE,
+            txn_id: None,
+        };
+        let (values, next) = match context.storage_handle.send_storage_effect(effect).await {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(ItemError::System(error.to_string()));
+            }
+            other => return Err(ItemError::System(format!("unexpected answer {other:?}"))),
+        };
+        for (key, value) in values {
+            let Some(path) = intent_path(&key) else {
+                return Err(ItemError::System(
+                    "a malformed write intent key".to_string(),
+                ));
+            };
+            if path > last {
+                return Ok(intents);
+            }
+            let intent = WriteIntent::from_bytes(&value);
+            let intent = intent.map_err(|error| ItemError::System(error.to_string()))?;
+            intents
+                .entry(path.to_string())
+                .or_default()
+                .push((key, intent));
+        }
+        match next {
+            Some(next) => start = IterStart::After(next),
+            None => return Ok(intents),
+        }
+    }
+}
+
+/// The path of an intent key: the import id, the path, a zero byte and the version id.
+fn intent_path(key: &[u8]) -> Option<&str> {
+    let end = key.len().checked_sub(17)?;
+    let path = key.get(16..end)?;
+    (key[end] == 0).then_some(())?;
+    std::str::from_utf8(path).ok()
 }
 
 /// Covers the literal-name head `version_id` of `literal` with a delete marker. The normal delete
@@ -1791,28 +1859,26 @@ mod tests {
     fn looks_up_intents() {
         let rule = recovery_rule("{dir}{id}_{name}");
         let listed = object("e1");
-        assert!(needs_lookup(&rule, &listed, None));
-        // An unchanged known file takes the fast path without any intent read.
+        assert!(needs_lookup(&rule, &listed, None, false));
+        // A known file without intents takes the fast path, changed or not.
         let literal = row(Ulid::nil(), "e1");
-        assert!(!needs_lookup(&rule, &listed, Some(&literal)));
+        assert!(!needs_lookup(&rule, &listed, Some(&literal), false));
         let keyed = ImportedObject {
             key: Some("in/a.csv".to_string()),
             ..literal.clone()
         };
-        assert!(!needs_lookup(&rule, &listed, Some(&keyed)));
-        let unlisted = ImportedObject::written(Ulid::nil(), "in/a.csv".to_string(), 4, None);
-        assert!(!needs_lookup(&rule, &listed, Some(&unlisted)));
-        // A file that changed under its row may be a later write that never committed.
-        assert!(needs_lookup(&rule, &object("e2"), Some(&keyed)));
-        assert!(needs_lookup(&rule, &object("e2"), Some(&literal)));
-        // A literal import whose name encodes a version is checked for its intent.
+        assert!(!needs_lookup(&rule, &object("e2"), Some(&keyed), false));
+        // An intent at the path is checked before any skip, also for an unchanged file.
+        assert!(needs_lookup(&rule, &listed, Some(&keyed), true));
+        assert!(needs_lookup(&rule, &listed, Some(&literal), true));
+        // A literal import whose name encodes a version is checked as well.
         let id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         let named = ExternalObject {
             key: format!("raw/{id}_a.csv"),
             ..object("e1")
         };
-        assert!(needs_lookup(&rule, &named, Some(&literal)));
-        assert!(!needs_lookup(&rule, &named, Some(&keyed)));
+        assert!(needs_lookup(&rule, &named, Some(&literal), false));
+        assert!(!needs_lookup(&rule, &named, Some(&keyed), false));
     }
 
     #[test]
@@ -1913,7 +1979,25 @@ mod tests {
         );
         assert!(write.await.is_ok());
 
-        let mut claims = read_claims(&context, &rule, "raw/a.csv")
+        // One range read covers the page; a path past its last object is not read.
+        let far = intent_key(rule.import_id, "raw/z.csv", Ulid::generate());
+        let value = open.1.to_bytes().unwrap();
+        assert!(
+            write_value(&context, IMPORT_INTENT_KEYSPACE, far, value)
+                .await
+                .is_ok()
+        );
+        let page = [
+            object("e1"),
+            ExternalObject {
+                key: "raw/b.csv".to_string(),
+                ..object("e1")
+            },
+        ];
+        let intents = page_intents(&context, &rule, &page).await.ok().unwrap();
+        let paths: Vec<&str> = intents.keys().map(String::as_str).collect();
+        assert_eq!(paths, ["raw/a.csv", "raw/a.csv2"]);
+        let mut claims = read_claims(&context, &rule, &intents["raw/a.csv"])
             .await
             .ok()
             .unwrap();
