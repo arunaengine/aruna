@@ -153,14 +153,14 @@ impl BackendImport {
         }
     }
 
-    /// Like [`Self::decode_path`]; a path the current pattern does not match is read with the
-    /// rule's `earlier` patterns, and different readings are ambiguous.
+    /// Like [`Self::decode_path`], also with the rule's `earlier` patterns; different readings
+    /// of the current and earlier patterns are ambiguous.
     pub fn decode_any(&self, path: &str, earlier: &[String]) -> PathIdentity {
+        let mut found = Vec::new();
         let current = self.decode_path(path);
         if current != PathIdentity::Unmatched {
-            return current;
+            found.push(current);
         }
-        let mut found = Vec::new();
         for pattern in earlier {
             let rule = BackendImport {
                 write_pattern: pattern.clone(),
@@ -773,7 +773,7 @@ mod tests {
             name: "a.csv".to_string(),
             id,
         };
-        // A file of the replaced pattern keeps its identity; the current pattern comes first.
+        // A file of the replaced pattern keeps its identity.
         let current = rule(DEFAULT_PATTERN);
         let old = format!("raw/{id}_a.csv");
         assert_eq!(current.decode_path(&old), PathIdentity::Unmatched);
@@ -788,6 +788,12 @@ mod tests {
         ];
         assert_eq!(
             rule(PLAIN_PATTERN).decode_any(&path, &both),
+            PathIdentity::Ambiguous
+        );
+        // The current pattern reads the path as another key and version: no guess.
+        let current = rule("{dir}{name}_{id}");
+        assert_eq!(
+            current.decode_any(&path, &both[..1]),
             PathIdentity::Ambiguous
         );
     }
