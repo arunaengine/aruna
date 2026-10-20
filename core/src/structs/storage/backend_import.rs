@@ -128,6 +128,8 @@ impl BackendImport {
         let mut decoded: Vec<PathIdentity> = found
             .into_iter()
             .filter(|(dir, ..)| dir.is_empty() || plain_safe(&dir[..dir.len() - 1]))
+            // A move tags a taken name with an attempt id, which is no version id.
+            .filter(|(_, name, _)| !ends_in_tag(name))
             .filter_map(|(dir, name, id)| {
                 let key = has_dir.then(|| format!("{}{dir}{name}", self.key_prefix));
                 let expanded = match &key {
@@ -314,6 +316,12 @@ fn plain_safe(path: &str) -> bool {
 /// Where a same-name write of version `id` goes when a file without versions holds `path`.
 pub fn tagged_path(path: &str, id: Ulid) -> String {
     format!("{path}~{id}")
+}
+
+/// Whether `name` ends in a `~<id>` tag of [`tagged_path`].
+fn ends_in_tag(name: &str) -> bool {
+    name.rsplit_once('~')
+        .is_some_and(|(_, tag)| Ulid::from_string(tag).is_ok_and(|id| id.to_string() == tag))
 }
 
 /// Rules are keyed by group first, so one group's rules are one prefix scan.
@@ -660,8 +668,20 @@ mod tests {
         );
         let mut moved = rule(DEFAULT_PATTERN);
         moved.write_backend_id = Some(Ulid::from_parts(9, 9));
-        let path = format!("raw/{id}_a.csv");
+        let path = format!("raw/a.csv~{id}");
         assert_eq!(moved.decode_path(&path), PathIdentity::Unmatched);
+        // A moved copy of a taken name carries an attempt id after the version id.
+        let other = Ulid::from_parts(3, 4);
+        for (pattern, path) in [
+            (DEFAULT_PATTERN, format!("raw/a.csv~{other}~{id}")),
+            ("{dir}{id}_{name}", format!("raw/{id}_a.csv~{other}")),
+        ] {
+            assert_eq!(
+                rule(pattern).decode_path(&path),
+                PathIdentity::Unmatched,
+                "{path}"
+            );
+        }
         // A placeholder used twice is not decoded.
         let path = format!("raw/a_{id}_a");
         let twice = rule("{name}_{id}_{name}").decode_path(&path);
