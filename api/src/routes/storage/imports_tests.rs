@@ -84,7 +84,10 @@ async fn requires_group_admin() {
     assert!(matches!(created, Err(ServerError::Forbidden)));
     let read = get_import(State(test.state.clone()), other(), Path(rule.clone())).await;
     assert!(matches!(read, Err(ServerError::Forbidden)));
-    let body = Json(UpdateImportRequest { schedule: None });
+    let body = Json(UpdateImportRequest {
+        schedule: None,
+        write_pattern: None,
+    });
     let updated = update_import(State(test.state.clone()), other(), Path(rule.clone()), body).await;
     assert!(matches!(updated, Err(ServerError::Forbidden)));
     let deleted = delete_import(State(test.state.clone()), other(), Path(rule.clone())).await;
@@ -156,14 +159,32 @@ async fn manages_rule() {
     );
 
     let rule = || Path((group.clone(), created.import_id.clone()));
-    let body = Json(UpdateImportRequest {
-        schedule: Some("0 3 * * *".to_string()),
-    });
-    let Json(updated) = update_import(State(test.state.clone()), auth(), rule(), body)
+    let body = |write_pattern: Option<&str>| {
+        Json(UpdateImportRequest {
+            schedule: Some("0 3 * * *".to_string()),
+            write_pattern: write_pattern.map(str::to_string),
+        })
+    };
+    let Json(updated) = update_import(State(test.state.clone()), auth(), rule(), body(None))
         .await
         .unwrap();
     assert_eq!(updated.schedule.as_deref(), Some("0 3 * * *"));
     assert!(updated.next_run_at.is_some());
+    // The pattern changes in place, under the same rule id.
+    let prefix = Some("{dir}{id}_{name}");
+    let Json(updated) = update_import(State(test.state.clone()), auth(), rule(), body(prefix))
+        .await
+        .unwrap();
+    assert_eq!(updated.import_id, created.import_id);
+    assert_eq!(updated.write_pattern, "{dir}{id}_{name}");
+    let bad = update_import(
+        State(test.state.clone()),
+        auth(),
+        rule(),
+        body(Some("{id}")),
+    )
+    .await;
+    assert!(matches!(bad, Err(ServerError::BadRequestMessage(_))));
 
     let (status, Json(run)) = run_import(State(test.state.clone()), auth(), rule())
         .await
@@ -173,6 +194,12 @@ async fn manages_rule() {
     assert!(
         matches!(again, Err(ServerError::Conflict(_))),
         "the first run is still queued"
+    );
+    let suffix = Some("{dir}{name}~{id}");
+    let changed = update_import(State(test.state.clone()), auth(), rule(), body(suffix)).await;
+    assert!(
+        matches!(changed, Err(ServerError::Conflict(_))),
+        "no pattern change while a run is queued"
     );
     let Json(read) = get_import(State(test.state.clone()), auth(), rule())
         .await

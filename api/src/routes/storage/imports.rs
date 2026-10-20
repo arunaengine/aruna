@@ -74,6 +74,10 @@ pub struct UpdateImportRequest {
     /// Five-field cron expression in UTC; `null` or omitted stops scheduled runs.
     #[serde(default)]
     pub schedule: Option<String>,
+    /// Path of later uploads below the write folder, as in the create request; omitted keeps
+    /// the current pattern.
+    #[serde(default)]
+    pub write_pattern: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -480,22 +484,29 @@ pub async fn get_import(
     put,
     path = "/data/groups/{group_id}/storage/imports/{import_id}",
     tag = "data/storage",
-    summary = "Change a backend import's schedule",
-    description = r#"Replaces the schedule of one backend import rule; the folders and the bucket stay as they are.
+    summary = "Change a backend import's schedule or write pattern",
+    description = r#"Replaces the schedule of one backend import rule and, when given, its write pattern; the rule id, the folders and the bucket stay as they are.
 
 **Authentication**: realm bearer token with WRITE on the group's admin path.
 
 **Behavior**
 - `null` or an omitted `schedule` stops scheduled runs; runs on request keep working.
-- A running import is not affected."#,
+- A running import is not affected.
+- A new `write_pattern` names only later uploads. Files already in the backend keep their names,
+  and every stored version still reads its own file.
+- A new pattern is refused with 409 while a run of the rule has not finished.
+
+**Limits**
+- `write_pattern` must contain `{name}` and give a relative path.
+- A rule that links a whole provider bucket keeps `{dir}{name}`, and no rule turns into one."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
         ("import_id" = String, Path, description = "Rule to change, as a 26-character ULID")
     ),
     request_body(
         content = UpdateImportRequest,
-        description = "The new schedule, or `null` to stop scheduled runs",
-        example = json!({"schedule": "*/30 * * * *"})
+        description = "The new schedule, or `null` to stop scheduled runs, and an optional pattern",
+        example = json!({"schedule": "*/30 * * * *", "write_pattern": "{dir}{name}~{id}"})
     ),
     responses(
         (
@@ -516,11 +527,11 @@ pub async fn get_import(
                 "updated_at": "2026-10-14T09:40:00+00:00"
             })
         ),
-        (status = 400, description = "Invalid ids or schedule", body = ErrorResponse),
+        (status = 400, description = "Invalid ids, schedule or pattern", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
-        (status = 409, description = "The group is being deleted", body = ErrorResponse)
+        (status = 409, description = "The group is being deleted, or a run has not finished", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -533,7 +544,10 @@ pub async fn update_import(
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
     let import_id = Ulid::from_str(&import_id).map_err(|_| ServerError::BadRequest)?;
     let scheduled = request.schedule.is_some();
-    let change = ImportChange::Schedule(request.schedule);
+    let change = ImportChange {
+        schedule: request.schedule,
+        write_pattern: request.write_pattern,
+    };
     let operation = ChangeImportOperation::new(group_id, import_id, change, SystemTime::now());
     let rule = drive(operation, &state.get_ctx())
         .await
