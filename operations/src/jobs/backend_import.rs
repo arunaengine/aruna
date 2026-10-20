@@ -8,8 +8,8 @@ use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, DELETE_AUDIT_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
-    JOB_STATE_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, DELETE_AUDIT_KEYSPACE, IMPORT_INTENT_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::HASH_MD5;
@@ -813,6 +813,21 @@ fn etag_differs(etag: Option<&str>, md5: Option<&[u8]>) -> bool {
     etag.len() == 32
         && etag.bytes().all(|byte| byte.is_ascii_hexdigit())
         && !etag.eq_ignore_ascii_case(&hex::encode(md5))
+}
+
+/// The BLAKE3 hash of the committed version of `key` in `bucket`, if it still exists.
+async fn committed_hash(
+    context: &DriverContext,
+    bucket: &str,
+    key: &str,
+    version_id: Ulid,
+) -> Result<Option<[u8; 32]>, ItemError> {
+    let version_key = VersionKey::new(bucket, key, version_id)
+        .to_bytes()
+        .map_err(|error| ItemError::Item(error.to_string()))?;
+    let [version] = read_values(context, [(BLOB_VERSIONS_KEYSPACE, version_key.into())]).await?;
+    let version = parse(version, BlobVersion::from_bytes)?;
+    Ok(version.and_then(|version| version.blob_hash().copied()))
 }
 
 async fn hash_object(
