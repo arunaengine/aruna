@@ -7,6 +7,7 @@ use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::execution::job::JobId;
 use crate::structs::identity::auth::AuthContext;
+use crate::structs::storage::blob::BackendRef;
 use crate::structs::storage::group_backend::path_bucket;
 use crate::types::{GroupId, Key};
 use serde::{Deserialize, Serialize};
@@ -109,12 +110,162 @@ impl BackendImport {
         plain_safe(&path).then_some(path)
     }
 
+    /// What a backend path of this rule's folder says about the write that made it. Only a
+    /// unique decoding that expands back to exactly `path` counts.
+    pub fn decode_path(&self, path: &str) -> PathIdentity {
+        let tokens = pattern_tokens(&self.write_pattern);
+        let rest = path.strip_prefix(self.write_folder());
+        let (Some(tokens), Some(rest)) = (tokens, rest) else {
+            return PathIdentity::Unmatched;
+        };
+        let has_dir = tokens.contains(&Token::Dir);
+        if self.write_backend() != self.backend_id || !tokens.contains(&Token::Id) {
+            return PathIdentity::Unmatched;
+        }
+        let mut found = Vec::new();
+        match_tokens(&tokens, rest, Parts::default(), &mut found);
+        let mut decoded: Vec<PathIdentity> = found
+            .into_iter()
+            .filter(|(dir, ..)| dir.is_empty() || plain_safe(&dir[..dir.len() - 1]))
+            .filter_map(|(dir, name, id)| {
+                let key = has_dir.then(|| format!("{}{dir}{name}", self.key_prefix));
+                let expanded = match &key {
+                    Some(key) => self.plain_path(key, id),
+                    None => expand_pattern(&self.write_pattern, "", name, id)
+                        .map(|expanded| format!("{}{expanded}", self.write_folder()))
+                        .filter(|expanded| plain_safe(expanded)),
+                };
+                (expanded.as_deref() == Some(path)).then(|| PathIdentity::Decoded {
+                    key,
+                    name: name.to_string(),
+                    id,
+                })
+            })
+            .collect();
+        decoded.dedup();
+        match decoded.len() {
+            0 => PathIdentity::Unmatched,
+            1 => decoded.remove(0),
+            _ => PathIdentity::Ambiguous,
+        }
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// The identity a backend path encodes under its rule's write pattern.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PathIdentity {
+    /// The path is no write of the pattern, or the pattern encodes no version id.
+    Unmatched,
+    /// More than one key or version id expands to the path.
+    Ambiguous,
+    /// `key` is `None` when the pattern drops the folder of the key, which the path cannot tell.
+    Decoded {
+        key: Option<String>,
+        name: String,
+        id: Ulid,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Token<'a> {
+    Text(&'a str),
+    Dir,
+    Name,
+    Id,
+}
+
+/// The parts of a pattern; `None` for an invalid brace or a placeholder used twice.
+fn pattern_tokens(pattern: &str) -> Option<Vec<Token<'_>>> {
+    let mut tokens = Vec::new();
+    let mut rest = pattern;
+    while let Some(start) = rest.find(['{', '}']) {
+        if start > 0 {
+            tokens.push(Token::Text(&rest[..start]));
+        }
+        let tail = &rest[start..];
+        let (token, length) = if tail.starts_with("{dir}") {
+            (Token::Dir, 5)
+        } else if tail.starts_with("{name}") {
+            (Token::Name, 6)
+        } else if tail.starts_with("{id}") {
+            (Token::Id, 4)
+        } else {
+            return None;
+        };
+        if tokens.contains(&token) {
+            return None;
+        }
+        tokens.push(token);
+        rest = &tail[length..];
+    }
+    if !rest.is_empty() {
+        tokens.push(Token::Text(rest));
+    }
+    Some(tokens)
+}
+
+/// The folder, name and id one match has taken so far.
+#[derive(Clone, Copy, Default)]
+struct Parts<'a> {
+    dir: &'a str,
+    name: &'a str,
+    id: Option<Ulid>,
+}
+
+/// Collects every way `path` splits into the tokens. A folder is empty or ends in `/`, a name
+/// is a non-empty file name and an id is a ulid in its canonical form.
+fn match_tokens<'a>(
+    tokens: &[Token<'_>],
+    path: &'a str,
+    parts: Parts<'a>,
+    found: &mut Vec<(&'a str, &'a str, Ulid)>,
+) {
+    let Some((token, rest)) = tokens.split_first() else {
+        if let (true, Some(id)) = (path.is_empty(), parts.id) {
+            found.push((parts.dir, parts.name, id));
+        }
+        return;
+    };
+    match token {
+        Token::Text(text) => {
+            if let Some(tail) = path.strip_prefix(text) {
+                match_tokens(rest, tail, parts, found);
+            }
+        }
+        Token::Id => {
+            let Some((text, tail)) = path.split_at_checked(26) else {
+                return;
+            };
+            let id = Ulid::from_string(text)
+                .ok()
+                .filter(|id| id.to_string() == text);
+            if id.is_some() {
+                match_tokens(rest, tail, Parts { id, ..parts }, found);
+            }
+        }
+        Token::Dir => {
+            let ends = std::iter::once(0).chain(path.match_indices('/').map(|(at, _)| at + 1));
+            for end in ends {
+                let dir = &path[..end];
+                match_tokens(rest, &path[end..], Parts { dir, ..parts }, found);
+            }
+        }
+        Token::Name => {
+            let file = path.find('/').unwrap_or(path.len());
+            let ends = path[..file].char_indices().map(|(at, _)| at).skip(1);
+            for end in ends.chain([file]).filter(|end| *end > 0) {
+                let name = &path[..end];
+                match_tokens(rest, &path[end..], Parts { name, ..parts }, found);
+            }
+        }
     }
 }
 
@@ -177,6 +328,20 @@ pub fn object_key(import_id: Ulid, backend_key: &str) -> Key {
     key.into()
 }
 
+/// Each write keeps its own intent; a path never holds a zero byte, so the prefix is exact.
+pub fn intent_key(import_id: Ulid, backend_key: &str, version_id: Ulid) -> Key {
+    let mut key = intent_prefix(import_id, backend_key).to_vec();
+    key.extend_from_slice(&version_id.to_bytes());
+    key.into()
+}
+
+/// The intents of every write to one backend key.
+pub fn intent_prefix(import_id: Ulid, backend_key: &str) -> Key {
+    let mut key = object_key(import_id, backend_key).to_vec();
+    key.push(0);
+    key.into()
+}
+
 /// Backend versions are keyed by the ulid of the location they belong to.
 pub fn version_key(location: Ulid) -> Key {
     location.to_bytes().to_vec().into()
@@ -213,6 +378,26 @@ impl ProviderCleanup {
             true => Ok(None),
             false => Ok(Some(postcard::from_bytes(value)?)),
         }
+    }
+}
+
+/// The identity a write to an import folder gets, stored before its bytes reach the path. It
+/// outlives a version that never commits, so a later import registers the file as that version.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WriteIntent {
+    pub key: String,
+    pub version_id: Ulid,
+    pub backend: BackendRef,
+    pub created_by: UserId,
+}
+
+impl WriteIntent {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
 
@@ -424,6 +609,64 @@ mod tests {
         );
         assert!(!rule(DEFAULT_PATTERN).same_name());
         assert!(moved.same_name());
+    }
+
+    #[test]
+    fn decodes_written_paths() {
+        let id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let decoded = |key: Option<&str>, name: &str| PathIdentity::Decoded {
+            key: key.map(str::to_string),
+            name: name.to_string(),
+            id,
+        };
+        for pattern in [DEFAULT_PATTERN, "{dir}{name}~{id}", "{dir}{id}/{name}"] {
+            let rule = rule(pattern);
+            for key in ["imported/a.csv", "imported/x/y/a_b.csv~1"] {
+                let path = rule.plain_path(key, id).unwrap();
+                let name = key.rsplit('/').next().unwrap();
+                assert_eq!(rule.decode_path(&path), decoded(Some(key), name), "{path}");
+            }
+        }
+        // Without `{dir}` the path keeps only the name, never the folder of the key.
+        let path = format!("raw/{id}_a.csv");
+        assert_eq!(
+            rule("{id}_{name}").decode_path(&path),
+            decoded(None, "a.csv")
+        );
+        let unmatched = [
+            "raw/a.csv".to_string(),
+            "other/x.csv".to_string(),
+            format!("raw/{}_a.csv", id.to_string().to_lowercase()),
+            format!("raw/x//{id}_a.csv"),
+            format!("raw/{id}_"),
+        ];
+        for path in unmatched {
+            let identity = rule(DEFAULT_PATTERN).decode_path(&path);
+            assert_eq!(identity, PathIdentity::Unmatched, "{path}");
+        }
+        // A pattern without `{id}` names no version, and a write elsewhere is not this folder.
+        let same = format!("raw/a.csv~{id}");
+        assert_eq!(
+            rule(PLAIN_PATTERN).decode_path(&same),
+            PathIdentity::Unmatched
+        );
+        let mut moved = rule(DEFAULT_PATTERN);
+        moved.write_backend_id = Some(Ulid::from_parts(9, 9));
+        let path = format!("raw/{id}_a.csv");
+        assert_eq!(moved.decode_path(&path), PathIdentity::Unmatched);
+        // A placeholder used twice is not decoded.
+        let path = format!("raw/a_{id}_a");
+        let twice = rule("{name}_{id}_{name}").decode_path(&path);
+        assert_eq!(twice, PathIdentity::Unmatched);
+        // An id-like name stays part of the name.
+        let other = Ulid::from_parts(3, 4);
+        let path = format!("raw/{other}_{id}");
+        let identity = rule("{name}_{id}").decode_path(&path);
+        assert_eq!(identity, decoded(None, &other.to_string()));
+        // Two keys expand to this path, so it names no single key.
+        let path = format!("raw/axxb/{id}");
+        let identity = rule("{name}x{dir}{id}").decode_path(&path);
+        assert_eq!(identity, PathIdentity::Ambiguous);
     }
 
     #[test]

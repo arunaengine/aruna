@@ -223,6 +223,8 @@ pub const BACKEND_IMPORT_KEYSPACE: &str = "backend_imports";
 pub const IMPORTED_OBJECT_KEYSPACE: &str = "backend_import_objects";
 /// The backend version id of bytes at a path of a tenant's folders, keyed by location ulid.
 pub const BACKEND_VERSION_KEYSPACE: &str = "backend_versions";
+/// What a write to an import folder will be, recorded before its bytes, keyed like its row.
+pub const IMPORT_INTENT_KEYSPACE: &str = "backend_import_intents";
 /// Removed import rules whose object rows are not all deleted yet, keyed by import id.
 pub const IMPORT_REMOVAL_KEYSPACE: &str = "backend_import_removals";
 
@@ -487,6 +489,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BACKEND_IMPORT_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE,
     BACKEND_VERSION_KEYSPACE,
+    IMPORT_INTENT_KEYSPACE,
     IMPORT_REMOVAL_KEYSPACE,
     OFFERED_DIRECTORY_KEYSPACE,
     DEVICE_INTAKE_KEYSPACE,
