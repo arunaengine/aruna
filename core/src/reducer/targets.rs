@@ -278,6 +278,18 @@ impl AdminDocumentState {
             .and_then(|value| serde_json::from_str(value).ok())
     }
 
+    /// The realm portal feature defaults the events agree on, if any.
+    pub fn materialized_realm_portal(&self) -> Option<BTreeMap<String, bool>> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(CONFIG_PORTAL_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| serde_json::from_str(value).ok())
+    }
+
     pub fn materialized_realm_quota(&self) -> Option<QuotaConfig> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return None;

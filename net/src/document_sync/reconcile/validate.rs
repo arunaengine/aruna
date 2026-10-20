@@ -1460,6 +1460,13 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 return Err(format!("realm federation settings rejected: {error}"));
             }
         }
+        AdminDocumentOperation::ConfigPortalSet { features } => {
+            if let Err(error) =
+                aruna_core::structs::identity::realm::validate_portal_features(features)
+            {
+                return Err(format!("realm portal features rejected: {error}"));
+            }
+        }
         AdminDocumentOperation::CandidateMapPublished { map } => {
             let mut seen = std::collections::BTreeSet::new();
             if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
@@ -1676,6 +1683,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::TransitionDrainReported { .. }
         | AdminDocumentOperation::ConfigComputeSet { .. }
         | AdminDocumentOperation::ConfigFederationSet { .. }
+        | AdminDocumentOperation::ConfigPortalSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
     };
 

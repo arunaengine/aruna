@@ -814,6 +814,7 @@ fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
             | AdminDocumentOperation::TransitionDrainReported { .. }
             | AdminDocumentOperation::ConfigComputeSet { .. }
             | AdminDocumentOperation::ConfigFederationSet { .. }
+            | AdminDocumentOperation::ConfigPortalSet { .. }
             | AdminDocumentOperation::ConfigTokenRevoked { .. }
     )
 }
