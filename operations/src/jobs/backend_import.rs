@@ -1548,7 +1548,7 @@ mod tests {
             Some(Ulid::nil()),
             2_000,
         );
-        assert_eq!(trail(&[other.clone()]), Trail::Touched);
+        assert_eq!(trail(std::slice::from_ref(&other)), Trail::Touched);
         let exact = audit(BlobAuditKind::DeleteVersion, "in/a.csv", Some(id), 2_000);
         assert_eq!(trail(&[other, exact]), Trail::Removed);
         // A purge removes what existed when it ran, not what was written after it.
@@ -1556,7 +1556,7 @@ mod tests {
         assert_eq!(trail(&[purge(2_000)]), Trail::Removed);
         assert_eq!(trail(&[purge(500)]), Trail::Clean);
         let bucket = audit(BlobAuditKind::Purge(BlobPurgeKind::Bucket), "", None, 2_000);
-        assert_eq!(trail(&[bucket.clone()]), Trail::Removed);
+        assert_eq!(trail(std::slice::from_ref(&bucket)), Trail::Removed);
         let elsewhere = BlobAuditRecord {
             bucket: "other".to_string(),
             ..bucket
