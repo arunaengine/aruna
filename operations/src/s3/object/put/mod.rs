@@ -2702,6 +2702,7 @@ mod decision_tests {
 
 mod plain;
 mod trail;
+pub(crate) use trail::Trail;
 
 pub(crate) use plain::{PlainRecord, intent_write, same_name_path, version_row};
 

@@ -8,7 +8,8 @@ use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, DELETE_AUDIT_KEYSPACE, IMPORT_INTENT_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::HASH_MD5;
@@ -22,6 +23,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
     ResolvedBackend, VersionKey, bucket_permission_path, ensure_confined_path,
 };
+use aruna_core::structs::storage::delete_audit::BlobAuditRecord;
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{RoutingSnapshot, RoutingTarget, RuleSource};
@@ -42,7 +44,9 @@ use crate::placement::policy::{GateContext, PolicyGateError};
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::complete_put;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::object::put::{
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, Trail,
+};
 use crate::s3::purge_fence::PurgeFenceError;
 
 const LIST_PAGE: usize = 500;
@@ -96,6 +100,8 @@ struct ImportRun {
     routing: RoutingSnapshot,
     quota: Option<u64>,
     gate: Option<GateContext>,
+    /// The group's delete trail, read on first use.
+    trail: tokio::sync::OnceCell<Vec<BlobAuditRecord>>,
 }
 
 fn permanent(message: impl Into<String>) -> JobRunOutcome {
@@ -273,6 +279,7 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
         routing,
         quota,
         gate,
+        trail: Default::default(),
     })
 }
 
@@ -384,6 +391,15 @@ async fn import_object(
         key: row.as_ref().and_then(|row| row.key.clone()),
         ..ImportedObject::new(version_id, object)
     };
+    // Aruna's own write that lost its head returns only if no delete removed it on purpose.
+    let keyed = row
+        .as_ref()
+        .filter(|row| row.key.is_some() && head.is_none());
+    if let Some(row) = keyed
+        && deleted_on_purpose(&ctx.driver, run, &key, row.version_id).await?
+    {
+        return Ok(Outcome::Skipped);
+    }
     let (location, version) = hash_object(ctx, spec, resolved, &object.key).await?;
     if location.blob_size != object.size {
         return Err(ItemError::Item(
@@ -396,7 +412,7 @@ async fn import_object(
         keep_head: false,
         guards: Vec::new(),
         retired: None,
-        trail: None,
+        trail: keyed.map(|row| row.version_id),
     };
     let put = put_version(
         ctx,
@@ -410,7 +426,9 @@ async fn import_object(
     match put.await {
         Ok(()) => {}
         // An Aruna write or delete marker came first and keeps the key.
-        Err(PutObjectError::HeadChanged) => return Ok(Outcome::Skipped),
+        Err(PutObjectError::HeadChanged | PutObjectError::HistoryDeleted) => {
+            return Ok(Outcome::Skipped);
+        }
         Err(error) => return Err(put_failure(error)),
     }
     // As for any put, a failed queue write after the commit leaves the obligation for repair.
@@ -489,6 +507,21 @@ fn item(message: impl Into<String>) -> ItemError {
     ItemError::Item(message.into())
 }
 
+/// Whether a file may be an uncommitted write, so its intents are read. A new file, a literal
+/// import whose name encodes a version and a changed file are; an unchanged known file is not.
+fn needs_lookup(
+    rule: &BackendImport,
+    object: &ExternalObject,
+    row: Option<&ImportedObject>,
+) -> bool {
+    let Some(row) = row else {
+        return true;
+    };
+    let changed = !row.matches(object) && trusted_listing(Some(row), object).is_none();
+    let decoded = rule.decode_path(&object.key) != PathIdentity::Unmatched;
+    changed || (row.key.is_none() && decoded)
+}
+
 /// Registers a file whose version never committed as the key and version its write intent or
 /// path names. `None` leaves the file to the ordinary import, as for any row Aruna wrote.
 async fn recover(
@@ -501,13 +534,15 @@ async fn recover(
     resolved: &ResolvedBackend,
 ) -> Result<Option<Outcome>, ItemError> {
     let rule = &run.rule;
-    if row.is_some_and(|row| row.key.is_some()) {
+    if !needs_lookup(rule, object, row) {
         return Ok(None);
     }
-    let claims = match row {
-        None => read_claims(&ctx.driver, rule, &object.key).await?,
-        Some(_) => Vec::new(),
-    };
+    let claims = read_claims(&ctx.driver, rule, &object.key).await?;
+    // A row of Aruna's own write names it; only the open intent of a later write overrides it.
+    let keyed = row.is_some_and(|row| row.key.is_some());
+    if keyed && claims.iter().all(|(.., committed)| *committed) {
+        return Ok(None);
+    }
     let Some(identity) = choose_identity(rule, &object.key, claims)? else {
         return Ok(None);
     };
@@ -648,6 +683,29 @@ async fn read_claims(
         claims.push((key, intent, found.1 != Exact::Absent));
     }
     Ok(claims)
+}
+
+/// Whether the group's delete trail removed version `id` of `key`, or the key without a head.
+/// The trail is read once per listing page and only when a page needs it.
+async fn deleted_on_purpose(
+    context: &DriverContext,
+    run: &ImportRun,
+    key: &str,
+    id: Ulid,
+) -> Result<bool, ItemError> {
+    let records = run.trail.get_or_try_init(|| async {
+        let prefix = Key::from(run.rule.group_id.to_bytes().to_vec());
+        let entries = iterate(context, DELETE_AUDIT_KEYSPACE, prefix).await?;
+        let records = entries
+            .iter()
+            .map(|(_, value)| BlobAuditRecord::from_bytes(value));
+        let records = records.collect::<Result<Vec<_>, _>>();
+        records.map_err(|error| ItemError::System(error.to_string()))
+    });
+    let bucket = &run.rule.bucket;
+    let add = |trail: Trail, record| trail.add(record, bucket, key, id);
+    let trail = records.await?.iter().fold(Trail::Clean, add);
+    Ok(trail != Trail::Clean)
 }
 
 /// Every entry under `prefix`, read in pages.
@@ -1561,6 +1619,34 @@ mod tests {
         };
         let stored = intent_key(rule.import_id, "raw/a.csv", intent.version_id);
         (stored, intent, committed)
+    }
+
+    #[test]
+    fn looks_up_intents() {
+        let rule = recovery_rule("{dir}{id}_{name}");
+        let listed = object("e1");
+        assert!(needs_lookup(&rule, &listed, None));
+        // An unchanged known file takes the fast path without any intent read.
+        let literal = row(Ulid::nil(), "e1");
+        assert!(!needs_lookup(&rule, &listed, Some(&literal)));
+        let keyed = ImportedObject {
+            key: Some("in/a.csv".to_string()),
+            ..literal.clone()
+        };
+        assert!(!needs_lookup(&rule, &listed, Some(&keyed)));
+        let unlisted = ImportedObject::written(Ulid::nil(), "in/a.csv".to_string(), 4, None);
+        assert!(!needs_lookup(&rule, &listed, Some(&unlisted)));
+        // A file that changed under its row may be a later write that never committed.
+        assert!(needs_lookup(&rule, &object("e2"), Some(&keyed)));
+        assert!(needs_lookup(&rule, &object("e2"), Some(&literal)));
+        // A literal import whose name encodes a version is checked for its intent.
+        let id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let named = ExternalObject {
+            key: format!("raw/{id}_a.csv"),
+            ..object("e1")
+        };
+        assert!(needs_lookup(&rule, &named, Some(&literal)));
+        assert!(!needs_lookup(&rule, &named, Some(&keyed)));
     }
 
     #[test]
