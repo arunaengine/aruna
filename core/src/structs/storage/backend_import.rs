@@ -248,11 +248,12 @@ impl ImportedObject {
         }
     }
 
-    /// A version Aruna wrote itself; the first listing only records its ETag and time.
-    pub fn written(version_id: Ulid, key: String, size: u64) -> Self {
+    /// A version Aruna wrote itself. Without the backend's ETag its first listing only records
+    /// its ETag and time; with it, listings compare like any imported object.
+    pub fn written(version_id: Ulid, key: String, size: u64, etag: Option<String>) -> Self {
         Self {
             version_id,
-            etag: None,
+            etag,
             size,
             modified_ms: None,
             key: Some(key),
@@ -274,10 +275,12 @@ impl ImportedObject {
         })
     }
 
-    /// Without an ETag the modification time decides whether the object changed.
+    /// Without an ETag the modification time decides whether the object changed. Quotes
+    /// around an ETag do not count, as write answers and listings differ there.
     pub fn matches(&self, object: &ExternalObject) -> bool {
+        let unquoted = |etag: Option<&str>| etag.map(|etag| etag.trim_matches('"').to_string());
         self.size == object.size
-            && self.etag == object.etag
+            && unquoted(self.etag.as_deref()) == unquoted(object.etag.as_deref())
             && (object.etag.is_some() || self.modified_ms == object.modified_ms)
     }
 
@@ -451,7 +454,7 @@ mod tests {
 
     #[test]
     fn notes_own_writes() {
-        let written = ImportedObject::written(Ulid::nil(), "in/a.csv".to_string(), 4);
+        let written = ImportedObject::written(Ulid::nil(), "in/a.csv".to_string(), 4, None);
         let listed = written.first_listing(&object(Some("e1"), Some(5))).unwrap();
         assert_eq!(listed.key.as_deref(), Some("in/a.csv"));
         assert!(listed.matches(&object(Some("e1"), Some(5))));
@@ -465,6 +468,11 @@ mod tests {
         };
         assert_eq!(written.first_listing(&resized), None);
         assert!(!ImportedObject::new(Ulid::nil(), &object(None, None)).unlisted());
+        // A write that kept the backend's ETag compares by it, quotes aside.
+        let tagged = ImportedObject::written(Ulid::nil(), "in/a.csv".into(), 4, Some("e1".into()));
+        assert_eq!(tagged.first_listing(&object(Some("\"e1\""), Some(5))), None);
+        assert!(tagged.matches(&object(Some("\"e1\""), Some(5))));
+        assert!(!tagged.matches(&object(Some("\"e2\""), Some(5))));
     }
 
     #[test]

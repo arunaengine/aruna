@@ -763,9 +763,14 @@ impl PutObjectOperation {
                 location
             }
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
-            Event::Blob(BlobEvent::PlainWritten { location, version }) => {
+            Event::Blob(BlobEvent::PlainWritten {
+                location,
+                version,
+                etag,
+            }) => {
                 if let Some(plain) = self.plain.as_mut() {
                     plain.version = version;
+                    plain.etag = etag;
                 }
                 location
             }

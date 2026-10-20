@@ -126,6 +126,7 @@ pub struct MigrateVersionOperation {
     plain_path: Option<PlainPath>,
     /// The backend's id of the bytes a plain write stored.
     backend_version: Option<String>,
+    backend_etag: Option<String>,
     /// A finished copy found at the target row; on another backend it is probed before use.
     found: Option<BackendLocation>,
     /// The routing the publication transaction read.
@@ -154,6 +155,7 @@ impl MigrateVersionOperation {
             plain: None,
             plain_path: None,
             backend_version: None,
+            backend_etag: None,
             found: None,
             fresh: None,
             state: MigrateState::Init,
@@ -446,8 +448,13 @@ impl MigrateVersionOperation {
     fn handle_written(&mut self, event: Event) -> Effects {
         let new = match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
-            Event::Blob(BlobEvent::PlainWritten { location, version }) => {
+            Event::Blob(BlobEvent::PlainWritten {
+                location,
+                version,
+                etag,
+            }) => {
                 self.backend_version = version;
+                self.backend_etag = etag;
                 location
             }
             // The adapter keeps a copy with an unclear outcome for reconciliation.
@@ -759,6 +766,7 @@ impl MigrateVersionOperation {
                 target,
                 written,
                 version: self.backend_version.as_deref().filter(|_| self.owns_row),
+                etag: self.backend_etag.as_deref(),
                 version_id: self.version_key.version_id,
                 key: &self.version_key.key,
             };
@@ -1837,6 +1845,7 @@ mod tests {
             Event::Blob(BlobEvent::PlainWritten {
                 location: written,
                 version: None,
+                etag: None,
             })
         }
 
@@ -2153,7 +2162,8 @@ mod tests {
             operation.start();
             operation.step(read_result(Some(version.to_bytes().unwrap())));
             operation.step(read_result(Some(old.to_bytes().unwrap())));
-            let row = ImportedObject::written(Ulid::from_bytes([2; 16]), "in/x/one.csv".into(), 40);
+            let row =
+                ImportedObject::written(Ulid::from_bytes([2; 16]), "in/x/one.csv".into(), 40, None);
 
             let effects = operation.step(read_result(Some(row.to_bytes().unwrap())));
 

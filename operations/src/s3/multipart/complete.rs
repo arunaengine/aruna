@@ -302,6 +302,7 @@ pub struct CompleteUploadOperation {
     /// The path composed last and the backend version the compose reported.
     plain_path: Option<PlainPath>,
     plain_version: Option<String>,
+    plain_etag: Option<String>,
 }
 
 impl CompleteUploadOperation {
@@ -350,6 +351,7 @@ impl CompleteUploadOperation {
             plain: None,
             plain_path: None,
             plain_version: None,
+            plain_etag: None,
         }
     }
 
@@ -1091,8 +1093,13 @@ impl CompleteUploadOperation {
     fn handle_blob_composed(&mut self, event: Event) -> Effects {
         let mut location = match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
-            Event::Blob(BlobEvent::PlainWritten { location, version }) => {
+            Event::Blob(BlobEvent::PlainWritten {
+                location,
+                version,
+                etag,
+            }) => {
                 self.plain_version = version;
+                self.plain_etag = etag;
                 location
             }
             Event::Blob(BlobEvent::Error(BlobError::PathTaken)) => return self.plain_taken(),

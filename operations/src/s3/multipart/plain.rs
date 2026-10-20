@@ -193,6 +193,7 @@ impl CompleteUploadOperation {
             target,
             written,
             version,
+            etag: self.plain_etag.as_deref(),
             version_id,
             key: &self.input.key,
         };
@@ -518,6 +519,7 @@ mod tests {
         let effects = operation.step(Event::Blob(BlobEvent::PlainWritten {
             location: location.clone(),
             version: Some("v1".to_string()),
+            etag: None,
         }));
         assert!(
             matches!(

@@ -19,6 +19,7 @@ pub(super) struct PlainWrite {
     target: PlainTarget,
     resolved: ResolvedBackend,
     pub(super) version: Option<String>,
+    pub(super) etag: Option<String>,
 }
 
 /// Rows an import commits with its version; the rule must still exist in that transaction.
@@ -68,6 +69,7 @@ impl PutObjectOperation {
             target,
             resolved,
             version: None,
+            etag: None,
         });
         if !same_name {
             return self.write_plain(path, false);
@@ -165,6 +167,7 @@ impl PutObjectOperation {
                 target: &plain.target,
                 written,
                 version,
+                etag: plain.etag.as_deref(),
                 version_id: self.version_id?,
                 key: &self.config.request.key,
             };
@@ -218,6 +221,8 @@ pub(crate) struct PlainRecord<'a> {
     pub target: &'a PlainTarget,
     pub written: &'a BackendLocation,
     pub version: Option<&'a str>,
+    /// The backend's ETag of the written file, so its first listing needs no read.
+    pub etag: Option<&'a str>,
     pub version_id: Ulid,
     pub key: &'a str,
 }
@@ -239,6 +244,7 @@ impl PlainRecord<'_> {
                 self.version_id,
                 self.key.to_string(),
                 self.written.blob_size,
+                self.etag.map(str::to_string),
             );
             let row_key = object_key(self.target.import_id, &self.written.backend_path);
             writes.push((
@@ -415,6 +421,7 @@ mod tests {
         operation.step(Event::Blob(BlobEvent::PlainWritten {
             location: written(plain.path.clone(), id),
             version: None,
+            etag: None,
         }));
         let effects = operation.abort();
         assert!(
@@ -439,7 +446,8 @@ mod tests {
                 false => location,
             };
             operation.output = Some(Ok(output));
-            operation.plain.as_mut().unwrap().version = Some("v1".to_string());
+            let plain = operation.plain.as_mut().unwrap();
+            (plain.version, plain.etag) = (Some("v1".to_string()), Some("\"e1\"".to_string()));
             operation.txn_id = Some(Ulid::nil());
 
             // The import row needs the rule, read in the version transaction.
@@ -477,7 +485,9 @@ mod tests {
         let row = ImportedObject::from_bytes(row).unwrap();
         assert_eq!(row.key.as_deref(), Some("in/x/one.csv"));
         assert_eq!(row.version_id, id);
-        assert!(row.unlisted());
+        // The backend's ETag lets the first listing compare without reading the file.
+        assert_eq!(row.etag.as_deref(), Some("\"e1\""));
+        assert!(!row.unlisted());
 
         // Without the rule only the backend version is written; the version still commits.
         let (_, writes) = records(false, false);
