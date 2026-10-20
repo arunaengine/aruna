@@ -1519,3 +1519,26 @@ fn changed_version_kept() {
     ));
     assert_eq!(op.finalize(), Err(DeleteObjectError::VersionChanged));
 }
+
+#[test]
+fn marker_needs_head() {
+    let head = Ulid::from_parts(5, 5);
+    let marked = |current: Ulid| {
+        let mut operation = audit_op(None).with_head(head);
+        operation.state = DeleteObjectState::ReadCurrentLookup;
+        operation.pending_version_id = Some(Ulid::generate());
+        let pointer = CurrentVersionPointer::new(current).to_bytes().unwrap();
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(pointer.into()),
+        }));
+        operation.output
+    };
+    // A head written meanwhile is never covered by the marker.
+    let moved = marked(Ulid::from_parts(6, 6));
+    assert!(matches!(
+        moved,
+        Some(Err(DeleteObjectError::VersionChanged))
+    ));
+    assert!(marked(head).is_none());
+}

@@ -195,6 +195,8 @@ pub struct DeleteObjectOperation {
     metadata: HashMap<String, String>,
     /// The record the deleted version must still have inside the delete's transaction.
     expected: Option<BlobVersion>,
+    /// The head a delete marker may only cover while it is still current.
+    expected_head: Option<Ulid>,
 }
 
 impl DeleteObjectOperation {
@@ -227,7 +229,14 @@ impl DeleteObjectOperation {
             restrictions: None,
             metadata: HashMap::new(),
             expected: None,
+            expected_head: None,
         }
+    }
+
+    /// Writes the delete marker only while `version_id` is the head, read in its transaction.
+    pub fn with_head(mut self, version_id: Ulid) -> Self {
+        self.expected_head = Some(version_id);
+        self
     }
 
     /// Metadata the delete marker carries. A forwarded sync delete tags the
@@ -482,6 +491,10 @@ impl DeleteObjectOperation {
             Err(err) => return self.emit_error(err.into()),
         };
         self.existing_pointer = existing.clone();
+        let head = existing.as_ref().map(|pointer| pointer.version_id);
+        if self.expected_head.is_some() && head != self.expected_head {
+            return self.emit_error(DeleteObjectError::VersionChanged);
+        }
         let Some(version_id) = self.pending_version_id.take() else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };

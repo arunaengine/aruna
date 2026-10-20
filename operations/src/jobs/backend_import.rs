@@ -44,6 +44,7 @@ use crate::placement::policy::{GateContext, PolicyGateError};
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::complete_put;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, Trail,
 };
@@ -566,8 +567,7 @@ async fn recover(
     let row_key = object_key(rule.import_id, &object.key);
     // An existing version only gets its missing row, and only for the same bytes.
     let (version_key, exact) = exact_version(&ctx.driver, &rule.bucket, &key, version_id).await?;
-    match exact {
-        Exact::Absent => {}
+    match &exact {
         Exact::Incompatible => {
             return Err(item(format!(
                 "version {version_id} of {key} exists in a state that cannot hold the file"
@@ -578,20 +578,28 @@ async fn recover(
                 "the file differs from version {version_id} of {key}"
             )));
         }
-        Exact::Materialized(_, value) => {
-            let guards = [
-                rule_guard(rule)?,
-                (BLOB_VERSIONS_KEYSPACE.to_string(), version_key, Some(value)),
-            ];
-            let retired = intent.map(|(key, _)| key);
-            let repaired = encode(&committed)?;
-            let note = Note {
-                guards: &guards,
-                retired,
-            };
-            note_listing(&ctx.driver, rule, row_key, stored, repaired, note).await?;
-            return Ok(Some(Outcome::Imported));
-        }
+        Exact::Absent | Exact::Materialized(..) => {}
+    }
+    // A literal-name import of the file stops being current before the file gets its identity.
+    let literal = rule.aruna_key(&object.key);
+    if let Some(alias) = row.filter(|row| row.key.is_none())
+        && let Some(literal) = literal.filter(|literal| *literal != key)
+    {
+        hide_alias(&ctx.driver, spec, rule, &literal, alias.version_id).await?;
+    }
+    if let Exact::Materialized(_, value) = exact {
+        let guards = [
+            rule_guard(rule)?,
+            (BLOB_VERSIONS_KEYSPACE.to_string(), version_key, Some(value)),
+        ];
+        let retired = intent.map(|(key, _)| key);
+        let repaired = encode(&committed)?;
+        let note = Note {
+            guards: &guards,
+            retired,
+        };
+        note_listing(&ctx.driver, rule, row_key, stored, repaired, note).await?;
+        return Ok(Some(Outcome::Imported));
     }
     // The version transaction reads the delete trail again, so a delete meanwhile conflicts.
     let head = read_head(&ctx.driver, &rule.bucket, &key).await?;
@@ -683,6 +691,39 @@ async fn read_claims(
         claims.push((key, intent, found.1 != Exact::Absent));
     }
     Ok(claims)
+}
+
+/// Covers the literal-name head `version_id` of `literal` with a delete marker. The normal delete
+/// path adjusts the live charges, keeps the version for pinned references and keeps the bytes.
+async fn hide_alias(
+    context: &DriverContext,
+    spec: &BackendImportSpec,
+    rule: &BackendImport,
+    literal: &str,
+    version_id: Ulid,
+) -> Result<(), ItemError> {
+    if read_head(context, &rule.bucket, literal).await? != Some(version_id) {
+        return Ok(());
+    }
+    let input = DeleteObjectInput {
+        bucket: rule.bucket.clone(),
+        key: literal.to_string(),
+        version_id: None,
+        group_id: rule.group_id,
+        realm_id: spec.auth_context.realm_id,
+        node_id: spec.node_id,
+        deleted_by: spec.auth_context.user_id,
+    };
+    let restrictions = spec.auth_context.path_restrictions.clone();
+    let delete = DeleteObjectOperation::new(input).with_head(version_id);
+    match drive(delete.with_restrictions(restrictions), context).await {
+        // A write to the literal key meanwhile is the tenant's own and stays current.
+        Ok(_) | Err(DeleteObjectError::VersionChanged) => Ok(()),
+        Err(error @ DeleteObjectError::StorageError(_)) => {
+            Err(ItemError::System(error.to_string()))
+        }
+        Err(error) => Err(item(error.to_string())),
+    }
 }
 
 /// Whether the group's delete trail removed version `id` of `key`, or the key without a head.
@@ -1480,6 +1521,67 @@ mod tests {
         assert!(done.await.is_ok());
         assert_eq!(stored().await, listed);
         assert!(!intent_left().await);
+    }
+
+    #[tokio::test]
+    async fn hides_literal_alias() {
+        let (_directory, storage) = crate::tests::s3::test_storage();
+        let context = crate::tests::s3::test_context(storage);
+        let rule = recovery_rule("{dir}{id}_{name}");
+        let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
+        let spec = BackendImportSpec {
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
+                user_id: UserId::local(Ulid::from_parts(2, 2), realm_id),
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
+            group_id: rule.group_id,
+            import_id: rule.import_id,
+        };
+        let (alias, other) = (Ulid::from_parts(7, 7), Ulid::from_parts(8, 8));
+        let literal = "in/x_a.csv";
+        let version = BlobVersion::materialized(
+            [7; 32],
+            BackendRef::Group(rule.backend_id),
+            aruna_core::structs::storage::format::EncodingClass::Raw,
+            std::time::SystemTime::UNIX_EPOCH,
+            Default::default(),
+            None,
+        );
+        for id in [alias, other] {
+            let key = Key::from(VersionKey::new("bucket", literal, id).to_bytes().unwrap());
+            let value = version.to_bytes().unwrap();
+            let write = write_value(&context, BLOB_VERSIONS_KEYSPACE, key, value);
+            assert!(write.await.is_ok());
+        }
+        let head_key = Key::from(BlobHeadKey::new("bucket", literal).to_bytes().unwrap());
+        let set_head = |id| {
+            let value = CurrentVersionPointer::new(id).to_bytes().unwrap();
+            write_value(&context, BLOB_HEAD_KEYSPACE, head_key.clone(), value)
+        };
+        let head = || read_head(&context, "bucket", literal);
+
+        // A write to the literal key meanwhile stays current.
+        assert!(set_head(other).await.is_ok());
+        let hidden = hide_alias(&context, &spec, &rule, literal, alias);
+        assert!(hidden.await.is_ok());
+        assert_eq!(head().await.ok().flatten(), Some(other));
+
+        // The alias head gets a delete marker; its version stays for pinned references.
+        assert!(set_head(alias).await.is_ok());
+        let hidden = hide_alias(&context, &spec, &rule, literal, alias);
+        assert!(hidden.await.is_ok());
+        let marker = head().await.ok().flatten().unwrap();
+        assert_ne!(marker, alias);
+        let kept = exact_version(&context, "bucket", literal, alias).await;
+        assert!(matches!(kept, Ok((_, Exact::Materialized(..)))));
+        let (_, marker) = exact_version(&context, "bucket", literal, marker)
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(marker, Exact::Incompatible);
     }
 
     #[tokio::test]
