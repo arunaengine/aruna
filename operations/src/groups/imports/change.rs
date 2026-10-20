@@ -8,11 +8,14 @@ use crate::groups::fence::{parse_group_record, read_group_record};
 use crate::jobs::store::decode_job_record;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, JOB_KEYSPACE};
+use aruna_core::keyspaces::{
+    BACKEND_IMPORT_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, JOB_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::job_record_key;
 use aruna_core::structs::storage::backend_import::{BackendImport, import_key, valid_pattern};
-use aruna_core::types::{Effects, GroupId, TxnId};
+use aruna_core::structs::storage::format::CompressionMigration;
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::time::SystemTime;
 use ulid::Ulid;
@@ -37,7 +40,7 @@ enum ChangeState {
 
 /// Rereads the rule in its own transaction, so a concurrent change is never lost. A new
 /// pattern names only later writes; files and their records stay where they are. It waits
-/// until the rule's last run ended, so no run reads paths with the old pattern.
+/// for the rule's last run and the bucket's move to end, so none uses the old pattern.
 #[derive(Debug, PartialEq)]
 pub struct ChangeImportOperation {
     group_id: GroupId,
@@ -95,24 +98,43 @@ impl ChangeImportOperation {
         if record.write_pattern == before.write_pattern {
             return self.write(record);
         }
-        let (Some(last_job), Some(txn_id)) = (record.last_job, self.txn_id) else {
-            return self.write(record);
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(ImportRuleError::Unexpected("Read"));
         };
+        let mut reads = vec![(
+            COMPRESSION_MIGRATION_KEYSPACE.to_string(),
+            record.bucket.as_bytes().to_vec().into(),
+        )];
+        if let Some(last_job) = record.last_job {
+            reads.push((JOB_KEYSPACE.to_string(), job_record_key(last_job)));
+        }
         self.changed = Some(record);
         self.state = ChangeState::Run;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_KEYSPACE.to_string(),
-            key: job_record_key(last_job),
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
             txn_id: Some(txn_id),
         })]
     }
 
-    /// A pruned last run has ended.
-    fn run_read(&mut self, value: Option<aruna_core::types::Value>) -> Effects {
+    /// A move still running would publish files named by the old pattern; a pruned last run
+    /// has ended.
+    fn run_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
         let Some(record) = self.changed.take() else {
             return self.fail(ImportRuleError::Unexpected("Run"));
         };
-        match value.as_deref().map(decode_job_record).transpose() {
+        let mut values = values.into_iter().map(|(_, value)| value);
+        let (moving, run) = (values.next().flatten(), values.next().flatten());
+        let moving = moving.as_deref().map(CompressionMigration::from_bytes);
+        match moving.transpose() {
+            Ok(Some(found)) if found.moving && found.finished_at_ms.is_none() => {
+                return self.fail(ImportRuleError::Conflict(
+                    "a move of this bucket has not finished".to_string(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => return self.fail(error.into()),
+        }
+        match run.as_deref().map(decode_job_record).transpose() {
             Ok(Some(last)) if is_running(last.state) => self.fail(ImportRuleError::Conflict(
                 "the last run of this import has not finished".to_string(),
             )),
@@ -179,8 +201,8 @@ impl Operation for ChangeImportOperation {
                 Ok(value) => self.apply(value),
                 Err(error) => self.fail(error.into()),
             },
-            (ChangeState::Run, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.run_read(value)
+            (ChangeState::Run, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                self.run_read(values)
             }
             (ChangeState::Write, Event::Storage(StorageEvent::WriteResult { .. })) => {
                 let Some(txn_id) = self.txn_id else {
@@ -224,7 +246,6 @@ mod tests {
     use aruna_core::structs::storage::backend_import::{
         BackendImportSpec, DEFAULT_PATTERN, PLAIN_PATTERN,
     };
-    use aruna_core::types::{Key, Value};
 
     const TXN: TxnId = TxnId::from_parts(7, 7);
 
@@ -314,11 +335,51 @@ mod tests {
         operation.finalize().unwrap()
     }
 
+    /// Answers the checks of a pattern change with a move record and the last run.
+    fn check(
+        operation: &mut ChangeImportOperation,
+        effects: &Effects,
+        moving: Option<CompressionMigration>,
+        run: Option<Value>,
+    ) -> Effects {
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+            panic!("expected the checks, got {effects:?}")
+        };
+        let spaces: Vec<&str> = reads.iter().map(|(space, _)| space.as_str()).collect();
+        let expected = match run.is_some() {
+            true => vec![COMPRESSION_MIGRATION_KEYSPACE, JOB_KEYSPACE],
+            false => vec![COMPRESSION_MIGRATION_KEYSPACE],
+        };
+        assert_eq!(spaces, expected);
+        let moving = moving.map(|record| record.to_bytes().unwrap().into());
+        let answers = [moving, run];
+        let values = reads
+            .iter()
+            .zip(answers)
+            .map(|((_, key), value)| (key.clone(), value));
+        let values = values.collect();
+        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+    }
+
+    fn conflict(operation: ChangeImportOperation, effects: &Effects) {
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction {
+                txn_id: TXN
+            })]
+        );
+        assert!(matches!(
+            operation.finalize(),
+            Err(ImportRuleError::Conflict(_))
+        ));
+    }
+
     #[test]
     fn changes_write_pattern() {
         // The rule keeps its id; the schedule follows the request as before.
         let stored = rule("{dir}{id}_{name}", None);
-        let (operation, effects) = read(&stored, Some(DEFAULT_PATTERN));
+        let (mut operation, effects) = read(&stored, Some(DEFAULT_PATTERN));
+        let effects = check(&mut operation, &effects, None, None);
         let changed = written(&effects);
         assert_eq!(changed.import_id, stored.import_id);
         assert_eq!(changed.write_pattern, DEFAULT_PATTERN);
@@ -335,32 +396,36 @@ mod tests {
         let stored = rule("{dir}{id}_{name}", Some(job_id()));
         for (state, ends) in [(JobState::Running, false), (JobState::Succeeded, true)] {
             let (mut operation, effects) = read(&stored, Some(DEFAULT_PATTERN));
-            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
-            else {
-                panic!("expected the run read, got {effects:?}")
-            };
-            assert_eq!(key_space, JOB_KEYSPACE);
-            let key = job_record_key(job_id());
-            let value = Some(job(state));
-            let effects = operation.step(Event::Storage(StorageEvent::ReadResult { key, value }));
-            if ends {
-                assert_eq!(written(&effects).write_pattern, DEFAULT_PATTERN);
-                continue;
+            let effects = check(&mut operation, &effects, None, Some(job(state)));
+            match ends {
+                true => assert_eq!(written(&effects).write_pattern, DEFAULT_PATTERN),
+                false => conflict(operation, &effects),
             }
-            assert_eq!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction {
-                    txn_id: TXN
-                })]
-            );
-            assert!(matches!(
-                operation.finalize(),
-                Err(ImportRuleError::Conflict(_))
-            ));
         }
         // The same pattern needs no check.
         let (_, effects) = read(&stored, Some("{dir}{id}_{name}"));
         written(&effects);
+    }
+
+    #[test]
+    fn waits_for_move() {
+        // A running move may still publish a file it tagged under the old pattern.
+        let stored = rule(PLAIN_PATTERN, None);
+        let mut moving =
+            CompressionMigration::new(aruna_core::structs::storage::format::Compression::Off, 1);
+        moving.moving = true;
+        let mut done = moving.clone();
+        done.finished_at_ms = Some(2);
+        let mut encoding = moving.clone();
+        encoding.moving = false;
+        for (record, ends) in [(moving, false), (done, true), (encoding, true)] {
+            let (mut operation, effects) = read(&stored, Some(DEFAULT_PATTERN));
+            let effects = check(&mut operation, &effects, Some(record), None);
+            match ends {
+                true => assert_eq!(written(&effects).write_pattern, DEFAULT_PATTERN),
+                false => conflict(operation, &effects),
+            }
+        }
     }
 
     #[test]
