@@ -1275,9 +1275,9 @@ fn map_put_error(error: PutObjectError) -> CallToolResult {
         PutObjectError::PolicyGate(error) => internal_error(error),
         PutObjectError::PurgeFence(error) => internal_error(error),
         PutObjectError::PutObjectFailed => internal_error("object write failed"),
-        error @ (PutObjectError::HeadChanged | PutObjectError::ImportRemoved) => {
-            internal_error(error)
-        }
+        error @ (PutObjectError::HeadChanged
+        | PutObjectError::ImportRemoved
+        | PutObjectError::VersionExists) => internal_error(error),
     }
 }
 
