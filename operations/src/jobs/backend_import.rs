@@ -347,7 +347,16 @@ async fn import_object(
         && let Some(md5) = committed_md5(&ctx.driver, &rule.bucket, &key, &listed, object).await?
         && !etag_differs(object.etag.as_deref(), md5.as_deref())
     {
-        note_listing(&ctx.driver, rule, row_key, Some(&seen), encode(&listed)?).await?;
+        let listed = encode(&listed)?;
+        note_listing(
+            &ctx.driver,
+            rule,
+            row_key,
+            Some(&seen),
+            listed,
+            Note::default(),
+        )
+        .await?;
         return Ok(Outcome::Skipped);
     }
     let head_key = BlobHeadKey::new(&rule.bucket, &key)
@@ -521,25 +530,38 @@ async fn recover(
     };
     let row_key = object_key(rule.import_id, &object.key);
     // An existing version only gets its missing row, and only for the same bytes.
-    if let Some(hash) = committed_hash(&ctx.driver, &rule.bucket, &key, version_id).await? {
-        if location.get_blake3() != Some(&hash[..]) {
+    let (version_key, exact) = exact_version(&ctx.driver, &rule.bucket, &key, version_id).await?;
+    match exact {
+        Exact::Absent => {}
+        Exact::Incompatible => {
+            return Err(item(format!(
+                "version {version_id} of {key} exists in a state that cannot hold the file"
+            )));
+        }
+        Exact::Materialized(hash, _) if location.get_blake3() != Some(&hash[..]) => {
             return Err(item(format!(
                 "the file differs from version {version_id} of {key}"
             )));
         }
-        let repaired = encode(&committed)?;
-        note_listing(&ctx.driver, rule, row_key, stored, repaired).await?;
-        drop_intent(&ctx.driver, intent).await?;
-        return Ok(Some(Outcome::Imported));
+        Exact::Materialized(_, value) => {
+            let guards = [
+                rule_guard(rule)?,
+                (BLOB_VERSIONS_KEYSPACE.to_string(), version_key, Some(value)),
+            ];
+            let retired = intent.map(|(key, _)| key);
+            let repaired = encode(&committed)?;
+            let note = Note {
+                guards: &guards,
+                retired,
+            };
+            note_listing(&ctx.driver, rule, row_key, stored, repaired, note).await?;
+            return Ok(Some(Outcome::Imported));
+        }
     }
     // The version transaction reads the delete trail again, so a delete meanwhile conflicts.
     let head = read_head(&ctx.driver, &rule.bucket, &key).await?;
     let guards = vec![
-        (
-            BACKEND_IMPORT_KEYSPACE.to_string(),
-            rule.key(),
-            Some(encode_rule(rule)?),
-        ),
+        rule_guard(rule)?,
         (
             IMPORTED_OBJECT_KEYSPACE.to_string(),
             row_key,
@@ -591,11 +613,12 @@ async fn recover(
     Ok(Some(Outcome::Imported))
 }
 
-fn encode_rule(rule: &BackendImport) -> Result<Value, ItemError> {
+/// The rule must still be defined as this run read it.
+fn rule_guard(rule: &BackendImport) -> Result<(String, Key, Option<Value>), ItemError> {
     let bytes = rule.to_bytes();
-    bytes
-        .map(Value::from)
-        .map_err(|error| ItemError::System(error.to_string()))
+    let value = bytes.map_err(|error| ItemError::System(error.to_string()))?;
+    let space = BACKEND_IMPORT_KEYSPACE.to_string();
+    Ok((space, rule.key(), Some(value.into())))
 }
 
 async fn read_head(
@@ -621,8 +644,8 @@ async fn read_claims(
     for (key, value) in iterate(context, IMPORT_INTENT_KEYSPACE, prefix).await? {
         let intent = WriteIntent::from_bytes(&value);
         let intent = intent.map_err(|error| ItemError::System(error.to_string()))?;
-        let found = committed_hash(context, &rule.bucket, &intent.key, intent.version_id).await?;
-        claims.push((key, intent, found.is_some()));
+        let found = exact_version(context, &rule.bucket, &intent.key, intent.version_id).await?;
+        claims.push((key, intent, found.1 != Exact::Absent));
     }
     Ok(claims)
 }
@@ -659,26 +682,6 @@ async fn iterate(
             }
             other => return Err(ItemError::System(format!("unexpected answer {other:?}"))),
         }
-    }
-}
-
-/// An intent whose version committed is done; the version and its row now hold the identity.
-async fn drop_intent(
-    context: &DriverContext,
-    intent: Option<(Key, UserId)>,
-) -> Result<(), ItemError> {
-    let Some((key, _)) = intent else {
-        return Ok(());
-    };
-    let effect = StorageEffect::Delete {
-        key_space: IMPORT_INTENT_KEYSPACE.to_string(),
-        key,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(ItemError::System(error.to_string())),
-        other => Err(ItemError::System(format!("unexpected answer {other:?}"))),
     }
 }
 
@@ -737,19 +740,38 @@ fn etag_differs(etag: Option<&str>, md5: Option<&[u8]>) -> bool {
         && !etag.eq_ignore_ascii_case(&hex::encode(md5))
 }
 
-/// The BLAKE3 hash of the committed version of `key` in `bucket`, if it still exists.
-async fn committed_hash(
+/// What one exact version id holds for a file that names it.
+#[derive(Debug, PartialEq)]
+enum Exact {
+    Absent,
+    /// The content hash, and the stored record a reconciling transaction compares again.
+    Materialized([u8; 32], Value),
+    /// A reference, pending content or deleted version can never be the file.
+    Incompatible,
+}
+
+/// The key and state of version `version_id` of `key` in `bucket`.
+async fn exact_version(
     context: &DriverContext,
     bucket: &str,
     key: &str,
     version_id: Ulid,
-) -> Result<Option<[u8; 32]>, ItemError> {
-    let version_key = VersionKey::new(bucket, key, version_id)
+) -> Result<(Key, Exact), ItemError> {
+    let version_key: Key = VersionKey::new(bucket, key, version_id)
         .to_bytes()
-        .map_err(|error| ItemError::Item(error.to_string()))?;
-    let [version] = read_values(context, [(BLOB_VERSIONS_KEYSPACE, version_key.into())]).await?;
-    let version = parse(version, BlobVersion::from_bytes)?;
-    Ok(version.and_then(|version| version.blob_hash().copied()))
+        .map_err(|error| ItemError::Item(error.to_string()))?
+        .into();
+    let [value] = read_values(context, [(BLOB_VERSIONS_KEYSPACE, version_key.clone())]).await?;
+    let Some(value) = value else {
+        return Ok((version_key, Exact::Absent));
+    };
+    let version = BlobVersion::from_bytes(&value);
+    let version = version.map_err(|error| ItemError::System(error.to_string()))?;
+    let exact = match version.blob_hash() {
+        Some(hash) => Exact::Materialized(*hash, value),
+        None => Exact::Incompatible,
+    };
+    Ok((version_key, exact))
 }
 
 async fn hash_object(
@@ -948,6 +970,15 @@ async fn write_value(
     }
 }
 
+/// What else a row update reads and deletes in its transaction.
+#[derive(Default)]
+struct Note<'a> {
+    /// Values that must still be stored as they were read.
+    guards: &'a [(String, Key, Option<Value>)],
+    /// A write intent the committed row makes obsolete.
+    retired: Option<Key>,
+}
+
 /// Replaces the row only while the rule exists and the row still holds `seen` (`None`: no row),
 /// in one transaction. Otherwise nothing is written and the next run looks at the object again.
 async fn note_listing(
@@ -956,6 +987,7 @@ async fn note_listing(
     row_key: Key,
     seen: Option<&Value>,
     row: Vec<u8>,
+    note: Note<'_>,
 ) -> Result<(), ItemError> {
     let storage = &context.storage_handle;
     let unexpected = |event: Event| ItemError::System(format!("unexpected answer {event:?}"));
@@ -965,10 +997,12 @@ async fn note_listing(
         other => return Err(unexpected(other)),
     };
     let abort = StorageEffect::AbortTransaction { txn_id };
-    let reads = vec![
+    let mut reads = vec![
         (BACKEND_IMPORT_KEYSPACE.to_string(), rule.key()),
         (IMPORTED_OBJECT_KEYSPACE.to_string(), row_key.clone()),
     ];
+    let guards = note.guards.iter();
+    reads.extend(guards.map(|(space, key, _)| (space.clone(), key.clone())));
     let read = StorageEffect::BatchRead {
         reads,
         txn_id: Some(txn_id),
@@ -980,7 +1014,14 @@ async fn note_listing(
             return Err(unexpected(other));
         }
     };
-    if !matches!(values.as_slice(), [(_, Some(_)), (_, value)] if value.as_ref() == seen) {
+    let expected = note.guards.iter().map(|(.., value)| value.as_ref());
+    let held = match values.as_slice() {
+        [(_, Some(_)), (_, value), rest @ ..] if value.as_ref() == seen => {
+            rest.len() == note.guards.len() && rest.iter().map(|(_, v)| v.as_ref()).eq(expected)
+        }
+        _ => false,
+    };
+    if !held {
         storage.send_storage_effect(abort).await;
         return Ok(());
     }
@@ -990,11 +1031,20 @@ async fn note_listing(
         value: row.into(),
         txn_id: Some(txn_id),
     };
-    match storage.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => {
-            storage.send_storage_effect(abort).await;
-            return Err(unexpected(other));
+    let retire = note.retired.map(|key| StorageEffect::Delete {
+        key_space: IMPORT_INTENT_KEYSPACE.to_string(),
+        key,
+        txn_id: Some(txn_id),
+    });
+    for effect in std::iter::once(write).chain(retire) {
+        match storage.send_storage_effect(effect).await {
+            Event::Storage(
+                StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
+            ) => {}
+            other => {
+                storage.send_storage_effect(abort).await;
+                return Err(unexpected(other));
+            }
         }
     }
     match storage
@@ -1231,6 +1281,8 @@ mod tests {
         let item = |error| matches!(put_failure(error), ItemError::Item(_));
         assert!(item(PutObjectError::QuotaExceeded { limit: 1, usage: 2 }));
         assert!(item(PutObjectError::PolicyGate(PolicyGateError::Invalid)));
+        // Deleted history is reported for the file; the run goes on.
+        assert!(item(PutObjectError::HistoryDeleted));
         assert!(!item(PutObjectError::StorageError(
             aruna_core::errors::StorageError::TransactionConflict
         )));
@@ -1296,6 +1348,7 @@ mod tests {
             row_key.clone(),
             Some(&seen),
             update.clone(),
+            Note::default(),
         );
         assert!(note.await.is_ok());
         assert_eq!(stored().await, written);
@@ -1314,13 +1367,100 @@ mod tests {
             row_key.clone(),
             Some(&other),
             update.clone(),
+            Note::default(),
         );
         assert!(note.await.is_ok());
         assert_eq!(stored().await, written);
 
-        let note = note_listing(&context, &rule, row_key.clone(), Some(&seen), update);
-        assert!(note.await.is_ok());
+        // A version deleted since it was compared keeps the row and the intent as they are.
+        let intent = intent_key(rule.import_id, "raw/a.csv", Ulid::nil());
+        let write = write_value(&context, IMPORT_INTENT_KEYSPACE, intent.clone(), vec![1]);
+        assert!(write.await.is_ok());
+        let version = (
+            BLOB_VERSIONS_KEYSPACE.to_string(),
+            Key::from(vec![7u8]),
+            Some(Value::from(vec![8u8])),
+        );
+        let guards = [version];
+        let note = |retired| Note {
+            guards: &guards,
+            retired,
+        };
+        let held = note_listing(
+            &context,
+            &rule,
+            row_key.clone(),
+            Some(&seen),
+            update.clone(),
+            note(Some(intent.clone())),
+        );
+        assert!(held.await.is_ok());
+        assert_eq!(stored().await, written);
+        let intent_left = || async {
+            let read = read_values(&context, [(IMPORT_INTENT_KEYSPACE, intent.clone())]).await;
+            matches!(read, Ok([Some(_)]))
+        };
+        assert!(intent_left().await);
+
+        // The committed row retires the intent in the same transaction.
+        let write = write_value(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            guards[0].1.clone(),
+            vec![8],
+        );
+        assert!(write.await.is_ok());
+        let retired = Some(intent.clone());
+        let done = note_listing(
+            &context,
+            &rule,
+            row_key.clone(),
+            Some(&seen),
+            update,
+            note(retired),
+        );
+        assert!(done.await.is_ok());
         assert_eq!(stored().await, listed);
+        assert!(!intent_left().await);
+    }
+
+    #[tokio::test]
+    async fn classifies_exact_versions() {
+        let (_directory, storage) = crate::tests::s3::test_storage();
+        let context = crate::tests::s3::test_context(storage);
+        let id = Ulid::from_parts(9, 9);
+        let exact = || async {
+            let found = exact_version(&context, "bucket", "in/a.csv", id).await;
+            found.ok().unwrap().1
+        };
+        assert_eq!(exact().await, Exact::Absent);
+        // A deleted version holds no bytes, so a file naming it is a conflict, not new.
+        let deleted = BlobVersion::deleted(std::time::SystemTime::UNIX_EPOCH, Default::default());
+        let key = Key::from(
+            VersionKey::new("bucket", "in/a.csv", id)
+                .to_bytes()
+                .unwrap(),
+        );
+        let write = write_value(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            key.clone(),
+            deleted.to_bytes().unwrap(),
+        );
+        assert!(write.await.is_ok());
+        assert_eq!(exact().await, Exact::Incompatible);
+        let version = BlobVersion::materialized(
+            [7; 32],
+            BackendRef::node_default(),
+            aruna_core::structs::storage::format::EncodingClass::Raw,
+            std::time::SystemTime::UNIX_EPOCH,
+            Default::default(),
+            None,
+        );
+        let value = version.to_bytes().unwrap();
+        let write = write_value(&context, BLOB_VERSIONS_KEYSPACE, key, value.clone());
+        assert!(write.await.is_ok());
+        assert_eq!(exact().await, Exact::Materialized([7; 32], value.into()));
     }
 
     #[tokio::test]
