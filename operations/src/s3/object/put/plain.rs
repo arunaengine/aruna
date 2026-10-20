@@ -131,6 +131,7 @@ impl PutObjectOperation {
         };
         match intent_write(import_id, &intent_path, &intent) {
             Ok(effect) => {
+                self.written_intent = Some(intent_key(import_id, &intent_path, ulid));
                 self.pending_write = Some(smallvec![write]);
                 self.state = PutObjectState::WriteIntent;
                 smallvec![effect]
@@ -151,6 +152,30 @@ impl PutObjectOperation {
                 write
             }
             (Event::Storage(StorageEvent::Error { error }), _) => self.emit_error(error.into()),
+            _ => self.emit_error(PutObjectError::InvalidOperationState),
+        }
+    }
+
+    /// A refused conditional write moved no byte, so its intent must not claim the path.
+    pub(super) fn drop_intent(&mut self) -> Effects {
+        let Some(key) = self.written_intent.take() else {
+            return self
+                .cleanup_failed_write(PutObjectError::BlobWriteFailed(BlobError::PathTaken));
+        };
+        self.state = PutObjectState::DropIntent;
+        smallvec![Effect::Storage(StorageEffect::Delete {
+            key_space: IMPORT_INTENT_KEYSPACE.to_string(),
+            key,
+            txn_id: None,
+        })]
+    }
+
+    /// A failed delete leaves the intent; the import then finds no committed version for it.
+    pub(super) fn intent_dropped(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::DeleteResult { .. } | StorageEvent::Error { .. }) => {
+                self.cleanup_failed_write(PutObjectError::BlobWriteFailed(BlobError::PathTaken))
+            }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
         }
     }
@@ -968,6 +993,18 @@ mod tests {
 
         // Another upload took the free path first; nothing at the path is deleted.
         let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
+        // The refused write moved no byte, so its intent goes first.
+        let id = operation.version_id.unwrap();
+        let [Effect::Storage(StorageEffect::Delete { key_space, key, .. })] = effects.as_slice()
+        else {
+            panic!("expected the intent delete, got {effects:?}")
+        };
+        assert_eq!(key_space, IMPORT_INTENT_KEYSPACE);
+        let intent = intent_key(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv", id);
+        assert_eq!(*key, intent);
+        let effects = operation.step(Event::Storage(StorageEvent::DeleteResult {
+            key: intent.clone(),
+        }));
         assert!(
             !effects
                 .iter()

@@ -107,6 +107,15 @@ impl CompleteUploadOperation {
     /// Another writer took the free path first; the parts are still there, so the object
     /// takes its tagged path instead.
     pub(super) fn plain_taken(&mut self) -> Effects {
+        // The refused compose moved no byte, so its intent must not claim the path.
+        if let Some(key) = self.written_intent.take() {
+            self.state = CompleteUploadState::DropIntent;
+            return smallvec![Effect::Storage(StorageEffect::Delete {
+                key_space: IMPORT_INTENT_KEYSPACE.to_string(),
+                key,
+                txn_id: None,
+            })];
+        }
         // Parts in a provider upload cannot move to another path; the client uploads again.
         if self.plain_upload().is_some() {
             return self.schedule_error(BlobError::PathTaken.into());
@@ -169,11 +178,22 @@ impl CompleteUploadOperation {
         };
         match intent_write(target.import_id, path, &intent) {
             Ok(effect) => {
+                self.written_intent = Some(intent_key(target.import_id, path, version_id));
                 self.pending_compose = Some(compose);
                 self.state = CompleteUploadState::WriteIntent;
                 smallvec![effect]
             }
             Err(error) => self.schedule_error(error.into()),
+        }
+    }
+
+    /// A failed delete leaves the intent; the import then finds no committed version for it.
+    pub(super) fn intent_dropped(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::DeleteResult { .. } | StorageEvent::Error { .. }) => {
+                self.plain_taken()
+            }
+            _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
         }
     }
 
@@ -456,6 +476,18 @@ mod tests {
         assert_eq!(versions(Some(Ulid::from_parts(6, 6))), 0);
     }
 
+    /// Answers the intent delete that comes after a refused compose, and returns its key.
+    fn past_drop(operation: &mut CompleteUploadOperation, effects: Effects) -> (Key, Effects) {
+        let [Effect::Storage(StorageEffect::Delete { key_space, key, .. })] = effects.as_slice()
+        else {
+            panic!("expected the intent delete, got {effects:?}")
+        };
+        assert_eq!(key_space, IMPORT_INTENT_KEYSPACE);
+        let key = key.clone();
+        let event = Event::Storage(StorageEvent::DeleteResult { key: key.clone() });
+        (key, operation.step(event))
+    }
+
     /// Answers the stored and synced write intent that comes before a plain compose.
     fn past_intent(operation: &mut CompleteUploadOperation, effects: Effects) -> Effects {
         match effects.as_slice() {
@@ -532,11 +564,18 @@ mod tests {
         // Another upload took the free path first; the parts still compose next to it.
         let taken = || Event::Blob(BlobEvent::Error(BlobError::PathTaken));
         let effects = operation.step(taken());
+        // The refused compose moved no byte, so the intent of the free path goes.
+        let (key, effects) = past_drop(&mut operation, effects);
+        assert_eq!(
+            key,
+            intent_key(Ulid::from_bytes([4u8; 16]), "raw/object", id)
+        );
         let plain = composed(&past_intent(&mut operation, effects));
         assert_eq!(plain.path, format!("raw/object~{id}"));
         assert!(plain.if_not_exists);
 
         let effects = operation.step(taken());
+        let (_, effects) = past_drop(&mut operation, effects);
         assert!(
             !effects
                 .iter()
@@ -673,6 +712,7 @@ mod tests {
         }));
         past_intent(&mut operation, effects);
         let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
+        let (_, effects) = past_drop(&mut operation, effects);
         assert!(
             !effects.iter().any(|effect| matches!(
                 effect,

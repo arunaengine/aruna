@@ -107,6 +107,8 @@ pub enum CompleteUploadState {
     WriteIntent,
     /// Deletes that record in the version transaction.
     RetireIntent,
+    /// Deletes the record of a compose the provider refused before any byte moved.
+    DropIntent,
     WriteCleanupRecords,
     WriteReplicationObligation,
     EnforceQuota,
@@ -309,6 +311,8 @@ pub struct CompleteUploadOperation {
     plain_etag: Option<String>,
     /// The compose that waits for its intent record.
     pending_compose: Option<Effects>,
+    /// The intent record of the compose in flight.
+    written_intent: Option<Key>,
 }
 
 impl CompleteUploadOperation {
@@ -359,6 +363,7 @@ impl CompleteUploadOperation {
             plain_version: None,
             plain_etag: None,
             pending_compose: None,
+            written_intent: None,
         }
     }
 
@@ -2312,6 +2317,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::ReadImportRule => self.import_rule_read(event),
             CompleteUploadState::WriteIntent => self.intent_written(event),
             CompleteUploadState::RetireIntent => self.intent_retired(event),
+            CompleteUploadState::DropIntent => self.intent_dropped(event),
             CompleteUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
             CompleteUploadState::WriteReplicationObligation => self.obligation_written(event),
             CompleteUploadState::EnforceQuota => self.handle_enforce_quota(event),

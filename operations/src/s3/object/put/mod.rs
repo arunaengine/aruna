@@ -124,6 +124,8 @@ pub enum PutObjectState {
     ReadHistory,
     /// Deletes the write intents the committed version makes obsolete.
     RetireIntents,
+    /// Deletes the intent of a write the provider refused before any byte moved.
+    DropIntent,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -288,6 +290,8 @@ pub struct PutObjectOperation {
     keep_head: bool,
     /// The plain write that waits for its intent record.
     pending_write: Option<Effects>,
+    /// The intent record of the plain write in flight.
+    written_intent: Option<aruna_core::types::Key>,
 }
 
 impl PutObjectOperation {
@@ -338,6 +342,7 @@ impl PutObjectOperation {
             rule_exists: None,
             keep_head: false,
             pending_write: None,
+            written_intent: None,
         }
     }
 
@@ -806,6 +811,7 @@ impl PutObjectOperation {
                 }
                 return self.cleanup_failed_write(PutObjectError::BlobWriteFailed(error));
             }
+            Event::Blob(BlobEvent::Error(BlobError::PathTaken)) => return self.drop_intent(),
             Event::Blob(BlobEvent::Error(error)) => {
                 return self.cleanup_failed_write(PutObjectError::BlobWriteFailed(error));
             }
@@ -1870,6 +1876,7 @@ impl Operation for PutObjectOperation {
             }
             PutObjectState::ReadImportRule => self.import_rule_read(event),
             PutObjectState::WriteIntent => self.intent_written(event),
+            PutObjectState::DropIntent => self.intent_dropped(event),
             PutObjectState::ReadHistory => self.history_read(event),
             PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
