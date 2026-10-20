@@ -175,9 +175,14 @@ impl CompleteUploadOperation {
         }
     }
 
+    /// The compose waits until its intent is synced to disk.
     pub(super) fn intent_written(&mut self, event: Event) -> Effects {
         match (event, self.pending_compose.take()) {
             (Event::Storage(StorageEvent::WriteResult { .. }), Some(compose)) => {
+                self.pending_compose = Some(compose);
+                smallvec![Effect::Storage(StorageEffect::SyncAll)]
+            }
+            (Event::Storage(StorageEvent::SyncAllFinished), Some(compose)) => {
                 self.state = CompleteUploadState::ComposeBlob;
                 compose
             }
@@ -399,15 +404,20 @@ mod tests {
         assert_eq!(versions(Some(Ulid::from_parts(6, 6))), 0);
     }
 
-    /// Answers the stored write intent that comes before a plain compose.
+    /// Answers the stored and synced write intent that comes before a plain compose.
     fn past_intent(operation: &mut CompleteUploadOperation, effects: Effects) -> Effects {
         match effects.as_slice() {
             [Effect::Storage(StorageEffect::Write { key_space, .. })]
                 if key_space == aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE =>
             {
-                operation.step(Event::Storage(StorageEvent::WriteResult {
+                let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
                     key: Vec::new().into(),
-                }))
+                }));
+                assert!(matches!(
+                    effects.as_slice(),
+                    [Effect::Storage(StorageEffect::SyncAll)]
+                ));
+                operation.step(Event::Storage(StorageEvent::SyncAllFinished))
             }
             _ => effects,
         }

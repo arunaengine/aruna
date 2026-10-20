@@ -137,10 +137,14 @@ impl PutObjectOperation {
         }
     }
 
-    /// Bytes move only once their identity is stored.
+    /// Bytes move only once their identity is stored and synced to disk.
     pub(super) fn intent_written(&mut self, event: Event) -> Effects {
         match (event, self.pending_write.take()) {
             (Event::Storage(StorageEvent::WriteResult { .. }), Some(write)) => {
+                self.pending_write = Some(write);
+                smallvec![Effect::Storage(StorageEffect::SyncAll)]
+            }
+            (Event::Storage(StorageEvent::SyncAllFinished), Some(write)) => {
                 self.state = PutObjectState::WriteBlob;
                 write
             }
@@ -479,7 +483,7 @@ mod tests {
         assert_eq!(path, "raw/data/a.csv");
         // A folder key is written at its exact key, without looking first.
         let (mut operation, _) = mapped("reports/");
-        let effects = operation.step(write_result());
+        let effects = past_intent(&mut operation);
         let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
             panic!("expected a folder write, got {effects:?}")
         };
@@ -495,10 +499,19 @@ mod tests {
         }
     }
 
-    fn write_result() -> Event {
-        Event::Storage(StorageEvent::WriteResult {
+    /// Answers the intent write and its sync; the write waits for both.
+    fn past_intent(operation: &mut PutObjectOperation) -> Effects {
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
             key: Vec::new().into(),
-        })
+        }));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::SyncAll)]
+            ),
+            "expected the intent sync, got {effects:?}"
+        );
+        operation.step(Event::Storage(StorageEvent::SyncAllFinished))
     }
 
     #[test]
@@ -529,7 +542,7 @@ mod tests {
             ("in/x/one.csv", id)
         );
         assert_eq!(intent.backend, BackendRef::Group(backend_id()));
-        let effects = operation.step(write_result());
+        let effects = past_intent(&mut operation);
         let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
             panic!("expected a plain write, got {effects:?}")
         };
@@ -840,7 +853,7 @@ mod tests {
             exists: true,
             version: None,
         }));
-        let effects = operation.step(write_result());
+        let effects = past_intent(&mut operation);
         let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
             panic!("expected a plain write, got {effects:?}")
         };
@@ -856,7 +869,7 @@ mod tests {
             exists: false,
             version: None,
         }));
-        operation.step(write_result());
+        past_intent(&mut operation);
 
         // Another upload took the free path first; nothing at the path is deleted.
         let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
