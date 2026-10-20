@@ -373,7 +373,8 @@ pub async fn backend_status(
         let Ok(
             BlobCleanupWork::DeleteBlob { location }
             | BlobCleanupWork::ReconcileWrite { location, .. }
-            | BlobCleanupWork::ReconcileReservation { location },
+            | BlobCleanupWork::ReconcileReservation { location }
+            | BlobCleanupWork::ReleaseRenamed { location, .. },
         ) = BlobCleanupWork::from_bytes(value.as_ref())
         else {
             continue;

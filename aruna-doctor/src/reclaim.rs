@@ -144,7 +144,8 @@ fn status_output(database_path: &str) -> Result<ReclaimStatusOutput, ExplorerErr
         if let Ok(
             BlobCleanupWork::DeleteBlob { location }
             | BlobCleanupWork::ReconcileWrite { location, .. }
-            | BlobCleanupWork::ReconcileReservation { location },
+            | BlobCleanupWork::ReconcileReservation { location }
+            | BlobCleanupWork::ReleaseRenamed { location, .. },
         ) = BlobCleanupWork::from_bytes(value.as_ref())
         {
             let row = backends.entry(location.backend.to_string()).or_default();

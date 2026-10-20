@@ -10,11 +10,12 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, COPY_OWNER_KEYSPACE, PENDING_LOCATION_KEYSPACE,
-    STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, COPY_OWNER_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::backend_import::{ImportedObject, object_key};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, CopyOwner,
     WriteOwner,
@@ -102,9 +103,8 @@ fn cleanup_row_key(work: &BlobCleanupWork) -> Key {
         }
         BlobCleanupWork::DeleteBlob { .. }
         | BlobCleanupWork::RegisterDht { .. }
-        | BlobCleanupWork::ReconcileReservation { .. } => {
-            Ulid::generate().to_bytes().to_vec().into()
-        }
+        | BlobCleanupWork::ReconcileReservation { .. }
+        | BlobCleanupWork::ReleaseRenamed { .. } => Ulid::generate().to_bytes().to_vec().into(),
     }
 }
 
@@ -400,6 +400,66 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
             realm_id,
             ttl_ms,
         } => register_dht(context, blake3, realm_id, ttl_ms).await.into(),
+        BlobCleanupWork::ReleaseRenamed {
+            location,
+            import_id,
+            version_id,
+        } => release_renamed(context, location, import_id, version_id)
+            .await
+            .into(),
+    }
+}
+
+/// Deletes the file a rename replaced, then the import row that names it. A row that names
+/// another version means another write took the path, so the file stays.
+async fn release_renamed(
+    context: &DriverContext,
+    location: BackendLocation,
+    import_id: Ulid,
+    version_id: Ulid,
+) -> bool {
+    let key = object_key(import_id, &location.backend_path);
+    let read = StorageEffect::Read {
+        key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
+        key: key.clone(),
+        txn_id: None,
+    };
+    let event = context.storage_handle.send_storage_effect(read).await;
+    let row = match parse_read(event, ImportedObject::from_bytes) {
+        Ok(row) => row,
+        Err(error) => {
+            warn!(%error, "Renamed file row could not be read");
+            return false;
+        }
+    };
+    if row.as_ref().is_some_and(|row| row.version_id != version_id) {
+        return true;
+    }
+    let Some(blob_handle) = context.blob_handle.as_ref() else {
+        return false;
+    };
+    let effect = BlobEffect::DeletePlain { location };
+    match blob_handle.send_blob_effect(effect).await {
+        Event::Blob(BlobEvent::DeleteFinished) => {}
+        event => {
+            warn!(?event, "Renamed file could not be deleted");
+            return false;
+        }
+    }
+    if row.is_none() {
+        return true;
+    }
+    let delete = StorageEffect::Delete {
+        key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
+        key,
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(delete).await {
+        Event::Storage(StorageEvent::DeleteResult { .. }) => true,
+        event => {
+            warn!(?event, "Renamed file row could not be deleted");
+            false
+        }
     }
 }
 
@@ -791,6 +851,64 @@ mod tests {
             .await
             .unwrap();
         values.len()
+    }
+
+    #[tokio::test]
+    async fn releases_renamed_once() {
+        use aruna_core::keyspaces::IMPORTED_OBJECT_KEYSPACE;
+        use aruna_core::structs::storage::backend_import::{ImportedObject, object_key};
+        let (_dir, storage, context) = setup_context();
+        let BlobCleanupWork::DeleteBlob { mut location } =
+            BlobCleanupWork::from_bytes(&delete_work()).unwrap()
+        else {
+            unreachable!()
+        };
+        (location.storage_bucket, location.backend_path) = (String::new(), "raw/a".to_string());
+        let (import_id, version_id) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
+        let work = |version_id| BlobCleanupWork::ReleaseRenamed {
+            location: location.clone(),
+            import_id,
+            version_id,
+        };
+        let row = ImportedObject::written(version_id, "in/a".to_string(), 0, None);
+        let event = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
+                key: object_key(import_id, "raw/a"),
+                value: row.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        // The file of this version waits for a blob handle; its row stays until the delete.
+        write_rows(&storage, vec![work(version_id).to_bytes().unwrap()]).await;
+        let outcome = process_cleanup_batch(&context).await.unwrap();
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(remaining_rows(&storage).await, 1);
+
+        // A path that another version took keeps its file, and the release ends.
+        let (_dir, storage, context) = setup_context();
+        let event = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
+                key: object_key(import_id, "raw/a"),
+                value: row.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        let other = work(Ulid::from_parts(3, 3)).to_bytes().unwrap();
+        write_rows(&storage, vec![other]).await;
+        let outcome = process_cleanup_batch(&context).await.unwrap();
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(remaining_rows(&storage).await, 0);
     }
 
     #[tokio::test]

@@ -1867,7 +1867,9 @@ impl CompleteUploadOperation {
                 BlobCleanupWork::ReconcileWrite { location, .. } => {
                     location.ulid.to_bytes().to_vec().into()
                 }
-                BlobCleanupWork::DeleteBlob { .. } | BlobCleanupWork::RegisterDht { .. } => {
+                BlobCleanupWork::DeleteBlob { .. }
+                | BlobCleanupWork::RegisterDht { .. }
+                | BlobCleanupWork::ReleaseRenamed { .. } => {
                     Ulid::generate().to_bytes().to_vec().into()
                 }
                 BlobCleanupWork::ReconcileReservation { .. } => {

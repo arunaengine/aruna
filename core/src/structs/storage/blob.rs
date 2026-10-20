@@ -320,6 +320,13 @@ pub enum BlobCleanupWork {
     ReconcileReservation {
         location: BackendLocation,
     },
+    /// A file in a linked folder that a rename replaced, and the import rule whose row names
+    /// it as `version_id`. Its version already names the new file.
+    ReleaseRenamed {
+        location: BackendLocation,
+        import_id: Ulid,
+        version_id: Ulid,
+    },
 }
 
 /// The record a write's commit would have made the owner of its bytes.
@@ -365,7 +372,8 @@ impl BlobCleanupWork {
         match self {
             Self::DeleteBlob { location }
             | Self::ReconcileWrite { location, .. }
-            | Self::ReconcileReservation { location } => Some(location),
+            | Self::ReconcileReservation { location }
+            | Self::ReleaseRenamed { location, .. } => Some(location),
             Self::RegisterDht { .. } => None,
         }
     }
