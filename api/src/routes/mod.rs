@@ -29,6 +29,7 @@ pub mod onboarding;
 pub mod pid;
 pub mod placement;
 pub mod policies;
+pub mod portal;
 pub mod repository;
 pub mod rocrate_import;
 pub mod search;
@@ -94,6 +95,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(link_routes::router())
         .merge(notifications::router())
         .merge(policies::router())
+        .merge(portal::router())
         .merge(search::router())
         .merge(access::service_accounts::router())
         .merge(access::sessions::router())
@@ -342,6 +344,7 @@ pub(crate) mod tests {
         ("GET", "/system/realm/descriptor"),
         ("GET", "/system/realm/federation"),
         ("GET", "/system/realm/placement"),
+        ("GET", "/system/realm/portal-features"),
         ("GET", "/system/usage"),
         ("GET", "/compute/jobs"),
         ("DELETE", "/compute/jobs/{job_id}"),
@@ -565,6 +568,7 @@ pub(crate) mod tests {
         ("PUT", "/data/groups/{group_id}/storage/routing"),
         ("PUT", "/data/groups/{group_id}/storage/imports/{import_id}"),
         ("PUT", "/system/realm/federation"),
+        ("PUT", "/system/realm/portal-features"),
         ("PUT", "/system/realm/quota"),
         ("PUT", "/metadata/{document_id}/rocrate"),
         (
