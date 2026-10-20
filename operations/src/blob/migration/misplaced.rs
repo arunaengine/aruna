@@ -1,8 +1,9 @@
-//! Counts the versions of a bucket that a storage move would move now.
+//! Counts the versions of a bucket that a storage move would move now, and the linked files
+//! it would rename.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{encrypting, move_routing, place, source_key, stays};
+use super::{encrypting, move_routing, place, read_earlier, renames, source_key, stays};
 use crate::blob::records::blob_location_read;
 use crate::driver::DriverContext;
 use aruna_core::events::{Event, StorageEvent};
@@ -16,13 +17,19 @@ use aruna_core::types::Key;
 /// Versions one count reads at most, so a request stays bounded.
 const COUNT_LIMIT: usize = 10_000;
 const COUNT_PAGE: usize = 256;
+/// Renames one count lists by name; `renamed` counts all of them.
+const RENAME_LIST: usize = 100;
 
 /// Versions under a prefix that are not where the rules place a new write of their key.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Misplaced {
     pub count: u64,
     /// `false` when the count stopped at its limit and more versions exist.
     pub complete: bool,
+    /// Linked files of an earlier pattern among them, which a move gives their current name.
+    pub renamed: u64,
+    /// The first of them, as the old and the new path.
+    pub renames: Vec<(String, String)>,
 }
 
 /// Counts what a move of `prefix` would move, with the move's own skips: an encrypted bucket
@@ -33,8 +40,8 @@ pub async fn count_misplaced(
     prefix: &str,
 ) -> Result<Misplaced, String> {
     let mut misplaced = Misplaced {
-        count: 0,
         complete: true,
+        ..Misplaced::default()
     };
     if encrypting(context, &bucket.as_bytes().to_vec().into()).await? {
         return Ok(misplaced);
@@ -42,6 +49,7 @@ pub async fn count_misplaced(
     let Some(routing) = move_routing(context, bucket).await? else {
         return Ok(misplaced);
     };
+    let earlier = read_earlier(context, &routing).await?;
     let scan = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
     let (mut after, mut seen) = (None::<Key>, 0);
     loop {
@@ -73,8 +81,25 @@ pub async fn count_misplaced(
             if read(context, BROKEN_VERSION_KEYSPACE, key.clone())
                 .await?
                 .is_some()
-                || !moves(context, &source).await?
             {
+                continue;
+            }
+            let Some(location) = read_location(context, &source).await? else {
+                continue;
+            };
+            let renamed = plain
+                .as_ref()
+                .filter(|plain| renames(&routing, &earlier, plain, &location, &version_key));
+            if let Some(plain) = renamed {
+                misplaced.renamed += 1;
+                if misplaced.renames.len() < RENAME_LIST {
+                    let paths = (location.backend_path.clone(), plain.path.clone());
+                    misplaced.renames.push(paths);
+                }
+                misplaced.count += 1;
+                continue;
+            }
+            if stays(&location, true) {
                 continue;
             }
             // A copy in place with its linked file recorded for this version is done.
@@ -118,20 +143,20 @@ async fn read(
     }
 }
 
-/// Whether the copy a version names exists and would leave its place.
-async fn moves(
+/// The copy a version names, if it exists.
+async fn read_location(
     context: &DriverContext,
     key: &aruna_core::structs::storage::blob::BlobLocationKey,
-) -> Result<bool, String> {
+) -> Result<Option<BackendLocation>, String> {
     let aruna_core::effects::Effect::Storage(read) = blob_location_read(key, None) else {
         return Err("unexpected location read".to_string());
     };
     match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => match value {
             Some(value) => BackendLocation::from_bytes(value.as_ref())
-                .map(|location| !stays(&location, true))
+                .map(Some)
                 .map_err(|error| error.to_string()),
-            None => Ok(false),
+            None => Ok(None),
         },
         other => Err(format!("could not read a location: {other:?}")),
     }

@@ -20,7 +20,7 @@ use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
     COMPRESSION_QUEUE_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, MANAGED_COPY_KEYSPACE,
     S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
@@ -30,17 +30,20 @@ use aruna_core::structs::storage::backend_import::{
     BackendImport, ImportedObject, PlainPath, object_key,
 };
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
-    ManagedCopyKey, ManagedCopyRecord, ResolvedBackend, VersionKey,
+    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion, BlobVersionState,
+    BucketInfo, ManagedCopyKey, ManagedCopyRecord, ResolvedBackend, VersionKey,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::encryption::BucketEncryption;
-use aruna_core::structs::storage::format::{Compression, CompressionMigration, EncodingClass};
+use aruna_core::structs::storage::format::{
+    Compression, CompressionMigration, EncodingClass, StoredLayout,
+};
 use aruna_core::structs::storage::routing::{
     GroupStorageRouting, PlainTarget, RoutingError, RoutingSnapshot, resolve_backend,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use ulid::Ulid;
@@ -53,6 +56,7 @@ pub enum MigrateState {
     ReadLocation,
     FindTarget,
     ProbeTarget,
+    HashTarget,
     CheckLinked,
     StatPlain,
     ReadBlob,
@@ -123,6 +127,10 @@ pub struct MigrateVersionOperation {
     resolved: Option<ResolvedBackend>,
     /// The path in a linked folder a move writes to, and the path its stat settled on.
     plain: Option<PlainTarget>,
+    /// Earlier write patterns of the bucket's import rules, by import id.
+    earlier: Earlier,
+    /// The version's linked file has a name of an earlier pattern and gets the current one.
+    renaming: bool,
     plain_path: Option<PlainPath>,
     /// The backend's id of the bytes a plain write stored.
     backend_version: Option<String>,
@@ -154,6 +162,8 @@ impl MigrateVersionOperation {
             resolved: None,
             plain: None,
             plain_path: None,
+            earlier: Earlier::new(),
+            renaming: false,
             backend_version: None,
             backend_etag: None,
             found: None,
@@ -173,6 +183,12 @@ impl MigrateVersionOperation {
     /// Moves the version to where `routing` sends a new write of its key.
     pub fn with_routing(mut self, routing: RoutingSnapshot) -> Self {
         self.routing = Some(routing);
+        self
+    }
+
+    /// Lets a move give linked files of an earlier pattern their current name.
+    pub fn with_earlier(mut self, earlier: Earlier) -> Self {
+        self.earlier = earlier;
         self
     }
 
@@ -272,7 +288,13 @@ impl MigrateVersionOperation {
             Ok(old) => old,
             Err(error) => return self.fail(error.into()),
         };
-        if stays(&old, self.routing.is_some()) {
+        self.renaming = match (self.routing.as_ref(), self.plain.as_ref()) {
+            (Some(routing), Some(plain)) => {
+                renames(routing, &self.earlier, plain, &old, &self.version_key)
+            }
+            _ => false,
+        };
+        if stays(&old, self.routing.is_some()) && !self.renaming {
             return self.skip();
         }
         let in_place = self
@@ -392,6 +414,19 @@ impl MigrateVersionOperation {
         let Some(plain) = self.plain.as_ref() else {
             return self.fail(MigrateVersionError::NotFinished);
         };
+        // A rename never tags or replaces a taken name; it adopts only an earlier copy of its own.
+        if self.renaming && exists {
+            let Some(old) = self.old.as_ref() else {
+                return self.fail(MigrateVersionError::NotFinished);
+            };
+            let resolved = ResolvedBackend::new(old.backend.clone(), old.storage_class.clone());
+            self.state = MigrateState::HashTarget;
+            return smallvec![Effect::Blob(BlobEffect::HashExternal {
+                resolved,
+                path: plain.path.clone(),
+                created_by: old.created_by,
+            })];
+        }
         let attempt = Ulid::generate();
         let versioned = plain.same_name && version.is_some();
         let (path, if_not_exists) = same_name_path(&plain.path, attempt, exists, versioned);
@@ -401,6 +436,28 @@ impl MigrateVersionOperation {
             if_not_exists,
         });
         self.read_blob()
+    }
+
+    /// The file at the new name is a copy an interrupted rename left, if its bytes match.
+    fn handle_hashed(&mut self, event: Event) -> Effects {
+        let (mut location, version) = match event {
+            Event::Blob(BlobEvent::ExternalHashed { location, version }) => (location, version),
+            Event::Blob(BlobEvent::Error(error)) => return self.fail(error.into()),
+            other => return self.unexpected(other),
+        };
+        let same = self.old.as_ref().is_some_and(|old| {
+            old.get_blake3() == location.get_blake3() && old.blob_size == location.blob_size
+        });
+        if !same {
+            return self.fail(BlobError::PathTaken.into());
+        }
+        location.format.layout = StoredLayout::Plain(location.ulid);
+        self.backend_version = version;
+        self.new = Some(location);
+        self.state = MigrateState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 
     fn read_blob(&mut self) -> Effects {
@@ -788,6 +845,19 @@ impl MigrateVersionOperation {
             self.version_key.to_bytes()?.into(),
             migrated.to_bytes()?.into(),
         ));
+        // The old file goes only after this commit makes the version name the new one.
+        if let (true, Some(plain)) = (self.renaming && !unchanged, self.plain.as_ref()) {
+            let work = BlobCleanupWork::ReleaseRenamed {
+                location: old.clone(),
+                import_id: plain.import_id,
+                version_id: self.version_key.version_id,
+            };
+            writes.push((
+                BLOB_CLEANUP_KEYSPACE.to_string(),
+                Ulid::generate().to_bytes().to_vec().into(),
+                work.to_bytes()?.into(),
+            ));
+        }
         if unchanged {
             return Ok(writes);
         }
@@ -881,6 +951,7 @@ impl Operation for MigrateVersionOperation {
             MigrateState::ReadLocation => self.handle_location(event),
             MigrateState::FindTarget => self.handle_found(event),
             MigrateState::ProbeTarget => self.handle_probe(event),
+            MigrateState::HashTarget => self.handle_hashed(event),
             MigrateState::CheckLinked => self.handle_linked(event),
             MigrateState::StatPlain => self.handle_stat(event),
             MigrateState::ReadBlob => self.handle_read(event),
@@ -959,6 +1030,51 @@ fn source_key(
     let governed = !version.placement_policies.is_empty() && wanted.0 != *backend;
     let moves = (linked || wanted != (backend.clone(), *encoding)) && !governed;
     moves.then(|| version.location_key()).flatten()
+}
+
+/// Earlier write patterns of import rules, by import id.
+pub type Earlier = BTreeMap<Ulid, Vec<String>>;
+
+/// Whether a move gives the linked file at `location` the name `plain` of its version: the
+/// file is the version's own copy, and an earlier pattern of the rule named it for the version.
+pub fn renames(
+    routing: &RoutingSnapshot,
+    earlier: &Earlier,
+    plain: &PlainTarget,
+    location: &BackendLocation,
+    key: &VersionKey,
+) -> bool {
+    let rule = routing
+        .imports
+        .iter()
+        .find(|rule| rule.import_id == plain.import_id);
+    let Some(rule) = rule.filter(|rule| BackendRef::Group(rule.backend_id) == plain.backend) else {
+        return false;
+    };
+    let patterns = earlier.get(&rule.import_id).map_or(&[][..], Vec::as_slice);
+    let target = rule.rename_target(patterns, &location.backend_path, &key.key, key.version_id);
+    location.is_external()
+        && !location.staging
+        && !location.partial
+        && location.backend == plain.backend
+        && matches!(location.format.layout, StoredLayout::Plain(_))
+        && target.as_deref() == Some(plain.path.as_str())
+}
+
+/// Reads the earlier patterns of the rules a move resolves against.
+pub async fn read_earlier(
+    context: &crate::driver::DriverContext,
+    routing: &RoutingSnapshot,
+) -> Result<Earlier, String> {
+    let mut earlier = Earlier::new();
+    for rule in &routing.imports {
+        let patterns = crate::groups::imports::read_earlier(context, rule.import_id).await;
+        let patterns = patterns.map_err(|error| error.to_string())?;
+        if !patterns.is_empty() {
+            earlier.insert(rule.import_id, patterns);
+        }
+    }
+    Ok(earlier)
 }
 
 /// Copies that stay: unfinished ones, and on a move files in a linked folder.
@@ -1116,6 +1232,10 @@ async fn migrate_page(
         },
         false => None,
     };
+    let earlier = match routing.as_ref() {
+        Some(routing) => read_earlier(context, routing).await?,
+        None => Earlier::new(),
+    };
     let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
     let (versions, next) = crate::jobs::store::iter_prefix_page(
         &context.storage_handle,
@@ -1137,7 +1257,9 @@ async fn migrate_page(
         let mut operation =
             MigrateVersionOperation::new(version_key, record.target, SystemTime::now());
         if let Some(routing) = routing {
-            operation = operation.with_routing(routing);
+            operation = operation
+                .with_routing(routing)
+                .with_earlier(earlier.clone());
         }
         let moved = crate::driver::drive(operation, context).await;
         let broken = moved.is_err() && moving && is_broken(context, key).await;
@@ -1842,6 +1964,7 @@ mod tests {
             let mut written = on_storage(location(false));
             (written.storage_bucket, written.backend_path) = (String::new(), plain.path.clone());
             written.ulid = plain.ulid;
+            written.format.layout = StoredLayout::Plain(plain.ulid);
             Event::Blob(BlobEvent::PlainWritten {
                 location: written,
                 version: None,
@@ -2187,6 +2310,136 @@ mod tests {
 
             let effects = operation.step(read_result(Some(external.to_bytes().unwrap())));
 
+            assert!(effects.is_empty());
+            assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+        }
+
+        /// A version whose own linked file has the name of the earlier prefix pattern.
+        fn prefixed() -> (BlobVersion, BackendLocation) {
+            let id = Ulid::from_bytes([2; 16]);
+            let mut old = on_storage(location(false));
+            old.storage_bucket = String::new();
+            old.backend_path = format!("raw/x/{id}_one.csv");
+            old.format.layout = StoredLayout::Plain(old.ulid);
+            let mut version = raw_version();
+            if let BlobVersionState::Materialized {
+                backend, encoding, ..
+            } = &mut version.state
+            {
+                (*backend, *encoding) = (storage(), old.format.encoding());
+            }
+            (version, old)
+        }
+
+        /// A move that knows the rule's earlier prefix pattern, up to the stat of the new name.
+        fn renaming(version: &BlobVersion, old: &BackendLocation) -> MigrateVersionOperation {
+            let earlier = Earlier::from([(IMPORT, vec!["{dir}{id}_{name}".to_string()])]);
+            let mut operation = operation("in/x/one.csv", vec![rule()]).with_earlier(earlier);
+            operation.start();
+            operation.step(read_result(Some(version.to_bytes().unwrap())));
+            operation.step(read_result(Some(old.to_bytes().unwrap())));
+            let effects = operation.step(read_result(None));
+            let [Effect::Blob(BlobEffect::StatPlain { path, .. })] = effects.as_slice() else {
+                panic!("expected the stat of the new name, got {effects:?}")
+            };
+            assert_eq!(
+                path,
+                &format!("raw/x/one.csv~{}", Ulid::from_bytes([2; 16]))
+            );
+            operation
+        }
+
+        #[test]
+        fn renames_linked_file() {
+            let (version, old) = prefixed();
+            let mut operation = renaming(&version, &old);
+            operation.step(Event::Blob(BlobEvent::PlainStat {
+                exists: false,
+                version: None,
+            }));
+            let effects = operation.step(empty_blob());
+            let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
+                panic!("expected the new file, got {effects:?}")
+            };
+            assert!(plain.if_not_exists);
+            let plain = plain.clone();
+            operation.step(plain_written(&plain));
+            operation.step(Event::Storage(StorageEvent::TransactionStarted {
+                txn_id: TxnId::default(),
+            }));
+            published(&mut operation, Some(rule()));
+            operation.step(read_result(Some(version.to_bytes().unwrap())));
+
+            let effects = operation.step(read_result(None));
+
+            // The version names the new file; the old one goes only through the cleanup queue.
+            let writes = batch(&effects);
+            let find = |space: &str| writes.iter().find(|(found, ..)| found == space).unwrap();
+            let moved = BlobVersion::from_bytes(&find(BLOB_VERSIONS_KEYSPACE).2).unwrap();
+            let encoding = EncodingClass::Plain {
+                location: plain.ulid,
+            };
+            assert_eq!(moved.location_key().unwrap().encoding, encoding);
+            assert_eq!(
+                find(IMPORTED_OBJECT_KEYSPACE).1,
+                object_key(IMPORT, &plain.path)
+            );
+            let work = BlobCleanupWork::from_bytes(&find(BLOB_CLEANUP_KEYSPACE).2).unwrap();
+            let BlobCleanupWork::ReleaseRenamed {
+                location,
+                import_id,
+                version_id,
+            } = work
+            else {
+                panic!("expected the release of the old file")
+            };
+            assert_eq!((location, import_id), (old, IMPORT));
+            assert_eq!(version_id, Ulid::from_bytes([2; 16]));
+        }
+
+        #[test]
+        fn resumes_taken_name() {
+            // An interrupted rename left its copy at the new name; matching bytes are adopted.
+            let (version, old) = prefixed();
+            for (hash, adopted) in [(4u8, true), (5u8, false)] {
+                let mut operation = renaming(&version, &old);
+                let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+                    exists: true,
+                    version: None,
+                }));
+                let [Effect::Blob(BlobEffect::HashExternal { path, .. })] = effects.as_slice()
+                else {
+                    panic!("expected the hash of the taken name, got {effects:?}")
+                };
+                let mut found = on_storage(location(false));
+                (found.storage_bucket, found.backend_path) = (String::new(), path.clone());
+                found.hashes = HashMap::from([(HASH_BLAKE3.to_string(), vec![hash; 32])]);
+                let effects = operation.step(Event::Blob(BlobEvent::ExternalHashed {
+                    location: found,
+                    version: None,
+                }));
+                if adopted {
+                    assert!(matches!(
+                        effects.as_slice(),
+                        [Effect::Storage(StorageEffect::StartTransaction { .. })]
+                    ));
+                    continue;
+                }
+                // Another file at the new name is never replaced or renamed around.
+                assert!(effects.is_empty());
+                let error = MigrateVersionError::Blob(BlobError::PathTaken);
+                assert_eq!(operation.finalize(), Err(error));
+            }
+        }
+
+        #[test]
+        fn keeps_unknown_name() {
+            // Without the earlier pattern the name tells no version, so the file stays.
+            let (version, old) = prefixed();
+            let mut operation = operation("in/x/one.csv", vec![rule()]);
+            operation.start();
+            operation.step(read_result(Some(version.to_bytes().unwrap())));
+            let effects = operation.step(read_result(Some(old.to_bytes().unwrap())));
             assert!(effects.is_empty());
             assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
         }
