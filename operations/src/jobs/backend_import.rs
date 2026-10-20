@@ -24,6 +24,7 @@ use aruna_core::structs::storage::blob::{
     ResolvedBackend, VersionKey, bucket_permission_path, ensure_confined_path,
 };
 use aruna_core::structs::storage::delete_audit::BlobAuditRecord;
+use aruna_core::structs::storage::discovery::{DiscoveryRule, discovered_key};
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{RoutingSnapshot, RoutingTarget, RuleSource};
@@ -40,6 +41,8 @@ use super::store::{put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive, gate_context, now_ms, routing_snapshot};
 use crate::groups::backends::query::GetBackendOperation;
+use crate::groups::imports::discovery::read_discovery;
+use crate::groups::imports::shared::{self, SharedRule, claim_file, read_shared};
 use crate::groups::imports::{read_earlier, read_import};
 use crate::placement::policy::{GateContext, PolicyGateError};
 use crate::realm::get_config::GetConfigOperation;
@@ -59,6 +62,8 @@ const LIST_PAGE: usize = 500;
 enum Decision {
     Skip,
     Import,
+    /// An unmapped file whose key the bucket already holds: a conflict, never a takeover.
+    Taken,
 }
 
 /// Writes and deletes in Aruna win: a changed object gets a new version only while the key
@@ -71,7 +76,7 @@ fn decide(
     version_exists: bool,
 ) -> Decision {
     match row {
-        None if head.is_some() => Decision::Skip,
+        None if head.is_some() => Decision::Taken,
         None => Decision::Import,
         Some(row) if row.matches(object) => match head {
             None if !version_exists => Decision::Import,
@@ -107,6 +112,10 @@ struct ImportRun {
     gate: Option<GateContext>,
     /// The write intents of the listed page by path, read in one range.
     intents: BTreeMap<String, Vec<(Key, WriteIntent)>>,
+    /// File name rules for objects without a recorded mapping.
+    discovery: Vec<DiscoveryRule>,
+    /// Other rules that read an overlapping folder; they may own a listed file.
+    shared: Vec<SharedRule>,
 }
 
 fn permanent(message: impl Into<String>) -> JobRunOutcome {
@@ -284,6 +293,10 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
     let gate = gate_context(&ctx.driver, realm_id, now_ms())
         .await
         .map_err(retryable)?;
+    let discovery = read_discovery(&ctx.driver, rule.group_id, rule.import_id)
+        .await
+        .map_err(retryable)?;
+    let shared = read_shared(&ctx.driver, &rule).await.map_err(retryable)?;
     Ok(ImportRun {
         rule,
         earlier,
@@ -293,6 +306,8 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
         quota,
         gate,
         intents: BTreeMap::new(),
+        discovery,
+        shared,
     })
 }
 
@@ -351,10 +366,18 @@ async fn import_object(
     if let Some(outcome) = recovery.await? {
         return Ok(outcome);
     }
-    let key = match row.as_ref().and_then(|row| row.key.clone()) {
-        Some(key) => key,
-        None => rule.aruna_key(&object.key).unwrap_or_default(),
-    };
+    let key = bucket_key(rule, &run.discovery, row.as_ref(), &object.key)?;
+    if row.is_none() {
+        let own = (rule, run.discovery.as_slice());
+        match claim_file(&ctx.driver, own, &run.shared, &object.key).await {
+            Ok(shared::Claim::Own) => {}
+            Ok(shared::Claim::Other) => return Ok(Outcome::Ignored),
+            Ok(shared::Claim::Conflict) => {
+                return Err(ItemError::Item(SHARED_CONFLICT.to_string()));
+            }
+            Err(error) => return Err(ItemError::System(error.to_string())),
+        }
+    }
     if key.is_empty() {
         return Err(ItemError::Item(
             "the object maps to an empty key".to_string(),
@@ -395,13 +418,19 @@ async fn import_object(
         }
         _ => false,
     };
-    if decide(object, row.as_ref(), head, version_exists) == Decision::Skip {
-        return Ok(Outcome::Skipped);
+    match decide(object, row.as_ref(), head, version_exists) {
+        Decision::Skip => return Ok(Outcome::Skipped),
+        Decision::Taken => return Err(taken(&key)),
+        Decision::Import => {}
     }
-    // The committed row stays until the new version replaces it in one transaction.
+    // The committed row stays until the new version replaces it in one transaction. A new
+    // row records its key, so later rule changes never move the object.
     let version_id = Ulid::generate();
     let committed = ImportedObject {
-        key: row.as_ref().and_then(|row| row.key.clone()),
+        key: match row.as_ref() {
+            Some(row) => row.key.clone(),
+            None => Some(key.clone()),
+        },
         ..ImportedObject::new(version_id, object)
     };
     // Aruna's own write that lost its head returns only if no delete removed it on purpose.
@@ -440,6 +469,7 @@ async fn import_object(
     match put.await {
         Ok(()) => {}
         // An Aruna write or delete marker came first and keeps the key.
+        Err(PutObjectError::HeadChanged) if row.is_none() => return Err(taken(&key)),
         Err(PutObjectError::HeadChanged | PutObjectError::HistoryDeleted) => {
             return Ok(Outcome::Skipped);
         }
@@ -914,6 +944,35 @@ async fn iterate(
     }
 }
 
+const SHARED_CONFLICT: &str =
+    "several rules read this folder and none or more than one names the file";
+
+/// An unmapped object whose key the bucket holds fails, even when the other write came first.
+fn taken(key: &str) -> ItemError {
+    ItemError::Item(format!("the key `{key}` already holds another object"))
+}
+
+/// A recorded mapping is kept; only an unmapped object is placed by the discovery rules.
+fn bucket_key(
+    rule: &BackendImport,
+    discovery: &[DiscoveryRule],
+    row: Option<&ImportedObject>,
+    path: &str,
+) -> Result<String, ItemError> {
+    let key = match row {
+        Some(row) => row.key.clone().or_else(|| rule.aruna_key(path)),
+        None => match discovered_key(rule, discovery, path) {
+            Some(Err(patterns)) => {
+                let patterns = patterns.join("`, `");
+                let error = format!("the file matches several discovery patterns: `{patterns}`");
+                return Err(ItemError::Item(error));
+            }
+            placed => placed.and_then(Result::ok),
+        },
+    };
+    Ok(key.unwrap_or_default())
+}
+
 /// The row an equal size updates without reading the bytes: the first listing of Aruna's own
 /// write, or any listing without ETag and time.
 fn trusted_listing(
@@ -1304,7 +1363,7 @@ async fn note_listing(
 
 /// Emits one listing or hashing effect and hands back the blob adapter's answer.
 #[derive(Debug, PartialEq)]
-struct BlobRequest {
+pub(crate) struct BlobRequest {
     state: RequestState,
     output: Option<Result<BlobEvent, BlobError>>,
 }
@@ -1324,7 +1383,7 @@ enum Answer {
 }
 
 impl BlobRequest {
-    fn new(effect: BlobEffect) -> Self {
+    pub(crate) fn new(effect: BlobEffect) -> Self {
         Self {
             state: RequestState::Ready(effect),
             output: None,
@@ -2129,11 +2188,73 @@ mod tests {
     }
 
     #[test]
+    fn keeps_recorded_keys() {
+        let mut rule = rule_at("");
+        rule.write_pattern = "{name}".to_string();
+        let discovery = [DiscoveryRule {
+            pattern: "*.txt".to_string(),
+            folder: "texts/".to_string(),
+        }];
+        let key = |row: Option<&ImportedObject>, path: &str| {
+            bucket_key(&rule, &discovery, row, path).ok()
+        };
+        // Uploads of `foo/bar.txt` and `bar/foo.txt` flattened into one folder keep their keys.
+        let bar = ImportedObject::written(Ulid::generate(), "foo/bar.txt".to_string(), 4, None);
+        let foo = ImportedObject::written(Ulid::generate(), "bar/foo.txt".to_string(), 4, None);
+        assert_eq!(
+            key(Some(&bar), "raw/bar.txt").as_deref(),
+            Some("foo/bar.txt")
+        );
+        assert_eq!(
+            key(Some(&foo), "raw/foo.txt").as_deref(),
+            Some("bar/foo.txt")
+        );
+        // An older row without a key keeps the rule's own mapping, whatever the patterns say.
+        let older = row(Ulid::generate(), "e1");
+        assert_eq!(key(Some(&older), "raw/a.txt").as_deref(), Some("a.txt"));
+        // A new file goes to the root unless one pattern places it.
+        assert_eq!(key(None, "raw/baz").as_deref(), Some("baz"));
+        assert_eq!(
+            key(None, "raw/x/new.txt").as_deref(),
+            Some("texts/x/new.txt")
+        );
+        let overlapping = [
+            discovery[0].clone(),
+            DiscoveryRule {
+                pattern: "new.*".to_string(),
+                folder: "other/".to_string(),
+            },
+        ];
+        let clash = bucket_key(&rule, &overlapping, None, "raw/new.txt");
+        assert!(matches!(clash, Err(ItemError::Item(_))));
+    }
+
+    fn rule_at(key_prefix: &str) -> BackendImport {
+        BackendImport {
+            import_id: Ulid::nil(),
+            group_id: Ulid::nil(),
+            backend_id: Ulid::nil(),
+            backend_prefix: "raw/".to_string(),
+            bucket: "bucket".to_string(),
+            key_prefix: key_prefix.to_string(),
+            schedule: None,
+            created_by: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: "{dir}{name}".to_string(),
+        }
+    }
+
+    #[test]
     fn imports_new_objects() {
         assert_eq!(decide(&object("e1"), None, None, false), Decision::Import);
-        // A key the bucket already holds is never taken over.
+        // A key the bucket already holds is a conflict, never taken over.
         let other = Some(Ulid::generate());
-        assert_eq!(decide(&object("e1"), None, other, false), Decision::Skip);
+        assert_eq!(decide(&object("e1"), None, other, false), Decision::Taken);
     }
 
     #[test]
