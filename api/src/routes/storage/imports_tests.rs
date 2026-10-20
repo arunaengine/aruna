@@ -4,7 +4,7 @@
 
 use super::{
     CreateImportRequest, UpdateImportRequest, create_import, delete_import, get_import,
-    list_group_imports, run_import, update_import,
+    get_renames, list_group_imports, run_import, start_renames, update_import,
 };
 use crate::error::ServerError;
 use crate::tests::storage_routing::{TestState, setup_state};
@@ -216,6 +216,43 @@ async fn manages_rule() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     let gone = get_import(State(test.state.clone()), auth(), rule()).await;
     assert!(matches!(gone, Err(ServerError::NotFound)));
+}
+
+#[tokio::test]
+async fn starts_renames() {
+    let test = setup_state().await;
+    let backend_id = register_backend(&test).await;
+    let auth = || Extension(Some(test.auth.clone()));
+    let group = test.group_id.to_string();
+    let body = Json(request(&test, backend_id, "raw/"));
+    let (_, Json(created)) =
+        create_import(State(test.state.clone()), auth(), Path(group.clone()), body)
+            .await
+            .unwrap();
+    let rule = || Path((group.clone(), created.import_id.clone()));
+
+    let Json(found) = get_renames(State(test.state.clone()), auth(), rule())
+        .await
+        .unwrap();
+    assert_eq!((found.count, found.files.len()), (0, 0));
+    assert!(found.progress.is_none());
+    // The rename is a move of the rule's folder, shown as the rule's progress.
+    let (status, Json(started)) = start_renames(State(test.state.clone()), auth(), rule())
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(started.prefix, "imported/");
+    let Json(found) = get_renames(State(test.state.clone()), auth(), rule())
+        .await
+        .unwrap();
+    assert!(found.progress.is_some());
+    // A running rename keeps the pattern its files are read with.
+    let body = Json(UpdateImportRequest {
+        schedule: None,
+        write_pattern: Some("{dir}{id}_{name}".to_string()),
+    });
+    let changed = update_import(State(test.state.clone()), auth(), rule(), body).await;
+    assert!(matches!(changed, Err(ServerError::Conflict(_))));
 }
 
 #[tokio::test]

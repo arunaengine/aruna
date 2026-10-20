@@ -4,18 +4,23 @@
 
 use crate::auth::{ensure_permission, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::storage::compression::MigrationProgress;
+use crate::routes::storage::moves::{BucketMoveStarted, move_refusal};
 use crate::routes::storage::routing::ensure_group_admin;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::drive;
+use aruna_operations::blob::migration::misplaced::count_misplaced;
+use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::groups::imports::change::{ChangeImportOperation, ImportChange};
 use aruna_operations::groups::imports::create::{CreateImportInput, CreateImportOperation};
 use aruna_operations::groups::imports::remove::RemoveImportOperation;
 use aruna_operations::groups::imports::schedule::{next_due, start_run, wake_schedule};
 use aruna_operations::groups::imports::{ImportRuleError, last_run, list_imports, read_import};
+use aruna_operations::s3::bucket::compression::MigrationStatusOperation;
+use aruna_operations::s3::bucket::storage_move::StartMoveOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -37,6 +42,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(create_import, list_group_imports))
         .routes(routes!(get_import, update_import, delete_import))
         .routes(routes!(run_import))
+        .routes(routes!(get_renames, start_renames))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -671,6 +677,172 @@ pub async fn run_import(
     };
     let job_id = job_id.to_string();
     Ok((StatusCode::ACCEPTED, Json(RunImportResponse { job_id })))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct RenameFileResponse {
+    /// Path of the file in the backend now.
+    pub from: String,
+    /// Path the file gets under the rule's current pattern.
+    pub to: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ImportRenamesResponse {
+    /// Files of the rule that an earlier pattern named and that a rename would give their
+    /// current name.
+    pub count: u64,
+    /// `false` when the count stopped at 10000 versions; `count` is then a lower bound.
+    pub complete: bool,
+    /// The first 100 of them.
+    pub files: Vec<RenameFileResponse>,
+    /// Progress of the last move of the rule's folder on this node; absent before any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<MigrationProgress>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/groups/{group_id}/storage/imports/{import_id}/rename",
+    tag = "data/storage",
+    summary = "List the files a rename would rename",
+    description = r#"Lists the files of a backend import rule that an earlier write pattern named, with the name the current pattern gives them, and the progress of the last rename.
+
+**Authentication**: realm bearer token with WRITE on the group's admin path.
+
+**Behavior**
+- A file counts when its version reads it from the rule's folder and an earlier pattern of the
+  rule named it for exactly that version. Files a user put there, and files with their current
+  name, never count.
+- Changing the pattern renames nothing; only `POST` on this path does.
+
+**Limits**
+- One request reads at most 10000 version rows and lists the first 100 files."#,
+    params(
+        ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
+        ("import_id" = String, Path, description = "Rule to check, as a 26-character ULID")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The files and the last rename",
+            body = ImportRenamesResponse,
+            example = json!({
+                "count": 1,
+                "complete": true,
+                "files": [{
+                    "from": "instrument/raw/01JA7Q3K2M4N5P6Q7R8S9T0V1W_b.fastq",
+                    "to": "instrument/raw/b.fastq~01JA7Q3K2M4N5P6Q7R8S9T0V1W"
+                }]
+            })
+        ),
+        (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
+        (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_renames(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, import_id)): Path<(String, String)>,
+) -> ServerResult<Json<ImportRenamesResponse>> {
+    let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
+    let rule = existing_rule(&state, group_id, &import_id).await?;
+    let counted = count_misplaced(&state.get_ctx(), &rule.bucket, &rule.key_prefix)
+        .await
+        .map_err(ServerError::InternalError)?;
+    let status = drive(
+        MigrationStatusOperation::new(rule.bucket.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let last = status.filter(|record| record.moving && record.prefix == rule.key_prefix);
+    let files = counted.renames.into_iter();
+    Ok(Json(ImportRenamesResponse {
+        count: counted.renamed,
+        complete: counted.complete,
+        files: files
+            .map(|(from, to)| RenameFileResponse { from, to })
+            .collect(),
+        progress: last.map(Into::into),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/groups/{group_id}/storage/imports/{import_id}/rename",
+    tag = "data/storage",
+    summary = "Give a rule's files the current name",
+    description = r#"Starts this node's background rename of the files `GET` on this path lists, as a storage move of the rule's folder in the bucket.
+
+**Authentication**: realm bearer token with WRITE on the group's admin path.
+
+**Behavior**
+- Each file is copied to its new name, never over a file that is already there. Only when the
+  copy has the same bytes does its version name the new file, together with the rule's record of
+  the file; the old file is deleted after that.
+- A copy an interrupted rename left at the new name is used again when its bytes match. Another
+  file at the new name keeps the old file in place and counts as failed.
+- The move also moves the folder's other versions to where a new upload of their key goes, as
+  `POST /data/buckets/{bucket}/storage/move` does. Progress shows in `GET` on this path.
+- A pattern change is refused while the rename runs, and a version that changed meanwhile
+  keeps its file.
+
+**Limits**
+- Only files on the rule's own folder storage are renamed. Encrypted buckets answer 409
+  `bucket_encrypted`, and a move with another prefix answers 409 `move_running`."#,
+    params(
+        ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
+        ("import_id" = String, Path, description = "Rule whose files get their name, as a 26-character ULID")
+    ),
+    responses(
+        (
+            status = 202,
+            description = "The move as stored; it runs in the background",
+            body = BucketMoveStarted,
+            example = json!({
+                "bucket": "research-raw",
+                "prefix": "raw/",
+                "progress": {
+                    "migrated": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                    "retries": 0,
+                    "started_at_ms": 1790000000000_u64
+                }
+            })
+        ),
+        (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
+        (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
+        (status = 409, description = "`bucket_encrypted` or `move_running`", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn start_renames(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, import_id)): Path<(String, String)>,
+) -> ServerResult<(StatusCode, Json<BucketMoveStarted>)> {
+    let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
+    let rule = existing_rule(&state, group_id, &import_id).await?;
+    let (bucket, prefix) = (rule.bucket, rule.key_prefix);
+    let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms());
+    let record = drive(operation, &state.get_ctx())
+        .await
+        .map_err(move_refusal)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(BucketMoveStarted {
+            bucket,
+            prefix: record.prefix.clone(),
+            progress: record.into(),
+        }),
+    ))
 }
 
 #[cfg(test)]
