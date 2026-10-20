@@ -61,7 +61,7 @@ pub struct CreateImportRequest {
     #[serde(default)]
     pub write_prefix: Option<String>,
     /// Path of a new upload below the write folder with `{dir}`, `{name}` and `{id}`;
-    /// omitted uses `{dir}{id}_{name}`.
+    /// omitted uses `{dir}{name}~{id}`.
     #[serde(default)]
     pub write_pattern: Option<String>,
     /// Also moves the bucket's stored files under `key_prefix` to the write folder.
@@ -283,7 +283,7 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
             "backend_prefix": "instrument/raw/",
             "bucket": "research-raw",
             "key_prefix": "raw/",
-            "write_pattern": "{dir}{id}_{name}",
+            "write_pattern": "{dir}{name}~{id}",
             "schedule": "0 3 * * *"
         })
     ),
@@ -299,7 +299,7 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
                 "backend_prefix": "instrument/raw/",
                 "bucket": "research-raw",
                 "key_prefix": "raw/",
-                "write_pattern": "{dir}{id}_{name}",
+                "write_pattern": "{dir}{name}~{id}",
                 "schedule": "0 3 * * *",
                 "next_run_at": "2026-10-15T03:00:00+00:00",
                 "created_at": "2026-10-14T09:12:00+00:00",
@@ -382,7 +382,7 @@ pub async fn create_import(
                     "backend_prefix": "instrument/raw/",
                     "bucket": "research-raw",
                     "key_prefix": "raw/",
-                    "write_pattern": "{dir}{id}_{name}",
+                    "write_pattern": "{dir}{name}~{id}",
                     "created_at": "2026-10-14T09:12:00+00:00",
                     "updated_at": "2026-10-14T09:12:00+00:00",
                     "last_run": {
@@ -509,7 +509,7 @@ pub async fn get_import(
                 "backend_prefix": "instrument/raw/",
                 "bucket": "research-raw",
                 "key_prefix": "raw/",
-                "write_pattern": "{dir}{id}_{name}",
+                "write_pattern": "{dir}{name}~{id}",
                 "schedule": "*/30 * * * *",
                 "next_run_at": "2026-10-14T10:00:00+00:00",
                 "created_at": "2026-10-14T09:12:00+00:00",

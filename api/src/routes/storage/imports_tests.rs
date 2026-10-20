@@ -234,5 +234,5 @@ async fn routes_new_uploads() {
         .unwrap();
     assert_eq!(created.write_backend_id, None);
     assert_eq!(created.write_prefix, None);
-    assert_eq!(created.write_pattern, "{dir}{id}_{name}");
+    assert_eq!(created.write_pattern, "{dir}{name}~{id}");
 }

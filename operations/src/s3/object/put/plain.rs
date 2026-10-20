@@ -685,7 +685,7 @@ mod tests {
         let [(key_space, key, value)] = writes.as_slice() else {
             panic!("a unique path gets one intent, got {writes:?}")
         };
-        let path = format!("raw/x/{id}_one.csv");
+        let path = format!("raw/x/one.csv~{id}");
         assert_eq!(key_space, IMPORT_INTENT_KEYSPACE);
         assert_eq!(*key, intent_key(Ulid::from_bytes([4u8; 16]), &path, id));
         assert_eq!(*txn_id, None);

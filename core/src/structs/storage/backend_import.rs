@@ -17,8 +17,9 @@ use ulid::Ulid;
 /// Failures one import run keeps for its report; later ones are only counted.
 pub const MAX_IMPORT_ERRORS: usize = 100;
 
-/// Write pattern of a rule that names none: a unique file per version.
-pub const DEFAULT_PATTERN: &str = "{dir}{id}_{name}";
+/// Write pattern of a rule that names none: a unique file per version, tagged like
+/// [`tagged_path`].
+pub const DEFAULT_PATTERN: &str = "{dir}{name}~{id}";
 
 /// Write pattern of a provider bucket linked to a bucket: the bucket key, unchanged.
 pub const PLAIN_PATTERN: &str = "{dir}{name}";
@@ -568,6 +569,10 @@ mod tests {
         let path = |pattern: &str, key: &str| rule(pattern).plain_path(key, id);
         assert_eq!(
             path(DEFAULT_PATTERN, "imported/x/a.csv"),
+            Some(format!("raw/x/a.csv~{id}"))
+        );
+        assert_eq!(
+            path("{dir}{id}_{name}", "imported/x/a.csv"),
             Some(format!("raw/x/{id}_a.csv"))
         );
         assert_eq!(

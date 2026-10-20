@@ -695,7 +695,7 @@ mod tests {
         else {
             panic!("expected a plain compose, got {effects:?}")
         };
-        assert_eq!(plain.path, format!("raw/{id}_object"));
+        assert_eq!(plain.path, format!("raw/object~{id}"));
         assert_eq!(plain.ulid, id);
     }
 

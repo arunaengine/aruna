@@ -2047,7 +2047,7 @@ mod tests {
             let plain = operation.plain_path.clone().unwrap();
             assert_eq!(
                 plain.path,
-                format!("raw/x/{}_one.csv", Ulid::from_bytes([2; 16]))
+                format!("raw/x/one.csv~{}", Ulid::from_bytes([2; 16]))
             );
             // Only a free path is taken, so an outside file is never replaced.
             assert!(plain.if_not_exists);
@@ -2075,7 +2075,7 @@ mod tests {
             copied(&mut operation, &raw_version(), true);
 
             let plain = operation.plain_path.clone().unwrap();
-            let path = format!("raw/x/{}_one.csv", Ulid::from_bytes([2; 16]));
+            let path = format!("raw/x/one.csv~{}", Ulid::from_bytes([2; 16]));
             assert_eq!(plain.path, tagged_path(&path, plain.ulid));
             assert_ne!(plain.ulid, Ulid::from_bytes([2; 16]));
             assert!(plain.if_not_exists);

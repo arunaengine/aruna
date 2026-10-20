@@ -1239,7 +1239,7 @@ mod tests {
         let mut snapshot = snapshot();
         snapshot.imports = vec![rule.clone()];
         let found = snapshot.plain_target("b", "in/a.csv", id).unwrap();
-        assert_eq!(found.path, format!("raw/{id}_a.csv"));
+        assert_eq!(found.path, format!("raw/a.csv~{id}"));
         assert_eq!(found.backend, BackendRef::Group(source));
         assert!(found.listed && !found.same_name);
         assert_eq!(snapshot.plain_target("b", "out/a.csv", id), None);
