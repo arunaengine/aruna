@@ -126,6 +126,8 @@ pub enum PutObjectState {
     RetireIntents,
     /// Deletes the intent of a write the provider refused before any byte moved.
     DropIntent,
+    /// Syncs that delete to disk.
+    SyncDroppedIntent,
     /// Reads the delete trail inside the version transaction.
     ReadTrail,
 }
@@ -295,7 +297,7 @@ pub struct PutObjectOperation {
     /// The plain write that waits for its intent record.
     pending_write: Option<Effects>,
     /// The intent record of the plain write in flight.
-    written_intent: Option<aruna_core::types::Key>,
+    written_intent: Vec<aruna_core::types::Key>,
     /// The delete trail the version transaction reads before an import registers a version.
     trail_scan: Option<trail::TrailScan>,
 }
@@ -348,7 +350,7 @@ impl PutObjectOperation {
             rule_exists: None,
             keep_head: false,
             pending_write: None,
-            written_intent: None,
+            written_intent: Vec::new(),
             trail_scan: None,
         }
     }
@@ -1890,7 +1892,9 @@ impl Operation for PutObjectOperation {
             }
             PutObjectState::ReadImportRule => self.import_rule_read(event),
             PutObjectState::WriteIntent => self.intent_written(event),
-            PutObjectState::DropIntent => self.intent_dropped(event),
+            PutObjectState::DropIntent | PutObjectState::SyncDroppedIntent => {
+                self.intent_dropped(event)
+            }
             PutObjectState::ReadTrail => self.trail_read(event),
             PutObjectState::ReadHistory => self.history_read(event),
             PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
@@ -2704,7 +2708,9 @@ mod plain;
 mod trail;
 pub(crate) use trail::{Trail, trail_ranges};
 
-pub(crate) use plain::{PlainRecord, intent_write, same_name_path, version_row};
+pub(crate) use plain::{
+    PlainRecord, intent_deletes, intent_keys, intent_writes, same_name_path, version_row,
+};
 
 #[path = "abe.rs"]
 pub(crate) mod abe;

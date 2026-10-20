@@ -109,6 +109,8 @@ pub enum CompleteUploadState {
     RetireIntent,
     /// Deletes the record of a compose the provider refused before any byte moved.
     DropIntent,
+    /// Syncs that delete to disk.
+    SyncDroppedIntent,
     WriteCleanupRecords,
     WriteReplicationObligation,
     EnforceQuota,
@@ -312,7 +314,7 @@ pub struct CompleteUploadOperation {
     /// The compose that waits for its intent record.
     pending_compose: Option<Effects>,
     /// The intent record of the compose in flight.
-    written_intent: Option<Key>,
+    written_intent: Vec<Key>,
 }
 
 impl CompleteUploadOperation {
@@ -363,7 +365,7 @@ impl CompleteUploadOperation {
             plain_version: None,
             plain_etag: None,
             pending_compose: None,
-            written_intent: None,
+            written_intent: Vec::new(),
         }
     }
 
@@ -2317,7 +2319,9 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::ReadImportRule => self.import_rule_read(event),
             CompleteUploadState::WriteIntent => self.intent_written(event),
             CompleteUploadState::RetireIntent => self.intent_retired(event),
-            CompleteUploadState::DropIntent => self.intent_dropped(event),
+            CompleteUploadState::DropIntent | CompleteUploadState::SyncDroppedIntent => {
+                self.intent_dropped(event)
+            }
             CompleteUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
             CompleteUploadState::WriteReplicationObligation => self.obligation_written(event),
             CompleteUploadState::EnforceQuota => self.handle_enforce_quota(event),

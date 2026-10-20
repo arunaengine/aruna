@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::s3::object::put::{PlainRecord, intent_write, same_name_path, version_row};
+use crate::s3::object::put::{
+    PlainRecord, intent_deletes, intent_keys, intent_writes, same_name_path, version_row,
+};
 use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, IMPORT_INTENT_KEYSPACE};
 use aruna_core::structs::storage::backend_import::{
     WriteIntent, import_key, intent_key, tagged_path,
@@ -82,7 +84,8 @@ impl CompleteUploadOperation {
                         .plain_upload()
                         .map(|upload| upload.location.backend_path.clone());
                     match (self.complete_provider(!replaces), path) {
-                        (Some(effects), Some(path)) => self.intent_first(&path, effects),
+                        // A provider upload completes at its own path only.
+                        (Some(effects), Some(path)) => self.intent_first(&path, false, effects),
                         _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
                     }
                 }
@@ -107,14 +110,10 @@ impl CompleteUploadOperation {
     /// Another writer took the free path first; the parts are still there, so the object
     /// takes its tagged path instead.
     pub(super) fn plain_taken(&mut self) -> Effects {
-        // The refused compose moved no byte, so its intent must not claim the path.
-        if let Some(key) = self.written_intent.take() {
+        // The refused compose moved no byte, so its intents must not claim the path.
+        if !self.written_intent.is_empty() {
             self.state = CompleteUploadState::DropIntent;
-            return smallvec![Effect::Storage(StorageEffect::Delete {
-                key_space: IMPORT_INTENT_KEYSPACE.to_string(),
-                key,
-                txn_id: None,
-            })];
+            return smallvec![intent_deletes(&self.written_intent)];
         }
         // Parts in a provider upload cannot move to another path; the client uploads again.
         if self.plain_upload().is_some() {
@@ -159,11 +158,11 @@ impl CompleteUploadOperation {
                 .collect(),
             plain: Some(plain),
         })];
-        self.intent_first(&path, compose)
+        self.intent_first(&path, if_not_exists, compose)
     }
 
     /// A listed plain object stores its identity before `compose` moves any byte to `path`.
-    fn intent_first(&mut self, path: &str, compose: Effects) -> Effects {
+    fn intent_first(&mut self, path: &str, if_not_exists: bool, compose: Effects) -> Effects {
         let (Some(target), Some(version_id)) = (self.plain.as_ref(), self.version_id) else {
             return compose;
         };
@@ -176,9 +175,10 @@ impl CompleteUploadOperation {
             backend: target.backend.clone(),
             created_by: self.input.created_by,
         };
-        match intent_write(target.import_id, path, &intent) {
+        let keys = intent_keys(target.import_id, path, version_id, if_not_exists);
+        match intent_writes(&keys, &intent) {
             Ok(effect) => {
-                self.written_intent = Some(intent_key(target.import_id, path, version_id));
+                self.written_intent = keys;
                 self.pending_compose = Some(compose);
                 self.state = CompleteUploadState::WriteIntent;
                 smallvec![effect]
@@ -187,12 +187,20 @@ impl CompleteUploadOperation {
         }
     }
 
-    /// A failed delete leaves the intent; the import then finds no committed version for it.
+    /// The refused compose goes on only once its intents are gone for good; a failed delete or
+    /// sync keeps them and fails the upload with that error.
     pub(super) fn intent_dropped(&mut self, event: Event) -> Effects {
+        let syncing = self.state == CompleteUploadState::SyncDroppedIntent;
         match event {
-            Event::Storage(StorageEvent::DeleteResult { .. } | StorageEvent::Error { .. }) => {
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) if !syncing => {
+                self.state = CompleteUploadState::SyncDroppedIntent;
+                smallvec![Effect::Storage(StorageEffect::SyncAll)]
+            }
+            Event::Storage(StorageEvent::SyncAllFinished) if syncing => {
+                self.written_intent.clear();
                 self.plain_taken()
             }
+            Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
             _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
         }
     }
@@ -200,7 +208,7 @@ impl CompleteUploadOperation {
     /// The compose waits until its intent is synced to disk.
     pub(super) fn intent_written(&mut self, event: Event) -> Effects {
         match (event, self.pending_compose.take()) {
-            (Event::Storage(StorageEvent::WriteResult { .. }), Some(compose)) => {
+            (Event::Storage(StorageEvent::BatchWriteResult { .. }), Some(compose)) => {
                 self.pending_compose = Some(compose);
                 smallvec![Effect::Storage(StorageEffect::SyncAll)]
             }
@@ -215,12 +223,17 @@ impl CompleteUploadOperation {
 
     /// The committed version holds the identity its intent recorded, so the intent goes.
     pub(super) fn retire_intent(&mut self) -> Option<Effects> {
-        let target = self.plain.as_ref().filter(|target| target.listed)?;
-        let path = &self.composed_location.as_ref()?.backend_path;
-        let key = intent_key(target.import_id, path, self.version_id?);
+        if self.written_intent.is_empty() {
+            return None;
+        }
+        let space = IMPORT_INTENT_KEYSPACE.to_string();
+        let deletes = self
+            .written_intent
+            .iter()
+            .map(|key| (space.clone(), key.clone()));
         self.state = CompleteUploadState::RetireIntent;
         Some(smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: vec![(IMPORT_INTENT_KEYSPACE.to_string(), key)],
+            deletes: deletes.collect(),
             txn_id: self.txn_id,
         })])
     }
@@ -442,6 +455,8 @@ mod tests {
     fn retires_intent() {
         let (mut operation, _) = recorded(true, None);
         let id = operation.version_id.unwrap();
+        let keys = intent_keys(Ulid::from_bytes([4u8; 16]), "raw/object", id, true);
+        operation.written_intent = keys.clone();
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: Vec::new(),
         }));
@@ -450,8 +465,9 @@ mod tests {
         else {
             panic!("expected the intent delete, got {effects:?}")
         };
-        let key = intent_key(Ulid::from_bytes([4u8; 16]), "raw/object", id);
-        assert_eq!(*deletes, vec![(IMPORT_INTENT_KEYSPACE.to_string(), key)]);
+        // Every intent the compose recorded goes, the tagged path's as well.
+        let found: Vec<_> = deletes.iter().map(|(_, key)| key.clone()).collect();
+        assert_eq!(found, keys);
         assert_eq!(*txn_id, Some(Ulid::nil()));
         let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
             entries: Vec::new(),
@@ -478,24 +494,38 @@ mod tests {
 
     /// Answers the intent delete that comes after a refused compose, and returns its key.
     fn past_drop(operation: &mut CompleteUploadOperation, effects: Effects) -> (Key, Effects) {
-        let [Effect::Storage(StorageEffect::Delete { key_space, key, .. })] = effects.as_slice()
+        let [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id })] = effects.as_slice()
         else {
             panic!("expected the intent delete, got {effects:?}")
         };
-        assert_eq!(key_space, IMPORT_INTENT_KEYSPACE);
-        let key = key.clone();
-        let event = Event::Storage(StorageEvent::DeleteResult { key: key.clone() });
-        (key, operation.step(event))
+        assert_eq!(
+            (deletes[0].0.as_str(), *txn_id),
+            (IMPORT_INTENT_KEYSPACE, None)
+        );
+        let key = deletes[0].1.clone();
+        let event = Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        });
+        // The compose goes on only once the delete is on disk.
+        let effects = operation.step(event);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::SyncAll)]
+        ));
+        (
+            key,
+            operation.step(Event::Storage(StorageEvent::SyncAllFinished)),
+        )
     }
 
     /// Answers the stored and synced write intent that comes before a plain compose.
     fn past_intent(operation: &mut CompleteUploadOperation, effects: Effects) -> Effects {
         match effects.as_slice() {
-            [Effect::Storage(StorageEffect::Write { key_space, .. })]
-                if key_space == aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE =>
+            [Effect::Storage(StorageEffect::BatchWrite { writes, .. })]
+                if writes[0].0 == aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE =>
             {
-                let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-                    key: Vec::new().into(),
+                let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+                    entries: Vec::new(),
                 }));
                 assert!(matches!(
                     effects.as_slice(),
@@ -514,8 +544,11 @@ mod tests {
 
         // No byte moves before the identity of the object is stored.
         let id = operation.version_id.expect("the path names the version");
-        let [Effect::Storage(StorageEffect::Write { key, value, .. })] = effects.as_slice() else {
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected the write intent, got {effects:?}")
+        };
+        let [(_, key, value)] = writes.as_slice() else {
+            panic!("a unique path gets one intent, got {writes:?}")
         };
         let path = format!("raw/{id}_object");
         let import_id = Ulid::from_bytes([4u8; 16]);

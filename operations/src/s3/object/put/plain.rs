@@ -114,7 +114,8 @@ impl PutObjectOperation {
             backend: plain.target.backend.clone(),
             created_by: self.config.user_id,
         });
-        let (import_id, intent_path) = (plain.target.import_id, path.clone());
+        let import_id = plain.target.import_id;
+        let keys = intent_keys(import_id, &path, ulid, if_not_exists);
         let write = Effect::Blob(BlobEffect::WritePlain {
             resolved: plain.resolved.clone(),
             plain: PlainPath {
@@ -129,9 +130,9 @@ impl PutObjectOperation {
         let Some(intent) = intent else {
             return smallvec![write];
         };
-        match intent_write(import_id, &intent_path, &intent) {
+        match intent_writes(&keys, &intent) {
             Ok(effect) => {
-                self.written_intent = Some(intent_key(import_id, &intent_path, ulid));
+                self.written_intent = keys;
                 self.pending_write = Some(smallvec![write]);
                 self.state = PutObjectState::WriteIntent;
                 smallvec![effect]
@@ -143,7 +144,7 @@ impl PutObjectOperation {
     /// Bytes move only once their identity is stored and synced to disk.
     pub(super) fn intent_written(&mut self, event: Event) -> Effects {
         match (event, self.pending_write.take()) {
-            (Event::Storage(StorageEvent::WriteResult { .. }), Some(write)) => {
+            (Event::Storage(StorageEvent::BatchWriteResult { .. }), Some(write)) => {
                 self.pending_write = Some(write);
                 smallvec![Effect::Storage(StorageEffect::SyncAll)]
             }
@@ -158,23 +159,30 @@ impl PutObjectOperation {
 
     /// A refused conditional write moved no byte, so its intent must not claim the path.
     pub(super) fn drop_intent(&mut self) -> Effects {
-        let Some(key) = self.written_intent.take() else {
-            return self
-                .cleanup_failed_write(PutObjectError::BlobWriteFailed(BlobError::PathTaken));
-        };
+        let taken = PutObjectError::BlobWriteFailed(BlobError::PathTaken);
+        if self.written_intent.is_empty() {
+            return self.cleanup_failed_write(taken);
+        }
         self.state = PutObjectState::DropIntent;
-        smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: IMPORT_INTENT_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        })]
+        smallvec![intent_deletes(&self.written_intent)]
     }
 
-    /// A failed delete leaves the intent; the import then finds no committed version for it.
+    /// The write fails as taken only once its intents are gone for good; a failed delete or
+    /// sync keeps them and fails the write with that error instead.
     pub(super) fn intent_dropped(&mut self, event: Event) -> Effects {
+        let syncing = self.state == PutObjectState::SyncDroppedIntent;
         match event {
-            Event::Storage(StorageEvent::DeleteResult { .. } | StorageEvent::Error { .. }) => {
-                self.cleanup_failed_write(PutObjectError::BlobWriteFailed(BlobError::PathTaken))
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) if !syncing => {
+                self.state = PutObjectState::SyncDroppedIntent;
+                smallvec![Effect::Storage(StorageEffect::SyncAll)]
+            }
+            Event::Storage(StorageEvent::SyncAllFinished) if syncing => {
+                self.written_intent.clear();
+                let taken = PutObjectError::BlobWriteFailed(BlobError::PathTaken);
+                self.cleanup_failed_write(taken)
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                self.cleanup_failed_write(PutObjectError::StorageError(error))
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
         }
@@ -206,12 +214,7 @@ impl PutObjectOperation {
             .import_rows
             .iter()
             .flat_map(|rows| rows.retired.clone());
-        let own = self.plain.as_ref().zip(self.get_written_location());
-        let own = own.zip(self.version_id).and_then(|((plain, written), id)| {
-            let listed = plain.target.listed;
-            listed.then(|| intent_key(plain.target.import_id, &written.backend_path, id))
-        });
-        let keys = rows.chain(own);
+        let keys = rows.chain(self.written_intent.iter().cloned());
         keys.map(|key| (IMPORT_INTENT_KEYSPACE.to_string(), key))
             .collect()
     }
@@ -427,18 +430,39 @@ impl PlainRecord<'_> {
     }
 }
 
-/// Stores the identity of a write to the import folder of `import_id` at `path`.
-pub(crate) fn intent_write(
-    import_id: Ulid,
-    path: &str,
-    intent: &WriteIntent,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space: IMPORT_INTENT_KEYSPACE.to_string(),
-        key: intent_key(import_id, path, intent.version_id),
-        value: intent.to_bytes()?.into(),
+/// Where the intent of a write to `path` goes. A backend without conditional writes moves a
+/// write that must find its path free to its tagged path, so that path gets the intent too.
+pub(crate) fn intent_keys(import_id: Ulid, path: &str, id: Ulid, if_not_exists: bool) -> Vec<Key> {
+    let mut keys = vec![intent_key(import_id, path, id)];
+    if if_not_exists && !path.ends_with(&format!("~{id}")) {
+        keys.push(intent_key(import_id, &tagged_path(path, id), id));
+    }
+    keys
+}
+
+/// Stores the identity of a write under each of its intent keys.
+pub(crate) fn intent_writes(keys: &[Key], intent: &WriteIntent) -> Result<Effect, ConversionError> {
+    let value: Value = intent.to_bytes()?.into();
+    let space = IMPORT_INTENT_KEYSPACE.to_string();
+    let writes = keys
+        .iter()
+        .map(|key| (space.clone(), key.clone(), value.clone()));
+    Ok(Effect::Storage(StorageEffect::BatchWrite {
+        writes: writes.collect(),
         txn_id: None,
     }))
+}
+
+/// Deletes the intents of a write that moved no byte.
+pub(crate) fn intent_deletes(keys: &[Key]) -> Effect {
+    let space = IMPORT_INTENT_KEYSPACE.to_string();
+    Effect::Storage(StorageEffect::BatchDelete {
+        deletes: keys
+            .iter()
+            .map(|key| (space.clone(), key.clone()))
+            .collect(),
+        txn_id: None,
+    })
 }
 
 /// Pins a plain object to the backend version it was written as.
@@ -591,8 +615,8 @@ mod tests {
 
     /// Answers the intent write and its sync; the write waits for both.
     fn past_intent(operation: &mut PutObjectOperation) -> Effects {
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Vec::new().into(),
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
         }));
         assert!(
             matches!(
@@ -611,16 +635,12 @@ mod tests {
 
         // The identity of the write is stored before any byte moves.
         let id = operation.version_id.expect("the path names the version");
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id,
-            }),
-        ] = effects.as_slice()
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice()
         else {
             panic!("expected the write intent, got {effects:?}")
+        };
+        let [(key_space, key, value)] = writes.as_slice() else {
+            panic!("a unique path gets one intent, got {writes:?}")
         };
         let path = format!("raw/x/{id}_one.csv");
         assert_eq!(key_space, IMPORT_INTENT_KEYSPACE);
@@ -848,6 +868,8 @@ mod tests {
         put.written_location = Some(location.clone());
         put.output = Some(Ok(location));
         put.txn_id = Some(Ulid::nil());
+        let keys = intent_keys(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv", id, true);
+        put.written_intent = keys.clone();
         put.plain_records(Ulid::nil());
         put.step(read(Some(vec![0u8])));
 
@@ -859,8 +881,10 @@ mod tests {
         else {
             panic!("expected the intent delete, got {effects:?}")
         };
-        let key = intent_key(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv", id);
-        assert_eq!(*deletes, vec![(IMPORT_INTENT_KEYSPACE.to_string(), key)]);
+        // Both paths the write could have taken lose their intent.
+        let space = IMPORT_INTENT_KEYSPACE.to_string();
+        let expected: Vec<_> = keys.into_iter().map(|key| (space.clone(), key)).collect();
+        assert_eq!(*deletes, expected);
         assert_eq!(*txn_id, Some(Ulid::nil()));
         // A second write answer is not what the delete waits for.
         let mut stray = operation(DEFAULT_PATTERN);
@@ -1060,6 +1084,28 @@ mod tests {
     }
 
     #[test]
+    fn keeps_failed_drop() {
+        let mut operation = operation("{dir}{name}");
+        begin(&mut operation);
+        operation.step(Event::Blob(BlobEvent::PlainStat {
+            exists: false,
+            version: None,
+        }));
+        past_intent(&mut operation);
+        operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
+        // An intent that could not be deleted stays unresolved; the write reports why.
+        let error = aruna_core::errors::StorageError::WriteError("disk".to_string());
+        operation.step(Event::Storage(StorageEvent::Error {
+            error: error.clone(),
+        }));
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize().unwrap_err(),
+            PutObjectError::StorageError(error)
+        );
+    }
+
+    #[test]
     fn taken_path_fails() {
         let mut operation = operation("{dir}{name}");
         begin(&mut operation);
@@ -1073,16 +1119,25 @@ mod tests {
         let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
         // The refused write moved no byte, so its intent goes first.
         let id = operation.version_id.unwrap();
-        let [Effect::Storage(StorageEffect::Delete { key_space, key, .. })] = effects.as_slice()
+        let [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id })] = effects.as_slice()
         else {
             panic!("expected the intent delete, got {effects:?}")
         };
-        assert_eq!(key_space, IMPORT_INTENT_KEYSPACE);
-        let intent = intent_key(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv", id);
-        assert_eq!(*key, intent);
-        let effects = operation.step(Event::Storage(StorageEvent::DeleteResult {
-            key: intent.clone(),
+        // A free path may go to its tagged path on a backend without conditional writes.
+        let keys = intent_keys(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv", id, true);
+        assert_eq!(keys.len(), 2);
+        let found: Vec<_> = deletes.iter().map(|(_, key)| key.clone()).collect();
+        assert_eq!((found, *txn_id), (keys, None));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
         }));
+        // The write fails as taken only once the delete is on disk.
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::SyncAll)]
+        ));
+        assert!(!operation.is_complete());
+        let effects = operation.step(Event::Storage(StorageEvent::SyncAllFinished));
         assert!(
             !effects
                 .iter()
