@@ -14,6 +14,7 @@ pub mod holders;
 pub mod key;
 pub mod list;
 pub mod placement;
+pub mod rename;
 pub mod rotate;
 pub mod routing;
 pub mod seal_missing;

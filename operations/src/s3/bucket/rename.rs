@@ -1,0 +1,972 @@
+//! Renames the keys under one folder of a bucket to another folder in one transaction. Version
+//! ids, history, delete markers and provider files stay; only the bucket keys change.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
+use crate::driver::{DriverContext, drive};
+use crate::groups::imports::schedule::is_running;
+use crate::groups::imports::validate_folder;
+use crate::jobs::store::decode_job_record;
+use crate::replication::queue::queued_prefixes;
+use crate::s3::purge_fence::fence_key;
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
+use aruna_core::keyspaces::{
+    BACKEND_IMPORT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BROKEN_VERSION_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
+    JOB_KEYSPACE, MANAGED_COPY_KEYSPACE, PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE,
+    RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+};
+use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::job_record_key;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::backend_import::{BackendImport, ImportedObject, object_prefix};
+use aruna_core::structs::storage::blob::{
+    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, HashIndex,
+    ManagedCopyRecord, VersionKey, ensure_confined_path,
+};
+use aruna_core::structs::storage::format::{CompressionMigration, EncodingClass};
+use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
+use aruna_core::structs::storage::multipart::MultipartUpload;
+use aruna_core::structs::sync_relationship_prefix;
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
+use smallvec::smallvec;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
+use thiserror::Error;
+use ulid::Ulid;
+
+/// Keys one rename takes; a larger folder is renamed in parts.
+pub const MAX_RENAME_KEYS: usize = 1000;
+
+const PAGE: usize = 256;
+
+/// Rows deleted under the old keys and rows written under the new ones.
+type RowMoves = (Vec<(String, Key)>, Vec<(String, Key, Value)>);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenameInput {
+    pub realm_id: RealmId,
+    pub node_id: NodeId,
+    /// The group the caller was authorized for; the bucket must still belong to it.
+    pub group_id: GroupId,
+    pub bucket: String,
+    pub from: String,
+    pub to: String,
+    /// The keys the preview showed. `None` selects the current keys under `from`, for a preview.
+    pub keys: Option<Vec<String>>,
+    /// `false` only plans and changes nothing.
+    pub apply: bool,
+}
+
+/// One planned key move.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RenameItem {
+    pub from: String,
+    pub to: String,
+    /// Every stored version of the key, current or not, which keep their ids.
+    pub versions: Vec<Ulid>,
+    pub current: Option<Ulid>,
+    /// The current version is a delete marker.
+    pub deleted: bool,
+    /// Provider files whose recorded key changes; the files themselves stay.
+    pub files: Vec<String>,
+    /// Why the key cannot move; a rename with any conflict changes nothing.
+    pub conflict: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RenamePlan {
+    pub items: Vec<RenameItem>,
+    /// More keys lie under `from` than one rename takes.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum RenameError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("bucket not found")]
+    NotFound,
+    #[error("permission denied")]
+    Forbidden,
+    #[error("authorization check failed: {0}")]
+    Authorization(String),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error("unexpected event in state {0}")]
+    Unexpected(&'static str),
+}
+
+/// Where `key` goes when the folder `from` becomes `to`; `None` outside `from`.
+pub fn renamed_key(from: &str, to: &str, key: &str) -> Option<String> {
+    key.strip_prefix(from).map(|rest| format!("{to}{rest}"))
+}
+
+/// Plans or applies a rename only with WRITE, by role and policy, on every old and new key.
+/// A denial answers `Forbidden` before any key is shown or moved.
+pub async fn authorized_rename(
+    context: &DriverContext,
+    auth: &AuthContext,
+    input: RenameInput,
+) -> Result<RenamePlan, RenameError> {
+    let scope = (input.realm_id, input.group_id, input.node_id);
+    let access = BucketAccess::load(context, auth, scope, &input.bucket)
+        .await
+        .map_err(access_error)?;
+    let allowed = |key: &str| access.allows(Some(key), &Permission::WRITE);
+    let permits = |from: &str, to: &str| allowed(from) && allowed(to);
+    let keys = input.keys.clone().unwrap_or_default();
+    let moved = |key: &String| renamed_key(&input.from, &input.to, key);
+    if !keys
+        .iter()
+        .all(|key| moved(key).is_none_or(|to| permits(key, &to)))
+    {
+        return Err(RenameError::Forbidden);
+    }
+    let plan = drive(RenameKeysOperation::new(input), context).await?;
+    match plan.items.iter().all(|item| permits(&item.from, &item.to)) {
+        true => Ok(plan),
+        false => Err(RenameError::Forbidden),
+    }
+}
+
+/// A denial by role or policy is a verdict; other failures are not.
+fn access_error(error: AuthorizeError) -> RenameError {
+    match error {
+        AuthorizeError::PermissionDenied | AuthorizeError::Policy(_) => RenameError::Forbidden,
+        AuthorizeError::Storage(error) => RenameError::Storage(error),
+        AuthorizeError::CheckFailed(message) => RenameError::Authorization(message),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanKind {
+    Relations,
+    Queued,
+    Rules,
+    Uploads,
+    Select,
+    Versions(usize),
+    Target(usize),
+    Copies(usize),
+    Broken(usize),
+    Rows(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Scan {
+    kind: ScanKind,
+    space: &'static str,
+    prefix: Vec<u8>,
+    limit: usize,
+    start: Option<Key>,
+}
+
+impl Scan {
+    fn new(kind: ScanKind, space: &'static str, prefix: Vec<u8>, limit: usize) -> Self {
+        Self {
+            kind,
+            space,
+            prefix,
+            limit,
+            start: None,
+        }
+    }
+}
+
+/// The rows of one key the transaction read.
+#[derive(Debug, Default, PartialEq)]
+struct Found {
+    head: Option<Value>,
+    target_head: bool,
+    target_versions: bool,
+    versions: Vec<(VersionKey, Value)>,
+    copies: Vec<(Key, ManagedCopyRecord)>,
+    broken: Vec<(VersionKey, Value)>,
+    /// Path index rows that exist for the key's versions.
+    indexed: Vec<HashIndex>,
+    rows: Vec<(Key, ImportedObject)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenameState {
+    Init,
+    Start,
+    Bucket,
+    Scan,
+    Runs,
+    Heads,
+    Index,
+    Delete,
+    Write,
+    Commit,
+    Finish,
+}
+
+/// Reads every row of the selected keys in one write transaction, checks for collisions and
+/// moves the rows, so a concurrent write, import start or rule change makes it fail whole.
+#[derive(Debug, PartialEq)]
+pub struct RenameKeysOperation {
+    input: RenameInput,
+    state: RenameState,
+    txn_id: Option<TxnId>,
+    scans: VecDeque<Scan>,
+    scan: Option<Scan>,
+    rules: Vec<BackendImport>,
+    /// Keys of the bucket with an open multipart upload, which would write the old key.
+    uploads: HashSet<String>,
+    items: Vec<RenameItem>,
+    found: Vec<Found>,
+    truncated: bool,
+    writes: Vec<(String, Key, Value)>,
+    output: Option<Result<RenamePlan, RenameError>>,
+}
+
+impl RenameKeysOperation {
+    pub fn new(input: RenameInput) -> Self {
+        Self {
+            input,
+            state: RenameState::Init,
+            txn_id: None,
+            scans: VecDeque::new(),
+            scan: None,
+            rules: Vec::new(),
+            uploads: HashSet::new(),
+            items: Vec::new(),
+            found: Vec::new(),
+            truncated: false,
+            writes: Vec::new(),
+            output: None,
+        }
+    }
+
+    fn fail(&mut self, error: RenameError) -> Effects {
+        self.state = RenameState::Finish;
+        self.output = Some(Err(error));
+        self.abort()
+    }
+
+    fn validate(&self) -> Result<Vec<RenameItem>, RenameError> {
+        let input = &self.input;
+        let invalid = |reason: String| RenameError::Invalid(reason);
+        validate_folder("from", &input.from).map_err(|error| invalid(error.to_string()))?;
+        validate_folder("to", &input.to).map_err(|error| invalid(error.to_string()))?;
+        if input.from == input.to {
+            return Err(invalid("from and to must differ".to_string()));
+        }
+        let Some(keys) = input.keys.as_ref() else {
+            return match input.apply {
+                true => Err(invalid(
+                    "a rename needs the keys of its preview".to_string(),
+                )),
+                false => Ok(Vec::new()),
+            };
+        };
+        if keys.is_empty() || keys.len() > MAX_RENAME_KEYS {
+            return Err(invalid(format!(
+                "a rename takes 1 to {MAX_RENAME_KEYS} keys"
+            )));
+        }
+        if keys.iter().collect::<HashSet<_>>().len() != keys.len() {
+            return Err(invalid("keys must not repeat".to_string()));
+        }
+        keys.iter().map(|key| self.item(key)).collect()
+    }
+
+    fn item(&self, key: &str) -> Result<RenameItem, RenameError> {
+        let input = &self.input;
+        let invalid = |reason: String| RenameError::Invalid(reason);
+        let to = renamed_key(&input.from, &input.to, key)
+            .filter(|_| !key.is_empty())
+            .ok_or_else(|| invalid(format!("key `{key}` does not lie under `{}`", input.from)))?;
+        if to.is_empty() {
+            return Err(invalid(format!("the new key of `{key}` would be empty")));
+        }
+        if to.len() > MAX_KEY_LEN {
+            return Err(invalid(format!("the new key of `{key}` is too long")));
+        }
+        ensure_confined_path(Path::new(&to)).map_err(|error| invalid(error.to_string()))?;
+        Ok(RenameItem {
+            from: key.to_string(),
+            to,
+            ..RenameItem::default()
+        })
+    }
+
+    fn txn(&self) -> Result<TxnId, RenameError> {
+        self.txn_id.ok_or(RenameError::Unexpected("transaction"))
+    }
+
+    fn read_bucket(&mut self, txn_id: TxnId) -> Effects {
+        self.txn_id = Some(txn_id);
+        self.state = RenameState::Bucket;
+        let name: Key = self.input.bucket.as_bytes().to_vec().into();
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (S3_BUCKET_KEYSPACE.to_string(), name.clone()),
+                (BUCKET_ENCRYPTION_KEYSPACE.to_string(), name.clone()),
+                (COMPRESSION_MIGRATION_KEYSPACE.to_string(), name),
+                (
+                    PURGE_FENCE_KEYSPACE.to_string(),
+                    fence_key(&self.input.bucket)
+                ),
+            ],
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    /// Only a plain bucket of the caller's group without replication, a purge or a running
+    /// compression or storage move is renamed; a move would miss the moved versions.
+    fn bucket_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+        let [(_, bucket), (_, encryption), (_, migration), (_, fence)] = values.as_slice() else {
+            return self.fail(RenameError::Unexpected("Bucket"));
+        };
+        match bucket.as_deref().map(BucketInfo::from_bytes).transpose() {
+            Ok(Some(info)) if info.group_id == self.input.group_id => {}
+            Ok(_) => return self.fail(RenameError::NotFound),
+            Err(error) => return self.fail(error.into()),
+        }
+        if encryption.is_some() {
+            return self.conflict("an encrypted bucket cannot be renamed");
+        }
+        if fence.is_some() {
+            return self.conflict("a permanent purge of this bucket is running");
+        }
+        match migration.as_deref().map(CompressionMigration::from_bytes) {
+            Some(Ok(record)) if record.finished_at_ms.is_none() => {
+                return self.conflict("a compression or storage move of this bucket is running");
+            }
+            Some(Err(error)) => return self.fail(error.into()),
+            _ => {}
+        }
+        let bucket = self.input.bucket.as_str();
+        let group = self.input.group_id.to_bytes().to_vec();
+        self.scans = VecDeque::from([
+            Scan::new(
+                ScanKind::Relations,
+                RELATIONSHIP_OUT_KEYSPACE,
+                sync_relationship_prefix(bucket),
+                1,
+            ),
+            Scan::new(
+                ScanKind::Relations,
+                RELATIONSHIP_IN_KEYSPACE,
+                sync_relationship_prefix(bucket),
+                1,
+            ),
+            Scan::new(ScanKind::Rules, BACKEND_IMPORT_KEYSPACE, group, PAGE),
+            Scan::new(ScanKind::Uploads, UPLOAD_KEYSPACE, Vec::new(), PAGE),
+        ]);
+        match queued_prefixes(bucket) {
+            Ok(prefixes) => self.scans.extend(
+                prefixes.map(|(space, prefix)| Scan::new(ScanKind::Queued, space, prefix, 1)),
+            ),
+            Err(error) => return self.fail(error.into()),
+        }
+        if self.input.keys.is_none() {
+            let prefix = BlobHeadKey::object_prefix(bucket, &self.input.from);
+            match prefix {
+                Ok(prefix) => self.scans.push_back(Scan::new(
+                    ScanKind::Select,
+                    BLOB_HEAD_KEYSPACE,
+                    prefix,
+                    PAGE,
+                )),
+                Err(error) => return self.fail(error.into()),
+            }
+        }
+        self.next_scan()
+    }
+
+    fn conflict(&mut self, reason: &str) -> Effects {
+        self.fail(RenameError::Conflict(reason.to_string()))
+    }
+
+    fn next_scan(&mut self) -> Effects {
+        let Some(scan) = self.scans.pop_front() else {
+            self.scan = None;
+            return self.scans_done();
+        };
+        self.state = RenameState::Scan;
+        let effect = Effect::Storage(StorageEffect::Iter {
+            key_space: scan.space.to_string(),
+            prefix: Some(scan.prefix.clone().into()),
+            start: scan.start.clone().map(IterStart::After),
+            limit: scan.limit,
+            txn_id: self.txn_id,
+        });
+        self.scan = Some(scan);
+        smallvec![effect]
+    }
+
+    fn scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+        let Some(mut scan) = self.scan.take() else {
+            return self.fail(RenameError::Unexpected("Scan"));
+        };
+        let more = match self.take_page(scan.kind, values) {
+            Ok(more) => more,
+            Err(error) => return self.fail(error),
+        };
+        if let (true, Some(next)) = (more, next) {
+            scan.start = Some(next);
+            self.scans.push_front(scan);
+        }
+        self.next_scan()
+    }
+
+    /// Records one page; answers whether the scan wants the next page.
+    fn take_page(
+        &mut self,
+        kind: ScanKind,
+        values: Vec<(Key, Value)>,
+    ) -> Result<bool, RenameError> {
+        match kind {
+            ScanKind::Relations if !values.is_empty() => Err(RenameError::Conflict(
+                "a bucket that replicates cannot be renamed".to_string(),
+            )),
+            ScanKind::Queued if !values.is_empty() => Err(RenameError::Conflict(
+                "a copy of this bucket to another node is still queued".to_string(),
+            )),
+            ScanKind::Relations | ScanKind::Queued => Ok(false),
+            ScanKind::Rules => {
+                for (_, value) in values {
+                    let rule = BackendImport::from_bytes(&value)?;
+                    if rule.bucket == self.input.bucket {
+                        self.rules.push(rule);
+                    }
+                }
+                Ok(true)
+            }
+            ScanKind::Uploads => {
+                for (_, value) in values {
+                    let upload = MultipartUpload::from_bytes(&value)?;
+                    if upload.bucket == self.input.bucket {
+                        self.uploads.insert(upload.key);
+                    }
+                }
+                Ok(true)
+            }
+            ScanKind::Select => {
+                for (key, _) in values {
+                    if self.items.len() == MAX_RENAME_KEYS {
+                        self.truncated = true;
+                        return Ok(false);
+                    }
+                    let head = BlobHeadKey::from_bytes(&key)?;
+                    // Keys are shown only after their permissions are checked.
+                    let item = self.item(&head.key).map_err(|_| {
+                        RenameError::Invalid(
+                            "a key under `from` cannot get a name under `to`".into(),
+                        )
+                    })?;
+                    self.items.push(item);
+                }
+                Ok(true)
+            }
+            ScanKind::Versions(index) => {
+                for (key, value) in values {
+                    self.found[index]
+                        .versions
+                        .push((VersionKey::from_bytes(&key)?, value));
+                }
+                Ok(true)
+            }
+            ScanKind::Target(index) => {
+                self.found[index].target_versions = !values.is_empty();
+                Ok(false)
+            }
+            ScanKind::Copies(index) => {
+                for (key, value) in values {
+                    let record = ManagedCopyRecord::from_bytes(&value)?;
+                    self.found[index].copies.push((key, record));
+                }
+                Ok(true)
+            }
+            ScanKind::Broken(index) => {
+                for (key, value) in values {
+                    self.found[index]
+                        .broken
+                        .push((VersionKey::from_bytes(&key)?, value));
+                }
+                Ok(true)
+            }
+            ScanKind::Rows(rule) => {
+                self.take_rows(rule, values)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Notes each recorded file that maps to a selected key.
+    fn take_rows(&mut self, rule: usize, values: Vec<(Key, Value)>) -> Result<(), RenameError> {
+        let sources: HashMap<&str, usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (item.from.as_str(), index))
+            .collect();
+        let rule = &self.rules[rule];
+        let mut taken = Vec::new();
+        for (key, value) in values {
+            let row = ImportedObject::from_bytes(&value)?;
+            let path = String::from_utf8_lossy(key.get(16..).unwrap_or_default()).into_owned();
+            let mapped = row.key.clone().or_else(|| rule.aruna_key(&path));
+            if let Some(&index) = mapped.as_deref().and_then(|key| sources.get(key)) {
+                taken.push((index, key, row, path));
+            }
+        }
+        for (index, key, row, path) in taken {
+            self.found[index].rows.push((key, row));
+            self.items[index].files.push(path);
+        }
+        Ok(())
+    }
+
+    /// The rules are known; a running import of the bucket would act on stale rows.
+    fn scans_done(&mut self) -> Effects {
+        match self.found.is_empty() {
+            true => self.read_runs(),
+            false => self.read_index(),
+        }
+    }
+
+    fn read_runs(&mut self) -> Effects {
+        // A later part would select the keys this part moved, so `to` inside `from` needs one part.
+        if self.truncated && self.input.to.starts_with(&self.input.from) {
+            return self.conflict("too many keys to rename into a folder inside `from` at once");
+        }
+        if self.items.is_empty() {
+            return self.finish_plan();
+        }
+        let reads: Vec<_> = self
+            .rules
+            .iter()
+            .filter_map(|rule| rule.last_job)
+            .map(|job_id| (JOB_KEYSPACE.to_string(), job_record_key(job_id)))
+            .collect();
+        if reads.is_empty() {
+            return self.read_heads();
+        }
+        self.state = RenameState::Runs;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn runs_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+        for (_, value) in values {
+            match value.as_deref().map(decode_job_record).transpose() {
+                Ok(Some(record)) if is_running(record.state) => {
+                    return self.conflict("an import of this bucket is running");
+                }
+                Ok(_) => {}
+                Err(error) => return self.fail(error.into()),
+            }
+        }
+        self.read_heads()
+    }
+
+    fn read_heads(&mut self) -> Effects {
+        let bucket = &self.input.bucket;
+        let reads: Result<Vec<_>, _> = self
+            .items
+            .iter()
+            .flat_map(|item| [&item.from, &item.to])
+            .map(|key| BlobHeadKey::new(bucket.clone(), key.clone()).to_bytes())
+            .map(|head| head.map(|head| (BLOB_HEAD_KEYSPACE.to_string(), Key::from(head))))
+            .collect();
+        let reads = match reads {
+            Ok(reads) => reads,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = RenameState::Heads;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn heads_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+        if values.len() != self.items.len() * 2 {
+            return self.fail(RenameError::Unexpected("Heads"));
+        }
+        let mut values = values.into_iter().map(|(_, value)| value);
+        while let (Some(head), Some(target)) = (values.next(), values.next()) {
+            self.found.push(Found {
+                head,
+                target_head: target.is_some(),
+                ..Found::default()
+            });
+        }
+        match self.key_scans() {
+            Ok(scans) => self.scans.extend(scans),
+            Err(error) => return self.fail(error),
+        }
+        self.next_scan()
+    }
+
+    /// Per key its versions, the new key's versions, copies and broken rows; then the files.
+    fn key_scans(&self) -> Result<Vec<Scan>, RenameError> {
+        let bucket = &self.input.bucket;
+        let mut scans = Vec::new();
+        for (index, item) in self.items.iter().enumerate() {
+            let source = VersionKey::object_prefix(bucket, &item.from)?;
+            let target = VersionKey::object_prefix(bucket, &item.to)?;
+            scans.extend([
+                Scan::new(
+                    ScanKind::Versions(index),
+                    BLOB_VERSIONS_KEYSPACE,
+                    source.clone(),
+                    PAGE,
+                ),
+                Scan::new(ScanKind::Target(index), BLOB_VERSIONS_KEYSPACE, target, 1),
+                Scan::new(
+                    ScanKind::Copies(index),
+                    MANAGED_COPY_KEYSPACE,
+                    source.clone(),
+                    PAGE,
+                ),
+                Scan::new(
+                    ScanKind::Broken(index),
+                    BROKEN_VERSION_KEYSPACE,
+                    source,
+                    PAGE,
+                ),
+            ]);
+        }
+        for (index, rule) in self.rules.iter().enumerate() {
+            let prefix = object_prefix(rule.import_id).to_vec();
+            scans.push(Scan::new(
+                ScanKind::Rows(index),
+                IMPORTED_OBJECT_KEYSPACE,
+                prefix,
+                PAGE,
+            ));
+        }
+        Ok(scans)
+    }
+
+    /// The path index row each materialized version may have under its old key.
+    fn index_rows(&self) -> Vec<(usize, HashIndex)> {
+        let input = &self.input;
+        let mut rows = Vec::new();
+        for (index, found) in self.found.iter().enumerate() {
+            for (key, value) in &found.versions {
+                let Ok(version) = BlobVersion::from_bytes(value) else {
+                    continue;
+                };
+                if let Some(hash) = version.blob_hash() {
+                    let row = HashIndex::new(
+                        *hash,
+                        key.version_id,
+                        input.realm_id,
+                        input.group_id,
+                        input.node_id,
+                        input.bucket.clone(),
+                        key.key.clone(),
+                    );
+                    rows.push((index, row));
+                }
+            }
+        }
+        rows
+    }
+
+    fn read_index(&mut self) -> Effects {
+        let rows = self.index_rows();
+        let mut reads = Vec::with_capacity(rows.len());
+        for (_, row) in &rows {
+            match row.to_bytes() {
+                Ok(key) => reads.push((PATHS_INDEX_KEYSPACE.to_string(), key.into())),
+                Err(error) => return self.fail(error.into()),
+            }
+        }
+        if reads.is_empty() {
+            return self.finish_plan();
+        }
+        self.state = RenameState::Index;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn index_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+        let rows = self.index_rows();
+        if values.len() != rows.len() {
+            return self.fail(RenameError::Unexpected("Index"));
+        }
+        for ((index, row), (_, value)) in rows.into_iter().zip(values) {
+            if value.is_some() {
+                self.found[index].indexed.push(row);
+            }
+        }
+        self.finish_plan()
+    }
+
+    /// Fills each item and its conflict; a preview ends here, a rename moves the rows.
+    fn finish_plan(&mut self) -> Effects {
+        let sources: HashSet<String> = self.items.iter().map(|item| item.from.clone()).collect();
+        let described: Result<(), RenameError> = self
+            .items
+            .iter_mut()
+            .zip(&self.found)
+            .try_for_each(|(item, found)| describe(item, found, &sources, &self.uploads));
+        if let Err(error) = described {
+            return self.fail(error);
+        }
+        let plan = RenamePlan {
+            items: self.items.clone(),
+            truncated: self.truncated,
+        };
+        if !self.input.apply {
+            self.state = RenameState::Finish;
+            self.output = Some(Ok(plan));
+            return self.abort();
+        }
+        let conflicts: Vec<String> = plan
+            .items
+            .iter()
+            .filter_map(|item| {
+                let conflict = item.conflict.as_ref()?;
+                Some(format!("`{}`: {conflict}", item.from))
+            })
+            .take(5)
+            .collect();
+        if !conflicts.is_empty() {
+            return self.fail(RenameError::Conflict(conflicts.join("; ")));
+        }
+        self.output = Some(Ok(plan));
+        match self.moves() {
+            Ok((deletes, writes)) => {
+                self.writes = writes;
+                self.state = RenameState::Delete;
+                smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                    deletes,
+                    txn_id: self.txn_id,
+                })]
+            }
+            Err(error) => self.fail(error),
+        }
+    }
+
+    /// The rows to delete under the old keys and to write under the new ones.
+    fn moves(&self) -> Result<RowMoves, RenameError> {
+        let bucket = &self.input.bucket;
+        let (mut deletes, mut writes) = (Vec::new(), Vec::new());
+        for (item, found) in self.items.iter().zip(&self.found) {
+            if let Some(head) = &found.head {
+                let old = BlobHeadKey::new(bucket.clone(), item.from.clone()).to_bytes()?;
+                let new = BlobHeadKey::new(bucket.clone(), item.to.clone()).to_bytes()?;
+                deletes.push((BLOB_HEAD_KEYSPACE.to_string(), old.into()));
+                writes.push((BLOB_HEAD_KEYSPACE.to_string(), new.into(), head.clone()));
+            }
+            let moved =
+                |key: &VersionKey| VersionKey::new(bucket.clone(), &item.to, key.version_id);
+            for (key, value) in &found.versions {
+                deletes.push((BLOB_VERSIONS_KEYSPACE.to_string(), key.to_bytes()?.into()));
+                let new = moved(key).to_bytes()?;
+                writes.push((
+                    BLOB_VERSIONS_KEYSPACE.to_string(),
+                    new.into(),
+                    value.clone(),
+                ));
+            }
+            for (key, record) in &found.copies {
+                deletes.push((MANAGED_COPY_KEYSPACE.to_string(), key.clone()));
+                let record = ManagedCopyRecord {
+                    version: moved(&record.version),
+                    ..record.clone()
+                };
+                let new = record.key().to_bytes()?.into();
+                writes.push((
+                    MANAGED_COPY_KEYSPACE.to_string(),
+                    new,
+                    record.to_bytes()?.into(),
+                ));
+            }
+            for (key, value) in &found.broken {
+                deletes.push((BROKEN_VERSION_KEYSPACE.to_string(), key.to_bytes()?.into()));
+                let new = moved(key).to_bytes()?;
+                writes.push((
+                    BROKEN_VERSION_KEYSPACE.to_string(),
+                    new.into(),
+                    value.clone(),
+                ));
+            }
+            for row in &found.indexed {
+                deletes.push((PATHS_INDEX_KEYSPACE.to_string(), row.to_bytes()?.into()));
+                let new = HashIndex {
+                    key: item.to.clone(),
+                    ..row.clone()
+                };
+                let empty = Value::from(Vec::new());
+                writes.push((
+                    PATHS_INDEX_KEYSPACE.to_string(),
+                    new.to_bytes()?.into(),
+                    empty,
+                ));
+            }
+            for (key, row) in &found.rows {
+                let row = ImportedObject {
+                    key: Some(item.to.clone()),
+                    ..row.clone()
+                };
+                writes.push((
+                    IMPORTED_OBJECT_KEYSPACE.to_string(),
+                    key.clone(),
+                    row.to_bytes()?.into(),
+                ));
+            }
+        }
+        Ok((deletes, writes))
+    }
+}
+
+/// Fills the versions of one item and the reason it cannot move, if any.
+fn describe(
+    item: &mut RenameItem,
+    found: &Found,
+    sources: &HashSet<String>,
+    uploads: &HashSet<String>,
+) -> Result<(), RenameError> {
+    let head = found
+        .head
+        .as_deref()
+        .map(CurrentVersionPointer::from_bytes)
+        .transpose()?;
+    item.current = head.map(|head| head.version_id);
+    item.versions = found
+        .versions
+        .iter()
+        .map(|(key, _)| key.version_id)
+        .collect();
+    let mut movable = true;
+    for (key, value) in &found.versions {
+        let version = BlobVersion::from_bytes(value)?;
+        if Some(key.version_id) == item.current {
+            item.deleted = version.is_deleted();
+        }
+        movable &= match &version.state {
+            BlobVersionState::Materialized { encoding, .. } => {
+                !matches!(encoding, EncodingClass::Pithos { .. })
+            }
+            BlobVersionState::Deleted => true,
+            BlobVersionState::Reference { .. } | BlobVersionState::PendingContent { .. } => false,
+        };
+    }
+    item.conflict = if found.head.is_none() && found.versions.is_empty() {
+        Some("the key does not exist".to_string())
+    } else if found.target_head || found.target_versions {
+        Some(format!("the key `{}` already exists", item.to))
+    } else if sources.contains(&item.to) {
+        Some(format!("the key `{}` is renamed as well", item.to))
+    } else if uploads.contains(&item.from) || uploads.contains(&item.to) {
+        Some("a multipart upload to the key is open".to_string())
+    } else if !movable {
+        Some("the key holds encrypted, referenced or unfinished versions".to_string())
+    } else {
+        None
+    };
+    Ok(())
+}
+
+impl Operation for RenameKeysOperation {
+    type Output = RenamePlan;
+    type Error = RenameError;
+
+    fn start(&mut self) -> Effects {
+        match self.validate() {
+            Ok(items) => self.items = items,
+            Err(error) => return self.fail(error),
+        }
+        self.state = RenameState::Start;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        let Event::Storage(event) = event else {
+            return self.fail(RenameError::Unexpected("Rename"));
+        };
+        match (self.state, event) {
+            (_, StorageEvent::Error { error }) => self.fail(error.into()),
+            (RenameState::Start, StorageEvent::TransactionStarted { txn_id }) => {
+                self.read_bucket(txn_id)
+            }
+            (RenameState::Bucket, StorageEvent::BatchReadResult { values }) => {
+                self.bucket_read(values)
+            }
+            (
+                RenameState::Scan,
+                StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                },
+            ) => self.scanned(values, next_start_after),
+            (RenameState::Runs, StorageEvent::BatchReadResult { values }) => self.runs_read(values),
+            (RenameState::Heads, StorageEvent::BatchReadResult { values }) => {
+                self.heads_read(values)
+            }
+            (RenameState::Index, StorageEvent::BatchReadResult { values }) => {
+                self.index_read(values)
+            }
+            (RenameState::Delete, StorageEvent::BatchDeleteResult { .. }) => {
+                self.state = RenameState::Write;
+                let writes = std::mem::take(&mut self.writes);
+                smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: self.txn_id,
+                })]
+            }
+            (RenameState::Write, StorageEvent::BatchWriteResult { .. }) => match self.txn() {
+                Ok(txn_id) => {
+                    self.state = RenameState::Commit;
+                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                }
+                Err(error) => self.fail(error),
+            },
+            (RenameState::Commit, StorageEvent::TransactionCommitted { .. }) => {
+                self.txn_id = None;
+                self.state = RenameState::Finish;
+                smallvec![]
+            }
+            _ => self.fail(RenameError::Unexpected("Rename")),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.state == RenameState::Finish
+    }
+
+    fn finalize(self) -> Result<RenamePlan, RenameError> {
+        match self.state {
+            RenameState::Finish => self
+                .output
+                .unwrap_or(Err(RenameError::Unexpected("Finish"))),
+            _ => Err(RenameError::Unexpected("Finish")),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        self.txn_id
+            .take()
+            .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+#[path = "rename_tests.rs"]
+mod tests;
