@@ -38,10 +38,12 @@ impl Trail {
                     false => self,
                 }
             }
+            // A delete of another version before this one was written says nothing about it.
             BlobAuditKind::DeleteVersion | BlobAuditKind::DeleteMarker if record.key == key => {
                 match record.version_id == Some(id) {
                     true => Self::Removed,
-                    false => Self::Touched,
+                    false if record.occurred_at_ms >= id.timestamp_ms() => Self::Touched,
+                    false => self,
                 }
             }
             _ => self,
@@ -161,6 +163,12 @@ mod tests {
         assert_eq!(trail(std::slice::from_ref(&other), id), Trail::Touched);
         let exact = audit(BlobAuditKind::DeleteVersion, "in/a.csv", Some(id), 2_000);
         assert_eq!(trail(&[exact, other], id), Trail::Removed);
+        // A delete before the version was written does not block it, unless it names it.
+        let kind = BlobAuditKind::DeleteMarker;
+        let older = audit(kind, "in/a.csv", Some(Ulid::nil()), 500);
+        assert_eq!(trail(std::slice::from_ref(&older), id), Trail::Clean);
+        let named = audit(BlobAuditKind::DeleteVersion, "in/a.csv", Some(id), 500);
+        assert_eq!(trail(&[older, named], id), Trail::Removed);
         // A purge removes what existed when it ran, not what was written after it.
         let purge = |at| audit(BlobAuditKind::Purge(BlobPurgeKind::Prefix), "in/", None, at);
         assert_eq!(trail(&[purge(2_000)], id), Trail::Removed);
