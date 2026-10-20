@@ -278,8 +278,10 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
 - All prefixes are empty or relative folders ending with `/`; `backend_prefix` and the write
   folder may not lie inside the folders where Aruna stores its own objects on that backend.
 - `write_pattern` must contain `{name}` and give a relative path.
-- Two rules may not import into overlapping folders of one bucket, and no rule may write into a
-  backend folder that another rule reads or writes.
+- Two rules may not import into overlapping folders of one bucket. Rules may share a backend
+  folder only when each writes inside the folder it reads. In a shared folder a recorded file
+  stays with its rule, and a new file is imported only by the one rule whose name pattern
+  matches it; otherwise each run reports it and imports nothing.
 - `schedule` is a five-field cron expression evaluated in UTC.
 - On a backend without a fixed bucket both folders start with a valid bucket name other than the
   default rule's bucket.
@@ -319,7 +321,7 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
         (status = 400, description = "Invalid ids, prefixes, schedule, bucket or backend, or a backend bucket that cannot be found, created or written", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or on the bucket", body = ErrorResponse),
-        (status = 409, description = "A routing rule for the folder names another target, another rule imports into an overlapping folder or shares a backend folder, a folder lies in the default rule's bucket, or the group is being deleted", body = ErrorResponse)
+        (status = 409, description = "A routing rule for the folder names another target, another rule imports into an overlapping folder or shares a backend folder it does not both read and write, a folder lies in the default rule's bucket, or the group is being deleted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -631,6 +633,9 @@ pub async fn delete_import(
   multipart upload, and on backends that list neither ETag nor time.
 - A changed object gets a new version unless the key was written or deleted in Aruna since;
   Aruna's side always wins.
+- A new object goes where the rule's discovery rules put it, else to `key_prefix` + its path.
+  Its key is recorded, so later rule changes never move it. A new object whose key already
+  holds another object, or that matches several patterns, fails and is not imported.
 - Imported bytes count toward the group quota like uploaded ones.
 - Progress, counts and the first errors show in `last_run` of the rule."#,
     params(
