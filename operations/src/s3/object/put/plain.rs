@@ -4,10 +4,12 @@
 
 use super::*;
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, IMPORT_INTENT_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE,
 };
 use aruna_core::structs::storage::backend_import::{
-    ImportedObject, PlainPath, import_key, object_key, tagged_path, version_key,
+    ImportedObject, PlainPath, WriteIntent, import_key, intent_key, object_key, tagged_path,
+    version_key,
 };
 use aruna_core::structs::storage::blob::ResolvedBackend;
 use aruna_core::structs::storage::routing::PlainTarget;
@@ -27,6 +29,8 @@ pub(super) struct PlainWrite {
 pub(super) struct ImportRows {
     import_id: Ulid,
     writes: Vec<(String, Key, Value)>,
+    /// Values the transaction must still read, or the write fails with `HeadChanged`.
+    guards: Vec<(String, Key, Option<Value>)>,
 }
 
 impl PutObjectOperation {
@@ -102,8 +106,14 @@ impl PutObjectOperation {
         let Some(blob) = self.config.request.body.take() else {
             return self.emit_error(PutObjectError::MissingBody);
         };
-        self.state = PutObjectState::WriteBlob;
-        smallvec![Effect::Blob(BlobEffect::WritePlain {
+        let intent = plain.target.listed.then(|| WriteIntent {
+            key: self.config.request.key.clone(),
+            version_id: ulid,
+            backend: plain.target.backend.clone(),
+            created_by: self.config.user_id,
+        });
+        let (import_id, intent_path) = (plain.target.import_id, path.clone());
+        let write = Effect::Blob(BlobEffect::WritePlain {
             resolved: plain.resolved.clone(),
             plain: PlainPath {
                 path,
@@ -112,12 +122,49 @@ impl PutObjectOperation {
             },
             created_by: self.config.user_id,
             blob,
-        })]
+        });
+        self.state = PutObjectState::WriteBlob;
+        let Some(intent) = intent else {
+            return smallvec![write];
+        };
+        match intent_write(import_id, &intent_path, &intent) {
+            Ok(effect) => {
+                self.pending_write = Some(smallvec![write]);
+                self.state = PutObjectState::WriteIntent;
+                smallvec![effect]
+            }
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    /// Bytes move only once their identity is stored.
+    pub(super) fn intent_written(&mut self, event: Event) -> Effects {
+        match (event, self.pending_write.take()) {
+            (Event::Storage(StorageEvent::WriteResult { .. }), Some(write)) => {
+                self.state = PutObjectState::WriteBlob;
+                write
+            }
+            (Event::Storage(StorageEvent::Error { error }), _) => self.emit_error(error.into()),
+            _ => self.emit_error(PutObjectError::InvalidOperationState),
+        }
     }
 
     /// Rows committed with the version only while the import rule `import_id` exists.
     pub fn with_import_rows(mut self, import_id: Ulid, writes: Vec<(String, Key, Value)>) -> Self {
-        self.import_rows = Some(ImportRows { import_id, writes });
+        let guards = Vec::new();
+        self.import_rows = Some(ImportRows {
+            import_id,
+            writes,
+            guards,
+        });
+        self
+    }
+
+    /// Values the version transaction must still read before it writes the import rows.
+    pub fn with_import_guards(mut self, guards: Vec<(String, Key, Option<Value>)>) -> Self {
+        if let Some(rows) = self.import_rows.as_mut() {
+            rows.guards = guards;
+        }
         self
     }
 
@@ -136,6 +183,20 @@ impl PutObjectOperation {
             && let Some(key) = self.rule_fence()
         {
             self.state = PutObjectState::ReadImportRule;
+            let guards = self
+                .import_rows
+                .as_ref()
+                .map_or(&[][..], |rows| &rows.guards);
+            if !guards.is_empty() {
+                let rule = (BACKEND_IMPORT_KEYSPACE.to_string(), key);
+                let reads = guards
+                    .iter()
+                    .map(|(space, key, _)| (space.clone(), key.clone()));
+                return Some(smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads: std::iter::once(rule).chain(reads).collect(),
+                    txn_id: Some(txn_id),
+                })]);
+            }
             return Some(smallvec![Effect::Storage(StorageEffect::Read {
                 key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
                 key,
@@ -193,6 +254,21 @@ impl PutObjectOperation {
         match event {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                 self.rule_exists = Some(value.is_some());
+                self.write_cleanup_row(txn_id)
+            }
+            Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                let guards = self
+                    .import_rows
+                    .as_ref()
+                    .map_or(&[][..], |rows| &rows.guards);
+                let Some(((_, rule), seen)) = values.split_first() else {
+                    return self.emit_error(PutObjectError::InvalidOperationState);
+                };
+                let expected = guards.iter().map(|(_, _, value)| value);
+                if seen.len() != guards.len() || !seen.iter().map(|(_, v)| v).eq(expected) {
+                    return self.emit_error(PutObjectError::HeadChanged);
+                }
+                self.rule_exists = Some(rule.is_some());
                 self.write_cleanup_row(txn_id)
             }
             Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
@@ -255,6 +331,20 @@ impl PlainRecord<'_> {
         }
         Ok(writes)
     }
+}
+
+/// Stores the identity of a write to the import folder of `import_id` at `path`.
+pub(crate) fn intent_write(
+    import_id: Ulid,
+    path: &str,
+    intent: &WriteIntent,
+) -> Result<Effect, ConversionError> {
+    Ok(Effect::Storage(StorageEffect::Write {
+        key_space: IMPORT_INTENT_KEYSPACE.to_string(),
+        key: intent_key(import_id, path, intent.version_id),
+        value: intent.to_bytes()?.into(),
+        txn_id: None,
+    }))
 }
 
 /// Pins a plain object to the backend version it was written as.
@@ -388,7 +478,8 @@ mod tests {
         };
         assert_eq!(path, "raw/data/a.csv");
         // A folder key is written at its exact key, without looking first.
-        let (_, effects) = mapped("reports/");
+        let (mut operation, _) = mapped("reports/");
+        let effects = operation.step(write_result());
         let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
             panic!("expected a folder write, got {effects:?}")
         };
@@ -404,16 +495,45 @@ mod tests {
         }
     }
 
+    fn write_result() -> Event {
+        Event::Storage(StorageEvent::WriteResult {
+            key: Vec::new().into(),
+        })
+    }
+
     #[test]
     fn writes_unique_path() {
         let mut operation = operation(DEFAULT_PATTERN);
         let effects = begin(&mut operation);
 
+        // The identity of the write is stored before any byte moves.
         let id = operation.version_id.expect("the path names the version");
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id,
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the write intent, got {effects:?}")
+        };
+        let path = format!("raw/x/{id}_one.csv");
+        assert_eq!(key_space, IMPORT_INTENT_KEYSPACE);
+        assert_eq!(*key, intent_key(Ulid::from_bytes([4u8; 16]), &path, id));
+        assert_eq!(*txn_id, None);
+        let intent = WriteIntent::from_bytes(value).unwrap();
+        assert_eq!(
+            (intent.key.as_str(), intent.version_id),
+            ("in/x/one.csv", id)
+        );
+        assert_eq!(intent.backend, BackendRef::Group(backend_id()));
+        let effects = operation.step(write_result());
         let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
             panic!("expected a plain write, got {effects:?}")
         };
-        assert_eq!(plain.path, format!("raw/x/{id}_one.csv"));
+        assert_eq!(plain.path, path);
         assert_eq!(plain.ulid, id);
         assert!(!plain.if_not_exists);
 
@@ -430,6 +550,51 @@ mod tests {
                 .any(|effect| matches!(effect, Effect::Blob(BlobEffect::Delete { .. }))),
             "{effects:?}"
         );
+    }
+
+    #[test]
+    fn guards_import_rows() {
+        let guarded = |found: Option<Vec<u8>>| {
+            let mut operation = operation(DEFAULT_PATTERN)
+                .with_import_rows(Ulid::from_bytes([4u8; 16]), Vec::new())
+                .with_import_guards(vec![(
+                    IMPORTED_OBJECT_KEYSPACE.to_string(),
+                    Key::from(vec![1u8]),
+                    Some(Value::from(vec![2u8])),
+                )]);
+            operation.txn_id = Some(Ulid::nil());
+            let Some(effects) = operation.plain_records(Ulid::nil()) else {
+                panic!("expected the guarded rule read")
+            };
+            let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
+            else {
+                panic!("expected one batch read, got {effects:?}")
+            };
+            assert_eq!(reads.len(), 2);
+            operation.step(Event::Storage(StorageEvent::BatchReadResult {
+                values: vec![
+                    (Key::from(vec![0u8]), Some(Value::from(vec![0u8]))),
+                    (Key::from(vec![1u8]), found.map(Value::from)),
+                ],
+            }));
+            operation
+        };
+        // A row that changed since the import read it refuses the write.
+        let changed = guarded(Some(vec![3u8]));
+        assert!(matches!(
+            changed.output,
+            Some(Err(PutObjectError::HeadChanged))
+        ));
+        assert!(matches!(
+            guarded(None).output,
+            Some(Err(PutObjectError::HeadChanged))
+        ));
+        let kept = guarded(Some(vec![2u8]));
+        assert_eq!(kept.rule_exists, Some(true));
+        assert!(!matches!(
+            kept.output,
+            Some(Err(PutObjectError::HeadChanged))
+        ));
     }
 
     #[test]
@@ -671,10 +836,11 @@ mod tests {
             [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "raw/x/one.csv"
         ));
 
-        let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+        operation.step(Event::Blob(BlobEvent::PlainStat {
             exists: true,
             version: None,
         }));
+        let effects = operation.step(write_result());
         let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
             panic!("expected a plain write, got {effects:?}")
         };
@@ -690,6 +856,7 @@ mod tests {
             exists: false,
             version: None,
         }));
+        operation.step(write_result());
 
         // Another upload took the free path first; nothing at the path is deleted.
         let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));

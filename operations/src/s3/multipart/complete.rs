@@ -103,6 +103,8 @@ pub enum CompleteUploadState {
     DeleteUploadRecords,
     /// Reads the import rule a plain object's import row belongs to.
     ReadImportRule,
+    /// Records what a plain object will be before its bytes reach the path.
+    WriteIntent,
     WriteCleanupRecords,
     WriteReplicationObligation,
     EnforceQuota,
@@ -303,6 +305,8 @@ pub struct CompleteUploadOperation {
     plain_path: Option<PlainPath>,
     plain_version: Option<String>,
     plain_etag: Option<String>,
+    /// The compose that waits for its intent record.
+    pending_compose: Option<Effects>,
 }
 
 impl CompleteUploadOperation {
@@ -352,6 +356,7 @@ impl CompleteUploadOperation {
             plain_path: None,
             plain_version: None,
             plain_etag: None,
+            pending_compose: None,
         }
     }
 
@@ -2300,6 +2305,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::WriteObjectMetadata => self.metadata_written(event),
             CompleteUploadState::DeleteUploadRecords => self.records_deleted(event),
             CompleteUploadState::ReadImportRule => self.import_rule_read(event),
+            CompleteUploadState::WriteIntent => self.intent_written(event),
             CompleteUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
             CompleteUploadState::WriteReplicationObligation => self.obligation_written(event),
             CompleteUploadState::EnforceQuota => self.handle_enforce_quota(event),

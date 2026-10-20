@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::s3::object::put::{PlainRecord, same_name_path, version_row};
+use crate::s3::object::put::{PlainRecord, intent_write, same_name_path, version_row};
 use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
-use aruna_core::structs::storage::backend_import::{import_key, tagged_path};
+use aruna_core::structs::storage::backend_import::{WriteIntent, import_key, tagged_path};
 use aruna_core::structs::storage::multipart::BackendUpload;
 
 impl CompleteUploadOperation {
@@ -76,9 +76,13 @@ impl CompleteUploadOperation {
             return match event {
                 Event::Blob(BlobEvent::PlainStat { exists, version }) => {
                     let replaces = exists && version.is_some();
-                    self.complete_provider(!replaces).unwrap_or_else(|| {
-                        self.schedule_error(CompleteUploadError::InvalidOperationState)
-                    })
+                    let path = self
+                        .plain_upload()
+                        .map(|upload| upload.location.backend_path.clone());
+                    match (self.complete_provider(!replaces), path) {
+                        (Some(effects), Some(path)) => self.intent_first(&path, effects),
+                        _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
+                    }
                 }
                 Event::Blob(BlobEvent::Error(error)) => self.schedule_error(error.into()),
                 _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
@@ -131,7 +135,8 @@ impl CompleteUploadOperation {
         };
         self.plain_path = Some(plain.clone());
         self.state = CompleteUploadState::ComposeBlob;
-        smallvec![Effect::Blob(BlobEffect::Compose {
+        let path = plain.path.clone();
+        let compose = smallvec![Effect::Blob(BlobEffect::Compose {
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
             resolved,
@@ -142,7 +147,43 @@ impl CompleteUploadOperation {
                 .map(|part| part.location.clone())
                 .collect(),
             plain: Some(plain),
-        })]
+        })];
+        self.intent_first(&path, compose)
+    }
+
+    /// A listed plain object stores its identity before `compose` moves any byte to `path`.
+    fn intent_first(&mut self, path: &str, compose: Effects) -> Effects {
+        let (Some(target), Some(version_id)) = (self.plain.as_ref(), self.version_id) else {
+            return compose;
+        };
+        if !target.listed {
+            return compose;
+        }
+        let intent = WriteIntent {
+            key: self.input.key.clone(),
+            version_id,
+            backend: target.backend.clone(),
+            created_by: self.input.created_by,
+        };
+        match intent_write(target.import_id, path, &intent) {
+            Ok(effect) => {
+                self.pending_compose = Some(compose);
+                self.state = CompleteUploadState::WriteIntent;
+                smallvec![effect]
+            }
+            Err(error) => self.schedule_error(error.into()),
+        }
+    }
+
+    pub(super) fn intent_written(&mut self, event: Event) -> Effects {
+        match (event, self.pending_compose.take()) {
+            (Event::Storage(StorageEvent::WriteResult { .. }), Some(compose)) => {
+                self.state = CompleteUploadState::ComposeBlob;
+                compose
+            }
+            (Event::Storage(StorageEvent::Error { error }), _) => self.schedule_error(error.into()),
+            _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
+        }
     }
 
     /// Reads the rule of a listed plain object in the finalize transaction, so its import
@@ -358,12 +399,37 @@ mod tests {
         assert_eq!(versions(Some(Ulid::from_parts(6, 6))), 0);
     }
 
+    /// Answers the stored write intent that comes before a plain compose.
+    fn past_intent(operation: &mut CompleteUploadOperation, effects: Effects) -> Effects {
+        match effects.as_slice() {
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE =>
+            {
+                operation.step(Event::Storage(StorageEvent::WriteResult {
+                    key: Vec::new().into(),
+                }))
+            }
+            _ => effects,
+        }
+    }
+
     #[test]
     fn composes_plain_path() {
         let mut operation = operation(DEFAULT_PATTERN);
         let effects = operation.compose_blob();
 
+        // No byte moves before the identity of the object is stored.
         let id = operation.version_id.expect("the path names the version");
+        let [Effect::Storage(StorageEffect::Write { key, value, .. })] = effects.as_slice() else {
+            panic!("expected the write intent, got {effects:?}")
+        };
+        let path = format!("raw/{id}_object");
+        let import_id = Ulid::from_bytes([4u8; 16]);
+        let intent_key = aruna_core::structs::storage::backend_import::intent_key;
+        assert_eq!(*key, intent_key(import_id, &path, id));
+        let intent = WriteIntent::from_bytes(value).unwrap();
+        assert_eq!((intent.key.as_str(), intent.version_id), ("in/object", id));
+        let effects = past_intent(&mut operation, effects);
         let [
             Effect::Blob(BlobEffect::Compose {
                 plain: Some(plain), ..
@@ -397,13 +463,14 @@ mod tests {
             ] => plain.clone(),
             _ => panic!("expected a plain compose, got {effects:?}"),
         };
-        let plain = composed(&effects);
+        let plain = composed(&past_intent(&mut operation, effects));
         assert_eq!(plain.path, "raw/object");
         assert!(plain.if_not_exists);
 
         // Another upload took the free path first; the parts still compose next to it.
         let taken = || Event::Blob(BlobEvent::Error(BlobError::PathTaken));
-        let plain = composed(&operation.step(taken()));
+        let effects = operation.step(taken());
+        let plain = composed(&past_intent(&mut operation, effects));
         assert_eq!(plain.path, format!("raw/object~{id}"));
         assert!(plain.if_not_exists);
 
@@ -475,6 +542,7 @@ mod tests {
         ] {
             let mut operation = in_place(id);
             let effects = operation.step(Event::Blob(BlobEvent::PlainStat { exists, version }));
+            let effects = past_intent(&mut operation, effects);
             assert_eq!(provider_condition(&effects), if_not_exists);
         }
 
@@ -506,10 +574,11 @@ mod tests {
 
     /// Completes a stat-checked in-place upload with backend version `v1`.
     fn written_in_place(operation: &mut CompleteUploadOperation) {
-        operation.step(Event::Blob(BlobEvent::PlainStat {
+        let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
             exists: false,
             version: None,
         }));
+        past_intent(operation, effects);
         let mut location = operation.plain_upload().unwrap().location.clone();
         location.blob_size = 3;
         location.hashes = HashMap::from([(
@@ -536,10 +605,11 @@ mod tests {
     fn taken_in_place() {
         // A file that took the free path first fails the upload; its parts cannot move.
         let mut operation = in_place(Ulid::from_parts(6, 6));
-        operation.step(Event::Blob(BlobEvent::PlainStat {
+        let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
             exists: false,
             version: None,
         }));
+        past_intent(&mut operation, effects);
         let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
         assert!(
             !effects.iter().any(|effect| matches!(

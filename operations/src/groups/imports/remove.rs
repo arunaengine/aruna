@@ -9,8 +9,8 @@ use crate::groups::fence::{parse_group_record, read_group_record};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, IMPORT_REMOVAL_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
-    STORAGE_BACKEND_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORT_REMOVAL_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{ProviderCleanup, import_key, object_prefix};
@@ -56,6 +56,8 @@ pub struct RemoveImportOperation {
     /// The provider bucket the mark deletes, and whether the storage deleted it.
     cleanup: Option<ProviderCleanup>,
     deleted: bool,
+    /// The rows go first, then the write intents.
+    space: &'static str,
     output: Option<Result<(), ImportRuleError>>,
 }
 
@@ -68,6 +70,7 @@ impl RemoveImportOperation {
             txn_id: None,
             cleanup: None,
             deleted: false,
+            space: IMPORTED_OBJECT_KEYSPACE,
             output: None,
         }
     }
@@ -81,6 +84,7 @@ impl RemoveImportOperation {
             txn_id: None,
             cleanup: None,
             deleted: false,
+            space: IMPORTED_OBJECT_KEYSPACE,
             output: None,
         }
     }
@@ -98,7 +102,7 @@ impl RemoveImportOperation {
     fn scan(&mut self) -> Effects {
         self.state = RemoveState::Scan;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
+            key_space: self.space.to_string(),
             prefix: Some(object_prefix(self.import_id)),
             start: None,
             limit: DELETE_PAGE,
@@ -107,6 +111,10 @@ impl RemoveImportOperation {
     }
 
     fn purge(&mut self, values: Vec<(Key, Value)>) -> Effects {
+        if values.is_empty() && self.space == IMPORTED_OBJECT_KEYSPACE {
+            self.space = IMPORT_INTENT_KEYSPACE;
+            return self.scan();
+        }
         if let (true, Some(cleanup)) = (values.is_empty(), self.cleanup.as_ref()) {
             self.state = RemoveState::DropProvider;
             return smallvec![Effect::Blob(BlobEffect::DeleteEmptyBucket {
@@ -125,7 +133,7 @@ impl RemoveImportOperation {
         self.state = RemoveState::Purge;
         let deletes = values
             .into_iter()
-            .map(|(key, _)| (IMPORTED_OBJECT_KEYSPACE.to_string(), key))
+            .map(|(key, _)| (self.space.to_string(), key))
             .collect();
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
             deletes,
@@ -361,6 +369,11 @@ mod tests {
                 effects.as_slice(),
                 [Effect::Storage(StorageEffect::BatchDelete { .. })]
             ));
+        }
+        // The write intents of the rule go after its rows.
+        if let [Effect::Storage(StorageEffect::Iter { key_space, .. })] = effects.as_slice() {
+            assert_eq!(key_space, IMPORT_INTENT_KEYSPACE);
+            return drain(operation, 0);
         }
         effects
     }
