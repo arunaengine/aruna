@@ -280,6 +280,52 @@ impl CompleteUploadOperation {
         }
     }
 
+    /// Reads the version in the finalize transaction, so a registration meanwhile conflicts.
+    pub(super) fn read_registered(&mut self, version_id: Ulid) -> Effects {
+        let key = VersionKey::new(&self.input.bucket, &self.input.key, version_id).to_bytes();
+        let key = match key {
+            Ok(key) => key.into(),
+            Err(error) => return self.schedule_error(error.into()),
+        };
+        self.state = CompleteUploadState::ReadRegistered;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// The same bytes an import registered finish the upload without a second head move or
+    /// charge; other content under the version id is a conflict.
+    pub(super) fn registered_read(&mut self, event: Event) -> Effects {
+        let value = match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            Event::Storage(StorageEvent::Error { error }) => {
+                return self.schedule_error(error.into());
+            }
+            _ => return self.schedule_error(CompleteUploadError::InvalidOperationState),
+        };
+        let Some(value) = value else {
+            self.registered = false;
+            let (existing, version_id) = (self.existing_pointer.clone(), self.version_id);
+            let Some(version_id) = version_id else {
+                return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
+            };
+            return self.write_head(existing.as_ref(), version_id);
+        };
+        let stored = BlobVersion::from_bytes(value.as_ref()).ok();
+        let hash = stored.as_ref().and_then(|version| version.blob_hash());
+        let written = self
+            .final_location
+            .as_ref()
+            .and_then(|location| location.get_blake3());
+        if hash.is_none() || hash.map(|hash| &hash[..]) != written {
+            return self.schedule_error(CompleteUploadError::VersionExists);
+        }
+        self.registered = true;
+        self.delete_upload_records()
+    }
+
     /// Reads the rule of a listed plain object in the finalize transaction, so its import
     /// row is written only while the rule exists.
     pub(super) fn plain_fence(&mut self) -> Option<Effects> {
@@ -483,6 +529,56 @@ mod tests {
             .iter()
             .filter(|(key_space, _, _)| key_space == keyspace)
             .count()
+    }
+
+    #[test]
+    fn adopts_registered_version() {
+        let found = |stored: Option<[u8; 32]>| {
+            let (mut operation, _) = recorded(true, None);
+            operation.state = CompleteUploadState::ReadLivenessVersion;
+            // The version is read in the finalize transaction before the head moves.
+            let effects = operation.write_current_lookup(None);
+            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
+            else {
+                panic!("expected the version read, got {effects:?}")
+            };
+            assert_eq!(key_space, aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE);
+            let version = stored.map(|hash| {
+                let version = BlobVersion::materialized(
+                    hash,
+                    BackendRef::Group(backend_id()),
+                    aruna_core::structs::storage::format::EncodingClass::Raw,
+                    SystemTime::UNIX_EPOCH,
+                    UserId::default(),
+                    None,
+                );
+                Value::from(version.to_bytes().unwrap())
+            });
+            let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: Vec::new().into(),
+                value: version,
+            }));
+            (operation, effects)
+        };
+        let (_, effects) = found(None);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == aruna_core::keyspaces::BLOB_HEAD_KEYSPACE
+        ));
+        // The same bytes registered by an import: only the upload is cleared, then committed.
+        let (mut operation, _) = found(Some([7u8; 32]));
+        assert_eq!(operation.state, CompleteUploadState::DeleteUploadRecords);
+        let effects = operation.write_obligation();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        ));
+        let (mut operation, _) = found(Some([8u8; 32]));
+        assert_eq!(
+            operation.cleanup.take_error(),
+            Some(CompleteUploadError::VersionExists)
+        );
     }
 
     #[test]

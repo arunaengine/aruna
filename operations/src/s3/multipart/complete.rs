@@ -113,6 +113,8 @@ pub enum CompleteUploadState {
     SyncDroppedIntent,
     /// Records the hash of the composed bytes in the write intent.
     WriteEvidence,
+    /// Reads the version an import may have registered already.
+    ReadRegistered,
     WriteCleanupRecords,
     WriteReplicationObligation,
     EnforceQuota,
@@ -194,6 +196,8 @@ pub enum CompleteUploadError {
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("CompleteMultipartUpload failed")]
     CompleteUploadFailed,
+    #[error("the version already exists with other content")]
+    VersionExists,
     #[error("operation did not finish")]
     NotFinished,
     #[error(transparent)]
@@ -315,6 +319,8 @@ pub struct CompleteUploadOperation {
     plain_etag: Option<String>,
     /// The compose that waits for its intent record.
     pending_compose: Option<Effects>,
+    /// An import registered this version with the same bytes before the finalize.
+    registered: bool,
     /// The intent record of the compose in flight.
     written_intent: Vec<Key>,
 }
@@ -367,6 +373,7 @@ impl CompleteUploadOperation {
             plain_version: None,
             plain_etag: None,
             pending_compose: None,
+            registered: false,
             written_intent: Vec::new(),
         }
     }
@@ -1502,6 +1509,18 @@ impl CompleteUploadOperation {
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
         let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
+        // An import may register a listed object's version before the finalize commits it.
+        if self.plain.as_ref().is_some_and(|target| target.listed) {
+            return self.read_registered(version_id);
+        }
+        self.write_head(existing, version_id)
+    }
+
+    fn write_head(
+        &mut self,
+        existing: Option<&CurrentVersionPointer>,
+        version_id: Ulid,
+    ) -> Effects {
         let pointer = match CurrentVersionPointer::next_for(existing, version_id) {
             Ok(pointer) => pointer,
             Err(err) => return self.schedule_error(err.into()),
@@ -1880,6 +1899,11 @@ impl CompleteUploadOperation {
     }
 
     fn write_obligation(&mut self) -> Effects {
+        // A registered version keeps its obligation and charges; only the upload is cleared.
+        if let (true, Some(txn_id)) = (self.registered, self.txn_id) {
+            self.state = CompleteUploadState::CommitFinalizeTransaction;
+            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        }
         let Some(version_id) = self.version_id else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
@@ -2317,6 +2341,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::ReadObjectLookup => self.object_lookup_read(event),
             CompleteUploadState::ReadLivenessVersion => self.liveness_read(event),
             CompleteUploadState::WriteBlobHead => self.head_written(event),
+            CompleteUploadState::ReadRegistered => self.registered_read(event),
             CompleteUploadState::WritePathIndex => self.path_index_written(event),
             CompleteUploadState::WriteVersionRecord => self.version_written(event),
             CompleteUploadState::WriteEnvelope => self.envelope_written(event),
