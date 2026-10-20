@@ -38,6 +38,7 @@ use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, Pending
 use aruna_storage::{SEALED_KEYSPACES, row_aad};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 use ulid::Ulid;
 
@@ -459,8 +460,8 @@ where
     Ok(Rewrites { scanned, rows })
 }
 
-/// Realm configuration documents gained the catch-up wait and then the session
-/// idle timeout as their last values. Postcard is positional, so appending the
+/// Realm configuration documents gained the catch-up wait, the session idle
+/// timeout, federation settings and portal features as their last values. Postcard is positional, so appending the
 /// defaults an older row lacks re-encodes it.
 fn realm_configs(
     db: &OptimisticTxDatabase,
@@ -482,15 +483,16 @@ fn realm_configs(
 }
 
 /// Appends the trailing defaults an older row lacks, shortest suffix first, so
-/// a row missing only the newest value keeps the one it already has. Every older
-/// row also lacks the federation settings, which follow the timeouts.
+/// a row missing only the newest value keeps the one it already has.
 fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
+    let features = postcard::to_allocvec(&BTreeMap::<String, bool>::new()).ok()?;
     let federation = postcard::to_allocvec(&None::<FederationSettings>).ok()?;
     let idle = postcard::to_allocvec(&IDLE_AFTER_MS).ok()?;
     let catch_up = postcard::to_allocvec(&CATCH_UP_MS).ok()?;
-    let idle_on = [idle.as_slice(), &federation].concat();
+    let federation_on = [federation.as_slice(), &features].concat();
+    let idle_on = [idle.as_slice(), &federation_on].concat();
     let both = [catch_up.as_slice(), &idle_on].concat();
-    for suffix in [federation, idle_on, both] {
+    for suffix in [features, federation_on, idle_on, both] {
         let mut bytes = value.to_vec();
         bytes.extend_from_slice(&suffix);
         if RealmConfigDocument::from_bytes(&bytes).is_ok() {
@@ -860,17 +862,19 @@ mod tests {
 
     #[test]
     fn rewrites_realm_configs() {
-        // Legacy documents decode with defaults for catch-up and session idle timeouts and
-        // without federation settings. Current documents remain byte-identical.
+        // Legacy documents decode with default timeouts, no federation settings and no portal
+        // features. Current documents remain byte-identical.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         let document = RealmConfigDocument::new(REALM, Vec::new(), 3);
         let current = postcard::to_allocvec(&document).unwrap();
         // Every legacy layout ends where the fields it lacks would start.
+        let features = postcard::to_allocvec(&BTreeMap::<String, bool>::new()).unwrap();
         let federation = postcard::to_allocvec(&None::<super::FederationSettings>).unwrap();
         let idle = postcard::to_allocvec(&IDLE_AFTER_MS).unwrap();
         let catch_up = postcard::to_allocvec(&CATCH_UP_MS).unwrap();
-        let unfederated = current[..current.len() - federation.len()].to_vec();
+        let featureless = current[..current.len() - features.len()].to_vec();
+        let unfederated = featureless[..featureless.len() - federation.len()].to_vec();
         let one_missing = unfederated[..unfederated.len() - idle.len()].to_vec();
         let both_missing = one_missing[..one_missing.len() - catch_up.len()].to_vec();
         write(
@@ -880,6 +884,7 @@ mod tests {
                 (b"old", both_missing),
                 (b"newer", one_missing),
                 (b"main", unfederated),
+                (b"prior", featureless),
                 (b"new", current.clone()),
             ],
         );
@@ -888,11 +893,12 @@ mod tests {
 
         assert_eq!(
             (output.realm_configs_scanned, output.realm_configs_rewritten),
-            (4, 3)
+            (5, 4)
         );
         let rows = read(&path, REALM_CONFIG_KEYSPACE);
         assert_eq!(rows[b"new".as_slice()], current);
         assert_eq!(rows[b"main".as_slice()], current);
+        assert_eq!(rows[b"prior".as_slice()], current);
         let migrated = RealmConfigDocument::from_bytes(&rows[b"old".as_slice()]).unwrap();
         assert_eq!(migrated.compute.catch_up_ms, CATCH_UP_MS);
         assert_eq!(migrated.compute.session_idle_ms, IDLE_AFTER_MS);
