@@ -15,7 +15,7 @@ use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::groups::storage_routing::routing_key;
 use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use crate::s3::bucket::key::rows::settings_read;
-use crate::s3::object::put::{PlainRecord, same_name_path};
+use crate::s3::object::put::{PlainRecord, owner_read, owns_path, same_name_path};
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -60,6 +60,7 @@ pub enum MigrateState {
     HashTarget,
     ReadSource,
     CheckLinked,
+    ReadPlainOwner,
     StatPlain,
     ReadBlob,
     WriteBlob,
@@ -136,6 +137,8 @@ pub struct MigrateVersionOperation {
     /// The backend version of the renamed file; without one the old file is never deleted.
     source_version: Option<String>,
     plain_path: Option<PlainPath>,
+    /// The file at the plain path may be replaced: the rule recorded it for this key.
+    plain_owned: bool,
     /// The backend's id of the bytes a plain write stored.
     backend_version: Option<String>,
     backend_etag: Option<String>,
@@ -169,6 +172,7 @@ impl MigrateVersionOperation {
             earlier: Earlier::new(),
             renaming: false,
             source_version: None,
+            plain_owned: false,
             backend_version: None,
             backend_etag: None,
             found: None,
@@ -416,6 +420,25 @@ impl MigrateVersionOperation {
     }
 
     fn after_found(&mut self) -> Effects {
+        if let Some(read) = self.plain.as_ref().and_then(owner_read) {
+            self.state = MigrateState::ReadPlainOwner;
+            return smallvec![read];
+        }
+        self.plain_owned = true;
+        self.stat_plain()
+    }
+
+    fn handle_owner(&mut self, event: Event) -> Effects {
+        match owns_path(event, &self.version_key.key) {
+            Ok(owned) => {
+                self.plain_owned = owned;
+                self.stat_plain()
+            }
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
+    fn stat_plain(&mut self) -> Effects {
         if let Some(plain) = self.plain.as_ref() {
             self.state = MigrateState::StatPlain;
             return smallvec![Effect::Blob(BlobEffect::StatPlain {
@@ -457,7 +480,7 @@ impl MigrateVersionOperation {
             })];
         }
         let attempt = Ulid::generate();
-        let versioned = plain.same_name && version.is_some();
+        let versioned = plain.same_name && version.is_some() && self.plain_owned;
         let (path, if_not_exists) = same_name_path(&plain.path, attempt, exists, versioned);
         self.plain_path = Some(PlainPath {
             path,
@@ -985,6 +1008,7 @@ impl Operation for MigrateVersionOperation {
             MigrateState::HashTarget => self.handle_hashed(event),
             MigrateState::ReadSource => self.handle_source(event),
             MigrateState::CheckLinked => self.handle_linked(event),
+            MigrateState::ReadPlainOwner => self.handle_owner(event),
             MigrateState::StatPlain => self.handle_stat(event),
             MigrateState::ReadBlob => self.handle_read(event),
             MigrateState::WriteBlob => self.handle_written(event),
@@ -2042,6 +2066,10 @@ mod tests {
             };
             assert_eq!(BlobLocationKey::from_bytes(key).unwrap().backend, storage());
             let mut effects = operation.step(read_result(None));
+            if let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() {
+                assert_eq!(key_space, IMPORTED_OBJECT_KEYSPACE);
+                effects = operation.step(read_result(None));
+            }
             if let [Effect::Blob(BlobEffect::StatPlain { .. })] = effects.as_slice() {
                 effects = operation.step(Event::Blob(BlobEvent::PlainStat {
                     exists: taken,
@@ -2306,7 +2334,8 @@ mod tests {
             };
             assert_eq!(key_space, IMPORTED_OBJECT_KEYSPACE);
             operation.step(read_result(None));
-            let effects = operation.step(read_result(Some(old.to_bytes().unwrap())));
+            operation.step(read_result(Some(old.to_bytes().unwrap())));
+            let effects = operation.step(read_result(None));
             assert!(matches!(
                 effects.as_slice(),
                 [Effect::Blob(BlobEffect::StatPlain { .. })]
@@ -2399,6 +2428,8 @@ mod tests {
             operation.step(read_result(Some(old.to_bytes().unwrap())));
             // The old file's backend version binds a later delete to the renamed bytes.
             operation.step(read_result(source.map(<[u8]>::to_vec)));
+            operation.step(read_result(None));
+            // Nothing records the new name for another key.
             let effects = operation.step(read_result(None));
             let [Effect::Blob(BlobEffect::StatPlain { path, .. })] = effects.as_slice() else {
                 panic!("expected the stat of the new name, got {effects:?}")

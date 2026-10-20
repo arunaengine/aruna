@@ -8,7 +8,7 @@ use crate::placement::policy::{
 };
 use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::object::put::abe::{abe_reads, parse_abe};
-use crate::s3::object::put::same_name_path;
+use crate::s3::object::put::{owner_read, owns_path, same_name_path};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -45,6 +45,7 @@ pub enum CreateMultipartState {
     ReadBucketKey,
     PolicyGate,
     CheckOpenFence,
+    ReadPlainOwner,
     StatPlain,
     OpenUpload,
     ReadAbe,
@@ -136,6 +137,8 @@ pub struct CreateMultipartOperation {
     backend_upload: Option<BackendUpload>,
     /// The plain path and version id a same-name upload checks before it opens.
     plain: Option<PlainPath>,
+    /// The file at the plain path may be replaced: the rule recorded it for this key.
+    plain_owned: bool,
     /// Bucket and settings read before the gate, kept until the key record completes the plan.
     settings: Option<(Option<BucketInfo>, BucketEncryption)>,
     encryption: Option<UploadEncryption>,
@@ -161,6 +164,7 @@ impl CreateMultipartOperation {
             stored_subject: 0,
             backend_upload: None,
             plain: None,
+            plain_owned: false,
             settings: None,
             encryption: None,
             envelope: None,
@@ -260,11 +264,38 @@ impl CreateMultipartOperation {
         }
         // A same-name upload picks its path as a single write does; completion checks it again.
         self.plain = Some(plain);
+        match owner_read(&target) {
+            Some(read) => {
+                self.state = CreateMultipartState::ReadPlainOwner;
+                smallvec![read]
+            }
+            None => {
+                self.plain_owned = true;
+                self.stat_plain()
+            }
+        }
+    }
+
+    fn plain_owner(&mut self, event: Event) -> Effects {
+        match owns_path(event, &self.input.key) {
+            Ok(owned) => {
+                self.plain_owned = owned;
+                self.stat_plain()
+            }
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn stat_plain(&mut self) -> Effects {
+        let (Some(plain), Some(resolved)) = (self.plain.as_ref(), self.resolved.as_ref()) else {
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+        };
+        let stat = BlobEffect::StatPlain {
+            backend: resolved.backend.clone(),
+            path: plain.path.clone(),
+        };
         self.state = CreateMultipartState::StatPlain;
-        smallvec![Effect::Blob(BlobEffect::StatPlain {
-            backend: target.backend,
-            path: target.path,
-        })]
+        smallvec![Effect::Blob(stat)]
     }
 
     fn plain_stat(&mut self, event: Event) -> Effects {
@@ -273,8 +304,9 @@ impl CreateMultipartOperation {
         };
         match event {
             Event::Blob(BlobEvent::PlainStat { exists, version }) => {
+                let replaces = version.is_some() && self.plain_owned;
                 let (path, if_not_exists) =
-                    same_name_path(&plain.path, plain.ulid, exists, version.is_some());
+                    same_name_path(&plain.path, plain.ulid, exists, replaces);
                 self.open_native(Some(PlainPath {
                     path,
                     if_not_exists,
@@ -715,6 +747,7 @@ impl Operation for CreateMultipartOperation {
             CreateMultipartState::ReadBucketKey => self.handle_bucket_key(event),
             CreateMultipartState::PolicyGate => self.handle_policy_gate(event),
             CreateMultipartState::CheckOpenFence => self.open_upload(event),
+            CreateMultipartState::ReadPlainOwner => self.plain_owner(event),
             CreateMultipartState::StatPlain => self.plain_stat(event),
             CreateMultipartState::OpenUpload => self.upload_opened(event),
             CreateMultipartState::ReadAbe => self.abe_read(event),
@@ -908,7 +941,8 @@ mod pure_tests {
             (operation, effects)
         };
         // A plain key checks its exact key before the provider upload opens there.
-        let (_, effects) = created("data/a.csv");
+        let (mut operation, _) = created("data/a.csv");
+        let effects = owner_answer(&mut operation, None);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "team-a-bucket/data/a.csv"
@@ -1404,6 +1438,24 @@ mod pure_tests {
         (operation, effects)
     }
 
+    /// Answers the read of the rule's record at the plain path with a row for `key`.
+    fn owner_answer(operation: &mut CreateMultipartOperation, key: Option<&str>) -> Effects {
+        let row = key.map(|key| {
+            let id = Ulid::from_parts(8, 8);
+            let row = aruna_core::structs::storage::backend_import::ImportedObject::written(
+                id,
+                key.to_string(),
+                1,
+                None,
+            );
+            row.to_bytes().unwrap().into()
+        });
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: row,
+        }))
+    }
+
     fn opened_plain(effects: &Effects) -> PlainPath {
         match effects.as_slice() {
             [
@@ -1419,13 +1471,25 @@ mod pure_tests {
     fn opens_plain_path() {
         // A same-name upload looks at the path first and opens where a single write would go.
         // A foreign file without versions keeps its path; the upload takes its tagged path.
+        // A file the rule recorded for another key or not at all is kept even with versions.
+        let own = Some("archive/one");
         let cases = [
-            (false, None, false, true),
-            (true, Some("v1".to_string()), false, false),
-            (true, None, true, true),
+            (own, false, None, false, true),
+            (own, true, Some("v1".to_string()), false, false),
+            (own, true, None, true, true),
+            (Some("other/one"), true, Some("v1".to_string()), true, true),
+            (None, true, Some("v1".to_string()), true, true),
         ];
-        for (exists, version, tagged, if_not_exists) in cases {
+        for (owner, exists, version, tagged, if_not_exists) in cases {
             let (mut operation, effects) = plain_create("{dir}{name}");
+            assert!(
+                matches!(
+                    effects.as_slice(),
+                    [Effect::Storage(StorageEffect::Read { .. })]
+                ),
+                "expected the owner read, got {effects:?}"
+            );
+            let effects = owner_answer(&mut operation, owner);
             assert!(
                 matches!(
                     effects.as_slice(),
@@ -1455,6 +1519,7 @@ mod pure_tests {
     #[test]
     fn plain_stat_fails() {
         let (mut operation, _) = plain_create("{dir}{name}");
+        owner_answer(&mut operation, None);
         let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::KeyTooLong)));
         assert!(effects.is_empty(), "nothing was opened yet: {effects:?}");
         assert!(matches!(

@@ -43,9 +43,9 @@ use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPoli
 use aruna_core::structs::storage::abe::{AbeError, ObjectEnvelope};
 use aruna_core::structs::storage::backend_import::PlainPath;
 use aruna_core::structs::storage::blob::{
-    ArchiveKey, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend, VersionKey,
-    WriteOwner,
+    ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobHeadKey, BlobLocationKey,
+    BlobVersion, BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend,
+    VersionKey, WriteOwner,
 };
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError};
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
@@ -71,6 +71,8 @@ const PART_PAGE: usize = 256;
 #[derive(Debug, Eq, PartialEq)]
 pub enum CompleteUploadState {
     Init,
+    /// Reads which key the rule recorded at the path of a same-name object.
+    ReadPlainOwner,
     /// Looks at the path of a same-name object before it is composed.
     StatPlain,
     StartMarkTransaction,
@@ -313,6 +315,9 @@ pub struct CompleteUploadOperation {
     recheck_pending: bool,
     routing: Option<RoutingSnapshot>,
     plain: Option<PlainTarget>,
+    /// The path a same-name object looks at, and whether the file there may be replaced.
+    plain_stat_at: Option<(BackendRef, String)>,
+    plain_owned: bool,
     /// The path composed last and the backend version the compose reported.
     plain_path: Option<PlainPath>,
     plain_version: Option<String>,
@@ -369,6 +374,8 @@ impl CompleteUploadOperation {
             recheck_pending: false,
             routing: None,
             plain: None,
+            plain_stat_at: None,
+            plain_owned: false,
             plain_path: None,
             plain_version: None,
             plain_etag: None,
@@ -2321,6 +2328,7 @@ impl Operation for CompleteUploadOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             CompleteUploadState::Init => self.handle_init(),
+            CompleteUploadState::ReadPlainOwner => self.plain_owner(event),
             CompleteUploadState::StatPlain => self.plain_stat(event),
             CompleteUploadState::StartMarkTransaction => self.mark_started(event),
             CompleteUploadState::CheckPurgeMark => self.mark_fence_checked(event),

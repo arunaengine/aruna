@@ -4,7 +4,8 @@
 
 use super::*;
 use crate::s3::object::put::{
-    PlainRecord, intent_deletes, intent_keys, intent_writes, same_name_path, version_row,
+    PlainRecord, intent_deletes, intent_keys, intent_writes, owner_read, owns_path, same_name_path,
+    version_row,
 };
 use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, IMPORT_INTENT_KEYSPACE};
 use aruna_core::structs::storage::backend_import::{
@@ -37,17 +38,52 @@ impl CompleteUploadOperation {
             .plain_target(bucket, key, id)
             .filter(|target| target.backend == upload.backend)?;
         self.version_id = Some(id);
-        let stat = BlobEffect::StatPlain {
-            backend: target.backend.clone(),
-            path: target.path.clone(),
-        };
+        let stat_at = (target.backend.clone(), target.path.clone());
         let (same_name, path) = (target.same_name, target.path.clone());
         self.plain = Some(target);
         if !same_name {
             return Some(self.compose_plain(path, false));
         }
+        Some(self.read_owner(stat_at))
+    }
+
+    /// The rule's record of the path decides first whether the file there may be replaced.
+    /// The record is read at the path the object completes at. Without the rule nothing proves
+    /// an owner, so the file there is kept.
+    fn read_owner(&mut self, stat_at: (BackendRef, String)) -> Effects {
+        let at = self.plain.clone().map(|target| PlainTarget {
+            path: stat_at.1.clone(),
+            ..target
+        });
+        self.plain_stat_at = Some(stat_at);
+        match at.as_ref().and_then(owner_read) {
+            Some(read) => {
+                self.state = CompleteUploadState::ReadPlainOwner;
+                smallvec![read]
+            }
+            None => {
+                self.plain_owned = at.is_some_and(|plain| !plain.listed);
+                self.stat_plain()
+            }
+        }
+    }
+
+    pub(super) fn plain_owner(&mut self, event: Event) -> Effects {
+        match owns_path(event, &self.input.key) {
+            Ok(owned) => {
+                self.plain_owned = owned;
+                self.stat_plain()
+            }
+            Err(error) => self.schedule_error(error.into()),
+        }
+    }
+
+    fn stat_plain(&mut self) -> Effects {
+        let Some((backend, path)) = self.plain_stat_at.clone() else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
         self.state = CompleteUploadState::StatPlain;
-        Some(smallvec![Effect::Blob(stat)])
+        smallvec![Effect::Blob(BlobEffect::StatPlain { backend, path })]
     }
 
     /// The provider upload of an upload that opened at its plain path.
@@ -67,11 +103,7 @@ impl CompleteUploadOperation {
             .as_ref()
             .and_then(|routing| routing.saved_target(bucket, key, &location.backend, path));
         self.version_id = Some(id);
-        self.state = CompleteUploadState::StatPlain;
-        smallvec![Effect::Blob(BlobEffect::StatPlain {
-            backend: location.backend,
-            path: location.backend_path,
-        })]
+        self.read_owner((location.backend, location.backend_path))
     }
 
     pub(super) fn plain_stat(&mut self, event: Event) -> Effects {
@@ -79,7 +111,7 @@ impl CompleteUploadOperation {
         if self.plain_upload().is_some() {
             return match event {
                 Event::Blob(BlobEvent::PlainStat { exists, version }) => {
-                    let replaces = exists && version.is_some();
+                    let replaces = exists && version.is_some() && self.plain_owned;
                     let path = self
                         .plain_upload()
                         .map(|upload| upload.location.backend_path.clone());
@@ -98,8 +130,8 @@ impl CompleteUploadOperation {
         };
         match event {
             Event::Blob(BlobEvent::PlainStat { exists, version }) => {
-                let path = &target.path;
-                let (path, if_not_exists) = same_name_path(path, id, exists, version.is_some());
+                let (path, replaces) = (&target.path, version.is_some() && self.plain_owned);
+                let (path, if_not_exists) = same_name_path(path, id, exists, replaces);
                 self.compose_plain(path, if_not_exists)
             }
             Event::Blob(BlobEvent::Error(error)) => self.schedule_error(error.into()),
@@ -386,7 +418,9 @@ impl CompleteUploadOperation {
 mod tests {
     use super::*;
     use aruna_core::keyspaces::{BACKEND_VERSION_KEYSPACE, IMPORTED_OBJECT_KEYSPACE};
-    use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
+    use aruna_core::structs::storage::backend_import::{
+        BackendImport, DEFAULT_PATTERN, ImportedObject, object_key,
+    };
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::multipart::BackendUpload;
     use aruna_core::structs::storage::routing::{BackendCatalog, GroupRoutingInputs};
@@ -699,11 +733,24 @@ mod tests {
         assert_eq!(plain.ulid, id);
     }
 
+    /// Answers the read of the rule's record at the path with a row for `key`, or none.
+    fn owner_answer(operation: &mut CompleteUploadOperation, key: Option<String>) -> Effects {
+        let row = key.map(|key| {
+            let row = ImportedObject::written(Ulid::from_parts(8, 8), key, 1, None);
+            row.to_bytes().unwrap().into()
+        });
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: row,
+        }))
+    }
+
     #[test]
     fn falls_back_tagged() {
         let mut operation = operation("{dir}{name}");
-        let effects = operation.compose_blob();
+        operation.compose_blob();
         let id = operation.version_id.unwrap();
+        let effects = owner_answer(&mut operation, None);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "raw/object"
@@ -751,15 +798,46 @@ mod tests {
         );
     }
 
-    /// An upload whose provider upload opened at `raw/object` as version `id`.
-    fn in_place(id: Ulid) -> CompleteUploadOperation {
+    #[test]
+    fn keeps_foreign_file() {
+        // Another key's file with versions is kept; the object composes at its tagged path.
         let mut operation = operation("{dir}{name}");
-        open_at(&mut operation, "raw/object", id);
+        operation.compose_blob();
+        let id = operation.version_id.unwrap();
+        owner_answer(&mut operation, Some("other".to_string()));
+        let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+            exists: true,
+            version: Some("v0".to_string()),
+        }));
+        let effects = past_intent(&mut operation, effects);
+        let [
+            Effect::Blob(BlobEffect::Compose {
+                plain: Some(plain), ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected a plain compose, got {effects:?}")
+        };
+        assert_eq!(plain.path, format!("raw/object~{id}"));
+        assert!(plain.if_not_exists);
+    }
+
+    /// An upload whose provider upload opened at `raw/object` as version `id`, a path the
+    /// rule recorded for `owner`.
+    fn in_place_for(id: Ulid, owner: Option<String>) -> CompleteUploadOperation {
+        let mut operation = operation("{dir}{name}");
+        open_at(&mut operation, "raw/object", id, owner);
         operation
     }
 
-    /// Opens the provider upload at `path` as version `id` and starts its completion.
-    fn open_at(operation: &mut CompleteUploadOperation, path: &str, id: Ulid) {
+    /// Opens the provider upload at `path` as version `id`, recorded for `owner`, and starts
+    /// its completion.
+    fn open_at(
+        operation: &mut CompleteUploadOperation,
+        path: &str,
+        id: Ulid,
+        owner: Option<String>,
+    ) {
         let location = BackendLocation {
             backend: BackendRef::Group(backend_id()),
             storage_class: None,
@@ -782,7 +860,8 @@ mod tests {
                 record_id: Ulid::from_parts(1, 1),
             });
         }
-        let effects = operation.compose_blob();
+        operation.compose_blob();
+        let effects = owner_answer(operation, owner);
         assert!(
             matches!(
                 effects.as_slice(),
@@ -791,6 +870,11 @@ mod tests {
             "expected the path stat, got {effects:?}"
         );
         assert_eq!(operation.version_id, Some(id));
+    }
+
+    fn in_place(id: Ulid) -> CompleteUploadOperation {
+        let key = operation("{dir}{name}").input.key;
+        in_place_for(id, Some(key))
     }
 
     fn provider_condition(effects: &Effects) -> bool {
@@ -814,6 +898,16 @@ mod tests {
             let effects = past_intent(&mut operation, effects);
             assert_eq!(provider_condition(&effects), if_not_exists);
         }
+        // A file the rule recorded for another key, or never, is kept even with versions.
+        for owner in [Some("other".to_string()), None] {
+            let mut operation = in_place_for(id, owner);
+            let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+                exists: true,
+                version: Some("v0".to_string()),
+            }));
+            let effects = past_intent(&mut operation, effects);
+            assert!(provider_condition(&effects));
+        }
 
         // The object written in place gets the records of a plain write.
         let mut operation = in_place(id);
@@ -833,7 +927,8 @@ mod tests {
         let opened = || {
             let mut operation = operation("{dir}{name}");
             operation.input.key = "in/report ".to_string();
-            open_at(&mut operation, &path, id);
+            let key = operation.input.key.clone();
+            open_at(&mut operation, &path, id, Some(key));
             operation
         };
         let mut operation = opened();
@@ -841,15 +936,47 @@ mod tests {
             exists: false,
             version: None,
         }));
-        let [Effect::Storage(StorageEffect::Write { key, .. })] = effects.as_slice() else {
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected the write intent, got {effects:?}")
         };
         let intent_key = aruna_core::structs::storage::backend_import::intent_key;
-        assert_eq!(*key, intent_key(Ulid::from_bytes([4u8; 16]), &path, id));
+        assert_eq!(
+            writes[0].1,
+            intent_key(Ulid::from_bytes([4u8; 16]), &path, id)
+        );
         let mut operation = opened();
         written_in_place(&mut operation);
         let writes = finalize_writes(&mut operation, true);
         assert_eq!(count(&writes, IMPORTED_OBJECT_KEYSPACE), 1);
+    }
+
+    #[test]
+    fn keeps_file_without_rule() {
+        // The rule was removed before completion, so nothing proves the file there is ours.
+        let id = Ulid::from_parts(6, 6);
+        let mut operation = in_place_for(id, None);
+        operation.plain = None;
+        operation.read_owner((BackendRef::Group(backend_id()), "raw/object".to_string()));
+        let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+            exists: true,
+            version: Some("v0".to_string()),
+        }));
+        assert!(provider_condition(&effects));
+    }
+
+    #[test]
+    fn reads_owner_at_path() {
+        // An upload opened at a tagged path asks who owns that path, not the plain one.
+        let mut operation = in_place(Ulid::from_parts(6, 6));
+        let effects = operation.read_owner((
+            BackendRef::Group(backend_id()),
+            "raw/object~tag".to_string(),
+        ));
+        let [Effect::Storage(StorageEffect::Read { key, .. })] = effects.as_slice() else {
+            panic!("expected the owner read, got {effects:?}")
+        };
+        let import_id = operation.plain.as_ref().unwrap().import_id;
+        assert_eq!(*key, object_key(import_id, "raw/object~tag"));
     }
 
     #[test]

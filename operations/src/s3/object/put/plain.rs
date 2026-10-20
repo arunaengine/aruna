@@ -22,6 +22,8 @@ pub(super) struct PlainWrite {
     resolved: ResolvedBackend,
     pub(super) version: Option<String>,
     pub(super) etag: Option<String>,
+    /// The file at the path may be replaced: the rule recorded it for this key.
+    owned: bool,
 }
 
 /// Rows an import commits with its version; the rule must still exist in that transaction.
@@ -66,12 +68,10 @@ impl PutObjectOperation {
         resolved: ResolvedBackend,
     ) -> Effects {
         self.adopted = true;
-        let stat = BlobEffect::StatPlain {
-            backend: target.backend.clone(),
-            path: target.path.clone(),
-        };
         let (same_name, path) = (target.same_name, target.path.clone());
+        let owner = owner_read(&target);
         self.plain = Some(PlainWrite {
+            owned: owner.is_none(),
             target,
             resolved,
             version: None,
@@ -80,8 +80,37 @@ impl PutObjectOperation {
         if !same_name {
             return self.write_plain(path, false);
         }
+        match owner {
+            Some(read) => {
+                self.state = PutObjectState::ReadPlainOwner;
+                smallvec![read]
+            }
+            None => self.stat_plain(),
+        }
+    }
+
+    fn stat_plain(&mut self) -> Effects {
+        let Some(plain) = self.plain.as_ref() else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let stat = BlobEffect::StatPlain {
+            backend: plain.target.backend.clone(),
+            path: plain.target.path.clone(),
+        };
         self.state = PutObjectState::StatPlain;
         smallvec![Effect::Blob(stat)]
+    }
+
+    pub(super) fn plain_owner(&mut self, event: Event) -> Effects {
+        let owned = owns_path(event, &self.config.request.key);
+        match (owned, self.plain.as_mut()) {
+            (Ok(owned), Some(plain)) => {
+                plain.owned = owned;
+                self.stat_plain()
+            }
+            (Err(error), _) => self.emit_error(PutObjectError::BlobWriteFailed(error)),
+            (_, None) => self.emit_error(PutObjectError::InvalidOperationState),
+        }
     }
 
     pub(super) fn plain_stat(&mut self, event: Event) -> Effects {
@@ -90,8 +119,8 @@ impl PutObjectOperation {
         };
         match event {
             Event::Blob(BlobEvent::PlainStat { exists, version }) => {
-                let path = &plain.target.path;
-                let (path, if_not_exists) = same_name_path(path, id, exists, version.is_some());
+                let (path, replaces) = (&plain.target.path, version.is_some() && plain.owned);
+                let (path, if_not_exists) = same_name_path(path, id, exists, replaces);
                 self.write_plain(path, if_not_exists)
             }
             Event::Blob(BlobEvent::Error(error)) => {
@@ -432,6 +461,36 @@ pub(crate) fn same_name_path(
     }
 }
 
+/// Reads the rule's record of the path, where the rule records its files; another rule's or
+/// an unknown file there is never replaced.
+pub(crate) fn owner_read(target: &PlainTarget) -> Option<Effect> {
+    target.listed.then(|| {
+        Effect::Storage(StorageEffect::Read {
+            key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
+            key: object_key(target.import_id, &target.path),
+            txn_id: None,
+        })
+    })
+}
+
+/// Whether the record read by `owner_read` names `key`. A record without a key proves no
+/// owner, since several keys can give the same path.
+pub(crate) fn owns_path(event: Event, key: &str) -> Result<bool, BlobError> {
+    match event {
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => {
+            let row = ImportedObject::from_bytes(&value)?;
+            Ok(row.key.as_deref() == Some(key))
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(BlobError::ReadError(error.to_string()))
+        }
+        _ => Err(BlobError::InvalidEffect),
+    }
+}
+
 /// What a plain write commits with its version.
 pub(crate) struct PlainRecord<'a> {
     pub target: &'a PlainTarget,
@@ -632,8 +691,9 @@ mod tests {
             let effects = begin(&mut operation);
             (operation, effects)
         };
-        let (_, effects) = mapped("data/a.csv");
+        let (mut operation, _) = mapped("data/a.csv");
         // The same-name write first looks at the exact key in the provider bucket.
+        let effects = operation.step(read(None));
         let [Effect::Blob(BlobEffect::StatPlain { path, .. })] = effects.as_slice() else {
             panic!("expected a plain path, got {effects:?}")
         };
@@ -1104,10 +1164,74 @@ mod tests {
         );
     }
 
+    /// Runs the gates and the read of the rule's record at the path, answered with `row`.
+    fn owner_answered(operation: &mut PutObjectOperation, row: Option<&str>) -> Effects {
+        let effects = begin(operation);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == IMPORTED_OBJECT_KEYSPACE
+        ));
+        let row = row.map(|key| {
+            let id = Ulid::from_parts(8, 8);
+            ImportedObject::written(id, key.to_string(), 3, None)
+                .to_bytes()
+                .unwrap()
+        });
+        operation.step(read(row))
+    }
+
+    #[test]
+    fn keyless_row_owns_nothing() {
+        // An imported `raw/a.csv` maps to `in/a.csv`, yet `in/x/a.csv` can give the same path.
+        let listed = aruna_core::structs::storage::backend_import::ExternalObject {
+            key: "raw/a.csv".to_string(),
+            size: 3,
+            etag: None,
+            modified_ms: None,
+        };
+        let row = ImportedObject::new(Ulid::from_parts(8, 8), &listed);
+        assert_eq!(row.key, None);
+        let event = read(Some(row.to_bytes().unwrap()));
+        assert_eq!(owns_path(event, "in/x/a.csv"), Ok(false));
+    }
+
+    #[test]
+    fn keeps_foreign_files() {
+        // Only the file the rule recorded for this key is replaced on a backend with versions.
+        let cases = [
+            (Some("in/x/one.csv"), false),
+            (Some("other/one.csv"), true),
+            (None, true),
+        ];
+        for (row, tagged) in cases {
+            let mut operation = operation("{dir}{name}");
+            owner_answered(&mut operation, row);
+            let id = operation.version_id.unwrap();
+            operation.step(Event::Blob(BlobEvent::PlainStat {
+                exists: true,
+                version: Some("v1".to_string()),
+            }));
+            let effects = past_intent(&mut operation);
+            let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
+                panic!("expected a plain write, got {effects:?}")
+            };
+            let expected = match tagged {
+                true => (format!("raw/x/one.csv~{id}"), true),
+                false => ("raw/x/one.csv".to_string(), false),
+            };
+            assert_eq!(
+                (plain.path.clone(), plain.if_not_exists),
+                expected,
+                "{row:?}"
+            );
+        }
+    }
+
     #[test]
     fn stats_same_name() {
         let mut operation = operation("{dir}{name}");
-        let effects = begin(&mut operation);
+        let effects = owner_answered(&mut operation, None);
         let id = operation.version_id.unwrap();
         assert!(matches!(
             effects.as_slice(),
@@ -1186,7 +1310,7 @@ mod tests {
     #[test]
     fn records_written_hash() {
         let mut operation = operation("{dir}{name}");
-        begin(&mut operation);
+        owner_answered(&mut operation, None);
         operation.step(Event::Blob(BlobEvent::PlainStat {
             exists: false,
             version: None,
@@ -1224,7 +1348,7 @@ mod tests {
     #[test]
     fn keeps_failed_drop() {
         let mut operation = operation("{dir}{name}");
-        begin(&mut operation);
+        owner_answered(&mut operation, None);
         operation.step(Event::Blob(BlobEvent::PlainStat {
             exists: false,
             version: None,
@@ -1246,7 +1370,7 @@ mod tests {
     #[test]
     fn taken_path_fails() {
         let mut operation = operation("{dir}{name}");
-        begin(&mut operation);
+        owner_answered(&mut operation, None);
         operation.step(Event::Blob(BlobEvent::PlainStat {
             exists: false,
             version: None,

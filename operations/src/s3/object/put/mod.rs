@@ -113,6 +113,8 @@ pub enum PutObjectState {
     ReadAbe,
     FenceAbe,
     WriteEnvelope,
+    /// Reads which key the rule recorded at the path of a same-name write.
+    ReadPlainOwner,
     /// Looks at the path of a same-name write before it is written.
     StatPlain,
     WritePlainRecords,
@@ -1941,6 +1943,7 @@ impl Operation for PutObjectOperation {
                 _ => self.emit_error(PutObjectError::InvalidOperationState),
             },
             PutObjectState::WriteBlob => self.handle_write_finished(event),
+            PutObjectState::ReadPlainOwner => self.plain_owner(event),
             PutObjectState::StatPlain => self.plain_stat(event),
             PutObjectState::WritePlainRecords | PutObjectState::RetireIntents => {
                 self.plain_written(event)
@@ -2766,7 +2769,8 @@ mod trail;
 pub(crate) use trail::{Trail, trail_ranges};
 
 pub(crate) use plain::{
-    PlainRecord, intent_deletes, intent_keys, intent_writes, same_name_path, version_row,
+    PlainRecord, intent_deletes, intent_keys, intent_writes, owner_read, owns_path, same_name_path,
+    version_row,
 };
 
 #[path = "abe.rs"]
