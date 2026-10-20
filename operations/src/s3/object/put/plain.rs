@@ -136,6 +136,11 @@ impl PutObjectOperation {
         }
     }
 
+    /// Whether this is a plain write to the folder of an import rule.
+    pub(super) fn listed_write(&self) -> bool {
+        self.plain.as_ref().is_some_and(|plain| plain.target.listed)
+    }
+
     /// The identity of a listed plain write, without its written bytes.
     fn plain_intent(&self) -> Option<WriteIntent> {
         let plain = self.plain.as_ref().filter(|plain| plain.target.listed)?;
@@ -1119,6 +1124,63 @@ mod tests {
         };
         assert_eq!(plain.path, format!("raw/x/one.csv~{id}"));
         assert!(plain.if_not_exists);
+    }
+
+    #[test]
+    fn adopts_registered_version() {
+        let found = |stored: Option<[u8; 32]>| {
+            let mut put = operation("{dir}{name}");
+            begin(&mut put);
+            let id = put.version_id.unwrap();
+            put.output = Some(Ok(written("raw/x/one.csv".to_string(), id)));
+            put.txn_id = Some(Ulid::nil());
+            // The version is read in the transaction before the head moves.
+            let effects = put.write_current_lookup(None);
+            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
+            else {
+                panic!("expected the version read, got {effects:?}")
+            };
+            assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
+            let version = stored.map(|hash| {
+                let version = BlobVersion::materialized(
+                    hash,
+                    BackendRef::Group(backend_id()),
+                    aruna_core::structs::storage::format::EncodingClass::Raw,
+                    SystemTime::UNIX_EPOCH,
+                    UserId::default(),
+                    None,
+                );
+                version.to_bytes().unwrap()
+            });
+            let effects = put.step(read(version));
+            (put, effects)
+        };
+        // Nothing registered yet: the write moves the head as usual.
+        let (_, effects) = found(None);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })] if key_space == BLOB_HEAD_KEYSPACE
+        ));
+        // An import registered the same bytes first: no head move and no second charge.
+        let (mut put, effects) = found(Some([7u8; 32]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        let effects = put.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: Ulid::nil(),
+        }));
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Storage(StorageEffect::Write { .. } | StorageEffect::AddUsage { .. })
+        )));
+        assert!(put.output.as_ref().is_some_and(Result::is_ok));
+        // Other bytes under the same version id are a conflict.
+        let (put, _) = found(Some([8u8; 32]));
+        assert!(matches!(
+            put.output,
+            Some(Err(PutObjectError::VersionExists))
+        ));
     }
 
     #[test]

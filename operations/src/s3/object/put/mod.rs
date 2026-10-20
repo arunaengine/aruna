@@ -130,6 +130,8 @@ pub enum PutObjectState {
     SyncDroppedIntent,
     /// Records the hash of the written bytes in the write intent.
     WriteEvidence,
+    /// Drops the transaction of a write an import already registered.
+    AbortRegistered,
     /// Reads the delete trail inside the version transaction.
     ReadTrail,
 }
@@ -1158,9 +1160,18 @@ impl PutObjectOperation {
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
         let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
-        if self.keep_head {
+        // An import may register a listed write's version before the write commits it.
+        if self.keep_head || self.listed_write() {
             return self.read_history(version_id);
         }
+        self.write_head(existing, version_id)
+    }
+
+    fn write_head(
+        &mut self,
+        existing: Option<&CurrentVersionPointer>,
+        version_id: Ulid,
+    ) -> Effects {
         let pointer = match CurrentVersionPointer::next_for(existing, version_id) {
             Ok(pointer) => pointer,
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
@@ -1189,11 +1200,44 @@ impl PutObjectOperation {
     }
 
     fn history_read(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => self.write_path_index(),
-            Event::Storage(StorageEvent::ReadResult { .. }) => {
-                self.emit_error(PutObjectError::VersionExists)
+        let value = match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
+            _ => return self.emit_error(PutObjectError::InvalidOperationState),
+        };
+        let Some(value) = value else {
+            if self.keep_head {
+                return self.write_path_index();
             }
+            let (existing, version_id) = (self.existing_pointer.clone(), self.version_id);
+            let Some(version_id) = version_id else {
+                return self.emit_error(PutObjectError::PutObjectFailed);
+            };
+            return self.write_head(existing.as_ref(), version_id);
+        };
+        // A listed write an import already registered with the same bytes is done: it is not
+        // charged or moved again. Other content under its version id is a conflict.
+        let stored = BlobVersion::from_bytes(value.as_ref()).ok();
+        let hash = stored.as_ref().and_then(|version| version.blob_hash());
+        let written = self.get_output().and_then(|location| location.get_blake3());
+        if self.keep_head || hash.is_none() || hash.map(|hash| &hash[..]) != written {
+            return self.emit_error(PutObjectError::VersionExists);
+        }
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(PutObjectError::NoTransactionFound);
+        };
+        self.state = PutObjectState::AbortRegistered;
+        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    }
+
+    /// The registered version stays as the import committed it.
+    fn registered_aborted(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::TransactionAborted { .. }) => {
+                self.txn_id = None;
+                self.after_commit()
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
             _ => self.emit_error(PutObjectError::InvalidOperationState),
         }
     }
@@ -1593,16 +1637,7 @@ impl PutObjectOperation {
         match event {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                 self.txn_id = None;
-                // The committed records own the blob now, so the rollback must
-                // not still hold it.
-                let release_id = self.written_location.take().map(|location| location.ulid);
-                if let Some(id) = release_id {
-                    self.cleanup.set_release(id);
-                    self.state = PutObjectState::ReleaseReservation;
-                    smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
-                } else {
-                    self.register_blob()
-                }
+                self.after_commit()
             }
             Event::Storage(StorageEvent::Error { error }) => {
                 self.txn_id = None;
@@ -1617,6 +1652,18 @@ impl PutObjectOperation {
                 self.keep_written_blob(error)
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
+        }
+    }
+
+    /// The committed records own the blob now, so the rollback must not still hold it.
+    fn after_commit(&mut self) -> Effects {
+        let release_id = self.written_location.take().map(|location| location.ulid);
+        if let Some(id) = release_id {
+            self.cleanup.set_release(id);
+            self.state = PutObjectState::ReleaseReservation;
+            smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
+        } else {
+            self.register_blob()
         }
     }
 
@@ -1905,6 +1952,7 @@ impl Operation for PutObjectOperation {
             }
             PutObjectState::ReadTrail => self.trail_read(event),
             PutObjectState::WriteEvidence => self.evidence_written(event),
+            PutObjectState::AbortRegistered => self.registered_aborted(event),
             PutObjectState::ReadHistory => self.history_read(event),
             PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
