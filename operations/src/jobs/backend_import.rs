@@ -6,10 +6,11 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::job::{JobError, JobId, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::backend_import::{
@@ -327,11 +328,11 @@ async fn import_object(
         ));
     }
     ensure_confined_path(Path::new(&key)).map_err(|error| ItemError::Item(error.to_string()))?;
-    // Only new or differing objects are read; a trusted listing needs its committed version.
+    // Only new or differing objects are read; a trusted listing needs its committed version
+    // and, when listed with a single-part ETag, the MD5 of that version.
     if let (Some(listed), Some(seen)) = (trusted_listing(row.as_ref(), object), stored)
-        && committed_hash(&ctx.driver, &rule.bucket, &key, listed.version_id)
-            .await?
-            .is_some()
+        && let Some(md5) = committed_md5(&ctx.driver, &rule.bucket, &key, &listed, object).await?
+        && !etag_differs(object.etag.as_deref(), md5.as_deref())
     {
         note_listing(&ctx.driver, rule, row_key, &seen, encode(&listed)?).await?;
         return Ok(Outcome::Skipped);
@@ -413,19 +414,47 @@ fn trusted_listing(
         .or_else(|| (unmarked && row.size == object.size).then(|| row.clone()))
 }
 
-/// The BLAKE3 hash of the committed version of `key` in `bucket`, if it still exists.
-async fn committed_hash(
+/// `None` when the committed version is gone; else the MD5 of its stored copy, read only
+/// for a listing with an ETag.
+async fn committed_md5(
     context: &DriverContext,
     bucket: &str,
     key: &str,
-    version_id: Ulid,
-) -> Result<Option<[u8; 32]>, ItemError> {
-    let version_key = VersionKey::new(bucket, key, version_id)
+    row: &ImportedObject,
+    object: &ExternalObject,
+) -> Result<Option<Option<Vec<u8>>>, ItemError> {
+    let version_key = VersionKey::new(bucket, key, row.version_id)
         .to_bytes()
         .map_err(|error| ItemError::Item(error.to_string()))?;
     let [version] = read_values(context, [(BLOB_VERSIONS_KEYSPACE, version_key.into())]).await?;
-    let version = parse(version, BlobVersion::from_bytes)?;
-    Ok(version.and_then(|version| version.blob_hash().copied()))
+    let Some(version) = parse(version, BlobVersion::from_bytes)? else {
+        return Ok(None);
+    };
+    let Some(location_key) = version.location_key() else {
+        return Ok(None);
+    };
+    if object.etag.is_none() {
+        return Ok(Some(None));
+    }
+    let [location] = read_values(
+        context,
+        [(BLOB_LOCATIONS_KEYSPACE, location_key.to_bytes().into())],
+    )
+    .await?;
+    let location = parse(location, BackendLocation::from_bytes)?;
+    Ok(Some(
+        location.and_then(|mut location| location.hashes.remove(HASH_MD5)),
+    ))
+}
+
+/// A single-part ETag is the MD5 of the bytes; a multipart or other ETag proves nothing.
+fn etag_differs(etag: Option<&str>, md5: Option<&[u8]>) -> bool {
+    let (Some(etag), Some(md5)) = (etag.map(|etag| etag.trim_matches('"')), md5) else {
+        return false;
+    };
+    etag.len() == 32
+        && etag.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !etag.eq_ignore_ascii_case(&hex::encode(md5))
 }
 
 async fn hash_object(
@@ -924,7 +953,7 @@ mod tests {
             write_pattern: "{dir}{name}".to_string(),
         };
         let row_key = object_key(rule.import_id, "raw/a.csv");
-        let written = ImportedObject::written(Ulid::nil(), "in/a.csv".to_string(), 4);
+        let written = ImportedObject::written(Ulid::nil(), "in/a.csv".to_string(), 4, None);
         let seen = Value::from(written.to_bytes().unwrap());
         let listed = written.first_listing(&object("e1")).unwrap();
         let stored = || async {
@@ -966,21 +995,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_committed_hash() {
+    async fn reads_committed_md5() {
+        use aruna_core::structs::storage::blob::BlobLocationKey;
+        use aruna_core::structs::storage::format::EncodingClass;
         let (_directory, storage) = crate::tests::s3::test_storage();
         let context = crate::tests::s3::test_context(storage);
-        let row = ImportedObject::written(Ulid::from_parts(6, 6), "in/a.csv".to_string(), 4);
-        assert_eq!(
-            committed_hash(&context, "bucket", "in/a.csv", row.version_id)
-                .await
-                .ok(),
-            Some(None)
-        );
+        let row = ImportedObject::written(Ulid::from_parts(6, 6), "in/a.csv".to_string(), 4, None);
+        let listed = object("e1");
+        let md5 = || committed_md5(&context, "bucket", "in/a.csv", &row, &listed);
+        assert_eq!(md5().await.ok(), Some(None));
 
+        let backend = BackendRef::Group(Ulid::from_parts(5, 5));
         let version = BlobVersion::materialized(
             [7; 32],
-            BackendRef::Group(Ulid::from_parts(5, 5)),
-            aruna_core::structs::storage::format::EncodingClass::Raw,
+            backend.clone(),
+            EncodingClass::Raw,
             std::time::SystemTime::UNIX_EPOCH,
             Default::default(),
             None,
@@ -990,12 +1019,48 @@ mod tests {
         let value = version.to_bytes().unwrap();
         let write = write_value(&context, BLOB_VERSIONS_KEYSPACE, key, value);
         assert!(write.await.is_ok());
-        assert_eq!(
-            committed_hash(&context, "bucket", "in/a.csv", row.version_id)
-                .await
-                .ok(),
-            Some(Some([7; 32]))
-        );
+        // A version without a location row has no MD5 to compare.
+        assert_eq!(md5().await.ok(), Some(Some(None)));
+
+        let location = BackendLocation {
+            backend: backend.clone(),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: "in/a.csv".to_string(),
+            ulid: Ulid::from_parts(7, 7),
+            format: Default::default(),
+            created_by: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 4,
+            hashes: [(HASH_MD5.to_string(), vec![1; 16])].into(),
+        };
+        let key = BlobLocationKey::new([7; 32], EncodingClass::Raw, backend).to_bytes();
+        let value = location.to_bytes().unwrap();
+        let write = write_value(&context, BLOB_LOCATIONS_KEYSPACE, key.into(), value);
+        assert!(write.await.is_ok());
+        assert_eq!(md5().await.ok(), Some(Some(Some(vec![1; 16]))));
+        // A listing without an ETag never reads the location.
+        let mut unmarked = object("e1");
+        unmarked.etag = None;
+        let blind = committed_md5(&context, "bucket", "in/a.csv", &row, &unmarked);
+        assert_eq!(blind.await.ok(), Some(Some(None)));
+    }
+
+    #[test]
+    fn compares_single_etags() {
+        let md5 = [0xab; 16];
+        let etag = format!("\"{}\"", hex::encode(md5));
+        assert!(!etag_differs(Some(&etag), Some(&md5)));
+        assert!(!etag_differs(Some(&etag.to_uppercase()), Some(&md5)));
+        assert!(etag_differs(Some(&etag), Some(&[0xcd; 16])));
+        // Multipart ETags, unknown MD5s and missing ETags fall back to the size.
+        let multipart = format!("{}-3", hex::encode([0xcd; 16]));
+        assert!(!etag_differs(Some(&multipart), Some(&md5)));
+        assert!(!etag_differs(Some(&etag), None));
+        assert!(!etag_differs(None, Some(&md5)));
     }
 
     #[test]
@@ -1045,7 +1110,7 @@ mod tests {
     #[test]
     fn trusts_equal_sizes() {
         // Aruna's own write is not read again; its first listing only adds ETag and time.
-        let written = ImportedObject::written(Ulid::generate(), "in/a.csv".to_string(), 4);
+        let written = ImportedObject::written(Ulid::generate(), "in/a.csv".to_string(), 4, None);
         let listed = trusted_listing(Some(&written), &object("e1")).unwrap();
         assert_eq!(listed.etag.as_deref(), Some("e1"));
         let mut grown = object("e1");

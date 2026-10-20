@@ -241,7 +241,7 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
 - A new upload to `key_prefix` + `d/n` is stored at the write folder (`write_prefix`, else
   `backend_prefix`) + `write_pattern`, with `{dir}` = `d/`, `{name}` = `n` and `{id}` = the
   version id, so other tools see it. Uploads under the rule's own import folder are not imported
-  again; later changes to such a file are, except a same-size change before the next run.
+  again; later changes to such a file are, found by its ETag or MD5 where the backend lists one.
 - A pattern without `{id}` keeps the file name. No upload waits for another. A new file is
   created only if the name is still free. If the file exists and the backend keeps versions, the
   upload replaces it and older Aruna versions still read their own backend version. Without
@@ -604,8 +604,9 @@ pub async fn delete_import(
 - The run lists the backend folder and registers each object without copying it. Hashes come
   from reading each new or changed object once.
 - Objects registered before are skipped by size and ETag (or modification time) without reading
-  them. A same-size change goes unnoticed on the first listing of Aruna's own upload and on
-  backends that list neither ETag nor time.
+  them. Aruna's own uploads compare with the ETag the backend answered, else a single-part ETag
+  with their MD5. A same-size change goes unnoticed only where neither exists, such as an older
+  multipart upload, and on backends that list neither ETag nor time.
 - A changed object gets a new version unless the key was written or deleted in Aruna since;
   Aruna's side always wins.
 - Imported bytes count toward the group quota like uploaded ones.
