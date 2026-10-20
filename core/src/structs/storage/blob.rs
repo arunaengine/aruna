@@ -321,11 +321,13 @@ pub enum BlobCleanupWork {
         location: BackendLocation,
     },
     /// A file in a linked folder that a rename replaced, and the import rule whose row names
-    /// it as `version_id`. Its version already names the new file.
+    /// it as `version_id`. Its version already names the new file; only the backend `version`
+    /// the rename read is deleted.
     ReleaseRenamed {
         location: BackendLocation,
         import_id: Ulid,
         version_id: Ulid,
+        version: String,
     },
 }
 

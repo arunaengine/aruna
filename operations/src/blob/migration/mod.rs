@@ -20,14 +20,15 @@ use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
-    COMPRESSION_QUEUE_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, MANAGED_COPY_KEYSPACE,
-    RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE, MANAGED_COPY_KEYSPACE, RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE,
+    STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, PlainPath, object_key,
+    BackendImport, ImportedObject, PlainPath, object_key, version_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion, BlobVersionState,
@@ -57,6 +58,7 @@ pub enum MigrateState {
     FindTarget,
     ProbeTarget,
     HashTarget,
+    ReadSource,
     CheckLinked,
     StatPlain,
     ReadBlob,
@@ -131,6 +133,8 @@ pub struct MigrateVersionOperation {
     earlier: Earlier,
     /// The version's linked file has a name of an earlier pattern and gets the current one.
     renaming: bool,
+    /// The backend version of the renamed file; without one the old file is never deleted.
+    source_version: Option<String>,
     plain_path: Option<PlainPath>,
     /// The backend's id of the bytes a plain write stored.
     backend_version: Option<String>,
@@ -164,6 +168,7 @@ impl MigrateVersionOperation {
             plain_path: None,
             earlier: Earlier::new(),
             renaming: false,
+            source_version: None,
             backend_version: None,
             backend_etag: None,
             found: None,
@@ -300,7 +305,16 @@ impl MigrateVersionOperation {
         let in_place = self
             .target_key_of(&old)
             .is_ok_and(|key| old.location_key() == Ok(key));
+        let source = version_key(old.ulid);
         self.old = Some(old);
+        if self.renaming {
+            self.state = MigrateState::ReadSource;
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: BACKEND_VERSION_KEYSPACE.to_string(),
+                key: source,
+                txn_id: None,
+            })];
+        }
         // A copy already on the rule's backend only needs its file in the linked folder.
         if let Some(plain) = self.plain.as_ref().filter(|_| in_place) {
             self.state = MigrateState::CheckLinked;
@@ -309,6 +323,21 @@ impl MigrateVersionOperation {
                 key: object_key(plain.import_id, &plain.path),
                 txn_id: None,
             })];
+        }
+        self.find_target()
+    }
+
+    /// The version of the old file, fixed when it was written, names the bytes a release deletes.
+    fn handle_source(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected(event);
+        };
+        let version = value
+            .map(|value| String::from_utf8(value.to_vec()))
+            .transpose();
+        match version {
+            Ok(version) => self.source_version = version,
+            Err(error) => return self.fail(ConversionError::from(error).into()),
         }
         self.find_target()
     }
@@ -846,11 +875,13 @@ impl MigrateVersionOperation {
             migrated.to_bytes()?.into(),
         ));
         // The old file goes only after this commit makes the version name the new one.
-        if let (true, Some(plain)) = (self.renaming && !unchanged, self.plain.as_ref()) {
+        let release = (self.plain.as_ref(), self.source_version.clone());
+        if let (true, (Some(plain), Some(version))) = (self.renaming && !unchanged, release) {
             let work = BlobCleanupWork::ReleaseRenamed {
                 location: old.clone(),
                 import_id: plain.import_id,
                 version_id: self.version_key.version_id,
+                version,
             };
             writes.push((
                 BLOB_CLEANUP_KEYSPACE.to_string(),
@@ -952,6 +983,7 @@ impl Operation for MigrateVersionOperation {
             MigrateState::FindTarget => self.handle_found(event),
             MigrateState::ProbeTarget => self.handle_probe(event),
             MigrateState::HashTarget => self.handle_hashed(event),
+            MigrateState::ReadSource => self.handle_source(event),
             MigrateState::CheckLinked => self.handle_linked(event),
             MigrateState::StatPlain => self.handle_stat(event),
             MigrateState::ReadBlob => self.handle_read(event),
@@ -2355,12 +2387,18 @@ mod tests {
         }
 
         /// A move that knows the rule's earlier prefix pattern, up to the stat of the new name.
-        fn renaming(version: &BlobVersion, old: &BackendLocation) -> MigrateVersionOperation {
+        fn renaming(
+            version: &BlobVersion,
+            old: &BackendLocation,
+            source: Option<&[u8]>,
+        ) -> MigrateVersionOperation {
             let earlier = Earlier::from([(IMPORT, vec!["{dir}{id}_{name}".to_string()])]);
             let mut operation = operation("in/x/one.csv", vec![rule()]).with_earlier(earlier);
             operation.start();
             operation.step(read_result(Some(version.to_bytes().unwrap())));
             operation.step(read_result(Some(old.to_bytes().unwrap())));
+            // The old file's backend version binds a later delete to the renamed bytes.
+            operation.step(read_result(source.map(<[u8]>::to_vec)));
             let effects = operation.step(read_result(None));
             let [Effect::Blob(BlobEffect::StatPlain { path, .. })] = effects.as_slice() else {
                 panic!("expected the stat of the new name, got {effects:?}")
@@ -2372,10 +2410,12 @@ mod tests {
             operation
         }
 
-        #[test]
-        fn renames_linked_file() {
+        /// Drives a rename to its publication rows.
+        fn renamed(
+            source: Option<&[u8]>,
+        ) -> (Vec<(String, Key, Value)>, PlainPath, BackendLocation) {
             let (version, old) = prefixed();
-            let mut operation = renaming(&version, &old);
+            let mut operation = renaming(&version, &old, source);
             operation.step(Event::Blob(BlobEvent::PlainStat {
                 exists: false,
                 version: None,
@@ -2394,9 +2434,13 @@ mod tests {
             operation.step(read_result(Some(version.to_bytes().unwrap())));
 
             let effects = operation.step(read_result(None));
+            (batch(&effects).clone(), plain, old)
+        }
 
+        #[test]
+        fn renames_linked_file() {
             // The version names the new file; the old one goes only through the cleanup queue.
-            let writes = batch(&effects);
+            let (writes, plain, old) = renamed(Some(b"v1"));
             let find = |space: &str| writes.iter().find(|(found, ..)| found == space).unwrap();
             let moved = BlobVersion::from_bytes(&find(BLOB_VERSIONS_KEYSPACE).2).unwrap();
             let encoding = EncodingClass::Plain {
@@ -2412,12 +2456,28 @@ mod tests {
                 location,
                 import_id,
                 version_id,
+                version,
             } = work
             else {
                 panic!("expected the release of the old file")
             };
-            assert_eq!((location, import_id), (old, IMPORT));
+            assert_eq!(
+                (location, import_id, version),
+                (old, IMPORT, "v1".to_string())
+            );
             assert_eq!(version_id, Ulid::from_bytes([2; 16]));
+            // Without the old file's backend version nothing names its bytes, so it stays.
+            let (writes, ..) = renamed(None);
+            assert!(
+                !writes
+                    .iter()
+                    .any(|(space, ..)| space == BLOB_CLEANUP_KEYSPACE)
+            );
+            assert!(
+                writes
+                    .iter()
+                    .any(|(space, ..)| space == BLOB_VERSIONS_KEYSPACE)
+            );
         }
 
         #[test]
@@ -2425,7 +2485,7 @@ mod tests {
             // An interrupted rename left its copy at the new name; matching bytes are adopted.
             let (version, old) = prefixed();
             for (hash, adopted) in [(4u8, true), (5u8, false)] {
-                let mut operation = renaming(&version, &old);
+                let mut operation = renaming(&version, &old, Some(b"v1"));
                 let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
                     exists: true,
                     version: None,

@@ -350,19 +350,19 @@ async fn deletes_renamed_files() {
     let BlobEvent::WriteFinished { location } = written.await else {
         panic!("plain write failed")
     };
-    // A missing file counts as deleted, so a repeated release finishes.
-    for _ in 0..2 {
-        let deleted = handler.delete_plain(location.clone()).await;
-        assert_eq!(deleted, BlobEvent::DeleteFinished);
-        assert!(!root.join("raw/old.txt").exists());
-    }
+    // A storage without versions cannot delete only the renamed bytes, so the file stays.
+    let deleted = handler
+        .delete_plain(location.clone(), "v1".to_string())
+        .await;
+    assert_eq!(deleted, BlobEvent::Error(BlobError::CleanupUnsupported));
+    assert!(root.join("raw/old.txt").exists());
     // A copy in Aruna's own layout is never deleted this way.
     let own = aruna_core::structs::storage::blob::BackendLocation {
         storage_bucket: "data".to_string(),
         ..location
     };
     assert!(matches!(
-        handler.delete_plain(own).await,
+        handler.delete_plain(own, "v1".to_string()).await,
         BlobEvent::Error(BlobError::DeleteError(_))
     ));
 }

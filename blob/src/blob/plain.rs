@@ -232,8 +232,13 @@ impl BlobHandler {
         }
     }
 
-    /// Only an explicit rename deletes a tenant file, after its version names the new one.
-    pub(super) async fn delete_plain(&self, location: BackendLocation) -> BlobEvent {
+    /// Only an explicit rename deletes a tenant file, after its version names the new one, and
+    /// only the exact backend version it read; a later write at the path stays.
+    pub(super) async fn delete_plain(
+        &self,
+        location: BackendLocation,
+        version: String,
+    ) -> BlobEvent {
         if !location.storage_bucket.is_empty() {
             return BlobEvent::Error(BlobError::DeleteError("not a plain path".to_string()));
         }
@@ -244,15 +249,10 @@ impl BlobHandler {
             Ok(found) => found,
             Err(error) => return BlobEvent::Error(error),
         };
-        let version = match self.read_version(&location).await {
-            Ok(version) => version,
-            Err(error) => return BlobEvent::Error(error),
-        };
-        let delete = operator.delete_with(&path);
-        let delete = match version.filter(|_| operator.info().capability().delete_with_version) {
-            Some(version) => delete.version(&version),
-            None => delete,
-        };
+        if !operator.info().capability().delete_with_version {
+            return BlobEvent::Error(BlobError::CleanupUnsupported);
+        }
+        let delete = operator.delete_with(&path).version(&version);
         match timeout(self.io_timeout(), delete.into_future()).await {
             Ok(Ok(())) => BlobEvent::DeleteFinished,
             Ok(Err(error)) if error.kind() == ErrorKind::NotFound => BlobEvent::DeleteFinished,

@@ -10,12 +10,11 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, COPY_OWNER_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
-    PENDING_LOCATION_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, COPY_OWNER_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::backend_import::{ImportedObject, object_key};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, CopyOwner,
     WriteOwner,
@@ -29,6 +28,7 @@ use aruna_core::types::Key;
 use tracing::{error, warn};
 use ulid::Ulid;
 
+use crate::blob::release::release_renamed;
 use crate::driver::{DriverContext, drive, now_ms};
 use crate::groups::backends::{backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
@@ -404,62 +404,10 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
             location,
             import_id,
             version_id,
-        } => release_renamed(context, location, import_id, version_id)
+            version,
+        } => release_renamed(context, location, import_id, version_id, version)
             .await
             .into(),
-    }
-}
-
-/// Deletes the file a rename replaced, then the import row that names it. A row that names
-/// another version means another write took the path, so the file stays.
-async fn release_renamed(
-    context: &DriverContext,
-    location: BackendLocation,
-    import_id: Ulid,
-    version_id: Ulid,
-) -> bool {
-    let key = object_key(import_id, &location.backend_path);
-    let read = StorageEffect::Read {
-        key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
-        key: key.clone(),
-        txn_id: None,
-    };
-    let event = context.storage_handle.send_storage_effect(read).await;
-    let row = match parse_read(event, ImportedObject::from_bytes) {
-        Ok(row) => row,
-        Err(error) => {
-            warn!(%error, "Renamed file row could not be read");
-            return false;
-        }
-    };
-    if row.as_ref().is_some_and(|row| row.version_id != version_id) {
-        return true;
-    }
-    let Some(blob_handle) = context.blob_handle.as_ref() else {
-        return false;
-    };
-    let effect = BlobEffect::DeletePlain { location };
-    match blob_handle.send_blob_effect(effect).await {
-        Event::Blob(BlobEvent::DeleteFinished) => {}
-        event => {
-            warn!(?event, "Renamed file could not be deleted");
-            return false;
-        }
-    }
-    if row.is_none() {
-        return true;
-    }
-    let delete = StorageEffect::Delete {
-        key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
-        key,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(delete).await {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => true,
-        event => {
-            warn!(?event, "Renamed file row could not be deleted");
-            false
-        }
     }
 }
 
@@ -869,6 +817,7 @@ mod tests {
             location: location.clone(),
             import_id,
             version_id,
+            version: "v1".to_string(),
         };
         let row = ImportedObject::written(version_id, "in/a".to_string(), 0, None);
         let event = storage
