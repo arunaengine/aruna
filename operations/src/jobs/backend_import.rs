@@ -52,20 +52,19 @@ enum Decision {
     Import,
 }
 
-/// Writes and deletes in Aruna win: a changed object (or `changed`, a hash unlike the committed
-/// one) gets a new version only while the key shows the imported one or nothing.
+/// Writes and deletes in Aruna win: a changed object gets a new version only while the key
+/// shows the imported one or nothing.
 /// A purged but unchanged object is imported again.
 fn decide(
     object: &ExternalObject,
     row: Option<&ImportedObject>,
     head: Option<Ulid>,
     version_exists: bool,
-    changed: bool,
 ) -> Decision {
     match row {
         None if head.is_some() => Decision::Skip,
         None => Decision::Import,
-        Some(row) if !changed && row.matches(object) => match head {
+        Some(row) if row.matches(object) => match head {
             None if !version_exists => Decision::Import,
             _ => Decision::Skip,
         },
@@ -328,23 +327,14 @@ async fn import_object(
         ));
     }
     ensure_confined_path(Path::new(&key)).map_err(|error| ItemError::Item(error.to_string()))?;
-    // An equal size is no proof for the first listing of Aruna's own write (which only notes
-    // ETag and time) or a listing without both, so the bytes must hash to the committed version.
-    let listed = row.as_ref().and_then(|row| row.first_listing(object));
-    let unmarked = object.etag.is_none() && object.modified_ms.is_none();
-    let blind = row
-        .clone()
-        .filter(|row| unmarked && row.size == object.size);
-    let (mut hashed, mut changed) = (None, false);
-    if let (Some(listed), Some(seen)) = (listed.or(blind), stored) {
-        let found = hash_object(ctx, spec, resolved.clone(), &object.key).await?;
-        let committed = committed_hash(&ctx.driver, &rule.bucket, &key, listed.version_id).await?;
-        if committed.is_some_and(|hash| Some(&hash[..]) == found.0.get_blake3()) {
-            note_listing(&ctx.driver, rule, row_key, &seen, encode(&listed)?).await?;
-            return Ok(Outcome::Skipped);
-        }
-        changed = committed.is_some();
-        hashed = Some(found);
+    // Only new or differing objects are read; a trusted listing needs its committed version.
+    if let (Some(listed), Some(seen)) = (trusted_listing(row.as_ref(), object), stored)
+        && committed_hash(&ctx.driver, &rule.bucket, &key, listed.version_id)
+            .await?
+            .is_some()
+    {
+        note_listing(&ctx.driver, rule, row_key, &seen, encode(&listed)?).await?;
+        return Ok(Outcome::Skipped);
     }
     let head_key = BlobHeadKey::new(&rule.bucket, &key)
         .to_bytes()
@@ -362,7 +352,7 @@ async fn import_object(
         }
         _ => false,
     };
-    if decide(object, row.as_ref(), head, version_exists, changed) == Decision::Skip {
+    if decide(object, row.as_ref(), head, version_exists) == Decision::Skip {
         return Ok(Outcome::Skipped);
     }
     // The committed row stays until the new version replaces it in one transaction.
@@ -371,10 +361,7 @@ async fn import_object(
         key: row.as_ref().and_then(|row| row.key.clone()),
         ..ImportedObject::new(version_id, object)
     };
-    let (location, version) = match hashed {
-        Some(hashed) => hashed,
-        None => hash_object(ctx, spec, resolved, &object.key).await?,
-    };
+    let (location, version) = hash_object(ctx, spec, resolved, &object.key).await?;
     if location.blob_size != object.size {
         return Err(ItemError::Item(
             "the object changed while it was read".to_string(),
@@ -412,6 +399,18 @@ async fn import_object(
     )
     .await;
     Ok(Outcome::Imported)
+}
+
+/// The row an equal size updates without reading the bytes: the first listing of Aruna's own
+/// write, or any listing without ETag and time.
+fn trusted_listing(
+    row: Option<&ImportedObject>,
+    object: &ExternalObject,
+) -> Option<ImportedObject> {
+    let row = row?;
+    let unmarked = object.etag.is_none() && object.modified_ms.is_none();
+    row.first_listing(object)
+        .or_else(|| (unmarked && row.size == object.size).then(|| row.clone()))
 }
 
 /// The BLAKE3 hash of the committed version of `key` in `bucket`, if it still exists.
@@ -1001,16 +1000,10 @@ mod tests {
 
     #[test]
     fn imports_new_objects() {
-        assert_eq!(
-            decide(&object("e1"), None, None, false, false),
-            Decision::Import
-        );
+        assert_eq!(decide(&object("e1"), None, None, false), Decision::Import);
         // A key the bucket already holds is never taken over.
         let other = Some(Ulid::generate());
-        assert_eq!(
-            decide(&object("e1"), None, other, false, false),
-            Decision::Skip
-        );
+        assert_eq!(decide(&object("e1"), None, other, false), Decision::Skip);
     }
 
     #[test]
@@ -1018,16 +1011,16 @@ mod tests {
         let version = Ulid::generate();
         let row = row(version, "e1");
         assert_eq!(
-            decide(&object("e1"), Some(&row), Some(version), true, false),
+            decide(&object("e1"), Some(&row), Some(version), true),
             Decision::Skip
         );
         // A purged version is imported again.
         assert_eq!(
-            decide(&object("e1"), Some(&row), None, false, false),
+            decide(&object("e1"), Some(&row), None, false),
             Decision::Import
         );
         assert_eq!(
-            decide(&object("e1"), Some(&row), None, true, false),
+            decide(&object("e1"), Some(&row), None, true),
             Decision::Skip
         );
     }
@@ -1037,33 +1030,36 @@ mod tests {
         let version = Ulid::generate();
         let row = row(version, "e1");
         let changed = object("e2");
-        let fresh = decide(&changed, Some(&row), Some(version), true, false);
+        let fresh = decide(&changed, Some(&row), Some(version), true);
         assert_eq!(fresh, Decision::Import);
-        assert_eq!(
-            decide(&changed, Some(&row), None, true, false),
-            Decision::Import
-        );
+        assert_eq!(decide(&changed, Some(&row), None, true), Decision::Import);
         // A later write or delete marker in Aruna keeps the key as Aruna has it.
         let newer = Some(Ulid::generate());
+        assert_eq!(decide(&changed, Some(&row), newer, true), Decision::Skip);
         assert_eq!(
-            decide(&changed, Some(&row), newer, true, false),
-            Decision::Skip
-        );
-        assert_eq!(
-            decide(&object("e1"), Some(&row), newer, true, false),
+            decide(&object("e1"), Some(&row), newer, true),
             Decision::Skip
         );
     }
 
     #[test]
-    fn imports_hash_mismatch() {
-        let version = Ulid::generate();
-        let row = row(version, "e1");
-        // Same size and ETag, yet the bytes hash differently.
-        let ours = decide(&object("e1"), Some(&row), Some(version), true, true);
-        assert_eq!(ours, Decision::Import);
-        let newer = Some(Ulid::generate());
-        let later = decide(&object("e1"), Some(&row), newer, true, true);
-        assert_eq!(later, Decision::Skip);
+    fn trusts_equal_sizes() {
+        // Aruna's own write is not read again; its first listing only adds ETag and time.
+        let written = ImportedObject::written(Ulid::generate(), "in/a.csv".to_string(), 4);
+        let listed = trusted_listing(Some(&written), &object("e1")).unwrap();
+        assert_eq!(listed.etag.as_deref(), Some("e1"));
+        let mut grown = object("e1");
+        grown.size = 5;
+        assert_eq!(trusted_listing(Some(&written), &grown), None);
+        // An imported row is compared by ETag later, never trusted here.
+        let imported = row(Ulid::generate(), "e1");
+        assert_eq!(trusted_listing(Some(&imported), &object("e2")), None);
+        let mut unmarked = object("e1");
+        (unmarked.etag, unmarked.modified_ms) = (None, None);
+        let blind = trusted_listing(Some(&imported), &unmarked);
+        assert_eq!(blind, Some(imported.clone()));
+        unmarked.size = 5;
+        assert_eq!(trusted_listing(Some(&imported), &unmarked), None);
+        assert_eq!(trusted_listing(None, &unmarked), None);
     }
 }
