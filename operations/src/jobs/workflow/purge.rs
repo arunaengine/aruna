@@ -6,12 +6,12 @@ use std::collections::BTreeSet;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::DELETE_AUDIT_KEYSPACE;
+use aruna_core::keyspaces::{DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE};
 use aruna_core::structs::execution::job::{JobError, JobProgress, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::delete_audit::{
-    BlobAuditKind, BlobAuditRecord, BlobPurgeKind, delete_audit_key,
+    BlobAuditKind, BlobAuditRecord, BlobPurgeKind, delete_audit_key, trail_key,
 };
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::storage_purge::{
@@ -200,18 +200,26 @@ async fn write_purge_audit(ctx: &JobContext, spec: &StoragePurgeSpec) -> Result<
     let value = record
         .to_bytes()
         .map_err(|error| JobError::retryable(format!("purge audit encode failed: {error}")))?;
+    let audit_id = ctx.job_id.as_ulid();
+    let trail = trail_key(&record, audit_id).into();
+    let value: aruna_core::types::Value = value.into();
     match ctx
         .driver
         .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: DELETE_AUDIT_KEYSPACE.to_string(),
-            key: delete_audit_key(spec.group_id, ctx.job_id.as_ulid()).into(),
-            value: value.into(),
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes: vec![
+                (
+                    DELETE_AUDIT_KEYSPACE.to_string(),
+                    delete_audit_key(spec.group_id, audit_id).into(),
+                    value.clone(),
+                ),
+                (DELETE_TRAIL_KEYSPACE.to_string(), trail, value),
+            ],
             txn_id: None,
         })
         .await
     {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         other => Err(JobError::retryable(format!("purge audit write failed: {other:?}")).into()),
     }
 }

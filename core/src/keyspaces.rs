@@ -172,6 +172,9 @@ pub const BLOB_VERSIONS_KEYSPACE: &str = "blob_versions";
 /// Node-local trail of S3 deletions: delete markers, per-version deletes and
 /// completed purge jobs. Written inside the transaction that performs them.
 pub const DELETE_AUDIT_KEYSPACE: &str = "blob_delete_audit";
+/// The same trail by object key and purges by group, written with each audit row, so the
+/// records about one key read without the rest of the trail.
+pub const DELETE_TRAIL_KEYSPACE: &str = "blob_delete_trail";
 pub const PATHS_INDEX_KEYSPACE: &str = "hash_paths_index";
 pub const USER_ACCESS_KEYSPACE: &str = "user_access";
 pub const ACCESS_OWNER_KEYSPACE: &str = "user_access_owner";
@@ -454,6 +457,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BLOB_HEAD_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE,
     DELETE_AUDIT_KEYSPACE,
+    DELETE_TRAIL_KEYSPACE,
     PATHS_INDEX_KEYSPACE,
     USER_ACCESS_KEYSPACE,
     ACCESS_OWNER_KEYSPACE,

@@ -18,7 +18,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DELETE_AUDIT_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE,
+    DELETE_TRAIL_KEYSPACE, OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
@@ -29,12 +29,12 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::delete_audit::{
-    BlobAuditKind, BlobAuditRecord, delete_audit_key,
+    BlobAuditKind, BlobAuditRecord, delete_audit_key, trail_key,
 };
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::{Effects, GroupId, Key};
+use aruna_core::types::{Effects, GroupId, Key, Value};
 use smallvec::smallvec;
 use std::collections::{HashMap, VecDeque};
 use std::time::SystemTime;
@@ -911,17 +911,25 @@ impl DeleteObjectOperation {
             Ok(value) => value,
             Err(error) => return self.emit_error(error.into()),
         };
+        let audit_id = Ulid::generate();
+        let value: Value = value.into();
+        let trail = trail_key(&record, audit_id).into();
         self.state = DeleteObjectState::WriteDeleteAudit;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: DELETE_AUDIT_KEYSPACE.to_string(),
-            key: delete_audit_key(self.input.group_id, Ulid::generate()).into(),
-            value: value.into(),
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes: vec![
+                (
+                    DELETE_AUDIT_KEYSPACE.to_string(),
+                    delete_audit_key(self.input.group_id, audit_id).into(),
+                    value.clone(),
+                ),
+                (DELETE_TRAIL_KEYSPACE.to_string(), trail, value),
+            ],
             txn_id: Some(txn_id),
         })]
     }
 
     fn handle_delete_audit(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
         let Some(txn_id) = self.txn_id else {

@@ -8,7 +8,7 @@ use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, DELETE_AUDIT_KEYSPACE, IMPORT_INTENT_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, DELETE_TRAIL_KEYSPACE, IMPORT_INTENT_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
@@ -46,7 +46,7 @@ use crate::replication::queue::complete_put;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{
-    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, Trail,
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, Trail, trail_ranges,
 };
 use crate::s3::purge_fence::PurgeFenceError;
 
@@ -101,8 +101,6 @@ struct ImportRun {
     routing: RoutingSnapshot,
     quota: Option<u64>,
     gate: Option<GateContext>,
-    /// The group's delete trail, read on first use.
-    trail: tokio::sync::OnceCell<Vec<BlobAuditRecord>>,
 }
 
 fn permanent(message: impl Into<String>) -> JobRunOutcome {
@@ -280,7 +278,6 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
         routing,
         quota,
         gate,
-        trail: Default::default(),
     })
 }
 
@@ -397,7 +394,7 @@ async fn import_object(
         .as_ref()
         .filter(|row| row.key.is_some() && head.is_none());
     if let Some(row) = keyed
-        && deleted_on_purpose(&ctx.driver, run, &key, row.version_id).await?
+        && deleted_on_purpose(&ctx.driver, rule, &key, row.version_id).await?
     {
         return Ok(Outcome::Skipped);
     }
@@ -726,26 +723,23 @@ async fn hide_alias(
     }
 }
 
-/// Whether the group's delete trail removed version `id` of `key`, or the key without a head.
-/// The trail is read once per listing page and only when a page needs it.
+/// Whether the delete trail removed version `id` of `key`, or the key without a head. Only the
+/// deletes of this key and the purges of its group are read.
 async fn deleted_on_purpose(
     context: &DriverContext,
-    run: &ImportRun,
+    rule: &BackendImport,
     key: &str,
     id: Ulid,
 ) -> Result<bool, ItemError> {
-    let records = run.trail.get_or_try_init(|| async {
-        let prefix = Key::from(run.rule.group_id.to_bytes().to_vec());
-        let entries = iterate(context, DELETE_AUDIT_KEYSPACE, prefix).await?;
-        let records = entries
-            .iter()
-            .map(|(_, value)| BlobAuditRecord::from_bytes(value));
-        let records = records.collect::<Result<Vec<_>, _>>();
-        records.map_err(|error| ItemError::System(error.to_string()))
-    });
-    let bucket = &run.rule.bucket;
-    let add = |trail: Trail, record| trail.add(record, bucket, key, id);
-    let trail = records.await?.iter().fold(Trail::Clean, add);
+    let (group_id, bucket) = (rule.group_id, &rule.bucket);
+    let mut trail = Trail::Clean;
+    for prefix in trail_ranges(group_id, bucket, key) {
+        for (_, value) in iterate(context, DELETE_TRAIL_KEYSPACE, prefix).await? {
+            let record = BlobAuditRecord::from_bytes(&value);
+            let record = record.map_err(|error| ItemError::System(error.to_string()))?;
+            trail = trail.add(&record, bucket, key, id);
+        }
+    }
     Ok(trail != Trail::Clean)
 }
 
@@ -1582,6 +1576,37 @@ mod tests {
             .ok()
             .unwrap();
         assert_eq!(marker, Exact::Incompatible);
+    }
+
+    #[tokio::test]
+    async fn reads_key_trail() {
+        use aruna_core::structs::storage::delete_audit::{BlobAuditKind, trail_key};
+        let (_directory, storage) = crate::tests::s3::test_storage();
+        let context = crate::tests::s3::test_context(storage);
+        let rule = recovery_rule("{dir}{name}");
+        let id = Ulid::from_parts(1_000, 1);
+        let deleted = || deleted_on_purpose(&context, &rule, "in/a.csv", id);
+        assert!(!deleted().await.ok().unwrap());
+        let record = |key: &str| aruna_core::structs::storage::delete_audit::BlobAuditRecord {
+            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]),
+            group_id: rule.group_id,
+            node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
+            user_id: Default::default(),
+            kind: BlobAuditKind::DeleteMarker,
+            bucket: "bucket".to_string(),
+            key: key.to_string(),
+            version_id: Some(Ulid::nil()),
+            occurred_at_ms: 2_000,
+        };
+        // A delete of another key is not read at all.
+        for key in ["in/a.csv2", "in/a.csv"] {
+            let record = record(key);
+            let trail = Key::from(trail_key(&record, Ulid::generate()));
+            let value = record.to_bytes().unwrap();
+            let write = write_value(&context, DELETE_TRAIL_KEYSPACE, trail, value);
+            assert!(write.await.is_ok());
+            assert_eq!(deleted().await.ok().unwrap(), key == "in/a.csv");
+        }
     }
 
     #[tokio::test]

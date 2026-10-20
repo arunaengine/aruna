@@ -86,17 +86,26 @@ fn audit_op(version_id: Option<Ulid>) -> DeleteObjectOperation {
 }
 
 fn audit_record(effects: &[Effect]) -> aruna_core::structs::storage::delete_audit::BlobAuditRecord {
-    let [
-        Effect::Storage(StorageEffect::Write {
-            key_space, value, ..
-        }),
-    ] = effects
-    else {
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects else {
         panic!("expected one audit write, got {effects:?}")
     };
-    assert_eq!(key_space, DELETE_AUDIT_KEYSPACE);
-    aruna_core::structs::storage::delete_audit::BlobAuditRecord::from_bytes(value.as_ref())
-        .expect("audit record decodes")
+    let [(audit_space, _, value), (trail_space, trail, indexed)] = writes.as_slice() else {
+        panic!("expected the audit row and its trail entry, got {writes:?}")
+    };
+    assert_eq!(audit_space, DELETE_AUDIT_KEYSPACE);
+    // The same record is indexed by its object key in the same transaction.
+    assert_eq!(trail_space, aruna_core::keyspaces::DELETE_TRAIL_KEYSPACE);
+    assert_eq!(value, indexed);
+    let record =
+        aruna_core::structs::storage::delete_audit::BlobAuditRecord::from_bytes(value.as_ref())
+            .expect("audit record decodes");
+    let prefix = aruna_core::structs::storage::delete_audit::delete_prefix(
+        record.group_id,
+        &record.bucket,
+        &record.key,
+    );
+    assert!(trail.starts_with(&prefix));
+    record
 }
 
 #[test]
@@ -300,7 +309,7 @@ fn delete_stages_debit() {
     assert_eq!(op.state, DeleteObjectState::WriteDeleteAudit);
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::Write { .. })]
+        [Effect::Storage(StorageEffect::BatchWrite { .. })]
     ));
 }
 
@@ -360,15 +369,10 @@ fn marker_queues_nothing() {
 
     let effects = op.write_reclaim_candidate();
 
-    let [
-        Effect::Storage(StorageEffect::Write {
-            key_space, txn_id, ..
-        }),
-    ] = effects.as_slice()
-    else {
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice() else {
         panic!("expected the audit write, got {effects:?}")
     };
-    assert_eq!(key_space, DELETE_AUDIT_KEYSPACE);
+    assert_eq!(writes[0].0, DELETE_AUDIT_KEYSPACE);
     assert_eq!(*txn_id, op.txn_id);
 }
 

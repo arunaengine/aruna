@@ -4,8 +4,10 @@
 
 use super::*;
 use aruna_core::effects::IterStart;
-use aruna_core::keyspaces::DELETE_AUDIT_KEYSPACE;
-use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobAuditRecord, BlobPurgeKind};
+use aruna_core::keyspaces::DELETE_TRAIL_KEYSPACE;
+use aruna_core::structs::storage::delete_audit::{
+    BlobAuditKind, BlobAuditRecord, BlobPurgeKind, delete_prefix, purge_prefix,
+};
 use aruna_core::types::Key;
 
 const TRAIL_PAGE: usize = 500;
@@ -51,6 +53,12 @@ impl Trail {
     }
 }
 
+/// The deletes of one object key, then the purges of its group.
+pub(crate) fn trail_ranges(group_id: GroupId, bucket: &str, key: &str) -> [Key; 2] {
+    let deletes = delete_prefix(group_id, bucket, key);
+    [deletes.into(), purge_prefix(group_id).into()]
+}
+
 /// The trail scan of one version transaction. Its range read makes a delete recorded meanwhile
 /// conflict with the commit, so the retried transaction reads it.
 #[derive(Debug, PartialEq)]
@@ -58,7 +66,8 @@ pub(super) struct TrailScan {
     version_id: Ulid,
     after: Option<Key>,
     trail: Trail,
-    done: bool,
+    /// The next of the two trail ranges to read; both read means done.
+    range: usize,
 }
 
 impl TrailScan {
@@ -67,7 +76,7 @@ impl TrailScan {
             version_id,
             after: None,
             trail: Trail::Clean,
-            done: false,
+            range: 0,
         }
     }
 
@@ -80,11 +89,14 @@ impl TrailScan {
 impl PutObjectOperation {
     /// The next page of the trail, or `None` once the whole trail is read.
     pub(super) fn trail_page(&mut self, txn_id: Ulid) -> Option<Effects> {
-        let scan = self.trail_scan.as_ref().filter(|scan| !scan.done)?;
+        let scan = self.trail_scan.as_ref()?;
+        let request = &self.config.request;
+        let ranges = trail_ranges(self.config.group_id, &request.bucket, &request.key);
+        let prefix = ranges.get(scan.range)?.clone();
         self.state = PutObjectState::ReadTrail;
         Some(smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: DELETE_AUDIT_KEYSPACE.to_string(),
-            prefix: Some(self.config.group_id.to_bytes().to_vec().into()),
+            key_space: DELETE_TRAIL_KEYSPACE.to_string(),
+            prefix: Some(prefix),
             start: scan.after.clone().map(IterStart::After),
             limit: TRAIL_PAGE,
             txn_id: Some(txn_id),
@@ -116,10 +128,10 @@ impl PutObjectOperation {
                 Err(error) => return self.emit_error(error.into()),
             }
         }
-        scan.done = next.is_none();
+        scan.range += usize::from(next.is_none());
         scan.after = next;
-        let trail = scan.trail;
-        if trail == Trail::Removed || (scan.done && trail == Trail::Touched && !self.has_head()) {
+        let (trail, done) = (scan.trail, scan.range >= 2);
+        if trail == Trail::Removed || (done && trail == Trail::Touched && !self.has_head()) {
             return self.emit_error(PutObjectError::HistoryDeleted);
         }
         self.write_cleanup_row(txn_id)

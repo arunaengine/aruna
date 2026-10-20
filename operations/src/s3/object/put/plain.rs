@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn checks_delete_trail() {
-        use aruna_core::keyspaces::DELETE_AUDIT_KEYSPACE;
+        use aruna_core::keyspaces::DELETE_TRAIL_KEYSPACE;
         use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobAuditRecord};
         let id = Ulid::from_parts(1_000, 1);
         let checked = |kind: BlobAuditKind, head: bool| {
@@ -726,7 +726,7 @@ mod tests {
             else {
                 panic!("expected one trail page, got {effects:?}")
             };
-            assert_eq!(key_space, DELETE_AUDIT_KEYSPACE);
+            assert_eq!(key_space, DELETE_TRAIL_KEYSPACE);
             assert_eq!(*txn_id, Some(Ulid::nil()));
             let record = BlobAuditRecord {
                 realm_id: RealmId::from_bytes([1; 32]),
@@ -740,8 +740,18 @@ mod tests {
                 occurred_at_ms: 2_000,
             };
             let value = Value::from(record.to_bytes().unwrap());
-            operation.step(Event::Storage(StorageEvent::IterResult {
+            let effects = operation.step(Event::Storage(StorageEvent::IterResult {
                 values: vec![(Key::from(vec![1u8]), value)],
+                next_start_after: None,
+            }));
+            // The purges of the group are the second range, read in the same transaction.
+            let [Effect::Storage(StorageEffect::Iter { prefix, .. })] = effects.as_slice() else {
+                panic!("expected the purge range, got {effects:?}")
+            };
+            let purges = aruna_core::structs::storage::delete_audit::purge_prefix;
+            assert_eq!(*prefix, Some(purges(operation.config.group_id).into()));
+            operation.step(Event::Storage(StorageEvent::IterResult {
+                values: Vec::new(),
                 next_start_after: None,
             }));
             operation.output
