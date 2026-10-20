@@ -583,19 +583,18 @@ impl BlobHandler {
                 Finished::Composed(composed) => return Ok((*composed, None, None)),
             }
         } else {
-            // Every assembled outcome holds exactly these parts, so it has their ETag.
-            etag = multipart_etag(&etags);
             let assembled =
                 self.assemble(&native, &path, upload, parts, etags.clone(), if_not_exists);
             match assembled.await {
-                Ok(id) => {
+                Ok((id, tag)) => {
                     let versioned = operator.info().capability().read_with_version;
                     version = id.filter(|id| versioned && id != "null");
+                    etag = tag;
                 }
                 Err(error) => {
                     // A completion whose answer was lost leaves the object. Only the ETag of
                     // exactly these parts proves it is this selection, not an earlier one.
-                    let expected = etag.clone();
+                    let expected = multipart_etag(&etags);
                     match timeout(self.io_timeout(), operator.stat(&path)).await {
                         Ok(Ok(metadata))
                             if metadata.content_length() == total
@@ -604,12 +603,14 @@ impl BlobHandler {
                                     == expected.as_deref() =>
                         {
                             version = backend_version(&operator, &metadata);
+                            etag = metadata.etag().map(str::to_string);
                         }
                         // A later write at a tenant path may have replaced it as newest bytes.
                         _ if upload.location.is_external() => {
-                            let etag = expected.as_deref().unwrap_or_default();
-                            let found = self.completed_version(&operator, &path, etag, total);
+                            let tag = expected.as_deref().unwrap_or_default();
+                            let found = self.completed_version(&operator, &path, tag, total);
                             version = Some(found.await.ok_or(error)?);
+                            etag = expected;
                         }
                         _ => return Err(error),
                     }
@@ -701,7 +702,7 @@ impl BlobHandler {
         parts: &[MultipartPart],
         mut etags: Vec<(u16, String)>,
         if_not_exists: bool,
-    ) -> Result<Option<String>, BlobError> {
+    ) -> Result<(Option<String>, Option<String>), BlobError> {
         for (slot, part) in etags.iter_mut().zip(parts) {
             if part.location.partial {
                 continue;

@@ -257,14 +257,15 @@ impl NativeMultipart {
     }
 
     /// Assembles the listed parts, in order, under the backend ETags recorded for them, and
-    /// answers the object's version id. `if_not_exists` fails with `PathTaken` on a taken key.
+    /// answers the object's version id and ETag. `if_not_exists` fails with `PathTaken` on a
+    /// taken key.
     pub async fn complete(
         &self,
         path: &str,
         upload_id: &str,
         parts: &[(u16, String)],
         if_not_exists: bool,
-    ) -> Result<Option<String>, BlobError> {
+    ) -> Result<(Option<String>, Option<String>), BlobError> {
         let parts = parts
             .iter()
             .map(|(part_number, etag)| {
@@ -294,7 +295,8 @@ impl NativeMultipart {
                 Some(412) => BlobError::PathTaken,
                 _ => write_error("complete", error),
             })?;
-        Ok(output.version_id().map(str::to_string))
+        let tag = output.e_tag().map(str::to_string);
+        Ok((output.version_id().map(str::to_string), tag))
     }
 
     /// Frees the stored parts of one upload; an upload the backend no longer has is gone already.
