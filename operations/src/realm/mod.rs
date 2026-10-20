@@ -18,4 +18,5 @@ pub mod recover_admin;
 pub mod set_compute;
 pub mod set_federation;
 pub mod set_policies;
+pub mod set_portal;
 pub mod set_quota;
