@@ -476,12 +476,36 @@ impl RoutingSnapshot {
         imports.any(|rule| rule.bucket == bucket && rule.mapped_bucket().is_some())
     }
 
-    pub fn plain_target(&self, bucket: &str, key: &str, id: Ulid) -> Option<PlainTarget> {
-        let rule = self
-            .imports
+    /// The import rule whose folder holds `key`, the one with the longest prefix.
+    fn import_rule(&self, bucket: &str, key: &str) -> Option<&BackendImport> {
+        self.imports
             .iter()
             .filter(|rule| rule.bucket == bucket && key.starts_with(&rule.key_prefix))
-            .max_by_key(|rule| rule.key_prefix.len())?;
+            .max_by_key(|rule| rule.key_prefix.len())
+    }
+
+    /// The target of a write already placed at `path`, as the rule's current pattern may
+    /// no longer build that path.
+    pub fn saved_target(
+        &self,
+        bucket: &str,
+        key: &str,
+        backend: &BackendRef,
+        path: &str,
+    ) -> Option<PlainTarget> {
+        let rule = self.import_rule(bucket, key)?;
+        Some(PlainTarget {
+            import_id: rule.import_id,
+            backend: backend.clone(),
+            path: path.to_string(),
+            same_name: rule.same_name(),
+            listed: *backend == BackendRef::Group(rule.backend_id)
+                && path.starts_with(&rule.backend_prefix),
+        })
+    }
+
+    pub fn plain_target(&self, bucket: &str, key: &str, id: Ulid) -> Option<PlainTarget> {
+        let rule = self.import_rule(bucket, key)?;
         if self.compression != Compression::Off {
             tracing::warn!(
                 import_id = %rule.import_id,

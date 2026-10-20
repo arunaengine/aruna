@@ -57,15 +57,15 @@ impl CompleteUploadOperation {
     }
 
     /// The object completes where its parts streamed to; the version id is the one the path
-    /// was chosen with. The path is looked at again, since the provider completes in place.
+    /// was chosen with, also after a pattern change. The provider completes in place, so the
+    /// path is looked at again.
     fn stat_in_place(&mut self, location: BackendLocation) -> Effects {
         let id = location.ulid;
-        let (bucket, key) = (&self.input.bucket, &self.input.key);
+        let (bucket, key, path) = (&self.input.bucket, &self.input.key, &location.backend_path);
         self.plain = self
             .routing
             .as_ref()
-            .and_then(|routing| routing.plain_target(bucket, key, id))
-            .filter(|target| target.backend == location.backend);
+            .and_then(|routing| routing.saved_target(bucket, key, &location.backend, path));
         self.version_id = Some(id);
         self.state = CompleteUploadState::StatPlain;
         smallvec![Effect::Blob(BlobEffect::StatPlain {
@@ -754,12 +754,18 @@ mod tests {
     /// An upload whose provider upload opened at `raw/object` as version `id`.
     fn in_place(id: Ulid) -> CompleteUploadOperation {
         let mut operation = operation("{dir}{name}");
+        open_at(&mut operation, "raw/object", id);
+        operation
+    }
+
+    /// Opens the provider upload at `path` as version `id` and starts its completion.
+    fn open_at(operation: &mut CompleteUploadOperation, path: &str, id: Ulid) {
         let location = BackendLocation {
             backend: BackendRef::Group(backend_id()),
             storage_class: None,
             root: String::new(),
             storage_bucket: String::new(),
-            backend_path: "raw/object".to_string(),
+            backend_path: path.to_string(),
             ulid: id,
             format: Default::default(),
             created_by: UserId::default(),
@@ -780,12 +786,11 @@ mod tests {
         assert!(
             matches!(
                 effects.as_slice(),
-                [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "raw/object"
+                [Effect::Blob(BlobEffect::StatPlain { path: stat, .. })] if stat == path
             ),
             "expected the path stat, got {effects:?}"
         );
         assert_eq!(operation.version_id, Some(id));
-        operation
     }
 
     fn provider_condition(effects: &Effects) -> bool {
@@ -815,6 +820,35 @@ mod tests {
         written_in_place(&mut operation);
         let writes = finalize_writes(&mut operation, true);
         assert_eq!(count(&writes, BACKEND_VERSION_KEYSPACE), 1);
+        assert_eq!(count(&writes, IMPORTED_OBJECT_KEYSPACE), 1);
+    }
+
+    #[test]
+    fn keeps_saved_identity() {
+        // The upload opened under a suffix pattern; the plain pattern cannot name this key.
+        let id = Ulid::from_parts(6, 6);
+        let path = format!("raw/report ~{id}");
+        let routing = operation("{dir}{name}").routing.unwrap();
+        assert_eq!(routing.plain_target("bucket", "in/report ", id), None);
+        let opened = || {
+            let mut operation = operation("{dir}{name}");
+            operation.input.key = "in/report ".to_string();
+            open_at(&mut operation, &path, id);
+            operation
+        };
+        let mut operation = opened();
+        let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+            exists: false,
+            version: None,
+        }));
+        let [Effect::Storage(StorageEffect::Write { key, .. })] = effects.as_slice() else {
+            panic!("expected the write intent, got {effects:?}")
+        };
+        let intent_key = aruna_core::structs::storage::backend_import::intent_key;
+        assert_eq!(*key, intent_key(Ulid::from_bytes([4u8; 16]), &path, id));
+        let mut operation = opened();
+        written_in_place(&mut operation);
+        let writes = finalize_writes(&mut operation, true);
         assert_eq!(count(&writes, IMPORTED_OBJECT_KEYSPACE), 1);
     }
 
