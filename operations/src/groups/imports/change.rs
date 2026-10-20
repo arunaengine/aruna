@@ -4,12 +4,14 @@
 
 use super::ImportRuleError;
 use super::schedule::{is_running, parse_schedule};
+use crate::groups::backends::backend_key;
 use crate::groups::fence::{parse_group_record, read_group_record};
 use crate::jobs::store::decode_job_record;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, IMPORT_PATTERN_KEYSPACE, JOB_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::job_record_key;
@@ -18,6 +20,7 @@ use aruna_core::structs::storage::backend_import::{
     write_patterns,
 };
 use aruna_core::structs::storage::format::CompressionMigration;
+use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::time::SystemTime;
@@ -92,12 +95,6 @@ impl ChangeImportOperation {
             return self.write(record, None);
         };
         record.write_pattern = pattern;
-        // A whole-bucket link keeps its plain names, and no rule becomes one.
-        if record.mapped_bucket() != before.mapped_bucket() {
-            return self.fail(ImportRuleError::Invalid(
-                "a linked provider bucket keeps the plain pattern".to_string(),
-            ));
-        }
         if record.write_pattern == before.write_pattern {
             return self.write(record, None);
         }
@@ -112,6 +109,10 @@ impl ChangeImportOperation {
             (
                 IMPORT_PATTERN_KEYSPACE.to_string(),
                 object_prefix(record.import_id),
+            ),
+            (
+                STORAGE_BACKEND_KEYSPACE.to_string(),
+                backend_key(record.backend_id),
             ),
         ];
         if let Some(last_job) = record.last_job {
@@ -133,7 +134,20 @@ impl ChangeImportOperation {
         };
         let mut values = values.into_iter().map(|(_, value)| value);
         let (moving, earlier) = (values.next().flatten(), values.next().flatten());
-        let run = values.next().flatten();
+        let (storage, run) = (values.next().flatten(), values.next().flatten());
+        let splits = match storage.as_deref().map(GroupStorage::from_bytes).transpose() {
+            Ok(Some(storage)) => storage.splits(),
+            Ok(None) => return self.fail(ImportRuleError::NotFound),
+            Err(error) => return self.fail(error.into()),
+        };
+        // A linked provider bucket keeps its plain names, and no rule becomes one.
+        let mut old_rule = record.clone();
+        old_rule.write_pattern = old.clone();
+        if splits && record.mapped_bucket() != old_rule.mapped_bucket() {
+            return self.fail(ImportRuleError::Invalid(
+                "a linked provider bucket keeps the plain pattern".to_string(),
+            ));
+        }
         let moving = moving.as_deref().map(CompressionMigration::from_bytes);
         match moving.transpose() {
             Ok(Some(found)) if found.moving && found.finished_at_ms.is_none() => {
@@ -395,24 +409,57 @@ mod tests {
         operation.finalize().unwrap()
     }
 
-    /// Answers the checks of a pattern change with a move record and the last run.
+    /// An S3 storage; without a fixed bucket its first folder names a provider bucket.
+    fn storage(splits: bool) -> Value {
+        let bucket = (!splits).then(|| ("bucket".to_string(), "lab".to_string()));
+        let storage = GroupStorage {
+            backend_id: Ulid::from_parts(4, 4),
+            group_id: Ulid::from_parts(3, 3),
+            name: "tenant".to_string(),
+            kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
+            public_config: bucket.into_iter().collect(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            disabled: false,
+            cleanup: Default::default(),
+        };
+        assert_eq!(storage.splits(), splits);
+        storage.to_bytes().unwrap().into()
+    }
+
+    /// Answers the checks of a pattern change with a move record, the storage and the last run.
     fn check(
         operation: &mut ChangeImportOperation,
         effects: &Effects,
         moving: Option<CompressionMigration>,
         run: Option<Value>,
     ) -> Effects {
+        check_on(operation, effects, moving, storage(true), run)
+    }
+
+    fn check_on(
+        operation: &mut ChangeImportOperation,
+        effects: &Effects,
+        moving: Option<CompressionMigration>,
+        storage: Value,
+        run: Option<Value>,
+    ) -> Effects {
         let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
             panic!("expected the checks, got {effects:?}")
         };
         let spaces: Vec<&str> = reads.iter().map(|(space, _)| space.as_str()).collect();
-        let mut expected = vec![COMPRESSION_MIGRATION_KEYSPACE, IMPORT_PATTERN_KEYSPACE];
+        let mut expected = vec![
+            COMPRESSION_MIGRATION_KEYSPACE,
+            IMPORT_PATTERN_KEYSPACE,
+            STORAGE_BACKEND_KEYSPACE,
+        ];
         if run.is_some() {
             expected.push(JOB_KEYSPACE);
         }
         assert_eq!(spaces, expected);
         let moving = moving.map(|record| record.to_bytes().unwrap().into());
-        let answers = [moving, None, run];
+        let answers = [moving, None, Some(storage), run];
         let values = reads
             .iter()
             .zip(answers)
@@ -512,11 +559,16 @@ mod tests {
         let mut whole = linked.clone();
         whole.write_pattern = DEFAULT_PATTERN.to_string();
         for (stored, pattern) in [(&linked, DEFAULT_PATTERN), (&whole, PLAIN_PATTERN)] {
-            let (operation, _) = read(stored, Some(pattern));
+            let (mut operation, effects) = read(stored, Some(pattern));
+            check(&mut operation, &effects, None, None);
             assert!(matches!(
                 operation.finalize(),
                 Err(ImportRuleError::Invalid(_))
             ));
+            // On a storage with a fixed bucket the same rule is an ordinary folder link.
+            let (mut operation, effects) = read(stored, Some(pattern));
+            let effects = check_on(&mut operation, &effects, None, storage(false), None);
+            assert_eq!(written(&effects).write_pattern, pattern);
         }
         let (_, effects) = read(&linked, Some(PLAIN_PATTERN));
         written(&effects);

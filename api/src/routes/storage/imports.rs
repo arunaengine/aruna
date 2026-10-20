@@ -494,11 +494,13 @@ pub async fn get_import(
 - A running import is not affected.
 - A new `write_pattern` names only later uploads. Files already in the backend keep their names,
   and every stored version still reads its own file.
-- A new pattern is refused with 409 while a run of the rule has not finished.
+- A new pattern is refused with 409 while a run of the rule or a move of its bucket has not
+  finished.
 
 **Limits**
 - `write_pattern` must contain `{name}` and give a relative path.
-- A rule that links a whole provider bucket keeps `{dir}{name}`, and no rule turns into one."#,
+- A rule that links a whole provider bucket of a storage without a fixed bucket keeps
+  `{dir}{name}`, and no rule turns into one."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
         ("import_id" = String, Path, description = "Rule to change, as a 26-character ULID")
@@ -531,7 +533,7 @@ pub async fn get_import(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
-        (status = 409, description = "The group is being deleted, or a run has not finished", body = ErrorResponse)
+        (status = 409, description = "The group is being deleted, or a run or move has not finished", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
