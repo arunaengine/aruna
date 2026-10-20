@@ -386,6 +386,9 @@ impl Operation for SetPortalOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
+        if !self.is_complete() {
+            return Err(SetPortalError::NotFinished);
+        }
         self.output.unwrap_or(Err(SetPortalError::NotFinished))
     }
 
@@ -557,5 +560,32 @@ mod tests {
         assert!(effects.is_empty());
         assert!(operation.is_complete());
         assert_eq!(operation.finalize(), Err(SetPortalError::Unauthorized));
+    }
+
+    #[test]
+    fn aborted_is_unfinished() {
+        // An abort before commit must never report the prepared map as stored.
+        let actor = actor(RealmId::from_bytes([1u8; 32]));
+        let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, RealmNodeKind::Management);
+        let mut operation = SetPortalOperation::new(portal_config(&actor, features()));
+        operation.start();
+        operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([2u8; 16]),
+        }));
+        let value: Value = config.to_bytes(&actor).unwrap().into();
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Key::from(b"config".as_slice()), Some(value)),
+                (Key::from(b"state".as_slice()), None),
+            ],
+        }));
+        assert!(!effects.is_empty());
+        assert!(!operation.is_complete());
+        operation.abort();
+        assert_eq!(operation.finalize(), Err(SetPortalError::NotFinished));
     }
 }
