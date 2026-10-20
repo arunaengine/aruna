@@ -465,6 +465,7 @@ fn choose_identity(
     rule: &BackendImport,
     path: &str,
     claims: Vec<Claim>,
+    hash: Option<&[u8; 32]>,
 ) -> Result<Option<Identity>, ItemError> {
     let backend = BackendRef::Group(rule.backend_id);
     let claims = claims
@@ -472,10 +473,21 @@ fn choose_identity(
         .filter(|(_, intent, _)| intent.backend == backend);
     let claims: Vec<Claim> = claims.collect();
     let open: Vec<&Claim> = claims.iter().filter(|(.., committed)| !committed).collect();
-    let chosen = match (open.as_slice(), claims.as_slice()) {
-        ([one], _) => Some(*one),
-        ([], [one]) => Some(one),
-        ([], []) => None,
+    // An open write names the file only if it recorded these very bytes.
+    let proven = open.iter().filter(|(_, intent, _)| {
+        let written = intent.written.as_ref();
+        written.is_some() && written == hash
+    });
+    let proven: Vec<&Claim> = proven.copied().collect();
+    let chosen = match (open.as_slice(), proven.as_slice(), claims.as_slice()) {
+        (_, [one], _) => Some(*one),
+        ([], _, [one]) => Some(one),
+        ([], _, []) => None,
+        (_, [], _) if !open.is_empty() => {
+            return Err(item(
+                "an unfinished write claims this file, but no record shows it wrote these bytes",
+            ));
+        }
         _ => return Err(item("several writes claim this file")),
     };
     if let Some((key, intent, _)) = chosen {
@@ -499,6 +511,20 @@ fn choose_identity(
             intent: None,
         })),
     }
+}
+
+/// Reads the listed object's bytes; a size other than the listed one means it changed meanwhile.
+async fn hash_listed(
+    ctx: &JobContext,
+    spec: &BackendImportSpec,
+    resolved: &ResolvedBackend,
+    object: &ExternalObject,
+) -> Result<(BackendLocation, Option<String>), ItemError> {
+    let hashed = hash_object(ctx, spec, resolved.clone(), &object.key).await?;
+    if hashed.0.blob_size != object.size {
+        return Err(item("the object changed while it was read"));
+    }
+    Ok(hashed)
 }
 
 fn item(message: impl Into<String>) -> ItemError {
@@ -541,7 +567,16 @@ async fn recover(
     if keyed && claims.iter().all(|(.., committed)| *committed) {
         return Ok(None);
     }
-    let Some(identity) = choose_identity(rule, &object.key, claims)? else {
+    // Only the hash of the file can prove which open write left it, so it is read first.
+    let mut hashed = None;
+    if claims.iter().any(|(.., committed)| !committed) {
+        hashed = Some(hash_listed(ctx, spec, resolved, object).await?);
+    }
+    let hash = hashed
+        .as_ref()
+        .and_then(|(location, _)| location.get_blake3());
+    let hash = hash.and_then(|hash| <[u8; 32]>::try_from(hash).ok());
+    let Some(identity) = choose_identity(rule, &object.key, claims, hash.as_ref())? else {
         return Ok(None);
     };
     let Identity {
@@ -550,10 +585,10 @@ async fn recover(
         intent,
     } = identity;
     ensure_confined_path(Path::new(&key)).map_err(|error| item(error.to_string()))?;
-    let (mut location, version) = hash_object(ctx, spec, resolved.clone(), &object.key).await?;
-    if location.blob_size != object.size {
-        return Err(item("the object changed while it was read"));
-    }
+    let (mut location, version) = match hashed {
+        Some(hashed) => hashed,
+        None => hash_listed(ctx, spec, resolved, object).await?,
+    };
     if let Some((_, writer)) = &intent {
         location.created_by = *writer;
     }
@@ -1737,12 +1772,16 @@ mod tests {
         }
     }
 
+    /// The hash every test claim recorded for its written bytes.
+    const HASH: [u8; 32] = [7; 32];
+
     fn claim(rule: &BackendImport, key: &str, committed: bool) -> Claim {
         let intent = WriteIntent {
             key: key.to_string(),
             version_id: Ulid::generate(),
             backend: BackendRef::Group(rule.backend_id),
             created_by: Default::default(),
+            written: Some(HASH),
         };
         let stored = intent_key(rule.import_id, "raw/a.csv", intent.version_id);
         (stored, intent, committed)
@@ -1781,7 +1820,9 @@ mod tests {
         let rule = recovery_rule("{dir}{id}_{name}");
         let id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         let path = format!("raw/x/{id}_a.csv");
-        let decoded = choose_identity(&rule, &path, Vec::new()).ok().flatten();
+        let decoded = choose_identity(&rule, &path, Vec::new(), None)
+            .ok()
+            .flatten();
         let expected = Identity {
             key: "in/x/a.csv".to_string(),
             version_id: id,
@@ -1789,27 +1830,32 @@ mod tests {
         };
         assert_eq!(decoded, Some(expected));
         assert!(matches!(
-            choose_identity(&rule, "raw/x/a.csv", Vec::new()),
+            choose_identity(&rule, "raw/x/a.csv", Vec::new(), None),
             Ok(None)
         ));
         // A path without the folder of its key is reported, never imported under a guess.
         let stripped = recovery_rule("{id}_{name}");
         let path = format!("raw/{id}_a.csv");
         assert!(matches!(
-            choose_identity(&stripped, &path, Vec::new()),
+            choose_identity(&stripped, &path, Vec::new(), None),
             Err(ItemError::Item(_))
         ));
         // The intent of the write that never committed names the full key.
         let open = claim(&stripped, "in/deep/a.csv", false);
         let done = claim(&stripped, "in/other/a.csv", true);
-        let chosen = choose_identity(&stripped, &path, vec![done.clone(), open.clone()]);
+        let chosen = choose_identity(
+            &stripped,
+            &path,
+            vec![done.clone(), open.clone()],
+            Some(&HASH),
+        );
         let chosen = chosen.ok().flatten().unwrap();
         assert_eq!(
             (chosen.key.as_str(), chosen.version_id),
             ("in/deep/a.csv", open.1.version_id)
         );
         assert_eq!(chosen.intent.map(|(key, _)| key), Some(open.0.clone()));
-        let only = choose_identity(&stripped, &path, vec![done.clone()])
+        let only = choose_identity(&stripped, &path, vec![done.clone()], None)
             .ok()
             .flatten();
         assert_eq!(
@@ -1817,11 +1863,20 @@ mod tests {
             Some(done.1.version_id)
         );
         let second = claim(&stripped, "in/b.csv", false);
-        assert!(choose_identity(&stripped, &path, vec![open.clone(), second]).is_err());
+        assert!(
+            choose_identity(&stripped, &path, vec![open.clone(), second], Some(&HASH)).is_err()
+        );
         // An intent for another backend says nothing about this file.
         let mut foreign = open;
         foreign.1.backend = BackendRef::Group(Ulid::from_parts(9, 9));
-        assert!(choose_identity(&stripped, &path, vec![foreign]).is_err());
+        assert!(choose_identity(&stripped, &path, vec![foreign], Some(&HASH)).is_err());
+        // An open write without a record of these bytes proves nothing; it is reported.
+        let mut unproven = claim(&stripped, "in/deep/a.csv", false);
+        let other = [8u8; 32];
+        assert!(choose_identity(&stripped, &path, vec![unproven.clone()], Some(&other)).is_err());
+        unproven.1.written = None;
+        let claims = vec![unproven, done];
+        assert!(choose_identity(&stripped, &path, claims, Some(&HASH)).is_err());
     }
 
     #[tokio::test]

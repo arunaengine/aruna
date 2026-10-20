@@ -128,6 +128,8 @@ pub enum PutObjectState {
     DropIntent,
     /// Syncs that delete to disk.
     SyncDroppedIntent,
+    /// Records the hash of the written bytes in the write intent.
+    WriteEvidence,
     /// Reads the delete trail inside the version transaction.
     ReadTrail,
 }
@@ -851,7 +853,13 @@ impl PutObjectOperation {
                 ));
             }
         }
+        if let Some(effects) = self.write_evidence() {
+            return effects;
+        }
+        self.start_transaction()
+    }
 
+    fn start_transaction(&mut self) -> Effects {
         self.state = PutObjectState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -1896,6 +1904,7 @@ impl Operation for PutObjectOperation {
                 self.intent_dropped(event)
             }
             PutObjectState::ReadTrail => self.trail_read(event),
+            PutObjectState::WriteEvidence => self.evidence_written(event),
             PutObjectState::ReadHistory => self.history_read(event),
             PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),

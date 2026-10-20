@@ -389,6 +389,9 @@ pub struct WriteIntent {
     pub version_id: Ulid,
     pub backend: BackendRef,
     pub created_by: UserId,
+    /// The BLAKE3 hash of the bytes the write put at the path, recorded once it is done.
+    /// Without it nothing proves that the file at the path holds this write's bytes.
+    pub written: Option<[u8; 32]>,
 }
 
 impl WriteIntent {

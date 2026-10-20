@@ -111,6 +111,8 @@ pub enum CompleteUploadState {
     DropIntent,
     /// Syncs that delete to disk.
     SyncDroppedIntent,
+    /// Records the hash of the composed bytes in the write intent.
+    WriteEvidence,
     WriteCleanupRecords,
     WriteReplicationObligation,
     EnforceQuota,
@@ -1161,7 +1163,13 @@ impl CompleteUploadOperation {
                 ));
             }
         }
+        if let Some(effects) = self.write_evidence() {
+            return effects;
+        }
+        self.start_finalize()
+    }
 
+    fn start_finalize(&mut self) -> Effects {
         self.state = CompleteUploadState::StartFinalizeTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
@@ -2319,6 +2327,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::ReadImportRule => self.import_rule_read(event),
             CompleteUploadState::WriteIntent => self.intent_written(event),
             CompleteUploadState::RetireIntent => self.intent_retired(event),
+            CompleteUploadState::WriteEvidence => self.evidence_written(event),
             CompleteUploadState::DropIntent | CompleteUploadState::SyncDroppedIntent => {
                 self.intent_dropped(event)
             }

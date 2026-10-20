@@ -174,6 +174,7 @@ impl CompleteUploadOperation {
             version_id,
             backend: target.backend.clone(),
             created_by: self.input.created_by,
+            written: None,
         };
         let keys = intent_keys(target.import_id, path, version_id, if_not_exists);
         match intent_writes(&keys, &intent) {
@@ -200,6 +201,39 @@ impl CompleteUploadOperation {
                 self.written_intent.clear();
                 self.plain_taken()
             }
+            Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
+            _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
+        }
+    }
+
+    /// Records the hash of the composed bytes in the intent of the path they reached. A lost
+    /// record leaves the intent unproven, which an import reports instead of trusting.
+    pub(super) fn write_evidence(&mut self) -> Option<Effects> {
+        let target = self
+            .plain
+            .as_ref()
+            .filter(|_| !self.written_intent.is_empty())?;
+        let written = self.composed_location.as_ref()?;
+        let intent = WriteIntent {
+            key: self.input.key.clone(),
+            version_id: self.version_id?,
+            backend: target.backend.clone(),
+            created_by: self.input.created_by,
+            written: Some(written.get_blake3()?.try_into().ok()?),
+        };
+        let path = &written.backend_path;
+        let key = intent_key(target.import_id, path, intent.version_id);
+        let effect = match intent_writes(&[key], &intent) {
+            Ok(effect) => effect,
+            Err(error) => return Some(self.schedule_error(error.into())),
+        };
+        self.state = CompleteUploadState::WriteEvidence;
+        Some(smallvec![effect])
+    }
+
+    pub(super) fn evidence_written(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.start_finalize(),
             Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
             _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
         }
@@ -724,6 +758,17 @@ mod tests {
             version: Some("v1".to_string()),
             etag: None,
         }));
+        // A listed object's intent records the hash of the bytes before the finalize.
+        let effects = match effects.as_slice() {
+            [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] => {
+                let intent = WriteIntent::from_bytes(&writes[0].2).unwrap();
+                assert_eq!(intent.written, Some([7u8; 32]));
+                operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+                    entries: Vec::new(),
+                }))
+            }
+            _ => effects,
+        };
         assert!(
             matches!(
                 effects.as_slice(),

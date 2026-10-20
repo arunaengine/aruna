@@ -108,12 +108,7 @@ impl PutObjectOperation {
         let Some(blob) = self.config.request.body.take() else {
             return self.emit_error(PutObjectError::MissingBody);
         };
-        let intent = plain.target.listed.then(|| WriteIntent {
-            key: self.config.request.key.clone(),
-            version_id: ulid,
-            backend: plain.target.backend.clone(),
-            created_by: self.config.user_id,
-        });
+        let intent = self.plain_intent();
         let import_id = plain.target.import_id;
         let keys = intent_keys(import_id, &path, ulid, if_not_exists);
         let write = Effect::Blob(BlobEffect::WritePlain {
@@ -138,6 +133,49 @@ impl PutObjectOperation {
                 smallvec![effect]
             }
             Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    /// The identity of a listed plain write, without its written bytes.
+    fn plain_intent(&self) -> Option<WriteIntent> {
+        let plain = self.plain.as_ref().filter(|plain| plain.target.listed)?;
+        Some(WriteIntent {
+            key: self.config.request.key.clone(),
+            version_id: self.version_id?,
+            backend: plain.target.backend.clone(),
+            created_by: self.config.user_id,
+            written: None,
+        })
+    }
+
+    /// Records the hash of the written bytes in the intent of the path they reached. A lost
+    /// record leaves the intent unproven, which an import reports instead of trusting.
+    pub(super) fn write_evidence(&mut self) -> Option<Effects> {
+        let mut intent = self
+            .plain_intent()
+            .filter(|_| !self.written_intent.is_empty())?;
+        let (plain, written) = (self.plain.as_ref()?, self.get_written_location()?);
+        intent.written = Some(written.get_blake3()?.try_into().ok()?);
+        let key = intent_key(
+            plain.target.import_id,
+            &written.backend_path,
+            intent.version_id,
+        );
+        let effect = match intent_writes(&[key], &intent) {
+            Ok(effect) => effect,
+            Err(error) => return Some(self.emit_error(error.into())),
+        };
+        self.state = PutObjectState::WriteEvidence;
+        Some(smallvec![effect])
+    }
+
+    pub(super) fn evidence_written(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.start_transaction(),
+            Event::Storage(StorageEvent::Error { error }) => {
+                self.cleanup_failed_write(PutObjectError::StorageError(error))
+            }
+            _ => self.emit_error(PutObjectError::InvalidOperationState),
         }
     }
 
@@ -1081,6 +1119,44 @@ mod tests {
         };
         assert_eq!(plain.path, format!("raw/x/one.csv~{id}"));
         assert!(plain.if_not_exists);
+    }
+
+    #[test]
+    fn records_written_hash() {
+        let mut operation = operation("{dir}{name}");
+        begin(&mut operation);
+        operation.step(Event::Blob(BlobEvent::PlainStat {
+            exists: false,
+            version: None,
+        }));
+        past_intent(&mut operation);
+        // A backend without conditional writes put the bytes at the tagged path instead.
+        let id = operation.version_id.unwrap();
+        let tagged = format!("raw/x/one.csv~{id}");
+        let effects = operation.step(Event::Blob(BlobEvent::PlainWritten {
+            location: written(tagged.clone(), id),
+            version: None,
+            etag: None,
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice()
+        else {
+            panic!("expected the written hash, got {effects:?}")
+        };
+        let [(space, key, value)] = writes.as_slice() else {
+            panic!("only the reached path gets the hash, got {writes:?}")
+        };
+        assert_eq!((space.as_str(), *txn_id), (IMPORT_INTENT_KEYSPACE, None));
+        assert_eq!(*key, intent_key(Ulid::from_bytes([4u8; 16]), &tagged, id));
+        let intent = WriteIntent::from_bytes(value).unwrap();
+        assert_eq!(intent.written, Some([7u8; 32]));
+        // The version transaction starts only after the hash is stored.
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
     }
 
     #[test]
