@@ -235,6 +235,8 @@ pub const IMPORT_INTENT_KEYSPACE: &str = "backend_import_intents";
 pub const IMPORT_PATTERN_KEYSPACE: &str = "backend_import_patterns";
 /// Removed import rules whose object rows are not all deleted yet, keyed by import id.
 pub const IMPORT_REMOVAL_KEYSPACE: &str = "backend_import_removals";
+/// File name discovery rules of import rules, keyed like the rule.
+pub const IMPORT_DISCOVERY_KEYSPACE: &str = "backend_import_discovery";
 
 /// Device-local registrations of the directories this node offers as read-only
 /// buckets, keyed by bucket name. Never replicated: the root path is the one
@@ -502,6 +504,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     IMPORT_INTENT_KEYSPACE,
     IMPORT_PATTERN_KEYSPACE,
     IMPORT_REMOVAL_KEYSPACE,
+    IMPORT_DISCOVERY_KEYSPACE,
     OFFERED_DIRECTORY_KEYSPACE,
     DEVICE_INTAKE_KEYSPACE,
     REALM_MARKER_KEYSPACE,

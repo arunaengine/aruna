@@ -4,8 +4,10 @@
 
 pub mod change;
 pub mod create;
+pub mod discovery;
 pub mod remove;
 pub mod schedule;
+pub mod shared;
 
 use crate::driver::DriverContext;
 use crate::groups::backends::{RecordReadError, parse_read};
@@ -44,6 +46,8 @@ pub enum ImportRuleError {
     Conflict(String),
     #[error("import rule not found")]
     NotFound,
+    #[error("permission denied")]
+    Forbidden,
     #[error("storage read failed: {0}")]
     Read(String),
     #[error(transparent)]

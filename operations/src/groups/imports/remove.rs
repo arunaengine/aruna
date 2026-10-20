@@ -9,8 +9,9 @@ use crate::groups::fence::{parse_group_record, read_group_record};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORT_PATTERN_KEYSPACE,
-    IMPORT_REMOVAL_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE, IMPORT_INTENT_KEYSPACE,
+    IMPORT_PATTERN_KEYSPACE, IMPORT_REMOVAL_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{ProviderCleanup, import_key, object_prefix};
@@ -228,16 +229,20 @@ impl Operation for RemoveImportOperation {
             (RemoveState::Read, Some(group_id), event) => match parse_group_record(event) {
                 Ok(Some(_)) => {
                     self.state = RemoveState::Delete;
-                    smallvec![Effect::Storage(StorageEffect::Delete {
-                        key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
-                        key: import_key(group_id, self.import_id),
+                    let key = import_key(group_id, self.import_id);
+                    // The discovery rules go with the rule.
+                    let deletes = [BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE]
+                        .map(|key_space| (key_space.to_string(), key.clone()))
+                        .to_vec();
+                    smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                        deletes,
                         txn_id: self.txn_id,
                     })]
                 }
                 Ok(None) => self.fail(ImportRuleError::NotFound),
                 Err(error) => self.fail(error.into()),
             },
-            (RemoveState::Delete, _, Event::Storage(StorageEvent::DeleteResult { .. })) => {
+            (RemoveState::Delete, _, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
                 self.state = RemoveState::Mark;
                 smallvec![Effect::Storage(StorageEffect::Write {
                     key_space: IMPORT_REMOVAL_KEYSPACE.to_string(),
@@ -416,17 +421,21 @@ mod tests {
                 (Key::from(Vec::new()), None),
             ],
         }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Delete {
+        let [
+            Effect::Storage(StorageEffect::BatchDelete {
+                deletes,
                 txn_id: Some(_),
-                ..
-            })]
-        ));
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the rule delete, got {effects:?}")
+        };
+        let spaces: Vec<_> = deletes.iter().map(|(space, _)| space.as_str()).collect();
+        assert_eq!(spaces, [BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE]);
 
         // The mark commits with the rule deletion, before any row goes.
-        let effects = operation.step(storage(StorageEvent::DeleteResult {
-            key: Vec::new().into(),
+        let effects = operation.step(storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
         }));
         let [
             Effect::Storage(StorageEffect::Write {

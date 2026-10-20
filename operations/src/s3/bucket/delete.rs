@@ -10,9 +10,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     ABE_DUE_KEYSPACE, ABE_REISSUE_KEYSPACE, ABE_REKEY_KEYSPACE, BACKEND_IMPORT_KEYSPACE,
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE,
-    BUCKET_KEY_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, IMPORT_REMOVAL_KEYSPACE, KEY_COPY_KEYSPACE,
-    NODE_VAULT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE,
-    STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
+    BUCKET_KEY_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE,
+    IMPORT_REMOVAL_KEYSPACE, KEY_COPY_KEYSPACE, NODE_VAULT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
+    RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
@@ -537,6 +537,8 @@ impl DeleteBucketOperation {
             writes.push((IMPORT_REMOVAL_KEYSPACE.to_string(), mark, value.into()));
             self.key_deletes
                 .push((BACKEND_IMPORT_KEYSPACE.to_string(), rule.key()));
+            self.key_deletes
+                .push((IMPORT_DISCOVERY_KEYSPACE.to_string(), rule.key()));
         }
         self.state = DeleteBucketState::WriteLinks;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
@@ -881,6 +883,7 @@ mod link_tests {
     fn deletes_empty_provider() {
         let (writes, deletes, effects) = delete("delete_empty");
         assert!(deletes.contains(&(BACKEND_IMPORT_KEYSPACE.to_string(), rule().key())));
+        assert!(deletes.contains(&(IMPORT_DISCOVERY_KEYSPACE.to_string(), rule().key())));
         let record = writes
             .iter()
             .find(|(space, ..)| space == STORAGE_BACKEND_KEYSPACE)

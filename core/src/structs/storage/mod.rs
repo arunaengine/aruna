@@ -12,6 +12,7 @@ pub mod cleanup;
 pub mod data_identity;
 pub mod dataset_location;
 pub mod delete_audit;
+pub mod discovery;
 pub mod encryption;
 pub mod format;
 pub mod group_backend;

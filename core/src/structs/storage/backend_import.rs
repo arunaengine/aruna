@@ -497,7 +497,8 @@ pub struct ImportedObject {
     pub etag: Option<String>,
     pub size: u64,
     pub modified_ms: Option<u64>,
-    /// The bucket key of a version Aruna wrote at this backend key.
+    /// The bucket key this backend key maps to; `None` on an older import row, which maps
+    /// by the rule's folders.
     pub key: Option<String>,
 }
 
