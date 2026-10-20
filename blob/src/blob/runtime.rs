@@ -122,6 +122,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::HashExternal { .. } => (EffectClass::Transfer, "hash_external"),
         BlobEffect::WritePlain { .. } => (EffectClass::Transfer, "write_plain"),
         BlobEffect::StatPlain { .. } => (EffectClass::Control, "stat_plain"),
+        BlobEffect::DeletePlain { .. } => (EffectClass::Local, "delete_plain"),
         BlobEffect::StatCopy { .. } => (EffectClass::Control, "stat_copy"),
         BlobEffect::EnsureBucket { .. } => (EffectClass::Control, "ensure_bucket"),
         BlobEffect::HeadBucket { .. } => (EffectClass::Control, "head_bucket"),
@@ -154,6 +155,7 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::ComposePieces { .. }
             | BlobEffect::ReplicateLeased { .. }
             | BlobEffect::WritePlain { .. }
+            | BlobEffect::DeletePlain { .. }
     )
 }
 
@@ -924,6 +926,7 @@ impl BlobHandler {
             BlobEffect::StatPlain { backend, path } => {
                 Box::pin(self.stat_plain(backend, path)).await
             }
+            BlobEffect::DeletePlain { location } => Box::pin(self.delete_plain(location)).await,
             BlobEffect::EnsureBucket { backend, bucket } => {
                 Box::pin(self.ensure_bucket(&backend, &bucket)).await
             }

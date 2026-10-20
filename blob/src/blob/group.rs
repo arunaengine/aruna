@@ -162,7 +162,9 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         BlobEffect::HashExternal { resolved, .. } => push(&mut ids, &resolved.backend),
         BlobEffect::WritePlain { resolved, .. } => push(&mut ids, &resolved.backend),
         BlobEffect::StatPlain { backend, .. } => push(&mut ids, backend),
-        BlobEffect::StatCopy { location } => push(&mut ids, &location.backend),
+        BlobEffect::StatCopy { location } | BlobEffect::DeletePlain { location } => {
+            push(&mut ids, &location.backend)
+        }
         BlobEffect::EnsureBucket { backend, .. }
         | BlobEffect::HeadBucket { backend, .. }
         | BlobEffect::DeleteEmptyBucket { backend, .. } => push(&mut ids, backend),

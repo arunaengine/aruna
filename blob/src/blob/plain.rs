@@ -232,6 +232,35 @@ impl BlobHandler {
         }
     }
 
+    /// Only an explicit rename deletes a tenant file, after its version names the new one.
+    pub(super) async fn delete_plain(&self, location: BackendLocation) -> BlobEvent {
+        if !location.storage_bucket.is_empty() {
+            return BlobEvent::Error(BlobError::DeleteError("not a plain path".to_string()));
+        }
+        let (operator, path) = match self
+            .operator_from_location(&location)
+            .and_then(|operator| Ok((operator, self.object_path(&location)?)))
+        {
+            Ok(found) => found,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let version = match self.read_version(&location).await {
+            Ok(version) => version,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let delete = operator.delete_with(&path);
+        let delete = match version.filter(|_| operator.info().capability().delete_with_version) {
+            Some(version) => delete.version(&version),
+            None => delete,
+        };
+        match timeout(self.io_timeout(), delete.into_future()).await {
+            Ok(Ok(())) => BlobEvent::DeleteFinished,
+            Ok(Err(error)) if error.kind() == ErrorKind::NotFound => BlobEvent::DeleteFinished,
+            Ok(Err(error)) => BlobEvent::Error(BlobError::DeleteError(error.to_string())),
+            Err(_) => BlobEvent::Error(BlobError::DeleteError("timed out deleting".into())),
+        }
+    }
+
     /// The backend version a write recorded for a tenant path; `None` reads the newest bytes.
     pub(super) async fn read_version(
         &self,

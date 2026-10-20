@@ -329,3 +329,40 @@ fn tags_without_condition() {
     assert!(!conditional(&operator, &mut location, &plain));
     assert_eq!(location.backend_path, plain.path);
 }
+
+#[tokio::test]
+async fn deletes_renamed_files() {
+    use super::stream_from_bytes;
+    use aruna_core::structs::storage::backend_import::PlainPath;
+    use ulid::Ulid;
+
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let root = context._temp_dir.path().join("hot");
+    let resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
+    let plain = PlainPath {
+        path: "raw/old.txt".to_string(),
+        ulid: Ulid::generate(),
+        if_not_exists: true,
+    };
+    let blob = stream_from_bytes(b"old");
+    let written = handler.write_plain(resolved, plain, test_user_id(), blob);
+    let BlobEvent::WriteFinished { location } = written.await else {
+        panic!("plain write failed")
+    };
+    // A missing file counts as deleted, so a repeated release finishes.
+    for _ in 0..2 {
+        let deleted = handler.delete_plain(location.clone()).await;
+        assert_eq!(deleted, BlobEvent::DeleteFinished);
+        assert!(!root.join("raw/old.txt").exists());
+    }
+    // A copy in Aruna's own layout is never deleted this way.
+    let own = aruna_core::structs::storage::blob::BackendLocation {
+        storage_bucket: "data".to_string(),
+        ..location
+    };
+    assert!(matches!(
+        handler.delete_plain(own).await,
+        BlobEvent::Error(BlobError::DeleteError(_))
+    ));
+}
