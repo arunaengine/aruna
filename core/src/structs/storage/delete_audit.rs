@@ -97,7 +97,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keys_trail_by_object() {
+    fn indexes_trail() {
         let group = Ulid::from_parts(1, 1);
         let record = |kind, key: &str| BlobAuditRecord {
             realm_id: RealmId::from_bytes([1; 32]),
