@@ -47,7 +47,8 @@ use crate::replication::queue::complete_put;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{
-    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, Trail, trail_ranges,
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, Trail, intent_keys,
+    trail_ranges,
 };
 use crate::s3::purge_fence::PurgeFenceError;
 
@@ -417,7 +418,7 @@ async fn import_object(
         head,
         keep_head: false,
         guards: Vec::new(),
-        retired: None,
+        retired: Vec::new(),
         trail: keyed.map(|row| row.version_id),
         keep_row: false,
     };
@@ -481,16 +482,18 @@ fn choose_identity(
         .into_iter()
         .filter(|(_, intent, _)| intent.backend == backend);
     let claims: Vec<Claim> = claims.collect();
-    let open: Vec<&Claim> = claims.iter().filter(|(.., committed)| !committed).collect();
-    // An open write names the file only if it recorded these very bytes.
-    let proven = open.iter().filter(|(_, intent, _)| {
+    // A write names the file only if it recorded these very bytes, committed or not.
+    let proven = |(_, intent, _): &&Claim| {
         let written = intent.written.as_ref();
         written.is_some() && written == hash
-    });
-    let proven: Vec<&Claim> = proven.copied().collect();
-    let chosen = match (open.as_slice(), proven.as_slice(), claims.as_slice()) {
+    };
+    let open: Vec<&Claim> = claims.iter().filter(|(.., committed)| !committed).collect();
+    let open_proven: Vec<&Claim> = open.iter().copied().filter(proven).collect();
+    let done = claims.iter().filter(|(.., committed)| *committed);
+    let done: Vec<&Claim> = done.filter(proven).collect();
+    let chosen = match (open.as_slice(), open_proven.as_slice(), done.as_slice()) {
         (_, [one], _) => Some(*one),
-        ([], _, [one]) => Some(one),
+        ([], _, [one]) => Some(*one),
         ([], _, []) => None,
         (_, [], _) if !open.is_empty() => {
             return Err(item(
@@ -520,6 +523,13 @@ fn choose_identity(
             intent: None,
         })),
     }
+}
+
+/// Every intent key the write `id` may have stored for the file at `path`: the free path and
+/// its tagged path, whichever of the two the bytes reached.
+fn write_intents(import_id: Ulid, path: &str, id: Ulid) -> Vec<Key> {
+    let free = path.strip_suffix(&format!("~{id}")).unwrap_or(path);
+    intent_keys(import_id, free, id, true)
 }
 
 /// Reads the listed object's bytes; a size other than the listed one means it changed meanwhile.
@@ -577,9 +587,9 @@ async fn recover(
     if keyed && claims.iter().all(|(.., committed)| *committed) {
         return Ok(None);
     }
-    // Only the hash of the file can prove which open write left it, so it is read first.
+    // Only the hash of the file can prove which write left it, so it is read first.
     let mut hashed = None;
-    if claims.iter().any(|(.., committed)| !committed) {
+    if !claims.is_empty() {
         hashed = Some(hash_listed(ctx, spec, resolved, object).await?);
     }
     let hash = hashed
@@ -645,10 +655,10 @@ async fn recover(
                 head,
                 keep_head: head.is_some(),
                 guards,
-                retired: intent
-                    .as_ref()
-                    .filter(|_| alias.is_none())
-                    .map(|(key, _)| key.clone()),
+                retired: match (&intent, &alias) {
+                    (Some(_), None) => write_intents(rule.import_id, &object.key, version_id),
+                    _ => Vec::new(),
+                },
                 trail: Some(version_id),
                 keep_row: alias.is_some(),
             };
@@ -699,7 +709,10 @@ async fn recover(
         rule_guard(rule)?,
         (BLOB_VERSIONS_KEYSPACE.to_string(), version_key, Some(value)),
     ];
-    let retired = intent.map(|(key, _)| key);
+    let retired = match intent {
+        Some(_) => write_intents(rule.import_id, &object.key, version_id),
+        None => Vec::new(),
+    };
     let repaired = encode(&committed)?;
     let note = Note {
         guards: &guards,
@@ -1023,8 +1036,8 @@ struct Fence {
     head: Option<Ulid>,
     keep_head: bool,
     guards: Vec<(String, Key, Option<Value>)>,
-    /// The write intent the version makes obsolete, deleted in its transaction.
-    retired: Option<Key>,
+    /// The write intents the version makes obsolete, deleted in its transaction.
+    retired: Vec<Key>,
     /// The version the delete trail must not show as removed.
     trail: Option<Ulid>,
     /// The reverse row stays as it was read; a later step rewrites it.
@@ -1096,7 +1109,7 @@ async fn put_version(
     if fence.keep_head {
         operation = operation.keep_head();
     }
-    if let Some(key) = fence.retired {
+    for key in fence.retired {
         operation = operation.with_retired_intent(key);
     }
     if let Some(version_id) = fence.trail {
@@ -1197,8 +1210,8 @@ async fn write_value(
 struct Note<'a> {
     /// Values that must still be stored as they were read.
     guards: &'a [(String, Key, Option<Value>)],
-    /// A write intent the committed row makes obsolete.
-    retired: Option<Key>,
+    /// The write intents the committed row makes obsolete.
+    retired: Vec<Key>,
 }
 
 /// Replaces the row only while the rule exists and the row still holds `seen` (`None`: no row),
@@ -1253,7 +1266,7 @@ async fn note_listing(
         value: row.into(),
         txn_id: Some(txn_id),
     };
-    let retire = note.retired.map(|key| StorageEffect::Delete {
+    let retire = note.retired.into_iter().map(|key| StorageEffect::Delete {
         key_space: IMPORT_INTENT_KEYSPACE.to_string(),
         key,
         txn_id: Some(txn_id),
@@ -1614,7 +1627,7 @@ mod tests {
             row_key.clone(),
             Some(&seen),
             update.clone(),
-            note(Some(intent.clone())),
+            note(vec![intent.clone()]),
         );
         assert!(held.await.is_ok());
         assert_eq!(stored().await, written);
@@ -1632,7 +1645,7 @@ mod tests {
             vec![8],
         );
         assert!(write.await.is_ok());
-        let retired = Some(intent.clone());
+        let retired = vec![intent.clone()];
         let done = note_listing(
             &context,
             &rule,
@@ -1644,6 +1657,16 @@ mod tests {
         assert!(done.await.is_ok());
         assert_eq!(stored().await, listed);
         assert!(!intent_left().await);
+    }
+
+    #[test]
+    fn retires_both_destinations() {
+        let (import_id, id) = (Ulid::from_parts(4, 4), Ulid::from_parts(5, 5));
+        let tagged = format!("raw/a~{id}");
+        let expected = intent_keys(import_id, "raw/a", id, true);
+        // Whichever path the bytes reached, both intents of the write go.
+        assert_eq!(write_intents(import_id, "raw/a", id), expected);
+        assert_eq!(write_intents(import_id, &tagged, id), expected);
     }
 
     #[test]
@@ -1981,7 +2004,7 @@ mod tests {
             ("in/deep/a.csv", open.1.version_id)
         );
         assert_eq!(chosen.intent.map(|(key, _)| key), Some(open.0.clone()));
-        let only = choose_identity(&stripped, &path, vec![done.clone()], None)
+        let only = choose_identity(&stripped, &path, vec![done.clone()], Some(&HASH))
             .ok()
             .flatten();
         assert_eq!(
@@ -2001,8 +2024,14 @@ mod tests {
         let other = [8u8; 32];
         assert!(choose_identity(&stripped, &path, vec![unproven.clone()], Some(&other)).is_err());
         unproven.1.written = None;
-        let claims = vec![unproven, done];
+        let claims = vec![unproven, done.clone()];
         assert!(choose_identity(&stripped, &path, claims, Some(&HASH)).is_err());
+        // A committed write without a record of these bytes never takes over the file.
+        let mut sibling = done;
+        sibling.1.written = None;
+        let named = recovery_rule("{dir}{name}");
+        let chosen = choose_identity(&named, "raw/a", vec![sibling], Some(&HASH));
+        assert!(matches!(chosen, Ok(None)));
     }
 
     #[tokio::test]
