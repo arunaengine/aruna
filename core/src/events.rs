@@ -261,10 +261,12 @@ pub enum BlobEvent {
     CopyStat {
         exists: bool,
     },
-    /// `version` is the backend's id of the bytes written, on a backend that keeps versions.
+    /// `version` is the backend's id of the bytes written, on a backend that keeps versions;
+    /// `etag` is the backend's ETag of them, when it reports one.
     PlainWritten {
         location: BackendLocation,
         version: Option<String>,
+        etag: Option<String>,
     },
     /// The bucket is ready; `created` when Aruna created it.
     BucketReady {

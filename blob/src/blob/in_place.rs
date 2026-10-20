@@ -503,7 +503,7 @@ impl BlobHandler {
         };
         let finished = self.finish_upload(&upload, &parts, streamed, compression, if_not_exists);
         match Box::pin(finished).await {
-            Ok((location, version)) => {
+            Ok((location, version, etag)) => {
                 self.chains().remove(&upload.upload_id);
                 reservation.retain();
                 // A composed copy keeps its own reservation; the target row discards the target.
@@ -512,9 +512,11 @@ impl BlobHandler {
                 }
                 // The object is the only copy of the parts: its row keeps it for a retry.
                 match self.write_target_row(&location, upload.record_id).await {
-                    Ok(()) if location.is_external() => {
-                        BlobEvent::PlainWritten { location, version }
-                    }
+                    Ok(()) if location.is_external() => BlobEvent::PlainWritten {
+                        location,
+                        version,
+                        etag,
+                    },
                     Ok(()) => BlobEvent::WriteFinished { location },
                     Err(error) => BlobEvent::Error(error),
                 }
@@ -530,7 +532,7 @@ impl BlobHandler {
         streamed: &[u16],
         compression: Compression,
         if_not_exists: bool,
-    ) -> Result<(BackendLocation, Option<String>), BlobError> {
+    ) -> Result<(BackendLocation, Option<String>, Option<String>), BlobError> {
         let mut listed = Vec::with_capacity(parts.len());
         let mut etags = Vec::with_capacity(parts.len());
         for part in parts {
@@ -570,7 +572,7 @@ impl BlobHandler {
         };
         // The completion's reservation also covers the hash read of the framed object.
         let mut share = None;
-        let mut version = None;
+        let (mut version, mut etag) = (None, None);
         if let Some(level) = part_level(upload) {
             let finished = self.finish_framed(upload, parts, level, streamed, compression);
             match Box::pin(finished).await? {
@@ -578,9 +580,11 @@ impl BlobHandler {
                     location.format.layout = StoredLayout::Frames(Box::new(layout));
                     share = Some(held);
                 }
-                Finished::Composed(composed) => return Ok((*composed, None)),
+                Finished::Composed(composed) => return Ok((*composed, None, None)),
             }
         } else {
+            // Every assembled outcome holds exactly these parts, so it has their ETag.
+            etag = multipart_etag(&etags);
             let assembled =
                 self.assemble(&native, &path, upload, parts, etags.clone(), if_not_exists);
             match assembled.await {
@@ -591,7 +595,7 @@ impl BlobHandler {
                 Err(error) => {
                     // A completion whose answer was lost leaves the object. Only the ETag of
                     // exactly these parts proves it is this selection, not an earlier one.
-                    let expected = multipart_etag(&etags);
+                    let expected = etag.clone();
                     match timeout(self.io_timeout(), operator.stat(&path)).await {
                         Ok(Ok(metadata))
                             if metadata.content_length() == total
@@ -659,7 +663,7 @@ impl BlobHandler {
         }
         location.hashes = state.to_map();
         drop(share);
-        Ok((location, version))
+        Ok((location, version, etag))
     }
 
     /// The provider version of `path` assembled from the parts with `etag`, found among all

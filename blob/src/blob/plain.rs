@@ -128,6 +128,7 @@ impl BlobHandler {
             true => BlobEvent::PlainWritten {
                 location,
                 version: None,
+                etag: None,
             },
             false => BlobEvent::WriteFinished { location },
         }
