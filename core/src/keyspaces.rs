@@ -98,6 +98,9 @@ pub const BLOB_RECLAIM_KEYSPACE: &str = "blob_reclaim_candidates";
 pub const COMPRESSION_MIGRATION_KEYSPACE: &str = "compression_migrations";
 /// Buckets whose compression migration is unfinished; the worker scans only these.
 pub const COMPRESSION_QUEUE_KEYSPACE: &str = "compression_migration_queue";
+/// Moves asked to rename linked files of earlier patterns: the start time of the move record
+/// they belong to, keyed by bucket name.
+pub const RENAME_MOVE_KEYSPACE: &str = "compression_migration_renames";
 /// Node-local progress of checking a bucket's current versions for copies that cannot serve.
 pub const STORAGE_CHECK_KEYSPACE: &str = "storage_checks";
 /// Buckets whose check is unfinished; the migration worker scans only these.
@@ -434,6 +437,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BLOB_RECLAIM_KEYSPACE,
     COMPRESSION_MIGRATION_KEYSPACE,
     COMPRESSION_QUEUE_KEYSPACE,
+    RENAME_MOVE_KEYSPACE,
     STORAGE_CHECK_KEYSPACE,
     CHECK_QUEUE_KEYSPACE,
     BROKEN_VERSION_KEYSPACE,

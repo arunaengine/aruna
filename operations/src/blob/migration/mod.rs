@@ -23,7 +23,7 @@ use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
     COMPRESSION_QUEUE_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, MANAGED_COPY_KEYSPACE,
-    S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+    RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{
@@ -1061,6 +1061,26 @@ pub fn renames(
         && target.as_deref() == Some(plain.path.as_str())
 }
 
+/// Whether the move `record` of `bucket` was started to rename linked files.
+pub async fn rename_asked(
+    context: &crate::driver::DriverContext,
+    bucket: &str,
+    record: &CompressionMigration,
+) -> Result<bool, String> {
+    let read = StorageEffect::Read {
+        key_space: RENAME_MOVE_KEYSPACE.to_string(),
+        key: bucket.as_bytes().to_vec().into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            let started = record.started_at_ms.to_string();
+            Ok(record.moving && value.is_some_and(|value| value.as_ref() == started.as_bytes()))
+        }
+        other => Err(format!("could not read the rename request: {other:?}")),
+    }
+}
+
 /// Reads the earlier patterns of the rules a move resolves against.
 pub async fn read_earlier(
     context: &crate::driver::DriverContext,
@@ -1232,9 +1252,12 @@ async fn migrate_page(
         },
         false => None,
     };
+    // Without earlier patterns no file is renamed, so only an asked rename reads them.
     let earlier = match routing.as_ref() {
-        Some(routing) => read_earlier(context, routing).await?,
-        None => Earlier::new(),
+        Some(routing) if rename_asked(context, bucket, &record).await? => {
+            read_earlier(context, routing).await?
+        }
+        _ => Earlier::new(),
     };
     let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
     let (versions, next) = crate::jobs::store::iter_prefix_page(

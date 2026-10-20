@@ -36,10 +36,12 @@ pub struct Misplaced {
 
 /// Counts what a move of `prefix` would move, with the move's own skips: an encrypted bucket
 /// moves nothing; linked-folder files, unfinished copies and recorded broken versions stay.
+/// With `renaming`, linked files of earlier patterns count as a rename would handle them.
 pub async fn count_misplaced(
     context: &DriverContext,
     bucket: &str,
     prefix: &str,
+    renaming: bool,
 ) -> Result<Misplaced, String> {
     let mut misplaced = Misplaced {
         complete: true,
@@ -51,7 +53,11 @@ pub async fn count_misplaced(
     let Some(routing) = move_routing(context, bucket).await? else {
         return Ok(misplaced);
     };
-    let earlier = read_earlier(context, &routing).await?;
+    // Only a move asked to rename gives linked files their current name.
+    let earlier = match renaming {
+        true => read_earlier(context, &routing).await?,
+        false => super::Earlier::new(),
+    };
     let scan = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
     let (mut after, mut seen, mut scanned) = (None::<Key>, 0, 0);
     loop {

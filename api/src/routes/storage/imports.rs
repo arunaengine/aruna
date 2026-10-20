@@ -751,7 +751,7 @@ pub async fn get_renames(
 ) -> ServerResult<Json<ImportRenamesResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
     let rule = existing_rule(&state, group_id, &import_id).await?;
-    let counted = count_misplaced(&state.get_ctx(), &rule.bucket, &rule.key_prefix)
+    let counted = count_misplaced(&state.get_ctx(), &rule.bucket, &rule.key_prefix, true)
         .await
         .map_err(ServerError::InternalError)?;
     let status = drive(
@@ -832,7 +832,7 @@ pub async fn start_renames(
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
     let rule = existing_rule(&state, group_id, &import_id).await?;
     let (bucket, prefix) = (rule.bucket, rule.key_prefix);
-    let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms());
+    let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms()).renaming();
     let record = drive(operation, &state.get_ctx())
         .await
         .map_err(move_refusal)?;

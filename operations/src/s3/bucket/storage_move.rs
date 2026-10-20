@@ -7,7 +7,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE,
-    S3_BUCKET_KEYSPACE, TRANSITION_KEYSPACE,
+    RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE, TRANSITION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -126,6 +126,8 @@ pub struct StartMoveOperation {
     group_id: GroupId,
     prefix: String,
     now_ms: u64,
+    /// Also gives linked files of earlier patterns their current name.
+    renaming: bool,
     state: StartMoveState,
     txn_id: Option<TxnId>,
     output: Option<Result<CompressionMigration, StartMoveError>>,
@@ -138,10 +140,17 @@ impl StartMoveOperation {
             group_id,
             prefix,
             now_ms,
+            renaming: false,
             state: StartMoveState::Init,
             txn_id: None,
             output: None,
         }
+    }
+
+    /// Asks the move to rename linked files of earlier patterns; an ordinary move never does.
+    pub fn renaming(mut self) -> Self {
+        self.renaming = true;
+        self
     }
 
     fn fail(&mut self, error: StartMoveError) -> Effects {
@@ -183,7 +192,12 @@ impl StartMoveOperation {
             stored.as_deref(),
         )?;
         let record = move_record(stored, info.compression, &self.prefix, self.now_ms)?;
-        let writes = move_rows(&self.bucket, &record)?;
+        let mut writes = move_rows(&self.bucket, &record)?;
+        if self.renaming {
+            let started = record.started_at_ms.to_string().into_bytes();
+            let key: Key = self.bucket.as_bytes().to_vec().into();
+            writes.push((RENAME_MOVE_KEYSPACE.to_string(), key, started.into()));
+        }
         self.output = Some(Ok(record));
         Ok(writes)
     }
@@ -294,6 +308,39 @@ mod tests {
         let compression = Some(CompressionMigration::new(Compression::Off, 1));
         let fresh = move_record(compression, Compression::Off, "x/", 9).unwrap();
         assert!(fresh.moving && fresh.prefix == "x/");
+    }
+
+    #[test]
+    fn records_asked_rename() {
+        // Only a move started to rename writes the request, bound to its record.
+        let group_id = ulid::Ulid::from_parts(1, 1);
+        let info = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+        };
+        for renaming in [false, true] {
+            let mut operation = StartMoveOperation::new("b".into(), group_id, "in/".into(), 7);
+            if renaming {
+                operation = operation.renaming();
+            }
+            let info = Some(info.to_bytes().unwrap().into());
+            let values = vec![(Key::from(vec![]), info), (vec![].into(), None)];
+            let values = [values, vec![(vec![].into(), None), (vec![].into(), None)]].concat();
+            let writes = operation.rows(values).unwrap();
+            let asked = writes
+                .iter()
+                .find(|(space, ..)| space == RENAME_MOVE_KEYSPACE);
+            assert_eq!(
+                asked.map(|(_, _, value)| value.to_vec()),
+                renaming.then(|| b"7".to_vec())
+            );
+        }
     }
 
     #[test]
