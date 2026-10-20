@@ -241,6 +241,13 @@ impl PutObjectOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
+    /// Refuses the version while the delete trail shows `version_id`, or the key without a
+    /// head, removed on purpose. The trail is read in the version transaction.
+    pub fn with_trail_check(mut self, version_id: Ulid) -> Self {
+        self.trail_scan = Some(super::trail::TrailScan::new(version_id));
+        self
+    }
+
     /// Values the version transaction must still read before it writes the import rows.
     pub fn with_import_guards(mut self, guards: Vec<(String, Key, Option<Value>)>) -> Self {
         if let Some(rows) = self.import_rows.as_mut() {
@@ -283,6 +290,12 @@ impl PutObjectOperation {
                 key,
                 txn_id: Some(txn_id),
             })]);
+        }
+        if self.import_rows.is_some()
+            && self.rule_exists == Some(true)
+            && let Some(effects) = self.trail_page(txn_id)
+        {
+            return Some(effects);
         }
         let mut writes = Vec::new();
         // A deduplicated version reads the older location, so it needs no version row.
@@ -685,6 +698,61 @@ mod tests {
             kept.output,
             Some(Err(PutObjectError::HeadChanged))
         ));
+    }
+
+    #[test]
+    fn checks_delete_trail() {
+        use aruna_core::keyspaces::DELETE_AUDIT_KEYSPACE;
+        use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobAuditRecord};
+        let id = Ulid::from_parts(1_000, 1);
+        let checked = |kind: BlobAuditKind, head: bool| {
+            let mut operation = operation(DEFAULT_PATTERN)
+                .with_import_rows(Ulid::from_bytes([4u8; 16]), Vec::new())
+                .with_trail_check(id);
+            operation.txn_id = Some(Ulid::nil());
+            operation.rule_exists = Some(true);
+            if head {
+                operation.existing_pointer = Some(CurrentVersionPointer::new(Ulid::nil()));
+            }
+            // The trail is read in the version transaction, so a later delete conflicts.
+            let Some(effects) = operation.plain_records(Ulid::nil()) else {
+                panic!("expected the trail read")
+            };
+            let [
+                Effect::Storage(StorageEffect::Iter {
+                    key_space, txn_id, ..
+                }),
+            ] = effects.as_slice()
+            else {
+                panic!("expected one trail page, got {effects:?}")
+            };
+            assert_eq!(key_space, DELETE_AUDIT_KEYSPACE);
+            assert_eq!(*txn_id, Some(Ulid::nil()));
+            let record = BlobAuditRecord {
+                realm_id: RealmId::from_bytes([1; 32]),
+                group_id: operation.config.group_id,
+                node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
+                user_id: Default::default(),
+                kind,
+                bucket: operation.config.request.bucket.clone(),
+                key: operation.config.request.key.clone(),
+                version_id: Some(Ulid::nil()),
+                occurred_at_ms: 2_000,
+            };
+            let value = Value::from(record.to_bytes().unwrap());
+            operation.step(Event::Storage(StorageEvent::IterResult {
+                values: vec![(Key::from(vec![1u8]), value)],
+                next_start_after: None,
+            }));
+            operation.output
+        };
+        let deleted = |output: &Option<Result<_, PutObjectError>>| {
+            matches!(output, Some(Err(PutObjectError::HistoryDeleted)))
+        };
+        // A key whose head was deleted on purpose gets no version back.
+        assert!(deleted(&checked(BlobAuditKind::DeleteMarker, false)));
+        // Below a current head older history may join.
+        assert!(!deleted(&checked(BlobAuditKind::DeleteVersion, true)));
     }
 
     #[test]

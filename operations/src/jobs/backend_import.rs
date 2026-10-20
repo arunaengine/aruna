@@ -8,8 +8,7 @@ use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, DELETE_AUDIT_KEYSPACE, IMPORT_INTENT_KEYSPACE,
-    IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::HASH_MD5;
@@ -23,7 +22,6 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
     ResolvedBackend, VersionKey, bucket_permission_path, ensure_confined_path,
 };
-use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobAuditRecord, BlobPurgeKind};
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{RoutingSnapshot, RoutingTarget, RuleSource};
@@ -389,6 +387,7 @@ async fn import_object(
         keep_head: false,
         guards: Vec::new(),
         retired: None,
+        trail: None,
     };
     let put = put_version(
         ctx,
@@ -481,41 +480,6 @@ fn item(message: impl Into<String>) -> ItemError {
     ItemError::Item(message.into())
 }
 
-/// What the delete trail says about one version of a key.
-#[derive(Debug, PartialEq)]
-enum Trail {
-    Clean,
-    /// Some version of the key was deleted, so its head may have been removed on purpose.
-    Touched,
-    /// The version was deleted, or a purge after its creation covered the key.
-    Removed,
-}
-
-fn read_trail(records: &[BlobAuditRecord], bucket: &str, key: &str, id: Ulid) -> Trail {
-    let mut trail = Trail::Clean;
-    for record in records.iter().filter(|record| record.bucket == bucket) {
-        let removed = match record.kind {
-            BlobAuditKind::Purge(scope) => {
-                let covers = match scope {
-                    BlobPurgeKind::File => record.key == key,
-                    BlobPurgeKind::Prefix => key.starts_with(&record.key),
-                    BlobPurgeKind::Bucket => true,
-                };
-                covers && record.occurred_at_ms >= id.timestamp_ms()
-            }
-            BlobAuditKind::DeleteVersion | BlobAuditKind::DeleteMarker if record.key == key => {
-                trail = Trail::Touched;
-                record.version_id == Some(id)
-            }
-            _ => false,
-        };
-        if removed {
-            return Trail::Removed;
-        }
-    }
-    trail
-}
-
 /// Registers a file whose version never committed as the key and version its write intent or
 /// path names. `None` leaves the file to the ordinary import, as for any row Aruna wrote.
 async fn recover(
@@ -568,22 +532,8 @@ async fn recover(
         drop_intent(&ctx.driver, intent).await?;
         return Ok(Some(Outcome::Imported));
     }
-    let records = audit_records(&ctx.driver, rule.group_id).await?;
-    let trail = read_trail(&records, &rule.bucket, &key, version_id);
+    // The version transaction reads the delete trail again, so a delete meanwhile conflicts.
     let head = read_head(&ctx.driver, &rule.bucket, &key).await?;
-    match (&trail, head) {
-        (Trail::Removed, _) => {
-            return Err(item(format!(
-                "version {version_id} of {key} was deleted and is not restored"
-            )));
-        }
-        (Trail::Touched, None) => {
-            return Err(item(format!(
-                "{key} has no current version after a delete; {version_id} is not restored"
-            )));
-        }
-        _ => {}
-    }
     let guards = vec![
         (
             BACKEND_IMPORT_KEYSPACE.to_string(),
@@ -602,6 +552,7 @@ async fn recover(
         keep_head: head.is_some(),
         guards,
         retired: intent.as_ref().map(|(key, _)| key.clone()),
+        trail: Some(version_id),
     };
     let size = location.blob_size;
     let put = put_version(
@@ -674,20 +625,6 @@ async fn read_claims(
         claims.push((key, intent, found.is_some()));
     }
     Ok(claims)
-}
-
-/// The delete trail of a group, read only for the rare file that needs recovery.
-async fn audit_records(
-    context: &DriverContext,
-    group_id: Ulid,
-) -> Result<Vec<BlobAuditRecord>, ItemError> {
-    let prefix = Key::from(group_id.to_bytes().to_vec());
-    let entries = iterate(context, DELETE_AUDIT_KEYSPACE, prefix).await?;
-    let records = entries
-        .iter()
-        .map(|(_, value)| BlobAuditRecord::from_bytes(value));
-    let records = records.collect::<Result<Vec<_>, _>>();
-    records.map_err(|error| ItemError::System(error.to_string()))
 }
 
 /// Every entry under `prefix`, read in pages.
@@ -858,6 +795,8 @@ struct Fence {
     guards: Vec<(String, Key, Option<Value>)>,
     /// The write intent the version makes obsolete, deleted in its transaction.
     retired: Option<Key>,
+    /// The version the delete trail must not show as removed.
+    trail: Option<Ulid>,
 }
 
 async fn put_version(
@@ -916,6 +855,9 @@ async fn put_version(
     if let Some(key) = fence.retired {
         operation = operation.with_retired_intent(key);
     }
+    if let Some(version_id) = fence.trail {
+        operation = operation.with_trail_check(version_id);
+    }
     if let Some(gate) = run.gate.clone() {
         operation = operation.with_gate(gate);
     }
@@ -928,6 +870,7 @@ fn put_failure(error: PutObjectError) -> ItemError {
     use PolicyGateError::{Denied, ForeignPolicy, Invalid, NoSubject, Required};
     match error {
         PutObjectError::QuotaExceeded { .. }
+        | PutObjectError::HistoryDeleted
         | PutObjectError::ObjectExists
         | PutObjectError::MissingHash(_)
         | PutObjectError::RoutingFailed(_)
@@ -1526,53 +1469,6 @@ mod tests {
         let mut foreign = open;
         foreign.1.backend = BackendRef::Group(Ulid::from_parts(9, 9));
         assert!(choose_identity(&stripped, &path, vec![foreign]).is_err());
-    }
-
-    fn audit(kind: BlobAuditKind, key: &str, version_id: Option<Ulid>, at: u64) -> BlobAuditRecord {
-        BlobAuditRecord {
-            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]),
-            group_id: Ulid::from_parts(3, 3),
-            node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
-            user_id: Default::default(),
-            kind,
-            bucket: "bucket".to_string(),
-            key: key.to_string(),
-            version_id,
-            occurred_at_ms: at,
-        }
-    }
-
-    #[test]
-    fn respects_delete_trail() {
-        let id = Ulid::from_parts(1_000, 1);
-        let trail = |records: &[BlobAuditRecord]| read_trail(records, "bucket", "in/a.csv", id);
-        assert_eq!(trail(&[]), Trail::Clean);
-        let other = audit(
-            BlobAuditKind::DeleteVersion,
-            "in/a.csv",
-            Some(Ulid::nil()),
-            2_000,
-        );
-        assert_eq!(trail(std::slice::from_ref(&other)), Trail::Touched);
-        let exact = audit(BlobAuditKind::DeleteVersion, "in/a.csv", Some(id), 2_000);
-        assert_eq!(trail(&[other, exact]), Trail::Removed);
-        // A purge removes what existed when it ran, not what was written after it.
-        let purge = |at| audit(BlobAuditKind::Purge(BlobPurgeKind::Prefix), "in/", None, at);
-        assert_eq!(trail(&[purge(2_000)]), Trail::Removed);
-        assert_eq!(trail(&[purge(500)]), Trail::Clean);
-        let bucket = audit(BlobAuditKind::Purge(BlobPurgeKind::Bucket), "", None, 2_000);
-        assert_eq!(trail(std::slice::from_ref(&bucket)), Trail::Removed);
-        let elsewhere = BlobAuditRecord {
-            bucket: "other".to_string(),
-            ..bucket
-        };
-        let file = audit(
-            BlobAuditKind::Purge(BlobPurgeKind::File),
-            "in/b.csv",
-            None,
-            2_000,
-        );
-        assert_eq!(trail(&[elsewhere, file]), Trail::Clean);
     }
 
     #[tokio::test]

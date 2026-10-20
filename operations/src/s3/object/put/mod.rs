@@ -126,6 +126,8 @@ pub enum PutObjectState {
     RetireIntents,
     /// Deletes the intent of a write the provider refused before any byte moved.
     DropIntent,
+    /// Reads the delete trail inside the version transaction.
+    ReadTrail,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -186,6 +188,8 @@ pub enum PutObjectError {
     ImportRemoved,
     #[error("the version already exists")]
     VersionExists,
+    #[error("the version or the current object of its key was deleted and is not restored")]
+    HistoryDeleted,
 }
 
 #[derive(Debug, PartialEq)]
@@ -292,6 +296,8 @@ pub struct PutObjectOperation {
     pending_write: Option<Effects>,
     /// The intent record of the plain write in flight.
     written_intent: Option<aruna_core::types::Key>,
+    /// The delete trail the version transaction reads before an import registers a version.
+    trail_scan: Option<trail::TrailScan>,
 }
 
 impl PutObjectOperation {
@@ -343,6 +349,7 @@ impl PutObjectOperation {
             keep_head: false,
             pending_write: None,
             written_intent: None,
+            trail_scan: None,
         }
     }
 
@@ -1618,6 +1625,9 @@ impl PutObjectOperation {
         self.quota_gate = None;
         self.output = None;
         self.rule_exists = None;
+        if let Some(scan) = self.trail_scan.as_mut() {
+            scan.restart();
+        }
         self.state = PutObjectState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -1881,6 +1891,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadImportRule => self.import_rule_read(event),
             PutObjectState::WriteIntent => self.intent_written(event),
             PutObjectState::DropIntent => self.intent_dropped(event),
+            PutObjectState::ReadTrail => self.trail_read(event),
             PutObjectState::ReadHistory => self.history_read(event),
             PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
@@ -2690,6 +2701,7 @@ mod decision_tests {
 }
 
 mod plain;
+mod trail;
 
 pub(crate) use plain::{PlainRecord, intent_write, same_name_path, version_row};
 
