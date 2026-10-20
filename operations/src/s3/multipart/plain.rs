@@ -680,7 +680,7 @@ mod tests {
         let [(_, key, value)] = writes.as_slice() else {
             panic!("a unique path gets one intent, got {writes:?}")
         };
-        let path = format!("raw/{id}_object");
+        let path = format!("raw/object~{id}");
         let import_id = Ulid::from_bytes([4u8; 16]);
         let intent_key = aruna_core::structs::storage::backend_import::intent_key;
         assert_eq!(*key, intent_key(import_id, &path, id));
