@@ -178,6 +178,26 @@ impl BackendImport {
         }
     }
 
+    /// The current name of the file at `path` that an `earlier` pattern named for version `id`
+    /// of `key`; `None` for any other file, and for a file that has its current name.
+    pub fn rename_target(
+        &self,
+        earlier: &[String],
+        path: &str,
+        key: &str,
+        id: Ulid,
+    ) -> Option<String> {
+        let target = self.plain_path(key, id).filter(|target| target != path)?;
+        match self.decode_any(path, earlier) {
+            PathIdentity::Decoded {
+                key: Some(found),
+                id: found_id,
+                ..
+            } if found == key && found_id == id => Some(target),
+            _ => None,
+        }
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
@@ -770,6 +790,33 @@ mod tests {
             rule(PLAIN_PATTERN).decode_any(&path, &both),
             PathIdentity::Ambiguous
         );
+    }
+
+    #[test]
+    fn finds_rename_targets() {
+        let id = Ulid::from_parts(1, 2);
+        let earlier = ["{dir}{id}_{name}".to_string()];
+        let current = rule(DEFAULT_PATTERN);
+        let target = |path: &str, key: &str, id| current.rename_target(&earlier, path, key, id);
+        let old = format!("raw/x/{id}_a.csv");
+        assert_eq!(
+            target(&old, "imported/x/a.csv", id),
+            Some(format!("raw/x/a.csv~{id}"))
+        );
+        // Only the version the old name tells is renamed; a current name stays.
+        assert_eq!(
+            target(&old, "imported/x/a.csv", Ulid::from_parts(3, 4)),
+            None
+        );
+        assert_eq!(target(&old, "imported/x/b.csv", id), None);
+        assert_eq!(
+            target(&format!("raw/x/a.csv~{id}"), "imported/x/a.csv", id),
+            None
+        );
+        // A plain or tagged name of a user's file names no version of an earlier pattern.
+        assert_eq!(target("raw/x/a.csv", "imported/x/a.csv", id), None);
+        let moved = format!("raw/x/a.csv~{}", Ulid::from_parts(5, 6));
+        assert_eq!(target(&moved, "imported/x/a.csv", id), None);
     }
 
     #[test]
