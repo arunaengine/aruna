@@ -419,6 +419,7 @@ async fn import_object(
         guards: Vec::new(),
         retired: None,
         trail: keyed.map(|row| row.version_id),
+        keep_row: false,
     };
     let put = put_version(
         ctx,
@@ -621,79 +622,90 @@ async fn recover(
         }
         Exact::Absent | Exact::Materialized(..) => {}
     }
-    // A literal-name import of the file stops being current before the file gets its identity.
-    let literal = rule.aruna_key(&object.key);
-    if let Some(alias) = row.filter(|row| row.key.is_none())
-        && let Some(literal) = literal.filter(|literal| *literal != key)
-    {
+    // A literal-name import of the file stops being current only once its replacement exists.
+    let literal = rule
+        .aruna_key(&object.key)
+        .filter(|literal| *literal != key);
+    let alias = row.filter(|row| row.key.is_none()).zip(literal);
+    let (version_key, exact) = match exact {
+        Exact::Absent => {
+            // The version transaction reads the delete trail again, so a delete meanwhile
+            // conflicts. An alias keeps its row until the alias is hidden.
+            let head = read_head(&ctx.driver, &rule.bucket, &key).await?;
+            let guards = vec![
+                rule_guard(rule)?,
+                (
+                    IMPORTED_OBJECT_KEYSPACE.to_string(),
+                    row_key.clone(),
+                    stored.cloned(),
+                ),
+            ];
+            // Older history joins below a head; a key that never had one gets the file as head.
+            let fence = Fence {
+                head,
+                keep_head: head.is_some(),
+                guards,
+                retired: intent
+                    .as_ref()
+                    .filter(|_| alias.is_none())
+                    .map(|(key, _)| key.clone()),
+                trail: Some(version_id),
+                keep_row: alias.is_some(),
+            };
+            let size = location.blob_size;
+            let file = (location, version);
+            let put = put_version(ctx, spec, run, key.clone(), file, committed.clone(), fence);
+            match put.await {
+                Ok(()) => {}
+                // Another write or recovery came first; the next run looks again.
+                Err(PutObjectError::HeadChanged | PutObjectError::VersionExists) => {
+                    return Ok(Some(Outcome::Skipped));
+                }
+                Err(error) => return Err(put_failure(error)),
+            }
+            if head.is_none() {
+                let auth = spec.auth_context.clone();
+                let (realm_id, group_id) = (auth.realm_id, rule.group_id);
+                let (bucket, node_id) = (rule.bucket.clone(), spec.node_id);
+                let key = key.clone();
+                complete_put(
+                    &ctx.driver,
+                    realm_id,
+                    node_id,
+                    auth,
+                    group_id,
+                    bucket,
+                    key,
+                    version_id,
+                    size,
+                )
+                .await;
+            }
+            if alias.is_none() {
+                return Ok(Some(Outcome::Imported));
+            }
+            exact_version(&ctx.driver, &rule.bucket, &key, version_id).await?
+        }
+        exact => (version_key, exact),
+    };
+    if let Some((alias, literal)) = alias {
         hide_alias(&ctx.driver, spec, rule, &literal, alias.version_id).await?;
     }
-    if let Exact::Materialized(_, value) = exact {
-        let guards = [
-            rule_guard(rule)?,
-            (BLOB_VERSIONS_KEYSPACE.to_string(), version_key, Some(value)),
-        ];
-        let retired = intent.map(|(key, _)| key);
-        let repaired = encode(&committed)?;
-        let note = Note {
-            guards: &guards,
-            retired,
-        };
-        note_listing(&ctx.driver, rule, row_key, stored, repaired, note).await?;
-        return Ok(Some(Outcome::Imported));
-    }
-    // The version transaction reads the delete trail again, so a delete meanwhile conflicts.
-    let head = read_head(&ctx.driver, &rule.bucket, &key).await?;
-    let guards = vec![
-        rule_guard(rule)?,
-        (
-            IMPORTED_OBJECT_KEYSPACE.to_string(),
-            row_key,
-            stored.cloned(),
-        ),
-    ];
-    // Older history joins below a head; a key that never had one gets the file as its head.
-    let fence = Fence {
-        head,
-        keep_head: head.is_some(),
-        guards,
-        retired: intent.as_ref().map(|(key, _)| key.clone()),
-        trail: Some(version_id),
+    // An existing version only gets its missing row, and only for the same bytes.
+    let Exact::Materialized(_, value) = exact else {
+        return Ok(Some(Outcome::Skipped));
     };
-    let size = location.blob_size;
-    let put = put_version(
-        ctx,
-        spec,
-        run,
-        key.clone(),
-        (location, version),
-        committed,
-        fence,
-    );
-    match put.await {
-        Ok(()) => {}
-        // Another write or recovery came first; the next run looks again.
-        Err(PutObjectError::HeadChanged | PutObjectError::VersionExists) => {
-            return Ok(Some(Outcome::Skipped));
-        }
-        Err(error) => return Err(put_failure(error)),
-    }
-    if head.is_none() {
-        let auth = spec.auth_context.clone();
-        let (realm_id, group_id, bucket) = (auth.realm_id, rule.group_id, rule.bucket.clone());
-        complete_put(
-            &ctx.driver,
-            realm_id,
-            spec.node_id,
-            auth,
-            group_id,
-            bucket,
-            key,
-            version_id,
-            size,
-        )
-        .await;
-    }
+    let guards = [
+        rule_guard(rule)?,
+        (BLOB_VERSIONS_KEYSPACE.to_string(), version_key, Some(value)),
+    ];
+    let retired = intent.map(|(key, _)| key);
+    let repaired = encode(&committed)?;
+    let note = Note {
+        guards: &guards,
+        retired,
+    };
+    note_listing(&ctx.driver, rule, row_key, stored, repaired, note).await?;
     Ok(Some(Outcome::Imported))
 }
 
@@ -1015,6 +1027,34 @@ struct Fence {
     retired: Option<Key>,
     /// The version the delete trail must not show as removed.
     trail: Option<Ulid>,
+    /// The reverse row stays as it was read; a later step rewrites it.
+    keep_row: bool,
+}
+
+/// The rows a version commits with: its reverse row, unless kept as read, and the backend
+/// version, so a later same-name overwrite does not change what the version reads.
+fn import_rows(
+    rule: &BackendImport,
+    location: &BackendLocation,
+    version: Option<String>,
+    row: &ImportedObject,
+    keep_row: bool,
+) -> Result<Vec<(String, Key, Value)>, aruna_core::errors::ConversionError> {
+    let mut rows = Vec::new();
+    if !keep_row {
+        let row_key = object_key(rule.import_id, &location.backend_path);
+        rows.push((
+            IMPORTED_OBJECT_KEYSPACE.to_string(),
+            row_key,
+            row.to_bytes()?.into(),
+        ));
+    }
+    if let Some(version) = version {
+        let value = version.into_bytes().into();
+        let key = version_key(location.ulid);
+        rows.push((BACKEND_VERSION_KEYSPACE.to_string(), key, value));
+    }
+    Ok(rows)
 }
 
 async fn put_version(
@@ -1026,21 +1066,7 @@ async fn put_version(
     row: ImportedObject,
     fence: Fence,
 ) -> Result<(), PutObjectError> {
-    let row_key = object_key(run.rule.import_id, &location.backend_path);
-    let mut rows = vec![(
-        IMPORTED_OBJECT_KEYSPACE.to_string(),
-        row_key,
-        row.to_bytes()?.into(),
-    )];
-    // A later same-name overwrite must not change what this version reads.
-    if let Some(version) = version {
-        let value = version.into_bytes().into();
-        rows.push((
-            BACKEND_VERSION_KEYSPACE.to_string(),
-            version_key(location.ulid),
-            value,
-        ));
-    }
+    let rows = import_rows(&run.rule, &location, version, &row, fence.keep_row)?;
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: spec.auth_context.user_id,
         group_id: run.rule.group_id,
@@ -1618,6 +1644,40 @@ mod tests {
         assert!(done.await.is_ok());
         assert_eq!(stored().await, listed);
         assert!(!intent_left().await);
+    }
+
+    #[test]
+    fn keeps_alias_row() {
+        let rule = recovery_rule("{dir}{id}_{name}");
+        let location = BackendLocation {
+            backend: BackendRef::Group(rule.backend_id),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: "raw/a.csv".to_string(),
+            ulid: Ulid::from_parts(7, 7),
+            format: Default::default(),
+            created_by: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 4,
+            hashes: Default::default(),
+        };
+        let row = ImportedObject::new(Ulid::nil(), &object("e1"));
+        let spaces = |keep_row| {
+            let rows = import_rows(&rule, &location, Some("v1".to_string()), &row, keep_row);
+            let rows = rows.ok().unwrap();
+            rows.into_iter()
+                .map(|(space, ..)| space)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            spaces(false),
+            [IMPORTED_OBJECT_KEYSPACE, BACKEND_VERSION_KEYSPACE]
+        );
+        // An alias keeps its literal row until the alias is hidden after the commit.
+        assert_eq!(spaces(true), [BACKEND_VERSION_KEYSPACE]);
     }
 
     #[tokio::test]
