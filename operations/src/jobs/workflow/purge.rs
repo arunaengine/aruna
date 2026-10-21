@@ -719,7 +719,7 @@ mod audit_tests {
     use super::*;
 
     #[test]
-    fn omits_deleted_bucket_trail() {
+    fn omits_bucket_trail() {
         let record = BlobAuditRecord {
             realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]),
             group_id: ulid::Ulid::from_parts(1, 1),
