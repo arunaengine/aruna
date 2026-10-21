@@ -4092,3 +4092,72 @@ mod rewrite;
 
 #[path = "external_tests.rs"]
 mod external;
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_copies_plain() {
+    // A rename copy keeps the bytes and hashes, and a "null" version is never an exact copy.
+    use aruna_core::keyspaces::BACKEND_VERSION_KEYSPACE;
+    use aruna_core::structs::storage::backend_import::{PlainPath, version_key};
+    let env = s3_env();
+    let context = setup_s3_mixed(&env).await;
+    let bucket = unique_name("copy-");
+    make_bucket(&bucket, &s3_config(&env, None)).await.unwrap();
+    let backend_id = Ulid::generate();
+    let entry = NodeBackend::new(
+        BackendConfig {
+            backend_type: Backend::Group(GroupBackendKind::S3),
+            root: String::new(),
+            service_config: s3_config(&env, Some(&bucket)),
+            bucket_prefix: None,
+            max_bucket_size: None,
+            multipart_bucket: Some(bucket.clone()),
+            timeouts: Default::default(),
+        },
+        None,
+    );
+    let handler = BlobHandler {
+        registry: context
+            .blob_handle
+            .handler
+            .registry
+            .with_groups(HashMap::from([(backend_id, Arc::new(entry))])),
+        ..context.blob_handle.handler.clone()
+    };
+    let resolved = ResolvedBackend::new(BackendRef::Group(backend_id), None);
+    let plain = |path: &str| PlainPath {
+        path: path.to_string(),
+        ulid: Ulid::generate(),
+        if_not_exists: true,
+        exact: true,
+    };
+    let source = plain("raw/7_a.bin");
+    let blob = stream_from_bytes(b"renamed bytes");
+    let BlobEvent::PlainWritten { location, .. } = handler
+        .write_plain(resolved.clone(), source, test_user_id(), blob)
+        .await
+    else {
+        panic!("source write failed")
+    };
+    let mark = aruna_core::effects::StorageEffect::Write {
+        key_space: BACKEND_VERSION_KEYSPACE.to_string(),
+        key: version_key(location.ulid),
+        value: b"null".to_vec().into(),
+        txn_id: None,
+    };
+    handler.storage.send_storage_effect(mark).await;
+    let event = handler
+        .copy_plain(resolved, plain("raw/a.bin~7"), location.clone())
+        .await;
+    let BlobEvent::PlainWritten {
+        location: copy,
+        version,
+        ..
+    } = event
+    else {
+        panic!("copy failed: {event:?}")
+    };
+    assert_ne!(version.as_deref(), Some("null"));
+    assert_eq!(copy.get_blake3(), location.get_blake3());
+    assert_eq!(read_back(&handler, copy).await, b"renamed bytes");
+}

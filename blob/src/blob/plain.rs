@@ -110,63 +110,68 @@ impl BlobHandler {
             Ok(version) => version,
             Err(error) => return BlobEvent::Error(error),
         };
+        // A "null" version names whatever the path holds now, never the recorded bytes.
+        let exact = version.as_deref().filter(|version| *version != "null");
         let inside = resolved.backend == source.backend && !is_folder(&source);
-        let native = match (inside, version.as_deref()) {
+        let native = match (inside, exact) {
             (true, Some(_)) => self.native_for(&source).ok().flatten(),
             _ => None,
         };
-        let Some(native) = native else {
-            return match self.read_blob(source.clone()).await {
-                BlobEvent::ReadFinished { blob, .. } => {
-                    let created_by = source.created_by;
-                    Box::pin(self.write_plain(resolved, plain, created_by, blob)).await
-                }
-                other => other,
-            };
-        };
-        let copied = self.copy_inside(resolved, plain, &source, (&native, version.as_deref()));
-        match Box::pin(copied).await {
-            Ok(event) => event,
-            Err(error) => BlobEvent::Error(error),
+        if let Some(native) = native {
+            let copied = self.copy_inside(resolved.clone(), &plain, &source, (&native, exact));
+            match Box::pin(copied).await {
+                Ok(Some(event)) => return event,
+                Ok(None) => {}
+                Err(error) => return BlobEvent::Error(error),
+            }
+        }
+        match self.read_blob(source.clone()).await {
+            BlobEvent::ReadFinished { blob, .. } => {
+                let created_by = source.created_by;
+                Box::pin(self.write_plain(resolved, plain, created_by, blob)).await
+            }
+            other => other,
         }
     }
 
     /// The provider copies the exact source version in parts of at most `COPY_PART` bytes and
-    /// completes create-only where asked. The size is checked, and the MD5 of a one-part copy.
+    /// completes create-only where asked, and the size is checked. `None` asks for a streamed
+    /// copy: the provider refused a part, or a one-part copy's ETag is not the source MD5.
     async fn copy_inside(
         &self,
         resolved: ResolvedBackend,
-        plain: PlainPath,
+        plain: &PlainPath,
         source: &BackendLocation,
         (native, version): (&crate::s3::NativeMultipart, Option<&str>),
-    ) -> Result<BlobEvent, BlobError> {
+    ) -> Result<Option<BlobEvent>, BlobError> {
         let class = resolved.storage_class.clone();
         let mut location =
-            self.plain_location(resolved.backend, class, &plain, source.created_by)?;
+            self.plain_location(resolved.backend, class, plain, source.created_by)?;
         let operator = self.operator_from_location(&location)?;
-        let if_not_exists = conditional(&operator, &mut location, &plain)?;
+        let if_not_exists = conditional(&operator, &mut location, plain)?;
         let target = self.native_upload(&location)?;
         let (path, source_path) = (self.object_path(&location)?, self.object_path(source)?);
+        // The path is this copy's own; an upload an interrupted try left there goes first.
+        let _ = timeout(self.io_timeout(), target.abort_path(&path)).await;
         let size = source.blob_size;
         let ranges = copy_ranges(size);
         let upload_id = target.create(&path).await?;
         let mut parts = Vec::with_capacity(ranges.len());
         for (index, range) in ranges.iter().enumerate() {
-            let number = u16::try_from(index + 1)
-                .map_err(|_| BlobError::WriteError("too many copy parts".to_string()));
-            let copied = match number {
-                Ok(number) => {
-                    let part = (number, *range);
-                    let from = (native, source_path.as_str(), version);
-                    target.copy_range(&path, &upload_id, part, from).await
-                }
-                Err(error) => Err(error),
+            let Ok(number) = u16::try_from(index + 1) else {
+                let _ = target.abort(&path, &upload_id).await;
+                return Ok(None);
             };
-            match copied {
-                Ok(etag) => parts.push((index as u16 + 1, etag)),
+            let from = (native, source_path.as_str(), version);
+            match target
+                .copy_range(&path, &upload_id, (number, *range), from)
+                .await
+            {
+                Ok(etag) => parts.push((number, etag)),
                 Err(error) => {
+                    tracing::warn!(%error, "Provider copy refused; the bytes are streamed");
                     let _ = target.abort(&path, &upload_id).await;
-                    return Err(error);
+                    return Ok(None);
                 }
             }
         }
@@ -175,13 +180,20 @@ impl BlobHandler {
             && etag.trim_matches('"') != hex::encode(md5)
         {
             let _ = target.abort(&path, &upload_id).await;
-            return Err(BlobError::IntegrityCheckFailed(
-                "the copied part does not match the source MD5".to_string(),
-            ));
+            return Ok(None);
         }
-        let (written, etag) = target
+        let completed = target
             .complete(&path, &upload_id, &parts, if_not_exists)
-            .await?;
+            .await;
+        let (written, etag) = match completed {
+            Ok(completed) => completed,
+            Err(error) => {
+                let _ = target.abort(&path, &upload_id).await;
+                return Err(error);
+            }
+        };
+        let versioned = operator.info().capability().read_with_version;
+        let written = written.filter(|version| versioned && version != "null");
         let stat = operator.stat_with(&path);
         let stat = match written.as_deref() {
             Some(version) if operator.info().capability().stat_with_version => {
@@ -201,11 +213,11 @@ impl BlobHandler {
         }
         location.blob_size = size;
         location.hashes = source.hashes.clone();
-        Ok(BlobEvent::PlainWritten {
+        Ok(Some(BlobEvent::PlainWritten {
             location,
             version: written,
             etag: etag.map(|etag| etag.trim_matches('"').to_string()),
-        })
+        }))
     }
 
     /// A key that ends in `/` is an empty folder object at that exact key.
