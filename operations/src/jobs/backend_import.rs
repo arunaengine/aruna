@@ -621,21 +621,27 @@ fn write_intents(import_id: Ulid, path: &str, id: Ulid) -> Vec<Key> {
     intent_keys(import_id, free, id, true)
 }
 
-/// `write_intents` and the intents of `id` at any tagged path of the free path, as a move
-/// tags with its attempt id rather than the version id.
+/// `write_intents` and the intents of `id` at any tagged path of the file's path or of its
+/// free path, as a move tags with its attempt id; a suffix pattern's name already ends in one.
 async fn stored_intents(
     context: &DriverContext,
     import_id: Ulid,
     path: &str,
     id: Ulid,
 ) -> Result<Vec<Key>, ItemError> {
-    let free = free_path(path);
-    let mut keys = write_intents(import_id, free, id);
-    let prefix = object_key(import_id, &format!("{free}~"));
-    for (key, _) in iterate(context, IMPORT_INTENT_KEYSPACE, prefix).await? {
-        let tagged = intent_path(&key).is_some_and(|tagged| free_path(tagged) == free);
-        if tagged && key.ends_with(&id.to_bytes()) && !keys.contains(&key) {
-            keys.push(key);
+    let mut keys = Vec::new();
+    for base in [path, free_path(path)] {
+        for key in write_intents(import_id, base, id) {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        let prefix = object_key(import_id, &format!("{base}~"));
+        for (key, _) in iterate(context, IMPORT_INTENT_KEYSPACE, prefix).await? {
+            let tagged = intent_path(&key).is_some_and(|tagged| free_path(tagged) == base);
+            if tagged && key.ends_with(&id.to_bytes()) && !keys.contains(&key) {
+                keys.push(key);
+            }
         }
     }
     Ok(keys)
@@ -1976,9 +1982,19 @@ mod tests {
         let mut expected = intent_keys(import_id, "raw/a", id, true);
         expected.push(moved);
         for path in ["raw/a", tagged.as_str()] {
-            let found = stored_intents(&context, import_id, path, id).await.ok();
-            assert_eq!(found, Some(expected.clone()), "{path}");
+            let found = stored_intents(&context, import_id, path, id).await;
+            let found = found.ok().unwrap();
+            assert!(expected.iter().all(|key| found.contains(key)), "{path}");
         }
+        // A suffix name ends in the version id; its move tags it once more.
+        let named = format!("raw/b~{id}");
+        let sibling = intent_key(import_id, &format!("{named}~{attempt}"), id);
+        let write = write_value(&context, IMPORT_INTENT_KEYSPACE, sibling.clone(), vec![1]);
+        assert!(write.await.is_ok());
+        let found = stored_intents(&context, import_id, &named, id).await;
+        let found = found.ok().unwrap();
+        assert!(found.contains(&sibling));
+        assert!(found.contains(&intent_key(import_id, &named, id)));
     }
 
     #[test]
