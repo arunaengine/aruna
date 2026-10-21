@@ -457,12 +457,18 @@ async fn import_object(
     };
     match decide(object, row.as_ref(), head, version_exists) {
         Decision::Skip => return Ok(Outcome::Skipped),
-        Decision::Taken => return register_twin(ctx, spec, run, object, (&key, resolved)).await,
+        Decision::Taken => {
+            return register_twin(ctx, spec, run, object, (&key, head, resolved)).await;
+        }
         Decision::Import => {}
     }
     // The committed row stays until the new version replaces it in one transaction. A new
-    // row records its key, so later rule changes never move the object.
-    let version_id = Ulid::generate();
+    // row records its key, so later rule changes never move the object. A new file is dated
+    // by its modification time, as a second file of its key would be.
+    let version_id = match (&row, object.modified_ms) {
+        (None, Some(at)) => dated(at),
+        _ => Ulid::generate(),
+    };
     let committed = ImportedObject {
         key: match row.as_ref() {
             Some(row) => row.key.clone(),
@@ -887,10 +893,11 @@ async fn recover(
                 }
                 _ => Vec::new(),
             };
-            // Older history joins below a head; a key that never had one gets the file as head.
+            // Older history joins below a head; a newer file becomes the head.
+            let keep_head = head.is_some_and(|head| head > version_id);
             let fence = Fence {
                 head,
-                keep_head: head.is_some(),
+                keep_head,
                 guards,
                 retired,
                 trail: Some(version_id),
@@ -908,7 +915,7 @@ async fn recover(
                 }
                 Err(error) => return Err(put_failure(error)),
             }
-            if head.is_none() {
+            if !keep_head {
                 let auth = spec.auth_context.clone();
                 let (realm_id, group_id) = (auth.realm_id, rule.group_id);
                 let (bucket, node_id) = (rule.bucket.clone(), spec.node_id);
@@ -1210,21 +1217,17 @@ async fn register_twin(
     spec: &BackendImportSpec,
     run: &ImportRun,
     object: &ExternalObject,
-    (key, resolved): (&str, ResolvedBackend),
+    (key, head, resolved): (&str, Option<Ulid>, ResolvedBackend),
 ) -> Result<Outcome, ItemError> {
     let rule = &run.rule;
-    // Only a file that may hold a version's bytes is read.
     let candidates = candidates(&ctx.driver, rule, key, object).await?;
-    if candidates.is_empty() {
-        return Err(taken(key));
-    }
     let (mut location, version) = hash_object(ctx, spec, resolved, &object.key).await?;
     if location.blob_size != object.size {
         return Err(item("the object changed while it was read"));
     }
     let same = (candidates.into_iter()).find(|(.., hash)| location.get_blake3() == Some(&hash[..]));
     let Some((stored, value, version_id, _)) = same else {
-        return Err(taken(key));
+        return add_version(ctx, spec, run, object, (key, head), (location, version)).await;
     };
     location.format.layout = StoredLayout::Plain(location.ulid);
     let row = ImportedObject {
@@ -1272,6 +1275,70 @@ async fn register_twin(
 
 /// Version rows of one key one search for the same content reads at most.
 const TWIN_SCAN: usize = 1024;
+
+/// A version id of the time `at`.
+fn dated(at: u64) -> Ulid {
+    Ulid::from_parts(at, Ulid::generate().random())
+}
+
+/// A file with other bytes than every version of its key is another version of it, dated by
+/// its modification time: the newest version becomes current, an older one joins the history.
+async fn add_version(
+    ctx: &JobContext,
+    spec: &BackendImportSpec,
+    run: &ImportRun,
+    object: &ExternalObject,
+    (key, head): (&str, Option<Ulid>),
+    file: (BackendLocation, Option<String>),
+) -> Result<Outcome, ItemError> {
+    let rule = &run.rule;
+    let version_id = dated(object.modified_ms.unwrap_or_else(now_ms));
+    let committed = ImportedObject {
+        key: Some(key.to_string()),
+        ..ImportedObject::new(version_id, object)
+    };
+    let keep_head = head.is_some_and(|head| head > version_id);
+    let fence = Fence {
+        head,
+        keep_head,
+        guards: shared_guards(run, &object.key),
+        retired: Vec::new(),
+        trail: None,
+        keep_row: false,
+        copy_index: None,
+    };
+    let size = file.0.blob_size;
+    let put = put_version(ctx, spec, run, key.to_string(), file, committed, fence);
+    match put.await {
+        Ok(()) => {}
+        // Another write came first; the next run looks again.
+        Err(
+            PutObjectError::HeadChanged
+            | PutObjectError::VersionExists
+            | PutObjectError::HistoryDeleted,
+        ) => return Ok(Outcome::Skipped),
+        Err(error) => return Err(put_failure(error)),
+    }
+    if !keep_head {
+        let auth = spec.auth_context.clone();
+        let (realm_id, group_id) = (auth.realm_id, rule.group_id);
+        let (bucket, node_id) = (rule.bucket.clone(), spec.node_id);
+        let key = key.to_string();
+        complete_put(
+            &ctx.driver,
+            realm_id,
+            node_id,
+            auth,
+            group_id,
+            bucket,
+            key,
+            version_id,
+            size,
+        )
+        .await;
+    }
+    Ok(Outcome::Imported)
+}
 
 /// The key index row of `path` when its row records a second copy, which a new version of
 /// the file retires.
