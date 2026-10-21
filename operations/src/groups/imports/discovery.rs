@@ -121,6 +121,16 @@ pub fn check_rules(rules: &[DiscoveryRule]) -> Result<(), ImportRuleError> {
     Ok(())
 }
 
+impl SetDiscoveryOperation {
+    fn commit(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(ImportRuleError::Unexpected("Write"));
+        };
+        self.state = SetState::Commit;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+}
+
 impl Operation for SetDiscoveryOperation {
     type Output = Vec<DiscoveryRule>;
     type Error = ImportRuleError;
@@ -153,17 +163,16 @@ impl Operation for SetDiscoveryOperation {
                 Ok(rule) => self.write(rule),
                 Err(error) => self.fail(error.into()),
             },
-            (
-                SetState::Write,
-                Event::Storage(
-                    StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
-                ),
-            ) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(ImportRuleError::Unexpected("Write"));
-                };
-                self.state = SetState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            // No rules delete the record, others write it; only that answer counts.
+            (SetState::Write, Event::Storage(StorageEvent::WriteResult { .. }))
+                if !self.rules.is_empty() =>
+            {
+                self.commit()
+            }
+            (SetState::Write, Event::Storage(StorageEvent::DeleteResult { .. }))
+                if self.rules.is_empty() =>
+            {
+                self.commit()
             }
             (SetState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
                 self.txn_id = None;
@@ -701,6 +710,16 @@ mod tests {
             txn_id: TxnId::from(3),
         }));
         assert_eq!(operation.finalize(), Ok(rules()));
+
+        // A delete answer does not count for a write.
+        let (mut wrong, _) = written(rules(), Some(vec![1]));
+        wrong.step(storage(StorageEvent::DeleteResult {
+            key: Vec::new().into(),
+        }));
+        assert!(matches!(
+            wrong.finalize(),
+            Err(ImportRuleError::Unexpected(_))
+        ));
 
         // No rules delete the row.
         let (_, effects) = written(Vec::new(), Some(vec![1]));

@@ -55,6 +55,8 @@ pub struct ChangeImportOperation {
     now: SystemTime,
     state: ChangeState,
     txn_id: Option<TxnId>,
+    /// The write carries the earlier patterns too, as one batch.
+    batched: bool,
     /// The changed rule and the pattern it replaces, written once no run or move uses it.
     changed: Option<(BackendImport, String)>,
     output: Option<Result<BackendImport, ImportRuleError>>,
@@ -69,6 +71,7 @@ impl ChangeImportOperation {
             now,
             state: ChangeState::Init,
             txn_id: None,
+            batched: false,
             changed: None,
             output: None,
         }
@@ -178,6 +181,14 @@ impl ChangeImportOperation {
         self.write(record, Some((key, value)))
     }
 
+    fn commit(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(ImportRuleError::Unexpected("Write"));
+        };
+        self.state = ChangeState::Commit;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
     /// Writes the rule, with the earlier patterns of a pattern change in the same batch.
     fn write(&mut self, record: BackendImport, earlier: Option<(Key, Value)>) -> Effects {
         let value = match record.to_bytes() {
@@ -185,6 +196,7 @@ impl ChangeImportOperation {
             Err(error) => return self.fail(error.into()),
         };
         self.state = ChangeState::Write;
+        self.batched = earlier.is_some();
         let (key, value) = (record.key(), value.into());
         let effect = match earlier {
             None => StorageEffect::Write {
@@ -250,17 +262,16 @@ impl Operation for ChangeImportOperation {
             (ChangeState::Run, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.run_read(values)
             }
-            (
-                ChangeState::Write,
-                Event::Storage(
-                    StorageEvent::WriteResult { .. } | StorageEvent::BatchWriteResult { .. },
-                ),
-            ) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(ImportRuleError::Unexpected("Write"));
-                };
-                self.state = ChangeState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            // A pattern change writes a batch, any other change one record.
+            (ChangeState::Write, Event::Storage(StorageEvent::WriteResult { .. }))
+                if !self.batched =>
+            {
+                self.commit()
+            }
+            (ChangeState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
+                if self.batched =>
+            {
+                self.commit()
             }
             (ChangeState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
                 self.txn_id = None;
@@ -402,7 +413,24 @@ mod tests {
     }
 
     fn finish(mut operation: ChangeImportOperation, key: Key) -> BackendImport {
-        operation.step(Event::Storage(StorageEvent::WriteResult { key }));
+        let written = |batched: bool| match batched {
+            true => StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
+            },
+            false => StorageEvent::WriteResult { key: key.clone() },
+        };
+        // A pattern change's batch answers as one; another answer would not count.
+        let change = operation.change.clone();
+        let mut wrong =
+            ChangeImportOperation::new(Ulid::nil(), Ulid::nil(), change, SystemTime::UNIX_EPOCH);
+        (wrong.state, wrong.txn_id, wrong.batched) = (ChangeState::Write, Some(TXN), true);
+        wrong.step(Event::Storage(written(false)));
+        assert!(matches!(
+            wrong.output,
+            Some(Err(ImportRuleError::Unexpected(_)))
+        ));
+        let written = written(operation.batched);
+        operation.step(Event::Storage(written));
         operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id: TXN,
         }));
