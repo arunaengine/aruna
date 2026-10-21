@@ -63,7 +63,7 @@ pub struct PreviewFileResponse {
     /// Bucket key the file gets; omitted for a conflict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
-    /// Version the file name or an unfinished write names; a run registers the file as it.
+    /// Version the file name encodes; a run registers the file as it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
     /// `known` (a recorded mapping keeps it), `matched`, `root` or `conflict`.
@@ -263,18 +263,19 @@ pub async fn put_discovery(
 bucket, including request policies. Tokens with path restrictions are refused.
 
 **Behavior**
-- Files are placed as a run places them: a recorded mapping first, then an unfinished write of
-  the rule, then the file name. `version_id` is the version a run registers the file as.
+- Files are placed as a run places them: a recorded mapping first, then the file name. A file
+  with an unfinished write is shown as a conflict. `version_id` is the version a run registers
+  the file as by its name.
 - Only files whose bucket key the caller may read are listed. A conflict is checked by its
   key at the bucket root and by every key an unfinished write names for it.
-- `known`: a recorded mapping, or an unfinished write that recorded its bytes, keeps its key
-  whatever the rules say.
+- `known`: a recorded mapping keeps its key whatever the rules say.
 - `matched`: one pattern matches; `key` is where the file goes.
 - `root`: no pattern matches; the file goes to the bucket root.
-- `conflict`: a run would report the file and not import it. `patterns` names the patterns
-  that all match it. Empty `patterns` means the name fits several keys or versions,
-  unfinished writes name different keys or did not record their bytes, or in a backend folder shared with other rules, no
-  single rule names a new file and the rules would give it different keys.
+- `conflict`: the preview cannot place the file. `patterns` names the patterns that all match
+  it. Empty `patterns` means the name fits several keys or versions, or in a backend folder
+  shared with other rules no single rule names a new file and the rules give it different
+  keys; a run reports such files and imports nothing. It also means an unfinished write names
+  the file, which a run decides by reading the file.
 - Files in the folders where Aruna stores its own objects are left out, as are files of a
   shared folder that another rule recorded, writes or alone matches. Rules that all give a new
   file the same root key of one bucket leave it to the oldest of them.

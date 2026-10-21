@@ -440,7 +440,7 @@ pub async fn preview_discovery(
         let file = match row {
             // A literal import whose name encodes a version is recovered as that version.
             Some(row)
-                if row.key.is_some() || open.is_empty() && !decodes(rule, &earlier, &path) =>
+                if open.is_empty() && (row.key.is_some() || !decodes(rule, &earlier, &path)) =>
             {
                 PreviewFile {
                     key: row.key.or_else(|| rule.aruna_key(&path)),
@@ -450,8 +450,9 @@ pub async fn preview_discovery(
                     path,
                 }
             }
-            // An open write names the file only if all its intents agree.
-            _ if !open.is_empty() => intended(path, open),
+            // An open write is decided by a run that reads the file; until then it is unresolved.
+            Some(row) if !open.is_empty() => intended(path, open, row.key),
+            _ if !open.is_empty() => intended(path, open, None),
             Some(_) => named(names, path),
             // A file of a shared folder that another rule takes is not listed here.
             None => match claim_file(names, &shared, taken.contains(&path), &path) {
@@ -480,29 +481,13 @@ fn decodes(rule: &BackendImport, earlier: &[String], path: &str) -> bool {
 }
 
 /// The key the open writes of a file name, as a run reads them before the file name.
-/// A run trusts an intent only with a record of the written bytes, which it checks against the
-/// file; without one, or when the writes disagree, the file is unresolved.
-fn intended(path: String, open: &[(Key, WriteIntent)]) -> PreviewFile {
-    let claimed: Vec<String> = open.iter().map(|(_, intent)| intent.key.clone()).collect();
-    let mut keys = claimed.iter();
-    let first = keys.next().cloned();
-    let proven = open.iter().all(|(_, intent)| intent.written.is_some());
-    if !proven || !keys.all(|key| Some(key) == first.as_ref()) {
-        return PreviewFile {
-            claimed,
-            ..unresolved(path, Vec::new())
-        };
-    }
-    let version_id = match open {
-        [(_, intent)] => Some(intent.version_id),
-        _ => None,
-    };
+/// A run trusts an unfinished write only for the bytes it recorded, which the preview does not
+/// read, so the file is unresolved. Every key it may get counts for who may see it.
+fn intended(path: String, open: &[(Key, WriteIntent)], mapped: Option<String>) -> PreviewFile {
+    let claims = open.iter().map(|(_, intent)| intent.key.clone());
     PreviewFile {
-        path,
-        key: first,
-        version_id,
-        claimed,
-        outcome: FileOutcome::Known,
+        claimed: mapped.into_iter().chain(claims).collect(),
+        ..unresolved(path, Vec::new())
     }
 }
 
@@ -630,18 +615,13 @@ mod tests {
             };
             (Key::from(Vec::new()), intent)
         };
-        // Without a record of the written bytes a run cannot trust the intent.
-        let file = intended("raw/a".to_string(), &[intent("in/a")]);
-        assert_eq!(file.outcome, FileOutcome::Conflict(Vec::new()));
-        assert_eq!(file.claimed, ["in/a"]);
+        // The preview reads no bytes, so even a recorded write leaves the file unresolved.
         let mut proven = intent("in/a");
         proven.1.written = Some([1; 32]);
-        let file = intended("raw/a".to_string(), &[proven]);
-        assert_eq!(
-            (file.key.as_deref(), file.version_id),
-            (Some("in/a"), Some(id))
-        );
-        let file = intended("raw/a".to_string(), &[intent("in/a"), intent("in/b")]);
+        let file = intended("raw/a".to_string(), &[proven], Some("old/a".to_string()));
+        assert_eq!(file.outcome, FileOutcome::Conflict(Vec::new()));
+        assert_eq!(file.claimed, ["old/a", "in/a"]);
+        let file = intended("raw/a".to_string(), &[intent("in/a"), intent("in/b")], None);
         assert_eq!(file.outcome, FileOutcome::Conflict(Vec::new()));
     }
 
