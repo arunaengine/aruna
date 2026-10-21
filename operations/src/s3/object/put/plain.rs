@@ -19,7 +19,7 @@ use aruna_core::types::{Key, Value};
 /// The path a write takes, the backend it resolved to and the backend version it got.
 #[derive(Debug, PartialEq)]
 pub(super) struct PlainWrite {
-    target: PlainTarget,
+    pub(super) target: PlainTarget,
     resolved: ResolvedBackend,
     pub(super) version: Option<String>,
     pub(super) etag: Option<String>,
@@ -456,6 +456,10 @@ impl PutObjectOperation {
                 Ok(rows) => writes.extend(rows),
                 Err(error) => return Some(self.emit_error(error.into())),
             }
+            match self.dedup_release().transpose() {
+                Ok(release) => writes.extend(release),
+                Err(error) => return Some(self.emit_error(error.into())),
+            }
         }
         if writes.is_empty() {
             // A write without records, as after its rule went, still retires its intents.
@@ -664,10 +668,12 @@ pub(crate) fn version_row(written: &BackendLocation, version: &str) -> (String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
     use aruna_core::stream::BackendStream;
+    use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
     use aruna_core::structs::storage::blob::BackendRef;
-    use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::structs::storage::format::{StoredFormat, StoredLayout};
     use aruna_core::structs::storage::routing::{
         BackendCatalog, GroupRoutingInputs, RoutingSnapshot, RoutingTarget,
     };
@@ -1696,5 +1702,99 @@ mod tests {
             operation.finalize().unwrap_err(),
             PutObjectError::BlobWriteFailed(BlobError::PathTaken)
         );
+    }
+
+    /// A write whose provider version is known, at its tagged path, before its transaction.
+    fn rewritten(hash: u8) -> PutObjectOperation {
+        let mut operation = operation(DEFAULT_PATTERN);
+        operation.version_id = Some(Ulid::from_parts(9, 1));
+        let resolved = ResolvedBackend::new(BackendRef::Group(backend_id()), None);
+        let target = operation.plain_target(&resolved).unwrap();
+        operation.plain = Some(PlainWrite {
+            target,
+            resolved,
+            version: Some("v2".to_string()),
+            etag: None,
+            owned: true,
+        });
+        let mut new = written("raw/x/one.csv~new".to_string(), Ulid::from_parts(5, 5));
+        new.hashes.insert(HASH_BLAKE3.to_string(), vec![hash; 32]);
+        operation.written_location = Some(new);
+        operation.txn_id = Some(Ulid::nil());
+        operation
+    }
+
+    /// Answers the reads of the current version, whose file holds bytes with hash 7.
+    fn current(operation: &mut PutObjectOperation, old: &BackendLocation) -> Effects {
+        let effects = operation.start_hash_lookup();
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the head read, got {effects:?}")
+        };
+        assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
+        let head = CurrentVersionPointer::new(Ulid::from_parts(8, 1));
+        operation.step(read(Some(head.to_bytes().unwrap())));
+        let version = BlobVersion::materialized(
+            [7; 32],
+            BackendRef::Group(backend_id()),
+            old.format.encoding(),
+            SystemTime::UNIX_EPOCH,
+            UserId::default(),
+            None,
+        );
+        operation.step(read(Some(version.to_bytes().unwrap())))
+    }
+
+    #[test]
+    fn reuses_same_file() {
+        let mut old = written("raw/x/one.csv~old".to_string(), Ulid::from_parts(4, 4));
+        old.format.layout = StoredLayout::Plain(old.ulid);
+        let mut operation = rewritten(7);
+        let effects = current(&mut operation, &old);
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the location read, got {effects:?}")
+        };
+        assert_eq!(key_space, BLOB_LOCATIONS_KEYSPACE);
+        operation.step(read(Some(old.to_bytes().unwrap())));
+        // The version reads the older file; the written one is released after the commit.
+        assert_eq!(operation.output, Some(Ok(old.clone())));
+        let (space, _, value) = operation.dedup_release().unwrap().unwrap();
+        assert_eq!(space, BLOB_CLEANUP_KEYSPACE);
+        let work = BlobCleanupWork::from_bytes(&value).unwrap();
+        let BlobCleanupWork::ReleaseRenamed {
+            location,
+            import_id,
+            version_id,
+            version,
+        } = work
+        else {
+            panic!("expected a release, got {work:?}")
+        };
+        assert_eq!(location.backend_path, "raw/x/one.csv~new");
+        assert_eq!(
+            (import_id, version_id, version.as_str()),
+            (Ulid::from_bytes([4u8; 16]), Ulid::from_parts(9, 1), "v2")
+        );
+    }
+
+    #[test]
+    fn keeps_other_bytes() {
+        let mut old = written("raw/x/one.csv~old".to_string(), Ulid::from_parts(4, 4));
+        old.format.layout = StoredLayout::Plain(old.ulid);
+        // Other bytes than the current version's go the usual way and release nothing.
+        let mut operation = rewritten(8);
+        let effects = current(&mut operation, &old);
+        assert_eq!(
+            operation.state,
+            PutObjectState::CheckHashLookup,
+            "{effects:?}"
+        );
+        assert!(operation.dedup_release().is_none());
+        // Without a backend version the written file cannot go, so it is kept as well.
+        let mut operation = rewritten(7);
+        if let Some(plain) = operation.plain.as_mut() {
+            plain.version = None;
+        }
+        operation.start_hash_lookup();
+        assert_eq!(operation.state, PutObjectState::CheckHashLookup);
     }
 }

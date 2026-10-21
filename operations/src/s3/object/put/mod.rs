@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::blob::cleanup::schedule_cleanup_effect;
 use crate::blob::managed_copy::{
     CopyRegistration, CopyRequest, ManagedCopyError, register_effect, serve_reads,
     split_serve_reads, validate_registration,
@@ -142,6 +143,10 @@ pub enum PutObjectState {
     ReadRules,
     /// Reads which rules read a linked write's path, inside the version transaction.
     ReadReaders,
+    /// Reads the current version and its file, which a re-upload of the same bytes reads too.
+    ReadDedupHead,
+    ReadDedupVersion,
+    ReadDedupLocation,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -316,6 +321,9 @@ pub struct PutObjectOperation {
     trail_scan: Option<trail::TrailScan>,
     rule_scan: Option<sharing::RuleScan>,
     readers: sharing::ReaderScan,
+    /// The written linked file the version gives up for the current version's identical one.
+    dedup: Option<BackendLocation>,
+    dedup_checked: bool,
 }
 
 impl PutObjectOperation {
@@ -371,6 +379,8 @@ impl PutObjectOperation {
             trail_scan: None,
             rule_scan: None,
             readers: sharing::ReaderScan::default(),
+            dedup: None,
+            dedup_checked: false,
         }
     }
 
@@ -1007,6 +1017,9 @@ impl PutObjectOperation {
     /// Looks up only the copy on the backend this write resolved to, so
     /// identical content on another backend never overrides the placement.
     fn start_hash_lookup(&mut self) -> Effects {
+        if let Some(effects) = self.read_current() {
+            return effects;
+        }
         self.state = PutObjectState::CheckHashLookup;
         let Some(written_location) = self.get_written_location() else {
             return self.emit_error(PutObjectError::MissingOutput);
@@ -1710,6 +1723,7 @@ impl PutObjectOperation {
             scan.restart();
         }
         self.readers = sharing::ReaderScan::default();
+        (self.dedup, self.dedup_checked) = (None, false);
         self.state = PutObjectState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -1789,7 +1803,10 @@ impl PutObjectOperation {
             smallvec![Effect::Blob(BlobEffect::Delete { location })]
         } else {
             self.state = PutObjectState::Finish;
-            smallvec![schedule_snapshot_publish()]
+            match self.dedup.is_some() {
+                true => smallvec![schedule_snapshot_publish(), schedule_cleanup_effect()],
+                false => smallvec![schedule_snapshot_publish()],
+            }
         }
     }
 
@@ -1991,6 +2008,9 @@ impl Operation for PutObjectOperation {
             PutObjectState::CheckSealFence => self.seal_fence_checked(event),
             PutObjectState::FenceBackend => self.handle_backend_fenced(event),
             PutObjectState::CheckHashLookup => self.hash_checked(event),
+            PutObjectState::ReadDedupHead
+            | PutObjectState::ReadDedupVersion
+            | PutObjectState::ReadDedupLocation => self.dedup_read(event),
             PutObjectState::CreateBlobLocation => self.location_created(event),
             PutObjectState::ReadObjectLookup => self.object_lookup_read(event),
             PutObjectState::ReadLivenessVersion => self.liveness_read(event),
@@ -2794,6 +2814,7 @@ mod decision_tests {
     }
 }
 
+mod dedup;
 pub(crate) mod fenced;
 mod plain;
 mod sharing;
