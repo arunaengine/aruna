@@ -572,15 +572,24 @@ impl Stage<'_> {
         copy: &BackendLocation,
     ) -> Result<Vec<(String, Key, Value)>, String> {
         let prefix = ManagedCopyKey::version_prefix(version).map_err(|error| error.to_string())?;
-        let page = iter_prefix_page(
-            &self.context.storage_handle,
-            MANAGED_COPY_KEYSPACE,
-            Some(prefix.into()),
-            None,
-            RULE_PAGE,
-            Some(self.txn_id),
-        );
-        let (rows, _) = page.await?;
+        let mut rows = Vec::new();
+        let mut after = None;
+        loop {
+            let page = iter_prefix_page(
+                &self.context.storage_handle,
+                MANAGED_COPY_KEYSPACE,
+                Some(prefix.clone().into()),
+                after.take(),
+                RULE_PAGE,
+                Some(self.txn_id),
+            );
+            let (page, next) = page.await?;
+            rows.extend(page);
+            match next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
         let mut writes = Vec::new();
         for (key, value) in rows {
             let record =
