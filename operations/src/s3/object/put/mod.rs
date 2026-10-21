@@ -124,6 +124,9 @@ pub enum PutObjectState {
     WriteIntent,
     /// Syncs that intent to disk before the bytes move.
     SyncIntent,
+    /// Reads the rule after its intent or evidence is stored; a removal drained it already.
+    CheckIntentRule,
+    CheckEvidenceRule,
     /// Reads the version a history write registers, inside the version transaction.
     ReadHistory,
     /// Deletes the write intents the committed version makes obsolete.
@@ -308,6 +311,8 @@ pub struct PutObjectOperation {
     pending_write: Option<Effects>,
     /// The intent record of the plain write in flight.
     written_intent: Vec<aruna_core::types::Key>,
+    /// The import rule was gone after the intent was stored, so the intent is dropped.
+    rule_removed: bool,
     /// The delete trail the version transaction reads before an import registers a version.
     trail_scan: Option<trail::TrailScan>,
     rule_scan: Option<sharing::RuleScan>,
@@ -362,6 +367,7 @@ impl PutObjectOperation {
             keep_head: false,
             pending_write: None,
             written_intent: Vec::new(),
+            rule_removed: false,
             trail_scan: None,
             rule_scan: None,
         }
@@ -1964,7 +1970,10 @@ impl Operation for PutObjectOperation {
                 self.plain_written(event)
             }
             PutObjectState::ReadImportRule => self.import_rule_read(event),
-            PutObjectState::WriteIntent | PutObjectState::SyncIntent => self.intent_written(event),
+            PutObjectState::WriteIntent
+            | PutObjectState::CheckIntentRule
+            | PutObjectState::SyncIntent => self.intent_written(event),
+            PutObjectState::CheckEvidenceRule => self.evidence_checked(event),
             PutObjectState::DropIntent | PutObjectState::SyncDroppedIntent => {
                 self.intent_dropped(event)
             }

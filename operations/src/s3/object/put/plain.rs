@@ -205,7 +205,10 @@ impl PutObjectOperation {
 
     pub(super) fn evidence_written(&mut self, event: Event) -> Effects {
         match event {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.start_transaction(),
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                self.state = PutObjectState::CheckEvidenceRule;
+                self.rule_read().unwrap_or_else(|| self.start_transaction())
+            }
             Event::Storage(StorageEvent::Error { error }) => {
                 self.cleanup_failed_write(PutObjectError::StorageError(error))
             }
@@ -213,16 +216,67 @@ impl PutObjectOperation {
         }
     }
 
-    /// Bytes move only once their identity is stored and synced to disk.
+    /// A removal deletes the rule before it drains the rule's intents, so an intent stored
+    /// while the rule still reads as present is drained with the others.
+    fn rule_read(&self) -> Option<Effects> {
+        let key = self.rule_fence()?;
+        Some(smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            key,
+            txn_id: None,
+        })])
+    }
+
+    /// Evidence stored after the rule went is dropped with the intents; the write goes on.
+    pub(super) fn evidence_checked(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {
+                self.start_transaction()
+            }
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+                self.rule_removed = true;
+                smallvec![intent_deletes(&self.written_intent)]
+            }
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) if self.rule_removed => {
+                self.written_intent.clear();
+                self.start_transaction()
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                self.cleanup_failed_write(PutObjectError::StorageError(error))
+            }
+            _ => self.emit_error(PutObjectError::InvalidOperationState),
+        }
+    }
+
+    /// Bytes move only once their identity is stored and synced to disk, and only while the
+    /// rule exists after the intent was stored.
     pub(super) fn intent_written(&mut self, event: Event) -> Effects {
-        let syncing = self.state == PutObjectState::SyncIntent;
+        let (writing, checking) = (
+            self.state == PutObjectState::WriteIntent,
+            self.state == PutObjectState::CheckIntentRule,
+        );
         match (event, self.pending_write.take()) {
-            (Event::Storage(StorageEvent::BatchWriteResult { .. }), Some(write)) if !syncing => {
+            (Event::Storage(StorageEvent::BatchWriteResult { .. }), Some(write)) if writing => {
+                self.pending_write = Some(write);
+                self.state = PutObjectState::CheckIntentRule;
+                self.rule_read()
+                    .unwrap_or_else(|| self.emit_error(PutObjectError::InvalidOperationState))
+            }
+            (Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }), Some(write))
+                if checking =>
+            {
                 self.pending_write = Some(write);
                 self.state = PutObjectState::SyncIntent;
                 smallvec![Effect::Storage(StorageEffect::SyncAll)]
             }
-            (Event::Storage(StorageEvent::SyncAllFinished), Some(write)) if syncing => {
+            (Event::Storage(StorageEvent::ReadResult { value: None, .. }), Some(_)) if checking => {
+                self.rule_removed = true;
+                self.state = PutObjectState::DropIntent;
+                smallvec![intent_deletes(&self.written_intent)]
+            }
+            (Event::Storage(StorageEvent::SyncAllFinished), Some(write))
+                if self.state == PutObjectState::SyncIntent =>
+            {
                 self.state = PutObjectState::WriteBlob;
                 write
             }
@@ -252,8 +306,11 @@ impl PutObjectOperation {
             }
             Event::Storage(StorageEvent::SyncAllFinished) if syncing => {
                 self.written_intent.clear();
-                let taken = PutObjectError::BlobWriteFailed(BlobError::PathTaken);
-                self.cleanup_failed_write(taken)
+                let error = match self.rule_removed {
+                    true => PutObjectError::ImportRemoved,
+                    false => PutObjectError::BlobWriteFailed(BlobError::PathTaken),
+                };
+                self.cleanup_failed_write(error)
             }
             Event::Storage(StorageEvent::Error { error }) => {
                 self.cleanup_failed_write(PutObjectError::StorageError(error))
@@ -424,7 +481,16 @@ impl PutObjectOperation {
             }
         }
         if writes.is_empty() {
-            return None;
+            // A write without records, as after its rule went, still retires its intents.
+            let deletes = self.retired_intents();
+            if self.plain.is_none() || deletes.is_empty() {
+                return None;
+            }
+            self.state = PutObjectState::RetireIntents;
+            return Some(smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                deletes,
+                txn_id: Some(txn_id),
+            })]);
         }
         self.state = PutObjectState::WritePlainRecords;
         Some(smallvec![Effect::Storage(StorageEffect::BatchWrite {
@@ -737,10 +803,20 @@ mod tests {
     }
 
     /// Answers the intent write and its sync; the write waits for both.
+    /// Answers the read of the rule after an intent or its evidence is stored.
+    fn past_rule(operation: &mut PutObjectOperation, effects: Effects) -> Effects {
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            return effects;
+        };
+        assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
+        operation.step(read(Some(vec![1])))
+    }
+
     fn past_intent(operation: &mut PutObjectOperation) -> Effects {
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: Vec::new(),
         }));
+        let effects = past_rule(operation, effects);
         assert!(
             matches!(
                 effects.as_slice(),
@@ -1436,14 +1512,39 @@ mod tests {
         assert_eq!(*key, intent_key(Ulid::from_bytes([4u8; 16]), &tagged, id));
         let intent = WriteIntent::from_bytes(value).unwrap();
         assert_eq!(intent.written, Some([7u8; 32]));
-        // The version transaction starts only after the hash is stored.
+        // The version transaction starts only after the hash is stored and the rule still reads.
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: Vec::new(),
         }));
+        let effects = past_rule(&mut operation, effects);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::StartTransaction { .. })]
         ));
+    }
+
+    #[test]
+    fn drops_orphan_intent() {
+        // A removal drained the rule's intents before this one was stored; it goes again.
+        let mut operation = operation(DEFAULT_PATTERN);
+        begin(&mut operation);
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        let effects = operation.step(read(None));
+        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice()
+        else {
+            panic!("expected the intent delete, got {effects:?}")
+        };
+        assert!(!deletes.is_empty());
+        operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+        assert_eq!(
+            operation.finalize().unwrap_err(),
+            PutObjectError::ImportRemoved
+        );
     }
 
     #[test]
