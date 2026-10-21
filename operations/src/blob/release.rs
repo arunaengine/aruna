@@ -691,7 +691,12 @@ mod tests {
         renamed_row(&context, IMPORT).await;
         assert!(!release(&context).await);
         let space = DELETE_CLAIM_KEYSPACE;
-        assert!(read_value(&context, space, claim.clone()).await.unwrap().is_some());
+        assert!(
+            read_value(&context, space, claim.clone())
+                .await
+                .unwrap()
+                .is_some()
+        );
         alias_version(&context, old().format.encoding()).await;
         assert!(release(&context).await);
         assert!(read_value(&context, space, claim).await.unwrap().is_none());

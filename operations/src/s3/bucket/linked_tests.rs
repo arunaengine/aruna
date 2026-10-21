@@ -192,3 +192,21 @@ async fn controls_renames() {
     let after = act(&context, LinkedAction::Resume).await;
     assert!(matches!(after, Err(LinkedError::NoJob(_))));
 }
+
+#[tokio::test]
+async fn needs_group_admin() {
+    // A job runs only while its caller still administers the group.
+    let (_directory, context) = setup().await;
+    let auth = access(&context).await;
+    assert!(still_admin(&context, &auth, group()).await.unwrap());
+    let stranger = aruna_core::structs::identity::auth::AuthContext {
+        user_id: aruna_core::UserId::local(Ulid::from_parts(77, 7), realm()),
+        ..auth.clone()
+    };
+    assert!(!still_admin(&context, &stranger, group()).await.unwrap());
+    let mut job = job(stranger);
+    job.task = LinkedTask::Unify {
+        prefix: String::new(),
+    };
+    assert!(job_access(&context, BUCKET, &job).await.unwrap().is_none());
+}

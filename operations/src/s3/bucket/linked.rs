@@ -491,6 +491,9 @@ async fn job_access(
     if !valid.await.map_err(|error| error.to_string())? {
         return Ok(None);
     }
+    if !still_admin(context, &job.auth, job.group_id).await? {
+        return Ok(None);
+    }
     let scope = (job.auth.realm_id, job.group_id, job.node_id);
     match BucketAccess::load(context, &job.auth, scope, bucket).await {
         Ok(access) if access.allows(None, &Permission::WRITE) => Ok(Some(access)),
@@ -498,6 +501,31 @@ async fn job_access(
         Err(AuthorizeError::Policy(
             crate::auth::request_policy::PolicyEnforcementError::Denied { .. },
         )) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Whether `auth` still administers `group_id`, as starting a bucket job required; a denial
+/// is a verdict, unreadable state an error to retry.
+pub(crate) async fn still_admin(
+    context: &DriverContext,
+    auth: &aruna_core::structs::identity::auth::AuthContext,
+    group_id: GroupId,
+) -> Result<bool, String> {
+    use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+    let path = format!("/{}/g/{group_id}/admin/**", auth.realm_id);
+    let checked = crate::auth::request_authorization::authorize(
+        context,
+        auth.realm_id,
+        auth,
+        &path,
+        &Permission::WRITE,
+        PolicyRequestExtras::rest(),
+    );
+    match checked.await {
+        Ok(_) => Ok(true),
+        Err(AuthorizeError::PermissionDenied)
+        | Err(AuthorizeError::Policy(PolicyEnforcementError::Denied { .. })) => Ok(false),
         Err(error) => Err(error.to_string()),
     }
 }

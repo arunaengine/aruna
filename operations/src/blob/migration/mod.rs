@@ -1486,6 +1486,10 @@ async fn rename_access(
     if !valid.await.map_err(|error| error.to_string())? {
         return Ok(None);
     }
+    let admin = crate::s3::bucket::linked::still_admin(context, &request.auth, routing.group_id);
+    if !admin.await? {
+        return Ok(None);
+    }
     let scope = (request.auth.realm_id, routing.group_id, request.node_id);
     let loaded = BucketAccess::load(context, &request.auth, scope, bucket).await;
     let Some(access) = granted(loaded)? else {
