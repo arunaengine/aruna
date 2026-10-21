@@ -31,8 +31,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, PlainPath, WriteIntent, import_key, intent_key, intent_prefix,
-    object_key, tagged_path, version_key,
+    BackendImport, ImportedObject, PlainPath, RenameRequest, WriteIntent, import_key, intent_key,
+    intent_prefix, object_key, tagged_path, version_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion, BlobVersionState,
@@ -1396,24 +1396,46 @@ pub fn renames(
         && target.as_deref() == Some(plain.path.as_str())
 }
 
-/// Whether the move `record` of `bucket` was started to rename linked files.
-pub async fn rename_asked(
+/// The rename request of the move `record` of `bucket`, if it was started to rename files.
+pub async fn rename_request(
     context: &crate::driver::DriverContext,
     bucket: &str,
     record: &CompressionMigration,
-) -> Result<bool, String> {
+) -> Result<Option<RenameRequest>, String> {
     let read = StorageEffect::Read {
         key_space: RENAME_MOVE_KEYSPACE.to_string(),
         key: bucket.as_bytes().to_vec().into(),
         txn_id: None,
     };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            let started = record.started_at_ms.to_string();
-            Ok(record.moving && value.is_some_and(|value| value.as_ref() == started.as_bytes()))
-        }
-        other => Err(format!("could not read the rename request: {other:?}")),
-    }
+    let value = match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        other => return Err(format!("could not read the rename request: {other:?}")),
+    };
+    let request = value
+        .map(|value| RenameRequest::from_bytes(&value))
+        .transpose();
+    let request = request.map_err(|error| error.to_string())?;
+    Ok(request.filter(|request| record.moving && request.started_at_ms == record.started_at_ms))
+}
+
+/// The caller's WRITE on the bucket's keys, loaded once for a page of a rename; `None` when
+/// the caller may not use the bucket at all any more.
+async fn rename_access(
+    context: &crate::driver::DriverContext,
+    request: &RenameRequest,
+    routing: &RoutingSnapshot,
+    bucket: &str,
+) -> Option<crate::auth::request_authorization::BucketAccess> {
+    let scope = (request.auth.realm_id, routing.group_id, request.node_id);
+    let access = crate::auth::request_authorization::BucketAccess::load(
+        context,
+        &request.auth,
+        scope,
+        bucket,
+    );
+    let access = access.await.ok()?;
+    let write = aruna_core::structs::identity::auth::Permission::WRITE;
+    access.allows(None, &write).then_some(access)
 }
 
 /// Reads the earlier patterns of the rules a move resolves against.
@@ -1587,13 +1609,20 @@ async fn migrate_page(
         },
         false => None,
     };
-    // Without earlier patterns no file is renamed, so only an asked rename reads them.
-    let earlier = match routing.as_ref() {
-        Some(routing) if rename_asked(context, bucket, &record).await? => {
-            read_earlier(context, routing).await?
-        }
-        _ => Earlier::new(),
+    // Without earlier patterns no file is renamed, so only an asked rename reads them; each
+    // file is renamed only while the caller who asked may still write its key.
+    let (earlier, access) = match routing.as_ref() {
+        Some(routing) => match rename_request(context, bucket, &record).await? {
+            Some(request) => match rename_access(context, &request, routing, bucket).await {
+                Some(access) => (read_earlier(context, routing).await?, Some(access)),
+                None => (Earlier::new(), None),
+            },
+            None => (Earlier::new(), None),
+        },
+        None => (Earlier::new(), None),
     };
+    let write = aruna_core::structs::identity::auth::Permission::WRITE;
+    let mut denied = 0usize;
     let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
     let (versions, next) = crate::jobs::store::iter_prefix_page(
         &context.storage_handle,
@@ -1612,12 +1641,18 @@ async fn migrate_page(
             .clone()
             .filter(|_| version_key.key.starts_with(&record.prefix));
         let moving = routing.is_some();
+        let object = version_key.key.clone();
         let mut operation =
             MigrateVersionOperation::new(version_key, record.target, SystemTime::now());
         if let Some(routing) = routing {
-            operation = operation
-                .with_routing(routing)
-                .with_earlier(earlier.clone());
+            let allowed =
+                (access.as_ref()).is_some_and(|access| access.allows(Some(&object), &write));
+            denied += usize::from(!earlier.is_empty() && !allowed);
+            let earlier = match allowed {
+                true => earlier.clone(),
+                false => Earlier::new(),
+            };
+            operation = operation.with_routing(routing).with_earlier(earlier);
         }
         let moved = crate::driver::drive(operation, context).await;
         let broken = moved.is_err() && moving && is_broken(context, key).await;
@@ -1631,6 +1666,13 @@ async fn migrate_page(
                 tracing::warn!(bucket, %error, "Failed to re-encode a version");
             }
         }
+    }
+    if denied > 0 {
+        tracing::warn!(
+            bucket,
+            denied,
+            "Files the rename's caller may not write keep their name"
+        );
     }
     let now = crate::effect_adapters::routing::now_ms();
     let after = match (next.is_some(), record.failed > 0) {
@@ -2184,6 +2226,46 @@ mod tests {
             marker,
             Event::Storage(StorageEvent::ReadResult { value: None, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn checks_rename_caller() {
+        // The rename's caller is read with its move, and each key is checked against them.
+        use aruna_core::structs::identity::realm::RealmId;
+        use aruna_core::structs::storage::blob::object_permission_path;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let context = crate::tests::s3::test_context(storage.clone());
+        let (realm, group) = (RealmId::from_bytes([1; 32]), Ulid::from_parts(1, 1));
+        let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let secret = object_permission_path(realm, group, node, "b", "secret/**");
+        let auth = crate::tests::access::seed_access(&context, (realm, group, node), &secret).await;
+        let mut record = CompressionMigration::new(Compression::Off, 1);
+        (record.moving, record.started_at_ms) = (true, 7);
+        let request = RenameRequest {
+            started_at_ms: 7,
+            auth,
+            node_id: node,
+        };
+        let write = StorageEffect::Write {
+            key_space: RENAME_MOVE_KEYSPACE.to_string(),
+            key: b"b".to_vec().into(),
+            value: request.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        storage.send_storage_effect(write).await;
+        let found = rename_request(&context, "b", &record).await.unwrap();
+        assert_eq!(found.as_ref(), Some(&request));
+        // A later move of the bucket is not the one the caller asked to rename.
+        record.started_at_ms = 8;
+        assert_eq!(rename_request(&context, "b", &record).await.unwrap(), None);
+        let routing = RoutingSnapshot::single(group);
+        let access = rename_access(&context, &request, &routing, "b")
+            .await
+            .unwrap();
+        let write = aruna_core::structs::identity::auth::Permission::WRITE;
+        assert!(access.allows(Some("in/a.csv"), &write));
+        assert!(!access.allows(Some("secret/a.csv"), &write));
     }
 
     #[test]

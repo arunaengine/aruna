@@ -812,7 +812,10 @@ restrictions are refused.
   `bucket_encrypted`, and a move with another prefix answers 409 `move_running`.
 - The keys are checked with the limits of `GET` on this path; a folder beyond them answers 409
   `rename_unchecked`. A pattern change between that check and the start answers 409
-  `rule_changed`; once the rename runs, pattern changes are refused."#,
+  `rule_changed`; once the rename runs, pattern changes are refused.
+- The rename runs as the caller: a file is renamed only while the caller may still write its
+  key when the rename reaches it, including files written after the start. Others keep their
+  name."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
         ("import_id" = String, Path, description = "Rule whose files get their name, as a 26-character ULID")
@@ -869,7 +872,7 @@ pub async fn start_renames(
     }
     let (bucket, prefix) = (rule.bucket, rule.key_prefix);
     let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms())
-        .renaming()
+        .renaming(auth.clone(), state.get_node_id())
         .with_guards(guards);
     let record = drive(operation, &state.get_ctx())
         .await

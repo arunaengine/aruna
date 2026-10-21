@@ -427,6 +427,25 @@ pub fn object_prefix(import_id: Ulid) -> Key {
     import_id.to_bytes().to_vec().into()
 }
 
+/// A storage move asked to rename linked files: the move it belongs to and who asked. The move
+/// renames only the files whose key that caller may still write.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameRequest {
+    pub started_at_ms: u64,
+    pub auth: AuthContext,
+    pub node_id: NodeId,
+}
+
+impl RenameRequest {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
 /// A write to a fixed path in the tenant's folders; `ulid` names its location.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlainPath {
