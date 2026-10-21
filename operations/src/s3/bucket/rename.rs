@@ -567,7 +567,10 @@ impl RenameKeysOperation {
                 let from = &self.items[index].from;
                 let prefix = VersionKey::object_prefix(&self.input.bucket, from)?;
                 for (key, _) in values {
-                    let row = key.get(prefix.len()..).unwrap_or_default().to_vec();
+                    // The index key is the rule, the key's prefix, then the row's path.
+                    let import = key.get(..16).unwrap_or_default();
+                    let path = key.get(16 + prefix.len()..).unwrap_or_default();
+                    let row = [import, path].concat();
                     self.found[index].renamed.push((key, row));
                 }
                 Ok(true)
@@ -827,8 +830,12 @@ impl RenameKeysOperation {
                     source.clone(),
                     PAGE,
                 ),
-                Scan::new(ScanKind::Renamed(index), RENAMED_ROW_KEYSPACE, source, PAGE),
             ]);
+            for rule in &self.rules {
+                let prefix = [&rule.import_id.to_bytes()[..], &source[..]].concat();
+                let kind = ScanKind::Renamed(index);
+                scans.push(Scan::new(kind, RENAMED_ROW_KEYSPACE, prefix, PAGE));
+            }
         }
         Ok(scans)
     }
@@ -1011,7 +1018,8 @@ impl RenameKeysOperation {
                     row.to_bytes()?.into(),
                 ));
                 // The row is found again by its new key, also when no version names its file.
-                let index = [&moved_to[..], &key[..]].concat();
+                let (import, path) = key.split_at(key.len().min(16));
+                let index = [import, &moved_to[..], path].concat();
                 let empty = Value::from(Vec::new());
                 writes.push((RENAMED_ROW_KEYSPACE.to_string(), index.into(), empty));
             }

@@ -11,7 +11,7 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BLOB_CLEANUP_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE,
     IMPORT_INTENT_KEYSPACE, IMPORT_PATTERN_KEYSPACE, IMPORT_REMOVAL_KEYSPACE,
-    IMPORTED_OBJECT_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE, RENAMED_ROW_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{ProviderCleanup, import_key, object_prefix};
@@ -124,20 +124,30 @@ impl RemoveImportOperation {
             self.space = IMPORT_PATTERN_KEYSPACE;
             return self.scan();
         }
-        // The rule's delete claims go with it, through the cleanup queue.
+        // The rule's delete claims and moved-row records go with it, through the cleanup queue.
         if values.is_empty() && !self.claims_queued {
-            let work = BlobCleanupWork::DropClaims {
-                import_id: self.import_id,
-            };
-            let value = match work.to_bytes() {
-                Ok(value) => value,
-                Err(error) => return self.fail(error.into()),
-            };
+            let id = self.import_id.to_bytes().to_vec();
+            let works = [
+                BlobCleanupWork::DropClaims {
+                    import_id: self.import_id,
+                },
+                BlobCleanupWork::DropRows {
+                    key_space: RENAMED_ROW_KEYSPACE.to_string(),
+                    prefix: id.clone(),
+                },
+            ];
+            let mut writes = Vec::new();
+            for (tag, work) in works.into_iter().enumerate() {
+                let value = match work.to_bytes() {
+                    Ok(value) => value,
+                    Err(error) => return self.fail(error.into()),
+                };
+                let key = [&id[..], &[tag as u8]].concat().into();
+                writes.push((BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into()));
+            }
             self.state = RemoveState::QueueClaims;
-            return smallvec![Effect::Storage(StorageEffect::Write {
-                key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-                key: self.import_id.to_bytes().to_vec().into(),
-                value: value.into(),
+            return smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                writes,
                 txn_id: None,
             })];
         }
@@ -289,7 +299,11 @@ impl Operation for RemoveImportOperation {
             (RemoveState::Purge, _, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
                 self.scan()
             }
-            (RemoveState::QueueClaims, _, Event::Storage(StorageEvent::WriteResult { .. })) => {
+            (
+                RemoveState::QueueClaims,
+                _,
+                Event::Storage(StorageEvent::BatchWriteResult { .. }),
+            ) => {
                 self.claims_queued = true;
                 self.purge(Vec::new())
             }
@@ -411,18 +425,21 @@ mod tests {
             );
             return drain(operation, 0);
         }
-        // The rule's delete claims are queued for removal before the mark goes.
-        if let [
-            Effect::Storage(StorageEffect::Write {
-                key_space, value, ..
-            }),
-        ] = effects.as_slice()
-            && key_space == BLOB_CLEANUP_KEYSPACE
-        {
-            let work = BlobCleanupWork::from_bytes(value).unwrap();
-            assert!(matches!(work, BlobCleanupWork::DropClaims { .. }));
-            return operation.step(storage(StorageEvent::WriteResult {
-                key: Vec::new().into(),
+        // The rule's delete claims and moved-row records are queued before the mark goes.
+        if let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() {
+            let works: Vec<_> = writes
+                .iter()
+                .map(|(_, _, value)| BlobCleanupWork::from_bytes(value).unwrap())
+                .collect();
+            assert!(matches!(
+                works.as_slice(),
+                [
+                    BlobCleanupWork::DropClaims { .. },
+                    BlobCleanupWork::DropRows { .. }
+                ]
+            ));
+            return operation.step(storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
             }));
         }
         effects

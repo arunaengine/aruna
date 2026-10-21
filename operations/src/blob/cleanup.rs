@@ -99,6 +99,38 @@ impl PendingCleanup {
 /// How long a recorded copy upload may run before the cleanup takes it for a leftover.
 const SETTLE_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Drops a page of `key_space` rows under `prefix`; `true` once none is left.
+async fn drop_rows(
+    context: &DriverContext,
+    key_space: &str,
+    prefix: Vec<u8>,
+) -> Result<bool, String> {
+    let page = iter_prefix_page(
+        &context.storage_handle,
+        key_space,
+        Some(prefix.into()),
+        None,
+        CLEANUP_PAGE_SIZE,
+        None,
+    );
+    let (rows, _) = page.await?;
+    if rows.is_empty() {
+        return Ok(true);
+    }
+    let deletes = rows
+        .into_iter()
+        .map(|(key, _)| (key_space.to_string(), key))
+        .collect();
+    let effect = StorageEffect::BatchDelete {
+        deletes,
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(false),
+        other => Err(format!("could not drop rows: {other:?}")),
+    }
+}
+
 /// Whether the purge job `job_id` has ended, or is gone; `None` while unreadable.
 async fn purge_ended(context: &DriverContext, job_id: Ulid) -> Option<bool> {
     let job_id = aruna_core::structs::execution::job::JobId::try_from_bytes(job_id.to_bytes());
@@ -128,7 +160,8 @@ fn cleanup_row_key(work: &BlobCleanupWork) -> Key {
         | BlobCleanupWork::DropClaims { .. }
         | BlobCleanupWork::ReleasePlanned { .. }
         | BlobCleanupWork::SettleUpload { .. }
-        | BlobCleanupWork::SettleMove { .. } => Ulid::generate().to_bytes().to_vec().into(),
+        | BlobCleanupWork::SettleMove { .. }
+        | BlobCleanupWork::DropRows { .. } => Ulid::generate().to_bytes().to_vec().into(),
     }
 }
 
@@ -471,6 +504,16 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
                 Ok(false) => RowOutcome::Kept,
                 Err(error) => {
                     warn!(%error, "A rename's move could not be settled");
+                    RowOutcome::Failed
+                }
+            }
+        }
+        BlobCleanupWork::DropRows { key_space, prefix } => {
+            match drop_rows(context, &key_space, prefix).await {
+                Ok(true) => RowOutcome::Done,
+                Ok(false) => RowOutcome::Kept,
+                Err(error) => {
+                    warn!(%error, "Rows of a removed rule could not be dropped");
                     RowOutcome::Failed
                 }
             }
@@ -1111,6 +1154,42 @@ mod tests {
         // This context has no blob storage, so the abort cannot run and the row stays.
         let stale = super::run_cleanup_work(&context, settle(0)).await;
         assert!(matches!(stale, super::RowOutcome::Failed));
+    }
+
+    #[tokio::test]
+    async fn drops_prefix_rows() {
+        // A removed rule's rows go page by page; rows of other prefixes stay.
+        use aruna_core::keyspaces::RENAMED_ROW_KEYSPACE;
+        let (_dir, storage, context) = setup_context();
+        for key in [
+            b"rule-a/1".to_vec(),
+            b"rule-a/2".to_vec(),
+            b"rule-b/1".to_vec(),
+        ] {
+            let write = StorageEffect::Write {
+                key_space: RENAMED_ROW_KEYSPACE.to_string(),
+                key: key.into(),
+                value: Vec::new().into(),
+                txn_id: None,
+            };
+            storage.send_storage_effect(write).await;
+        }
+        let work = || BlobCleanupWork::DropRows {
+            key_space: RENAMED_ROW_KEYSPACE.to_string(),
+            prefix: b"rule-a/".to_vec(),
+        };
+        assert!(matches!(
+            super::run_cleanup_work(&context, work()).await,
+            super::RowOutcome::Kept
+        ));
+        assert!(matches!(
+            super::run_cleanup_work(&context, work()).await,
+            super::RowOutcome::Done
+        ));
+        let (left, _) = iter_prefix_page(&storage, RENAMED_ROW_KEYSPACE, None, None, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(left.len(), 1);
     }
 
     #[tokio::test]

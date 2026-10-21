@@ -108,7 +108,8 @@ pub const LINKED_JOB_KEYSPACE: &str = "linked_storage_jobs";
 pub const DELETE_CLAIM_KEYSPACE: &str = "linked_delete_claims";
 /// The delete claims by the rule whose file they name, keyed by import id and claim key.
 pub const CLAIM_INDEX_KEYSPACE: &str = "linked_delete_claim_rules";
-/// Import rows a key rename moved to a key, keyed by the key's version prefix and the row key.
+/// Import rows a key rename moved to a key, keyed by the import id, the key's version prefix
+/// and the row's path; they go with their rule.
 pub const RENAMED_ROW_KEYSPACE: &str = "backend_import_renamed_rows";
 /// Node-local progress of checking a bucket's current versions for copies that cannot serve.
 pub const STORAGE_CHECK_KEYSPACE: &str = "storage_checks";

@@ -1921,7 +1921,8 @@ impl CompleteUploadOperation {
                 | BlobCleanupWork::DropClaims { .. }
                 | BlobCleanupWork::ReleasePlanned { .. }
                 | BlobCleanupWork::SettleUpload { .. }
-                | BlobCleanupWork::SettleMove { .. } => Ulid::generate().to_bytes().to_vec().into(),
+                | BlobCleanupWork::SettleMove { .. }
+                | BlobCleanupWork::DropRows { .. } => Ulid::generate().to_bytes().to_vec().into(),
                 BlobCleanupWork::ReconcileReservation { .. } => {
                     Ulid::generate().to_bytes().to_vec().into()
                 }

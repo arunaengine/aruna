@@ -364,6 +364,12 @@ pub enum BlobCleanupWork {
         version: VersionKey,
         intents: Vec<Vec<u8>>,
     },
+    /// Rows of `key_space` under `prefix` that belong to something removed; they go a page at
+    /// a time.
+    DropRows {
+        key_space: String,
+        prefix: Vec<u8>,
+    },
 }
 
 /// The record a write's commit would have made the owner of its bytes.
@@ -416,7 +422,8 @@ impl BlobCleanupWork {
             Self::RegisterDht { .. }
             | Self::DropTrail { .. }
             | Self::DropClaims { .. }
-            | Self::SettleMove { .. } => None,
+            | Self::SettleMove { .. }
+            | Self::DropRows { .. } => None,
         }
     }
 }
