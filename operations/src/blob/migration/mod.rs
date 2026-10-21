@@ -1944,7 +1944,7 @@ pub async fn settle_move(
         false => None,
     };
     let Some(routing) = routing else {
-        return drop_intents(context, intents).await;
+        return retire_intents(context, version, intents).await;
     };
     let earlier = read_earlier(context, &routing).await?;
     let operation =
@@ -1953,7 +1953,7 @@ pub async fn settle_move(
             .with_earlier(earlier);
     // A run that ends on its own decided the version's file; any intent it leaves is stale.
     if crate::driver::drive(operation, context).await.is_ok() {
-        return drop_intents(context, intents).await;
+        return retire_intents(context, version, intents).await;
     }
     let reads = intents
         .iter()
@@ -1968,6 +1968,136 @@ pub async fn settle_move(
             Ok(values.iter().all(|(_, value)| value.is_none()))
         }
         other => Err(format!("could not read the move's intents: {other:?}")),
+    }
+}
+
+/// Retires the intents of a settled move; a copy one of them proves that no version reads is
+/// handed to the release of renamed files at its exact backend version first.
+async fn retire_intents(
+    context: &crate::driver::DriverContext,
+    version: &VersionKey,
+    intents: &[Vec<u8>],
+) -> Result<bool, String> {
+    let read_path = read_path(context, version).await?;
+    for key in intents {
+        let read = StorageEffect::Read {
+            key_space: IMPORT_INTENT_KEYSPACE.to_string(),
+            key: key.clone().into(),
+            txn_id: None,
+        };
+        let value = match context.storage_handle.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            other => return Err(format!("could not read a move intent: {other:?}")),
+        };
+        let Some(value) = value else {
+            continue;
+        };
+        let intent = WriteIntent::from_bytes(&value).map_err(|error| error.to_string())?;
+        // The key is the rule, the path, a zero byte and the version id.
+        let (Some(import), Some(path)) = (key.get(..16), key.get(16..key.len().saturating_sub(17)))
+        else {
+            continue;
+        };
+        let path = String::from_utf8_lossy(path).into_owned();
+        if read_path.as_deref() == Some(path.as_str()) {
+            continue;
+        }
+        let import = Ulid::from_bytes(import.try_into().map_err(|_| "bad intent key")?);
+        if !abandon(context, (&intent, import), path).await? {
+            return Ok(false);
+        }
+    }
+    drop_intents(context, intents).await
+}
+
+/// The path of the linked file `version` reads now, if any.
+async fn read_path(
+    context: &crate::driver::DriverContext,
+    version: &VersionKey,
+) -> Result<Option<String>, String> {
+    let key = version.to_bytes().map_err(|error| error.to_string())?;
+    let read = StorageEffect::Read {
+        key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+        key: key.into(),
+        txn_id: None,
+    };
+    let value = match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        other => return Err(format!("could not read a version: {other:?}")),
+    };
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let blob = BlobVersion::from_bytes(&value).map_err(|error| error.to_string())?;
+    let Some(location) = blob.location_key() else {
+        return Ok(None);
+    };
+    let Effect::Storage(read) = blob_location_read(&location, None) else {
+        return Err("unexpected location read".to_string());
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|value| BackendLocation::from_bytes(&value).map(|found| found.backend_path))
+            .transpose()
+            .map_err(|error| error.to_string()),
+        other => Err(format!("could not read a location: {other:?}")),
+    }
+}
+
+/// Queues the release of the file at `path` if it holds the bytes `intent` recorded and has a
+/// backend version; `false` when the storage cannot be asked yet.
+async fn abandon(
+    context: &crate::driver::DriverContext,
+    (intent, import_id): (&WriteIntent, Ulid),
+    path: String,
+) -> Result<bool, String> {
+    let Some(blob_handle) = context.blob_handle.as_ref() else {
+        return Ok(false);
+    };
+    let stat = BlobEffect::StatPlain {
+        backend: intent.backend.clone(),
+        path: path.clone(),
+    };
+    let version = match blob_handle.send_blob_effect(stat).await {
+        Event::Blob(BlobEvent::PlainStat {
+            exists: true,
+            version: Some(version),
+        }) => version,
+        // Nothing there, or no exact version to delete: the file, if any, stays.
+        Event::Blob(BlobEvent::PlainStat { .. }) => return Ok(true),
+        _ => return Ok(false),
+    };
+    let resolved = ResolvedBackend::new(intent.backend.clone(), None);
+    let hash = BlobEffect::HashExternal {
+        resolved,
+        path,
+        created_by: intent.created_by,
+    };
+    let mut location = match blob_handle.send_blob_effect(hash).await {
+        Event::Blob(BlobEvent::ExternalHashed { location, .. }) => location,
+        _ => return Ok(false),
+    };
+    let written = intent.written.map(|hash| hash.to_vec());
+    if location.get_blake3().map(<[u8]>::to_vec) != written {
+        return Ok(true);
+    }
+    location.format.layout = StoredLayout::Plain(location.ulid);
+    let work = BlobCleanupWork::ReleaseRenamed {
+        location,
+        import_id,
+        version_id: intent.version_id,
+        version,
+    };
+    let value = work.to_bytes().map_err(|error| error.to_string())?;
+    let write = StorageEffect::Write {
+        key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+        key: Ulid::generate().to_bytes().to_vec().into(),
+        value: value.into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(true),
+        other => Err(format!("could not queue the abandoned copy: {other:?}")),
     }
 }
 
@@ -2846,14 +2976,15 @@ mod tests {
         assert_eq!(moved, VersionKey::new("b", "a.csv", id));
         // A version that cannot run keeps its intents for a later pass.
         assert!(!settle_move(&context, &moved, &intents).await.unwrap());
-        // Once the version is gone, its intents go and the move is settled.
+        // Once the version is gone, its copy must be checked before its intents go; without
+        // a blob storage to ask, the move stays unsettled and keeps them.
         let delete = StorageEffect::Delete {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             key: version.into(),
             txn_id: None,
         };
         storage.send_storage_effect(delete).await;
-        assert!(settle_move(&context, &moved, &intents).await.unwrap());
+        assert!(!settle_move(&context, &moved, &intents).await.unwrap());
         let read = StorageEffect::Read {
             key_space: IMPORT_INTENT_KEYSPACE.to_string(),
             key: intents[0].clone().into(),
@@ -2861,7 +2992,7 @@ mod tests {
         };
         assert!(matches!(
             storage.send_storage_effect(read).await,
-            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
         ));
     }
 
