@@ -287,10 +287,9 @@ pub async fn preview_page(
     Ok(page)
 }
 
-/// Unifies the next keys after the job's cursor. A key the caller may not write, or one
-/// written after the job started, keeps its files. Each key changes in one transaction with
-/// the job's progress, and only while the job is stored as read, so a paused or aborted job
-/// changes nothing more.
+/// Unifies the next keys after the job's cursor; keys the caller may not write or written
+/// after the start keep their files. Each key changes with the job's progress, and only while
+/// the job is stored as read, so a paused or aborted job changes nothing more.
 pub async fn job_page(
     context: &DriverContext,
     (bucket, prefix): (&str, &str),
@@ -364,10 +363,9 @@ pub enum Unified {
     Stopped,
 }
 
-/// In one transaction that still reads the same versions and kept file, points the versions
-/// of each copy only this key records at the kept file, moves their copy registrations along,
-/// and queues the release of those copies. With `fence`, the bucket's job must still be
-/// stored as its first value and gets its second.
+/// Points the versions of each copy only this key records at the kept file, with their copy
+/// registrations, and queues the copies' release, in one transaction that rereads them all.
+/// With `fence`, the bucket's job must still be stored as its first value and gets its second.
 pub async fn unify(
     context: &DriverContext,
     (bucket, group_id): (&str, GroupId),

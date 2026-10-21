@@ -250,10 +250,9 @@ fn input(scope: &RemapScope<'_>, pairs: Vec<(String, String)>, apply: bool) -> R
     }
 }
 
-/// Re-maps the next keys after the job's cursor. Keys changed after the job started stay, as
-/// do keys with a reason; a reason for the whole bucket makes the page wait without moving.
-/// The keys move in one transaction with the job's progress, and only while the job is
-/// stored as `job`, so a paused or aborted job moves nothing more.
+/// Re-maps the next keys after the job's cursor; keys changed after the start or with a reason
+/// stay, and a reason for the whole bucket makes the page wait. The keys move with the job's
+/// progress, and only while the job is stored as `job`, so a paused or aborted job stops.
 pub async fn job_page(
     context: &DriverContext,
     plan: &RemapPlan,
