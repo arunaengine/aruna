@@ -443,7 +443,7 @@ pub async fn preview_discovery(
                 if open.is_empty() && (row.key.is_some() || !decodes(rule, &earlier, &path)) =>
             {
                 PreviewFile {
-                    key: row.key.or_else(|| rule.aruna_key(&path)),
+                    key: row_key(rule, &row, &path),
                     version_id: None,
                     claimed: Vec::new(),
                     outcome: FileOutcome::Known,
@@ -451,7 +451,10 @@ pub async fn preview_discovery(
                 }
             }
             // An open write is decided by a run that reads the file; until then it is unresolved.
-            Some(row) if !open.is_empty() => intended(path, open, row.key),
+            Some(row) if !open.is_empty() => {
+                let mapped = row_key(rule, &row, &path);
+                intended(path, open, mapped)
+            }
             _ if !open.is_empty() => intended(path, open, None),
             Some(_) => named(names, path),
             // A file of a shared folder that another rule takes is not listed here.
@@ -464,6 +467,11 @@ pub async fn preview_discovery(
         files.push(file);
     }
     Ok(DiscoveryPreview { files, next })
+}
+
+/// The key a row keeps its file at; an older row without one keeps the rule's own mapping.
+fn row_key(rule: &BackendImport, row: &ImportedObject, path: &str) -> Option<String> {
+    row.key.clone().or_else(|| rule.aruna_key(path))
 }
 
 fn unresolved(path: String, patterns: Vec<String>) -> PreviewFile {
@@ -622,6 +630,16 @@ mod tests {
         assert_eq!(file.outcome, FileOutcome::Conflict(Vec::new()));
         assert_eq!(file.claimed, ["old/a", "in/a"]);
         let file = intended("raw/a".to_string(), &[intent("in/a"), intent("in/b")], None);
+        // An older row without a key is checked by the key the rule gives the file.
+        let legacy = ImportedObject::written(id, String::new(), 1, None);
+        let legacy = ImportedObject {
+            key: None,
+            ..legacy
+        };
+        assert_eq!(
+            row_key(&rule, &legacy, "raw/run/x"),
+            Some("run/x".to_string())
+        );
         assert_eq!(file.outcome, FileOutcome::Conflict(Vec::new()));
     }
 
