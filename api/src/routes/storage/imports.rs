@@ -53,7 +53,8 @@ pub struct CreateImportRequest {
     #[serde(default)]
     pub backend_prefix: String,
     pub bucket: String,
-    /// Folder in the bucket that receives the objects: empty, or a path ending with `/`.
+    /// Folder in the bucket whose uploads go to the linked folder: empty, or a path ending with
+    /// `/`. Files a run finds go to the bucket root or their discovery folder instead.
     #[serde(default)]
     pub key_prefix: String,
     /// Five-field cron expression in UTC; omitted runs only on request.
@@ -248,7 +249,9 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
 - The rule also adds a bucket routing rule that sends writes under `key_prefix` to the write
   backend (`write_backend_id`, else `backend_id`). An existing rule for the same folder must
   already name it.
-- A backend key `backend_prefix` + `x` becomes the bucket key `key_prefix` + `x`.
+- `key_prefix` is where uploads go from. A backend file found by a run, without a recorded
+  mapping, goes to the folder of its discovery rule, else to its path below `backend_prefix`
+  at the bucket root; it never gets `key_prefix`.
 - A new upload to `key_prefix` + `d/n` is stored at the write folder (`write_prefix`, else
   `backend_prefix`) + `write_pattern`, with `{dir}` = `d/`, `{name}` = `n` and `{id}` = the
   version id, so other tools see it. Uploads under the rule's own import folder are not imported
@@ -634,7 +637,8 @@ pub async fn delete_import(
   multipart upload, and on backends that list neither ETag nor time.
 - A changed object gets a new version unless the key was written or deleted in Aruna since;
   Aruna's side always wins.
-- A new object goes where the rule's discovery rules put it, else to `key_prefix` + its path.
+- A new object goes where the rule's discovery rules put it, else to its path below
+  `backend_prefix` at the bucket root, never below `key_prefix`.
   Its key is recorded, so later rule changes never move it. A new object whose key already
   holds another object, or that matches several patterns, fails and is not imported.
 - Imported bytes count toward the group quota like uploaded ones.
