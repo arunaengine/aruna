@@ -135,17 +135,15 @@ pub async fn preview_page(
         .await
         .map_err(read)?;
     let (mut keys, mut scanned, mut cursor) = (Vec::new(), 0usize, after.clone());
-    let mut next = None;
+    let (mut next, mut seen) = (None, None);
     'scan: loop {
         let (page, last) = head_page(context, scope.bucket, &plan.from, cursor.as_deref())
             .await
             .map_err(read)?;
         for (key, _) in &page {
             if keys.len() == limit || scanned == PAGE_SCAN {
-                next = keys
-                    .last()
-                    .cloned()
-                    .or_else(|| readable(scope, cursor.as_deref()));
+                // The cursor is the last key the caller may read, selected or not.
+                next = seen.clone();
                 if next.is_none() {
                     return Err(RenameError::Conflict(
                         "too many keys in a row are hidden from the caller".to_string(),
@@ -155,6 +153,9 @@ pub async fn preview_page(
             }
             scanned += 1;
             cursor = Some(key.clone());
+            if readable(scope, Some(key)).is_some() {
+                seen = Some(key.clone());
+            }
             if shown(plan, scope, filter, key) {
                 keys.push(key.clone());
             }
