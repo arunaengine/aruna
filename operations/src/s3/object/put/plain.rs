@@ -215,12 +215,14 @@ impl PutObjectOperation {
 
     /// Bytes move only once their identity is stored and synced to disk.
     pub(super) fn intent_written(&mut self, event: Event) -> Effects {
+        let syncing = self.state == PutObjectState::SyncIntent;
         match (event, self.pending_write.take()) {
-            (Event::Storage(StorageEvent::BatchWriteResult { .. }), Some(write)) => {
+            (Event::Storage(StorageEvent::BatchWriteResult { .. }), Some(write)) if !syncing => {
                 self.pending_write = Some(write);
+                self.state = PutObjectState::SyncIntent;
                 smallvec![Effect::Storage(StorageEffect::SyncAll)]
             }
-            (Event::Storage(StorageEvent::SyncAllFinished), Some(write)) => {
+            (Event::Storage(StorageEvent::SyncAllFinished), Some(write)) if syncing => {
                 self.state = PutObjectState::WriteBlob;
                 write
             }
@@ -729,6 +731,32 @@ mod tests {
             "expected the intent sync, got {effects:?}"
         );
         operation.step(Event::Storage(StorageEvent::SyncAllFinished))
+    }
+
+    #[test]
+    fn orders_intent_acks() {
+        // A sync answer before the intent write, or a second write answer, is refused.
+        let mut early = operation(DEFAULT_PATTERN);
+        begin(&mut early);
+        early.step(Event::Storage(StorageEvent::SyncAllFinished));
+        let error = early.finalize().unwrap_err();
+        assert_eq!(error, PutObjectError::InvalidOperationState);
+        let mut twice = operation(DEFAULT_PATTERN);
+        begin(&mut twice);
+        let ack = || {
+            Event::Storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
+            })
+        };
+        twice.step(ack());
+        let effects = twice.step(ack());
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Blob(_)))
+        );
+        let error = twice.finalize().unwrap_err();
+        assert_eq!(error, PutObjectError::InvalidOperationState);
     }
 
     #[test]

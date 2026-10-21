@@ -122,6 +122,8 @@ pub enum PutObjectState {
     ReadImportRule,
     /// Records what a write to an import folder will be before its bytes move.
     WriteIntent,
+    /// Syncs that intent to disk before the bytes move.
+    SyncIntent,
     /// Reads the version a history write registers, inside the version transaction.
     ReadHistory,
     /// Deletes the write intents the committed version makes obsolete.
@@ -1949,7 +1951,7 @@ impl Operation for PutObjectOperation {
                 self.plain_written(event)
             }
             PutObjectState::ReadImportRule => self.import_rule_read(event),
-            PutObjectState::WriteIntent => self.intent_written(event),
+            PutObjectState::WriteIntent | PutObjectState::SyncIntent => self.intent_written(event),
             PutObjectState::DropIntent | PutObjectState::SyncDroppedIntent => {
                 self.intent_dropped(event)
             }

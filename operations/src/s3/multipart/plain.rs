@@ -273,12 +273,14 @@ impl CompleteUploadOperation {
 
     /// The compose waits until its intent is synced to disk.
     pub(super) fn intent_written(&mut self, event: Event) -> Effects {
+        let syncing = self.state == CompleteUploadState::SyncIntent;
         match (event, self.pending_compose.take()) {
-            (Event::Storage(StorageEvent::BatchWriteResult { .. }), Some(compose)) => {
+            (Event::Storage(StorageEvent::BatchWriteResult { .. }), Some(compose)) if !syncing => {
                 self.pending_compose = Some(compose);
+                self.state = CompleteUploadState::SyncIntent;
                 smallvec![Effect::Storage(StorageEffect::SyncAll)]
             }
-            (Event::Storage(StorageEvent::SyncAllFinished), Some(compose)) => {
+            (Event::Storage(StorageEvent::SyncAllFinished), Some(compose)) if syncing => {
                 self.state = CompleteUploadState::ComposeBlob;
                 compose
             }
@@ -699,6 +701,21 @@ mod tests {
             }
             _ => effects,
         }
+    }
+
+    #[test]
+    fn orders_intent_acks() {
+        // The compose waits for the intent write and then its sync, each answered once.
+        let mut operation = operation(DEFAULT_PATTERN);
+        let effects = operation.compose_blob();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchWrite { .. })]
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+        let compose = |effect: &Effect| matches!(effect, Effect::Blob(BlobEffect::Compose { .. }));
+        assert!(!effects.iter().any(compose), "{effects:?}");
+        assert_ne!(operation.state, CompleteUploadState::ComposeBlob);
     }
 
     #[test]

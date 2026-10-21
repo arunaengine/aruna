@@ -107,6 +107,8 @@ pub enum CompleteUploadState {
     ReadImportRule,
     /// Records what a plain object will be before its bytes reach the path.
     WriteIntent,
+    /// Syncs that record to disk before the compose.
+    SyncIntent,
     /// Deletes that record in the version transaction.
     RetireIntent,
     /// Deletes the record of a compose the provider refused before any byte moved.
@@ -2360,7 +2362,9 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::WriteObjectMetadata => self.metadata_written(event),
             CompleteUploadState::DeleteUploadRecords => self.records_deleted(event),
             CompleteUploadState::ReadImportRule => self.import_rule_read(event),
-            CompleteUploadState::WriteIntent => self.intent_written(event),
+            CompleteUploadState::WriteIntent | CompleteUploadState::SyncIntent => {
+                self.intent_written(event)
+            }
             CompleteUploadState::RetireIntent => self.intent_retired(event),
             CompleteUploadState::WriteEvidence => self.evidence_written(event),
             CompleteUploadState::DropIntent | CompleteUploadState::SyncDroppedIntent => {
