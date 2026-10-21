@@ -11,7 +11,8 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, JobResultPayload};
@@ -24,8 +25,8 @@ use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportSpec, DEFAULT_PATTERN, PlainPath,
 };
 use aruna_core::structs::storage::blob::{
-    Backend, BackendConfig, BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer,
-    ResolvedBackend,
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
+    CurrentVersionPointer, ResolvedBackend, VersionKey,
 };
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::discovery::DiscoveryRule;
@@ -49,7 +50,9 @@ use aruna_operations::groups::imports::discovery::{
 };
 use aruna_operations::jobs::backend_import::run_backend_import;
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use aruna_operations::jobs::store::{ClaimOutcome, claim_job, insert_job, transition_to_running};
+use aruna_operations::jobs::store::{
+    ClaimOutcome, claim_job, insert_job, iter_prefix_page, transition_to_running,
+};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::purge_fence::acquire_purge_fence;
@@ -447,53 +450,139 @@ async fn current(context: &TestContext, key: &str) -> Option<Ulid> {
 #[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
 async fn s3_finds_copies() {
     // A plain file with the bytes of a recovered upload of its key is that version's second
-    // copy, which the duplicates preview lists; other bytes stay a conflict.
+    // copy; the cleanup keeps the plain file and deletes the one named by the version's id.
     let context = setup_pattern("{dir}{id}_{name}").await;
-    let (id, other) = (Ulid::generate(), Ulid::generate());
+    let id = Ulid::generate();
     place(&context, &format!("old/{id}_sample.faa.gz"), b"same bytes").await;
     place(&context, "old/sample.faa.gz", b"same bytes").await;
-    place(&context, &format!("old/{other}_x.txt"), b"first").await;
-    place(&context, "old/x.txt", b"second").await;
-    assert_eq!(run_import(&context, 0xC3).await, (3, 0, 1));
+    assert_eq!(run_import(&context, 0xC3).await, (2, 0, 0));
     assert_eq!(current(&context, "old/sample.faa.gz").await, Some(id));
-    assert_eq!(current(&context, "old/x.txt").await, Some(other));
-    // A second run knows both copies.
-    assert_eq!(run_import(&context, 0xD4).await, (0, 3, 1));
+    assert_eq!(run_import(&context, 0xD4).await, (0, 2, 0));
 
-    let scope = (context.auth.realm_id, context.group_id, context.node_id);
-    let access = BucketAccess::load(&context.driver, &context.auth, scope, BUCKET)
-        .await
-        .unwrap();
-    let page = preview_page(&context.driver, (BUCKET, ""), &access, (None, None, 100))
-        .await
-        .unwrap();
+    let page = duplicates(&context).await;
     assert_eq!((page.keys, page.bytes), (1, 10));
     let [found] = page.entries.as_slice() else {
         panic!("expected one key with copies: {page:?}")
     };
     assert_eq!(found.key, "old/sample.faa.gz");
-    assert!(
-        found
-            .keep
-            .backend_path
-            .ends_with(&format!("old/{id}_sample.faa.gz"))
-    );
+    assert!(found.keep.backend_path.ends_with("raw/old/sample.faa.gz"));
     let [copy] = found.copies.as_slice() else {
         panic!("expected one copy: {found:?}")
     };
-    assert!(copy.backend_path.ends_with("raw/old/sample.faa.gz"));
-    // The cleanup lets the key keep one file, and the preview has nothing left to tidy.
+    let named = format!("old/{id}_sample.faa.gz");
+    assert!(copy.backend_path.ends_with(&named));
     let bucket = (BUCKET, context.group_id);
     let unified = unify(&context.driver, bucket, found, None).await.unwrap();
     assert_eq!(unified, Unified::Done);
-    let page = preview_page(&context.driver, (BUCKET, ""), &access, (None, None, 100))
-        .await
-        .unwrap();
-    assert_eq!((page.keys, page.entries.len()), (0, 0));
-    // The queued release runs; the storage keeps no exact versions, so the files stay
-    // recorded and the next run changes nothing.
+    assert_eq!(duplicates(&context).await.keys, 0);
+    // The storage keeps no versions; the file named by the id goes all the same.
     process_cleanup_batch(&context.driver).await.unwrap();
-    assert_eq!(run_import(&context, 0xE5).await, (0, 3, 1));
+    assert!(!exists(&context, &named).await);
+    assert!(exists(&context, "old/sample.faa.gz").await);
+    assert_eq!(
+        content(&context, "old/sample.faa.gz", id).await,
+        b"same bytes"
+    );
+    assert_eq!(run_import(&context, 0xE5).await, (0, 1, 0));
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_orders_conflicts() {
+    // A plain file with other bytes than its key's upload becomes another version, dated by
+    // its modification time; the newest is current, and a rerun adds nothing.
+    let context = setup_pattern("{dir}{id}_{name}").await;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let older = Ulid::from_parts(now - 3_600_000, 1);
+    let newer = Ulid::from_parts(now + 3_600_000, 1);
+    place(&context, &format!("old/{older}_x.txt"), b"first").await;
+    place(&context, "old/x.txt", b"second").await;
+    place(&context, &format!("old/{newer}_y.txt"), b"first").await;
+    place(&context, "old/y.txt", b"second").await;
+    assert_eq!(run_import(&context, 0xC3).await, (4, 0, 0));
+    let x = versions(&context, "old/x.txt").await;
+    assert_eq!((x.len(), x[0]), (2, older));
+    assert_eq!(current(&context, "old/x.txt").await, Some(x[1]));
+    assert_eq!(content(&context, "old/x.txt", x[1]).await, b"second");
+    let y = versions(&context, "old/y.txt").await;
+    assert_eq!((y.len(), y[1]), (2, newer));
+    assert_eq!(current(&context, "old/y.txt").await, Some(newer));
+    assert_eq!(run_import(&context, 0xD4).await, (0, 4, 0));
+    assert_eq!(versions(&context, "old/x.txt").await, x);
+}
+
+/// The version ids of `key` in order.
+async fn versions(context: &TestContext, key: &str) -> Vec<Ulid> {
+    let prefix = VersionKey::object_prefix(BUCKET, key).unwrap();
+    let (rows, _) = iter_prefix_page(
+        &context.driver.storage_handle,
+        BLOB_VERSIONS_KEYSPACE,
+        Some(prefix.into()),
+        None,
+        100,
+        None,
+    )
+    .await
+    .unwrap();
+    rows.iter()
+        .map(|(key, _)| VersionKey::from_bytes(key).unwrap().version_id)
+        .collect()
+}
+
+/// Whether the rule's folder holds `name`.
+async fn exists(context: &TestContext, name: &str) -> bool {
+    let stat = BlobEffect::StatPlain {
+        backend: BackendRef::Group(context.rule.backend_id),
+        path: format!("{}/raw/{name}", context.folder),
+    };
+    let blob = context.driver.blob_handle.as_ref().unwrap();
+    match blob.send_blob_effect(stat).await {
+        Event::Blob(BlobEvent::PlainStat { exists, .. }) => exists,
+        other => panic!("stat failed: {other:?}"),
+    }
+}
+
+/// The bytes version `id` of `key` reads.
+async fn content(context: &TestContext, key: &str, id: Ulid) -> Vec<u8> {
+    let storage = &context.driver.storage_handle;
+    let read = |space: &str, key: Vec<u8>| StorageEffect::Read {
+        key_space: space.to_string(),
+        key: key.into(),
+        txn_id: None,
+    };
+    let version = VersionKey::new(BUCKET, key, id).to_bytes().unwrap();
+    let event = storage
+        .send_storage_effect(read(BLOB_VERSIONS_KEYSPACE, version))
+        .await;
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(value), ..
+    }) = event
+    else {
+        panic!("version read failed: {event:?}")
+    };
+    let version = BlobVersion::from_bytes(&value).unwrap();
+    let key = version.location_key().unwrap().to_bytes();
+    let event = storage
+        .send_storage_effect(read(BLOB_LOCATIONS_KEYSPACE, key))
+        .await;
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(value), ..
+    }) = event
+    else {
+        panic!("location read failed: {event:?}")
+    };
+    let location = BackendLocation::from_bytes(&value).unwrap();
+    let blob = context.driver.blob_handle.as_ref().unwrap();
+    let Event::Blob(BlobEvent::ReadFinished { blob, .. }) =
+        blob.send_blob_effect(BlobEffect::Read { location }).await
+    else {
+        panic!("read failed")
+    };
+    let chunks: Vec<bytes::Bytes> = futures_util::TryStreamExt::try_collect(blob).await.unwrap();
+    chunks.concat()
 }
 
 /// The duplicates preview of the whole bucket.
@@ -530,7 +619,7 @@ async fn s3_replaces_copies() {
     // A cleanup found before the overwrite leaves the new version's file alone.
     let bucket = (BUCKET, context.group_id);
     let unified = unify(&context.driver, bucket, found, None).await.unwrap();
-    assert_eq!(unified, Unified::Kept);
+    assert_eq!(unified, Unified::Changed);
     assert_eq!(run_import(&context, 0xE5).await, (0, 2, 0));
     assert_eq!(current(&context, "old/a.txt").await, replaced);
 }
@@ -588,15 +677,20 @@ async fn s3_unifies_uploads() {
         quota_ceiling: None,
         routing,
     });
-    drive(put, &context.driver).await.unwrap();
+    let upload = drive(put, &context.driver).await.unwrap().version_id;
     let page = duplicates(&context).await;
     let [found] = page.entries.as_slice() else {
         panic!("expected one key with copies: {page:?}")
     };
-    // The upload has the name the rule's pattern gives it, so the imported raw copy goes.
-    assert!(found.copies[0].backend_path.ends_with("raw/x.txt"));
+    // The imported file keeps its plain name; the upload's file, named by its id, goes.
+    assert!(found.keep.backend_path.ends_with("raw/x.txt"));
+    let named = format!("x.txt~{upload}");
+    assert!(found.copies[0].backend_path.ends_with(&named));
     let bucket = (BUCKET, context.group_id);
     let unified = unify(&context.driver, bucket, found, None).await.unwrap();
     assert_eq!(unified, Unified::Done);
     assert_eq!(duplicates(&context).await.keys, 0);
+    process_cleanup_batch(&context.driver).await.unwrap();
+    assert!(!exists(&context, &named).await);
+    assert_eq!(content(&context, "x.txt", upload).await, b"abc");
 }
