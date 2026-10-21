@@ -1072,6 +1072,16 @@ mod tests {
             let Some(effects) = records(&mut operation, &[]) else {
                 panic!("expected the trail read")
             };
+            // The bucket's creation row comes first and names the incarnation.
+            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
+            else {
+                panic!("expected the creation read, got {effects:?}")
+            };
+            assert_eq!(key_space, aruna_core::keyspaces::BUCKET_CREATION_KEYSPACE);
+            let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: Vec::new().into(),
+                value: None,
+            }));
             let [
                 Effect::Storage(StorageEffect::Iter {
                     key_space, txn_id, ..
@@ -1512,7 +1522,11 @@ mod tests {
             (put, effects)
         };
         // Nothing registered yet: the delete trail is read, then the head moves as usual.
-        let (mut put, effects) = found(None);
+        let (mut put, _) = found(None);
+        let effects = put.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        }));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Iter { key_space, .. })]

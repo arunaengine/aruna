@@ -8,8 +8,8 @@ use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, DELETE_TRAIL_KEYSPACE, IMPORT_INTENT_KEYSPACE,
-    IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, BUCKET_CREATION_KEYSPACE, DELETE_TRAIL_KEYSPACE,
+    IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::HASH_MD5;
@@ -21,7 +21,7 @@ use aruna_core::structs::storage::backend_import::{
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
-    ResolvedBackend, VersionKey, bucket_permission_path, ensure_confined_path,
+    ResolvedBackend, VersionKey, bucket_permission_path, ensure_confined_path, incarnation,
 };
 use aruna_core::structs::storage::delete_audit::BlobAuditRecord;
 use aruna_core::structs::storage::discovery::{
@@ -109,6 +109,8 @@ struct ImportRun {
     earlier: Vec<String>,
     backend: GroupStorage,
     bucket: BucketInfo,
+    /// The bucket incarnation the run started on, whose delete trail it reads.
+    incarnation: u128,
     routing: RoutingSnapshot,
     quota: Option<u64>,
     gate: Option<GateContext>,
@@ -293,6 +295,14 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
         }
         Err(error) => return Err(retryable(error)),
     };
+    let creation = [(
+        BUCKET_CREATION_KEYSPACE,
+        rule.bucket.as_bytes().to_vec().into(),
+    )];
+    let [creation] = read_values(&ctx.driver, creation)
+        .await
+        .map_err(|(ItemError::Item(error) | ItemError::System(error))| retryable(error))?;
+    let incarnation = incarnation(creation.as_ref().map(|value| value.as_ref()));
     let realm_id = spec.auth_context.realm_id;
     let allowed = drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
@@ -327,6 +337,7 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
         earlier,
         backend,
         bucket,
+        incarnation,
         routing,
         quota,
         gate,
@@ -1090,7 +1101,7 @@ async fn deleted_on_purpose(
     key: &str,
     id: Ulid,
 ) -> Result<bool, ItemError> {
-    trail_of(context, &run.rule, run.bucket.incarnation(), key, id).await
+    trail_of(context, &run.rule, run.incarnation, key, id).await
 }
 
 async fn trail_of(

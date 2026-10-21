@@ -344,8 +344,6 @@ pub struct CompleteUploadOperation {
     written_intent: Vec<Key>,
     /// The record or hash write in flight, in one transaction with a read of its rule.
     fence: Option<crate::s3::object::put::fenced::FencedWrite>,
-    /// The incarnation of the bucket as the gate read it; its delete trail is the bucket's own.
-    incarnation: u128,
     /// The rules that read the composed path, as the finalize transaction reads them.
     readers: crate::s3::object::put::ReaderScan,
 }
@@ -405,7 +403,6 @@ impl CompleteUploadOperation {
             written_intent: Vec::new(),
             fence: None,
             readers: Default::default(),
-            incarnation: 0,
         }
     }
 
@@ -999,7 +996,6 @@ impl CompleteUploadOperation {
             Ok(bucket) => bucket,
             Err(error) => return self.schedule_error(error.into()),
         };
-        self.incarnation = bucket.as_ref().map_or(0, BucketInfo::incarnation);
         self.compression = bucket
             .as_ref()
             .map(|bucket| bucket.compression)

@@ -185,6 +185,8 @@ pub const S3_SESSION_KEYSPACE: &str = "s3_sessions";
 pub const SESSION_OWNER_KEYSPACE: &str = "s3_session_owner";
 pub const SESSION_EXPIRY_KEYSPACE: &str = "s3_session_expiry";
 pub const S3_BUCKET_KEYSPACE: &str = "s3_buckets";
+/// The creation id of each bucket by name, fresh on every creation of the name.
+pub const BUCKET_CREATION_KEYSPACE: &str = "s3_bucket_creations";
 pub const RELATIONSHIP_OUT_KEYSPACE: &str = "sync_relationship_out";
 pub const RELATIONSHIP_IN_KEYSPACE: &str = "sync_relationship_in";
 pub const MIRROR_REPAIR_KEYSPACE: &str = "sync_mirror_repair";
@@ -473,6 +475,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SESSION_OWNER_KEYSPACE,
     SESSION_EXPIRY_KEYSPACE,
     S3_BUCKET_KEYSPACE,
+    BUCKET_CREATION_KEYSPACE,
     RELATIONSHIP_OUT_KEYSPACE,
     RELATIONSHIP_IN_KEYSPACE,
     MIRROR_REPAIR_KEYSPACE,

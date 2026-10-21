@@ -1786,10 +1786,19 @@ fn writer_reads_trail() {
         op.version_id = Some(Ulid::generate());
         op.txn_id = Some(Ulid::generate());
         op.state = PutObjectState::ReadHistory;
-        // The version is not registered, so the trail is read before the head moves.
+        // The version is not registered, so the trail is read before the head moves, in the
+        // incarnation the bucket's creation row names.
         let effects = op.history_read(Event::Storage(StorageEvent::ReadResult {
             key: vec![0].into(),
             value: None,
+        }));
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the creation read, got {effects:?}")
+        };
+        assert_eq!(key_space, aruna_core::keyspaces::BUCKET_CREATION_KEYSPACE);
+        let effects = op.trail_read(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0].into(),
+            value: Some(5u128.to_be_bytes().to_vec().into()),
         }));
         let [
             Effect::Storage(StorageEffect::Iter {
@@ -1849,27 +1858,13 @@ fn writer_reads_trail() {
         panic!("expected the head write, got {effects:?}")
     };
     assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
-    // The trail is read in the incarnation of the bucket the write goes to.
+    // The purges are read in the incarnation the creation row named.
     let mut op = writer();
-    let bucket = BucketInfo {
-        group_id,
-        created_at: std::time::UNIX_EPOCH + std::time::Duration::from_millis(5),
-        created_by: op.config.user_id,
-        cors_configuration: None,
-        storage_routing: Vec::new(),
-        placement_policies: Vec::new(),
-        placement_policy_generation: 0,
-        compression: Compression::Off,
-    };
-    let incarnation = bucket.incarnation();
-    op.expected_bucket = Some(bucket);
     let effects = op.trail_read(page(Vec::new()));
     let [Effect::Storage(StorageEffect::Iter { prefix, .. })] = effects.as_slice() else {
         panic!("expected the purge read, got {effects:?}")
     };
-    let bucket = op.config.request.bucket.as_str();
-    let purges =
-        aruna_core::structs::storage::delete_audit::purge_prefix(group_id, bucket, incarnation);
+    let purges = aruna_core::structs::storage::delete_audit::purge_prefix(group_id, "mybucket", 5);
     assert_eq!(*prefix, Some(purges.into()));
 }
 

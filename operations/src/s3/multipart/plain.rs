@@ -429,12 +429,17 @@ impl CompleteUploadOperation {
         else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
-        let bucket = (self.input.bucket.as_str(), self.incarnation);
-        let ranges = trail_ranges(record.group_id, bucket, &self.input.key);
+        let group_id = record.group_id;
         let scan = self
             .trail_scan
             .get_or_insert_with(|| TrailScan::new(version_id));
         scan.writer = true;
+        let Some(incarnation) = scan.incarnation else {
+            self.state = CompleteUploadState::ReadTrail;
+            return smallvec![TrailScan::creation_read(&self.input.bucket, self.txn_id)];
+        };
+        let bucket = (self.input.bucket.as_str(), incarnation);
+        let ranges = trail_ranges(group_id, bucket, &self.input.key);
         let Some(prefix) = ranges.get(scan.range).cloned() else {
             let existing = self.existing_pointer.clone();
             return self.write_head(existing.as_ref(), version_id);
@@ -451,6 +456,13 @@ impl CompleteUploadOperation {
     }
 
     pub(super) fn trail_read(&mut self, event: Event) -> Effects {
+        let creation = self
+            .trail_scan
+            .as_mut()
+            .map(|scan| scan.take_creation(&event));
+        if creation == Some(true) {
+            return self.writer_trail();
+        }
         let (values, next) = match event {
             Event::Storage(StorageEvent::IterResult {
                 values,
@@ -870,7 +882,11 @@ mod tests {
             (operation, effects)
         };
         // An unregistered version reads the delete trail before its head moves.
-        let (mut operation, effects) = found(None, false);
+        let (mut operation, _) = found(None, false);
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        }));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Iter { key_space, .. })]

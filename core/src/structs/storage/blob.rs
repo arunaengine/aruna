@@ -704,14 +704,14 @@ pub struct BucketInfo {
     pub compression: Compression,
 }
 
-impl BucketInfo {
-    /// The creation time in nanoseconds, which tells one bucket of a name from a later one;
-    /// its delete trail is kept per incarnation.
-    pub fn incarnation(&self) -> u128 {
-        let since = self.created_at.duration_since(SystemTime::UNIX_EPOCH);
-        since.map_or(0, |since| since.as_nanos())
-    }
+/// The incarnation of a bucket from its creation row, which tells one bucket of a name from
+/// a later one; a bucket created before creation rows were kept is incarnation 0.
+pub fn incarnation(creation: Option<&[u8]>) -> u128 {
+    let id = creation.and_then(|value| <[u8; 16]>::try_from(value).ok());
+    id.map_or(0, u128::from_be_bytes)
+}
 
+impl BucketInfo {
     /// The only ingress that changes the bucket default ref set.
     pub fn with_policies(
         mut self,

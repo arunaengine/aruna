@@ -114,7 +114,7 @@ fn audit_record(effects: &[Effect]) -> aruna_core::structs::storage::delete_audi
 
 #[test]
 fn reads_audit_bucket() {
-    // Without a known incarnation the bucket is read in the delete transaction first.
+    // Without a known incarnation the creation row is read in the delete transaction first.
     let mut operation = audit_op(None);
     operation.version_id = Some(Ulid::generate());
     operation.incarnation = None;
@@ -127,20 +127,10 @@ fn reads_audit_bucket() {
     else {
         panic!("expected the bucket read, got {effects:?}")
     };
-    assert_eq!(key_space, S3_BUCKET_KEYSPACE);
+    assert_eq!(key_space, aruna_core::keyspaces::BUCKET_CREATION_KEYSPACE);
     assert_eq!(*txn_id, operation.txn_id);
     assert_eq!(operation.state, DeleteObjectState::ReadAuditBucket);
-    let bucket = BucketInfo {
-        group_id: operation.input.group_id,
-        created_at: std::time::UNIX_EPOCH + std::time::Duration::from_nanos(INCARNATION as u64),
-        created_by: test_user_id(),
-        cors_configuration: None,
-        storage_routing: Vec::new(),
-        placement_policies: Vec::new(),
-        placement_policy_generation: 0,
-        compression: aruna_core::structs::storage::format::Compression::Off,
-    };
-    let value = Some(bucket.to_bytes().unwrap().into());
+    let value = Some(INCARNATION.to_be_bytes().to_vec().into());
     let effects = operation.audit_bucket_read(Event::Storage(StorageEvent::ReadResult {
         key: vec![0].into(),
         value,

@@ -4,7 +4,8 @@
 
 use super::*;
 use aruna_core::effects::IterStart;
-use aruna_core::keyspaces::DELETE_TRAIL_KEYSPACE;
+use aruna_core::keyspaces::{BUCKET_CREATION_KEYSPACE, DELETE_TRAIL_KEYSPACE};
+use aruna_core::structs::storage::blob::incarnation;
 use aruna_core::structs::storage::delete_audit::{
     BlobAuditKind, BlobAuditRecord, BlobPurgeKind, delete_prefix, purge_prefix,
 };
@@ -78,6 +79,8 @@ pub(crate) struct TrailScan {
     pub(crate) range: usize,
     /// The original write of the version, which only an exact removal refuses.
     pub(crate) writer: bool,
+    /// The bucket incarnation, read in the transaction before the first page.
+    pub(crate) incarnation: Option<u128>,
 }
 
 impl TrailScan {
@@ -88,7 +91,29 @@ impl TrailScan {
             trail: Trail::Clean,
             range: 0,
             writer: false,
+            incarnation: None,
         }
+    }
+
+    /// Reads the bucket's creation row in the transaction, so a recreation meanwhile conflicts.
+    pub(crate) fn creation_read(bucket: &str, txn_id: Option<Ulid>) -> Effect {
+        Effect::Storage(StorageEffect::Read {
+            key_space: BUCKET_CREATION_KEYSPACE.to_string(),
+            key: bucket.as_bytes().to_vec().into(),
+            txn_id,
+        })
+    }
+
+    /// Takes the creation row; `false` when the event is not that answer.
+    pub(crate) fn take_creation(&mut self, event: &Event) -> bool {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return false;
+        };
+        let fresh = self.incarnation.is_none();
+        if fresh {
+            self.incarnation = Some(incarnation(value.as_ref().map(|value| value.as_ref())));
+        }
+        fresh
     }
 
     /// Where a page of `prefix` starts. The original write needs only the deletes of its key
@@ -116,7 +141,12 @@ impl PutObjectOperation {
     pub(super) fn trail_page(&mut self, txn_id: Ulid) -> Option<Effects> {
         let scan = self.trail_scan.as_ref()?;
         let request = &self.config.request;
-        let bucket = (request.bucket.as_str(), self.incarnation());
+        let Some(incarnation) = scan.incarnation else {
+            let read = TrailScan::creation_read(&request.bucket, Some(txn_id));
+            self.state = PutObjectState::ReadTrail;
+            return Some(smallvec![read]);
+        };
+        let bucket = (request.bucket.as_str(), incarnation);
         let ranges = trail_ranges(self.config.group_id, bucket, &request.key);
         let prefix = ranges.get(scan.range)?.clone();
         self.state = PutObjectState::ReadTrail;
@@ -133,6 +163,15 @@ impl PutObjectOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(PutObjectError::NoTransactionFound);
         };
+        let Some(scan) = self.trail_scan.as_mut() else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        if scan.take_creation(&event) {
+            return match scan.writer {
+                true => self.writer_trail(txn_id),
+                false => self.write_cleanup_row(txn_id),
+            };
+        }
         let (values, next) = match event {
             Event::Storage(StorageEvent::IterResult {
                 values,

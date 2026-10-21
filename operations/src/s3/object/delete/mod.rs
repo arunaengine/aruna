@@ -17,15 +17,15 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DELETE_AUDIT_KEYSPACE,
-    DELETE_TRAIL_KEYSPACE, OBJECT_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_CREATION_KEYSPACE,
+    DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE, OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    BucketInfo, CopyOwner, CurrentVersionPointer, VersionKey,
+    CopyOwner, CurrentVersionPointer, VersionKey, incarnation,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::delete_audit::{
@@ -70,7 +70,7 @@ pub enum DeleteObjectState {
     WriteBlobVersion,
     WriteReplicationObligation,
     UpdateUsage,
-    /// Reads the bucket for the incarnation its delete trail belongs to.
+    /// Reads the bucket's creation row for the incarnation its delete trail belongs to.
     ReadAuditBucket,
     WriteDeleteAudit,
     CommitTransaction,
@@ -901,7 +901,7 @@ impl DeleteObjectOperation {
         let Some(incarnation) = self.incarnation else {
             self.state = DeleteObjectState::ReadAuditBucket;
             return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key_space: BUCKET_CREATION_KEYSPACE.to_string(),
                 key: self.input.bucket.as_bytes().to_vec().into(),
                 txn_id: Some(txn_id),
             })];
@@ -948,16 +948,8 @@ impl DeleteObjectOperation {
             Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
             _ => return self.emit_error(DeleteObjectError::InvalidOperationState),
         };
-        let bucket = value
-            .map(|value| BucketInfo::from_bytes(value.as_ref()))
-            .transpose();
-        match bucket {
-            Ok(bucket) => {
-                self.incarnation = Some(bucket.as_ref().map_or(0, BucketInfo::incarnation));
-                self.write_delete_audit()
-            }
-            Err(error) => self.emit_error(error.into()),
-        }
+        self.incarnation = Some(incarnation(value.as_ref().map(|value| value.as_ref())));
+        self.write_delete_audit()
     }
 
     fn handle_delete_audit(&mut self, event: Event) -> Effects {

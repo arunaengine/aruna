@@ -6,10 +6,12 @@ use std::collections::BTreeSet;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    BUCKET_CREATION_KEYSPACE, DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::structs::execution::job::{JobError, JobProgress, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::blob::incarnation;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::delete_audit::{
     BlobAuditKind, BlobAuditRecord, BlobPurgeKind, delete_audit_key, trail_key,
@@ -76,7 +78,12 @@ async fn run_fenced_purge(
     .await
     {
         Ok(info) if info.group_id == spec.group_id => {
-            incarnation = Some(info.incarnation());
+            let storage = &ctx.driver.storage_handle;
+            incarnation = read_incarnation(storage, spec.scope.bucket(), None)
+                .await
+                .map_err(|event| {
+                    JobError::retryable(format!("purge bucket read failed: {event:?}"))
+                })?;
             true
         }
         Ok(_) => {
@@ -218,6 +225,30 @@ fn audit_rows(
     writes
 }
 
+/// The incarnation of `bucket` while it exists, from its row and its creation row.
+async fn read_incarnation(
+    storage: &aruna_storage::storage::StorageHandle,
+    bucket: &str,
+    txn_id: Option<ulid::Ulid>,
+) -> Result<Option<u128>, Event> {
+    let key: aruna_core::types::Key = bucket.as_bytes().to_vec().into();
+    let read = StorageEffect::BatchRead {
+        reads: vec![
+            (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
+            (BUCKET_CREATION_KEYSPACE.to_string(), key),
+        ],
+        txn_id,
+    };
+    match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::BatchReadResult { values }) if values.len() == 2 => {
+            let (bucket, creation) = (&values[0].1, &values[1].1);
+            let creation = creation.as_ref().map(|value| value.as_ref());
+            Ok(bucket.as_ref().map(|_| incarnation(creation)))
+        }
+        other => Err(other),
+    }
+}
+
 /// Records the completed purge once. The job id is the record id, so a
 /// re-driven job overwrites its own row instead of adding a second one.
 async fn write_purge_audit(
@@ -237,16 +268,9 @@ async fn write_purge_audit(
         other => return Err(failed(other).into()),
     };
     // The bucket is read in the transaction, so its removal or replacement meanwhile conflicts.
-    let read = StorageEffect::Read {
-        key_space: S3_BUCKET_KEYSPACE.to_string(),
-        key: spec.scope.bucket().as_bytes().to_vec().into(),
-        txn_id: Some(txn_id),
-    };
-    let current = match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .and_then(|value| BucketInfo::from_bytes(value.as_ref()).ok())
-            .map(|info| info.incarnation()),
-        other => {
+    let current = match read_incarnation(storage, spec.scope.bucket(), Some(txn_id)).await {
+        Ok(current) => current,
+        Err(other) => {
             let abort = StorageEffect::AbortTransaction { txn_id };
             storage.send_storage_effect(abort).await;
             return Err(failed(other).into());

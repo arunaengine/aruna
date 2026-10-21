@@ -316,8 +316,6 @@ pub struct PutObjectOperation {
     trail_scan: Option<trail::TrailScan>,
     rule_scan: Option<sharing::RuleScan>,
     readers: sharing::ReaderScan,
-    /// The incarnation of the bucket as the gate read it; its delete trail is the bucket's own.
-    gate_incarnation: u128,
 }
 
 impl PutObjectOperation {
@@ -373,7 +371,6 @@ impl PutObjectOperation {
             trail_scan: None,
             rule_scan: None,
             readers: sharing::ReaderScan::default(),
-            gate_incarnation: 0,
         }
     }
 
@@ -606,7 +603,6 @@ impl PutObjectOperation {
             Ok(bucket) => bucket,
             Err(error) => return self.emit_error(error.into()),
         };
-        self.gate_incarnation = bucket.as_ref().map_or(0, BucketInfo::incarnation);
         let refs = match union_refs(
             &GatedBucket::observe(bucket.as_ref()).policies,
             &self.inherited_policies,
@@ -1937,12 +1933,6 @@ impl PutObjectOperation {
 
     fn get_written_location(&self) -> Option<&BackendLocation> {
         self.written_location.as_ref()
-    }
-
-    /// The bucket incarnation the version goes to: the one an import checks, else the gate's.
-    fn incarnation(&self) -> u128 {
-        let expected = self.expected_bucket.as_ref().map(BucketInfo::incarnation);
-        expected.unwrap_or(self.gate_incarnation)
     }
 }
 
