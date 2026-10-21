@@ -15,19 +15,20 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BROKEN_VERSION_KEYSPACE,
-    BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
-    JOB_KEYSPACE, MANAGED_COPY_KEYSPACE, PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE,
-    RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BROKEN_VERSION_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE, JOB_KEYSPACE, MANAGED_COPY_KEYSPACE, PATHS_INDEX_KEYSPACE,
+    PURGE_FENCE_KEYSPACE, RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE,
+    UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::job_record_key;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::backend_import::{BackendImport, ImportedObject, object_prefix};
+use aruna_core::structs::storage::backend_import::{BackendImport, ImportedObject, object_key};
 use aruna_core::structs::storage::blob::{
-    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, HashIndex,
-    ManagedCopyRecord, VersionKey, ensure_confined_path,
+    BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
+    CurrentVersionPointer, HashIndex, ManagedCopyRecord, VersionKey, ensure_confined_path,
 };
 use aruna_core::structs::storage::format::{CompressionMigration, EncodingClass};
 use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
@@ -61,6 +62,8 @@ pub struct RenameInput {
     pub keys: Option<Vec<String>>,
     /// `false` only plans and changes nothing.
     pub apply: bool,
+    /// Explicit new keys by old key; when not empty, `from`, `to` and `keys` are not used.
+    pub pairs: Vec<(String, String)>,
 }
 
 /// One planned key move.
@@ -104,6 +107,17 @@ pub enum RenameError {
     Conversion(#[from] ConversionError),
     #[error("unexpected event in state {0}")]
     Unexpected(&'static str),
+}
+
+/// Why `to` cannot be a key, if it cannot.
+pub fn check_target(to: &str) -> Result<(), String> {
+    if to.is_empty() {
+        return Err("the new key would be empty".to_string());
+    }
+    if to.len() > MAX_KEY_LEN {
+        return Err(format!("the new key `{to}` is too long"));
+    }
+    ensure_confined_path(Path::new(to)).map_err(|error| error.to_string())
 }
 
 /// Where `key` goes when the folder `from` becomes `to`; `None` outside `from`.
@@ -159,7 +173,6 @@ enum ScanKind {
     Target(usize),
     Copies(usize),
     Broken(usize),
-    Rows(usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,6 +218,8 @@ enum RenameState {
     Scan,
     Runs,
     Heads,
+    Locations,
+    Rows,
     Index,
     Delete,
     Write,
@@ -222,10 +237,14 @@ pub struct RenameKeysOperation {
     scans: VecDeque<Scan>,
     scan: Option<Scan>,
     rules: Vec<BackendImport>,
+    /// The new key of each old key of `pairs`.
+    targets: HashMap<String, String>,
     /// Keys of the bucket with an open multipart upload, which would write the old key.
     uploads: HashSet<String>,
     items: Vec<RenameItem>,
     found: Vec<Found>,
+    /// The rows the transaction reads for the linked files of the keys: item, rule and path.
+    row_reads: Option<Vec<(usize, usize, String)>>,
     truncated: bool,
     writes: Vec<(String, Key, Value)>,
     output: Option<Result<RenamePlan, RenameError>>,
@@ -233,8 +252,10 @@ pub struct RenameKeysOperation {
 
 impl RenameKeysOperation {
     pub fn new(input: RenameInput) -> Self {
+        let targets = input.pairs.iter().cloned().collect();
         Self {
             input,
+            targets,
             state: RenameState::Init,
             txn_id: None,
             scans: VecDeque::new(),
@@ -243,6 +264,7 @@ impl RenameKeysOperation {
             uploads: HashSet::new(),
             items: Vec::new(),
             found: Vec::new(),
+            row_reads: None,
             truncated: false,
             writes: Vec::new(),
             output: None,
@@ -258,6 +280,20 @@ impl RenameKeysOperation {
     fn validate(&self) -> Result<Vec<RenameItem>, RenameError> {
         let input = &self.input;
         let invalid = |reason: String| RenameError::Invalid(reason);
+        if !input.pairs.is_empty() {
+            let pairs = &input.pairs;
+            if input.keys.is_some() || pairs.len() > MAX_RENAME_KEYS {
+                return Err(invalid(format!(
+                    "a rename takes 1 to {MAX_RENAME_KEYS} keys"
+                )));
+            }
+            let sources: HashSet<_> = pairs.iter().map(|(from, _)| from).collect();
+            let targets: HashSet<_> = pairs.iter().map(|(_, to)| to).collect();
+            if sources.len() != pairs.len() || targets.len() != pairs.len() {
+                return Err(invalid("keys and new keys must not repeat".to_string()));
+            }
+            return pairs.iter().map(|(from, _)| self.item(from)).collect();
+        }
         validate_folder("from", &input.from).map_err(|error| invalid(error.to_string()))?;
         validate_folder("to", &input.to).map_err(|error| invalid(error.to_string()))?;
         if input.from == input.to {
@@ -285,7 +321,11 @@ impl RenameKeysOperation {
     fn item(&self, key: &str) -> Result<RenameItem, RenameError> {
         let input = &self.input;
         let invalid = |reason: String| RenameError::Invalid(reason);
-        let to = renamed_key(&input.from, &input.to, key)
+        let to = match input.pairs.is_empty() {
+            true => renamed_key(&input.from, &input.to, key),
+            false => self.targets.get(key).cloned(),
+        };
+        let to = to
             .filter(|_| !key.is_empty())
             .ok_or_else(|| invalid(format!("key `{key}` does not lie under `{}`", input.from)))?;
         if to.is_empty() {
@@ -372,7 +412,7 @@ impl RenameKeysOperation {
             ),
             Err(error) => return self.fail(error.into()),
         }
-        if self.input.keys.is_none() {
+        if self.input.keys.is_none() && self.input.pairs.is_empty() {
             let prefix = BlobHeadKey::object_prefix(bucket, &self.input.from);
             match prefix {
                 Ok(prefix) => self.scans.push_back(Scan::new(
@@ -499,43 +539,119 @@ impl RenameKeysOperation {
                 }
                 Ok(true)
             }
-            ScanKind::Rows(rule) => {
-                self.take_rows(rule, values)?;
-                Ok(true)
-            }
         }
     }
 
-    /// Notes each recorded file that maps to a selected key.
-    fn take_rows(&mut self, rule: usize, values: Vec<(Key, Value)>) -> Result<(), RenameError> {
-        let sources: HashMap<&str, usize> = self
-            .items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| (item.from.as_str(), index))
-            .collect();
-        let rule = &self.rules[rule];
-        let mut taken = Vec::new();
-        for (key, value) in values {
-            let row = ImportedObject::from_bytes(&value)?;
-            let path = String::from_utf8_lossy(key.get(16..).unwrap_or_default()).into_owned();
-            let mapped = row.key.clone().or_else(|| rule.aruna_key(&path));
-            if let Some(&index) = mapped.as_deref().and_then(|key| sources.get(key)) {
-                taken.push((index, key, row, path));
+    /// The location rows of the keys' materialized versions, which name their linked files.
+    fn read_locations(&mut self) -> Effects {
+        let mut reads = Vec::new();
+        for found in &self.found {
+            for (_, value) in &found.versions {
+                let version = match BlobVersion::from_bytes(value) {
+                    Ok(version) => version,
+                    Err(error) => return self.fail(error.into()),
+                };
+                if let Some(key) = version.location_key() {
+                    reads.push((BLOB_LOCATIONS_KEYSPACE.to_string(), key.to_bytes().into()));
+                }
             }
         }
-        for (index, key, row, path) in taken {
-            self.found[index].rows.push((key, row));
-            self.items[index].files.push(path);
+        self.row_reads = Some(Vec::new());
+        if reads.is_empty() || self.rules.is_empty() {
+            return self.read_index();
         }
-        Ok(())
+        self.state = RenameState::Locations;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// Reads each rule's record of every linked file a version of a selected key names.
+    fn locations_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+        let mut owners = Vec::new();
+        for (index, found) in self.found.iter().enumerate() {
+            let count = found.versions.iter().filter(|(_, value)| {
+                BlobVersion::from_bytes(value).is_ok_and(|version| version.location_key().is_some())
+            });
+            owners.extend(std::iter::repeat_n(index, count.count()));
+        }
+        if owners.len() != values.len() {
+            return self.fail(RenameError::Unexpected("Locations"));
+        }
+        let mut reads = Vec::new();
+        let mut seen = HashSet::new();
+        for (index, (_, value)) in owners.into_iter().zip(values) {
+            let Some(value) = value else {
+                continue;
+            };
+            let location = match BackendLocation::from_bytes(&value) {
+                Ok(location) => location,
+                Err(error) => return self.fail(error.into()),
+            };
+            if !location.is_external() {
+                continue;
+            }
+            for (rule, import) in self.rules.iter().enumerate() {
+                let on = |id: Ulid| BackendRef::Group(id) == location.backend;
+                let path = location.backend_path.clone();
+                if (on(import.backend_id) || on(import.write_backend()))
+                    && seen.insert((index, rule, path.clone()))
+                {
+                    reads.push((index, rule, path));
+                }
+            }
+        }
+        if reads.is_empty() {
+            return self.read_index();
+        }
+        let effect = StorageEffect::BatchRead {
+            reads: reads
+                .iter()
+                .map(|(_, rule, path)| {
+                    let key = object_key(self.rules[*rule].import_id, path);
+                    (IMPORTED_OBJECT_KEYSPACE.to_string(), key)
+                })
+                .collect(),
+            txn_id: self.txn_id,
+        };
+        self.row_reads = Some(reads);
+        self.state = RenameState::Rows;
+        smallvec![Effect::Storage(effect)]
+    }
+
+    /// Notes each recorded file that maps to its selected key.
+    fn rows_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+        let reads = self.row_reads.clone().unwrap_or_default();
+        if reads.len() != values.len() {
+            return self.fail(RenameError::Unexpected("Rows"));
+        }
+        for ((index, rule, path), (key, value)) in reads.into_iter().zip(values) {
+            let Some(value) = value else {
+                continue;
+            };
+            let row = match ImportedObject::from_bytes(&value) {
+                Ok(row) => row,
+                Err(error) => return self.fail(error.into()),
+            };
+            let mapped = row
+                .key
+                .clone()
+                .or_else(|| self.rules[rule].aruna_key(&path));
+            if mapped.as_deref() == Some(self.items[index].from.as_str()) {
+                self.found[index].rows.push((key, row));
+                self.items[index].files.push(path);
+            }
+        }
+        self.read_index()
     }
 
     /// The rules are known; a running import of the bucket would act on stale rows.
     fn scans_done(&mut self) -> Effects {
-        match self.found.is_empty() {
-            true => self.read_runs(),
-            false => self.read_index(),
+        match (self.found.is_empty(), self.row_reads.is_some()) {
+            (true, _) => self.read_runs(),
+            (false, false) => self.read_locations(),
+            (false, true) => self.read_index(),
         }
     }
 
@@ -643,15 +759,6 @@ impl RenameKeysOperation {
                     PAGE,
                 ),
             ]);
-        }
-        for (index, rule) in self.rules.iter().enumerate() {
-            let prefix = object_prefix(rule.import_id).to_vec();
-            scans.push(Scan::new(
-                ScanKind::Rows(index),
-                IMPORTED_OBJECT_KEYSPACE,
-                prefix,
-                PAGE,
-            ));
         }
         Ok(scans)
     }
@@ -919,6 +1026,10 @@ impl Operation for RenameKeysOperation {
             (RenameState::Heads, StorageEvent::BatchReadResult { values }) => {
                 self.heads_read(values)
             }
+            (RenameState::Locations, StorageEvent::BatchReadResult { values }) => {
+                self.locations_read(values)
+            }
+            (RenameState::Rows, StorageEvent::BatchReadResult { values }) => self.rows_read(values),
             (RenameState::Index, StorageEvent::BatchReadResult { values }) => {
                 self.index_read(values)
             }
@@ -969,4 +1080,4 @@ impl Operation for RenameKeysOperation {
 
 #[cfg(test)]
 #[path = "rename_tests.rs"]
-mod tests;
+pub(crate) mod tests;

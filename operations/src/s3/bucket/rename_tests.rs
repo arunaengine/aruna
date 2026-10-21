@@ -12,17 +12,17 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::Compression;
 use std::time::SystemTime;
 
-const BUCKET: &str = "bucket";
+pub(crate) const BUCKET: &str = "bucket";
 
-fn group() -> GroupId {
+pub(crate) fn group() -> GroupId {
     Ulid::from_parts(1, 1)
 }
 
-fn realm() -> RealmId {
+pub(crate) fn realm() -> RealmId {
     RealmId::from_bytes([1; 32])
 }
 
-fn rule() -> BackendImport {
+pub(crate) fn rule() -> BackendImport {
     BackendImport {
         import_id: Ulid::from_parts(2, 2),
         group_id: group(),
@@ -52,10 +52,11 @@ fn input(from: &str, to: &str, keys: Option<Vec<&str>>, apply: bool) -> RenameIn
         to: to.to_string(),
         keys: keys.map(|keys| keys.into_iter().map(str::to_string).collect()),
         apply,
+        pairs: Vec::new(),
     }
 }
 
-fn version(hash: u8) -> BlobVersion {
+pub(crate) fn version(hash: u8) -> BlobVersion {
     let backend = BackendRef::Group(rule().backend_id);
     let at = SystemTime::UNIX_EPOCH;
     BlobVersion::materialized(
@@ -68,7 +69,7 @@ fn version(hash: u8) -> BlobVersion {
     )
 }
 
-async fn put(context: &DriverContext, space: &str, key: Vec<u8>, value: Vec<u8>) {
+pub(crate) async fn put(context: &DriverContext, space: &str, key: Vec<u8>, value: Vec<u8>) {
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
@@ -84,7 +85,7 @@ async fn put(context: &DriverContext, space: &str, key: Vec<u8>, value: Vec<u8>)
     ));
 }
 
-async fn get(context: &DriverContext, space: &str, key: Vec<u8>) -> Option<Value> {
+pub(crate) async fn get(context: &DriverContext, space: &str, key: Vec<u8>) -> Option<Value> {
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -99,11 +100,11 @@ async fn get(context: &DriverContext, space: &str, key: Vec<u8>) -> Option<Value
     value
 }
 
-fn head_key(key: &str) -> Vec<u8> {
+pub(crate) fn head_key(key: &str) -> Vec<u8> {
     BlobHeadKey::new(BUCKET, key).to_bytes().unwrap()
 }
 
-fn version_key(key: &str, id: Ulid) -> Vec<u8> {
+pub(crate) fn version_key(key: &str, id: Ulid) -> Vec<u8> {
     VersionKey::new(BUCKET, key, id).to_bytes().unwrap()
 }
 
@@ -112,7 +113,7 @@ fn index_row(key: &str, hash: u8, id: Ulid) -> HashIndex {
 }
 
 /// Stores `key` with the versions `ids`, the last one current; `deleted` makes it a marker.
-async fn object(context: &DriverContext, key: &str, ids: &[Ulid], deleted: bool) {
+pub(crate) async fn object(context: &DriverContext, key: &str, ids: &[Ulid], deleted: bool) {
     for (at, id) in ids.iter().enumerate() {
         let last = at + 1 == ids.len();
         let value = match deleted && last {
@@ -137,7 +138,38 @@ async fn object(context: &DriverContext, key: &str, ids: &[Ulid], deleted: bool)
     .await;
 }
 
-async fn setup() -> (tempfile::TempDir, DriverContext) {
+/// Records that the raw copy with `hash` is the linked file at `path`.
+pub(crate) async fn link(context: &DriverContext, hash: u8, path: &str) {
+    let location = BackendLocation {
+        backend: BackendRef::Group(rule().backend_id),
+        storage_class: None,
+        root: String::new(),
+        storage_bucket: String::new(),
+        backend_path: path.to_string(),
+        ulid: Ulid::from_parts(30, u128::from(hash)),
+        format: Default::default(),
+        created_by: Default::default(),
+        created_at: SystemTime::UNIX_EPOCH,
+        staging: false,
+        partial: false,
+        blob_size: 4,
+        hashes: [(
+            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+            vec![hash; 32],
+        )]
+        .into(),
+    };
+    let key = location.location_key().unwrap().to_bytes();
+    put(
+        context,
+        BLOB_LOCATIONS_KEYSPACE,
+        key,
+        location.to_bytes().unwrap(),
+    )
+    .await;
+}
+
+pub(crate) async fn setup() -> (tempfile::TempDir, DriverContext) {
     let (directory, storage) = test_storage();
     let context = test_context(storage);
     let bucket = BucketInfo {
@@ -188,6 +220,17 @@ async fn renames_into_folder() {
     );
     object(&context, "x", &[v1, v2], true).await;
     object(&context, "sub/y", &[v3], false).await;
+    let other = version(3).to_bytes().unwrap();
+    put(
+        &context,
+        BLOB_VERSIONS_KEYSPACE,
+        version_key("sub/y", v3),
+        other,
+    )
+    .await;
+    // The rule's rows are found through the files the versions read.
+    link(&context, 1, "raw/x").await;
+    link(&context, 3, "raw/other").await;
     // The provider file `raw/x` maps by the rule's folders, `raw/other` by its recorded key.
     let plain = ImportedObject::new(
         v1,
@@ -458,7 +501,7 @@ fn checks_input() {
 }
 
 /// The owner may write everywhere except below `secret/`.
-async fn access(context: &DriverContext) -> AuthContext {
+pub(crate) async fn access(context: &DriverContext) -> AuthContext {
     let secret = aruna_core::structs::storage::blob::object_permission_path(
         realm(),
         group(),
