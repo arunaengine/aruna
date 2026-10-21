@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::errors::ConversionError;
-use crate::structs::storage::backend_import::BackendImport;
+use crate::structs::storage::backend_import::{BackendImport, PathIdentity};
 use crate::structs::storage::glob::{check_glob, glob_match, globs_overlap};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -14,9 +14,9 @@ pub const MAX_DISCOVERY_RULES: usize = 32;
 /// Characters one pattern may hold, which bounds every match and overlap check.
 pub const MAX_PATTERN_LEN: usize = 128;
 
-/// Sends an unmapped file whose name matches `pattern` to `folder` below the rule's
-/// `key_prefix`. `*` matches any text, `?` one character, `[0-9]` one of a set, `{4}` or
-/// `{2,8}` repeats a set or `?` and `{fna,fa}` either text.
+/// Sends an unmapped file whose name matches `pattern` to `folder` of the bucket. `*` matches
+/// any text, `?` one character, `[0-9]` one of a set, `{4}` or `{2,8}` repeats a set or `?`
+/// and `{fna,fa}` either text.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiscoveryRule {
     pub pattern: String,
@@ -95,27 +95,81 @@ pub fn place(rules: &[DiscoveryRule], name: &str) -> Placement {
     }
 }
 
-/// The bucket key of an unmapped backend key: the discovery folder goes between the rule's
-/// `key_prefix` and the path below `backend_prefix`. `None` outside `backend_prefix`.
-pub fn discovered_key(
+/// The identity a run gives a backend file without a recorded mapping or write intent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileIdentity {
+    /// The bucket key: the discovery folder, if one pattern matches, then the path below
+    /// `backend_prefix`. It never depends on the rule's `key_prefix`.
+    pub key: String,
+    /// The version id the write pattern encodes in the file name, kept apart from the key.
+    pub version_id: Option<Ulid>,
+    /// Whether a pattern placed the file; `false` means the bucket root.
+    pub matched: bool,
+}
+
+/// Why a file gets no identity; such a file is reported and not imported.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdentityError {
+    /// The name fits more than one key or version of the rule's patterns.
+    Ambiguous,
+    /// Several discovery patterns match the name.
+    Conflict(Vec<String>),
+}
+
+/// Places a file by its name alone. A name the current or an `earlier` write pattern encodes
+/// is matched without its version id; a folder the pattern stripped stays unknown, so the
+/// file goes to the bucket root or the matching folder. `None` outside `backend_prefix`.
+pub fn file_identity(
     rule: &BackendImport,
+    earlier: &[String],
     rules: &[DiscoveryRule],
     backend_key: &str,
-) -> Option<Result<String, Vec<String>>> {
+) -> Option<Result<FileIdentity, IdentityError>> {
     let rest = backend_key.strip_prefix(&rule.backend_prefix)?;
-    let name = rest.rsplit('/').next().unwrap_or(rest);
-    Some(match place(rules, listed_name(rule, name)) {
-        Placement::Root => Ok(format!("{}{rest}", rule.key_prefix)),
-        Placement::Folder(folder) => Ok(format!("{}{folder}{rest}", rule.key_prefix)),
-        Placement::Conflict(patterns) => Err(patterns),
+    let file = rest.rsplit('/').next().unwrap_or(rest);
+    let (path, name, version_id) = match rule.decode_any(backend_key, earlier) {
+        PathIdentity::Ambiguous => return Some(Err(IdentityError::Ambiguous)),
+        PathIdentity::Decoded { key, name, id } => {
+            let path = key
+                .and_then(|key| key.strip_prefix(&rule.key_prefix).map(str::to_string))
+                .unwrap_or_else(|| name.clone());
+            (path, name, Some(id))
+        }
+        PathIdentity::Unmatched => (
+            rest.to_string(),
+            listed_name(rule, earlier, file).to_string(),
+            None,
+        ),
+    };
+    Some(match place(rules, &name) {
+        Placement::Root => Ok(FileIdentity {
+            key: path,
+            version_id,
+            matched: false,
+        }),
+        Placement::Folder(folder) => Ok(FileIdentity {
+            key: format!("{folder}{path}"),
+            version_id,
+            matched: true,
+        }),
+        Placement::Conflict(patterns) => Err(IdentityError::Conflict(patterns)),
     })
 }
 
-/// The file name patterns see: without the version id that the rule's write pattern or a
-/// same-name tag adds. Call point for the shared naming parser of the suffix naming change.
-pub fn listed_name<'a>(rule: &BackendImport, name: &'a str) -> &'a str {
+/// The file name patterns see: without the version id that the rule's current or an earlier
+/// write pattern, or a same-name tag, adds.
+pub fn listed_name<'a>(rule: &BackendImport, earlier: &[String], name: &'a str) -> &'a str {
     let name = strip_id(name, "~", "").unwrap_or(name);
-    let pattern = &rule.write_pattern;
+    let patterns =
+        std::iter::once(rule.write_pattern.as_str()).chain(earlier.iter().map(String::as_str));
+    patterns
+        .map(|pattern| strip_wrapper(pattern, name))
+        .find(|stripped| *stripped != name)
+        .unwrap_or(name)
+}
+
+/// `name` without the version id wrapper of `pattern`.
+fn strip_wrapper<'a>(pattern: &str, name: &'a str) -> &'a str {
     let Some(at) = pattern.find("{name}") else {
         return name;
     };
@@ -252,47 +306,87 @@ mod tests {
         );
     }
 
+    /// The key and version a file gets, or the error.
+    fn identity(
+        rule: &BackendImport,
+        path: &str,
+    ) -> Option<Result<(String, Option<Ulid>), IdentityError>> {
+        let found = file_identity(rule, &[], &genome(), path)?;
+        Some(found.map(|found| (found.key, found.version_id)))
+    }
+
     #[test]
     fn keeps_nested_paths() {
         let plain = import("{dir}{name}");
-        let key = |path: &str| discovered_key(&plain, &genome(), path);
-        assert_eq!(key("raw/baz"), Some(Ok("baz".to_string())));
+        let key = |path: &str| identity(&plain, path);
+        assert_eq!(key("raw/baz"), Some(Ok(("baz".to_string(), None))));
         assert_eq!(
             key("raw/run1/lane2/sample.faa.gz"),
-            Some(Ok("proteins/run1/lane2/sample.faa.gz".to_string()))
+            Some(Ok(("proteins/run1/lane2/sample.faa.gz".to_string(), None)))
         );
         assert_eq!(
             key("raw/sample.fna.gz"),
-            Some(Ok("nucleotides/sample.fna.gz".to_string()))
+            Some(Ok(("nucleotides/sample.fna.gz".to_string(), None)))
         );
         assert_eq!(key("other/sample.faa.gz"), None);
+        // The rule's own folder is for its writes; found files go to the bucket root.
         let mut prefixed = plain.clone();
         prefixed.key_prefix = "in/".to_string();
+        let found = |path: &str| identity(&prefixed, path);
         assert_eq!(
-            discovered_key(&prefixed, &genome(), "raw/a.faa.gz"),
-            Some(Ok("in/proteins/a.faa.gz".to_string()))
+            found("raw/a.faa.gz"),
+            Some(Ok(("proteins/a.faa.gz".to_string(), None)))
         );
+        assert_eq!(found("raw/baz"), Some(Ok(("baz".to_string(), None))));
     }
 
     #[test]
     fn reads_version_wrappers() {
-        let id = Ulid::from_parts(1, 2).to_string();
-        let suffix = import("{dir}{name}~{id}");
+        let ulid = Ulid::from_parts(1, 2);
+        let id = ulid.to_string();
+        let mut suffix = import("{dir}{name}~{id}");
+        suffix.key_prefix = "in/".to_string();
         let tagged = format!("sample.faa.gz~{id}");
-        assert_eq!(listed_name(&suffix, &tagged), "sample.faa.gz");
+        assert_eq!(listed_name(&suffix, &[], &tagged), "sample.faa.gz");
+        // A recovered version keeps its id apart and goes where the rules place its name.
         let path = format!("raw/x/{tagged}");
+        let placed = ("proteins/x/sample.faa.gz".to_string(), Some(ulid));
+        assert_eq!(identity(&suffix, &path), Some(Ok(placed.clone())));
+        // A name an earlier pattern wrote is read without its wrapper too.
+        let current = import("{dir}{name}");
+        let earlier = ["{dir}{name}~{id}".to_string()];
+        let found = file_identity(&current, &earlier, &genome(), &path)
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            discovered_key(&suffix, &genome(), &path),
-            Some(Ok(format!("proteins/x/{tagged}")))
+            (found.key, found.version_id, found.matched),
+            (placed.0, placed.1, true)
         );
         let prefix = import("{dir}{id}_{name}");
-        assert_eq!(listed_name(&prefix, &format!("{id}_a.fna.gz")), "a.fna.gz");
+        assert_eq!(
+            listed_name(&prefix, &[], &format!("{id}_a.fna.gz")),
+            "a.fna.gz"
+        );
+        assert_eq!(
+            listed_name(
+                &current,
+                &["{dir}{id}_{name}".to_string()],
+                &format!("{id}_a")
+            ),
+            "a"
+        );
         // A same-name tag after a plain pattern is a wrapper too.
         let plain = import("{dir}{name}");
-        assert_eq!(listed_name(&plain, &tagged), "sample.faa.gz");
+        assert_eq!(listed_name(&plain, &[], &tagged), "sample.faa.gz");
         // Names that only look wrapped stay as they are.
-        assert_eq!(listed_name(&prefix, "notanid_a.fna.gz"), "notanid_a.fna.gz");
-        assert_eq!(listed_name(&suffix, &format!("~{id}")), format!("~{id}"));
-        assert_eq!(listed_name(&plain, "a~b"), "a~b");
+        assert_eq!(
+            listed_name(&prefix, &[], "notanid_a.fna.gz"),
+            "notanid_a.fna.gz"
+        );
+        assert_eq!(
+            listed_name(&suffix, &[], &format!("~{id}")),
+            format!("~{id}")
+        );
+        assert_eq!(listed_name(&plain, &[], "a~b"), "a~b");
     }
 }

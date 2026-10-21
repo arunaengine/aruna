@@ -24,14 +24,16 @@ use aruna_core::structs::storage::blob::{
     ResolvedBackend, VersionKey, bucket_permission_path, ensure_confined_path,
 };
 use aruna_core::structs::storage::delete_audit::BlobAuditRecord;
-use aruna_core::structs::storage::discovery::{DiscoveryRule, discovered_key};
+use aruna_core::structs::storage::discovery::{
+    DiscoveryRule, FileIdentity, IdentityError, file_identity,
+};
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{RoutingSnapshot, RoutingTarget, RuleSource};
 use aruna_core::types::{Effects, Key, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use ulid::Ulid;
@@ -391,17 +393,12 @@ async fn import_object(
     if let Some(outcome) = recovery.await? {
         return Ok(outcome);
     }
-    let key = bucket_key(rule, &run.discovery, row.as_ref(), &object.key)?;
-    if row.is_none() {
-        let own = (rule, run.discovery.as_slice());
-        match claim_file(&ctx.driver, own, &run.shared, &object.key).await {
-            Ok(shared::Claim::Own) => {}
-            Ok(shared::Claim::Other) => return Ok(Outcome::Ignored),
-            Ok(shared::Claim::Conflict) => {
-                return Err(ItemError::Item(SHARED_CONFLICT.to_string()));
-            }
-            Err(error) => return Err(ItemError::System(error.to_string())),
-        }
+    let names = (rule, run.earlier.as_slice(), run.discovery.as_slice());
+    let key = bucket_key(names, row.as_ref(), &object.key)?;
+    if row.is_none()
+        && let Some(outcome) = claimed(run, &object.key)?
+    {
+        return Ok(outcome);
     }
     if key.is_empty() {
         return Err(ItemError::Item(
@@ -528,8 +525,7 @@ type Claim = (Key, WriteIntent, bool);
 /// Prefers the one write whose version never committed; else the path itself. Several open
 /// writes or a path that does not tell the folder of its key are reported, never guessed.
 fn choose_identity(
-    rule: &BackendImport,
-    earlier: &[String],
+    (rule, earlier, discovery): (&BackendImport, &[String], &[DiscoveryRule]),
     path: &str,
     claims: Vec<Claim>,
     hash: Option<&[u8; 32]>,
@@ -566,19 +562,34 @@ fn choose_identity(
             intent: Some((key.clone(), intent.created_by)),
         }));
     }
-    match rule.decode_any(path, earlier) {
-        PathIdentity::Unmatched => Ok(None),
-        PathIdentity::Ambiguous => Err(item("the file name fits more than one key or version")),
-        PathIdentity::Decoded { key: None, id, .. } => Err(item(format!(
-            "the file names version {id}, but not the folder of its key"
-        ))),
-        PathIdentity::Decoded {
-            key: Some(key), id, ..
-        } => Ok(Some(Identity {
+    // A name alone gives the version id; the discovery rules place it like any found file.
+    match file_identity(rule, earlier, discovery, path) {
+        None
+        | Some(Ok(FileIdentity {
+            version_id: None, ..
+        })) => Ok(None),
+        Some(Err(error)) => Err(identity_error(error)),
+        Some(Ok(FileIdentity {
             key,
-            version_id: id,
+            version_id: Some(version_id),
+            ..
+        })) => Ok(Some(Identity {
+            key,
+            version_id,
             intent: None,
         })),
+    }
+}
+
+fn identity_error(error: IdentityError) -> ItemError {
+    match error {
+        IdentityError::Ambiguous => item("the file name fits more than one key or version"),
+        IdentityError::Conflict(patterns) => {
+            let patterns = patterns.join("`, `");
+            item(format!(
+                "the file matches several discovery patterns: `{patterns}`"
+            ))
+        }
     }
 }
 
@@ -732,8 +743,8 @@ async fn recover(
         .as_ref()
         .and_then(|(location, _)| location.get_blake3());
     let hash = hash.and_then(|hash| <[u8; 32]>::try_from(hash).ok());
-    let Some(identity) = choose_identity(rule, &run.earlier, &object.key, claims, hash.as_ref())?
-    else {
+    let names = (rule, run.earlier.as_slice(), run.discovery.as_slice());
+    let Some(identity) = choose_identity(names, &object.key, claims, hash.as_ref())? else {
         return Ok(None);
     };
     let Identity {
@@ -1065,20 +1076,15 @@ fn taken(key: &str) -> ItemError {
 
 /// A recorded mapping is kept; only an unmapped object is placed by the discovery rules.
 fn bucket_key(
-    rule: &BackendImport,
-    discovery: &[DiscoveryRule],
+    (rule, earlier, discovery): (&BackendImport, &[String], &[DiscoveryRule]),
     row: Option<&ImportedObject>,
     path: &str,
 ) -> Result<String, ItemError> {
     let key = match row {
         Some(row) => row.key.clone().or_else(|| rule.aruna_key(path)),
-        None => match discovered_key(rule, discovery, path) {
-            Some(Err(patterns)) => {
-                let patterns = patterns.join("`, `");
-                let error = format!("the file matches several discovery patterns: `{patterns}`");
-                return Err(ItemError::Item(error));
-            }
-            placed => placed.and_then(Result::ok),
+        None => match file_identity(rule, earlier, discovery, path) {
+            Some(Err(error)) => return Err(identity_error(error)),
+            placed => placed.and_then(Result::ok).map(|placed| placed.key),
         },
     };
     Ok(key.unwrap_or_default())
@@ -2177,11 +2183,13 @@ mod tests {
         let rule = recovery_rule("{dir}{id}_{name}");
         let id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         let path = format!("raw/x/{id}_a.csv");
-        let decoded = choose_identity(&rule, &[], &path, Vec::new(), None)
+        let decoded = choose_identity((&rule, &[], &[]), &path, Vec::new(), None)
             .ok()
             .flatten();
+        // A name alone names the version, not the stripped folder `in/`: found files go to the
+        // bucket root or where the discovery rules place them.
         let expected = Identity {
-            key: "in/x/a.csv".to_string(),
+            key: "x/a.csv".to_string(),
             version_id: id,
             intent: None,
         };
@@ -2189,32 +2197,45 @@ mod tests {
         // After a switch to suffix names the replaced pattern still reads the file.
         let suffix = recovery_rule("{dir}{name}~{id}");
         assert!(matches!(
-            choose_identity(&suffix, &[], &path, Vec::new(), None),
+            choose_identity((&suffix, &[], &[]), &path, Vec::new(), None),
             Ok(None)
         ));
         let earlier = ["{dir}{id}_{name}".to_string()];
-        let found = choose_identity(&suffix, &earlier, &path, Vec::new(), None)
+        let found = choose_identity((&suffix, &earlier, &[]), &path, Vec::new(), None)
             .ok()
             .flatten();
         assert_eq!(
             found.map(|found| (found.key, found.version_id)),
-            Some(("in/x/a.csv".to_string(), id))
+            Some(("x/a.csv".to_string(), id))
         );
+        let sorted = [DiscoveryRule {
+            pattern: "*.csv".to_string(),
+            folder: "tables/".to_string(),
+        }];
+        let placed = choose_identity((&rule, &[], &sorted), &path, Vec::new(), None);
+        let placed = placed
+            .ok()
+            .flatten()
+            .map(|found| (found.key, found.version_id));
+        assert_eq!(placed, Some(("tables/x/a.csv".to_string(), id)));
         assert!(matches!(
-            choose_identity(&rule, &[], "raw/x/a.csv", Vec::new(), None),
+            choose_identity((&rule, &[], &[]), "raw/x/a.csv", Vec::new(), None),
             Ok(None)
         ));
-        // A path without the folder of its key is reported, never imported under a guess.
+        // A pattern without the folder gives the name and version only.
         let stripped = recovery_rule("{id}_{name}");
         let path = format!("raw/{id}_a.csv");
-        assert!(matches!(
-            choose_identity(&stripped, &[], &path, Vec::new(), None),
-            Err(ItemError::Item(_))
-        ));
+        let found = choose_identity((&stripped, &[], &[]), &path, Vec::new(), None);
+        let found = found
+            .ok()
+            .flatten()
+            .map(|found| (found.key, found.version_id));
+        assert_eq!(found, Some(("a.csv".to_string(), id)));
         // The intent of the write that never committed names the full key.
         let open = claim(&stripped, "in/deep/a.csv", false);
         let done = claim(&stripped, "in/other/a.csv", true);
-        let chosen = choose_identity(&stripped, &[],
+        let chosen = choose_identity(
+            (&stripped, &[], &[]),
             &path,
             vec![done.clone(), open.clone()],
             Some(&HASH),
@@ -2225,40 +2246,57 @@ mod tests {
             ("in/deep/a.csv", open.1.version_id)
         );
         assert_eq!(chosen.intent.map(|(key, _)| key), Some(open.0.clone()));
-        let only = choose_identity(&stripped, &[], &path, vec![done.clone()], Some(&HASH))
-            .ok()
-            .flatten();
+        let only = choose_identity(
+            (&stripped, &[], &[]),
+            &path,
+            vec![done.clone()],
+            Some(&HASH),
+        )
+        .ok()
+        .flatten();
         assert_eq!(
             only.map(|identity| identity.version_id),
             Some(done.1.version_id)
         );
         let second = claim(&stripped, "in/b.csv", false);
         assert!(
-            choose_identity(&stripped, &[],
+            choose_identity(
+                (&stripped, &[], &[]),
                 &path,
                 vec![open.clone(), second],
                 Some(&HASH)
             )
             .is_err()
         );
-        // An intent for another backend says nothing about this file.
+        // An intent for another backend says nothing about this file; its name still does.
         let mut foreign = open;
         foreign.1.backend = BackendRef::Group(Ulid::from_parts(9, 9));
-        assert!(choose_identity(&stripped, &[], &path, vec![foreign], Some(&HASH)).is_err());
+        let found = choose_identity((&stripped, &[], &[]), &path, vec![foreign], Some(&HASH));
+        let found = found
+            .ok()
+            .flatten()
+            .map(|found| (found.key, found.intent.is_none()));
+        assert_eq!(found, Some(("a.csv".to_string(), true)));
         // An open write without a record of these bytes proves nothing; it is reported.
         let mut unproven = claim(&stripped, "in/deep/a.csv", false);
         let other = [8u8; 32];
         assert!(
-            choose_identity(&stripped, &[], &path, vec![unproven.clone()], Some(&other)).is_err()
+            choose_identity(
+                (&stripped, &[], &[]),
+                &path,
+                vec![unproven.clone()],
+                Some(&other)
+            )
+            .is_err()
         );
         unproven.1.written = None;
         let claims = vec![unproven, done.clone()];
-        assert!(choose_identity(&stripped, &[], &path, claims, Some(&HASH)).is_err());
+        assert!(choose_identity((&stripped, &[], &[]), &path, claims, Some(&HASH)).is_err());
         // A committed write without a record of these bytes never takes over the file.
         let mut sibling = done;
         sibling.1.written = None;
         let named = recovery_rule("{dir}{name}");
-        let chosen = choose_identity(&named, &[], "raw/a", vec![sibling], Some(&HASH));
+        let chosen = choose_identity((&named, &[], &[]), "raw/a", vec![sibling], Some(&HASH));
         assert!(matches!(chosen, Ok(None)));
     }
 
@@ -2333,7 +2371,7 @@ mod tests {
             folder: "texts/".to_string(),
         }];
         let key = |row: Option<&ImportedObject>, path: &str| {
-            bucket_key(&rule, &discovery, row, path).ok()
+            bucket_key((&rule, &[], &discovery), row, path).ok()
         };
         // Uploads of `foo/bar.txt` and `bar/foo.txt` flattened into one folder keep their keys.
         let bar = ImportedObject::written(Ulid::generate(), "foo/bar.txt".to_string(), 4, None);
@@ -2362,8 +2400,13 @@ mod tests {
                 folder: "other/".to_string(),
             },
         ];
-        let clash = bucket_key(&rule, &overlapping, None, "raw/new.txt");
+        let clash = bucket_key((&rule, &[], &overlapping), None, "raw/new.txt");
         assert!(matches!(clash, Err(ItemError::Item(_))));
+        // The rule's own folder is where its uploads come from, not where found files go.
+        let foo = rule_at("foo/");
+        let found = |path| bucket_key((&foo, &[], &discovery), None, path).ok();
+        assert_eq!(found("raw/baz").as_deref(), Some("baz"));
+        assert_eq!(found("raw/x/new.txt").as_deref(), Some("texts/x/new.txt"));
     }
 
     fn rule_at(key_prefix: &str) -> BackendImport {
