@@ -51,8 +51,9 @@ pub struct Duplicate {
     pub copies: Vec<BackendLocation>,
     /// The versions that read a copy now, with their stored rows.
     versions: Vec<(Ulid, Vec<u8>)>,
-    /// Copies no version reads, which only a row names, by location id with their index row.
-    twins: Vec<(Ulid, Key)>,
+    /// Copies no version reads, which only a row names, by location id with their index row
+    /// and the version that row named.
+    twins: Vec<(Ulid, Key, Ulid)>,
 }
 
 impl Duplicate {
@@ -190,18 +191,15 @@ async fn duplicates(
         groups.entry(group).or_default().push((id, value, file));
     }
     let twins = second_copies(context, routing, (bucket, key), &versions_of(&groups)).await?;
-    let twins: Vec<_> = (twins.into_iter())
-        .map(|(file, index, _)| (file, index))
-        .collect();
     for ((hash, backend), members) in groups {
         let twins: Vec<_> = (twins.iter())
-            .filter(|(file, _)| {
+            .filter(|(file, ..)| {
                 file.get_blake3() == Some(&hash[..]) && file.backend.key_bytes() == backend
             })
             .collect();
         // Only content that two files hold needs its location rows read.
         let mut files: std::collections::HashSet<_> = members.iter().map(|(.., at)| *at).collect();
-        files.extend(twins.iter().map(|(file, _)| file.ulid));
+        files.extend(twins.iter().map(|(file, ..)| file.ulid));
         if files.len() < 2 {
             continue;
         }
@@ -231,7 +229,7 @@ async fn duplicates(
                 None => files.push((location, vec![(*id, value.clone())])),
             }
         }
-        for (file, _) in &twins {
+        for (file, ..) in &twins {
             if !files.iter().any(|(known, _)| known.ulid == file.ulid) {
                 files.push((file.clone(), Vec::new()));
             }
@@ -262,8 +260,8 @@ async fn duplicates(
             .collect();
         let copies: Vec<BackendLocation> = files.into_iter().map(|(file, _)| file).collect();
         let twins = (twins.into_iter())
-            .filter(|(file, _)| copies.iter().any(|copy| copy.ulid == file.ulid))
-            .map(|(file, index)| (file.ulid, index.clone()))
+            .filter(|(file, ..)| copies.iter().any(|copy| copy.ulid == file.ulid))
+            .map(|(file, index, version)| (file.ulid, index.clone(), *version))
             .collect();
         found.push(Duplicate {
             key: key.to_string(),
@@ -640,7 +638,7 @@ impl Stage<'_> {
         for copy in &found.copies {
             let provider = values.next().flatten();
             let mine = readers.remove(&copy.ulid).unwrap_or_default();
-            let twin = found.twins.iter().find(|(ulid, _)| *ulid == copy.ulid);
+            let twin = found.twins.iter().find(|(ulid, ..)| *ulid == copy.ulid);
             let mut owner = None;
             let mut foreign = false;
             for rule in self.rules {
@@ -650,8 +648,11 @@ impl Stage<'_> {
                     continue;
                 };
                 // A row of another key or version makes the file that version's own.
-                let ours = row.key.as_deref().is_none_or(|key| key == found.key)
-                    && (twin.is_some() || mine.iter().any(|(id, _)| *id == row.version_id));
+                let named = match twin {
+                    Some((.., version)) => *version == row.version_id,
+                    None => mine.iter().any(|(id, _)| *id == row.version_id),
+                };
+                let ours = row.key.as_deref().is_none_or(|key| key == found.key) && named;
                 match ours {
                     true => owner = owner.or(Some((rule.import_id, row.version_id))),
                     false => foreign = true,
@@ -660,8 +661,19 @@ impl Stage<'_> {
             if foreign || (mine.is_empty() && twin.is_none()) {
                 continue;
             }
-            // A second copy goes with its row; its index row goes now.
-            if let Some((_, index)) = twin {
+            // A second copy goes with its row while its index row still names it; that row
+            // goes now.
+            if let Some((_, index, _)) = twin {
+                let read = vec![(RENAMED_ROW_KEYSPACE.to_string(), index.clone())];
+                let stored = self.batch(read).await?.pop().flatten();
+                let stored = stored.filter(|value| !value.is_empty());
+                let stored = stored
+                    .as_deref()
+                    .map(BackendLocation::from_bytes)
+                    .transpose();
+                if stored.map_err(error)?.as_ref() != Some(copy) {
+                    continue;
+                }
                 deletes.push((RENAMED_ROW_KEYSPACE.to_string(), index.clone()));
             }
             for (id, mut version) in mine {
