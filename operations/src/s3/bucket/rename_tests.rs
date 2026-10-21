@@ -53,6 +53,8 @@ fn input(from: &str, to: &str, keys: Option<Vec<&str>>, apply: bool) -> RenameIn
         keys: keys.map(|keys| keys.into_iter().map(str::to_string).collect()),
         apply,
         pairs: Vec::new(),
+        cutoff_ms: None,
+        job: None,
     }
 }
 
@@ -666,4 +668,43 @@ async fn hides_error_names() {
         panic!("expected an invalid rename, got {result:?}")
     };
     assert_eq!(message, "a key under `from` cannot get a name under `to`");
+}
+
+/// Stores a running job of the bucket with `task` that started at `started_ms`, run as the
+/// caller of `access`.
+pub(crate) async fn store_job(
+    context: &DriverContext,
+    task: aruna_core::structs::storage::linked_job::LinkedTask,
+    started_ms: u64,
+) -> aruna_core::structs::storage::linked_job::LinkedJob {
+    use aruna_core::structs::storage::backend_import::TokenGrant;
+    use aruna_core::structs::storage::linked_job::{LinkedJob, LinkedState};
+    let job = LinkedJob {
+        id: Ulid::generate(),
+        task,
+        group_id: group(),
+        auth: access(context).await,
+        node_id: node(4),
+        grant: TokenGrant {
+            token_hash: "token".to_string(),
+            issuer: realm(),
+            issued_at_secs: 1,
+            expires_at_secs: u64::MAX,
+            via: None,
+        },
+        state: LinkedState::Running,
+        cursor: None,
+        total: 0,
+        counted: true,
+        done: 0,
+        skipped: 0,
+        failed: 0,
+        waiting: None,
+        started_at_ms: started_ms,
+        updated_at_ms: 0,
+        finished_at_ms: None,
+    };
+    let key = BUCKET.as_bytes().to_vec();
+    put(context, LINKED_JOB_KEYSPACE, key, job.to_bytes().unwrap()).await;
+    job
 }

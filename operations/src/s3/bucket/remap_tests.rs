@@ -3,12 +3,35 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
 use crate::s3::bucket::rename::tests::{
-    BUCKET, access, get, group, head_key, object, realm, setup,
+    BUCKET, access, get, group, head_key, object, realm, setup, store_job,
 };
 use crate::tests::records::node;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::LINKED_JOB_KEYSPACE;
 use ulid::Ulid;
+
+/// Stores a running remap job of the bucket that started at `started_ms`.
+async fn begin(context: &DriverContext, started_ms: u64) {
+    use aruna_core::structs::storage::linked_job::LinkedTask;
+    store_job(context, LinkedTask::Remap(plan()), started_ms).await;
+}
+
+async fn stored(context: &DriverContext) -> LinkedJob {
+    let value = get(context, LINKED_JOB_KEYSPACE, BUCKET.as_bytes().to_vec()).await;
+    LinkedJob::from_bytes(&value.unwrap()).unwrap()
+}
+
+/// Runs one page of the stored job and answers the page and the job after it.
+async fn step(
+    context: &DriverContext,
+    plan: &RemapPlan,
+    scope: &RemapScope<'_>,
+) -> (JobStep, LinkedJob) {
+    let job = stored(context).await;
+    let step = job_page(context, plan, scope, &job).await.unwrap();
+    (step, stored(context).await)
+}
 
 fn plan() -> RemapPlan {
     RemapPlan {
@@ -127,10 +150,10 @@ async fn reports_collisions() {
     );
 
     // The job moves the free key and keeps the taken one; nothing is overwritten.
-    let step = job_page(&context, &plan(), &scope, (None, u64::MAX))
-        .await
-        .unwrap();
-    assert_eq!((step.done, step.skipped, step.finished), (2, 1, true));
+    begin(&context, u64::MAX).await;
+    let (page, job) = step(&context, &plan(), &scope).await;
+    assert!(page.finished);
+    assert_eq!((job.done, job.skipped), (2, 1));
     assert!(
         get(&context, BLOB_HEAD_KEYSPACE, head_key("a.faa.gz"))
             .await
@@ -167,10 +190,9 @@ async fn skips_denied_keys() {
         .await
         .unwrap();
     assert_eq!((page.total, page.entries.len(), page.next), (0, 0, None));
-    let step = job_page(&context, &plan, &scope, (None, u64::MAX))
-        .await
-        .unwrap();
-    assert_eq!((step.done, step.skipped), (0, 2));
+    begin(&context, u64::MAX).await;
+    let (page, job) = step(&context, &plan, &scope).await;
+    assert_eq!((page.skipped, job.done), (2, 0));
     assert!(
         get(&context, BLOB_HEAD_KEYSPACE, head_key("secret/a.faa.gz"))
             .await
@@ -184,22 +206,25 @@ async fn resumes_after_cursor() {
     many(&context, 600).await;
     let access = load(&context).await;
     let scope = scope(&access);
-    let first = job_page(&context, &plan(), &scope, (None, u64::MAX))
-        .await
-        .unwrap();
-    assert_eq!((first.done, first.finished), (JOB_KEYS as u64, false));
+    begin(&context, u64::MAX).await;
+    let (first, job) = step(&context, &plan(), &scope).await;
+    assert_eq!((job.done, first.finished), (JOB_KEYS as u64, false));
+    // A stale copy of the job, as after a pause meanwhile, moves nothing.
+    let stale = LinkedJob {
+        done: 7,
+        ..job.clone()
+    };
+    let refused = job_page(&context, &plan(), &scope, &stale).await.unwrap();
+    assert_eq!(refused.cursor, stale.cursor);
+    assert_eq!(stored(&context).await, job);
     // An interrupted job starts again from its stored cursor and redoes nothing.
-    let (mut cursor, mut done) = (first.cursor, first.done);
     loop {
-        let step = job_page(&context, &plan(), &scope, (cursor, u64::MAX))
-            .await
-            .unwrap();
-        (cursor, done) = (step.cursor, done + step.done);
-        if step.finished {
+        let (page, _) = step(&context, &plan(), &scope).await;
+        if page.finished {
             break;
         }
     }
-    assert_eq!(done, 600);
+    assert_eq!(stored(&context).await.done, 600);
     let page = preview_page(&context, &plan(), &scope, (None, None, MAX_PAGE))
         .await
         .unwrap();
@@ -215,8 +240,7 @@ async fn resumes_after_cursor() {
     );
     // Keys written after the start stay.
     object(&context, "z.faa.gz", &[Ulid::from_parts(10, 1)], false).await;
-    let late = job_page(&context, &plan(), &scope, (None, 0))
-        .await
-        .unwrap();
-    assert_eq!((late.done, late.skipped), (0, 1));
+    begin(&context, 0).await;
+    let (late, job) = step(&context, &plan(), &scope).await;
+    assert_eq!((late.skipped, job.done), (1, 0));
 }

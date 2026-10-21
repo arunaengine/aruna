@@ -17,9 +17,9 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BROKEN_VERSION_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
-    IMPORTED_OBJECT_KEYSPACE, JOB_KEYSPACE, MANAGED_COPY_KEYSPACE, PATHS_INDEX_KEYSPACE,
-    PURGE_FENCE_KEYSPACE, RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE,
-    UPLOAD_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE, JOB_KEYSPACE, LINKED_JOB_KEYSPACE, MANAGED_COPY_KEYSPACE,
+    PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
+    RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::job_record_key;
@@ -40,6 +40,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use thiserror::Error;
 use ulid::Ulid;
+
+/// Why a rename of a bucket job's page refuses: the job was paused, aborted or replaced.
+pub const JOB_CHANGED: &str = "the bucket job changed";
 
 /// Keys one rename takes; a larger folder is renamed in parts.
 pub const MAX_RENAME_KEYS: usize = 1000;
@@ -64,6 +67,11 @@ pub struct RenameInput {
     pub apply: bool,
     /// Explicit new keys by old key; when not empty, `from`, `to` and `keys` are not used.
     pub pairs: Vec<(String, String)>,
+    /// A key whose current version is newer than this stays.
+    pub cutoff_ms: Option<u64>,
+    /// The bucket's job row as the caller read it and as the rename leaves it; another stored
+    /// row, as after a pause or an abort, refuses the rename.
+    pub job: Option<(Value, Value)>,
 }
 
 /// One planned key move.
@@ -354,11 +362,12 @@ impl RenameKeysOperation {
             reads: vec![
                 (S3_BUCKET_KEYSPACE.to_string(), name.clone()),
                 (BUCKET_ENCRYPTION_KEYSPACE.to_string(), name.clone()),
-                (COMPRESSION_MIGRATION_KEYSPACE.to_string(), name),
+                (COMPRESSION_MIGRATION_KEYSPACE.to_string(), name.clone()),
                 (
                     PURGE_FENCE_KEYSPACE.to_string(),
                     fence_key(&self.input.bucket)
                 ),
+                (LINKED_JOB_KEYSPACE.to_string(), name),
             ],
             txn_id: Some(txn_id),
         })]
@@ -367,9 +376,21 @@ impl RenameKeysOperation {
     /// Only a plain bucket of the caller's group without replication, a purge or a running
     /// compression or storage move is renamed; a move would miss the moved versions.
     fn bucket_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let [(_, bucket), (_, encryption), (_, migration), (_, fence)] = values.as_slice() else {
+        let [
+            (_, bucket),
+            (_, encryption),
+            (_, migration),
+            (_, fence),
+            (_, job),
+        ] = values.as_slice()
+        else {
             return self.fail(RenameError::Unexpected("Bucket"));
         };
+        if let Some((expected, _)) = &self.input.job
+            && job.as_ref() != Some(expected)
+        {
+            return self.conflict(JOB_CHANGED);
+        }
         match bucket.as_deref().map(BucketInfo::from_bytes).transpose() {
             Ok(Some(info)) if info.group_id == self.input.group_id => {}
             Ok(_) => return self.fail(RenameError::NotFound),
@@ -828,7 +849,9 @@ impl RenameKeysOperation {
             .items
             .iter_mut()
             .zip(&self.found)
-            .try_for_each(|(item, found)| describe(item, found, &sources, &self.uploads));
+            .try_for_each(|(item, found)| {
+                describe(item, found, (&sources, &self.uploads), self.input.cutoff_ms)
+            });
         if let Err(error) = described {
             return self.fail(error);
         }
@@ -936,6 +959,10 @@ impl RenameKeysOperation {
                 ));
             }
         }
+        if let Some((_, next)) = &self.input.job {
+            let name = bucket.as_bytes().to_vec().into();
+            writes.push((LINKED_JOB_KEYSPACE.to_string(), name, next.clone()));
+        }
         Ok((deletes, writes))
     }
 }
@@ -944,8 +971,8 @@ impl RenameKeysOperation {
 fn describe(
     item: &mut RenameItem,
     found: &Found,
-    sources: &HashSet<String>,
-    uploads: &HashSet<String>,
+    (sources, uploads): (&HashSet<String>, &HashSet<String>),
+    cutoff_ms: Option<u64>,
 ) -> Result<(), RenameError> {
     let head = found
         .head
@@ -972,8 +999,11 @@ fn describe(
             BlobVersionState::Reference { .. } | BlobVersionState::PendingContent { .. } => false,
         };
     }
+    let newer = item.current.zip(cutoff_ms);
     item.conflict = if found.head.is_none() && found.versions.is_empty() {
         Some("the key does not exist".to_string())
+    } else if newer.is_some_and(|(current, cutoff)| current.timestamp_ms() > cutoff) {
+        Some("the key changed after the job started".to_string())
     } else if found.target_head || found.target_versions {
         Some(format!("the key `{}` already exists", item.to))
     } else if sources.contains(&item.to) {

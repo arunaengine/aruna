@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::linked::JobStep;
-use super::rename::{RenameError, RenameInput, RenameKeysOperation, check_target};
+use super::rename::{JOB_CHANGED, RenameError, RenameInput, RenameKeysOperation, check_target};
 use crate::auth::request_authorization::BucketAccess;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::store::iter_prefix_page;
@@ -13,7 +13,7 @@ use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
-use aruna_core::structs::storage::linked_job::RemapPlan;
+use aruna_core::structs::storage::linked_job::{LinkedJob, RemapPlan};
 use aruna_core::types::{GroupId, Key};
 use std::collections::{HashMap, HashSet};
 
@@ -245,18 +245,23 @@ fn input(scope: &RemapScope<'_>, pairs: Vec<(String, String)>, apply: bool) -> R
         keys: None,
         pairs,
         apply,
+        cutoff_ms: None,
+        job: None,
     }
 }
 
-/// Re-maps the next keys after `cursor`. Keys changed after `started_ms` stay, as do keys
-/// with a reason; a reason for the whole bucket makes the page wait without moving.
+/// Re-maps the next keys after the job's cursor. Keys changed after the job started stay, as
+/// do keys with a reason; a reason for the whole bucket makes the page wait without moving.
+/// The keys move in one transaction with the job's progress, and only while the job is
+/// stored as `job`, so a paused or aborted job moves nothing more.
 pub async fn job_page(
     context: &DriverContext,
     plan: &RemapPlan,
     scope: &RemapScope<'_>,
-    (cursor, started_ms): (Option<String>, u64),
+    job: &LinkedJob,
 ) -> Result<JobStep, RenameError> {
     let read = |error: String| RenameError::Authorization(error);
+    let (cursor, started_ms) = (job.cursor.clone(), job.started_at_ms);
     let mut step = JobStep {
         cursor: cursor.clone(),
         ..JobStep::default()
@@ -287,12 +292,13 @@ pub async fn job_page(
         }
     }
     let (entries, blocked) = check_keys(context, plan, scope, keys).await?;
+    let unchanged = |waiting| JobStep {
+        cursor: cursor.clone(),
+        waiting,
+        ..JobStep::default()
+    };
     if let Some(reason) = blocked {
-        return Ok(JobStep {
-            cursor,
-            waiting: Some(reason),
-            ..JobStep::default()
-        });
+        return Ok(unchanged(Some(reason)));
     }
     let pairs: Vec<_> = entries
         .iter()
@@ -303,20 +309,28 @@ pub async fn job_page(
     if pairs.is_empty() {
         return Ok(step);
     }
-    let count = pairs.len() as u64;
-    match drive(RenameKeysOperation::new(input(scope, pairs, true)), context).await {
-        Ok(_) => step.done += count,
+    let mut next = job.clone();
+    next.cursor = step.cursor.clone();
+    (next.done, next.skipped) = (job.done + pairs.len() as u64, job.skipped + step.skipped);
+    next.waiting = None;
+    let fence = (job.to_bytes()?.into(), next.to_bytes()?.into());
+    let mut apply = input(scope, pairs, true);
+    (apply.cutoff_ms, apply.job) = (Some(started_ms), Some(fence));
+    match drive(RenameKeysOperation::new(apply), context).await {
+        // The progress is stored with the keys.
+        Ok(_) => Ok(JobStep {
+            done: 0,
+            skipped: 0,
+            ..step
+        }),
+        Err(RenameError::Conflict(reason)) if reason == JOB_CHANGED => Ok(unchanged(None)),
         // Something changed between the check and the move; the page runs again.
-        Err(RenameError::Conflict(reason)) => {
-            return Ok(JobStep {
-                cursor,
-                waiting: Some(reason),
-                ..JobStep::default()
-            });
+        Err(RenameError::Conflict(reason)) => Ok(unchanged(Some(reason))),
+        Err(RenameError::Storage(aruna_core::errors::StorageError::TransactionConflict)) => {
+            Ok(unchanged(None))
         }
-        Err(error) => return Err(error),
+        Err(error) => Err(error),
     }
-    Ok(step)
 }
 
 #[cfg(test)]

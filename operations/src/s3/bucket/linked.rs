@@ -527,15 +527,13 @@ async fn page(
                 bucket,
                 access,
             };
-            let from = (job.cursor.clone(), job.started_at_ms);
-            match job_page(context, plan, &scope, from).await {
+            match job_page(context, plan, &scope, job).await {
                 Ok(step) => step,
                 Err(error) => waiting(error.to_string()),
             }
         }
         LinkedTask::Unify { prefix } => {
-            let from = (job.cursor.clone(), job.started_at_ms);
-            let page = crate::blob::unify::job_page(context, (bucket, prefix), access, from);
+            let page = crate::blob::unify::job_page(context, (bucket, prefix), access, job);
             match page.await {
                 Ok(step) => step,
                 Err(error) => waiting(error),

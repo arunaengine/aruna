@@ -155,6 +155,8 @@ fn rename_input(
         apply: keys.is_some(),
         keys,
         pairs: Vec::new(),
+        cutoff_ms: None,
+        job: None,
     }
 }
 
