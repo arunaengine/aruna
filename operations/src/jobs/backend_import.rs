@@ -9,7 +9,8 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, BUCKET_CREATION_KEYSPACE, DELETE_CLAIM_KEYSPACE, DELETE_TRAIL_KEYSPACE,
-    IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE, RENAMED_ROW_KEYSPACE,
+    IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE, PURGE_FENCE_KEYSPACE,
+    RENAMED_ROW_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::HASH_MD5;
@@ -953,6 +954,7 @@ async fn recover(
         retired,
         writes: Vec::new(),
         sharing: None,
+        fenced: None,
     };
     note_listing(&ctx.driver, rule, row_key, stored, repaired, note).await?;
     Ok(Some(Outcome::Imported))
@@ -1256,10 +1258,14 @@ async fn register_twin(
         retired: Vec::new(),
         writes,
         sharing: Some(sharing(run)),
+        fenced: Some(key),
     };
     let row_key = object_key(rule.import_id, &object.key);
-    note_listing(&ctx.driver, rule, row_key, None, encode(&row)?, note).await?;
-    Ok(Outcome::Imported)
+    // A refused copy is looked at again by the next run.
+    match note_listing(&ctx.driver, rule, row_key, None, encode(&row)?, note).await? {
+        true => Ok(Outcome::Imported),
+        false => Ok(Outcome::Skipped),
+    }
 }
 
 /// Version rows of one key one search for the same content reads at most.
@@ -1702,10 +1708,13 @@ struct Note<'a> {
     writes: Vec<(String, Key, Value)>,
     /// The rules that must share the folder at commit, read again in the transaction.
     sharing: Option<std::collections::BTreeSet<Ulid>>,
+    /// The bucket key a permanent purge must not hold at commit.
+    fenced: Option<&'a str>,
 }
 
 /// Replaces the row only while the rule exists and the row still holds `seen` (`None`: no row),
-/// in one transaction. Otherwise nothing is written and the next run looks at the object again.
+/// in one transaction, and answers whether it committed. Otherwise nothing is written and the
+/// next run looks at the object again.
 async fn note_listing(
     context: &DriverContext,
     rule: &BackendImport,
@@ -1713,7 +1722,7 @@ async fn note_listing(
     seen: Option<&Value>,
     row: Vec<u8>,
     note: Note<'_>,
-) -> Result<(), ItemError> {
+) -> Result<bool, ItemError> {
     let storage = &context.storage_handle;
     let unexpected = |event: Event| ItemError::System(format!("unexpected answer {event:?}"));
     let started = StorageEffect::StartTransaction { read: false };
@@ -1756,9 +1765,21 @@ async fn note_listing(
         },
         _ => true,
     };
-    if !held || !shared {
+    let open = match note.fenced.filter(|_| held && shared) {
+        Some(key) => {
+            let read = StorageEffect::Read {
+                key_space: PURGE_FENCE_KEYSPACE.to_string(),
+                key: crate::s3::purge_fence::fence_key(&rule.bucket),
+                txn_id: Some(txn_id),
+            };
+            let event = storage.send_storage_effect(read).await;
+            crate::s3::purge_fence::check_write_fence(event, &rule.bucket, key).is_ok()
+        }
+        None => true,
+    };
+    if !held || !shared || !open {
         storage.send_storage_effect(abort).await;
-        return Ok(());
+        return Ok(false);
     }
     let write = StorageEffect::Write {
         key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
@@ -1795,10 +1816,10 @@ async fn note_listing(
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
         Event::Storage(StorageEvent::Error {
             error: StorageError::TransactionConflict,
-        }) => Ok(()),
+        }) => Ok(false),
         other => Err(unexpected(other)),
     }
 }
@@ -2164,6 +2185,7 @@ mod tests {
             retired,
             writes: Vec::new(),
             sharing: None,
+            fenced: None,
         };
         let held = note_listing(
             &context,
