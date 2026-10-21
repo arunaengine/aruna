@@ -266,13 +266,14 @@ bucket, including request policies. Tokens with path restrictions are refused.
 - Files are placed as a run places them: a recorded mapping first, then an unfinished write of
   the rule, then the file name. `version_id` is the version a run registers the file as.
 - Only files whose bucket key the caller may read are listed. A conflict is checked by its
-  key at the bucket root.
-- `known`: a recorded mapping or an unfinished write keeps its key whatever the rules say.
+  key at the bucket root and by every key an unfinished write names for it.
+- `known`: a recorded mapping, or an unfinished write that recorded its bytes, keeps its key
+  whatever the rules say.
 - `matched`: one pattern matches; `key` is where the file goes.
 - `root`: no pattern matches; the file goes to the bucket root.
 - `conflict`: a run would report the file and not import it. `patterns` names the patterns
   that all match it. Empty `patterns` means the name fits several keys or versions,
-  unfinished writes name different keys, or in a backend folder shared with other rules, no
+  unfinished writes name different keys or did not record their bytes, or in a backend folder shared with other rules, no
   single rule names a new file and the rules would give it different keys.
 - Files in the folders where Aruna stores its own objects are left out, as are files of a
   shared folder that another rule recorded, writes or alone matches. Rules that all give a new

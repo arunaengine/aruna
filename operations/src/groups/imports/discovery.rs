@@ -320,7 +320,11 @@ fn readable(access: &BucketAccess, rule: &BackendImport, file: &PreviewFile) -> 
             .map(str::to_string)
     };
     let key = file.key.clone().or_else(root);
-    key.is_some_and(|key| access.allows(Some(&key), &Permission::READ))
+    let keys = key.iter().chain(&file.claimed);
+    key.is_some()
+        && keys
+            .into_iter()
+            .all(|key| access.allows(Some(key), &Permission::READ))
 }
 
 /// Where a run would put one listed file.
@@ -344,6 +348,8 @@ pub struct PreviewFile {
     pub key: Option<String>,
     /// The version the file name or the write intent names, which a run registers it as.
     pub version_id: Option<Ulid>,
+    /// Keys unfinished writes name for the file; the caller must be able to read all of them.
+    pub claimed: Vec<String>,
     pub outcome: FileOutcome,
 }
 
@@ -430,6 +436,7 @@ pub async fn preview_discovery(
                 PreviewFile {
                     key: row.key.or_else(|| rule.aruna_key(&path)),
                     version_id: None,
+                    claimed: Vec::new(),
                     outcome: FileOutcome::Known,
                     path,
                 }
@@ -454,6 +461,7 @@ fn unresolved(path: String, patterns: Vec<String>) -> PreviewFile {
         path,
         key: None,
         version_id: None,
+        claimed: Vec::new(),
         outcome: FileOutcome::Conflict(patterns),
     }
 }
@@ -463,11 +471,18 @@ fn decodes(rule: &BackendImport, earlier: &[String], path: &str) -> bool {
 }
 
 /// The key the open writes of a file name, as a run reads them before the file name.
+/// A run trusts an intent only with a record of the written bytes, which it checks against the
+/// file; without one, or when the writes disagree, the file is unresolved.
 fn intended(path: String, open: &[(Key, WriteIntent)]) -> PreviewFile {
-    let mut keys = open.iter().map(|(_, intent)| &intent.key);
+    let claimed: Vec<String> = open.iter().map(|(_, intent)| intent.key.clone()).collect();
+    let mut keys = claimed.iter();
     let first = keys.next().cloned();
-    if !keys.all(|key| Some(key) == first.as_ref()) {
-        return unresolved(path, Vec::new());
+    let proven = open.iter().all(|(_, intent)| intent.written.is_some());
+    if !proven || !keys.all(|key| Some(key) == first.as_ref()) {
+        return PreviewFile {
+            claimed,
+            ..unresolved(path, Vec::new())
+        };
     }
     let version_id = match open {
         [(_, intent)] => Some(intent.version_id),
@@ -477,6 +492,7 @@ fn intended(path: String, open: &[(Key, WriteIntent)]) -> PreviewFile {
         path,
         key: first,
         version_id,
+        claimed,
         outcome: FileOutcome::Known,
     }
 }
@@ -493,6 +509,7 @@ fn named(
             path,
             key: Some(found.key),
             version_id: found.version_id,
+            claimed: Vec::new(),
             outcome: match found.matched {
                 true => FileOutcome::Matched,
                 false => FileOutcome::Root,
@@ -544,12 +561,19 @@ mod tests {
             path: path.to_string(),
             key: key.map(str::to_string),
             version_id: None,
+            claimed: Vec::new(),
             outcome: FileOutcome::Matched,
         };
         // A file shows only when the caller may read its key, also a conflict without one.
         assert!(readable(&access, &rule, &file("raw/a", Some("a"))));
         assert!(!readable(&access, &rule, &file("raw/a", Some("secret/a"))));
         assert!(!readable(&access, &rule, &file("raw/secret/b", None)));
+        // An unresolved file shows only when every key a write claims for it is readable.
+        let claimed = PreviewFile {
+            claimed: vec!["secret/b".to_string()],
+            ..file("raw/b", None)
+        };
+        assert!(!readable(&access, &rule, &claimed));
 
         let mut restricted = auth.clone();
         restricted.path_restrictions = Some(Vec::new());
@@ -597,7 +621,13 @@ mod tests {
             };
             (Key::from(Vec::new()), intent)
         };
+        // Without a record of the written bytes a run cannot trust the intent.
         let file = intended("raw/a".to_string(), &[intent("in/a")]);
+        assert_eq!(file.outcome, FileOutcome::Conflict(Vec::new()));
+        assert_eq!(file.claimed, ["in/a"]);
+        let mut proven = intent("in/a");
+        proven.1.written = Some([1; 32]);
+        let file = intended("raw/a".to_string(), &[proven]);
         assert_eq!(
             (file.key.as_deref(), file.version_id),
             (Some("in/a"), Some(id))
