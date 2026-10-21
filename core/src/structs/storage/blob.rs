@@ -329,6 +329,13 @@ pub enum BlobCleanupWork {
         version_id: Ulid,
         version: String,
     },
+    /// The delete trail of a removed bucket, or of a whole removed group without `bucket`,
+    /// recorded before `before_ms`; it goes a page per pass. The audit itself stays.
+    DropTrail {
+        group_id: Ulid,
+        bucket: Option<String>,
+        before_ms: u64,
+    },
 }
 
 /// The record a write's commit would have made the owner of its bytes.
@@ -376,7 +383,7 @@ impl BlobCleanupWork {
             | Self::ReconcileWrite { location, .. }
             | Self::ReconcileReservation { location }
             | Self::ReleaseRenamed { location, .. } => Some(location),
-            Self::RegisterDht { .. } => None,
+            Self::RegisterDht { .. } | Self::DropTrail { .. } => None,
         }
     }
 }

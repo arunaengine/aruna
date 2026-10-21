@@ -235,6 +235,7 @@ impl CommitOperation {
         writes.push(self.membership.entry(record.plan.realm_id)?);
         deletes.extend(stale_conflict_deletes(Some(previous), Some(&reducer)));
         writes.extend(conflict_write_entries(&reducer)?);
+        writes.push(trail_drop(record.plan.group_id)?);
         if self.auth.is_some() {
             let config = self.config.as_ref().ok_or_else(|| {
                 GroupDeletionError::Unavailable("realm configuration is missing".into())
@@ -314,6 +315,21 @@ impl CommitOperation {
         self.state = State::Commit;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
+}
+
+/// The cleanup queue drops the group's delete trail, a page at a time; the audit stays.
+fn trail_drop(group_id: ulid::Ulid) -> Result<(String, Key, Value), GroupDeletionError> {
+    let row = ulid::Ulid::generate();
+    let work = aruna_core::structs::storage::blob::BlobCleanupWork::DropTrail {
+        group_id,
+        bucket: None,
+        before_ms: row.timestamp_ms(),
+    };
+    let value = work
+        .to_bytes()
+        .map_err(|error| GroupDeletionError::Invalid(error.to_string()))?;
+    let space = aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE.to_string();
+    Ok((space, row.to_bytes().to_vec().into(), value.into()))
 }
 
 impl Operation for CommitOperation {

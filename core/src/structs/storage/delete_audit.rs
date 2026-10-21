@@ -85,6 +85,15 @@ pub fn delete_prefix(group_id: GroupId, bucket: &str, key: &str) -> Vec<u8> {
     bytes
 }
 
+/// The marker and version deletes of every key of one bucket.
+pub fn bucket_prefix(group_id: GroupId, bucket: &str) -> Vec<u8> {
+    let mut bytes = group_id.to_bytes().to_vec();
+    bytes.push(0);
+    bytes.extend_from_slice(&(bucket.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(bucket.as_bytes());
+    bytes
+}
+
 /// The purges of one group, whatever their scope.
 pub fn purge_prefix(group_id: GroupId) -> Vec<u8> {
     let mut bytes = group_id.to_bytes().to_vec();
@@ -122,6 +131,8 @@ mod tests {
             id,
         );
         assert!(purge.starts_with(&purge_prefix(group)));
+        assert!(marker.starts_with(&bucket_prefix(group, "b")));
+        assert!(!marker.starts_with(&bucket_prefix(group, "ba")));
         assert!(!purge.starts_with(&delete_prefix(group, "b", "a")));
     }
 }

@@ -1895,9 +1895,8 @@ impl CompleteUploadOperation {
                 }
                 BlobCleanupWork::DeleteBlob { .. }
                 | BlobCleanupWork::RegisterDht { .. }
-                | BlobCleanupWork::ReleaseRenamed { .. } => {
-                    Ulid::generate().to_bytes().to_vec().into()
-                }
+                | BlobCleanupWork::ReleaseRenamed { .. }
+                | BlobCleanupWork::DropTrail { .. } => Ulid::generate().to_bytes().to_vec().into(),
                 BlobCleanupWork::ReconcileReservation { .. } => {
                     Ulid::generate().to_bytes().to_vec().into()
                 }

@@ -104,7 +104,8 @@ fn cleanup_row_key(work: &BlobCleanupWork) -> Key {
         BlobCleanupWork::DeleteBlob { .. }
         | BlobCleanupWork::RegisterDht { .. }
         | BlobCleanupWork::ReconcileReservation { .. }
-        | BlobCleanupWork::ReleaseRenamed { .. } => Ulid::generate().to_bytes().to_vec().into(),
+        | BlobCleanupWork::ReleaseRenamed { .. }
+        | BlobCleanupWork::DropTrail { .. } => Ulid::generate().to_bytes().to_vec().into(),
     }
 }
 
@@ -408,6 +409,19 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
         } => release_renamed(context, location, import_id, version_id, version)
             .await
             .into(),
+        BlobCleanupWork::DropTrail {
+            group_id,
+            bucket,
+            before_ms,
+        } => match crate::blob::trail::drop_trail(context, group_id, bucket.as_deref(), before_ms)
+            .await
+        {
+            Ok(()) => RowOutcome::Done,
+            Err(error) => {
+                warn!(%error, "Delete trail of a removed bucket could not be dropped");
+                RowOutcome::Failed
+            }
+        },
     }
 }
 

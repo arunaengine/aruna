@@ -13,3 +13,4 @@ pub mod promote;
 pub mod reclaim;
 pub mod records;
 pub mod release;
+pub(crate) mod trail;
