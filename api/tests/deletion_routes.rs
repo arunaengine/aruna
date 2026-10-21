@@ -427,6 +427,7 @@ async fn previews_storage_files() {
         key: "linked/".to_string(),
         limit: Some(1),
         after,
+        filter: None,
     };
     let state = || State(fixture.state.clone());
     let auth = || Extension(Some(fixture.auth.clone()));
@@ -446,10 +447,55 @@ async fn previews_storage_files() {
         .unwrap();
     assert_eq!(second.items[0].key, "linked/b.faa.gz");
     assert!(second.next.is_none());
+    // A filter narrows the page; the totals stay for the folder.
+    let filtered = DeleteImpactRequest {
+        filter: Some("b.faa".to_string()),
+        limit: Some(10),
+        ..request(None)
+    };
+    let Json(only) = delete_preview(state(), auth(), bucket(), Json(filtered))
+        .await
+        .unwrap();
+    let keys: Vec<_> = only.items.iter().map(|item| item.key.as_str()).collect();
+    assert_eq!((keys, only.versions), (vec!["linked/b.faa.gz"], 2));
     let bad = DeleteImpactRequest {
         kind: "everything".to_string(),
         ..request(None)
     };
     let refused = delete_preview(state(), auth(), bucket(), Json(bad)).await;
     assert!(matches!(refused, Err(ServerError::BadRequest)));
+}
+
+#[tokio::test]
+async fn shows_purge_pause() {
+    use aruna_api::routes::storage::deletion::{control_purge, get_purge};
+    let fixture = setup().await;
+    let request = SubmitPurgeRequest {
+        scope: PurgeScopeRequest::Prefix {
+            bucket: "data".to_string(),
+            prefix: "reads/".to_string(),
+        },
+        idempotency_key: None,
+        delete_storage_files: true,
+        confirm: None,
+    };
+    let state = || State(fixture.state.clone());
+    let auth = || Extension(Some(fixture.auth.clone()));
+    let (_, Json(job)) = submit_purge(state(), auth(), Json(request)).await.unwrap();
+    let path = |action: &str| axum::extract::Path((job.job_id.clone(), action.to_string()));
+    // A restricted token steers no purge of storage files.
+    let mut restricted = fixture.auth.clone();
+    restricted.path_restrictions = Some(Vec::new());
+    let refused = control_purge(state(), Extension(Some(restricted)), path("pause")).await;
+    assert!(matches!(refused, Err(ServerError::Forbidden)));
+    let Json(paused) = control_purge(state(), auth(), path("pause")).await.unwrap();
+    assert_eq!((paused.state.as_str(), paused.paused), ("paused", true));
+    let id = || axum::extract::Path(job.job_id.clone());
+    let Json(shown) = get_purge(state(), auth(), id()).await.unwrap();
+    assert!(shown.paused && shown.delete_storage_files);
+    let Json(resumed) = control_purge(state(), auth(), path("resume"))
+        .await
+        .unwrap();
+    assert!(!resumed.paused);
+    assert_ne!(resumed.state, "paused");
 }

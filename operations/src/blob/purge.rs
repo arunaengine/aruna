@@ -238,6 +238,7 @@ pub struct ScopeTotals {
 pub async fn scope_totals(
     context: &DriverContext,
     scope: &StoragePurgeScope,
+    readable: &(dyn Fn(&str) -> bool + Sync),
 ) -> Result<ScopeTotals, String> {
     use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
     let mut totals = ScopeTotals::default();
@@ -261,7 +262,7 @@ pub async fn scope_totals(
                 ListVersionsItem::Version { key, location, .. } => (key, location.as_ref()),
                 ListVersionsItem::DeleteMarker { key, .. } => (key, None),
             };
-            if !scope.matches_key(scope.bucket(), key) {
+            if !scope.matches_key(scope.bucket(), key) || !readable(key) {
                 continue;
             }
             totals.versions += 1;

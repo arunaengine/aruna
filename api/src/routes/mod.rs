@@ -602,6 +602,7 @@ pub(crate) mod tests {
         ("POST", "/data/buckets/{bucket}/storage/rename"),
         ("POST", "/data/buckets/{bucket}/storage/delete/preview"),
         ("POST", "/data/storage/purge/jobs/{job_id}/{action}"),
+        ("GET", "/data/storage/purge/jobs/{job_id}"),
         ("POST", "/data/buckets/{bucket}/storage/rename/preview"),
         ("POST", "/data/buckets/{bucket}/storage/check"),
         ("POST", "/data/buckets/{bucket}/storage/check/cleanup"),
