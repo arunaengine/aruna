@@ -644,7 +644,7 @@ impl BlobHandler {
             false => Ok(Err(unsupported())),
         };
         let delete = match delete {
-            Ok(Err(error)) if error.kind() == ErrorKind::Unsupported => {
+            Ok(Err(error)) if conditional_unsupported(&error) => {
                 timeout(self.io_timeout(), operator.delete(path)).await
             }
             delete => delete,
@@ -693,6 +693,16 @@ impl BlobHandler {
     }
 }
 
+/// Whether a storage refused a conditional delete as not implemented, which OpenDAL may also
+/// report as an unexpected 501 answer; a failed condition is never such a refusal.
+fn conditional_unsupported(error: &opendal::Error) -> bool {
+    match error.kind() {
+        ErrorKind::Unsupported => true,
+        ErrorKind::Unexpected => error.to_string().contains("NotImplemented"),
+        _ => false,
+    }
+}
+
 /// Bytes one copied part takes at most; the provider limit is 5 GiB.
 const COPY_PART: u64 = 1 << 30;
 
@@ -725,6 +735,21 @@ pub(super) fn folder_read(location: &BackendLocation) -> Option<BlobEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spots_unsupported_conditions() {
+        let refused = |kind, message| conditional_unsupported(&opendal::Error::new(kind, message));
+        assert!(refused(ErrorKind::Unsupported, "no conditional delete"));
+        assert!(refused(
+            ErrorKind::Unexpected,
+            "S3Error { code: \"NotImplemented\" }"
+        ));
+        assert!(!refused(ErrorKind::ConditionNotMatch, "PreconditionFailed"));
+        assert!(!refused(
+            ErrorKind::Unexpected,
+            "S3Error { code: \"AccessDenied\" }"
+        ));
+    }
 
     #[test]
     fn splits_large_copies() {
