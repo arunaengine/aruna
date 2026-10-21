@@ -218,3 +218,23 @@ async fn controls_jobs() {
     let Json(status) = link_status(state(), auth(), path()).await.unwrap();
     assert_eq!((status.files, status.conflicts.len()), (None, 0));
 }
+
+#[tokio::test]
+async fn hides_unmapped_failures() {
+    let test = setup_state().await;
+    let ids = rule(&test).await;
+    let context = test.state.get_ctx();
+    let group = Ulid::from_string(&ids.0).unwrap();
+    let import = Ulid::from_string(&ids.1).unwrap();
+    let rule = aruna_operations::groups::imports::read_import(&context, group, import)
+        .await
+        .unwrap()
+        .unwrap();
+    let scope = (test.auth.realm_id, group, test.state.get_node_id());
+    let access = BucketAccess::load(&context, &test.auth, scope, &test.bucket)
+        .await
+        .unwrap();
+    // A failed file is shown by the keys the rule gives it; one outside its folder has none.
+    assert!(shown(&rule, &access, "raw/a.faa.gz"));
+    assert!(!shown(&rule, &access, "elsewhere/a.faa.gz"));
+}

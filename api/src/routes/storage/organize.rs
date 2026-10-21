@@ -7,7 +7,7 @@ use super::imports::{admin_of_group, existing_rule, map_error};
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::linked_job::{LinkedJob, LinkedState, LinkedTask, RemapPlan};
 use aruna_operations::auth::bearer_token::token_grant;
@@ -727,7 +727,7 @@ pub async fn link_status(
     Extension(auth): Extension<Option<AuthContext>>,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<Json<LinkStatus>> {
-    let (rule, ..) = caller(&state, auth, (&group_id, &import_id)).await?;
+    let (rule, _, access) = caller(&state, auth, (&group_id, &import_id)).await?;
     let run = last_run(&state.get_ctx(), &rule).await.map_err(map_error)?;
     let Some(run) = run else {
         return Ok(Json(LinkStatus {
@@ -743,12 +743,25 @@ pub async fn link_status(
         files: finished.then_some(files),
         bytes: None,
         conflicts: (checkpoint.errors.into_iter())
+            .filter(|failure| shown(&rule, &access, &failure.key))
             .map(|failure| LinkConflict {
                 path: failure.key,
                 reason: failure.error,
             })
             .collect(),
     }))
+}
+
+/// A failed file is shown only when the caller may read every key the rule may give it: its
+/// key under the rule's folders and its key at the bucket root.
+fn shown(rule: &BackendImport, access: &BucketAccess, path: &str) -> bool {
+    let read = |key: &str| access.allows(Some(key), &Permission::READ);
+    let root = path.strip_prefix(&rule.backend_prefix);
+    let mapped = rule.aruna_key(path);
+    match (mapped, root) {
+        (Some(mapped), Some(root)) => read(&mapped) && read(root),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
