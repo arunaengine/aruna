@@ -31,8 +31,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, PlainPath, WriteIntent, import_key, intent_key, object_key,
-    tagged_path, version_key,
+    BackendImport, ImportedObject, PlainPath, WriteIntent, import_key, intent_key, intent_prefix,
+    object_key, tagged_path, version_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion, BlobVersionState,
@@ -82,6 +82,8 @@ pub enum MigrateState {
     CheckVersion,
     CheckCopy,
     ReadTarget,
+    /// Reads the intents other rules hold for the linked file's path.
+    ReadPeerIntents,
     WriteRows,
     /// Deletes the intents the published version makes obsolete.
     RetireIntents,
@@ -158,6 +160,10 @@ pub struct MigrateVersionOperation {
     tag_checked: bool,
     /// The intent write in flight, in one transaction with a read of its rule.
     fence: Option<FencedWrite>,
+    /// The target row the publication read, kept while the peers' intents are read.
+    target_row: Option<Option<Vec<u8>>>,
+    /// The other rules of the path whose intents are still to read.
+    peers: Vec<Ulid>,
     /// The write intents stored for a write to a linked folder, at both paths it may reach.
     written_intent: Vec<Key>,
     /// The write that waits for its intent to be on disk.
@@ -197,6 +203,8 @@ impl MigrateVersionOperation {
             backend_version: None,
             tag_checked: false,
             fence: None,
+            target_row: None,
+            peers: Vec::new(),
             written_intent: Vec::new(),
             pending_write: None,
             backend_etag: None,
@@ -981,14 +989,11 @@ impl MigrateVersionOperation {
     /// The records other rules that read the linked file's path, as this transaction reads
     /// the rules, would keep of it; any of them makes the file theirs.
     fn shared_rows(&self) -> Vec<(String, Key)> {
-        let (Some(target), Some(new), Some(fresh)) = (&self.plain, &self.new, &self.fresh) else {
+        let Some(new) = self.new.as_ref() else {
             return Vec::new();
         };
-        let path = &new.backend_path;
-        let readers = fresh
-            .readers(target.import_id, &target.backend, path)
-            .into_iter();
-        let rows = readers.map(|import_id| object_key(import_id, path));
+        let rows = self.readers().into_iter();
+        let rows = rows.map(|import_id| object_key(import_id, &new.backend_path));
         rows.map(|key| (IMPORTED_OBJECT_KEYSPACE.to_string(), key))
             .collect()
     }
@@ -1009,7 +1014,50 @@ impl MigrateVersionOperation {
             }
             other => return self.unexpected(other),
         };
-        match self.rows(value.map(|value| value.to_vec())) {
+        self.target_row = Some(value.map(|value| value.to_vec()));
+        self.peers = self.readers();
+        self.peer_intents()
+    }
+
+    /// The other rules that read the linked file's path, as this transaction reads the rules.
+    fn readers(&self) -> Vec<Ulid> {
+        let (Some(target), Some(new), Some(fresh)) = (&self.plain, &self.new, &self.fresh) else {
+            return Vec::new();
+        };
+        fresh.readers(target.import_id, &target.backend, &new.backend_path)
+    }
+
+    /// An unfinished write of another rule to the path claims the file there too, so the move
+    /// does not take it; each rule's intents of the path are read in the transaction.
+    fn peer_intents(&mut self) -> Effects {
+        let (Some(import_id), Some(new)) = (self.peers.pop(), self.new.as_ref()) else {
+            let row = self.target_row.take().flatten();
+            return self.publish(row);
+        };
+        self.state = MigrateState::ReadPeerIntents;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: IMPORT_INTENT_KEYSPACE.to_string(),
+            prefix: Some(intent_prefix(import_id, &new.backend_path)),
+            start: None,
+            limit: 1,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_peers(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::IterResult { values, .. }) if values.is_empty() => {
+                self.peer_intents()
+            }
+            Event::Storage(StorageEvent::IterResult { .. }) => {
+                self.fail(BlobError::PathTaken.into())
+            }
+            other => self.unexpected(other),
+        }
+    }
+
+    fn publish(&mut self, value: Option<Vec<u8>>) -> Effects {
+        match self.rows(value) {
             Ok(writes) => {
                 self.state = MigrateState::WriteRows;
                 smallvec![Effect::Storage(StorageEffect::BatchWrite {
@@ -1245,6 +1293,7 @@ impl Operation for MigrateVersionOperation {
             MigrateState::CheckVersion => self.handle_check(event),
             MigrateState::CheckCopy => self.handle_copy(event),
             MigrateState::ReadTarget => self.handle_target(event),
+            MigrateState::ReadPeerIntents => self.handle_peers(event),
             MigrateState::WriteRows => self.handle_rows(event),
             MigrateState::RetireIntents => self.handle_retired(event),
             MigrateState::UpdateUsage => self.handle_usage(event),
@@ -2668,26 +2717,51 @@ mod tests {
                 key_prefix: "other/".to_string(),
                 ..rule()
             };
-            let mut moved = operation("in/x/one.csv", vec![rule(), other.clone()]);
             let version = raw_version();
-            copied(&mut moved, &version, false);
-            let default = Some(RoutingTarget::Backend(storage()));
-            rules_read(&mut moved, default, [rule(), other.clone()]);
-            moved.step(storage_record(false));
-            let effects = moved.step(read_result(Some(version.to_bytes().unwrap())));
-            let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
-            else {
-                panic!("expected the target and shared reads, got {effects:?}")
+            let at_target = || {
+                let mut moved = operation("in/x/one.csv", vec![rule(), other.clone()]);
+                copied(&mut moved, &version, false);
+                let default = Some(RoutingTarget::Backend(storage()));
+                rules_read(&mut moved, default, [rule(), other.clone()]);
+                moved.step(storage_record(false));
+                let effects = moved.step(read_result(Some(version.to_bytes().unwrap())));
+                let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
+                else {
+                    panic!("expected the target and shared reads, got {effects:?}")
+                };
+                let path = moved.new.as_ref().unwrap().backend_path.clone();
+                assert_eq!(reads[1].1, object_key(other.import_id, &path));
+                (moved, path)
             };
-            let path = &moved.new.as_ref().unwrap().backend_path;
-            assert_eq!(reads[1].1, object_key(other.import_id, path));
-            let values = vec![
-                (Key::from(Vec::new()), None),
-                (Key::from(Vec::new()), Some(Value::from(vec![1]))),
-            ];
-            moved.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-            let taken = MigrateVersionError::Blob(BlobError::PathTaken);
-            assert_eq!(moved.output, Some(Err(taken)));
+            let row = |other: Option<Value>| {
+                let values = vec![
+                    (Key::from(Vec::new()), None),
+                    (Key::from(Vec::new()), other),
+                ];
+                Event::Storage(StorageEvent::BatchReadResult { values })
+            };
+            let taken = || Some(Err(MigrateVersionError::Blob(BlobError::PathTaken)));
+            let (mut moved, _) = at_target();
+            moved.step(row(Some(vec![1].into())));
+            assert_eq!(moved.output, taken());
+            // Nor while the other rule has an unfinished write of the path.
+            let (mut moved, path) = at_target();
+            let effects = moved.step(row(None));
+            let [
+                Effect::Storage(StorageEffect::Iter {
+                    prefix: Some(prefix),
+                    ..
+                }),
+            ] = effects.as_slice()
+            else {
+                panic!("expected the peer intents, got {effects:?}")
+            };
+            assert_eq!(*prefix, intent_prefix(other.import_id, &path));
+            moved.step(Event::Storage(StorageEvent::IterResult {
+                values: vec![(Key::from(vec![1]), Value::from(vec![1]))],
+                next_start_after: None,
+            }));
+            assert_eq!(moved.output, taken());
         }
 
         #[test]
