@@ -84,6 +84,10 @@ async fn finish_delete(
     let Some(blob_handle) = context.blob_handle.as_ref() else {
         return false;
     };
+    // The deleting mark may be only buffered from a failed sync; it must be on disk first.
+    if !synced(context).await {
+        return false;
+    }
     let key = object_key(import_id, &location.backend_path);
     let effect = BlobEffect::DeletePlain {
         location: location.clone(),
