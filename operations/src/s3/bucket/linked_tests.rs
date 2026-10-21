@@ -7,7 +7,7 @@ use crate::s3::bucket::rename::tests::{
     BUCKET, access, get, group, head_key, object, realm, setup,
 };
 use crate::tests::records::node;
-use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE};
 use aruna_core::structs::storage::backend_import::TokenGrant;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::linked_job::RemapPlan;
@@ -179,14 +179,15 @@ async fn controls_renames() {
     let Ok(BucketJob::Rename(ended, aborted)) = act(&context, LinkedAction::Abort).await else {
         panic!("expected the aborted rename")
     };
+    // The worker ends the move once its version in flight is done; until then it holds.
     assert_eq!(
         (ended.finished_at_ms, aborted.aborted_at_ms),
-        (Some(5), Some(5))
+        (None, Some(5))
     );
     assert!(
         get(&context, COMPRESSION_QUEUE_KEYSPACE, bucket)
             .await
-            .is_none()
+            .is_some()
     );
     let after = act(&context, LinkedAction::Resume).await;
     assert!(matches!(after, Err(LinkedError::NoJob(_))));

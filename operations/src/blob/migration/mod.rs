@@ -1690,6 +1690,13 @@ async fn migrate_page(
         Some(_) => rename_request(context, bucket, &record).await?,
         None => None,
     };
+    // An aborted rename ends here with its counts, once no version of it is in flight.
+    if request
+        .as_ref()
+        .is_some_and(|request| request.aborted_at_ms.is_some())
+    {
+        return end_aborted(context, bucket, record).await;
+    }
     // A paused rename waits for its resume, which wakes this task again.
     if request.as_ref().is_some_and(|request| request.paused) {
         return Ok(None);
@@ -1757,6 +1764,10 @@ async fn migrate_page(
         }
     }
     if stopped {
+        let aborted = rename_request(context, bucket, &record).await?;
+        if aborted.is_some_and(|request| request.aborted_at_ms.is_some()) {
+            return end_aborted(context, bucket, record).await;
+        }
         store_progress(context, bucket, &record).await?;
         return Ok(None);
     }
@@ -1785,6 +1796,18 @@ async fn migrate_page(
     };
     store_progress(context, bucket, &record).await?;
     Ok(after)
+}
+
+/// Ends an aborted rename's move with its last progress; its request stays to show the abort.
+async fn end_aborted(
+    context: &crate::driver::DriverContext,
+    bucket: &str,
+    mut record: CompressionMigration,
+) -> Result<Option<Duration>, String> {
+    record.retry_at_ms = None;
+    record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
+    store_progress(context, bucket, &record).await?;
+    Ok(None)
 }
 
 /// Whether the caller paused or aborted the rename of the move `record`.
@@ -1898,9 +1921,26 @@ async fn stage_progress(
         Event::Storage(StorageEvent::WriteResult { .. }) => {}
         other => return Err(format!("could not write migration progress: {other:?}")),
     }
-    // A finished migration leaves the queue and its rename request with its last progress.
+    // A finished migration leaves the queue and its rename request with its last progress;
+    // the request of an aborted rename stays to show the abort.
     if record.finished_at_ms.is_some() {
-        for space in [COMPRESSION_QUEUE_KEYSPACE, RENAME_MOVE_KEYSPACE] {
+        let read = StorageEffect::Read {
+            key_space: RENAME_MOVE_KEYSPACE.to_string(),
+            key: key.clone(),
+            txn_id: Some(txn_id),
+        };
+        let request = match storage.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            other => return Err(format!("could not read the rename request: {other:?}")),
+        };
+        let request = request.as_deref().map(RenameRequest::from_bytes);
+        let aborted = request
+            .is_some_and(|request| request.is_ok_and(|request| request.aborted_at_ms.is_some()));
+        let spaces = match aborted {
+            true => &[COMPRESSION_QUEUE_KEYSPACE][..],
+            false => &[COMPRESSION_QUEUE_KEYSPACE, RENAME_MOVE_KEYSPACE][..],
+        };
+        for space in spaces {
             let delete = StorageEffect::Delete {
                 key_space: space.to_string(),
                 key: key.clone(),
@@ -2403,6 +2443,85 @@ mod tests {
         expired.grant.expires_at_secs = 1;
         let access = rename_access(&context, &expired, &routing, "b").await;
         assert!(access.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn ends_aborted_rename() {
+        // An aborted rename ends its move with its counts and keeps the request as the abort.
+        let temp = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let context = crate::tests::s3::test_context(storage.clone());
+        let mut record = CompressionMigration::new(Compression::Off, 7);
+        (record.moving, record.migrated) = (true, 3);
+        let info = BucketInfo {
+            group_id: Ulid::from_parts(1, 1),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+        };
+        let request = RenameRequest {
+            started_at_ms: 7,
+            auth: aruna_core::structs::identity::auth::AuthContext {
+                user_id: Default::default(),
+                realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]),
+                path_restrictions: None,
+                session: None,
+            },
+            node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+            grant: aruna_core::structs::storage::backend_import::TokenGrant {
+                token_hash: "hash".to_string(),
+                issuer: aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]),
+                issued_at_secs: 1,
+                expires_at_secs: u64::MAX,
+                via: None,
+            },
+            paused: true,
+            aborted_at_ms: Some(9),
+        };
+        for (key_space, value) in [
+            (S3_BUCKET_KEYSPACE, info.to_bytes().unwrap()),
+            (COMPRESSION_QUEUE_KEYSPACE, Vec::new()),
+            (COMPRESSION_MIGRATION_KEYSPACE, record.to_bytes().unwrap()),
+            (RENAME_MOVE_KEYSPACE, request.to_bytes().unwrap()),
+        ] {
+            let write = StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key: b"b".to_vec().into(),
+                value: value.into(),
+                txn_id: None,
+            };
+            storage.send_storage_effect(write).await;
+        }
+
+        assert_eq!(migrate_page(&context, "b", record).await.unwrap(), None);
+
+        let key: Key = b"b".to_vec().into();
+        let stored = read_progress(&context, &key).await.unwrap().unwrap();
+        assert!(stored.finished_at_ms.is_some());
+        assert_eq!(stored.migrated, 3);
+        let read = |key_space: &str| StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: key.clone(),
+            txn_id: None,
+        };
+        let kept = storage
+            .send_storage_effect(read(RENAME_MOVE_KEYSPACE))
+            .await;
+        assert!(matches!(
+            kept,
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
+        ));
+        let queued = storage
+            .send_storage_effect(read(COMPRESSION_QUEUE_KEYSPACE))
+            .await;
+        assert!(matches!(
+            queued,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
     }
 
     #[test]

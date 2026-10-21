@@ -10,8 +10,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE,
-    LINKED_JOB_KEYSPACE, RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, LINKED_JOB_KEYSPACE,
+    RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::Permission;
@@ -177,17 +177,15 @@ fn decide(
     let Some((migration, request)) = rows.running_rename() else {
         return Err(LinkedError::NoJob("no job of this bucket runs".into()));
     };
-    let (mut migration, mut request) = (migration.clone(), request.clone());
-    let mut deletes = Vec::new();
+    let (migration, mut request) = (migration.clone(), request.clone());
+    if request.aborted_at_ms.is_some() {
+        return Err(LinkedError::NoJob("the rename is aborted".into()));
+    }
     match (request.paused, action) {
         (false, LinkedAction::Pause) => request.paused = true,
         (true, LinkedAction::Resume) => request.paused = false,
-        (_, LinkedAction::Abort) => {
-            // The record ends with its counts; the request stays to show the abort.
-            request.aborted_at_ms = Some(now_ms);
-            (migration.finished_at_ms, migration.retry_at_ms) = (Some(now_ms), None);
-            deletes.push((COMPRESSION_QUEUE_KEYSPACE.to_string(), key.clone()));
-        }
+        // The move ends once the version in flight is done, with its counts.
+        (_, LinkedAction::Abort) => request.aborted_at_ms = Some(now_ms),
         (paused, _) => {
             return Err(LinkedError::NoJob(format!(
                 "the rename is {}",
@@ -195,19 +193,12 @@ fn decide(
             )));
         }
     }
-    let writes = vec![
-        (
-            COMPRESSION_MIGRATION_KEYSPACE.to_string(),
-            key.clone(),
-            migration.to_bytes()?.into(),
-        ),
-        (
-            RENAME_MOVE_KEYSPACE.to_string(),
-            key,
-            request.to_bytes()?.into(),
-        ),
-    ];
-    Ok((writes, deletes, BucketJob::Rename(migration, request)))
+    let writes = vec![(
+        RENAME_MOVE_KEYSPACE.to_string(),
+        key,
+        request.to_bytes()?.into(),
+    )];
+    Ok((writes, Vec::new(), BucketJob::Rename(migration, request)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -273,7 +264,8 @@ impl BucketJobOperation {
     }
 
     fn wakes(&self) -> bool {
-        matches!(self.action, LinkedAction::Start(_) | LinkedAction::Resume)
+        // An abort wakes the worker too, which ends an aborted rename.
+        !matches!(self.action, LinkedAction::Pause)
     }
 }
 
