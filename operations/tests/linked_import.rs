@@ -24,7 +24,8 @@ use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportSpec, DEFAULT_PATTERN, PlainPath,
 };
 use aruna_core::structs::storage::blob::{
-    Backend, BackendConfig, BackendRef, BlobHeadKey, BucketInfo, ResolvedBackend,
+    Backend, BackendConfig, BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer,
+    ResolvedBackend,
 };
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::discovery::DiscoveryRule;
@@ -403,7 +404,30 @@ async fn s3_imports_folder() {
     assert!(has_key(&context, "proteins/a.faa.gz").await);
     assert!(has_key(&context, "b.txt").await);
     assert!(!has_key(&context, "a.faa.gz").await);
-    place(&context, "c.txt", b"later").await;
+    // A name the write pattern made keeps the version id it encodes.
+    let id = Ulid::generate();
+    place(&context, &format!("c.txt~{id}"), b"later").await;
     assert_eq!(run_import(&context, 0xD4).await, (1, 2, 0));
-    assert!(has_key(&context, "c.txt").await);
+    assert_eq!(current(&context, "c.txt").await, Some(id));
+}
+
+async fn current(context: &TestContext, key: &str) -> Option<Ulid> {
+    let read = StorageEffect::Read {
+        key_space: BLOB_HEAD_KEYSPACE.to_string(),
+        key: BlobHeadKey::new(BUCKET, key).to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    let event = context
+        .driver
+        .storage_handle
+        .send_storage_effect(read)
+        .await;
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        panic!("head read failed: {event:?}")
+    };
+    value.map(|value| {
+        CurrentVersionPointer::from_bytes(&value)
+            .unwrap()
+            .version_id
+    })
 }
