@@ -418,3 +418,27 @@ async fn copies_plain_files() {
         b"copied bytes"
     );
 }
+
+#[tokio::test]
+async fn records_copy_uploads() {
+    // A copy's provider upload is recorded by its attempt until it settles, and only that one.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let attempt = ulid::Ulid::generate();
+    assert_eq!(handler.copy_upload(attempt).await.unwrap(), None);
+    handler
+        .record_upload(attempt, Some(("raw/a.txt~7", "upload-1")))
+        .await
+        .unwrap();
+    let recorded = handler.copy_upload(attempt).await.unwrap();
+    assert_eq!(
+        recorded,
+        Some(("raw/a.txt~7".to_string(), "upload-1".to_string()))
+    );
+    assert_eq!(
+        handler.copy_upload(ulid::Ulid::generate()).await.unwrap(),
+        None
+    );
+    handler.record_upload(attempt, None).await.unwrap();
+    assert_eq!(handler.copy_upload(attempt).await.unwrap(), None);
+}

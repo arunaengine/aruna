@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle as _;
-use aruna_core::keyspaces::BACKEND_VERSION_KEYSPACE;
+use aruna_core::keyspaces::{BACKEND_VERSION_KEYSPACE, COPY_UPLOAD_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::storage::backend_import::{PlainPath, tagged_path, version_key};
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, ResolvedBackend};
@@ -151,16 +151,26 @@ impl BlobHandler {
         let if_not_exists = conditional(&operator, &mut location, plain)?;
         let target = self.native_upload(&location)?;
         let (path, source_path) = (self.object_path(&location)?, self.object_path(source)?);
-        // The path is this copy's own; an upload an interrupted try left there goes first.
-        let _ = timeout(self.io_timeout(), target.abort_path(&path)).await;
+        // The upload an interrupted try of this copy recorded goes first, and only that one.
+        if let Some((left, upload_id)) = self.copy_upload(plain.ulid).await? {
+            target.abort(&left, &upload_id).await?;
+            self.record_upload(plain.ulid, None).await?;
+        }
         let size = source.blob_size;
         let ranges = copy_ranges(size);
         let upload_id = target.create(&path).await?;
+        // The upload is on disk before any part moves, so a crash leaves it reconcilable.
+        if let Err(error) = self
+            .record_upload(plain.ulid, Some((&path, &upload_id)))
+            .await
+        {
+            let _ = target.abort(&path, &upload_id).await;
+            return Err(error);
+        }
         let mut parts = Vec::with_capacity(ranges.len());
         for (index, range) in ranges.iter().enumerate() {
             let Ok(number) = u16::try_from(index + 1) else {
-                let _ = target.abort(&path, &upload_id).await;
-                return Ok(None);
+                return self.settle(target, (&path, &upload_id), plain.ulid).await;
             };
             let from = (native, source_path.as_str(), version);
             match target
@@ -170,8 +180,7 @@ impl BlobHandler {
                 Ok(etag) => parts.push((number, etag)),
                 Err(error) => {
                     tracing::warn!(%error, "Provider copy refused; the bytes are streamed");
-                    let _ = target.abort(&path, &upload_id).await;
-                    return Ok(None);
+                    return self.settle(target, (&path, &upload_id), plain.ulid).await;
                 }
             }
         }
@@ -179,8 +188,7 @@ impl BlobHandler {
         if let ([(_, etag)], Some(md5)) = (parts.as_slice(), md5)
             && etag.trim_matches('"') != hex::encode(md5)
         {
-            let _ = target.abort(&path, &upload_id).await;
-            return Ok(None);
+            return self.settle(target, (&path, &upload_id), plain.ulid).await;
         }
         let completed = target
             .complete(&path, &upload_id, &parts, if_not_exists)
@@ -188,10 +196,11 @@ impl BlobHandler {
         let (written, etag) = match completed {
             Ok(completed) => completed,
             Err(error) => {
-                let _ = target.abort(&path, &upload_id).await;
+                self.settle(target, (&path, &upload_id), plain.ulid).await?;
                 return Err(error);
             }
         };
+        self.record_upload(plain.ulid, None).await?;
         let versioned = operator.info().capability().read_with_version;
         let written = written.filter(|version| versioned && version != "null");
         let stat = operator.stat_with(&path);
@@ -218,6 +227,89 @@ impl BlobHandler {
             version: written,
             etag: etag.map(|etag| etag.trim_matches('"').to_string()),
         }))
+    }
+
+    /// Aborts this copy's own provider upload and forgets it, then asks for a streamed copy. A
+    /// failed abort keeps the record, so a later try aborts it before anything else.
+    async fn settle(
+        &self,
+        target: crate::s3::NativeMultipart,
+        (path, upload_id): (&str, &str),
+        attempt: ulid::Ulid,
+    ) -> Result<Option<BlobEvent>, BlobError> {
+        target.abort(path, upload_id).await?;
+        self.record_upload(attempt, None).await?;
+        Ok(None)
+    }
+
+    /// The provider upload a copy attempt recorded: its path and upload id.
+    pub(super) async fn copy_upload(
+        &self,
+        attempt: ulid::Ulid,
+    ) -> Result<Option<(String, String)>, BlobError> {
+        let read = StorageEffect::Read {
+            key_space: COPY_UPLOAD_KEYSPACE.to_string(),
+            key: attempt.to_bytes().to_vec().into(),
+            txn_id: None,
+        };
+        match self.storage.send_effect(Effect::Storage(read)).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+                .map(|value| postcard::from_bytes(&value))
+                .transpose()
+                .map_err(|error| BlobError::ReadError(error.to_string())),
+            other => Err(BlobError::ReadError(format!(
+                "failed to read the copy upload: {other:?}"
+            ))),
+        }
+    }
+
+    /// Records a copy attempt's provider upload durably, or forgets it with `None`.
+    pub(super) async fn record_upload(
+        &self,
+        attempt: ulid::Ulid,
+        upload: Option<(&str, &str)>,
+    ) -> Result<(), BlobError> {
+        let key = attempt.to_bytes().to_vec().into();
+        let space = COPY_UPLOAD_KEYSPACE.to_string();
+        let effect = match upload {
+            Some(upload) => {
+                let value = postcard::to_allocvec(&upload)
+                    .map_err(|error| BlobError::WriteError(error.to_string()))?;
+                StorageEffect::Write {
+                    key_space: space,
+                    key,
+                    value: value.into(),
+                    txn_id: None,
+                }
+            }
+            None => StorageEffect::Delete {
+                key_space: space,
+                key,
+                txn_id: None,
+            },
+        };
+        let stored = self.storage.send_effect(Effect::Storage(effect)).await;
+        if !matches!(
+            stored,
+            Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. })
+        ) {
+            return Err(BlobError::WriteError(format!(
+                "failed to record the copy upload: {stored:?}"
+            )));
+        }
+        if upload.is_none() {
+            return Ok(());
+        }
+        let synced = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::SyncAll))
+            .await;
+        match synced {
+            Event::Storage(StorageEvent::SyncAllFinished) => Ok(()),
+            other => Err(BlobError::WriteError(format!(
+                "failed to sync the copy upload: {other:?}"
+            ))),
+        }
     }
 
     /// A key that ends in `/` is an empty folder object at that exact key.
