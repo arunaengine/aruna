@@ -603,11 +603,42 @@ fn identity_error(error: IdentityError) -> ItemError {
     }
 }
 
+/// The free path of a file at `path`, without a trailing `~<id>` tag of any id.
+fn free_path(path: &str) -> &str {
+    let Some((free, tag)) = path.rsplit_once('~') else {
+        return path;
+    };
+    match Ulid::from_string(tag) {
+        Ok(_) if !free.is_empty() => free,
+        _ => path,
+    }
+}
+
 /// Every intent key the write `id` may have stored for the file at `path`: the free path and
 /// its tagged path, whichever of the two the bytes reached.
 fn write_intents(import_id: Ulid, path: &str, id: Ulid) -> Vec<Key> {
     let free = path.strip_suffix(&format!("~{id}")).unwrap_or(path);
     intent_keys(import_id, free, id, true)
+}
+
+/// `write_intents` and the intents of `id` at any tagged path of the free path, as a move
+/// tags with its attempt id rather than the version id.
+async fn stored_intents(
+    context: &DriverContext,
+    import_id: Ulid,
+    path: &str,
+    id: Ulid,
+) -> Result<Vec<Key>, ItemError> {
+    let free = free_path(path);
+    let mut keys = write_intents(import_id, free, id);
+    let prefix = object_key(import_id, &format!("{free}~"));
+    for (key, _) in iterate(context, IMPORT_INTENT_KEYSPACE, prefix).await? {
+        let tagged = intent_path(&key).is_some_and(|tagged| free_path(tagged) == free);
+        if tagged && key.ends_with(&id.to_bytes()) && !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    Ok(keys)
 }
 
 /// Reads the listed object's bytes; a size other than the listed one means it changed meanwhile.
@@ -818,15 +849,18 @@ async fn recover(
             if row.is_none() {
                 guards.extend(shared_guards(run, &object.key));
             }
+            let retired = match (&intent, &alias) {
+                (Some(_), None) => {
+                    stored_intents(&ctx.driver, rule.import_id, &object.key, version_id).await?
+                }
+                _ => Vec::new(),
+            };
             // Older history joins below a head; a key that never had one gets the file as head.
             let fence = Fence {
                 head,
                 keep_head: head.is_some(),
                 guards,
-                retired: match (&intent, &alias) {
-                    (Some(_), None) => write_intents(rule.import_id, &object.key, version_id),
-                    _ => Vec::new(),
-                },
+                retired,
                 trail: Some(version_id),
                 keep_row: alias.is_some(),
             };
@@ -878,7 +912,7 @@ async fn recover(
         (BLOB_VERSIONS_KEYSPACE.to_string(), version_key, Some(value)),
     ];
     let retired = match intent {
-        Some(_) => write_intents(rule.import_id, &object.key, version_id),
+        Some(_) => stored_intents(&ctx.driver, rule.import_id, &object.key, version_id).await?,
         None => Vec::new(),
     };
     let repaired = encode(&committed)?;
@@ -1917,6 +1951,34 @@ mod tests {
         assert!(done.await.is_ok());
         assert_eq!(stored().await, listed);
         assert!(!intent_left().await);
+    }
+
+    #[tokio::test]
+    async fn retires_move_intents() {
+        // A move tags with its attempt id; its intents of the version go wherever the file is.
+        let (_directory, storage) = crate::tests::s3::test_storage();
+        let context = crate::tests::s3::test_context(storage);
+        let (import_id, id, attempt) = (
+            Ulid::from_parts(4, 4),
+            Ulid::from_parts(5, 5),
+            Ulid::from_parts(6, 6),
+        );
+        let tagged = format!("raw/a~{attempt}");
+        let moved = intent_key(import_id, &tagged, id);
+        let other = intent_key(import_id, &tagged, Ulid::from_parts(7, 7));
+        for key in [moved.clone(), other] {
+            assert!(
+                write_value(&context, IMPORT_INTENT_KEYSPACE, key, vec![1])
+                    .await
+                    .is_ok()
+            );
+        }
+        let mut expected = intent_keys(import_id, "raw/a", id, true);
+        expected.push(moved);
+        for path in ["raw/a", tagged.as_str()] {
+            let found = stored_intents(&context, import_id, path, id).await.ok();
+            assert_eq!(found, Some(expected.clone()), "{path}");
+        }
     }
 
     #[test]
