@@ -758,3 +758,66 @@ async fn renames_shared_imports() {
     assert_eq!(plan.items[0].files, ["raw/y"]);
     assert_eq!(row(&context, "raw/y").await.key.as_deref(), Some("done/y"));
 }
+
+#[tokio::test]
+async fn renames_job_pairs() {
+    // A job renames named pairs under its fence and stops at keys written after it started.
+    let (_directory, context) = setup().await;
+    let (v1, v2) = (Ulid::from_parts(10, 1), Ulid::from_parts(5_000, 1));
+    object(&context, "x", &[v1], false).await;
+    object(&context, "y", &[v2], false).await;
+    let job = store_job(
+        &context,
+        aruna_core::structs::storage::linked_job::LinkedTask::Unify {
+            prefix: String::new(),
+        },
+        1,
+    )
+    .await;
+    let stored = Value::from(job.to_bytes().unwrap());
+    let next = aruna_core::structs::storage::linked_job::LinkedJob { done: 1, ..job };
+    let next = Value::from(next.to_bytes().unwrap());
+    let paired = |pairs: &[(&str, &str)], job: Option<(Value, Value)>, apply: bool| RenameInput {
+        pairs: pairs
+            .iter()
+            .map(|(from, to)| (from.to_string(), to.to_string()))
+            .collect(),
+        cutoff_ms: Some(1_000),
+        job,
+        ..input("", "", None, apply)
+    };
+    let run = |input| drive(RenameKeysOperation::new(input), &context);
+
+    let mut both = paired(&[("x", "p/x")], None, true);
+    both.keys = Some(vec!["x".to_string()]);
+    assert!(matches!(run(both).await, Err(RenameError::Invalid(_))));
+    let repeated = paired(&[("x", "p/x"), ("y", "p/x")], None, true);
+    assert!(matches!(run(repeated).await, Err(RenameError::Invalid(_))));
+    // A key written after the job started keeps its name.
+    let preview = run(paired(&[("y", "p/y")], None, false)).await.unwrap();
+    assert_eq!(
+        preview.items[0].conflict.as_deref(),
+        Some("the key changed after the job started")
+    );
+    // A job record that changed since the page was read stops the rename.
+    let fence = Some((next.clone(), next.clone()));
+    let changed = run(paired(&[("x", "p/x")], fence, true)).await;
+    assert!(matches!(changed, Err(RenameError::Conflict(reason)) if reason == JOB_CHANGED));
+    assert!(
+        get(&context, BLOB_HEAD_KEYSPACE, head_key("x"))
+            .await
+            .is_some()
+    );
+
+    let fence = Some((stored, next.clone()));
+    let plan = run(paired(&[("x", "p/x")], fence, true)).await.unwrap();
+    assert_eq!(plan.items[0].to, "p/x");
+    assert!(
+        get(&context, BLOB_HEAD_KEYSPACE, head_key("p/x"))
+            .await
+            .is_some()
+    );
+    // The job's progress is written with the rename.
+    let job_row = get(&context, LINKED_JOB_KEYSPACE, BUCKET.as_bytes().to_vec()).await;
+    assert_eq!(job_row, Some(next));
+}
