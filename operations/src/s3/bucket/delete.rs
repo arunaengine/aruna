@@ -18,7 +18,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
-use aruna_core::structs::storage::backend_import::{BackendImport, ProviderCleanup};
+use aruna_core::structs::storage::backend_import::{BackendImport, ProviderCleanup, RemovalMark};
 use aruna_core::structs::storage::blob::{
     BlobCleanupWork, BlobHeadKey, BucketInfo, VersionKey, incarnation,
 };
@@ -547,8 +547,12 @@ impl DeleteBucketOperation {
                 cleanup.backend_id == rule.backend_id
                     && rule.mapped_bucket() == Some(cleanup.bucket.as_str())
             });
-            let value = match cleanup.map(ProviderCleanup::to_bytes).transpose() {
-                Ok(value) => value.unwrap_or_default(),
+            let removal = RemovalMark {
+                bucket: rule.bucket.clone(),
+                cleanup: cleanup.cloned(),
+            };
+            let value = match removal.to_bytes() {
+                Ok(value) => value,
                 Err(error) => return self.emit_error(error.into()),
             };
             writes.push((IMPORT_REMOVAL_KEYSPACE.to_string(), mark, value.into()));
@@ -949,7 +953,7 @@ mod link_tests {
             .iter()
             .find(|(space, ..)| space == IMPORT_REMOVAL_KEYSPACE)
             .unwrap();
-        ProviderCleanup::from_mark(value).unwrap()
+        RemovalMark::from_bytes(value).unwrap().cleanup
     }
 
     #[test]

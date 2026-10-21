@@ -14,8 +14,10 @@ use aruna_core::keyspaces::{
     IMPORTED_OBJECT_KEYSPACE, RENAMED_ROW_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::storage::backend_import::{ProviderCleanup, import_key, object_prefix};
-use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork};
+use aruna_core::structs::storage::backend_import::{
+    BackendImport, ProviderCleanup, RemovalMark, WriteIntent, import_key, object_prefix,
+};
+use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork, VersionKey};
 use aruna_core::structs::storage::group_backend::{BUCKET_DELETING, BUCKET_STATE, GroupStorage};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -34,6 +36,7 @@ enum RemoveState {
     ReadMark,
     Scan,
     Purge,
+    QueueMoves,
     QueueClaims,
     Unmark,
     DropProvider,
@@ -57,9 +60,13 @@ pub struct RemoveImportOperation {
     txn_id: Option<TxnId>,
     /// The provider bucket the mark deletes, and whether the storage deleted it.
     cleanup: Option<ProviderCleanup>,
+    /// The rule's bucket, which the settlement of its unfinished moves names.
+    bucket: Option<String>,
     deleted: bool,
     /// The rows go first, then the write intents.
     space: &'static str,
+    /// The intent rows that go once their settlements are queued.
+    pending: Vec<(String, Key)>,
     claims_queued: bool,
     output: Option<Result<(), ImportRuleError>>,
 }
@@ -72,8 +79,10 @@ impl RemoveImportOperation {
             state: RemoveState::Init,
             txn_id: None,
             cleanup: None,
+            bucket: None,
             deleted: false,
             space: IMPORTED_OBJECT_KEYSPACE,
+            pending: Vec::new(),
             claims_queued: false,
             output: None,
         }
@@ -87,8 +96,10 @@ impl RemoveImportOperation {
             state: RemoveState::Init,
             txn_id: None,
             cleanup: None,
+            bucket: None,
             deleted: false,
             space: IMPORTED_OBJECT_KEYSPACE,
+            pending: Vec::new(),
             claims_queued: false,
             output: None,
         }
@@ -166,15 +177,59 @@ impl RemoveImportOperation {
                 txn_id: None,
             })];
         }
-        self.state = RemoveState::Purge;
+        // A move's own intents are settled through the cleanup queue, which keeps each one.
+        let settle = match self.space == IMPORT_INTENT_KEYSPACE {
+            true => self.settlements(&values),
+            false => Ok(Vec::new()),
+        };
         let deletes = values
             .into_iter()
             .map(|(key, _)| (self.space.to_string(), key))
             .collect();
+        match settle {
+            Ok(writes) if !writes.is_empty() => {
+                self.state = RemoveState::QueueMoves;
+                self.pending = deletes;
+                smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None,
+                })]
+            }
+            Ok(_) => self.purge_rows(deletes),
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn purge_rows(&mut self, deletes: Vec<(String, Key)>) -> Effects {
+        self.state = RemoveState::Purge;
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
             deletes,
             txn_id: None,
         })]
+    }
+
+    /// One `SettleMove` work per intent a move owns, keyed by the intent like a hand-over.
+    fn settlements(
+        &self,
+        values: &[(Key, Value)],
+    ) -> Result<Vec<(String, Key, Value)>, ImportRuleError> {
+        let mut writes = Vec::new();
+        for (key, value) in values {
+            let intent = WriteIntent::from_bytes(value)?;
+            let Some(bucket) = self.bucket.as_deref().filter(|_| intent.mover.is_some()) else {
+                continue;
+            };
+            let work = BlobCleanupWork::SettleMove {
+                version: VersionKey::new(bucket, &intent.key, intent.version_id),
+                intents: vec![(key.to_vec(), intent)],
+            };
+            writes.push((
+                BLOB_CLEANUP_KEYSPACE.to_string(),
+                key.clone(),
+                work.to_bytes()?.into(),
+            ));
+        }
+        Ok(writes)
     }
 }
 
@@ -258,7 +313,11 @@ impl Operation for RemoveImportOperation {
                 )]
             }
             (RemoveState::Read, Some(group_id), event) => match parse_group_record(event) {
-                Ok(Some(_)) => {
+                Ok(Some(rule)) => {
+                    match BackendImport::from_bytes(&rule) {
+                        Ok(rule) => self.bucket = Some(rule.bucket),
+                        Err(error) => return self.fail(error.into()),
+                    }
                     self.state = RemoveState::Delete;
                     let key = import_key(group_id, self.import_id);
                     // The discovery rules go with the rule.
@@ -275,10 +334,18 @@ impl Operation for RemoveImportOperation {
             },
             (RemoveState::Delete, _, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
                 self.state = RemoveState::Mark;
+                let mark = RemovalMark {
+                    bucket: self.bucket.clone().unwrap_or_default(),
+                    cleanup: None,
+                };
+                let value = match mark.to_bytes() {
+                    Ok(value) => value,
+                    Err(error) => return self.fail(error.into()),
+                };
                 smallvec![Effect::Storage(StorageEffect::Write {
                     key_space: IMPORT_REMOVAL_KEYSPACE.to_string(),
                     key: self.mark_key(),
-                    value: Vec::new().into(),
+                    value: value.into(),
                     txn_id: self.txn_id,
                 })]
             }
@@ -299,6 +366,10 @@ impl Operation for RemoveImportOperation {
             (RemoveState::Purge, _, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
                 self.scan()
             }
+            (RemoveState::QueueMoves, _, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                let deletes = std::mem::take(&mut self.pending);
+                self.purge_rows(deletes)
+            }
             (
                 RemoveState::QueueClaims,
                 _,
@@ -308,9 +379,13 @@ impl Operation for RemoveImportOperation {
                 self.purge(Vec::new())
             }
             (RemoveState::ReadMark, _, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let mark = value.as_deref().map(ProviderCleanup::from_mark).transpose();
+                let mark = value.as_deref().map(RemovalMark::from_bytes).transpose();
                 match mark {
-                    Ok(cleanup) => self.cleanup = cleanup.flatten(),
+                    Ok(Some(mark)) => {
+                        self.cleanup = mark.cleanup;
+                        self.bucket = Some(mark.bucket);
+                    }
+                    Ok(None) => {}
                     Err(error) => return self.fail(error.into()),
                 }
                 self.scan()
@@ -468,12 +543,13 @@ mod tests {
     fn marks_removed_rule() {
         let (group_id, import_id) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
         let mut operation = RemoveImportOperation::new(group_id, import_id);
+        let rule = crate::s3::bucket::rename::tests::rule();
         operation.start();
         let txn_id = TxnId::from(7);
         operation.step(storage(StorageEvent::TransactionStarted { txn_id }));
         let effects = operation.step(storage(StorageEvent::BatchReadResult {
             values: vec![
-                (Key::from(Vec::new()), Some(vec![1u8].into())),
+                (Key::from(Vec::new()), Some(rule.to_bytes().unwrap().into())),
                 (Key::from(Vec::new()), None),
             ],
         }));
@@ -539,6 +615,11 @@ mod tests {
         }))
     }
 
+    fn marked(cleanup: Option<ProviderCleanup>) -> Vec<u8> {
+        let bucket = "bucket".to_string();
+        RemovalMark { bucket, cleanup }.to_bytes().unwrap()
+    }
+
     fn cleanup() -> ProviderCleanup {
         ProviderCleanup {
             backend_id: Ulid::from_parts(4, 4),
@@ -570,7 +651,7 @@ mod tests {
     /// answers the record written in the closing transaction.
     fn settled(answer: BlobEvent) -> GroupStorage {
         let mut operation = RemoveImportOperation::resume(Ulid::from_parts(2, 2));
-        mark(&mut operation, Some(cleanup().to_bytes().unwrap()));
+        mark(&mut operation, Some(marked(Some(cleanup()))));
         let effects = drain(&mut operation, 0);
         assert_eq!(
             effects.as_slice(),
@@ -620,7 +701,7 @@ mod tests {
     #[test]
     fn failed_cleanup_retries() {
         let mut operation = RemoveImportOperation::resume(Ulid::from_parts(2, 2));
-        mark(&mut operation, Some(cleanup().to_bytes().unwrap()));
+        mark(&mut operation, Some(marked(Some(cleanup()))));
         drain(&mut operation, 0);
         let failure = aruna_core::errors::BlobError::WriteError("unreachable".to_string());
         let effects = operation.step(Event::Blob(BlobEvent::Error(failure)));
@@ -647,7 +728,7 @@ mod tests {
         let import_id = Ulid::from_parts(2, 2);
         let mut writes = record_writes(&deleting()).unwrap();
         let mark_key: Key = import_id.to_bytes().to_vec().into();
-        let mark_value: Value = cleanup().to_bytes().unwrap().into();
+        let mark_value: Value = marked(Some(cleanup())).into();
         writes.push((
             IMPORT_REMOVAL_KEYSPACE.to_string(),
             mark_key.clone(),
@@ -674,7 +755,7 @@ mod tests {
         else {
             panic!("mark read failed")
         };
-        let cleanup = ProviderCleanup::from_mark(&value.unwrap()).unwrap();
+        let cleanup = RemovalMark::from_bytes(&value.unwrap()).unwrap().cleanup;
         assert_eq!(
             cleanup.map(|cleanup| cleanup.bucket).as_deref(),
             Some("team-a-x")
@@ -689,10 +770,100 @@ mod tests {
         assert_eq!(record.bucket_state("team-a-x"), Some(BUCKET_DELETING));
     }
 
+    #[tokio::test]
+    async fn settles_move_intents() {
+        // A removed rule's move intents are queued for settlement, with their data, before
+        // they go; an upload's intent just goes.
+        use crate::driver::{DriverContext, drive};
+        use aruna_core::handle::Handle as _;
+        use aruna_core::structs::storage::backend_import::intent_key;
+        let dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let import_id = Ulid::from_parts(2, 2);
+        let intent = |mover| WriteIntent {
+            key: "a.csv".to_string(),
+            version_id: Ulid::from_parts(3, 3),
+            backend: BackendRef::node_default(),
+            created_by: Default::default(),
+            written: None,
+            mover,
+        };
+        let (moved, uploaded) = (intent(Some(7)), intent(None));
+        let moved_key = intent_key(import_id, "raw/a.csv~X", moved.version_id);
+        let uploaded_key = intent_key(import_id, "raw/a.csv", uploaded.version_id);
+        let writes = vec![
+            (
+                IMPORT_REMOVAL_KEYSPACE.to_string(),
+                import_id.to_bytes().to_vec().into(),
+                marked(None).into(),
+            ),
+            (
+                IMPORT_INTENT_KEYSPACE.to_string(),
+                moved_key.clone(),
+                moved.to_bytes().unwrap().into(),
+            ),
+            (
+                IMPORT_INTENT_KEYSPACE.to_string(),
+                uploaded_key.clone(),
+                uploaded.to_bytes().unwrap().into(),
+            ),
+        ];
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        storage_handle.send_effect(Effect::Storage(write)).await;
+        drive(RemoveImportOperation::resume(import_id), &context)
+            .await
+            .unwrap();
+        let read = |key_space: &str, key: Key| {
+            let effect = StorageEffect::Read {
+                key_space: key_space.to_string(),
+                key,
+                txn_id: None,
+            };
+            storage_handle.send_effect(Effect::Storage(effect))
+        };
+        for key in [moved_key.clone(), uploaded_key.clone()] {
+            let Event::Storage(StorageEvent::ReadResult { value, .. }) =
+                read(IMPORT_INTENT_KEYSPACE, key).await
+            else {
+                panic!("intent read failed")
+            };
+            assert!(value.is_none());
+        }
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) =
+            read(BLOB_CLEANUP_KEYSPACE, moved_key.clone()).await
+        else {
+            panic!("work read failed")
+        };
+        let work = BlobCleanupWork::from_bytes(&value.unwrap()).unwrap();
+        let expected = BlobCleanupWork::SettleMove {
+            version: VersionKey::new("bucket", "a.csv", moved.version_id),
+            intents: vec![(moved_key.to_vec(), moved)],
+        };
+        assert_eq!(work, expected);
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) =
+            read(BLOB_CLEANUP_KEYSPACE, uploaded_key).await
+        else {
+            panic!("work read failed")
+        };
+        assert!(value.is_none());
+    }
+
     #[test]
     fn resumes_row_removal() {
         let mut operation = RemoveImportOperation::resume(Ulid::from_parts(2, 2));
-        let effects = mark(&mut operation, Some(Vec::new()));
+        let effects = mark(&mut operation, Some(marked(None)));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Iter { .. })]

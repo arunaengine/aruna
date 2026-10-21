@@ -500,17 +500,21 @@ pub struct ProviderCleanup {
     pub bucket: String,
 }
 
-impl ProviderCleanup {
+/// The removal mark of an import rule: its bucket, which the settlement of its unfinished
+/// moves names, and the provider bucket the removal deletes while it is empty.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemovalMark {
+    pub bucket: String,
+    pub cleanup: Option<ProviderCleanup>,
+}
+
+impl RemovalMark {
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
 
-    /// `None` for the empty value of a mark without a provider bucket.
-    pub fn from_mark(value: &[u8]) -> Result<Option<Self>, ConversionError> {
-        match value.is_empty() {
-            true => Ok(None),
-            false => Ok(Some(postcard::from_bytes(value)?)),
-        }
+    pub fn from_bytes(value: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(value)?)
     }
 }
 
