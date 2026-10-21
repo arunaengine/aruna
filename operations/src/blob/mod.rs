@@ -10,6 +10,7 @@ pub mod migration;
 pub mod pending_reclaim;
 pub mod permission_paths;
 pub mod promote;
+pub mod purge;
 pub mod reclaim;
 pub mod records;
 pub mod release;

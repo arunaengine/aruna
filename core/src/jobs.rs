@@ -76,7 +76,7 @@ impl From<&JobPayload> for JobKind {
             JobPayload::ExportRoCrate(_) => Self::ExportRoCrate,
             JobPayload::Harvest(_) => Self::Harvest,
             JobPayload::MintPersistentId(_) => Self::MintPersistentId,
-            JobPayload::StoragePurge(_) => Self::StoragePurge,
+            JobPayload::StoragePurge(_) | JobPayload::StoragePurgeFiles(_) => Self::StoragePurge,
             JobPayload::CopyObject(_) => Self::CopyObject,
             JobPayload::RegisterIdentifiers(_) => Self::RegisterIdentifiers,
             JobPayload::BackendImport(_) => Self::BackendImport,

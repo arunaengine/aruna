@@ -617,6 +617,8 @@ pub enum JobPayload {
     RegisterIdentifiers(crate::structs::secondary_id::RegisterIdentifiersSpec),
     /// One run of a backend import rule. Safe to requeue: registered objects are skipped.
     BackendImport(crate::structs::storage::backend_import::BackendImportSpec),
+    /// A purge that also deletes the linked-storage files of the purged versions.
+    StoragePurgeFiles(StoragePurgeSpec),
 }
 
 impl ExecutionSpec {
@@ -641,7 +643,7 @@ impl JobPayload {
             Self::Staging(spec) => Some(spec.group_id),
             Self::ImportRoCrate(spec) => Some(spec.metadata.group_id),
             Self::Harvest(spec) => Some(spec.group_id),
-            Self::StoragePurge(spec) => Some(spec.group_id),
+            Self::StoragePurge(spec) | Self::StoragePurgeFiles(spec) => Some(spec.group_id),
             Self::CopyObject(spec) => Some(spec.group_id),
             Self::BackendImport(spec) => Some(spec.group_id),
             Self::Probe { .. }
@@ -669,6 +671,7 @@ impl JobPayload {
             JobPayload::CopyObject(_) => "copy_object",
             JobPayload::RegisterIdentifiers(_) => "register_identifiers",
             JobPayload::BackendImport(_) => "backend_import",
+            JobPayload::StoragePurgeFiles(_) => "storage_purge_files",
         }
     }
 
@@ -682,7 +685,7 @@ impl JobPayload {
             | JobPayload::ExportRoCrate(_)
             | JobPayload::BackendImport(_) => "items",
             JobPayload::Harvest(_) => "records",
-            JobPayload::StoragePurge(_) => "entries",
+            JobPayload::StoragePurge(_) | JobPayload::StoragePurgeFiles(_) => "entries",
             JobPayload::CopyObject(_) => "bytes",
             JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
@@ -701,6 +704,7 @@ impl JobPayload {
             | JobPayload::ExportRoCrate(_)
             | JobPayload::Harvest(_)
             | JobPayload::StoragePurge(_)
+            | JobPayload::StoragePurgeFiles(_)
             | JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. }
@@ -734,8 +738,18 @@ impl JobPayload {
         self.is_rocrate()
             || matches!(
                 self,
-                JobPayload::MintPersistentId(_) | JobPayload::StoragePurge(_)
+                JobPayload::MintPersistentId(_)
+                    | JobPayload::StoragePurge(_)
+                    | JobPayload::StoragePurgeFiles(_)
             )
+    }
+
+    /// The purge a purge job runs, with or without its linked-storage files.
+    pub fn purge_spec(&self) -> Option<&StoragePurgeSpec> {
+        match self {
+            JobPayload::StoragePurge(spec) | JobPayload::StoragePurgeFiles(spec) => Some(spec),
+            _ => None,
+        }
     }
 
     pub fn rocrate_limits(&self) -> Option<&RoCrateLimits> {

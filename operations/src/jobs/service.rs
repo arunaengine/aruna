@@ -344,9 +344,10 @@ pub async fn submit_import_job(
     .await
 }
 
+/// Queues a purge; with `files` it also deletes the linked-storage files of the versions.
 pub async fn submit_purge_job(
     context: &DriverContext,
-    spec: StoragePurgeSpec,
+    (spec, files): (StoragePurgeSpec, bool),
     owner_node_id: NodeId,
     idempotency_key: Option<String>,
     retention_ms: u64,
@@ -363,7 +364,10 @@ pub async fn submit_purge_job(
     submit_local_job(
         context,
         SubmitJobSpec {
-            payload: JobPayload::StoragePurge(spec),
+            payload: match files {
+                true => JobPayload::StoragePurgeFiles(spec),
+                false => JobPayload::StoragePurge(spec),
+            },
             created_by,
             owner_node_id,
             dedup_key,

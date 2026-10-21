@@ -15,21 +15,24 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
-    PURGE_CHECKPOINT_KEYSPACE, PURGE_FENCE_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
-    UPLOAD_KEYSPACE,
+    AUTH_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE,
+    PURGE_FENCE_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
+use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, JobResultPayload};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
+use aruna_core::structs::storage::backend_import::version_key;
 use aruna_core::structs::storage::blob::{
-    Backend, BackendConfig, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
-    CurrentVersionPointer, VersionKey, bucket_permission_path,
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork, BlobHeadKey, BlobVersion,
+    BucketInfo, CurrentVersionPointer, VersionKey, bucket_permission_path,
 };
+use aruna_core::structs::storage::format::{StoredFormat, StoredLayout};
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartUpload, MultipartUploadStatus,
 };
@@ -481,7 +484,7 @@ async fn purge_checks_objects() {
     )
     .await;
 
-    let outcome = run_storage_purge(&job, &spec).await;
+    let outcome = run_storage_purge(&job, &spec, false).await;
 
     assert!(matches!(
         outcome,
@@ -585,7 +588,7 @@ async fn purge_resumes_cleanly() {
     .await
     .unwrap();
 
-    let first = purge_result(run_storage_purge(&prefix_job, &prefix_spec).await);
+    let first = purge_result(run_storage_purge(&prefix_job, &prefix_spec, false).await);
     assert!(first.emptiness_proven);
     assert!(!first.bucket_deleted);
     assert_eq!(first.versions_removed, 2);
@@ -623,7 +626,7 @@ async fn purge_resumes_cleanly() {
         "a prefix purge must not delete neighboring keys"
     );
 
-    let resumed = purge_result(run_storage_purge(&prefix_job, &prefix_spec).await);
+    let resumed = purge_result(run_storage_purge(&prefix_job, &prefix_spec, false).await);
     assert_eq!(
         resumed, first,
         "retry after a lost terminal write is idempotent"
@@ -667,7 +670,7 @@ async fn purge_resumes_cleanly() {
     };
     let bucket_job_id = JobId::from_bytes([0xB2; 16]);
     let bucket_job = claimed_job(context.driver.clone(), bucket_job_id, bucket_spec.clone()).await;
-    let bucket_result = purge_result(run_storage_purge(&bucket_job, &bucket_spec).await);
+    let bucket_result = purge_result(run_storage_purge(&bucket_job, &bucket_spec, false).await);
     assert!(bucket_result.emptiness_proven);
     assert!(bucket_result.bucket_deleted);
     complete_job(
@@ -852,4 +855,192 @@ async fn read_value(
         panic!("unexpected storage read event")
     };
     value
+}
+
+/// Stores a current version of `key` that reads a linked file written as backend version `p1`.
+async fn seed_linked(context: &TestContext, key: &str, version_id: Ulid) -> BackendLocation {
+    let storage = &context.driver.storage_handle;
+    let ulid = Ulid::generate();
+    let location = BackendLocation {
+        backend: BackendRef::Group(Ulid::from_parts(3, 3)),
+        storage_class: None,
+        root: String::new(),
+        storage_bucket: String::new(),
+        backend_path: format!("raw/{key}"),
+        ulid,
+        format: StoredFormat {
+            layout: StoredLayout::Plain(ulid),
+            ..StoredFormat::default()
+        },
+        created_by: context.user_id,
+        created_at: UNIX_EPOCH,
+        staging: false,
+        partial: false,
+        blob_size: 4,
+        hashes: [(HASH_BLAKE3.to_string(), vec![5; 32])].into(),
+    };
+    let version = BlobVersion::materialized(
+        [5; 32],
+        location.backend.clone(),
+        location.format.encoding(),
+        SystemTime::now(),
+        context.user_id,
+        None,
+    );
+    let rows = [
+        (
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new("bucket", key, version_id)
+                .to_bytes()
+                .unwrap(),
+            version.to_bytes().unwrap(),
+        ),
+        (
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new("bucket", key).to_bytes().unwrap(),
+            CurrentVersionPointer::new(version_id).to_bytes().unwrap(),
+        ),
+        (
+            BLOB_LOCATIONS_KEYSPACE,
+            location.location_key().unwrap().to_bytes(),
+            location.to_bytes().unwrap(),
+        ),
+        (
+            BACKEND_VERSION_KEYSPACE,
+            version_key(ulid).to_vec(),
+            b"p1".to_vec(),
+        ),
+    ];
+    for (space, key, value) in rows {
+        write_value(storage, space, key, value).await;
+    }
+    location
+}
+
+/// The file releases the cleanup queue holds.
+async fn releases(storage: &StorageHandle) -> Vec<BackendLocation> {
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 100,
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("unexpected cleanup scan")
+    };
+    values
+        .into_iter()
+        .filter_map(
+            |(_, value)| match BlobCleanupWork::from_bytes(&value).unwrap() {
+                BlobCleanupWork::ReleaseRenamed { location, .. } => Some(location),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+fn files_spec(context: &TestContext) -> StoragePurgeSpec {
+    StoragePurgeSpec {
+        scope: StoragePurgeScope::Prefix {
+            bucket: "bucket".to_string(),
+            prefix: "linked/".to_string(),
+        },
+        group_id: context.group_id,
+        auth_context: auth(context),
+        node_id: context.node_id,
+    }
+}
+
+#[tokio::test]
+async fn purge_releases_files() {
+    let context = setup_context().await;
+    let version_id = Ulid::generate();
+    let location = seed_linked(&context, "linked/a.txt", version_id).await;
+    let spec = files_spec(&context);
+    let job = claimed_job(
+        context.driver.clone(),
+        JobId::from_bytes([0xE1; 16]),
+        spec.clone(),
+    )
+    .await;
+
+    purge_result(run_storage_purge(&job, &spec, true).await);
+
+    let storage = &context.driver.storage_handle;
+    let version = VersionKey::new("bucket", "linked/a.txt", version_id);
+    let version = version.to_bytes().unwrap();
+    assert!(
+        read_value(storage, BLOB_VERSIONS_KEYSPACE, version)
+            .await
+            .is_none()
+    );
+    // The file goes through the release, which deletes only its exact backend version.
+    assert_eq!(releases(storage).await, [location]);
+}
+
+#[tokio::test]
+async fn aborted_purge_releases() {
+    let context = setup_context().await;
+    let location = seed_linked(&context, "linked/a.txt", Ulid::generate()).await;
+    let spec = files_spec(&context);
+    let job = claimed_job(
+        context.driver.clone(),
+        JobId::from_bytes([0xE2; 16]),
+        spec.clone(),
+    )
+    .await;
+    // A page planned before the abort still hands its files over; nothing stays planned.
+    let versions: Vec<_> = list_linked(&context).await;
+    let found = aruna_operations::blob::purge::storage_files(
+        &context.driver,
+        ("bucket", context.group_id),
+        &versions,
+        None,
+    )
+    .await
+    .unwrap();
+    aruna_operations::blob::purge::plan_files(&context.driver, job.job_id.as_ulid(), &found)
+        .await
+        .unwrap();
+    aruna_operations::blob::purge::set_paused(&context.driver, job.job_id.as_ulid(), true)
+        .await
+        .unwrap();
+    job.cancel.cancel();
+
+    let outcome = run_storage_purge(&job, &spec, true).await;
+
+    assert!(matches!(outcome, JobRunOutcome::Cancelled));
+    let storage = &context.driver.storage_handle;
+    assert_eq!(releases(storage).await, [location]);
+    let paused = aruna_operations::blob::purge::is_paused(&context.driver, job.job_id.as_ulid());
+    assert!(!paused.await.unwrap());
+}
+
+/// The version ids of the seeded linked key.
+async fn list_linked(context: &TestContext) -> Vec<(String, Ulid)> {
+    let prefix = VersionKey::object_prefix("bucket", "linked/a.txt").unwrap();
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = context
+        .driver
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: None,
+            limit: 10,
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("unexpected version scan")
+    };
+    values
+        .into_iter()
+        .map(|(key, _)| {
+            let key = VersionKey::from_bytes(&key).unwrap();
+            (key.key, key.version_id)
+        })
+        .collect()
 }

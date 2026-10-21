@@ -488,7 +488,7 @@ async fn stage(
 }
 
 /// The group's rules that read or write on `backend`, whose rows may record a copy.
-async fn rules_on(
+pub(crate) async fn rules_on(
     context: &DriverContext,
     group_id: GroupId,
     backend: &BackendRef,

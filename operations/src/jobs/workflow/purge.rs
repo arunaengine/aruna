@@ -37,14 +37,33 @@ use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersi
 use crate::s3::purge_fence::{PurgeFenceError, acquire_purge_fence};
 
 const PURGE_BATCH_SIZE: usize = 1_000;
+/// How often a paused purge looks whether it was resumed.
+const PAUSE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
-pub async fn run_storage_purge(ctx: &JobContext, spec: &StoragePurgeSpec) -> JobRunOutcome {
+/// Runs a purge; with `files` it also releases the linked-storage files of the versions.
+pub async fn run_storage_purge(
+    ctx: &JobContext,
+    spec: &StoragePurgeSpec,
+    files: bool,
+) -> JobRunOutcome {
     if let Err(error) =
         acquire_purge_fence(&ctx.driver.storage_handle, ctx.job_id, &spec.scope).await
     {
         return JobRunOutcome::Failed(fence_error(error));
     }
-    match run_fenced_purge(ctx, spec).await {
+    let outcome = run_fenced_purge(ctx, spec, files).await;
+    // The files of the versions gone so far go once the run ends, also when it is aborted.
+    if matches!(outcome, Ok(_) | Err(PurgeRunError::Cancelled)) {
+        let job_id = ctx.job_id.as_ulid();
+        let released = crate::blob::purge::hand_over(&ctx.driver, job_id).await;
+        let unpaused = crate::blob::purge::set_paused(&ctx.driver, job_id, false).await;
+        if let Err(error) = released.and(unpaused) {
+            return JobRunOutcome::Failed(JobError::retryable(format!(
+                "purge file release failed: {error}"
+            )));
+        }
+    }
+    match outcome {
         Ok(result) => JobRunOutcome::Succeeded(JobResultPayload::StoragePurge(result)),
         Err(PurgeRunError::Cancelled) => JobRunOutcome::Cancelled,
         Err(PurgeRunError::Interrupted) => JobRunOutcome::Interrupted,
@@ -67,6 +86,7 @@ impl From<JobError> for PurgeRunError {
 async fn run_fenced_purge(
     ctx: &JobContext,
     spec: &StoragePurgeSpec,
+    files: bool,
 ) -> Result<StoragePurgeResult, PurgeRunError> {
     check_stop(ctx)?;
     // The trail is published only for the bucket incarnation the purge began on.
@@ -143,7 +163,7 @@ async fn run_fenced_purge(
 
     if bucket_exists {
         abort_uploads(ctx, spec, &mut checkpoint).await?;
-        delete_versions(ctx, spec, &mut checkpoint).await?;
+        delete_versions(ctx, (spec, files), &mut checkpoint).await?;
         final_relist(ctx, &spec.scope).await?;
     }
 
@@ -304,6 +324,7 @@ async fn abort_uploads(
 ) -> Result<(), PurgeRunError> {
     loop {
         check_stop(ctx)?;
+        wait_paused(ctx).await?;
         let page = list_multipart_page(ctx, &spec.scope, PURGE_BATCH_SIZE).await?;
         if page.is_empty() {
             return Ok(());
@@ -345,11 +366,12 @@ async fn abort_uploads(
 
 async fn delete_versions(
     ctx: &JobContext,
-    spec: &StoragePurgeSpec,
+    (spec, files): (&StoragePurgeSpec, bool),
     checkpoint: &mut StoragePurgeCheckpoint,
 ) -> Result<(), PurgeRunError> {
     loop {
         check_stop(ctx)?;
+        wait_paused(ctx).await?;
         let page = list_version_page(ctx, &spec.scope, PURGE_BATCH_SIZE, None, None).await?;
         if page.items.is_empty() {
             return Ok(());
@@ -375,6 +397,9 @@ async fn delete_versions(
             .collect::<BTreeSet<_>>()
         {
             authorize_object(ctx, spec, key).await?;
+        }
+        if files {
+            plan_files(ctx, spec, &entries).await?;
         }
         let batch_len = entries.len() as u64;
         let outcomes = delete_objects(
@@ -655,6 +680,48 @@ async fn persist_progress(ctx: &JobContext) -> Result<(), PurgeRunError> {
         return Err(PurgeRunError::Cancelled);
     }
     Ok(())
+}
+
+/// Plans the release of the linked-storage files the entries read, before they go.
+async fn plan_files(
+    ctx: &JobContext,
+    spec: &StoragePurgeSpec,
+    entries: &[BulkDeleteEntry],
+) -> Result<(), PurgeRunError> {
+    let versions: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| Some((entry.key.clone(), entry.version_id?)))
+        .collect();
+    let scope = (spec.scope.bucket(), spec.group_id);
+    let failed = |error: String| JobError::retryable(format!("purge file plan failed: {error}"));
+    let found = crate::blob::purge::storage_files(&ctx.driver, scope, &versions, None)
+        .await
+        .map_err(failed)?;
+    crate::blob::purge::plan_files(&ctx.driver, ctx.job_id.as_ulid(), &found)
+        .await
+        .map_err(|error| failed(error).into())
+}
+
+/// Waits while the caller paused the purge; a cancel or a shutdown ends the wait.
+async fn wait_paused(ctx: &JobContext) -> Result<(), PurgeRunError> {
+    loop {
+        let paused = crate::blob::purge::is_paused(&ctx.driver, ctx.job_id.as_ulid()).await;
+        match paused {
+            Ok(false) => return Ok(()),
+            Ok(true) => {}
+            Err(error) => {
+                return Err(
+                    JobError::retryable(format!("purge pause read failed: {error}")).into(),
+                );
+            }
+        }
+        tokio::select! {
+            () = ctx.cancel.cancelled() => {}
+            () = ctx.shutdown.cancelled() => {}
+            () = tokio::time::sleep(PAUSE_POLL) => {}
+        }
+        check_stop(ctx)?;
+    }
 }
 
 fn check_stop(ctx: &JobContext) -> Result<(), PurgeRunError> {

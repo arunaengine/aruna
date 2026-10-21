@@ -200,6 +200,9 @@ pub const UPLOAD_PART_KEYSPACE: &str = "s3_multipart_upload_parts";
 pub const PURGE_FENCE_KEYSPACE: &str = "s3_purge_fences";
 /// Durable inventory and batch counters for resumable permanent-purge jobs.
 pub const PURGE_CHECKPOINT_KEYSPACE: &str = "s3_purge_checkpoints";
+/// Linked-storage files a purge releases once its versions are gone, and its pause marker,
+/// keyed by job id.
+pub const PURGE_FILES_KEYSPACE: &str = "s3_purge_files";
 pub const REPLICATION_JOB_KEYSPACE: &str = "blob_replication_jobs";
 pub const REPLICATION_OBLIGATION_KEYSPACE: &str = "blob_live_replication_obligations";
 pub const REFRESH_JOB_KEYSPACE: &str = "reference_metadata_refresh_jobs";
@@ -488,6 +491,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     UPLOAD_PART_KEYSPACE,
     PURGE_FENCE_KEYSPACE,
     PURGE_CHECKPOINT_KEYSPACE,
+    PURGE_FILES_KEYSPACE,
     REPLICATION_JOB_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE,
     REFRESH_JOB_KEYSPACE,
