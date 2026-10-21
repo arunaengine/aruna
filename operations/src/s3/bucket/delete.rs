@@ -88,6 +88,8 @@ pub struct DeleteBucketOperation {
     state: DeleteBucketState,
     txn_id: Option<TxnId>,
     group_id: Option<GroupId>,
+    /// The incarnation of the bucket, whose delete trail goes with it.
+    incarnation: u128,
     usage_update: Option<UsageCounterUpdate>,
     relationship_deletes: Vec<(String, Key)>,
     relationships: Vec<SyncRelationship>,
@@ -109,6 +111,7 @@ impl DeleteBucketOperation {
             state: DeleteBucketState::Init,
             txn_id: None,
             group_id: None,
+            incarnation: 0,
             usage_update: None,
             relationship_deletes: Vec::new(),
             relationships: Vec::new(),
@@ -164,7 +167,10 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::NotFound);
         };
         match BucketInfo::from_bytes(value.as_ref()) {
-            Ok(info) => self.group_id = Some(info.group_id),
+            Ok(info) => {
+                self.group_id = Some(info.group_id);
+                self.incarnation = info.incarnation();
+            }
             Err(err) => return self.emit_error(err.into()),
         }
 
@@ -644,7 +650,7 @@ impl DeleteBucketOperation {
         let work = BlobCleanupWork::DropTrail {
             group_id,
             bucket: Some(self.bucket.clone()),
-            before_ms: row.timestamp_ms(),
+            incarnation: self.incarnation,
         };
         let value = match work.to_bytes() {
             Ok(value) => value,

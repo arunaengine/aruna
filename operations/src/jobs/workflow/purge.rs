@@ -6,9 +6,10 @@ use std::collections::BTreeSet;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE};
+use aruna_core::keyspaces::{DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::structs::execution::job::{JobError, JobProgress, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::delete_audit::{
     BlobAuditKind, BlobAuditRecord, BlobPurgeKind, delete_audit_key, trail_key,
@@ -66,13 +67,18 @@ async fn run_fenced_purge(
     spec: &StoragePurgeSpec,
 ) -> Result<StoragePurgeResult, PurgeRunError> {
     check_stop(ctx)?;
+    // The trail is published only for the bucket incarnation the purge began on.
+    let mut incarnation = None;
     let bucket_exists = match drive(
         GetBucketOperation::new(spec.scope.bucket().to_string()),
         &ctx.driver,
     )
     .await
     {
-        Ok(info) if info.group_id == spec.group_id => true,
+        Ok(info) if info.group_id == spec.group_id => {
+            incarnation = Some(info.incarnation());
+            true
+        }
         Ok(_) => {
             return Err(JobError::permanent("purge bucket is outside the authorized group").into());
         }
@@ -162,7 +168,8 @@ async fn run_fenced_purge(
         false
     };
 
-    write_purge_audit(ctx, spec, bucket_deleted).await?;
+    let incarnation = incarnation.filter(|_| !bucket_deleted);
+    write_purge_audit(ctx, spec, incarnation).await?;
     ctx.progress.set_current(total);
     Ok(StoragePurgeResult {
         scope: spec.scope.clone(),
@@ -193,18 +200,19 @@ fn purge_audit_record(spec: &StoragePurgeSpec, occurred_at_ms: u64) -> BlobAudit
     }
 }
 
-/// The audit row of a purge and its trail row. A purge that deleted its bucket leaves nothing
-/// to protect, and a bucket created again under the name must not meet its trail.
+/// The audit row of a purge and its trail row in the bucket incarnation it purged, if that
+/// bucket still stands. A purge that deleted its bucket, or one whose bucket was replaced,
+/// leaves nothing to protect, and a bucket created again must not meet its trail.
 fn audit_rows(
     record: &BlobAuditRecord,
     audit_id: ulid::Ulid,
     value: aruna_core::types::Value,
-    bucket_deleted: bool,
+    incarnation: Option<u128>,
 ) -> Vec<(String, aruna_core::types::Key, aruna_core::types::Value)> {
     let audit = delete_audit_key(record.group_id, audit_id).into();
     let mut writes = vec![(DELETE_AUDIT_KEYSPACE.to_string(), audit, value.clone())];
-    if !bucket_deleted {
-        let trail = trail_key(record, audit_id).into();
+    if let Some(incarnation) = incarnation {
+        let trail = trail_key(record, incarnation, audit_id).into();
         writes.push((DELETE_TRAIL_KEYSPACE.to_string(), trail, value));
     }
     writes
@@ -215,24 +223,53 @@ fn audit_rows(
 async fn write_purge_audit(
     ctx: &JobContext,
     spec: &StoragePurgeSpec,
-    bucket_deleted: bool,
+    incarnation: Option<u128>,
 ) -> Result<(), PurgeRunError> {
     let record = purge_audit_record(spec, unix_timestamp_millis());
     let value = record
         .to_bytes()
         .map_err(|error| JobError::retryable(format!("purge audit encode failed: {error}")))?;
-    let writes = audit_rows(&record, ctx.job_id.as_ulid(), value.into(), bucket_deleted);
-    match ctx
-        .driver
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        other => Err(JobError::retryable(format!("purge audit write failed: {other:?}")).into()),
+    let storage = &ctx.driver.storage_handle;
+    let failed = |event: Event| JobError::retryable(format!("purge audit write failed: {event:?}"));
+    let started = StorageEffect::StartTransaction { read: false };
+    let txn_id = match storage.send_storage_effect(started).await {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        other => return Err(failed(other).into()),
+    };
+    // The bucket is read in the transaction, so its removal or replacement meanwhile conflicts.
+    let read = StorageEffect::Read {
+        key_space: S3_BUCKET_KEYSPACE.to_string(),
+        key: spec.scope.bucket().as_bytes().to_vec().into(),
+        txn_id: Some(txn_id),
+    };
+    let current = match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .and_then(|value| BucketInfo::from_bytes(value.as_ref()).ok())
+            .map(|info| info.incarnation()),
+        other => {
+            let abort = StorageEffect::AbortTransaction { txn_id };
+            storage.send_storage_effect(abort).await;
+            return Err(failed(other).into());
+        }
+    };
+    let incarnation = incarnation.filter(|incarnation| current == Some(*incarnation));
+    let writes = audit_rows(&record, ctx.job_id.as_ulid(), value.into(), incarnation);
+    let write = StorageEffect::BatchWrite {
+        writes,
+        txn_id: Some(txn_id),
+    };
+    match storage.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+        other => {
+            let abort = StorageEffect::AbortTransaction { txn_id };
+            storage.send_storage_effect(abort).await;
+            return Err(failed(other).into());
+        }
+    }
+    let commit = StorageEffect::CommitTransaction { txn_id };
+    match storage.send_storage_effect(commit).await {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        other => Err(failed(other).into()),
     }
 }
 
@@ -695,17 +732,17 @@ mod audit_tests {
             occurred_at_ms: 1,
         };
         let id = ulid::Ulid::from_parts(3, 3);
-        let spaces = |deleted| {
-            let rows = audit_rows(&record, id, vec![1].into(), deleted);
+        let spaces = |incarnation| {
+            let rows = audit_rows(&record, id, vec![1].into(), incarnation);
             rows.into_iter()
                 .map(|(space, ..)| space)
                 .collect::<Vec<_>>()
         };
-        // The audit always stays; the trail only while the bucket does.
+        // The audit always stays; the trail only while the purged bucket incarnation does.
         assert_eq!(
-            spaces(false),
+            spaces(Some(7)),
             [DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE]
         );
-        assert_eq!(spaces(true), [DELETE_AUDIT_KEYSPACE]);
+        assert_eq!(spaces(None), [DELETE_AUDIT_KEYSPACE]);
     }
 }

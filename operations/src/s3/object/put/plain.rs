@@ -1103,7 +1103,8 @@ mod tests {
                 panic!("expected the purge range, got {effects:?}")
             };
             let purges = aruna_core::structs::storage::delete_audit::purge_prefix;
-            assert_eq!(*prefix, Some(purges(operation.config.group_id).into()));
+            let group = operation.config.group_id;
+            assert_eq!(*prefix, Some(purges(group, "bucket", 0).into()));
             operation.step(Event::Storage(StorageEvent::IterResult {
                 values: Vec::new(),
                 next_start_after: None,

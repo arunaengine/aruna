@@ -429,7 +429,8 @@ impl CompleteUploadOperation {
         else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
-        let ranges = trail_ranges(record.group_id, &self.input.bucket, &self.input.key);
+        let bucket = (self.input.bucket.as_str(), self.incarnation);
+        let ranges = trail_ranges(record.group_id, bucket, &self.input.key);
         let scan = self
             .trail_scan
             .get_or_insert_with(|| TrailScan::new(version_id));

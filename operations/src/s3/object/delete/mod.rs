@@ -18,14 +18,14 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DELETE_AUDIT_KEYSPACE,
-    DELETE_TRAIL_KEYSPACE, OBJECT_METADATA_KEYSPACE,
+    DELETE_TRAIL_KEYSPACE, OBJECT_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CopyOwner, CurrentVersionPointer, VersionKey,
+    BucketInfo, CopyOwner, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::delete_audit::{
@@ -70,6 +70,8 @@ pub enum DeleteObjectState {
     WriteBlobVersion,
     WriteReplicationObligation,
     UpdateUsage,
+    /// Reads the bucket for the incarnation its delete trail belongs to.
+    ReadAuditBucket,
     WriteDeleteAudit,
     CommitTransaction,
     Finish,
@@ -197,6 +199,8 @@ pub struct DeleteObjectOperation {
     expected: Option<BlobVersion>,
     /// The head a delete marker may only cover while it is still current.
     expected_head: Option<Ulid>,
+    /// The bucket incarnation the delete is made in, read in its transaction for the trail.
+    incarnation: Option<u128>,
 }
 
 impl DeleteObjectOperation {
@@ -230,6 +234,7 @@ impl DeleteObjectOperation {
             metadata: HashMap::new(),
             expected: None,
             expected_head: None,
+            incarnation: None,
         }
     }
 
@@ -892,6 +897,15 @@ impl DeleteObjectOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(DeleteObjectError::NoTransactionFound);
         };
+        // The trail belongs to this incarnation of the bucket, read in the transaction.
+        let Some(incarnation) = self.incarnation else {
+            self.state = DeleteObjectState::ReadAuditBucket;
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: self.input.bucket.as_bytes().to_vec().into(),
+                txn_id: Some(txn_id),
+            })];
+        };
         let (kind, version_id) = match self.version_id {
             Some(marker) => (BlobAuditKind::DeleteMarker, Some(marker)),
             None => (BlobAuditKind::DeleteVersion, self.input.version_id),
@@ -913,7 +927,7 @@ impl DeleteObjectOperation {
         };
         let audit_id = Ulid::generate();
         let value: Value = value.into();
-        let trail = trail_key(&record, audit_id).into();
+        let trail = trail_key(&record, incarnation, audit_id).into();
         self.state = DeleteObjectState::WriteDeleteAudit;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes: vec![
@@ -926,6 +940,24 @@ impl DeleteObjectOperation {
             ],
             txn_id: Some(txn_id),
         })]
+    }
+
+    fn audit_bucket_read(&mut self, event: Event) -> Effects {
+        let value = match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
+            _ => return self.emit_error(DeleteObjectError::InvalidOperationState),
+        };
+        let bucket = value
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose();
+        match bucket {
+            Ok(bucket) => {
+                self.incarnation = Some(bucket.as_ref().map_or(0, BucketInfo::incarnation));
+                self.write_delete_audit()
+            }
+            Err(error) => self.emit_error(error.into()),
+        }
     }
 
     fn handle_delete_audit(&mut self, event: Event) -> Effects {
@@ -1116,6 +1148,7 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::WriteBlobVersion => self.version_written(event),
             DeleteObjectState::WriteReplicationObligation => self.obligation_written(event),
             DeleteObjectState::UpdateUsage => self.handle_usage_update(event),
+            DeleteObjectState::ReadAuditBucket => self.audit_bucket_read(event),
             DeleteObjectState::WriteDeleteAudit => self.handle_delete_audit(event),
             DeleteObjectState::CommitTransaction => self.handle_transaction_committed(event),
             DeleteObjectState::Finish => smallvec![],

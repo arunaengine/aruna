@@ -329,12 +329,12 @@ pub enum BlobCleanupWork {
         version_id: Ulid,
         version: String,
     },
-    /// The delete trail of a removed bucket, or of a whole removed group without `bucket`,
-    /// recorded before `before_ms`; it goes a page per pass. The audit itself stays.
+    /// The delete trail of a removed bucket incarnation, or of a whole removed group without
+    /// `bucket`; it goes a page at a time. The audit itself stays.
     DropTrail {
         group_id: Ulid,
         bucket: Option<String>,
-        before_ms: u64,
+        incarnation: u128,
     },
 }
 
@@ -705,11 +705,11 @@ pub struct BucketInfo {
 }
 
 impl BucketInfo {
-    /// When this bucket was created, in milliseconds; older deletes under its name were of
-    /// an earlier bucket.
-    pub fn created_ms(&self) -> u64 {
+    /// The creation time in nanoseconds, which tells one bucket of a name from a later one;
+    /// its delete trail is kept per incarnation.
+    pub fn incarnation(&self) -> u128 {
         let since = self.created_at.duration_since(SystemTime::UNIX_EPOCH);
-        since.map_or(0, |since| since.as_millis() as u64)
+        since.map_or(0, |since| since.as_nanos())
     }
 
     /// The only ingress that changes the bucket default ref set.

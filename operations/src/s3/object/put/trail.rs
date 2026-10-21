@@ -53,10 +53,18 @@ impl Trail {
     }
 }
 
-/// The deletes of one object key, then the purges of its group.
-pub(crate) fn trail_ranges(group_id: GroupId, bucket: &str, key: &str) -> [Key; 2] {
-    let deletes = delete_prefix(group_id, bucket, key);
-    [deletes.into(), purge_prefix(group_id).into()]
+/// The deletes of one object key, then the purges of its bucket, in the bucket incarnation the
+/// write goes to: an earlier bucket of the name has its own trail.
+pub(crate) fn trail_ranges(
+    group_id: GroupId,
+    (bucket, incarnation): (&str, u128),
+    key: &str,
+) -> [Key; 2] {
+    let deletes = delete_prefix(group_id, bucket, incarnation, key);
+    [
+        deletes.into(),
+        purge_prefix(group_id, bucket, incarnation).into(),
+    ]
 }
 
 /// The trail scan of one version transaction. Its range read makes a delete recorded meanwhile
@@ -108,7 +116,8 @@ impl PutObjectOperation {
     pub(super) fn trail_page(&mut self, txn_id: Ulid) -> Option<Effects> {
         let scan = self.trail_scan.as_ref()?;
         let request = &self.config.request;
-        let ranges = trail_ranges(self.config.group_id, &request.bucket, &request.key);
+        let bucket = (request.bucket.as_str(), self.incarnation());
+        let ranges = trail_ranges(self.config.group_id, bucket, &request.key);
         let prefix = ranges.get(scan.range)?.clone();
         self.state = PutObjectState::ReadTrail;
         Some(smallvec![Effect::Storage(StorageEffect::Iter {
@@ -133,17 +142,11 @@ impl PutObjectOperation {
             _ => return self.emit_error(PutObjectError::InvalidOperationState),
         };
         let request = &self.config.request;
-        // Deletes before the bucket was created were of an earlier bucket of the name.
-        let since = self
-            .expected_bucket
-            .as_ref()
-            .map_or(0, BucketInfo::created_ms);
         let Some(scan) = self.trail_scan.as_mut() else {
             return self.emit_error(PutObjectError::InvalidOperationState);
         };
         for (_, value) in values {
             match BlobAuditRecord::from_bytes(&value) {
-                Ok(record) if record.occurred_at_ms < since => {}
                 Ok(record) => {
                     let id = scan.version_id;
                     scan.trail = scan.trail.add(&record, &request.bucket, &request.key, id);

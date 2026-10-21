@@ -64,39 +64,40 @@ pub fn delete_audit_key(group_id: GroupId, audit_id: Ulid) -> Vec<u8> {
     bytes
 }
 
-/// Where `record` is indexed in the trail by key. The audit id keeps records apart.
-pub fn trail_key(record: &BlobAuditRecord, audit_id: Ulid) -> Vec<u8> {
+/// Where `record` is indexed in the trail by key, below the bucket incarnation `incarnation`
+/// it was made in. The audit id keeps records apart.
+pub fn trail_key(record: &BlobAuditRecord, incarnation: u128, audit_id: Ulid) -> Vec<u8> {
+    let (group, bucket) = (record.group_id, record.bucket.as_str());
     let mut key = match record.kind {
-        BlobAuditKind::Purge(_) => purge_prefix(record.group_id),
-        _ => delete_prefix(record.group_id, &record.bucket, &record.key),
+        BlobAuditKind::Purge(_) => purge_prefix(group, bucket, incarnation),
+        _ => delete_prefix(group, bucket, incarnation, &record.key),
     };
     key.extend_from_slice(&audit_id.to_bytes());
     key
 }
 
-/// The marker and version deletes of one object key. Lengths keep a key apart from longer ones.
-pub fn delete_prefix(group_id: GroupId, bucket: &str, key: &str) -> Vec<u8> {
+/// Every trail row of one incarnation of a bucket: a bucket created again under the name has
+/// its own. Lengths keep a name apart from longer ones.
+pub fn bucket_prefix(group_id: GroupId, bucket: &str, incarnation: u128) -> Vec<u8> {
     let mut bytes = group_id.to_bytes().to_vec();
-    bytes.push(0);
-    for part in [bucket, key] {
-        bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
-        bytes.extend_from_slice(part.as_bytes());
-    }
-    bytes
-}
-
-/// The marker and version deletes of every key of one bucket.
-pub fn bucket_prefix(group_id: GroupId, bucket: &str) -> Vec<u8> {
-    let mut bytes = group_id.to_bytes().to_vec();
-    bytes.push(0);
     bytes.extend_from_slice(&(bucket.len() as u64).to_be_bytes());
     bytes.extend_from_slice(bucket.as_bytes());
+    bytes.extend_from_slice(&incarnation.to_be_bytes());
     bytes
 }
 
-/// The purges of one group, whatever their scope.
-pub fn purge_prefix(group_id: GroupId) -> Vec<u8> {
-    let mut bytes = group_id.to_bytes().to_vec();
+/// The marker and version deletes of one object key.
+pub fn delete_prefix(group_id: GroupId, bucket: &str, incarnation: u128, key: &str) -> Vec<u8> {
+    let mut bytes = bucket_prefix(group_id, bucket, incarnation);
+    bytes.push(0);
+    bytes.extend_from_slice(&(key.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(key.as_bytes());
+    bytes
+}
+
+/// The purges of one bucket incarnation, whatever their scope.
+pub fn purge_prefix(group_id: GroupId, bucket: &str, incarnation: u128) -> Vec<u8> {
+    let mut bytes = bucket_prefix(group_id, bucket, incarnation);
     bytes.push(1);
     bytes
 }
@@ -120,19 +121,19 @@ mod tests {
             occurred_at_ms: 0,
         };
         let id = Ulid::from_parts(2, 2);
-        let marker = trail_key(&record(BlobAuditKind::DeleteMarker, "a"), id);
-        assert!(marker.starts_with(&delete_prefix(group, "b", "a")));
+        let marker = trail_key(&record(BlobAuditKind::DeleteMarker, "a"), 7, id);
+        assert!(marker.starts_with(&delete_prefix(group, "b", 7, "a")));
         // A longer key or another bucket never shares the prefix of a key.
-        let longer = trail_key(&record(BlobAuditKind::DeleteVersion, "ab"), id);
-        assert!(!longer.starts_with(&delete_prefix(group, "b", "a")));
-        assert!(!marker.starts_with(&delete_prefix(group, "ba", "")));
-        let purge = trail_key(
-            &record(BlobAuditKind::Purge(BlobPurgeKind::Prefix), "a"),
-            id,
-        );
-        assert!(purge.starts_with(&purge_prefix(group)));
-        assert!(marker.starts_with(&bucket_prefix(group, "b")));
-        assert!(!marker.starts_with(&bucket_prefix(group, "ba")));
-        assert!(!purge.starts_with(&delete_prefix(group, "b", "a")));
+        let longer = trail_key(&record(BlobAuditKind::DeleteVersion, "ab"), 7, id);
+        assert!(!longer.starts_with(&delete_prefix(group, "b", 7, "a")));
+        assert!(!marker.starts_with(&delete_prefix(group, "ba", 7, "")));
+        let kind = BlobAuditKind::Purge(BlobPurgeKind::Prefix);
+        let purge = trail_key(&record(kind, "a"), 7, id);
+        assert!(purge.starts_with(&purge_prefix(group, "b", 7)));
+        assert!(marker.starts_with(&bucket_prefix(group, "b", 7)));
+        assert!(!marker.starts_with(&bucket_prefix(group, "ba", 7)));
+        assert!(!purge.starts_with(&delete_prefix(group, "b", 7, "a")));
+        // A bucket created again under the name keeps its own trail.
+        assert!(!marker.starts_with(&bucket_prefix(group, "b", 8)));
     }
 }

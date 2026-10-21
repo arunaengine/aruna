@@ -412,16 +412,18 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
         BlobCleanupWork::DropTrail {
             group_id,
             bucket,
-            before_ms,
-        } => match crate::blob::trail::drop_trail(context, group_id, bucket.as_deref(), before_ms)
-            .await
-        {
-            Ok(()) => RowOutcome::Done,
-            Err(error) => {
-                warn!(%error, "Delete trail of a removed bucket could not be dropped");
-                RowOutcome::Failed
+            incarnation,
+        } => {
+            match crate::blob::trail::drop_trail(context, group_id, bucket.as_deref(), incarnation)
+                .await
+            {
+                Ok(()) => RowOutcome::Done,
+                Err(error) => {
+                    warn!(%error, "Delete trail of a removed bucket could not be dropped");
+                    RowOutcome::Failed
+                }
             }
-        },
+        }
     }
 }
 

@@ -1849,9 +1849,9 @@ fn writer_reads_trail() {
         panic!("expected the head write, got {effects:?}")
     };
     assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
-    // A delete from before the bucket was created again under its name is of the old bucket.
+    // The trail is read in the incarnation of the bucket the write goes to.
     let mut op = writer();
-    op.expected_bucket = Some(BucketInfo {
+    let bucket = BucketInfo {
         group_id,
         created_at: std::time::UNIX_EPOCH + std::time::Duration::from_millis(5),
         created_by: op.config.user_id,
@@ -1860,13 +1860,17 @@ fn writer_reads_trail() {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
-    });
-    let old = BlobAuditRecord {
-        version_id: op.version_id,
-        ..record
     };
-    op.trail_read(page(vec![(vec![0].into(), old.to_bytes().unwrap().into())]));
-    assert!(op.output.is_none());
+    let incarnation = bucket.incarnation();
+    op.expected_bucket = Some(bucket);
+    let effects = op.trail_read(page(Vec::new()));
+    let [Effect::Storage(StorageEffect::Iter { prefix, .. })] = effects.as_slice() else {
+        panic!("expected the purge read, got {effects:?}")
+    };
+    let bucket = op.config.request.bucket.as_str();
+    let purges =
+        aruna_core::structs::storage::delete_audit::purge_prefix(group_id, bucket, incarnation);
+    assert_eq!(*prefix, Some(purges.into()));
 }
 
 #[tokio::test]

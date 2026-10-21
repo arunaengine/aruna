@@ -82,8 +82,11 @@ fn audit_op(version_id: Option<Ulid>) -> DeleteObjectOperation {
         deleted_by: test_user_id(),
     });
     operation.txn_id = Some(Ulid::generate());
+    operation.incarnation = Some(INCARNATION);
     operation
 }
+
+const INCARNATION: u128 = 9;
 
 fn audit_record(effects: &[Effect]) -> aruna_core::structs::storage::delete_audit::BlobAuditRecord {
     let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects else {
@@ -102,10 +105,47 @@ fn audit_record(effects: &[Effect]) -> aruna_core::structs::storage::delete_audi
     let prefix = aruna_core::structs::storage::delete_audit::delete_prefix(
         record.group_id,
         &record.bucket,
+        INCARNATION,
         &record.key,
     );
     assert!(trail.starts_with(&prefix));
     record
+}
+
+#[test]
+fn reads_audit_bucket() {
+    // Without a known incarnation the bucket is read in the delete transaction first.
+    let mut operation = audit_op(None);
+    operation.version_id = Some(Ulid::generate());
+    operation.incarnation = None;
+    let effects = operation.write_delete_audit();
+    let [
+        Effect::Storage(StorageEffect::Read {
+            key_space, txn_id, ..
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("expected the bucket read, got {effects:?}")
+    };
+    assert_eq!(key_space, S3_BUCKET_KEYSPACE);
+    assert_eq!(*txn_id, operation.txn_id);
+    assert_eq!(operation.state, DeleteObjectState::ReadAuditBucket);
+    let bucket = BucketInfo {
+        group_id: operation.input.group_id,
+        created_at: std::time::UNIX_EPOCH + std::time::Duration::from_nanos(INCARNATION as u64),
+        created_by: test_user_id(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: aruna_core::structs::storage::format::Compression::Off,
+    };
+    let value = Some(bucket.to_bytes().unwrap().into());
+    let effects = operation.audit_bucket_read(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0].into(),
+        value,
+    }));
+    audit_record(&effects);
 }
 
 #[test]
@@ -261,6 +301,7 @@ fn sized_delete_op() -> DeleteObjectOperation {
         deleted_by: test_user_id(),
     });
     op.txn_id = Some(Ulid::from_bytes([7u8; 16]));
+    op.incarnation = Some(INCARNATION);
     op.target_version = Some(VersionSummary {
         version_id,
         materialized_hash: Some([4u8; 32]),
@@ -324,6 +365,7 @@ fn candidate_op(location: Option<BlobLocationKey>) -> DeleteObjectOperation {
         deleted_by: test_user_id(),
     });
     op.txn_id = Some(Ulid::from_bytes([7u8; 16]));
+    op.incarnation = Some(INCARNATION);
     op.target_location = location;
     op
 }

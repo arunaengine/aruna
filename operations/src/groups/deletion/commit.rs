@@ -323,7 +323,7 @@ fn trail_drop(group_id: ulid::Ulid) -> Result<(String, Key, Value), GroupDeletio
     let work = aruna_core::structs::storage::blob::BlobCleanupWork::DropTrail {
         group_id,
         bucket: None,
-        before_ms: row.timestamp_ms(),
+        incarnation: 0,
     };
     let value = work
         .to_bytes()

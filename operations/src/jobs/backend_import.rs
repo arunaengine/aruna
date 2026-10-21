@@ -1083,32 +1083,30 @@ async fn hide_alias(
 }
 
 /// Whether the delete trail removed version `id` of `key`, or the key without a head. Only the
-/// deletes of this key and the purges of its group since the bucket was created are read.
+/// deletes of this key and the purges of this incarnation of the bucket are read.
 async fn deleted_on_purpose(
     context: &DriverContext,
     run: &ImportRun,
     key: &str,
     id: Ulid,
 ) -> Result<bool, ItemError> {
-    trail_since(context, &run.rule, run.bucket.created_ms(), key, id).await
+    trail_of(context, &run.rule, run.bucket.incarnation(), key, id).await
 }
 
-async fn trail_since(
+async fn trail_of(
     context: &DriverContext,
     rule: &BackendImport,
-    since_ms: u64,
+    incarnation: u128,
     key: &str,
     id: Ulid,
 ) -> Result<bool, ItemError> {
     let (group_id, bucket) = (rule.group_id, &rule.bucket);
     let mut trail = Trail::Clean;
-    for prefix in trail_ranges(group_id, bucket, key) {
+    for prefix in trail_ranges(group_id, (bucket, incarnation), key) {
         for (_, value) in iterate(context, DELETE_TRAIL_KEYSPACE, prefix).await? {
             let record = BlobAuditRecord::from_bytes(&value);
             let record = record.map_err(|error| ItemError::System(error.to_string()))?;
-            if record.occurred_at_ms >= since_ms {
-                trail = trail.add(&record, bucket, key, id);
-            }
+            trail = trail.add(&record, bucket, key, id);
         }
     }
     Ok(trail != Trail::Clean)
@@ -2121,7 +2119,7 @@ mod tests {
         let context = crate::tests::s3::test_context(storage);
         let rule = recovery_rule("{dir}{name}");
         let id = Ulid::from_parts(1_000, 1);
-        let deleted = || trail_since(&context, &rule, 0, "in/a.csv", id);
+        let deleted = || trail_of(&context, &rule, 5, "in/a.csv", id);
         assert!(!deleted().await.ok().unwrap());
         let record = |key: &str| aruna_core::structs::storage::delete_audit::BlobAuditRecord {
             realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]),
@@ -2137,14 +2135,14 @@ mod tests {
         // A delete of another key is not read at all.
         for key in ["in/a.csv2", "in/a.csv"] {
             let record = record(key);
-            let trail = Key::from(trail_key(&record, Ulid::generate()));
+            let trail = Key::from(trail_key(&record, 5, Ulid::generate()));
             let value = record.to_bytes().unwrap();
             let write = write_value(&context, DELETE_TRAIL_KEYSPACE, trail, value);
             assert!(write.await.is_ok());
             assert_eq!(deleted().await.ok().unwrap(), key == "in/a.csv");
         }
         // A bucket created again under the name starts with a clean trail.
-        let fresh = trail_since(&context, &rule, 3_000, "in/a.csv", id).await;
+        let fresh = trail_of(&context, &rule, 6, "in/a.csv", id).await;
         assert!(!fresh.ok().unwrap());
     }
 
