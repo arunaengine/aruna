@@ -72,8 +72,9 @@ pub(crate) async fn release_renamed(
             return false;
         }
     }
-    // The rename's own old location goes first, whatever the storage's cleanup strategy.
-    if !retire_source(context, &location).await {
+    // The rename's own old location goes first, whatever the storage's cleanup strategy, and
+    // the rename and that retirement are on disk before the file is deleted.
+    if !retire_source(context, &location).await || !synced(context).await {
         return false;
     }
     let Some(blob_handle) = context.blob_handle.as_ref() else {
@@ -145,6 +146,20 @@ async fn referenced(
         other => return Err(format!("could not read archive owners: {other:?}")),
     }
     other_rows(context, location, import_id).await
+}
+
+/// Whether the storage confirmed that every committed transaction is on disk.
+async fn synced(context: &DriverContext) -> bool {
+    match send(context, StorageEffect::SyncAll).await {
+        Event::Storage(StorageEvent::SyncAllFinished) => true,
+        event => {
+            warn!(
+                ?event,
+                "Storage did not sync before a renamed file is deleted"
+            );
+            false
+        }
+    }
 }
 
 /// Drops the old location row of the rename in a reclaim transaction that proves no version
@@ -580,6 +595,13 @@ mod tests {
         renamed_row(&context, IMPORT).await;
         assert!(!release(&context).await);
         assert!(row(&context, IMPORT).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn syncs_before_delete() {
+        // The node storage answers the sync the release waits for before it deletes the file.
+        let (_dir, context) = setup();
+        assert!(synced(&context).await);
     }
 
     #[tokio::test]
