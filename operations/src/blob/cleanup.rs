@@ -139,7 +139,7 @@ async fn purge_ended(context: &DriverContext, job_id: Ulid) -> Option<bool> {
     };
     let record = crate::jobs::store::read_job_record(&context.storage_handle, job_id, None);
     match record.await {
-        Ok(record) => Some(record.is_none_or(|record| record.state.is_terminal())),
+        Ok(record) => Some(record.is_none_or(|record| record.is_settled())),
         Err(error) => {
             warn!(%error, "A purge job could not be read");
             None
@@ -547,8 +547,9 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
             // Exactly the decoded upload; a newer try of the attempt keeps its own.
             let upload = Some((Box::new(location), upload_id));
             let effect = BlobEffect::SettleCopy { attempt, upload };
+            // The settlement removes the record itself, and only while it is unchanged.
             match blob_handle.send_blob_effect(effect).await {
-                Event::Blob(BlobEvent::UploadAborted) => RowOutcome::Done,
+                Event::Blob(BlobEvent::UploadAborted) => RowOutcome::Kept,
                 event => {
                     warn!(?event, "A copy upload could not be settled");
                     RowOutcome::Failed
