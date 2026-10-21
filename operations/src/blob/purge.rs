@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::records::iter_hash_page;
-use crate::blob::unify::rules_on;
+use crate::blob::unify::{rules_on, second_copies};
 use crate::driver::DriverContext;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -37,6 +37,8 @@ pub struct StorageFile {
     pub owner: Option<(Ulid, Ulid)>,
     /// Why the file would stay after the purge, as far as a preview can tell.
     pub kept: Option<String>,
+    /// The key index row of a second copy no version reads, which goes with the versions.
+    pub index: Option<Key>,
 }
 
 impl StorageFile {
@@ -123,7 +125,31 @@ pub async fn storage_files(
             version: None,
             owner: None,
             kept: None,
+            index: None,
         });
+    }
+    // A second copy an import registered for a purged version goes with that version.
+    let routing = crate::blob::migration::move_routing(context, bucket).await?;
+    let mut keys: std::collections::BTreeMap<&str, Vec<Ulid>> = Default::default();
+    for (key, id) in versions {
+        keys.entry(key.as_str()).or_default().push(*id);
+    }
+    for (key, ids) in keys {
+        let twins = second_copies(context, routing.as_ref(), (bucket, key), &ids).await?;
+        for (location, index, version_id) in twins {
+            if files.iter().any(|file| file.location.ulid == location.ulid) {
+                continue;
+            }
+            files.push(StorageFile {
+                key: key.to_string(),
+                version_id,
+                location,
+                version: None,
+                owner: None,
+                kept: None,
+                index: Some(index),
+            });
+        }
     }
     let mut rules: HashMap<Vec<u8>, Vec<BackendImport>> = HashMap::new();
     for file in &files {
@@ -145,7 +171,9 @@ pub async fn storage_files(
         let mut values = batch(context, reads).await?.into_iter();
         let version = values.next().flatten();
         let version = version.map(|value| String::from_utf8(value.to_vec()));
-        file.version = version.transpose().map_err(|error| error.to_string())?;
+        let version = version.transpose().map_err(|error| error.to_string())?;
+        // "null" names whatever the path holds later, never the file's bytes.
+        file.version = version.filter(|version| version != "null");
         let mut owners = Vec::new();
         for (rule, row) in rules.iter().zip(values) {
             let row = row.as_deref().map(ImportedObject::from_bytes).transpose();
@@ -245,6 +273,10 @@ pub async fn scope_totals(
     let (mut key_marker, mut version_marker) = (None, None);
     let mut last_key = None::<String>;
     let mut scanned = 0u64;
+    let routing = crate::blob::migration::move_routing(context, scope.bucket()).await?;
+    let routing = routing.as_ref();
+    // The versions of the key passed over last, whose second copies count once it ends.
+    let mut ids = Vec::new();
     loop {
         let input = ListVersionsInput {
             bucket: scope.bucket().to_string(),
@@ -258,9 +290,16 @@ pub async fn scope_totals(
             .await
             .map_err(|error| error.to_string())?;
         for item in &page.items {
-            let (key, location) = match item {
-                ListVersionsItem::Version { key, location, .. } => (key, location.as_ref()),
-                ListVersionsItem::DeleteMarker { key, .. } => (key, None),
+            let (key, id, location) = match item {
+                ListVersionsItem::Version {
+                    key,
+                    version_id,
+                    location,
+                    ..
+                } => (key, *version_id, location.as_ref()),
+                ListVersionsItem::DeleteMarker {
+                    key, version_id, ..
+                } => (key, *version_id, None),
             };
             // The bound counts every version passed over, also the hidden ones.
             scanned += 1;
@@ -269,9 +308,18 @@ pub async fn scope_totals(
             }
             totals.versions += 1;
             if last_key.as_deref() != Some(key.as_str()) {
+                let ended = (last_key.as_deref(), std::mem::take(&mut ids));
+                count_copies(
+                    context,
+                    (scope.bucket(), routing),
+                    ended,
+                    (&mut totals, &mut seen),
+                )
+                .await?;
                 totals.keys += 1;
                 last_key = Some(key.clone());
             }
+            ids.push(id);
             let Some(location) = location else {
                 continue;
             };
@@ -283,6 +331,14 @@ pub async fn scope_totals(
             }
         }
         if scanned >= TOTAL_VERSIONS && page.is_truncated {
+            let ended = (last_key.as_deref(), ids);
+            count_copies(
+                context,
+                (scope.bucket(), routing),
+                ended,
+                (&mut totals, &mut seen),
+            )
+            .await?;
             return Ok(totals);
         }
         match (page.is_truncated, page.next_key_marker) {
@@ -290,11 +346,41 @@ pub async fn scope_totals(
                 (key_marker, version_marker) = (Some(next), page.next_version_marker)
             }
             _ => {
+                let ended = (last_key.as_deref(), ids);
+                count_copies(
+                    context,
+                    (scope.bucket(), routing),
+                    ended,
+                    (&mut totals, &mut seen),
+                )
+                .await?;
                 totals.complete = true;
                 return Ok(totals);
             }
         }
     }
+}
+
+/// Counts the second copies an import registered for the versions `ids` of `key`.
+async fn count_copies(
+    context: &DriverContext,
+    (bucket, routing): (
+        &str,
+        Option<&aruna_core::structs::storage::routing::RoutingSnapshot>,
+    ),
+    (key, ids): (Option<&str>, Vec<Ulid>),
+    (totals, seen): (&mut ScopeTotals, &mut std::collections::HashSet<Ulid>),
+) -> Result<(), String> {
+    let Some(key) = key.filter(|_| !ids.is_empty()) else {
+        return Ok(());
+    };
+    for (file, ..) in second_copies(context, routing, (bucket, key), &ids).await? {
+        if seen.insert(file.ulid) {
+            totals.storage_files += 1;
+            totals.storage_bytes += file.blob_size;
+        }
+    }
+    Ok(())
 }
 
 fn plan_key(job_id: Ulid, location: Ulid) -> Key {

@@ -394,9 +394,10 @@ async fn delete_versions(
         {
             authorize_object(ctx, spec, key).await?;
         }
-        if files {
-            plan_files(ctx, spec, &entries).await?;
-        }
+        let indexes = match files {
+            true => plan_files(ctx, spec, &entries).await?,
+            false => Vec::new(),
+        };
         let batch_len = entries.len() as u64;
         let outcomes = delete_objects(
             &ctx.driver,
@@ -422,6 +423,7 @@ async fn delete_versions(
                 JobError::retryable(format!("versioned purge delete failed: {error}")).into(),
             );
         }
+        drop_indexes(ctx, indexes).await?;
         checkpoint.batches_completed = checkpoint.batches_completed.saturating_add(1);
         persist_batch(ctx, checkpoint, batch_len).await?;
     }
@@ -678,12 +680,13 @@ async fn persist_progress(ctx: &JobContext) -> Result<(), PurgeRunError> {
     Ok(())
 }
 
-/// Plans the release of the linked-storage files the entries read, before they go.
+/// Plans the release of the linked-storage files the entries read, before they go. Answers
+/// the key index rows of the second copies among them.
 async fn plan_files(
     ctx: &JobContext,
     spec: &StoragePurgeSpec,
     entries: &[BulkDeleteEntry],
-) -> Result<(), PurgeRunError> {
+) -> Result<Vec<aruna_core::types::Key>, PurgeRunError> {
     let versions: Vec<_> = entries
         .iter()
         .filter_map(|entry| Some((entry.key.clone(), entry.version_id?)))
@@ -695,7 +698,33 @@ async fn plan_files(
         .map_err(failed)?;
     crate::blob::purge::plan_files(&ctx.driver, ctx.job_id.as_ulid(), &found)
         .await
-        .map_err(|error| failed(error).into())
+        .map_err(failed)?;
+    Ok(found.into_iter().filter_map(|file| file.index).collect())
+}
+
+/// Drops the key index rows of second copies whose versions are gone; their rows and files
+/// go through the planned releases.
+async fn drop_indexes(
+    ctx: &JobContext,
+    indexes: Vec<aruna_core::types::Key>,
+) -> Result<(), PurgeRunError> {
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    let deletes = (indexes.into_iter())
+        .map(|key| (aruna_core::keyspaces::RENAMED_ROW_KEYSPACE.to_string(), key))
+        .collect();
+    let delete = StorageEffect::BatchDelete {
+        deletes,
+        txn_id: None,
+    };
+    match ctx.driver.storage_handle.send_storage_effect(delete).await {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
+        other => {
+            let error = format!("purge could not drop copy indexes: {other:?}");
+            Err(JobError::retryable(error).into())
+        }
+    }
 }
 
 /// Waits while the caller paused the purge; a cancel or a shutdown ends the wait.

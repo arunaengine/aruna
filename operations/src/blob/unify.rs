@@ -190,6 +190,9 @@ async fn duplicates(
         groups.entry(group).or_default().push((id, value, file));
     }
     let twins = second_copies(context, routing, (bucket, key), &versions_of(&groups)).await?;
+    let twins: Vec<_> = (twins.into_iter())
+        .map(|(file, index, _)| (file, index))
+        .collect();
     for ((hash, backend), members) in groups {
         let twins: Vec<_> = (twins.iter())
             .filter(|(file, _)| {
@@ -279,13 +282,13 @@ fn versions_of(groups: &BTreeMap<([u8; 32], Vec<u8>), Vec<Member>>) -> Vec<Ulid>
 }
 
 /// The second copies of `key` an import registered for one of `versions`: files with a
-/// version's content whose row names that version, with their index rows.
-async fn second_copies(
+/// version's content whose row names that version, with their index rows and that version.
+pub(crate) async fn second_copies(
     context: &DriverContext,
     routing: Option<&RoutingSnapshot>,
     (bucket, key): (&str, &str),
     versions: &[Ulid],
-) -> Result<Vec<(BackendLocation, Key)>, String> {
+) -> Result<Vec<(BackendLocation, Key, Ulid)>, String> {
     let error = |error: aruna_core::errors::ConversionError| error.to_string();
     let rules = routing.map_or(&[][..], |routing| routing.imports.as_slice());
     let prefix = VersionKey::object_prefix(bucket, key).map_err(error)?;
@@ -318,7 +321,8 @@ async fn second_copies(
                 if row.key.as_deref() != Some(key) || !versions.contains(&row.version_id) {
                     continue;
                 }
-                found.push((BackendLocation::from_bytes(&value).map_err(error)?, index));
+                let file = BackendLocation::from_bytes(&value).map_err(error)?;
+                found.push((file, index, row.version_id));
             }
             match next {
                 Some(next) => after = Some(next),
