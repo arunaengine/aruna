@@ -303,3 +303,7 @@ pub async fn rename_keys(
         .map_err(map_error)?;
     Ok(Json(plan_response(bucket, plan)))
 }
+
+#[cfg(test)]
+#[path = "rename_tests.rs"]
+mod tests;
