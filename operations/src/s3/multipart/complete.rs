@@ -1537,8 +1537,10 @@ impl CompleteUploadOperation {
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
         let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
-        // An import may register a listed object's version before the finalize commits it.
-        if self.plain.as_ref().is_some_and(|target| target.listed) {
+        // An import may register a listed object's version before the finalize commits it; an
+        // upload opened at a provider path stays one after its rule was removed.
+        if self.plain.as_ref().is_some_and(|target| target.listed) || self.plain_upload().is_some()
+        {
             return self.read_registered(version_id);
         }
         self.write_head(existing, version_id)

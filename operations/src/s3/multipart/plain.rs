@@ -95,7 +95,7 @@ impl CompleteUploadOperation {
     }
 
     /// The provider upload of an upload that opened at its plain path.
-    fn plain_upload(&self) -> Option<&BackendUpload> {
+    pub(super) fn plain_upload(&self) -> Option<&BackendUpload> {
         let upload = self.upload_record.as_ref()?.backend_upload.as_ref()?;
         upload.location.is_external().then_some(upload)
     }
@@ -1343,6 +1343,22 @@ mod tests {
         };
         let import_id = operation.plain.as_ref().unwrap().import_id;
         assert_eq!(*key, object_key(import_id, "raw/object~tag"));
+    }
+
+    #[test]
+    fn checks_ruleless_replay() {
+        // An upload opened at a provider path is checked for a registered or deleted version
+        // also after its rule was removed.
+        let mut operation = in_place(Ulid::from_parts(6, 6));
+        operation.plain = None;
+        written_in_place(&mut operation);
+        operation.txn_id = Some(Ulid::nil());
+        let effects = operation.write_current_lookup(None);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE
+        ));
     }
 
     #[test]
