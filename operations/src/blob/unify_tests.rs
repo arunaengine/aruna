@@ -375,3 +375,28 @@ async fn stops_when_paused() {
     assert_eq!(cleanup_rows(&context).await, 0);
     assert_eq!(job_row(&context).await, paused);
 }
+
+#[tokio::test]
+async fn pages_within_keys() {
+    // A key with more duplicate contents than a page holds continues on the next page.
+    let (_directory, context) = setup().await;
+    for (tag, at) in [(1u8, 10u64), (2, 20)] {
+        let (v1, v2) = (Ulid::from_parts(at, 1), Ulid::from_parts(at + 1, 1));
+        let old = file(&format!("raw/{v1}_k"), Ulid::from_parts(at, 7), tag);
+        let new = file(&format!("raw/k~{v2}"), Ulid::from_parts(at + 1, 7), tag);
+        store(&context, "k", v1, &old).await;
+        store(&context, "k", v2, &new).await;
+    }
+    let access = load(&context).await;
+    let first = preview_page(&context, (BUCKET, ""), &access, (None, None, 1))
+        .await
+        .unwrap();
+    assert_eq!((first.keys, first.entries.len()), (1, 1));
+    assert_eq!(first.next, Some(("k".to_string(), Some(1))));
+    let second = preview_page(&context, (BUCKET, ""), &access, (None, first.next, 1))
+        .await
+        .unwrap();
+    assert_eq!(second.entries.len(), 1);
+    assert_ne!(second.entries[0].keep.ulid, first.entries[0].keep.ulid);
+    assert_eq!(second.next, None);
+}

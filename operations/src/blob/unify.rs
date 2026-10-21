@@ -67,9 +67,12 @@ pub struct UnifyPage {
     pub bytes: u64,
     pub complete: bool,
     pub entries: Vec<Duplicate>,
-    /// The key after which the next page starts; a key the caller may read.
-    pub next: Option<String>,
+    /// Where the next page starts: after a key the caller may read, or within it.
+    pub next: Option<Cursor>,
 }
+
+/// A key the caller may read and, to continue within it, the content groups already shown.
+pub type Cursor = (String, Option<usize>);
 
 /// The versions of the keys of a bucket in storage order, one key at a time.
 pub(crate) struct KeyWalk<'a> {
@@ -98,6 +101,13 @@ impl<'a> KeyWalk<'a> {
             end: false,
             scanned: 0,
         }
+    }
+
+    /// Starts at the first version of `key`.
+    pub(crate) fn from_key(context: &'a DriverContext, bucket: &'a str, key: &str) -> Self {
+        let mut walk = Self::new(context, bucket, None);
+        walk.start = VersionKey::object_prefix(bucket, key).ok().map(Into::into);
+        walk
     }
 
     async fn fill(&mut self) -> Result<(), String> {
@@ -247,7 +257,7 @@ pub async fn preview_page(
     context: &DriverContext,
     (bucket, prefix): (&str, &str),
     access: &BucketAccess,
-    (filter, after, limit): (Option<&str>, Option<String>, usize),
+    (filter, after, limit): (Option<&str>, Option<Cursor>, usize),
 ) -> Result<UnifyPage, String> {
     let routing = move_routing(context, bucket).await?;
     let visible = |key: &str| access.allows(Some(key), &Permission::READ);
@@ -271,11 +281,15 @@ pub async fn preview_page(
         page.keys += u64::from(!found.is_empty());
         page.bytes += found.iter().map(Duplicate::freed).sum::<u64>();
     }
-    let mut walk = KeyWalk::new(context, bucket, after.as_deref());
+    let mut walk = match &after {
+        Some((key, Some(_))) => KeyWalk::from_key(context, bucket, key),
+        Some((key, None)) => KeyWalk::new(context, bucket, Some(key)),
+        None => KeyWalk::new(context, bucket, None),
+    };
     let mut last = None;
     while let Some((key, versions)) = walk.next().await? {
         if page.entries.len() == limit || walk.scanned > PAGE_SCAN {
-            page.next = page.entries.last().map(|entry| entry.key.clone()).or(last);
+            page.next = last;
             if page.next.is_none() {
                 return Err("too many keys in a row are hidden from the caller".to_string());
             }
@@ -283,13 +297,24 @@ pub async fn preview_page(
         }
         // A cursor may name any key the caller reads, also one the filter leaves out.
         if visible(&key) {
-            last = Some(key.clone());
+            last = Some((key.clone(), None));
         }
         if !readable(&key) {
             continue;
         }
         let found = duplicates(context, routing.as_ref(), (bucket, &key), versions).await?;
-        page.entries.extend(found);
+        let skip = match &after {
+            Some((after, Some(shown))) if *after == key => *shown,
+            _ => 0,
+        };
+        // A key with more contents than the page holds continues on the next page.
+        for (index, duplicate) in found.into_iter().enumerate().skip(skip) {
+            if page.entries.len() == limit {
+                page.next = Some((key.clone(), Some(index)));
+                return Ok(page);
+            }
+            page.entries.push(duplicate);
+        }
     }
     Ok(page)
 }

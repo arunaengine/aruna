@@ -526,6 +526,11 @@ pub async fn preview_duplicates(
 ) -> ServerResult<Json<DuplicatePreview>> {
     let (rule, _, access) = caller(&state, auth, (&group_id, &import_id)).await?;
     let (after, limit) = page_of(&page)?;
+    // A cursor within a key names how many of its content groups were shown.
+    let after = after.map(|after| match after.split_once('\0') {
+        Some((key, shown)) => (key.to_string(), shown.parse().ok()),
+        None => (after, None),
+    });
     let filter = page.filter.as_deref();
     let found = unify::preview_page(
         &state.get_ctx(),
@@ -550,7 +555,10 @@ pub async fn preview_duplicates(
                 removed: entry.copies.into_iter().map(file).collect(),
             })
             .collect(),
-        next: found.next.map(encode_cursor),
+        next: found.next.map(|(key, shown)| match shown {
+            Some(shown) => encode_cursor(format!("{key}\0{shown}")),
+            None => encode_cursor(key),
+        }),
     }))
 }
 
