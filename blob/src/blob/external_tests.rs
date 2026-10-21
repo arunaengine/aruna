@@ -568,6 +568,30 @@ async fn deletes_exact_versions() {
 }
 
 #[tokio::test]
+async fn deletes_unversioned_files() {
+    // Without a version only a file of the recorded size is deleted.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let root = context._temp_dir.path().join("hot");
+    place(&root, "raw/a.txt", b"bytes");
+    let resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
+    let BlobEvent::ExternalHashed { mut location, .. } = handler
+        .hash_external(resolved, "raw/a.txt".to_string(), test_user_id())
+        .await
+    else {
+        panic!("hash failed")
+    };
+    location.blob_size += 1;
+    let refused = handler.delete_plain(location.clone(), String::new()).await;
+    assert_eq!(refused, BlobEvent::Error(BlobError::CleanupUnsupported));
+    assert!(root.join("raw/a.txt").exists());
+    location.blob_size -= 1;
+    let deleted = handler.delete_plain(location, String::new()).await;
+    assert_eq!(deleted, BlobEvent::DeleteFinished);
+    assert!(!root.join("raw/a.txt").exists());
+}
+
+#[tokio::test]
 async fn copies_missing_source() {
     // A copy of a file that is gone fails without writing anything at the new name.
     use aruna_core::structs::storage::backend_import::PlainPath;

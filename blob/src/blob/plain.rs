@@ -569,7 +569,8 @@ impl BlobHandler {
     }
 
     /// Only an explicit rename deletes a tenant file, after its version names the new one, and
-    /// only the exact backend version it read; a later write at the path stays.
+    /// only the exact backend version it read; a later write at the path stays. An empty
+    /// version deletes a file of an unversioned storage whose size and ETag still match.
     pub(super) async fn delete_plain(
         &self,
         location: BackendLocation,
@@ -590,11 +591,49 @@ impl BlobHandler {
             Ok(found) => found,
             Err(error) => return BlobEvent::Error(error),
         };
+        if version.is_empty() {
+            return self.delete_unversioned(&operator, &path, &location).await;
+        }
         if !operator.info().capability().delete_with_version {
             return BlobEvent::Error(BlobError::CleanupUnsupported);
         }
         let delete = operator.delete_with(&path).version(&version);
         match timeout(self.io_timeout(), delete.into_future()).await {
+            Ok(Ok(())) => BlobEvent::DeleteFinished,
+            Ok(Err(error)) if error.kind() == ErrorKind::NotFound => BlobEvent::DeleteFinished,
+            Ok(Err(error)) => BlobEvent::Error(BlobError::DeleteError(error.to_string())),
+            Err(_) => BlobEvent::Error(BlobError::DeleteError("timed out deleting".into())),
+        }
+    }
+
+    /// Deletes the file at `path` unless its size or single-part ETag shows other bytes.
+    async fn delete_unversioned(
+        &self,
+        operator: &Operator,
+        path: &str,
+        location: &BackendLocation,
+    ) -> BlobEvent {
+        let metadata = match timeout(self.io_timeout(), operator.stat(path)).await {
+            Ok(Ok(metadata)) => metadata,
+            Ok(Err(error)) if error.kind() == ErrorKind::NotFound => {
+                return BlobEvent::DeleteFinished;
+            }
+            Ok(Err(error)) => return BlobEvent::Error(BlobError::DeleteError(error.to_string())),
+            Err(_) => return BlobEvent::Error(BlobError::DeleteError("timed out reading".into())),
+        };
+        let etag = metadata
+            .etag()
+            .map(|etag| etag.trim_matches('"').to_ascii_lowercase());
+        let md5 = location.hashes.get(aruna_core::structs::checksum::HASH_MD5);
+        let md5 = md5.map(hex::encode);
+        let single = etag
+            .as_ref()
+            .filter(|etag| etag.len() == 32 && !etag.contains('-'));
+        let differs = single.zip(md5).is_some_and(|(etag, md5)| *etag != md5);
+        if metadata.content_length() != location.blob_size || differs {
+            return BlobEvent::Error(BlobError::CleanupUnsupported);
+        }
+        match timeout(self.io_timeout(), operator.delete(path)).await {
             Ok(Ok(())) => BlobEvent::DeleteFinished,
             Ok(Err(error)) if error.kind() == ErrorKind::NotFound => BlobEvent::DeleteFinished,
             Ok(Err(error)) => BlobEvent::Error(BlobError::DeleteError(error.to_string())),
