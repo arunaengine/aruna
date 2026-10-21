@@ -746,8 +746,8 @@ key the caller may read are counted and listed.
 - Changing the pattern renames nothing; only `POST` on this path does.
 
 **Limits**
-- Pages hold 1 to 1000 files, in storage order; `next` resumes after the last key shown and
-  names only keys the caller may read. Totals pass over at most 2,000,000 version rows."#,
+- Pages hold 1 to 1000 files, in storage order; `next` resumes after the last version passed
+  over and names only keys the caller may read. Totals pass over at most 2,000,000 version rows."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
         ("import_id" = String, Path, description = "Rule to check, as a 26-character ULID"),
@@ -789,10 +789,7 @@ pub async fn get_renames(
     let limit = page.limit.unwrap_or(DEFAULT_PAGE);
     let bad = || ServerError::BadRequestMessage("`after` is not a cursor".to_string());
     let after = match page.after.as_deref() {
-        Some(after) => {
-            let bytes = URL_SAFE_NO_PAD.decode(after).map_err(|_| bad())?;
-            Some(String::from_utf8(bytes).map_err(|_| bad())?)
-        }
+        Some(after) => Some(URL_SAFE_NO_PAD.decode(after).map_err(|_| bad())?),
         None => None,
     };
     if !(1..=MAX_PAGE).contains(&limit) {

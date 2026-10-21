@@ -245,10 +245,9 @@ pub async fn preview_page(
     (filter, after, limit): (Option<&str>, Option<String>, usize),
 ) -> Result<UnifyPage, String> {
     let routing = move_routing(context, bucket).await?;
+    let visible = |key: &str| access.allows(Some(key), &Permission::READ);
     let readable = |key: &str| {
-        key.starts_with(prefix)
-            && filter.is_none_or(|filter| key.contains(filter))
-            && access.allows(Some(key), &Permission::READ)
+        key.starts_with(prefix) && filter.is_none_or(|filter| key.contains(filter)) && visible(key)
     };
     let mut page = UnifyPage {
         complete: true,
@@ -277,10 +276,13 @@ pub async fn preview_page(
             }
             return Ok(page);
         }
+        // A cursor may name any key the caller reads, also one the filter leaves out.
+        if visible(&key) {
+            last = Some(key.clone());
+        }
         if !readable(&key) {
             continue;
         }
-        last = Some(key.clone());
         let found = duplicates(context, routing.as_ref(), (bucket, &key), versions).await?;
         page.entries.extend(found);
     }

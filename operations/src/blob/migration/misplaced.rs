@@ -196,12 +196,12 @@ pub struct RenamePage {
     pub complete: bool,
     /// The old and the new path, and whether the caller may write the key.
     pub entries: Vec<(String, String, bool)>,
-    /// The key after which the next page starts; a key the caller may read.
-    pub next: Option<String>,
+    /// The version row after which the next page starts; it names a key the caller may read.
+    pub next: Option<Vec<u8>>,
 }
 
 /// The linked files under `prefix` of `bucket` an asked rename renames, page by page in
-/// storage order after the key `after`, as far as `readable` allows the key.
+/// version storage order after the row `after`, as far as `readable` allows the key.
 pub async fn rename_page(
     context: &DriverContext,
     (bucket, prefix): (&str, &str),
@@ -209,9 +209,8 @@ pub async fn rename_page(
         &(dyn Fn(&str) -> bool + Sync),
         &(dyn Fn(&str) -> bool + Sync),
     ),
-    (filter, after, limit): (Option<&str>, Option<String>, usize),
+    (filter, after, limit): (Option<&str>, Option<Vec<u8>>, usize),
 ) -> Result<RenamePage, String> {
-    use crate::blob::unify::KeyWalk;
     let mut page = RenamePage {
         complete: true,
         ..RenamePage::default()
@@ -226,64 +225,101 @@ pub async fn rename_page(
     let shown = |key: &str| {
         key.starts_with(prefix) && filter.is_none_or(|filter| key.contains(filter)) && readable(key)
     };
-    let mut walk = KeyWalk::new(context, bucket, None);
-    while let Some((key, versions)) = walk.next().await? {
-        if walk.scanned > TOTAL_ROWS {
-            page.complete = false;
-            break;
-        }
-        if shown(&key) {
-            let found = renamed(context, &routing, &earlier, (bucket, &key), versions).await?;
-            page.total += found.len() as u64;
-        }
-    }
-    let mut walk = KeyWalk::new(context, bucket, after.as_deref());
-    let mut last = None;
-    while let Some((key, versions)) = walk.next().await? {
-        if page.entries.len() >= limit || walk.scanned > PAGE_ROWS {
-            page.next = last;
-            if page.next.is_none() {
-                return Err("too many keys in a row are hidden from the caller".to_string());
+    let scan = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
+    let (mut start, mut scanned) = (None::<Key>, 0usize);
+    'total: loop {
+        let (rows, next) = crate::jobs::store::iter_prefix_page(
+            &context.storage_handle,
+            BLOB_VERSIONS_KEYSPACE,
+            Some(scan.clone().into()),
+            start.take(),
+            COUNT_PAGE,
+            None,
+        )
+        .await?;
+        for (key, value) in &rows {
+            if scanned == TOTAL_ROWS {
+                page.complete = false;
+                break 'total;
             }
-            return Ok(page);
+            scanned += 1;
+            let version_key = VersionKey::from_bytes(key).map_err(|e| e.to_string())?;
+            if shown(&version_key.key)
+                && renamed(context, (&routing, &earlier), &version_key, value)
+                    .await?
+                    .is_some()
+            {
+                page.total += 1;
+            }
         }
-        if !shown(&key) {
-            continue;
+        match next {
+            Some(next) => start = Some(next),
+            None => break,
         }
-        let found = renamed(context, &routing, &earlier, (bucket, &key), versions).await?;
-        let allowed = writable(&key);
-        page.entries
-            .extend(found.into_iter().map(|(from, to)| (from, to, allowed)));
-        last = Some(key);
     }
-    Ok(page)
+    let (mut start, mut scanned) = (after.map(Key::from), 0usize);
+    let mut last = None;
+    loop {
+        let (rows, next) = crate::jobs::store::iter_prefix_page(
+            &context.storage_handle,
+            BLOB_VERSIONS_KEYSPACE,
+            Some(scan.clone().into()),
+            start.take(),
+            COUNT_PAGE,
+            None,
+        )
+        .await?;
+        for (key, value) in &rows {
+            if page.entries.len() == limit || scanned == PAGE_ROWS {
+                // A cursor names only a row of a key the caller may read.
+                page.next = last;
+                if page.next.is_none() {
+                    return Err("too many keys in a row are hidden from the caller".to_string());
+                }
+                return Ok(page);
+            }
+            scanned += 1;
+            let version_key = VersionKey::from_bytes(key).map_err(|e| e.to_string())?;
+            if readable(&version_key.key) {
+                last = Some(key.to_vec());
+            }
+            if !shown(&version_key.key) {
+                continue;
+            }
+            if let Some((from, to)) =
+                renamed(context, (&routing, &earlier), &version_key, value).await?
+            {
+                page.entries.push((from, to, writable(&version_key.key)));
+            }
+        }
+        match next {
+            Some(next) => start = Some(next),
+            None => return Ok(page),
+        }
+    }
 }
 
-/// The old and new path of each version of `key` whose linked file a rename renames.
+/// The old and new path of the version's linked file, if a rename renames it.
 async fn renamed(
     context: &DriverContext,
-    routing: &aruna_core::structs::storage::routing::RoutingSnapshot,
-    earlier: &super::Earlier,
-    (bucket, key): (&str, &str),
-    versions: Vec<(ulid::Ulid, Vec<u8>)>,
-) -> Result<Vec<(String, String)>, String> {
-    let mut found = Vec::new();
-    for (id, value) in versions {
-        let version_key = VersionKey::new(bucket, key, id);
-        let Ok((resolved, Some(plain))) = place(routing, &version_key) else {
-            continue;
-        };
-        let version = BlobVersion::from_bytes(&value).map_err(|error| error.to_string())?;
-        let target = (resolved.backend.clone(), resolved.compression.into());
-        let Some(source) = source_key(&version, |_: &_| target.clone(), true) else {
-            continue;
-        };
-        let Some(location) = read_location(context, &source).await? else {
-            continue;
-        };
-        if renames(routing, earlier, &plain, &location, &version_key) {
-            found.push((location.backend_path, plain.path));
-        }
-    }
-    Ok(found)
+    (routing, earlier): (
+        &aruna_core::structs::storage::routing::RoutingSnapshot,
+        &super::Earlier,
+    ),
+    version_key: &VersionKey,
+    value: &[u8],
+) -> Result<Option<(String, String)>, String> {
+    let Ok((resolved, Some(plain))) = place(routing, version_key) else {
+        return Ok(None);
+    };
+    let version = BlobVersion::from_bytes(value).map_err(|error| error.to_string())?;
+    let target = (resolved.backend.clone(), resolved.compression.into());
+    let Some(source) = source_key(&version, |_: &_| target.clone(), true) else {
+        return Ok(None);
+    };
+    let Some(location) = read_location(context, &source).await? else {
+        return Ok(None);
+    };
+    let found = renames(routing, earlier, &plain, &location, version_key);
+    Ok(found.then_some((location.backend_path, plain.path)))
 }
