@@ -512,6 +512,14 @@ async fn deletes_exact_versions() {
         .delete_plain(location.clone(), "v1".to_string())
         .await;
     assert_eq!(unsupported, BlobEvent::Error(BlobError::CleanupUnsupported));
+    // An unversioned "null" never names the bytes to delete.
+    let unversioned = handler
+        .delete_plain(location.clone(), "null".to_string())
+        .await;
+    assert!(matches!(
+        unversioned,
+        BlobEvent::Error(BlobError::DeleteError(_))
+    ));
     assert!(root.join("raw/a.txt").exists());
     location.storage_bucket = "managed".to_string();
     let refused = handler.delete_plain(location, "v1".to_string()).await;

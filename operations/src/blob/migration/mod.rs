@@ -389,8 +389,9 @@ impl MigrateVersionOperation {
         let version = value
             .map(|value| String::from_utf8(value.to_vec()))
             .transpose();
+        // An unversioned "null" names whatever the path holds later, never the bytes read.
         match version {
-            Ok(version) => self.source_version = version,
+            Ok(version) => self.source_version = version.filter(|version| version != "null"),
             Err(error) => return self.fail(ConversionError::from(error).into()),
         }
         self.find_target()
@@ -3976,12 +3977,15 @@ mod tests {
             );
             assert_eq!(version_id, Ulid::from_bytes([2; 16]));
             // Without the old file's backend version nothing names its bytes, so it stays.
+            for source in [None, Some(&b"null"[..])] {
+                let (writes, ..) = renamed(source);
+                assert!(
+                    !writes
+                        .iter()
+                        .any(|(space, ..)| space == BLOB_CLEANUP_KEYSPACE)
+                );
+            }
             let (writes, ..) = renamed(None);
-            assert!(
-                !writes
-                    .iter()
-                    .any(|(space, ..)| space == BLOB_CLEANUP_KEYSPACE)
-            );
             assert!(
                 writes
                     .iter()

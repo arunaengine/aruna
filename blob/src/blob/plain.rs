@@ -578,6 +578,11 @@ impl BlobHandler {
         if !location.storage_bucket.is_empty() {
             return BlobEvent::Error(BlobError::DeleteError("not a plain path".to_string()));
         }
+        // "null" names whatever the path holds now, so it never selects the bytes to delete.
+        if version == "null" {
+            let reason = "an unversioned path names no exact bytes".to_string();
+            return BlobEvent::Error(BlobError::DeleteError(reason));
+        }
         let (operator, path) = match self
             .operator_from_location(&location)
             .and_then(|operator| Ok((operator, self.object_path(&location)?)))
