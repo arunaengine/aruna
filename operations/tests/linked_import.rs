@@ -37,8 +37,9 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::auth::request_authorization::BucketAccess;
+use aruna_operations::blob::cleanup::process_cleanup_batch;
 use aruna_operations::blob::unify::{Unified, preview_page, unify};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::driver::{DriverContext, drive, routing_snapshot};
 use aruna_operations::groups::backends::record_writes;
 use aruna_operations::groups::fence::GroupWriteOperation;
 use aruna_operations::groups::imports::create::{CreateImportInput, CreateImportOperation};
@@ -49,6 +50,7 @@ use aruna_operations::jobs::backend_import::run_backend_import;
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::{ClaimOutcome, claim_job, insert_job, transition_to_running};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_storage::storage;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -486,4 +488,82 @@ async fn s3_finds_copies() {
         .await
         .unwrap();
     assert_eq!((page.keys, page.entries.len()), (0, 0));
+    // The queued release runs; the storage keeps no exact versions, so the files stay
+    // recorded and the next run changes nothing.
+    process_cleanup_batch(&context.driver).await.unwrap();
+    assert_eq!(run_import(&context, 0xE5).await, (0, 3, 1));
+}
+
+/// The duplicates preview of the whole bucket.
+async fn duplicates(context: &TestContext) -> aruna_operations::blob::unify::UnifyPage {
+    let scope = (context.auth.realm_id, context.group_id, context.node_id);
+    let access = BucketAccess::load(&context.driver, &context.auth, scope, BUCKET)
+        .await
+        .unwrap();
+    preview_page(&context.driver, (BUCKET, ""), &access, (None, None, 100))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_replaces_copies() {
+    // A second copy overwritten with other bytes becomes a new version of its key and is no
+    // copy any more.
+    let context = setup_pattern("{dir}{id}_{name}").await;
+    let id = Ulid::generate();
+    place(&context, &format!("old/{id}_a.txt"), b"same").await;
+    place(&context, "old/a.txt", b"same").await;
+    assert_eq!(run_import(&context, 0xC3).await, (2, 0, 0));
+    assert_eq!(duplicates(&context).await.keys, 1);
+    place(&context, "old/a.txt", b"other bytes").await;
+    assert_eq!(run_import(&context, 0xD4).await, (1, 1, 0));
+    assert_ne!(current(&context, "old/a.txt").await, Some(id));
+    let page = duplicates(&context).await;
+    assert_eq!((page.keys, page.entries.len()), (0, 0));
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_unifies_uploads() {
+    // An imported file and an upload of the same bytes to its key end up as one file.
+    let context = setup_context().await;
+    place(&context, "x.txt", b"abc").await;
+    assert_eq!(run_import(&context, 0xC3).await, (1, 0, 0));
+    let routing = routing_snapshot(&context.driver, context.group_id, BUCKET)
+        .await
+        .unwrap();
+    let body = BackendStream::new(tokio_util::io::ReaderStream::new(std::io::Cursor::new(
+        b"abc".to_vec(),
+    )));
+    let put = PutObjectOperation::new(PutObjectConfig {
+        user_id: context.auth.user_id,
+        group_id: context.group_id,
+        realm_id: context.auth.realm_id,
+        node_id: context.node_id,
+        request: PutObjectInput {
+            bucket: BUCKET.to_string(),
+            key: "x.txt".to_string(),
+            content_length: Some(3),
+            body: Some(body),
+        },
+        expected_checksums: Vec::new(),
+        checksum_type: None,
+        exists: true,
+        version_source: None,
+        preassigned_version_id: None,
+        quota_ceiling: None,
+        routing,
+    });
+    drive(put, &context.driver).await.unwrap();
+    let page = duplicates(&context).await;
+    let [found] = page.entries.as_slice() else {
+        panic!("expected one key with copies: {page:?}")
+    };
+    // The upload has the name the rule's pattern gives it, so the imported raw copy goes.
+    assert!(found.copies[0].backend_path.ends_with("raw/x.txt"));
+    let bucket = (BUCKET, context.group_id);
+    let unified = unify(&context.driver, bucket, found, None).await.unwrap();
+    assert_eq!(unified, Unified::Done);
+    assert_eq!(duplicates(&context).await.keys, 0);
 }
