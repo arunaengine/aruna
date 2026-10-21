@@ -161,6 +161,10 @@ async fn backends_holding_data(context: &DriverContext) -> Result<BTreeSet<Backe
             if let Some(location) = work.as_ref().ok().and_then(BlobCleanupWork::location) {
                 holding.insert(location.backend.clone());
             }
+            // A move to settle may still need to release a copy on the storage of its intents.
+            if let Ok(BlobCleanupWork::SettleMove { intents, .. }) = &work {
+                holding.extend(intents.iter().map(|(_, intent)| intent.backend.clone()));
+            }
         }
         match next {
             Some(next) => start_after = Some(next),
