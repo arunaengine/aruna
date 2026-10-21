@@ -456,3 +456,89 @@ async fn records_copy_uploads() {
     handler.record_upload(attempt, None).await.unwrap();
     assert_eq!(handler.copy_upload(attempt).await.unwrap(), None);
 }
+
+#[tokio::test]
+async fn checks_stored_copies() {
+    // A copy's stat answers whether its bytes are still there.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let root = context._temp_dir.path().join("hot");
+    place(&root, "raw/a.txt", b"bytes");
+    let resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
+    let BlobEvent::ExternalHashed { mut location, .. } = handler
+        .hash_external(resolved, "raw/a.txt".to_string(), test_user_id())
+        .await
+    else {
+        panic!("hash failed")
+    };
+    assert_eq!(
+        handler.stat_copy(location.clone()).await,
+        BlobEvent::CopyStat { exists: true }
+    );
+    location.backend_path = "raw/gone.txt".to_string();
+    assert_eq!(
+        handler.stat_copy(location).await,
+        BlobEvent::CopyStat { exists: false }
+    );
+}
+
+#[tokio::test]
+async fn deletes_exact_versions() {
+    // Only a tenant path is deleted, and only where the storage deletes one version.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let root = context._temp_dir.path().join("hot");
+    place(&root, "raw/a.txt", b"bytes");
+    let resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
+    let BlobEvent::ExternalHashed { mut location, .. } = handler
+        .hash_external(resolved, "raw/a.txt".to_string(), test_user_id())
+        .await
+    else {
+        panic!("hash failed")
+    };
+    let unsupported = handler
+        .delete_plain(location.clone(), "v1".to_string())
+        .await;
+    assert_eq!(unsupported, BlobEvent::Error(BlobError::CleanupUnsupported));
+    assert!(root.join("raw/a.txt").exists());
+    location.storage_bucket = "managed".to_string();
+    let refused = handler.delete_plain(location, "v1".to_string()).await;
+    assert!(matches!(
+        refused,
+        BlobEvent::Error(BlobError::DeleteError(_))
+    ));
+}
+
+#[tokio::test]
+async fn copies_missing_source() {
+    // A copy of a file that is gone fails without writing anything at the new name.
+    use aruna_core::structs::storage::backend_import::PlainPath;
+    use ulid::Ulid;
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let root = context._temp_dir.path().join("hot");
+    place(&root, "raw/a.txt", b"bytes");
+    let resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
+    let BlobEvent::ExternalHashed { mut location, .. } = handler
+        .hash_external(resolved.clone(), "raw/a.txt".to_string(), test_user_id())
+        .await
+    else {
+        panic!("hash failed")
+    };
+    location.backend_path = "raw/gone.txt".to_string();
+    let plain = PlainPath {
+        path: "raw/b.txt".to_string(),
+        ulid: Ulid::generate(),
+        if_not_exists: true,
+        exact: true,
+    };
+    let event = handler.copy_plain(resolved, plain, location).await;
+    assert!(
+        !matches!(
+            event,
+            BlobEvent::PlainWritten { .. } | BlobEvent::WriteFinished { .. }
+        ),
+        "{event:?}"
+    );
+    assert!(!root.join("raw/b.txt").exists());
+}
