@@ -400,3 +400,36 @@ async fn pages_within_keys() {
     assert_ne!(second.entries[0].keep.ulid, first.entries[0].keep.ulid);
     assert_eq!(second.next, None);
 }
+
+#[tokio::test]
+async fn skips_deleting_files() {
+    // A kept file of an unversioned storage that a release is deleting takes no new reader.
+    let (_directory, context) = setup().await;
+    let (_, new) = twins(&context, "a.faa.gz", 10).await;
+    let provider = version_key_bytes(new.ulid);
+    let delete = StorageEffect::Delete {
+        key_space: BACKEND_VERSION_KEYSPACE.to_string(),
+        key: provider.into(),
+        txn_id: None,
+    };
+    context.storage_handle.send_storage_effect(delete).await;
+    let claim = claim_key(&new, "").unwrap();
+    put(
+        &context,
+        DELETE_CLAIM_KEYSPACE,
+        claim.to_vec(),
+        b"deleting".to_vec(),
+    )
+    .await;
+    let access = load(&context).await;
+    let page = preview_page(&context, (BUCKET, ""), &access, (None, None, 100))
+        .await
+        .unwrap();
+    let [entry] = page.entries.as_slice() else {
+        panic!("expected one key with copies, got {:?}", page.entries)
+    };
+    let unified = unify(&context, (BUCKET, group()), entry, None)
+        .await
+        .unwrap();
+    assert_eq!(unified, Unified::Changed);
+}

@@ -678,6 +678,8 @@ async fn s3_unifies_uploads() {
         routing,
     });
     let upload = drive(put, &context.driver).await.unwrap().version_id;
+    // The next run records the upload's ETag, which its delete must find again.
+    assert_eq!(run_import(&context, 0xD4).await, (0, 2, 0));
     let page = duplicates(&context).await;
     let [found] = page.entries.as_slice() else {
         panic!("expected one key with copies: {page:?}")
