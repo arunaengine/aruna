@@ -155,6 +155,8 @@ pub struct MigrateVersionOperation {
     plain_owned: bool,
     /// The backend's id of the bytes a plain write stored.
     backend_version: Option<String>,
+    /// A rename looked at its tagged path too before writing.
+    tag_checked: bool,
     /// The write intents stored for a write to a linked folder, at both paths it may reach.
     written_intent: Vec<Key>,
     /// The write that waits for its intent to be on disk.
@@ -192,6 +194,7 @@ impl MigrateVersionOperation {
             source_version: None,
             plain_owned: false,
             backend_version: None,
+            tag_checked: false,
             written_intent: Vec::new(),
             pending_write: None,
             backend_etag: None,
@@ -486,25 +489,34 @@ impl MigrateVersionOperation {
         let Some(plain) = self.plain.as_ref() else {
             return self.fail(MigrateVersionError::NotFinished);
         };
+        let attempt = self.attempt();
         // A rename never tags or replaces a taken name; it adopts only an earlier copy of its own.
-        if self.renaming && exists {
+        // A storage without conditional writes puts it at the tagged path, so that is checked too.
+        let fallback = tagged_path(&plain.path, attempt);
+        if self.renaming && (exists || !self.tag_checked) {
             let Some(old) = self.old.as_ref() else {
                 return self.fail(MigrateVersionError::NotFinished);
             };
+            let (backend, path) = (plain.backend.clone(), plain.path.clone());
+            let checked = std::mem::replace(&mut self.tag_checked, true);
+            if !exists {
+                self.state = MigrateState::StatPlain;
+                return smallvec![Effect::Blob(BlobEffect::StatPlain {
+                    backend,
+                    path: fallback,
+                })];
+            }
             let resolved = ResolvedBackend::new(old.backend.clone(), old.storage_class.clone());
             self.state = MigrateState::HashTarget;
             return smallvec![Effect::Blob(BlobEffect::HashExternal {
                 resolved,
-                path: plain.path.clone(),
+                path: match checked {
+                    true => fallback,
+                    false => path,
+                },
                 created_by: old.created_by,
             })];
         }
-        // A rename keeps one attempt id per old file, apart from the old file's own id, so a
-        // retry stores the same intents and names the same copy.
-        let attempt = match (self.renaming, self.old.as_ref()) {
-            (true, Some(old)) => Ulid::from(u128::from(old.ulid) ^ 1),
-            _ => Ulid::generate(),
-        };
         let versioned = plain.same_name && version.is_some() && self.plain_owned;
         let (path, if_not_exists) = same_name_path(&plain.path, attempt, exists, versioned);
         self.plain_path = Some(PlainPath {
@@ -531,6 +543,8 @@ impl MigrateVersionOperation {
         location.format.layout = StoredLayout::Plain(location.ulid);
         self.backend_version = version;
         self.new = Some(location);
+        // An earlier attempt left this copy and its intents; the publication retires them.
+        self.written_intent = self.intent_keys(self.attempt());
         self.state = MigrateState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -582,6 +596,30 @@ impl MigrateVersionOperation {
 
     /// A write to a linked folder stores its identity at the path and at its tagged path, and
     /// syncs it, before any byte moves; an import then registers the file as this version.
+    /// A rename keeps one attempt id per old file, apart from the old file's own id, so a
+    /// retry stores the same intents and names the same copy.
+    fn attempt(&self) -> Ulid {
+        match (self.renaming, self.old.as_ref()) {
+            (true, Some(old)) => Ulid::from(u128::from(old.ulid) ^ 1),
+            _ => self
+                .plain_path
+                .as_ref()
+                .map_or_else(Ulid::generate, |path| path.ulid),
+        }
+    }
+
+    /// The intent keys of a write of this version to the linked path and its tagged path.
+    fn intent_keys(&self, attempt: Ulid) -> Vec<Key> {
+        let Some(target) = self.plain.as_ref().filter(|target| target.listed) else {
+            return Vec::new();
+        };
+        let tagged = tagged_path(&target.path, attempt);
+        let id = self.version_key.version_id;
+        [target.path.as_str(), tagged.as_str()]
+            .map(|path| intent_key(target.import_id, path, id))
+            .into()
+    }
+
     fn intent_first(&mut self, write: Effects, created_by: aruna_core::UserId) -> Effects {
         let listed = self.plain.as_ref().filter(|target| target.listed);
         let (Some(target), Some(path)) = (listed, self.plain_path.as_ref()) else {
@@ -589,16 +627,15 @@ impl MigrateVersionOperation {
             return write;
         };
         let id = self.version_key.version_id;
-        let tagged = tagged_path(&target.path, path.ulid);
-        let keys: Vec<Key> = [target.path.as_str(), tagged.as_str()]
-            .map(|path| intent_key(target.import_id, path, id))
-            .into();
+        let keys = self.intent_keys(path.ulid);
+        // The source bytes are known, so the intent proves the copy even if no later record lands.
+        let source = self.old.as_ref().and_then(|old| old.get_blake3());
         let intent = WriteIntent {
             key: self.version_key.key.clone(),
             version_id: id,
             backend: target.backend.clone(),
             created_by,
-            written: None,
+            written: source.and_then(|hash| hash.try_into().ok()),
         };
         match intent_writes(&keys, &intent) {
             Ok(effect) => {
@@ -2278,6 +2315,10 @@ mod tests {
                 (writes[0].0.as_str(), *txn_id),
                 (IMPORT_INTENT_KEYSPACE, None)
             );
+            // The source bytes are known, so the intent proves the copy before it is written.
+            let intent = WriteIntent::from_bytes(&writes[0].2).unwrap();
+            let source = operation.old.as_ref().and_then(|old| old.get_blake3());
+            assert_eq!(intent.written.as_ref().map(|hash| &hash[..]), source);
             let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
                 entries: Vec::new(),
             }));
@@ -2538,6 +2579,7 @@ mod tests {
             let tagged = tagged_path(&plain.path, plain.ulid);
             let expected = [&plain.path, &tagged].map(|path| intent_key(IMPORT, path, id));
             assert_eq!(moved.written_intent, expected.to_vec());
+            assert_eq!(moved.intent_keys(plain.ulid), expected.to_vec());
             published(&mut moved, Some(rule()));
             moved.step(read_result(Some(version.to_bytes().unwrap())));
             moved.step(read_result(None));
@@ -2787,6 +2829,16 @@ mod tests {
         ) -> (Vec<(String, Key, Value)>, PlainPath, BackendLocation) {
             let (version, old) = prefixed();
             let mut operation = renaming(&version, &old, source);
+            let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+                exists: false,
+                version: None,
+            }));
+            // A storage without conditional writes may have put an earlier attempt there.
+            let [Effect::Blob(BlobEffect::StatPlain { path, .. })] = effects.as_slice() else {
+                panic!("expected the stat of the tagged name, got {effects:?}")
+            };
+            let attempt = Ulid::from(u128::from(old.ulid) ^ 1);
+            assert!(path.ends_with(&format!("~{attempt}")));
             operation.step(Event::Blob(BlobEvent::PlainStat {
                 exists: false,
                 version: None,
@@ -2878,6 +2930,10 @@ mod tests {
                         effects.as_slice(),
                         [Effect::Storage(StorageEffect::StartTransaction { .. })]
                     ));
+                    // The intents the earlier attempt stored go with the publication.
+                    let attempt = Ulid::from(u128::from(old.ulid) ^ 1);
+                    assert_eq!(operation.written_intent, operation.intent_keys(attempt));
+                    assert_eq!(operation.written_intent.len(), 2);
                     continue;
                 }
                 // Another file at the new name is never replaced or renamed around.
