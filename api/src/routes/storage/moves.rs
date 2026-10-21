@@ -144,7 +144,7 @@ pub async fn get_bucket_move(
     let group_id = bucket_group(&state, &bucket).await?;
     let path = bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), &bucket);
     crate::auth::ensure_permission(&state, &auth, path, Permission::READ).await?;
-    let counted = count_misplaced(&state.get_ctx(), &bucket, &query.prefix, false)
+    let counted = count_misplaced(&state.get_ctx(), &bucket, &query.prefix, None)
         .await
         .map_err(ServerError::InternalError)?;
     let status = drive(

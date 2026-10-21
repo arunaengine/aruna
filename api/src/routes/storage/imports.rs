@@ -12,10 +12,10 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::blob::migration::misplaced::count_misplaced;
 use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::groups::imports::change::{ChangeImportOperation, ImportChange};
 use aruna_operations::groups::imports::create::{CreateImportInput, CreateImportOperation};
+use aruna_operations::groups::imports::discovery::authorized_renames;
 use aruna_operations::groups::imports::remove::RemoveImportOperation;
 use aruna_operations::groups::imports::schedule::{next_due, start_run, wake_schedule};
 use aruna_operations::groups::imports::{ImportRuleError, last_run, list_imports, read_import};
@@ -163,6 +163,7 @@ fn map_error(error: ImportRuleError) -> ServerError {
         ImportRuleError::Conflict(message) => ServerError::Conflict(message),
         ImportRuleError::GroupWrite(error) => ServerError::Conflict(error.to_string()),
         ImportRuleError::NotFound => ServerError::NotFound,
+        ImportRuleError::Forbidden => ServerError::Forbidden,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -713,7 +714,9 @@ pub struct ImportRenamesResponse {
     summary = "List the files a rename would rename",
     description = r#"Lists the files of a backend import rule that an earlier write pattern named, with the name the current pattern gives them, and the progress of the last rename.
 
-**Authentication**: realm bearer token with WRITE on the group's admin path.
+**Authentication**: realm bearer token with WRITE on the group's admin path and on the rule's
+bucket, including request policies. Tokens with path restrictions are refused. Only files whose
+key the caller may read are counted and listed.
 
 **Behavior**
 - A file counts when its version reads it from the rule's folder and an earlier pattern of the
@@ -744,7 +747,7 @@ pub struct ImportRenamesResponse {
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -754,11 +757,12 @@ pub async fn get_renames(
     Extension(auth): Extension<Option<AuthContext>>,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<Json<ImportRenamesResponse>> {
-    let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
+    let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let rule = existing_rule(&state, group_id, &import_id).await?;
-    let counted = count_misplaced(&state.get_ctx(), &rule.bucket, &rule.key_prefix, true)
+    let caller = (&auth, state.get_node_id());
+    let counted = authorized_renames(&state.get_ctx(), caller, &rule, Permission::READ)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(map_error)?;
     let status = drive(
         MigrationStatusOperation::new(rule.bucket.clone()),
         &state.get_ctx(),
@@ -784,7 +788,9 @@ pub async fn get_renames(
     summary = "Give a rule's files the current name",
     description = r#"Starts this node's background rename of the files `GET` on this path lists, as a storage move of the rule's folder in the bucket.
 
-**Authentication**: realm bearer token with WRITE on the group's admin path.
+**Authentication**: realm bearer token with WRITE on the group's admin path, on the rule's
+bucket and on the key of every file to rename, including request policies. Tokens with path
+restrictions are refused.
 
 **Behavior**
 - Each file is copied to its new name, never over a file that is already there. Only when the
@@ -799,7 +805,9 @@ pub async fn get_renames(
 
 **Limits**
 - Only files on the rule's own folder storage are renamed. Encrypted buckets answer 409
-  `bucket_encrypted`, and a move with another prefix answers 409 `move_running`."#,
+  `bucket_encrypted`, and a move with another prefix answers 409 `move_running`.
+- The keys are checked with the limits of `GET` on this path; a folder beyond them answers 409
+  `rename_unchecked`."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
         ("import_id" = String, Path, description = "Rule whose files get their name, as a 26-character ULID")
@@ -823,9 +831,9 @@ pub async fn get_renames(
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the group admin path, the bucket or a key, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
-        (status = 409, description = "`bucket_encrypted` or `move_running`", body = ErrorResponse)
+        (status = 409, description = "`bucket_encrypted`, `move_running` or `rename_unchecked`", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -834,8 +842,22 @@ pub async fn start_renames(
     Extension(auth): Extension<Option<AuthContext>>,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<BucketMoveStarted>)> {
-    let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
+    let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let rule = existing_rule(&state, group_id, &import_id).await?;
+    let caller = (&auth, state.get_node_id());
+    let checked = authorized_renames(&state.get_ctx(), caller, &rule, Permission::WRITE)
+        .await
+        .map_err(map_error)?;
+    if checked.withheld > 0 {
+        return Err(ServerError::Forbidden);
+    }
+    if !checked.complete {
+        return Err(ServerError::Refused(
+            StatusCode::CONFLICT,
+            "rename_unchecked",
+            "the folder has more files than one request can check".to_string(),
+        ));
+    }
     let (bucket, prefix) = (rule.bucket, rule.key_prefix);
     let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms()).renaming();
     let record = drive(operation, &state.get_ctx())

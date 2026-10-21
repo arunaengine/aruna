@@ -11,6 +11,7 @@ use crate::tests::storage_routing::{TestState, setup_state};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
@@ -230,6 +231,23 @@ async fn starts_renames() {
             .await
             .unwrap();
     let rule = || Path((group.clone(), created.import_id.clone()));
+    // A token limited to some paths could reach files outside them.
+    let restricted = || {
+        let pattern = format!("/{}/g/{}/**", test.state.get_realm_id(), test.group_id);
+        let path = PathRestriction {
+            pattern,
+            permission: Permission::WRITE,
+        };
+        let auth = test.auth.clone();
+        Extension(Some(AuthContext {
+            path_restrictions: Some(vec![path]),
+            ..auth
+        }))
+    };
+    let listed = get_renames(State(test.state.clone()), restricted(), rule()).await;
+    assert!(matches!(listed, Err(ServerError::Forbidden)));
+    let started = start_renames(State(test.state.clone()), restricted(), rule()).await;
+    assert!(matches!(started, Err(ServerError::Forbidden)));
 
     let Json(found) = get_renames(State(test.state.clone()), auth(), rule())
         .await

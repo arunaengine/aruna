@@ -32,16 +32,18 @@ pub struct Misplaced {
     pub renamed: u64,
     /// The first of them, as the old and the new path.
     pub renames: Vec<(String, String)>,
+    /// Renames of keys the caller may not use; they are neither counted nor listed.
+    pub withheld: u64,
 }
 
 /// Counts what a move of `prefix` would move, with the move's own skips: an encrypted bucket
 /// moves nothing; linked-folder files, unfinished copies and recorded broken versions stay.
-/// With `renaming`, linked files of earlier patterns count as a rename would handle them.
+/// With `renaming`, linked files of earlier patterns whose key it allows count as renames.
 pub async fn count_misplaced(
     context: &DriverContext,
     bucket: &str,
     prefix: &str,
-    renaming: bool,
+    renaming: Option<&(dyn Fn(&str) -> bool + Sync)>,
 ) -> Result<Misplaced, String> {
     let mut misplaced = Misplaced {
         complete: true,
@@ -55,8 +57,8 @@ pub async fn count_misplaced(
     };
     // Only a move asked to rename gives linked files their current name.
     let earlier = match renaming {
-        true => read_earlier(context, &routing).await?,
-        false => super::Earlier::new(),
+        Some(_) => read_earlier(context, &routing).await?,
+        None => super::Earlier::new(),
     };
     let scan = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
     let (mut after, mut seen, mut scanned) = (None::<Key>, 0, 0);
@@ -104,6 +106,10 @@ pub async fn count_misplaced(
                 .as_ref()
                 .filter(|plain| renames(&routing, &earlier, plain, &location, &version_key));
             if let Some(plain) = renamed {
+                if !renaming.is_some_and(|allow| allow(&version_key.key)) {
+                    misplaced.withheld += 1;
+                    continue;
+                }
                 misplaced.renamed += 1;
                 if misplaced.renames.len() < RENAME_LIST {
                     let paths = (location.backend_path.clone(), plain.path.clone());

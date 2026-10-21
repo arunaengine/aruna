@@ -246,7 +246,7 @@ async fn moves_bucket_copies() {
         .location_key()
         .unwrap();
     route_cold(&context, "data/").await;
-    let counted = count_misplaced(&context.driver, BUCKET, "", false)
+    let counted = count_misplaced(&context.driver, BUCKET, "", None)
         .await
         .unwrap();
     assert_eq!((counted.count, counted.complete), (71, true));
@@ -276,7 +276,7 @@ async fn moves_bucket_copies() {
         let small = version(&context, key, *version_id).await;
         assert_eq!(content(&context, &small).await, key.as_bytes());
     }
-    let counted = count_misplaced(&context.driver, BUCKET, "", false)
+    let counted = count_misplaced(&context.driver, BUCKET, "", None)
         .await
         .unwrap();
     assert_eq!(counted.count, 0);
