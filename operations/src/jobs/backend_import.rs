@@ -495,6 +495,7 @@ async fn import_object(
         retired: Vec::new(),
         trail: keyed.map(|row| row.version_id),
         keep_row: false,
+        copy_index: copy_index(&ctx.driver, rule, row.as_ref(), &object.key).await?,
     };
     let put = put_version(
         ctx,
@@ -893,6 +894,7 @@ async fn recover(
                 retired,
                 trail: Some(version_id),
                 keep_row: alias.is_some(),
+                copy_index: None,
             };
             let size = location.blob_size;
             let file = (location, version);
@@ -950,6 +952,7 @@ async fn recover(
         guards: &guards,
         retired,
         writes: Vec::new(),
+        sharing: None,
     };
     note_listing(&ctx.driver, rule, row_key, stored, repaired, note).await?;
     Ok(Some(Outcome::Imported))
@@ -1206,11 +1209,17 @@ async fn register_twin(
     (key, resolved): (&str, ResolvedBackend),
 ) -> Result<Outcome, ItemError> {
     let rule = &run.rule;
+    // Only a file that may hold a version's bytes is read.
+    let candidates = candidates(&ctx.driver, rule, key, object).await?;
+    if candidates.is_empty() {
+        return Err(taken(key));
+    }
     let (mut location, version) = hash_object(ctx, spec, resolved, &object.key).await?;
     if location.blob_size != object.size {
         return Err(item("the object changed while it was read"));
     }
-    let Some((stored, value, version_id)) = same_content(ctx, rule, key, &location).await? else {
+    let same = (candidates.into_iter()).find(|(.., hash)| location.get_blake3() == Some(&hash[..]));
+    let Some((stored, value, version_id, _)) = same else {
         return Err(taken(key));
     };
     location.format.layout = StoredLayout::Plain(location.ulid);
@@ -1246,6 +1255,7 @@ async fn register_twin(
         guards: &guards,
         retired: Vec::new(),
         writes,
+        sharing: Some(sharing(run)),
     };
     let row_key = object_key(rule.import_id, &object.key);
     note_listing(&ctx.driver, rule, row_key, None, encode(&row)?, note).await?;
@@ -1255,18 +1265,39 @@ async fn register_twin(
 /// Version rows of one key one search for the same content reads at most.
 const TWIN_SCAN: usize = 1024;
 
-/// A version of `key` that reads a file of the rule's storage with the bytes of
-/// `location`: its key, stored row and id.
-async fn same_content(
-    ctx: &JobContext,
+/// The key index row of `path` when its row records a second copy, which a new version of
+/// the file retires.
+async fn copy_index(
+    context: &DriverContext,
+    rule: &BackendImport,
+    row: Option<&ImportedObject>,
+    path: &str,
+) -> Result<Option<Key>, ItemError> {
+    let Some(key) = row.and_then(|row| row.key.as_deref()) else {
+        return Ok(None);
+    };
+    let prefix = VersionKey::object_prefix(&rule.bucket, key)
+        .map_err(|error| ItemError::Item(error.to_string()))?;
+    let index: Key = [&rule.import_id.to_bytes()[..], &prefix[..], path.as_bytes()]
+        .concat()
+        .into();
+    let [value] = read_values(context, [(RENAMED_ROW_KEYSPACE, index.clone())]).await?;
+    Ok(value.filter(|value| !value.is_empty()).map(|_| index))
+}
+
+/// The versions of `key` whose bytes `object` may hold: read from a file of the rule's
+/// storage, of its size, and not refuted by its single-part ETag. Each comes with its key,
+/// stored row, id and content hash.
+async fn candidates(
+    context: &DriverContext,
     rule: &BackendImport,
     key: &str,
-    location: &BackendLocation,
-) -> Result<Option<(Key, Value, Ulid)>, ItemError> {
+    object: &ExternalObject,
+) -> Result<Vec<(Key, Value, Ulid, [u8; 32])>, ItemError> {
     let prefix = VersionKey::object_prefix(&rule.bucket, key)
         .map_err(|error| ItemError::Item(error.to_string()))?;
     let page = super::store::iter_prefix_page(
-        &ctx.driver.storage_handle,
+        &context.storage_handle,
         BLOB_VERSIONS_KEYSPACE,
         Some(prefix.into()),
         None,
@@ -1275,27 +1306,41 @@ async fn same_content(
     );
     let (rows, _) = page.await.map_err(ItemError::System)?;
     let backend = BackendRef::Group(rule.backend_id);
+    let mut found = Vec::new();
     for (stored, value) in rows {
         let version = BlobVersion::from_bytes(&value);
         let version = version.map_err(|error| ItemError::System(error.to_string()))?;
         let BlobVersionState::Materialized {
             blob_hash,
-            backend: found,
+            backend: on,
             encoding: EncodingClass::Plain { .. } | EncodingClass::Raw,
             ..
         } = &version.state
         else {
             continue;
         };
-        if *found != backend || location.get_blake3() != Some(&blob_hash[..]) {
+        let Some(location_key) = version.location_key().filter(|_| *on == backend) else {
+            continue;
+        };
+        let [location] = read_values(
+            context,
+            [(BLOB_LOCATIONS_KEYSPACE, location_key.to_bytes().into())],
+        )
+        .await?;
+        let Some(mut location) = parse(location, BackendLocation::from_bytes)? else {
+            continue;
+        };
+        let md5 = location.hashes.remove(HASH_MD5);
+        let refuted = etag_differs(object.etag.as_deref(), md5.as_deref());
+        if location.blob_size != object.size || refuted {
             continue;
         }
         let id = VersionKey::from_bytes(&stored)
             .map_err(|error| ItemError::System(error.to_string()))?
             .version_id;
-        return Ok(Some((stored, value, id)));
+        found.push((stored, value, id, *blob_hash));
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// An unmapped object whose key the bucket holds fails, even when the other write came first.
@@ -1455,6 +1500,8 @@ struct Fence {
     trail: Option<Ulid>,
     /// The reverse row stays as it was read; a later step rewrites it.
     keep_row: bool,
+    /// The key index row of a second copy the new version replaces, retired with it.
+    copy_index: Option<Key>,
 }
 
 /// The rows a version commits with: its reverse row, unless kept as read, and the backend
@@ -1498,7 +1545,15 @@ async fn put_version(
         let claim = aruna_core::structs::storage::backend_import::claim_key(&location, version)?;
         guards.push((DELETE_CLAIM_KEYSPACE.to_string(), claim, None));
     }
-    let rows = import_rows(&run.rule, &location, version, &row, fence.keep_row)?;
+    let mut rows = import_rows(&run.rule, &location, version, &row, fence.keep_row)?;
+    // The file is the new version's own now: its index row names no second copy any more.
+    if let Some(index) = fence.copy_index {
+        rows.push((
+            RENAMED_ROW_KEYSPACE.to_string(),
+            index,
+            Value::from(Vec::new()),
+        ));
+    }
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: spec.auth_context.user_id,
         group_id: run.rule.group_id,
@@ -1645,6 +1700,8 @@ struct Note<'a> {
     retired: Vec<Key>,
     /// Rows the committed row comes with.
     writes: Vec<(String, Key, Value)>,
+    /// The rules that must share the folder at commit, read again in the transaction.
+    sharing: Option<std::collections::BTreeSet<Ulid>>,
 }
 
 /// Replaces the row only while the rule exists and the row still holds `seen` (`None`: no row),
@@ -1689,7 +1746,17 @@ async fn note_listing(
         }
         _ => false,
     };
-    if !held {
+    let shared = match &note.sharing {
+        Some(expected) if held => match sharing_now(context, rule, txn_id).await {
+            Ok(found) => found == *expected,
+            Err(error) => {
+                storage.send_storage_effect(abort).await;
+                return Err(error);
+            }
+        },
+        _ => true,
+    };
+    if !held || !shared {
         storage.send_storage_effect(abort).await;
         return Ok(());
     }
@@ -1733,6 +1800,38 @@ async fn note_listing(
             error: StorageError::TransactionConflict,
         }) => Ok(()),
         other => Err(unexpected(other)),
+    }
+}
+
+/// The rules that share the folder of `rule` as `txn_id` reads them.
+async fn sharing_now(
+    context: &DriverContext,
+    rule: &BackendImport,
+    txn_id: Ulid,
+) -> Result<std::collections::BTreeSet<Ulid>, ItemError> {
+    let mut found = std::collections::BTreeSet::new();
+    let mut after = None;
+    loop {
+        let page = super::store::iter_prefix_page(
+            &context.storage_handle,
+            BACKEND_IMPORT_KEYSPACE,
+            Some(rule.group_id.to_bytes().to_vec().into()),
+            after.take(),
+            128,
+            Some(txn_id),
+        );
+        let (rows, next) = page.await.map_err(ItemError::System)?;
+        for (_, value) in rows {
+            let other = BackendImport::from_bytes(&value);
+            let other = other.map_err(|error| ItemError::System(error.to_string()))?;
+            if crate::groups::imports::shared::shares_folder(rule, &other) {
+                found.insert(other.import_id);
+            }
+        }
+        match next {
+            Some(next) => after = Some(next),
+            None => return Ok(found),
+        }
     }
 }
 
@@ -2064,6 +2163,7 @@ mod tests {
             guards: &guards,
             retired,
             writes: Vec::new(),
+            sharing: None,
         };
         let held = note_listing(
             &context,
@@ -2410,6 +2510,106 @@ mod tests {
 
     /// The hash every test claim recorded for its written bytes.
     const HASH: [u8; 32] = [7; 32];
+
+    #[tokio::test]
+    async fn finds_copy_candidates() {
+        // Only versions a file of this size and ETag could hold are hashed against: on the
+        // rule's storage, of a linked encoding, of the size and not refuted by the ETag.
+        let (_directory, storage) = crate::tests::s3::test_storage();
+        let context = crate::tests::s3::test_context(storage);
+        let rule = recovery_rule(aruna_core::structs::storage::backend_import::DEFAULT_PATTERN);
+        let ours = BackendRef::Group(rule.backend_id);
+        let other = BackendRef::Group(Ulid::from_parts(6, 6));
+        let raw = EncodingClass::Raw;
+        let plain = |at: u64| EncodingClass::Plain {
+            location: Ulid::from_parts(at, 1),
+        };
+        let md5 = |byte: u8| Some(vec![byte; 16]);
+        let seeds = [
+            (1, ours.clone(), raw, 4, None),
+            (2, other, plain(2), 4, None),
+            (3, ours.clone(), raw, 9, None),
+            (4, ours.clone(), plain(4), 4, md5(0)),
+            (5, ours, plain(5), 4, md5(1)),
+        ];
+        for (at, backend, encoding, size, md5) in seeds {
+            let id = Ulid::from_parts(at, 9);
+            let hash = [at as u8; 32];
+            let version = BlobVersion::materialized(
+                hash,
+                backend.clone(),
+                encoding,
+                std::time::SystemTime::UNIX_EPOCH,
+                Default::default(),
+                None,
+            );
+            let location_key = version.location_key().unwrap();
+            let mut hashes = std::collections::HashMap::from([(
+                aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+                hash.to_vec(),
+            )]);
+            if let Some(md5) = md5 {
+                hashes.insert(HASH_MD5.to_string(), md5);
+            }
+            let location = BackendLocation {
+                backend,
+                storage_class: None,
+                root: String::new(),
+                storage_bucket: String::new(),
+                backend_path: format!("raw/{at}"),
+                ulid: Ulid::from_parts(at, 1),
+                format: Default::default(),
+                created_by: Default::default(),
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+                staging: false,
+                partial: false,
+                blob_size: size,
+                hashes,
+            };
+            let version_key = VersionKey::new("bucket", "in/a", id).to_bytes().unwrap();
+            let rows = [
+                (
+                    BLOB_VERSIONS_KEYSPACE,
+                    version_key,
+                    version.to_bytes().unwrap(),
+                ),
+                (
+                    BLOB_LOCATIONS_KEYSPACE,
+                    location_key.to_bytes(),
+                    location.to_bytes().unwrap(),
+                ),
+            ];
+            for (space, key, value) in rows {
+                assert!(
+                    write_value(&context, space, key.into(), value)
+                        .await
+                        .is_ok()
+                );
+            }
+        }
+        let object = ExternalObject {
+            key: "raw/a".to_string(),
+            size: 4,
+            etag: Some(hex::encode([0u8; 16])),
+            modified_ms: None,
+        };
+        let found = candidates(&context, &rule, "in/a", &object)
+            .await
+            .ok()
+            .unwrap();
+        let ids: Vec<_> = found
+            .iter()
+            .map(|(_, _, id, _)| id.timestamp_ms())
+            .collect();
+        assert_eq!(ids, [1, 4]);
+        // Without one, a run refuses the file at once and never reads it.
+        let object = ExternalObject { size: 5, ..object };
+        let found = candidates(&context, &rule, "in/a", &object)
+            .await
+            .ok()
+            .unwrap();
+        assert!(found.is_empty());
+    }
 
     fn claim(rule: &BackendImport, key: &str, committed: bool) -> Claim {
         let intent = WriteIntent {
