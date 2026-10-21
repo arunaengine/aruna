@@ -4096,13 +4096,34 @@ mod external;
 #[tokio::test]
 #[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
 async fn s3_copies_plain() {
-    // A rename copy keeps the bytes and hashes, and a "null" version is never an exact copy.
-    use aruna_core::keyspaces::BACKEND_VERSION_KEYSPACE;
+    // A rename copy inside the provider keeps the bytes and hashes and leaves no recorded
+    // upload; a "null" version is never an exact copy and goes through the node instead.
+    use aruna_core::keyspaces::{BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE};
     use aruna_core::structs::storage::backend_import::{PlainPath, version_key};
+    use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
     let env = s3_env();
     let context = setup_s3_mixed(&env).await;
     let bucket = unique_name("copy-");
     make_bucket(&bucket, &s3_config(&env, None)).await.unwrap();
+    let client = crate::s3::create_s3_client(
+        &env.endpoint,
+        Some(env.region.clone()),
+        &env.access_key,
+        &env.secret_key,
+        true,
+    )
+    .await
+    .unwrap();
+    let versioning = VersioningConfiguration::builder()
+        .status(BucketVersioningStatus::Enabled)
+        .build();
+    client
+        .put_bucket_versioning()
+        .bucket(&bucket)
+        .versioning_configuration(versioning)
+        .send()
+        .await
+        .unwrap();
     let backend_id = Ulid::generate();
     let entry = NodeBackend::new(
         BackendConfig {
@@ -4131,33 +4152,53 @@ async fn s3_copies_plain() {
         if_not_exists: true,
         exact: true,
     };
-    let source = plain("raw/7_a.bin");
     let blob = stream_from_bytes(b"renamed bytes");
-    let BlobEvent::PlainWritten { location, .. } = handler
-        .write_plain(resolved.clone(), source, test_user_id(), blob)
+    let BlobEvent::PlainWritten {
+        location, version, ..
+    } = handler
+        .write_plain(resolved.clone(), plain("raw/7_a.bin"), test_user_id(), blob)
         .await
     else {
         panic!("source write failed")
     };
-    let mark = aruna_core::effects::StorageEffect::Write {
-        key_space: BACKEND_VERSION_KEYSPACE.to_string(),
-        key: version_key(location.ulid),
-        value: b"null".to_vec().into(),
-        txn_id: None,
-    };
-    handler.storage.send_storage_effect(mark).await;
-    let event = handler
-        .copy_plain(resolved, plain("raw/a.bin~7"), location.clone())
-        .await;
-    let BlobEvent::PlainWritten {
-        location: copy,
-        version,
-        ..
-    } = event
-    else {
-        panic!("copy failed: {event:?}")
-    };
-    assert_ne!(version.as_deref(), Some("null"));
-    assert_eq!(copy.get_blake3(), location.get_blake3());
-    assert_eq!(read_back(&handler, copy).await, b"renamed bytes");
+    for (recorded, target) in [
+        (version.clone().unwrap_or_default(), "raw/a.bin~7"),
+        ("null".to_string(), "raw/a.bin~8"),
+    ] {
+        let mark = aruna_core::effects::StorageEffect::Write {
+            key_space: BACKEND_VERSION_KEYSPACE.to_string(),
+            key: version_key(location.ulid),
+            value: recorded.into_bytes().into(),
+            txn_id: None,
+        };
+        handler.storage.send_storage_effect(mark).await;
+        let target = plain(target);
+        let event = handler
+            .copy_plain(resolved.clone(), target.clone(), location.clone())
+            .await;
+        let BlobEvent::PlainWritten {
+            location: copy,
+            version,
+            ..
+        } = event
+        else {
+            panic!("copy failed: {event:?}")
+        };
+        assert_ne!(version.as_deref(), Some("null"));
+        assert_eq!(copy.get_blake3(), location.get_blake3());
+        assert_eq!(read_back(&handler, copy).await, b"renamed bytes");
+        let read = aruna_core::effects::StorageEffect::Read {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: target.ulid.to_bytes().to_vec().into(),
+            txn_id: None,
+        };
+        let left = handler.storage.send_storage_effect(read).await;
+        assert!(matches!(
+            left,
+            aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::ReadResult {
+                value: None,
+                ..
+            })
+        ));
+    }
 }
