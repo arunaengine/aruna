@@ -479,6 +479,35 @@ async fn records_copy_uploads() {
 }
 
 #[tokio::test]
+async fn keeps_unsettled_uploads() {
+    // A copy upload that cannot be aborted keeps its record for a later try.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let attempt = ulid::Ulid::generate();
+    let resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
+    let plain = aruna_core::structs::storage::backend_import::PlainPath {
+        path: "raw/a.txt".to_string(),
+        ulid: attempt,
+        if_not_exists: true,
+        exact: true,
+    };
+    let blob = super::stream_from_bytes(b"x");
+    let written = handler.write_plain(resolved, plain, test_user_id(), blob);
+    let BlobEvent::WriteFinished { location } = written.await else {
+        panic!("plain write failed")
+    };
+    let upload = Some((&location, "upload-1"));
+    handler.record_upload(attempt, upload).await.unwrap();
+    // The filesystem opens no provider uploads, so it has none to abort.
+    for given in [None, Some((location.clone(), "upload-1".to_string()))] {
+        let event = handler.settle_copy(attempt, given).await;
+        assert!(matches!(event, BlobEvent::Error(_)), "{event:?}");
+        let kept = handler.copy_upload(attempt).await.unwrap();
+        assert_eq!(kept, Some((location.clone(), "upload-1".to_string())));
+    }
+}
+
+#[tokio::test]
 async fn checks_stored_copies() {
     // A copy's stat answers whether its bytes are still there.
     let context = setup_two_backends().await;
