@@ -372,7 +372,7 @@ async fn deletes_renamed_files() {
     };
     // A storage without versions cannot delete only the renamed bytes, so the file stays.
     let deleted = handler
-        .delete_plain(location.clone(), "v1".to_string())
+        .delete_plain(location.clone(), "v1".to_string(), None)
         .await;
     assert_eq!(deleted, BlobEvent::Error(BlobError::CleanupUnsupported));
     assert!(root.join("raw/old.txt").exists());
@@ -382,7 +382,7 @@ async fn deletes_renamed_files() {
         ..location
     };
     assert!(matches!(
-        handler.delete_plain(own, "v1".to_string()).await,
+        handler.delete_plain(own, "v1".to_string(), None).await,
         BlobEvent::Error(BlobError::DeleteError(_))
     ));
 }
@@ -547,12 +547,12 @@ async fn deletes_exact_versions() {
         panic!("hash failed")
     };
     let unsupported = handler
-        .delete_plain(location.clone(), "v1".to_string())
+        .delete_plain(location.clone(), "v1".to_string(), None)
         .await;
     assert_eq!(unsupported, BlobEvent::Error(BlobError::CleanupUnsupported));
     // An unversioned "null" never names the bytes to delete.
     let unversioned = handler
-        .delete_plain(location.clone(), "null".to_string())
+        .delete_plain(location.clone(), "null".to_string(), None)
         .await;
     assert!(matches!(
         unversioned,
@@ -560,7 +560,7 @@ async fn deletes_exact_versions() {
     ));
     assert!(root.join("raw/a.txt").exists());
     location.storage_bucket = "managed".to_string();
-    let refused = handler.delete_plain(location, "v1".to_string()).await;
+    let refused = handler.delete_plain(location, "v1".to_string(), None).await;
     assert!(matches!(
         refused,
         BlobEvent::Error(BlobError::DeleteError(_))
@@ -569,26 +569,26 @@ async fn deletes_exact_versions() {
 
 #[tokio::test]
 async fn deletes_unversioned_files() {
-    // Without a version only a file of the recorded size is deleted.
+    // Without a version a file is only deleted while its size and recorded ETag still match;
+    // without a recorded ETag, or with another one, it stays.
     let context = setup_two_backends().await;
     let handler = context.blob_handle.handler.clone();
     let root = context._temp_dir.path().join("hot");
     place(&root, "raw/a.txt", b"bytes");
     let resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
-    let BlobEvent::ExternalHashed { mut location, .. } = handler
+    let BlobEvent::ExternalHashed { location, .. } = handler
         .hash_external(resolved, "raw/a.txt".to_string(), test_user_id())
         .await
     else {
         panic!("hash failed")
     };
-    location.blob_size += 1;
-    let refused = handler.delete_plain(location.clone(), String::new()).await;
-    assert_eq!(refused, BlobEvent::Error(BlobError::CleanupUnsupported));
-    assert!(root.join("raw/a.txt").exists());
-    location.blob_size -= 1;
-    let deleted = handler.delete_plain(location, String::new()).await;
-    assert_eq!(deleted, BlobEvent::DeleteFinished);
-    assert!(!root.join("raw/a.txt").exists());
+    for etag in [None, Some("\"other\"".to_string())] {
+        let refused = handler
+            .delete_plain(location.clone(), String::new(), etag)
+            .await;
+        assert_eq!(refused, BlobEvent::Error(BlobError::CleanupUnsupported));
+        assert!(root.join("raw/a.txt").exists());
+    }
 }
 
 #[tokio::test]

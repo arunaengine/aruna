@@ -954,9 +954,11 @@ impl BlobHandler {
             BlobEffect::StatPlain { backend, path } => {
                 Box::pin(self.stat_plain(backend, path)).await
             }
-            BlobEffect::DeletePlain { location, version } => {
-                Box::pin(self.delete_plain(location, version)).await
-            }
+            BlobEffect::DeletePlain {
+                location,
+                version,
+                etag,
+            } => Box::pin(self.delete_plain(location, version, etag)).await,
             BlobEffect::EnsureBucket { backend, bucket } => {
                 Box::pin(self.ensure_bucket(&backend, &bucket)).await
             }

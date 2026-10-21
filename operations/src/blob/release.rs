@@ -93,12 +93,21 @@ async fn finish_delete(
         return false;
     }
     let key = object_key(import_id, &location.backend_path);
+    let etag = match recorded_etag(context, &key, version_id, &version).await {
+        Ok(etag) => etag,
+        Err(_) => return false,
+    };
     let effect = BlobEffect::DeletePlain {
         location: location.clone(),
         version: version.clone(),
+        etag,
     };
     match blob_handle.send_blob_effect(effect).await {
         Event::Blob(BlobEvent::DeleteFinished) => {}
+        // Other bytes at an unversioned path prove that no earlier send deleted them.
+        Event::Blob(BlobEvent::Error(BlobError::CleanupUnsupported)) if version.is_empty() => {
+            return claimed(context, claim, None).await;
+        }
         event => {
             warn!(?event, "A sent delete could not be finished");
             return false;
@@ -115,10 +124,30 @@ async fn finish_delete(
     let named = matches!(row, Some(Ok(row)) if row.version_id == version_id);
     // Another location of the path at another backend version keeps the path's row.
     let shared = !matches!(pinned(context, &location, &version).await, Ok(Some(false)));
-    match (observed, named && !shared) {
+    let dropped = match (observed, named && !shared) {
         (Some(observed), true) => drop_row(context, key, observed).await,
         _ => true,
+    };
+    dropped && (!version.is_empty() || claimed(context, claim, None).await)
+}
+
+/// The ETag the import recorded for the file of `version_id` at the row `key`, which an
+/// unversioned delete must find again.
+async fn recorded_etag(
+    context: &DriverContext,
+    key: &Key,
+    version_id: Ulid,
+    version: &str,
+) -> Result<Option<String>, String> {
+    if !version.is_empty() {
+        return Ok(None);
     }
+    let row = read_value(context, IMPORTED_OBJECT_KEYSPACE, key.clone()).await?;
+    let row = row.as_deref().map(ImportedObject::from_bytes).transpose();
+    let row = row.map_err(|error| error.to_string())?;
+    Ok(row
+        .filter(|row| row.version_id == version_id)
+        .and_then(|row| row.etag))
 }
 
 /// How a release ended.
@@ -186,15 +215,15 @@ async fn release_claimed(
         .as_deref()
         .map(ImportedObject::from_bytes)
         .transpose();
-    match row {
+    let observed_etag = match row {
         // Another write took the path, so the file there is not the renamed one.
         Ok(Some(row)) if row.version_id != version_id => return Released::Kept,
-        Ok(_) => {}
+        Ok(row) => row.and_then(|row| row.etag),
         Err(error) => {
             warn!(%error, "Renamed file row could not be decoded");
             return Released::Retry;
         }
-    }
+    };
     match referenced(context, &location, (import_id, &version)).await {
         Ok(true) => return Released::Kept,
         Ok(false) => {}
@@ -225,7 +254,16 @@ async fn release_claimed(
     if !claimed(context, claim, Some(DELETING)).await || !synced(context).await {
         return Released::Retry;
     }
-    let effect = BlobEffect::DeletePlain { location, version };
+    let etag = match version.is_empty() {
+        true => observed_etag,
+        false => None,
+    };
+    let unversioned = version.is_empty();
+    let effect = BlobEffect::DeletePlain {
+        location,
+        version,
+        etag,
+    };
     match blob_handle.send_blob_effect(effect).await {
         // The tombstone is on disk before anything else may fail.
         Event::Blob(BlobEvent::DeleteFinished) => {
@@ -244,7 +282,10 @@ async fn release_claimed(
         Some(observed) if !shared => drop_row(context, key, observed).await,
         _ => true,
     };
-    match dropped {
+    // An unversioned path has no exact version to tombstone: once its row is gone, a later
+    // file there is new and may be registered again.
+    let cleared = !unversioned || claimed(context, claim, None).await;
+    match dropped && cleared {
         true => Released::Deleted,
         false => Released::Retry,
     }

@@ -377,12 +377,13 @@ pub enum BlobEffect {
         backend: BackendRef,
         path: String,
     },
-    /// Deletes exactly backend `version` of the file at `location`, a path in the tenant's
-    /// folders that a rename replaced. Answers `DeleteFinished`, also for a missing file, and
-    /// `CleanupUnsupported` where the storage cannot delete one version.
+    /// Deletes exactly backend `version` of a replaced tenant file at `location`; an empty one
+    /// deletes it only while its size and full ETag equal `location` and `etag`. Answers
+    /// `DeleteFinished`, also for a missing file, else `CleanupUnsupported` and keeps it.
     DeletePlain {
         location: BackendLocation,
         version: String,
+        etag: Option<String>,
     },
     /// Finds or creates `bucket` on a group storage without a bucket and proves that Aruna
     /// may write and delete there; answers `BucketReady`.

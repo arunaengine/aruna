@@ -635,18 +635,18 @@ impl Stage<'_> {
             }
             _ => return Ok(Unified::Changed),
         }
-        // A kept file whose backend version a release is deleting takes no new reader.
+        // A kept file a release is deleting, at its backend version or without one, takes no
+        // new reader.
         let read = vec![(
             BACKEND_VERSION_KEYSPACE.to_string(),
             version_key(found.keep.ulid),
         )];
-        if let Some(provider) = self.batch(read).await?.pop().flatten() {
-            let provider = String::from_utf8_lossy(&provider).into_owned();
-            let claim = claim_key(&found.keep, &provider).map_err(error)?;
-            let read = vec![(DELETE_CLAIM_KEYSPACE.to_string(), claim)];
-            if self.batch(read).await?.pop().flatten().is_some() {
-                return Ok(Unified::Changed);
-            }
+        let provider = self.batch(read).await?.pop().flatten();
+        let provider = provider.map(|provider| String::from_utf8_lossy(&provider).into_owned());
+        let claim = claim_key(&found.keep, &provider.unwrap_or_default()).map_err(error)?;
+        let read = vec![(DELETE_CLAIM_KEYSPACE.to_string(), claim)];
+        if self.batch(read).await?.pop().flatten().is_some() {
+            return Ok(Unified::Changed);
         }
         // Which copy each version reads now; any change refuses the whole key.
         let mut readers: HashMap<Ulid, Vec<(Ulid, BlobVersion)>> = HashMap::new();

@@ -575,6 +575,7 @@ impl BlobHandler {
         &self,
         location: BackendLocation,
         version: String,
+        etag: Option<String>,
     ) -> BlobEvent {
         if !location.storage_bucket.is_empty() {
             return BlobEvent::Error(BlobError::DeleteError("not a plain path".to_string()));
@@ -592,7 +593,7 @@ impl BlobHandler {
             Err(error) => return BlobEvent::Error(error),
         };
         if version.is_empty() {
-            return self.delete_unversioned(&operator, &path, &location).await;
+            return (self.delete_unversioned(&operator, &path, &location, etag)).await;
         }
         if !operator.info().capability().delete_with_version {
             return BlobEvent::Error(BlobError::CleanupUnsupported);
@@ -606,13 +607,18 @@ impl BlobHandler {
         }
     }
 
-    /// Deletes the file at `path` unless its size or single-part ETag shows other bytes.
+    /// Deletes the file at `path` only while its size and full ETag equal the recorded ones;
+    /// without a recorded ETag the file stays.
     async fn delete_unversioned(
         &self,
         operator: &Operator,
         path: &str,
         location: &BackendLocation,
+        etag: Option<String>,
     ) -> BlobEvent {
+        let Some(recorded) = etag else {
+            return BlobEvent::Error(BlobError::CleanupUnsupported);
+        };
         let metadata = match timeout(self.io_timeout(), operator.stat(path)).await {
             Ok(Ok(metadata)) => metadata,
             Ok(Err(error)) if error.kind() == ErrorKind::NotFound => {
@@ -621,16 +627,9 @@ impl BlobHandler {
             Ok(Err(error)) => return BlobEvent::Error(BlobError::DeleteError(error.to_string())),
             Err(_) => return BlobEvent::Error(BlobError::DeleteError("timed out reading".into())),
         };
-        let etag = metadata
-            .etag()
-            .map(|etag| etag.trim_matches('"').to_ascii_lowercase());
-        let md5 = location.hashes.get(aruna_core::structs::checksum::HASH_MD5);
-        let md5 = md5.map(hex::encode);
-        let single = etag
-            .as_ref()
-            .filter(|etag| etag.len() == 32 && !etag.contains('-'));
-        let differs = single.zip(md5).is_some_and(|(etag, md5)| *etag != md5);
-        if metadata.content_length() != location.blob_size || differs {
+        let unquoted = |etag: &str| etag.trim_matches('"').to_string();
+        let same = metadata.etag().map(unquoted) == Some(unquoted(&recorded));
+        if metadata.content_length() != location.blob_size || !same {
             return BlobEvent::Error(BlobError::CleanupUnsupported);
         }
         match timeout(self.io_timeout(), operator.delete(path)).await {

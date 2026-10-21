@@ -1237,6 +1237,11 @@ async fn register_twin(
     let mut guards = shared_guards(run, &object.key);
     guards.push(rule_guard(rule)?);
     guards.push((BLOB_VERSIONS_KEYSPACE.to_string(), stored, Some(value)));
+    // A file a release is deleting is no copy to keep.
+    let deleting = version.as_deref().unwrap_or_default();
+    let claim = aruna_core::structs::storage::backend_import::claim_key(&location, deleting)
+        .map_err(|error| ItemError::System(error.to_string()))?;
+    guards.push((DELETE_CLAIM_KEYSPACE.to_string(), claim, None));
     // The copy is found by its key like a renamed row, and keeps its file and version there.
     let prefix = VersionKey::object_prefix(&rule.bucket, key)
         .map_err(|error| ItemError::Item(error.to_string()))?;
@@ -1615,11 +1620,11 @@ async fn put_version(
     fence: Fence,
 ) -> Result<(), PutObjectError> {
     let mut guards = fence.guards;
-    // A backend version a release is deleting is not registered again.
-    if let Some(version) = version.as_deref() {
-        let claim = aruna_core::structs::storage::backend_import::claim_key(&location, version)?;
-        guards.push((DELETE_CLAIM_KEYSPACE.to_string(), claim, None));
-    }
+    // A file a release is deleting, at its backend version or without one, is not registered
+    // again.
+    let deleting = version.as_deref().unwrap_or_default();
+    let claim = aruna_core::structs::storage::backend_import::claim_key(&location, deleting)?;
+    guards.push((DELETE_CLAIM_KEYSPACE.to_string(), claim, None));
     let mut rows = import_rows(&run.rule, &location, version, &row, fence.keep_row)?;
     // The file is the new version's own now: its index row names no second copy any more.
     if let Some(index) = fence.copy_index {
