@@ -258,11 +258,15 @@ pub(crate) fn move_refusal(error: StartMoveError) -> ServerError {
             "move_running",
             format!("a move of the keys under `{prefix}` is still running; retry when it finishes"),
         ),
-        StartMoveError::RuleChanged => ServerError::Refused(
-            StatusCode::CONFLICT,
-            "rule_changed",
-            "the import rule changed since its files were checked; try again".to_string(),
-        ),
+        StartMoveError::RuleChanged
+        | StartMoveError::Storage(aruna_core::errors::StorageError::TransactionConflict) => {
+            ServerError::Refused(
+                StatusCode::CONFLICT,
+                "rule_changed",
+                "the bucket or its import rule changed while the move started; try again"
+                    .to_string(),
+            )
+        }
         StartMoveError::Encrypted => ServerError::Refused(
             StatusCode::CONFLICT,
             "bucket_encrypted",
@@ -275,6 +279,19 @@ pub(crate) fn move_refusal(error: StartMoveError) -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_rule_conflicts() {
+        // A pattern change while a rename starts is a conflict to retry, not a server error.
+        let conflict =
+            StartMoveError::Storage(aruna_core::errors::StorageError::TransactionConflict);
+        for error in [StartMoveError::RuleChanged, conflict] {
+            assert!(matches!(
+                move_refusal(error),
+                ServerError::Refused(StatusCode::CONFLICT, "rule_changed", _)
+            ));
+        }
+    }
 
     #[test]
     fn encrypted_bucket_conflicts() {
