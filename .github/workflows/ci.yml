@@ -225,7 +225,8 @@ jobs:
           | test(=blob::tests::framed::s3_completion_budget)
           | test(=blob::tests::framed::s3_bucketless_framed))
           | (package(aruna-operations) & binary(multipart)
-          & (test(=s3_provider_flow) | test(=s3_framed_completion)))'
+          & (test(=s3_provider_flow) | test(=s3_framed_completion)))
+          | (package(aruna-operations) & binary(linked_import))'
 
   docker-backend:
     runs-on: ubuntu-latest
