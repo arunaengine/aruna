@@ -2,8 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::blob::reclaim::{ReclaimBlobOperation, ReclaimVerdict};
 use crate::blob::records::{iter_index_effect, owners_scan_effect};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::groups::backends::parse_read;
 use crate::jobs::store::iter_prefix_page;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
@@ -17,6 +18,7 @@ use aruna_core::structs::storage::backend_import::{BackendImport, ImportedObject
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, HashIndex, VersionKey,
 };
+use aruna_core::structs::storage::cleanup::ReclaimCandidateKey;
 use aruna_core::types::Key;
 use tracing::warn;
 use ulid::Ulid;
@@ -69,6 +71,10 @@ pub(crate) async fn release_renamed(
             warn!(%error, "Locations of a renamed file could not be read");
             return false;
         }
+    }
+    // The rename's own old location goes first, whatever the storage's cleanup strategy.
+    if !retire_source(context, &location).await {
+        return false;
     }
     let Some(blob_handle) = context.blob_handle.as_ref() else {
         return false;
@@ -141,8 +147,27 @@ async fn referenced(
     other_rows(context, location, import_id).await
 }
 
-/// Whether any location row of these bytes on the same storage reads the same file. Reclaim
-/// drops such rows without touching the file, so the release waits for them.
+/// Drops the old location row of the rename in a reclaim transaction that proves no version
+/// reads it, and debits its bytes; `false` while something still reads it.
+async fn retire_source(context: &DriverContext, location: &BackendLocation) -> bool {
+    let Ok(key) = location.location_key() else {
+        return false;
+    };
+    let candidate = ReclaimCandidateKey::new(key.backend, key.encoding, key.blake3_hash);
+    let now = std::time::SystemTime::now();
+    let operation = ReclaimBlobOperation::new(candidate, now, now).forced();
+    match drive(operation, context).await {
+        Ok(ReclaimVerdict::Freed { .. } | ReclaimVerdict::Dropped) => true,
+        Ok(ReclaimVerdict::Pinned | ReclaimVerdict::NotDue) => false,
+        Err(error) => {
+            warn!(%error, "Old location of a renamed file could not be retired");
+            false
+        }
+    }
+}
+
+/// Whether any other location row of these bytes on the same storage reads the same file.
+/// Reclaim drops such rows without touching the file, so the release waits for them.
 async fn pinned(context: &DriverContext, location: &BackendLocation) -> Result<bool, String> {
     let wanted = location.location_key().map_err(|error| error.to_string())?;
     let mut start = None;
@@ -161,9 +186,10 @@ async fn pinned(context: &DriverContext, location: &BackendLocation) -> Result<b
             }) => (values, next_start_after),
             other => return Err(format!("could not read locations: {other:?}")),
         };
-        for (_, value) in rows {
+        for (key, value) in rows {
             let row = BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
-            if row.backend == location.backend && same_path(&row, location) {
+            let own = key.as_ref() == wanted.to_bytes().as_slice();
+            if !own && row.backend == location.backend && same_path(&row, location) {
                 return Ok(true);
             }
         }
@@ -518,6 +544,16 @@ mod tests {
     async fn waits_for_locations() {
         // A stored location of the file, referenced or not, keeps the release waiting.
         let (_dir, context) = setup();
+        assert!(!pinned(&context, &old()).await.unwrap());
+        // The rename's own old location is retired by the release, so it does not pin.
+        let own = old().location_key().unwrap().to_bytes().into();
+        put(
+            &context,
+            BLOB_LOCATIONS_KEYSPACE,
+            own,
+            old().to_bytes().unwrap(),
+        )
+        .await;
         assert!(!pinned(&context, &old()).await.unwrap());
         let mut raw = old();
         raw.format = StoredFormat::default();
