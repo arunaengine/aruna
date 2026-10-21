@@ -9,7 +9,7 @@ use crate::blob::migration::move_routing;
 use crate::driver::DriverContext;
 use crate::jobs::store::iter_prefix_page;
 use crate::s3::bucket::linked::JobStep;
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE,
@@ -18,7 +18,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, claim_key, object_key, version_key,
+    BackendImport, ImportedObject, PathIdentity, claim_key, object_key, version_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobVersion, BlobVersionState, ManagedCopyKey,
@@ -237,17 +237,29 @@ async fn duplicates(
         if files.len() < 2 {
             continue;
         }
-        // The file the current name pattern gives one of its versions is kept, else the newest.
-        let named = |(file, readers): &(BackendLocation, Vec<(Ulid, Vec<u8>)>)| {
+        // A plain name is kept, one a version read before a second copy first; a file whose
+        // name carries the id of a version reading it goes. Without a plain name the newest stays.
+        let rules = routing.map_or(&[][..], |routing| routing.imports.as_slice());
+        let plain = |(file, readers): &(BackendLocation, Vec<(Ulid, Vec<u8>)>)| {
+            !readers
+                .iter()
+                .any(|(id, _)| id_named(rules, &file.backend_path, *id))
+        };
+        let newest = |(_, readers): &(BackendLocation, Vec<(Ulid, Vec<u8>)>)| {
+            readers.iter().map(|(id, _)| *id).max()
+        };
+        // Among files all named by ids, the one the current pattern names stays.
+        let current = |(file, readers): &(BackendLocation, Vec<(Ulid, Vec<u8>)>)| {
             readers.iter().any(|(id, _)| {
                 let target = routing.and_then(|routing| routing.plain_target(bucket, key, *id));
                 target.is_some_and(|target| target.path == file.backend_path)
             })
         };
-        let newest = |(_, readers): &(BackendLocation, Vec<(Ulid, Vec<u8>)>)| {
-            readers.iter().map(|(id, _)| *id).max()
-        };
-        let keep = match files.iter().position(named) {
+        let read = files
+            .iter()
+            .position(|file| plain(file) && !file.1.is_empty());
+        let named = files.iter().position(current);
+        let keep = match read.or_else(|| files.iter().position(plain)).or(named) {
             Some(at) => at,
             None => (0..files.len())
                 .max_by_key(|at| newest(&files[*at]))
@@ -259,8 +271,11 @@ async fn duplicates(
             .flat_map(|(_, readers)| readers.clone())
             .collect();
         let copies: Vec<BackendLocation> = files.into_iter().map(|(file, _)| file).collect();
+        let listed = |file: &BackendLocation| {
+            file.ulid == keep.ulid || copies.iter().any(|copy| copy.ulid == file.ulid)
+        };
         let twins = (twins.into_iter())
-            .filter(|(file, ..)| copies.iter().any(|copy| copy.ulid == file.ulid))
+            .filter(|(file, ..)| listed(file))
             .map(|(file, index, version)| (file.ulid, index.clone(), *version))
             .collect();
         found.push(Duplicate {
@@ -272,6 +287,16 @@ async fn duplicates(
         });
     }
     Ok(found)
+}
+
+/// Whether a rule's write pattern gives `path` the version id `id`, or its file name holds it
+/// as an older pattern did.
+fn id_named(rules: &[BackendImport], path: &str, id: Ulid) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.contains(&id.to_string())
+        || rules.iter().any(|rule| {
+        matches!(rule.decode_any(path, &[]), PathIdentity::Decoded { id: named, .. } if named == id)
+    })
 }
 
 /// The ids of the versions grouped by content.
@@ -591,8 +616,25 @@ impl Stage<'_> {
         let kept = values.next().flatten();
         // Compared decoded: the encoding of a location's hash map is not stable.
         let kept = kept.as_deref().map(BackendLocation::from_bytes).transpose();
-        if kept.map_err(error)?.as_ref() != Some(&found.keep) {
-            return Ok(Unified::Changed);
+        let mut deletes = Vec::new();
+        let twin = found
+            .twins
+            .iter()
+            .find(|(ulid, ..)| *ulid == found.keep.ulid);
+        match (kept.map_err(error)?, twin) {
+            (Some(kept), None) if kept == found.keep => {}
+            // A kept second copy becomes the versions' own file with a location row.
+            (None, Some((_, index, version))) => {
+                if !self.adoptable(index, *version).await? {
+                    return Ok(Unified::Changed);
+                }
+                let value = found.keep.to_bytes().map_err(error)?;
+                let location = Key::from(keep_key.to_bytes());
+                writes.push((BLOB_LOCATIONS_KEYSPACE.to_string(), location, value.into()));
+                deletes.push((RENAMED_ROW_KEYSPACE.to_string(), index.clone()));
+                self.charge(&found.keep).await?;
+            }
+            _ => return Ok(Unified::Changed),
         }
         // A kept file whose backend version a release is deleting takes no new reader.
         let read = vec![(
@@ -634,7 +676,6 @@ impl Stage<'_> {
         }
         let encoding = found.keep.format.encoding();
         let mut changed = 0;
-        let mut deletes = Vec::new();
         for copy in &found.copies {
             let provider = values.next().flatten();
             let mine = readers.remove(&copy.ulid).unwrap_or_default();
@@ -686,7 +727,17 @@ impl Stage<'_> {
                 let key = key.to_bytes().map_err(error)?;
                 writes.push((BLOB_VERSIONS_KEYSPACE.to_string(), key.into(), value.into()));
             }
-            writes.push(release(copy, provider, owner)?);
+            // A file named by its version's id was written by Aruna, so it goes without a
+            // backend version too.
+            let named = owner.is_some_and(|(import, version)| {
+                let rules = self.rules.iter().filter(|rule| rule.import_id == import);
+                id_named(
+                    &rules.cloned().collect::<Vec<_>>(),
+                    &copy.backend_path,
+                    version,
+                )
+            });
+            writes.push(release(copy, provider, owner, named)?);
             changed += 1;
         }
         if changed == 0 {
@@ -714,6 +765,67 @@ impl Stage<'_> {
         match self.context.storage_handle.send_storage_effect(write).await {
             Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(Unified::Done),
             other => Err(format!("could not write the unification: {other:?}")),
+        }
+    }
+
+    /// Whether the kept second copy's index row still names it and its row still names
+    /// `version` under this key, as this transaction reads them.
+    async fn adoptable(&self, index: &Key, version: Ulid) -> Result<bool, String> {
+        let error = |error: aruna_core::errors::ConversionError| error.to_string();
+        let found = self.found;
+        let mut reads = vec![(RENAMED_ROW_KEYSPACE.to_string(), index.clone())];
+        for rule in self.rules {
+            let row = object_key(rule.import_id, &found.keep.backend_path);
+            reads.push((IMPORTED_OBJECT_KEYSPACE.to_string(), row));
+        }
+        let mut values = self.batch(reads).await?.into_iter();
+        let stored = values.next().flatten().filter(|value| !value.is_empty());
+        let stored = stored
+            .as_deref()
+            .map(BackendLocation::from_bytes)
+            .transpose();
+        if stored.map_err(error)?.as_ref() != Some(&found.keep) {
+            return Ok(false);
+        }
+        for row in values.flatten() {
+            let row = ImportedObject::from_bytes(&row).map_err(error)?;
+            if row.key.as_deref() == Some(found.key.as_str()) && row.version_id == version {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Charges the kept file's new location row, as reclaim debits the released one.
+    async fn charge(&self, location: &BackendLocation) -> Result<(), String> {
+        use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate};
+        let bytes = i128::from(location.stored_size());
+        let Some(stored) = StoredDelta::of_copy(location, 1, bytes) else {
+            return Ok(());
+        };
+        let mut update = UsageCounterUpdate::for_stored(stored);
+        let mut effects = update.start(self.txn_id);
+        loop {
+            let mut answer = None;
+            for effect in effects {
+                let Effect::Storage(effect) = effect else {
+                    return Err(format!("not a storage effect: {effect:?}"));
+                };
+                answer = Some(
+                    self.context
+                        .storage_handle
+                        .send_storage_effect(effect)
+                        .await,
+                );
+            }
+            let Some(answer) = answer else {
+                return Ok(());
+            };
+            match update.step(answer, self.txn_id) {
+                Ok(Some(next)) => effects = next,
+                Ok(None) => return Ok(()),
+                Err(error) => return Err(error.to_string()),
+            }
         }
     }
 
@@ -759,14 +871,16 @@ impl Stage<'_> {
     }
 }
 
-/// The release of `copy` at its backend version, or without one the drop of its location row,
-/// which leaves the file in place.
+/// The release of `copy` at its backend version, or of a file its version's id names, or else
+/// the drop of its location row, which leaves the file in place.
 fn release(
     copy: &BackendLocation,
     provider: Option<Value>,
     owner: Option<(Ulid, Ulid)>,
+    named: bool,
 ) -> Result<(String, Key, Value), String> {
     let error = |error: aruna_core::errors::ConversionError| error.to_string();
+    let provider = provider.or_else(|| named.then(|| Value::from(Vec::new())));
     let Some(provider) = provider else {
         let location = copy.location_key().map_err(error)?;
         let candidate =

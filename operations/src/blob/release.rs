@@ -37,6 +37,10 @@ pub(crate) async fn release_renamed(
     version_id: Ulid,
     version: String,
 ) -> bool {
+    // Without a backend version only a file whose name carries the version's id may go.
+    if version.is_empty() && !location.backend_path.contains(&version_id.to_string()) {
+        return true;
+    }
     let Ok(claim) = claim_key(&location, &version) else {
         return false;
     };
