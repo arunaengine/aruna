@@ -32,6 +32,9 @@ impl Class {
     }
 
     fn accepts(&self, c: char) -> bool {
+        if c == '/' {
+            return false;
+        }
         match self {
             Self::Any => true,
             Self::Set { negated, ranges } => {
@@ -40,17 +43,15 @@ impl Class {
         }
     }
 
-    /// Whether some character is accepted by both.
+    /// Whether some character of a file name, never `/`, is accepted by both.
     fn meets(&self, other: &Self) -> bool {
+        let named = |(lo, hi): (char, char)| (lo, hi) != ('/', '/');
         match (self, other) {
-            (Self::Any, _) | (_, Self::Any) => true,
-            (
-                Self::Set {
-                    negated: true,
-                    ranges: _,
-                },
-                Self::Set { negated: true, .. },
-            ) => true,
+            (Self::Any, Self::Any) | (Self::Any, Self::Set { negated: true, .. }) => true,
+            (Self::Set { negated: true, .. }, Self::Any | Self::Set { negated: true, .. }) => true,
+            (Self::Any, Self::Set { ranges, .. }) | (Self::Set { ranges, .. }, Self::Any) => {
+                ranges.iter().any(|range| named(*range))
+            }
             (
                 Self::Set {
                     negated: false,
@@ -65,19 +66,26 @@ impl Class {
                     ranges,
                 },
             ) => ranges.iter().any(|range| !covered(*range, set)),
-            (Self::Set { ranges: left, .. }, Self::Set { ranges: right, .. }) => left
-                .iter()
-                .any(|(a, b)| right.iter().any(|(c, d)| a <= d && c <= b)),
+            (Self::Set { ranges: left, .. }, Self::Set { ranges: right, .. }) => {
+                left.iter().any(|(a, b)| {
+                    let both = |(c, d): &(char, char)| (*a.max(c), *b.min(d));
+                    right
+                        .iter()
+                        .map(both)
+                        .any(|(lo, hi)| lo <= hi && named((lo, hi)))
+                })
+            }
         }
     }
 }
 
-/// Whether the negated `set` refuses every character of `range`.
+/// Whether the negated `set` refuses every file name character of `range`; `/` never counts.
 fn covered((lo, hi): (char, char), set: &Class) -> bool {
     let Class::Set { ranges, .. } = set else {
         return false;
     };
     let mut ranges = ranges.clone();
+    ranges.push(('/', '/'));
     ranges.sort();
     let mut next = lo as u32;
     for (start, end) in ranges {
@@ -399,5 +407,9 @@ mod tests {
         assert!(globs_overlap("?{2,4}", "abc"));
         assert!(!globs_overlap("?{2,4}", "abcde"));
         assert!(!globs_overlap("[0-9]{4}", "[0-9]{3}"));
+        // A file name never holds `/`, also where a range or negation spans it.
+        assert!(!globs_overlap("[.-0].txt", "[!.0].txt"));
+        assert!(!globs_overlap("[.-0]", "[/]"));
+        assert!(globs_overlap("[.-0].txt", "[!.].txt"));
     }
 }
