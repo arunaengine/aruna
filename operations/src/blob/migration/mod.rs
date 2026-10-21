@@ -1606,6 +1606,10 @@ pub async fn process_migrations(
     if !resumed && let Some(after) = check::process_checks(context).await? {
         soon(after);
     }
+    // So do the re-mapping and duplicate cleanup jobs of buckets.
+    if !resumed && let Some(after) = crate::s3::bucket::linked::process_linked(context).await? {
+        soon(after);
+    }
     // Queued buckets after this page, or before it when the run resumed mid-queue.
     if cursor.is_some() || resumed {
         soon(MIGRATION_CONTINUE);
@@ -1682,8 +1686,16 @@ async fn migrate_page(
     };
     // Without earlier patterns no file is renamed, so only an asked rename reads them; each
     // file is renamed only while the caller who asked may still write its key.
+    let request = match routing.as_ref() {
+        Some(_) => rename_request(context, bucket, &record).await?,
+        None => None,
+    };
+    // A paused rename waits for its resume, which wakes this task again.
+    if request.as_ref().is_some_and(|request| request.paused) {
+        return Ok(None);
+    }
     let (earlier, access) = match routing.as_ref() {
-        Some(routing) => match rename_request(context, bucket, &record).await? {
+        Some(routing) => match request.clone() {
             Some(request) => match rename_access(context, &request, routing, bucket).await? {
                 Some(access) => (read_earlier(context, routing).await?, Some(access)),
                 None => (Earlier::new(), None),
@@ -1704,7 +1716,13 @@ async fn migrate_page(
         None,
     )
     .await?;
+    let mut stopped = false;
     for (key, _) in &versions {
+        // A pause or an abort of the rename stops it before the next version.
+        if request.is_some() && rename_stopped(context, bucket, &record).await? {
+            stopped = true;
+            break;
+        }
         let version_key = VersionKey::from_bytes(key.as_ref()).map_err(|e| e.to_string())?;
         record.cursor = Some(key.to_vec());
         // Keys outside a move's prefix are only re-encoded.
@@ -1738,6 +1756,10 @@ async fn migrate_page(
             }
         }
     }
+    if stopped {
+        store_progress(context, bucket, &record).await?;
+        return Ok(None);
+    }
     if denied > 0 {
         tracing::warn!(
             bucket,
@@ -1763,6 +1785,16 @@ async fn migrate_page(
     };
     store_progress(context, bucket, &record).await?;
     Ok(after)
+}
+
+/// Whether the caller paused or aborted the rename of the move `record`.
+async fn rename_stopped(
+    context: &crate::driver::DriverContext,
+    bucket: &str,
+    record: &CompressionMigration,
+) -> Result<bool, String> {
+    let request = rename_request(context, bucket, record).await?;
+    Ok(request.is_none_or(|request| request.paused || request.aborted_at_ms.is_some()))
 }
 
 /// Whether a version whose move failed is broken; a check records it.
@@ -1848,7 +1880,9 @@ async fn stage_progress(
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(false),
         other => return Err(format!("could not read migration progress: {other:?}")),
     };
-    if stored.started_at_ms != record.started_at_ms || stored.target != record.target {
+    // An aborted move keeps the end its abort wrote.
+    let ended = stored.finished_at_ms.is_some();
+    if stored.started_at_ms != record.started_at_ms || stored.target != record.target || ended {
         return Ok(false);
     }
     let value = record.to_bytes().map_err(|error| error.to_string())?;
@@ -2343,6 +2377,8 @@ mod tests {
             auth,
             node_id: node,
             grant,
+            paused: false,
+            aborted_at_ms: None,
         };
         let write = StorageEffect::Write {
             key_space: RENAME_MOVE_KEYSPACE.to_string(),

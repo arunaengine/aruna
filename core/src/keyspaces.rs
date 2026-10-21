@@ -101,6 +101,8 @@ pub const COMPRESSION_QUEUE_KEYSPACE: &str = "compression_migration_queue";
 /// Moves asked to rename linked files of earlier patterns: the start time of the move record
 /// they belong to, keyed by bucket name.
 pub const RENAME_MOVE_KEYSPACE: &str = "compression_migration_renames";
+/// The re-mapping or duplicate cleanup job of each bucket, keyed by bucket name.
+pub const LINKED_JOB_KEYSPACE: &str = "linked_storage_jobs";
 /// Node-local progress of checking a bucket's current versions for copies that cannot serve.
 pub const STORAGE_CHECK_KEYSPACE: &str = "storage_checks";
 /// Buckets whose check is unfinished; the migration worker scans only these.
@@ -442,6 +444,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     COMPRESSION_MIGRATION_KEYSPACE,
     COMPRESSION_QUEUE_KEYSPACE,
     RENAME_MOVE_KEYSPACE,
+    LINKED_JOB_KEYSPACE,
     STORAGE_CHECK_KEYSPACE,
     CHECK_QUEUE_KEYSPACE,
     BROKEN_VERSION_KEYSPACE,

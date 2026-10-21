@@ -8,7 +8,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE,
-    RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE, TRANSITION_KEYSPACE,
+    LINKED_JOB_KEYSPACE, RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE, TRANSITION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -16,6 +16,7 @@ use aruna_core::structs::storage::backend_import::{RenameRequest, TokenGrant};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
+use aruna_core::structs::storage::linked_job::LinkedJob;
 use aruna_core::structs::storage::transition::EncryptionTransition;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -39,6 +40,8 @@ pub enum StartMoveError {
     NotFinished,
     #[error("the import rule changed since its files were checked")]
     RuleChanged,
+    #[error("a re-mapping or duplicate cleanup of the bucket runs")]
+    JobRunning,
     #[error("unexpected event: {0:?}")]
     Unexpected(Box<Event>),
 }
@@ -181,6 +184,13 @@ impl StartMoveOperation {
         if seen.len() != self.guards.len() || !seen.iter().map(|(_, value)| value).eq(expected) {
             return self.fail(StartMoveError::RuleChanged);
         }
+        // A re-mapping or duplicate cleanup of the bucket holds it until it ends.
+        let linked = values.pop().and_then(|(_, value)| value);
+        match linked.as_deref().map(LinkedJob::from_bytes).transpose() {
+            Ok(Some(job)) if job.is_active() => return self.fail(StartMoveError::JobRunning),
+            Ok(_) => {}
+            Err(error) => return self.fail(error.into()),
+        }
         match self.rows(values) {
             Ok(writes) => {
                 self.state = StartMoveState::Write;
@@ -220,6 +230,8 @@ impl StartMoveOperation {
                 auth,
                 node_id,
                 grant,
+                paused: false,
+                aborted_at_ms: None,
             };
             let key: Key = self.bucket.as_bytes().to_vec().into();
             let value = request.to_bytes()?.into();
@@ -257,6 +269,8 @@ impl Operation for StartMoveOperation {
                     .iter()
                     .map(|(space, key, _)| (space.clone(), key.clone()));
                 let mut reads = move_reads(&self.bucket);
+                let key = self.bucket.as_bytes().to_vec().into();
+                reads.push((LINKED_JOB_KEYSPACE.to_string(), key));
                 reads.extend(guards);
                 smallvec![Effect::Storage(StorageEffect::BatchRead {
                     reads,
@@ -399,6 +413,8 @@ mod tests {
                 auth: asker(),
                 node_id: node(),
                 grant: grant(),
+                paused: false,
+                aborted_at_ms: None,
             };
             assert_eq!(asked, renaming.then_some(expected));
         }
@@ -424,7 +440,7 @@ mod tests {
             panic!("expected the reads, got {effects:?}")
         };
         assert_eq!(reads.last().map(|(space, _)| space.as_str()), Some("rules"));
-        let mut values: Vec<(Key, Option<Value>)> = vec![(vec![].into(), None); 4];
+        let mut values: Vec<(Key, Option<Value>)> = vec![(vec![].into(), None); 5];
         values.push((vec![1].into(), Some(vec![3].into())));
         operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
         assert!(matches!(

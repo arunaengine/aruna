@@ -437,6 +437,10 @@ pub struct RenameRequest {
     pub node_id: NodeId,
     /// The bearer token the caller asked with, checked again before each page.
     pub grant: TokenGrant,
+    /// The caller paused the rename; the move makes no progress until it resumes.
+    pub paused: bool,
+    /// When the caller stopped the rename for good; the move record then ends.
+    pub aborted_at_ms: Option<u64>,
 }
 
 /// The non-secret identity of a bearer token: enough to tell later whether it was revoked,

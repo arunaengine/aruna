@@ -267,6 +267,11 @@ pub(crate) fn move_refusal(error: StartMoveError) -> ServerError {
                     .to_string(),
             )
         }
+        StartMoveError::JobRunning => ServerError::Refused(
+            StatusCode::CONFLICT,
+            "job_running",
+            "a re-mapping or duplicate cleanup of the bucket runs; retry when it ends".to_string(),
+        ),
         StartMoveError::Encrypted => ServerError::Refused(
             StatusCode::CONFLICT,
             "bucket_encrypted",
