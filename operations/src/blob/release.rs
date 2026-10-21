@@ -15,7 +15,7 @@ use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, CLAIM_INDEX_KEYSPACE, DELETE_CLAIM_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
 };
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, claim_key, object_key, version_key,
+    BackendImport, ImportedObject, claim_key, names_version, object_key, version_key,
 };
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, HashIndex, VersionKey,
@@ -38,7 +38,7 @@ pub(crate) async fn release_renamed(
     version: String,
 ) -> bool {
     // Without a backend version only a file whose name carries the version's id may go.
-    if version.is_empty() && !location.backend_path.contains(&version_id.to_string()) {
+    if version.is_empty() && !names_version(&location.backend_path, version_id) {
         return true;
     }
     let Ok(claim) = claim_key(&location, &version) else {
@@ -872,6 +872,19 @@ mod tests {
         alias_version(&context, old().format.encoding()).await;
         assert!(release(&context).await);
         assert!(read_value(&context, space, claim).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn keeps_plain_unversioned() {
+        // Without a backend version a file whose name only contains the id stays untouched.
+        let (_dir, context) = setup();
+        let mut location = old();
+        location.backend_path = format!("raw/backup-{VERSION}.csv");
+        let released = release_renamed(&context, location.clone(), IMPORT, VERSION, String::new());
+        assert!(released.await);
+        let claim = claim_key(&location, "").unwrap();
+        let stored = read_value(&context, DELETE_CLAIM_KEYSPACE, claim).await;
+        assert!(stored.unwrap().is_none());
     }
 
     #[tokio::test]

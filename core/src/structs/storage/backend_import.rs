@@ -440,6 +440,20 @@ pub fn claim_key(
     Ok(postcard::to_allocvec(&file)?.into())
 }
 
+/// Whether the file name of `path` holds `id` in the id slot of Aruna's names, as
+/// `{id}_{name}` or `{name}~{id}`; never a part of another name or a folder.
+pub fn names_version(path: &str, id: Ulid) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let id = id.to_string();
+    let first = name
+        .strip_prefix(&id)
+        .and_then(|rest| rest.strip_prefix('_'));
+    let last = name
+        .strip_suffix(&id)
+        .and_then(|rest| rest.strip_suffix('~'));
+    first.or(last).is_some_and(|rest| !rest.is_empty())
+}
+
 pub fn object_prefix(import_id: Ulid) -> Key {
     import_id.to_bytes().to_vec().into()
 }
@@ -663,6 +677,25 @@ impl BackendImportCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_id_slots() {
+        // Only the whole slot of an id in the file name counts, never a part of a name.
+        let id = Ulid::from_parts(5, 5);
+        for path in [format!("raw/{id}_a.txt"), format!("raw/a.txt~{id}")] {
+            assert!(names_version(&path, id), "{path}");
+        }
+        for path in [
+            format!("raw/backup-{id}.txt"),
+            format!("raw/{id}/a.txt"),
+            format!("raw/{id}_"),
+            format!("raw/x{id}_a.txt"),
+            format!("raw/a.txt~{id}.bak"),
+            format!("raw/{}_a.txt", Ulid::from_parts(6, 6)),
+        ] {
+            assert!(!names_version(&path, id), "{path}");
+        }
+    }
 
     fn object(etag: Option<&str>, modified_ms: Option<u64>) -> ExternalObject {
         ExternalObject {

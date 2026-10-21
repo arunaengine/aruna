@@ -18,7 +18,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, PathIdentity, claim_key, object_key, version_key,
+    BackendImport, ImportedObject, PathIdentity, claim_key, names_version, object_key, version_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobVersion, BlobVersionState, ManagedCopyKey,
@@ -289,11 +289,10 @@ async fn duplicates(
     Ok(found)
 }
 
-/// Whether a rule's write pattern gives `path` the version id `id`, or its file name holds it
-/// as an older pattern did.
+/// Whether a rule's write pattern gives `path` the version id `id`, or its file name has it
+/// in the id slot of Aruna's names.
 fn id_named(rules: &[BackendImport], path: &str, id: Ulid) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    name.contains(&id.to_string())
+    names_version(path, id)
         || rules.iter().any(|rule| {
         matches!(rule.decode_any(path, &[]), PathIdentity::Decoded { id: named, .. } if named == id)
     })
