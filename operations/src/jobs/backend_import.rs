@@ -759,6 +759,20 @@ fn needs_lookup(
     intents || (row.key.is_none() && decoded)
 }
 
+/// A row of Aruna's own write names the file while every intent at the path is that very
+/// committed write. Any other write, also a committed move of another version, is checked by
+/// the file's hash.
+fn row_covers(row: Option<&ImportedObject>, claims: &[Claim]) -> bool {
+    let Some(row) = row.filter(|row| row.key.is_some()) else {
+        return false;
+    };
+    claims.iter().all(|(_, intent, committed)| {
+        *committed
+            && row.key.as_deref() == Some(intent.key.as_str())
+            && row.version_id == intent.version_id
+    })
+}
+
 /// Registers a file whose version never committed as the key and version its write intent or
 /// path names. `None` leaves the file to the ordinary import, as for any row Aruna wrote.
 async fn recover(
@@ -776,9 +790,7 @@ async fn recover(
         return Ok(None);
     }
     let claims = read_claims(&ctx.driver, rule, intents).await?;
-    // A row of Aruna's own write names it; only the open intent of a later write overrides it.
-    let keyed = row.is_some_and(|row| row.key.is_some());
-    if keyed && claims.iter().all(|(.., committed)| *committed) {
+    if row_covers(row, &claims) {
         return Ok(None);
     }
     // Only the hash of the file can prove which write left it, so it is read first.
@@ -2277,6 +2289,26 @@ mod tests {
         };
         let stored = intent_key(rule.import_id, "raw/a.csv", intent.version_id);
         (stored, intent, committed)
+    }
+
+    #[test]
+    fn covers_own_write() {
+        let rule = recovery_rule("{dir}{name}");
+        let id = Ulid::from_parts(5, 5);
+        let row = ImportedObject::written(id, "in/a.csv".to_string(), 4, None);
+        let committed = |key: &str, version_id: Ulid| {
+            let mut claim = claim(&rule, key, true);
+            claim.1.version_id = version_id;
+            claim
+        };
+        // The row's own committed write needs no hash.
+        assert!(row_covers(Some(&row), &[committed("in/a.csv", id)]));
+        // A committed move of another version onto the same name is checked by its hash.
+        let moved = committed("in/a.csv", Ulid::from_parts(6, 6));
+        assert!(!row_covers(Some(&row), &[moved]));
+        assert!(!row_covers(Some(&row), &[committed("in/b.csv", id)]));
+        assert!(!row_covers(Some(&row), &[claim(&rule, "in/a.csv", false)]));
+        assert!(!row_covers(None, &[]));
     }
 
     #[test]
