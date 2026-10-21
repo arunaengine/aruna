@@ -620,6 +620,7 @@ mod tests {
                 backend: BackendRef::Group(rule.backend_id),
                 created_by: Default::default(),
                 written: None,
+                mover: None,
             };
             (Key::from(Vec::new()), intent)
         };

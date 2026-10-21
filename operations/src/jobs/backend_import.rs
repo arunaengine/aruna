@@ -2301,6 +2301,7 @@ mod tests {
             backend: BackendRef::Group(rule.backend_id),
             created_by: Default::default(),
             written: Some(HASH),
+            mover: None,
         };
         let stored = intent_key(rule.import_id, "raw/a.csv", intent.version_id);
         (stored, intent, committed)

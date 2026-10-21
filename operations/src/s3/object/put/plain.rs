@@ -185,6 +185,7 @@ impl PutObjectOperation {
             backend: plain.target.backend.clone(),
             created_by: self.config.user_id,
             written: None,
+            mover: None,
         })
     }
 

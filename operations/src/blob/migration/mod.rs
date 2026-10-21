@@ -162,6 +162,8 @@ pub struct MigrateVersionOperation {
     tag_checked: bool,
     /// The delete claim of the file a rename adopts, which its publication must not find.
     adopt_claim: Option<Key>,
+    /// The start of the storage move this run belongs to, which owns its write intents.
+    mover: Option<u64>,
     /// The intent write in flight, in one transaction with a read of its rule.
     fence: Option<FencedWrite>,
     /// The target row the publication read, kept while the peers' intents are read.
@@ -209,6 +211,7 @@ impl MigrateVersionOperation {
             backend_version: None,
             tag_checked: false,
             adopt_claim: None,
+            mover: None,
             fence: None,
             target_row: None,
             peers: Vec::new(),
@@ -233,6 +236,12 @@ impl MigrateVersionOperation {
     /// Moves the version to where `routing` sends a new write of its key.
     pub fn with_routing(mut self, routing: RoutingSnapshot) -> Self {
         self.routing = Some(routing);
+        self
+    }
+
+    /// Marks the write intents of this run as those of the move started at `started_ms`.
+    pub fn with_mover(mut self, started_ms: u64) -> Self {
+        self.mover = Some(started_ms);
         self
     }
 
@@ -687,6 +696,7 @@ impl MigrateVersionOperation {
             backend: target.backend.clone(),
             created_by,
             written: source.and_then(|hash| hash.try_into().ok()),
+            mover: self.mover,
         };
         let Some(routing) = self.routing.as_ref() else {
             return self.fail(MigrateVersionError::NotFinished);
@@ -1779,7 +1789,9 @@ async fn migrate_page(
                 true => earlier.clone(),
                 false => Earlier::new(),
             };
-            operation = operation.with_routing(routing).with_earlier(earlier);
+            operation = (operation.with_routing(routing))
+                .with_earlier(earlier)
+                .with_mover(record.started_at_ms);
         }
         let moved = crate::driver::drive(operation, context).await;
         let broken = moved.is_err() && moving && is_broken(context, key).await;
@@ -1821,6 +1833,10 @@ async fn migrate_page(
             Some(wait)
         }
         (false, _) => {
+            // A move ending with failures hands its unsettled attempts to the cleanup queue.
+            if record.moving && record.failed > 0 {
+                hand_over_moves(context, bucket, record.started_at_ms).await?;
+            }
             record.finished_at_ms = Some(now);
             None
         }
@@ -1837,23 +1853,23 @@ async fn end_aborted(
     bucket: &str,
     mut record: CompressionMigration,
 ) -> Result<Option<Duration>, String> {
-    hand_over_moves(context, bucket).await?;
+    hand_over_moves(context, bucket, record.started_at_ms).await?;
     record.retry_at_ms = None;
     record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
     store_progress(context, bucket, &record).await?;
     Ok(None)
 }
 
-/// Writes one `SettleMove` work per version whose move intents the bucket's rules still hold,
-/// keyed by the version, so a repeated hand-over writes the same rows.
+/// Writes one `SettleMove` work per intent this move still owns, a page at a time, keyed by
+/// the intent, so a repeated hand-over writes the same rows.
 async fn hand_over_moves(
     context: &crate::driver::DriverContext,
     bucket: &str,
+    started_ms: u64,
 ) -> Result<(), String> {
     let Some(routing) = move_routing(context, bucket).await? else {
         return Ok(());
     };
-    let mut moves: BTreeMap<Vec<u8>, (VersionKey, Vec<Vec<u8>>)> = BTreeMap::new();
     for rule in routing.imports.iter().filter(|rule| rule.bucket == bucket) {
         let mut after = None;
         loop {
@@ -1868,16 +1884,30 @@ async fn hand_over_moves(
                 None,
             )
             .await?;
+            let mut writes = Vec::new();
             for (key, value) in rows {
                 let intent = WriteIntent::from_bytes(&value).map_err(|error| error.to_string())?;
-                // A move records its source hash before its bytes; an upload's intent waits.
-                if intent.written.is_none() {
+                // Only this move's own intents; an upload's or another move's stay.
+                if intent.mover != Some(started_ms) {
                     continue;
                 }
                 let version = VersionKey::new(bucket, &intent.key, intent.version_id);
-                let id = version.to_bytes().map_err(|error| error.to_string())?;
-                let entry = moves.entry(id).or_insert_with(|| (version, Vec::new()));
-                entry.1.push(key.to_vec());
+                let work = BlobCleanupWork::SettleMove {
+                    version,
+                    intents: vec![key.to_vec()],
+                };
+                let value = work.to_bytes().map_err(|error| error.to_string())?;
+                writes.push((BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into()));
+            }
+            if !writes.is_empty() {
+                let write = StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None,
+                };
+                match context.storage_handle.send_storage_effect(write).await {
+                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+                    other => return Err(format!("could not hand over the moves: {other:?}")),
+                }
             }
             match next {
                 Some(next) => after = Some(next),
@@ -1885,23 +1915,7 @@ async fn hand_over_moves(
             }
         }
     }
-    if moves.is_empty() {
-        return Ok(());
-    }
-    let mut writes = Vec::with_capacity(moves.len());
-    for (id, (version, intents)) in moves {
-        let work = BlobCleanupWork::SettleMove { version, intents };
-        let value = work.to_bytes().map_err(|error| error.to_string())?;
-        writes.push((BLOB_CLEANUP_KEYSPACE.to_string(), id.into(), value.into()));
-    }
-    let write = StorageEffect::BatchWrite {
-        writes,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        other => Err(format!("could not hand over the rename's moves: {other:?}")),
-    }
+    Ok(())
 }
 
 /// Runs `version` once more as a rename, which adopts a copy that reached its new name or
@@ -2732,6 +2746,7 @@ mod tests {
             backend: BackendRef::Group(rule.backend_id),
             created_by: Default::default(),
             written: Some([1; 32]),
+            mover: Some(7),
         };
         let write = |key_space: &str, key: Vec<u8>, value: Vec<u8>| StorageEffect::Write {
             key_space: key_space.to_string(),
@@ -2767,7 +2782,7 @@ mod tests {
             ),
             write(
                 IMPORT_INTENT_KEYSPACE,
-                intent_row,
+                intent_row.clone(),
                 intent.to_bytes().unwrap(),
             ),
             // A version row that cannot be read makes its run fail.
@@ -2785,13 +2800,34 @@ mod tests {
         );
         storage.send_storage_effect(stored).await;
 
+        // An upload's intent with its hash is not the move's and stays where it is.
+        let upload = WriteIntent {
+            mover: None,
+            ..intent.clone()
+        };
+        let upload_row = intent_key(rule.import_id, "raw/b.csv", id).to_vec();
+        let stored = write(
+            IMPORT_INTENT_KEYSPACE,
+            upload_row.clone(),
+            upload.to_bytes().unwrap(),
+        );
+        storage.send_storage_effect(stored).await;
         // The abort hands the version over to the cleanup queue and ends the move.
         assert_eq!(end_aborted(&context, "b", record).await.unwrap(), None);
+        let read = StorageEffect::Read {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: upload_row.into(),
+            txn_id: None,
+        };
+        assert!(matches!(
+            storage.send_storage_effect(read).await,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
         let ended = read_progress(&context, &key).await.unwrap().unwrap();
         assert!(ended.finished_at_ms.is_some());
         let read = StorageEffect::Read {
             key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-            key: version.clone().into(),
+            key: intent_row.clone().into(),
             txn_id: None,
         };
         let Event::Storage(StorageEvent::ReadResult {

@@ -216,6 +216,7 @@ impl CompleteUploadOperation {
             backend: target.backend.clone(),
             created_by: self.input.created_by,
             written: None,
+            mover: None,
         };
         let keys = intent_keys(target.import_id, path, version_id, if_not_exists);
         let (rows, Some(rule)) = (intent_rows(&keys, &intent), self.rule_key()) else {
@@ -271,6 +272,7 @@ impl CompleteUploadOperation {
             backend: target.backend.clone(),
             created_by: self.input.created_by,
             written: Some(written.get_blake3()?.try_into().ok()?),
+            mover: None,
         };
         let path = &written.backend_path;
         let key = intent_key(target.import_id, path, intent.version_id);

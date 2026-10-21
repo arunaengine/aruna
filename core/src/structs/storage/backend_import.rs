@@ -525,6 +525,9 @@ pub struct WriteIntent {
     /// The BLAKE3 hash of the bytes the write put at the path, recorded once it is done.
     /// Without it nothing proves that the file at the path holds this write's bytes.
     pub written: Option<[u8; 32]>,
+    /// The start of the storage move that wrote the file, which owns the intent; an upload's
+    /// intent has none.
+    pub mover: Option<u64>,
 }
 
 impl WriteIntent {
