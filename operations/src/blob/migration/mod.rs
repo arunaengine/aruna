@@ -2017,8 +2017,8 @@ async fn hand_over_moves(
         match next {
             Some(next) => place.after = Some(next.to_vec()),
             None => {
-                let at = rules.iter().position(|rule| *rule == import_id);
-                place.import_id = at.and_then(|at| rules.get(at + 1)).copied();
+                // Rules are sorted; a removed rule still has its place among them.
+                place.import_id = rules.iter().find(|rule| **rule > import_id).copied();
             }
         }
     }
@@ -3029,8 +3029,16 @@ mod tests {
             upload.to_bytes().unwrap(),
         );
         storage.send_storage_effect(stored).await;
+        // A hand-over stopped in a rule removed since goes on with the next rule.
+        let place = Handover {
+            started_ms: 7,
+            import_id: Some(Ulid::from_parts(1, 1)),
+            after: Some(b"zz".to_vec()),
+        };
+        store_handover(&context, "b", Some(&place)).await.unwrap();
         // The abort hands the version over to the cleanup queue and ends the move.
         assert_eq!(end_aborted(&context, "b", record).await.unwrap(), None);
+        assert!(read_handover(&context, "b").await.unwrap().is_none());
         let read = StorageEffect::Read {
             key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
             key: upload_row.into(),
