@@ -34,12 +34,13 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
-use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
+use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::blob::cleanup::process_cleanup_batch;
+use aruna_operations::blob::purge::{scope_totals, storage_files};
 use aruna_operations::blob::unify::{Unified, preview_page, unify};
 use aruna_operations::driver::{DriverContext, drive, routing_snapshot};
 use aruna_operations::groups::backends::record_writes;
@@ -51,8 +52,9 @@ use aruna_operations::groups::imports::discovery::{
 use aruna_operations::jobs::backend_import::run_backend_import;
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::{
-    ClaimOutcome, claim_job, insert_job, iter_prefix_page, transition_to_running,
+    ClaimOutcome, claim_job, complete_job, insert_job, iter_prefix_page, transition_to_running,
 };
+use aruna_operations::jobs::workflow::purge::run_storage_purge;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::purge_fence::acquire_purge_fence;
@@ -311,38 +313,7 @@ async fn run_import(context: &TestContext, tag: u8) -> (u64, u64, u64) {
         group_id: context.group_id,
         import_id: context.rule.import_id,
     };
-    let job_id = JobId::from_bytes([tag; 16]);
-    let storage = &context.driver.storage_handle;
-    let record = JobRecord::new(
-        job_id,
-        JobPayload::BackendImport(spec.clone()),
-        spec.auth_context.user_id,
-        spec.node_id,
-        1,
-        1,
-        None,
-    );
-    insert_job(storage, &record).await.unwrap();
-    let now = unix_timestamp_millis();
-    let ClaimOutcome::Claimed(claimed) =
-        claim_job(storage, job_id, spec.node_id, now).await.unwrap()
-    else {
-        panic!("the import job was not claimed")
-    };
-    let claim_token = claimed.claim.as_ref().unwrap().claim_token;
-    let running = transition_to_running(storage, job_id, claim_token, now)
-        .await
-        .unwrap();
-    let job = JobContext {
-        driver: context.driver.clone(),
-        job_id,
-        owner_node_id: spec.node_id,
-        claim_token,
-        final_attempt: false,
-        cancel: CancellationToken::new(),
-        shutdown: CancellationToken::new(),
-        progress: ProgressReporter::from_progress(&running.progress),
-    };
+    let job = claimed(context, tag, JobPayload::BackendImport(spec.clone())).await;
     match run_backend_import(&job, &spec).await {
         JobRunOutcome::Succeeded(JobResultPayload::BackendImport {
             imported,
@@ -351,6 +322,34 @@ async fn run_import(context: &TestContext, tag: u8) -> (u64, u64, u64) {
         }) => (imported, skipped, failed),
         JobRunOutcome::Failed(error) => panic!("the import failed: {}", error.message),
         _ => panic!("the import did not succeed"),
+    }
+}
+
+/// A running job `tag` of the test's user with `payload`.
+async fn claimed(context: &TestContext, tag: u8, payload: JobPayload) -> JobContext {
+    let job_id = JobId::from_bytes([tag; 16]);
+    let storage = &context.driver.storage_handle;
+    let (user, node) = (context.auth.user_id, context.node_id);
+    let record = JobRecord::new(job_id, payload, user, node, 1, 1, None);
+    insert_job(storage, &record).await.unwrap();
+    let now = unix_timestamp_millis();
+    let ClaimOutcome::Claimed(claimed) = claim_job(storage, job_id, node, now).await.unwrap()
+    else {
+        panic!("the job was not claimed")
+    };
+    let claim_token = claimed.claim.as_ref().unwrap().claim_token;
+    let running = transition_to_running(storage, job_id, claim_token, now)
+        .await
+        .unwrap();
+    JobContext {
+        driver: context.driver.clone(),
+        job_id,
+        owner_node_id: node,
+        claim_token,
+        final_attempt: false,
+        cancel: CancellationToken::new(),
+        shutdown: CancellationToken::new(),
+        progress: ProgressReporter::from_progress(&running.progress),
     }
 }
 
@@ -695,4 +694,61 @@ async fn s3_unifies_uploads() {
     process_cleanup_batch(&context.driver).await.unwrap();
     assert!(!exists(&context, &named).await);
     assert_eq!(content(&context, "x.txt", upload).await, b"abc");
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_purges_named() {
+    // A permanent purge on a storage without versions deletes the file named by its version's
+    // id and keeps the plain one, as its preview says.
+    let context = setup_pattern("{dir}{id}_{name}").await;
+    let id = Ulid::generate();
+    let named = format!("old/{id}_a.txt");
+    place(&context, &named, b"named").await;
+    place(&context, "old/b.txt", b"plain").await;
+    assert_eq!(run_import(&context, 0xC3).await, (2, 0, 0));
+    let spec = StoragePurgeSpec {
+        scope: StoragePurgeScope::Prefix {
+            bucket: BUCKET.to_string(),
+            prefix: "old/".to_string(),
+        },
+        group_id: context.group_id,
+        auth_context: context.auth.clone(),
+        node_id: context.node_id,
+    };
+    let readable = |_: &str| true;
+    let totals = scope_totals(&context.driver, &spec.scope, &readable)
+        .await
+        .unwrap();
+    assert_eq!((totals.storage_files, totals.storage_bytes), (2, 10));
+    let versions = [
+        ("old/a.txt", id),
+        ("old/b.txt", current(&context, "old/b.txt").await.unwrap()),
+    ]
+    .map(|(key, id)| (key.to_string(), id));
+    let scope = (BUCKET, context.group_id);
+    let files = storage_files(&context.driver, scope, &versions, Some(&spec.scope))
+        .await
+        .unwrap();
+    let kept: Vec<_> = (files.iter()).map(|file| file.kept.is_some()).collect();
+    assert_eq!(kept, [false, true]);
+
+    let job = claimed(&context, 0xE7, JobPayload::StoragePurge(spec.clone())).await;
+    let JobRunOutcome::Succeeded(JobResultPayload::StoragePurge(result)) =
+        run_storage_purge(&job, &spec, true).await
+    else {
+        panic!("the purge did not succeed")
+    };
+    let storage = &context.driver.storage_handle;
+    let (result, progress) = (
+        JobResultPayload::StoragePurge(result),
+        job.progress.snapshot(),
+    );
+    let now = unix_timestamp_millis();
+    complete_job(storage, job.job_id, job.claim_token, result, progress, now)
+        .await
+        .unwrap();
+    process_cleanup_batch(&context.driver).await.unwrap();
+    assert!(!exists(&context, &named).await);
+    assert!(exists(&context, "old/b.txt").await);
 }
