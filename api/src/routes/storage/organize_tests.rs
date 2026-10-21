@@ -239,4 +239,30 @@ async fn hides_unmapped_failures() {
         .await
         .unwrap();
     assert!(outside.is_empty());
+    // A pending write names its key as well.
+    let id = Ulid::generate();
+    let intent = aruna_core::structs::storage::backend_import::WriteIntent {
+        key: "secret/a.faa.gz".to_string(),
+        version_id: id,
+        backend: aruna_core::structs::storage::blob::BackendRef::Group(rule.backend_id),
+        created_by: test.auth.user_id,
+        written: None,
+        mover: None,
+    };
+    let key = aruna_core::structs::storage::backend_import::intent_key(
+        rule.import_id,
+        "raw/a.faa.gz",
+        id,
+    );
+    let write = StorageEffect::Write {
+        key_space: aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE.to_string(),
+        key,
+        value: intent.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    context.storage_handle.send_storage_effect(write).await;
+    let pending = file_keys(&context, (&rule, &[], &[]), "raw/a.faa.gz")
+        .await
+        .unwrap();
+    assert!(pending.contains(&"secret/a.faa.gz".to_string()));
 }

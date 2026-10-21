@@ -711,7 +711,7 @@ pub async fn control_job(
     summary = "Show what the link holds",
     description = r#"Shows the files the last sync of the rule could not take, such as a file two links claim, without reading the storage again.
 
-A file is shown only when the caller may read every key the rule may give it: its recorded key, its key under the rule's folders and its discovery key.
+A file is shown only when the caller may read every key the rule may give it: its recorded key, the keys of pending writes to it, its key under the rule's folders and its discovery key.
 
 **Authentication**: as the previews.
 
@@ -774,8 +774,12 @@ pub async fn link_status(
     }))
 }
 
-/// Every key the rule may give the file at `path`: the key its row records, the key its
-/// folders give it, and the key discovery gives it. Empty when none is known.
+/// Intents of one path a link status reads at most; more hide the file.
+const INTENT_PAGE: usize = 64;
+
+/// Every key the rule may give the file at `path`: the key its row records, the keys of its
+/// pending writes, the key its folders give it, and the key discovery gives it. Empty when
+/// none is known.
 async fn file_keys(
     context: &aruna_operations::driver::DriverContext,
     (rule, earlier, rules): (
@@ -803,6 +807,48 @@ async fn file_keys(
     let row = row.map_err(|error| ServerError::InternalError(error.to_string()))?;
     let mut keys: Vec<String> = row.and_then(|row| row.key).into_iter().collect();
     keys.extend(rule.aruna_key(path));
+    // A pending write to the path names its key too.
+    let intents = aruna_operations::jobs::store::iter_prefix_page(
+        &context.storage_handle,
+        aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE,
+        Some(aruna_core::structs::storage::backend_import::intent_prefix(
+            rule.import_id,
+            path,
+        )),
+        None,
+        INTENT_PAGE,
+        None,
+    );
+    let (intents, more) = intents.await.map_err(ServerError::InternalError)?;
+    if more.is_some() {
+        return Ok(Vec::new());
+    }
+    for (_, value) in intents {
+        let intent = aruna_core::structs::storage::backend_import::WriteIntent::from_bytes(&value);
+        let intent = intent.map_err(|error| ServerError::InternalError(error.to_string()))?;
+        keys.push(intent.key);
+    }
+    // A pending write to the path names its key too.
+    let intents = aruna_operations::jobs::store::iter_prefix_page(
+        &context.storage_handle,
+        aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE,
+        Some(aruna_core::structs::storage::backend_import::intent_prefix(
+            rule.import_id,
+            path,
+        )),
+        None,
+        INTENT_PAGE,
+        None,
+    );
+    let (intents, more) = intents.await.map_err(ServerError::InternalError)?;
+    if more.is_some() {
+        return Ok(Vec::new());
+    }
+    for (_, value) in intents {
+        let intent = aruna_core::structs::storage::backend_import::WriteIntent::from_bytes(&value);
+        let intent = intent.map_err(|error| ServerError::InternalError(error.to_string()))?;
+        keys.push(intent.key);
+    }
     match file_identity(rule, earlier, rules, path) {
         Some(Ok(identity)) => keys.push(identity.key),
         // A file of several patterns or keys names nothing a caller could be shown safely.
