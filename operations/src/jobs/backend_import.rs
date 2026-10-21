@@ -52,8 +52,8 @@ use crate::replication::queue::complete_put;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{
-    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, Trail, intent_keys,
-    trail_ranges,
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, RuleScan, Trail,
+    intent_keys, trail_ranges,
 };
 use crate::s3::purge_fence::PurgeFenceError;
 
@@ -1097,6 +1097,14 @@ async fn iterate(
     }
 }
 
+/// The ids of the rules this run saw sharing its folder.
+fn sharing(run: &ImportRun) -> std::collections::BTreeSet<Ulid> {
+    run.shared
+        .iter()
+        .map(|other| other.rule.import_id)
+        .collect()
+}
+
 /// `None` when this rule imports an unmapped file of a shared folder; else the outcome.
 fn claimed(run: &ImportRun, path: &str) -> Result<Option<Outcome>, ItemError> {
     let own = (&run.rule, run.earlier.as_slice(), run.discovery.as_slice());
@@ -1344,7 +1352,8 @@ async fn put_version(
     .with_restrictions(spec.auth_context.path_restrictions.clone())
     .with_expected_head(fence.head)
     .with_import_rows(run.rule.import_id, rows)
-    .with_import_guards(fence.guards);
+    .with_import_guards(fence.guards)
+    .with_rule_scan(RuleScan::new(run.rule.clone(), sharing(run)));
     if fence.keep_head {
         operation = operation.keep_head();
     }

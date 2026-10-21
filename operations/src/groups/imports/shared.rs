@@ -34,6 +34,13 @@ pub enum Claim {
     Conflict,
 }
 
+/// Whether `other` is another rule that reads an overlapping folder of the same backend.
+pub fn shares_folder(rule: &BackendImport, other: &BackendImport) -> bool {
+    other.import_id != rule.import_id
+        && other.backend_id == rule.backend_id
+        && folders_overlap(&other.backend_prefix, &rule.backend_prefix)
+}
+
 /// The other rules of the group that read an overlapping folder of the same backend.
 pub async fn read_shared(
     context: &DriverContext,
@@ -41,10 +48,7 @@ pub async fn read_shared(
 ) -> Result<Vec<SharedRule>, ImportRuleError> {
     let mut shared = Vec::new();
     for other in list_imports(context, rule.group_id).await? {
-        if other.import_id == rule.import_id
-            || other.backend_id != rule.backend_id
-            || !folders_overlap(&other.backend_prefix, &rule.backend_prefix)
-        {
+        if !shares_folder(rule, &other) {
             continue;
         }
         let discovery = read_discovery(context, other.group_id, other.import_id).await?;

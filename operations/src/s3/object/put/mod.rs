@@ -138,6 +138,8 @@ pub enum PutObjectState {
     AbortRegistered,
     /// Reads the delete trail inside the version transaction.
     ReadTrail,
+    /// Reads the group's import rules inside the version transaction.
+    ReadRules,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -308,6 +310,7 @@ pub struct PutObjectOperation {
     written_intent: Vec<aruna_core::types::Key>,
     /// The delete trail the version transaction reads before an import registers a version.
     trail_scan: Option<trail::TrailScan>,
+    rule_scan: Option<sharing::RuleScan>,
 }
 
 impl PutObjectOperation {
@@ -360,6 +363,7 @@ impl PutObjectOperation {
             pending_write: None,
             written_intent: Vec::new(),
             trail_scan: None,
+            rule_scan: None,
         }
     }
 
@@ -1695,6 +1699,9 @@ impl PutObjectOperation {
         if let Some(scan) = self.trail_scan.as_mut() {
             scan.restart();
         }
+        if let Some(scan) = self.rule_scan.as_mut() {
+            scan.restart();
+        }
         self.state = PutObjectState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -1962,6 +1969,7 @@ impl Operation for PutObjectOperation {
                 self.intent_dropped(event)
             }
             PutObjectState::ReadTrail => self.trail_read(event),
+            PutObjectState::ReadRules => self.rules_read(event),
             PutObjectState::WriteEvidence => self.evidence_written(event),
             PutObjectState::AbortRegistered => self.registered_aborted(event),
             PutObjectState::ReadHistory => self.history_read(event),
@@ -2773,7 +2781,9 @@ mod decision_tests {
 }
 
 mod plain;
+mod sharing;
 mod trail;
+pub(crate) use sharing::RuleScan;
 pub(crate) use trail::{Trail, TrailScan, trail_ranges};
 
 pub(crate) use plain::{
