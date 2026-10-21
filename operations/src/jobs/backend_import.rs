@@ -956,7 +956,9 @@ async fn recover(
         sharing: None,
         fenced: None,
     };
-    note_listing(&ctx.driver, rule, row_key, stored, repaired, note).await?;
+    if !note_listing(&ctx.driver, rule, row_key, stored, repaired, note).await? {
+        return Ok(Some(Outcome::Skipped));
+    }
     Ok(Some(Outcome::Imported))
 }
 
@@ -1773,7 +1775,14 @@ async fn note_listing(
                 txn_id: Some(txn_id),
             };
             let event = storage.send_storage_effect(read).await;
-            crate::s3::purge_fence::check_write_fence(event, &rule.bucket, key).is_ok()
+            match crate::s3::purge_fence::check_write_fence(event, &rule.bucket, key) {
+                Ok(()) => true,
+                Err(crate::s3::purge_fence::PurgeFenceError::Suspended) => false,
+                Err(error) => {
+                    storage.send_storage_effect(abort).await;
+                    return Err(ItemError::System(error.to_string()));
+                }
+            }
         }
         None => true,
     };
