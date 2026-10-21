@@ -358,7 +358,7 @@ async fn import_object(
         return Ok(Outcome::Ignored);
     }
     if page_skip(
-        rule,
+        (rule, &run.earlier),
         &run.page,
         run.intents.contains_key(&object.key),
         object,
@@ -651,7 +651,7 @@ async fn page_reads(
 
 /// Whether the page reads alone prove a known file unchanged, as the full checks would find.
 fn page_skip(
-    rule: &BackendImport,
+    (rule, earlier): (&BackendImport, &[String]),
     page: &PageReads,
     intents: bool,
     object: &ExternalObject,
@@ -662,7 +662,7 @@ fn page_skip(
     let Ok(row) = ImportedObject::from_bytes(stored) else {
         return false;
     };
-    if needs_lookup(rule, object, Some(&row), intents) {
+    if needs_lookup((rule, earlier), object, Some(&row), intents) {
         return false;
     }
     let Some(key) = row.key.clone().or_else(|| rule.aruna_key(&object.key)) else {
@@ -689,7 +689,7 @@ fn page_skip(
 /// Whether a file may be an uncommitted write, so its intents are read. A new file, a literal
 /// import whose name encodes a version and a changed file are; an unchanged known file is not.
 fn needs_lookup(
-    rule: &BackendImport,
+    (rule, earlier): (&BackendImport, &[String]),
     object: &ExternalObject,
     row: Option<&ImportedObject>,
     intents: bool,
@@ -697,7 +697,7 @@ fn needs_lookup(
     let Some(row) = row else {
         return true;
     };
-    let decoded = rule.decode_path(&object.key) != PathIdentity::Unmatched;
+    let decoded = rule.decode_any(&object.key, earlier) != PathIdentity::Unmatched;
     intents || (row.key.is_none() && decoded)
 }
 
@@ -714,7 +714,7 @@ async fn recover(
 ) -> Result<Option<Outcome>, ItemError> {
     let rule = &run.rule;
     let intents = run.intents.get(&object.key).map_or(&[][..], Vec::as_slice);
-    if !needs_lookup(rule, object, row, !intents.is_empty()) {
+    if !needs_lookup((rule, &run.earlier), object, row, !intents.is_empty()) {
         return Ok(None);
     }
     let claims = read_claims(&ctx.driver, rule, intents).await?;
@@ -2135,26 +2135,41 @@ mod tests {
     fn looks_up_intents() {
         let rule = recovery_rule("{dir}{id}_{name}");
         let listed = object("e1");
-        assert!(needs_lookup(&rule, &listed, None, false));
+        assert!(needs_lookup((&rule, &[]), &listed, None, false));
         // A known file without intents takes the fast path, changed or not.
         let literal = row(Ulid::nil(), "e1");
-        assert!(!needs_lookup(&rule, &listed, Some(&literal), false));
+        assert!(!needs_lookup((&rule, &[]), &listed, Some(&literal), false));
         let keyed = ImportedObject {
             key: Some("in/a.csv".to_string()),
             ..literal.clone()
         };
-        assert!(!needs_lookup(&rule, &object("e2"), Some(&keyed), false));
+        assert!(!needs_lookup(
+            (&rule, &[]),
+            &object("e2"),
+            Some(&keyed),
+            false
+        ));
         // An intent at the path is checked before any skip, also for an unchanged file.
-        assert!(needs_lookup(&rule, &listed, Some(&keyed), true));
-        assert!(needs_lookup(&rule, &listed, Some(&literal), true));
+        assert!(needs_lookup((&rule, &[]), &listed, Some(&keyed), true));
+        assert!(needs_lookup((&rule, &[]), &listed, Some(&literal), true));
         // A literal import whose name encodes a version is checked as well.
         let id = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         let named = ExternalObject {
             key: format!("raw/{id}_a.csv"),
             ..object("e1")
         };
-        assert!(needs_lookup(&rule, &named, Some(&literal), false));
-        assert!(!needs_lookup(&rule, &named, Some(&keyed), false));
+        assert!(needs_lookup((&rule, &[]), &named, Some(&literal), false));
+        assert!(!needs_lookup((&rule, &[]), &named, Some(&keyed), false));
+        // So is one an earlier pattern of the rule named.
+        let suffix = recovery_rule("{dir}{name}~{id}");
+        assert!(!needs_lookup((&suffix, &[]), &named, Some(&literal), false));
+        let earlier = ["{dir}{id}_{name}".to_string()];
+        assert!(needs_lookup(
+            (&suffix, &earlier),
+            &named,
+            Some(&literal),
+            false
+        ));
     }
 
     #[test]
@@ -2434,12 +2449,12 @@ mod tests {
         page.heads.insert(key, Some(id));
         let version = version.to_bytes().unwrap().into();
         page.versions.insert("raw/a.csv".to_string(), Some(version));
-        assert!(page_skip(&rule, &page, false, &object("e1")));
+        assert!(page_skip((&rule, &[]), &page, false, &object("e1")));
         // A changed file, an open intent or an unread page takes the full path.
-        assert!(!page_skip(&rule, &page, false, &object("e2")));
-        assert!(!page_skip(&rule, &page, true, &object("e1")));
+        assert!(!page_skip((&rule, &[]), &page, false, &object("e2")));
+        assert!(!page_skip((&rule, &[]), &page, true, &object("e1")));
         assert!(!page_skip(
-            &rule,
+            (&rule, &[]),
             &PageReads::default(),
             false,
             &object("e1")
@@ -2447,9 +2462,9 @@ mod tests {
         // Without ETag and time an equal size skips only when the row would stay the same.
         let mut unmarked = object("e1");
         unmarked.etag = None;
-        assert!(page_skip(&rule, &page, false, &unmarked));
+        assert!(page_skip((&rule, &[]), &page, false, &unmarked));
         page.versions.insert("raw/a.csv".to_string(), None);
-        assert!(!page_skip(&rule, &page, false, &unmarked));
+        assert!(!page_skip((&rule, &[]), &page, false, &unmarked));
     }
 
     #[test]
