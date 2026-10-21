@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, PURGE_FILES_KEYSPACE,
 };
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, object_key, version_key,
+    BackendImport, ImportedObject, names_version, object_key, version_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobVersion, HashIndex, VersionKey,
@@ -31,7 +31,8 @@ pub struct StorageFile {
     pub key: String,
     pub version_id: Ulid,
     pub location: BackendLocation,
-    /// The backend version the file was written as; only that version is deleted.
+    /// The backend version the file was written as; only that version is deleted. Empty for
+    /// a file of an unversioned storage named by its version's id.
     pub version: Option<String>,
     /// The rule that records the file and the version its row names.
     pub owner: Option<(Ulid, Ulid)>,
@@ -185,6 +186,14 @@ pub async fn storage_files(
             row.key.as_deref() == Some(file.key.as_str()) || row.version_id == file.version_id
         });
         file.owner = own.map(|at| (owners[at].0, owners[at].1.version_id));
+        // Without a backend version, only a file named by its version's id, whose ETag the
+        // import recorded, goes; its release checks size and ETag first.
+        let recorded = own.is_some_and(|at| owners[at].1.etag.is_some());
+        let named =
+            (file.owner).is_some_and(|(_, id)| names_version(&file.location.backend_path, id));
+        if file.version.is_none() && named && recorded {
+            file.version = Some(String::new());
+        }
         let Some(scope) = pins else {
             continue;
         };

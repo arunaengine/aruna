@@ -277,3 +277,43 @@ async fn pauses_purges() {
     set_paused(&context, job, false).await.unwrap();
     assert!(!is_paused(&context, job).await.unwrap());
 }
+
+#[tokio::test]
+async fn plans_named_unversioned() {
+    // Without a backend version only a file named by its version's id, with a recorded ETag,
+    // is planned; a plain name is kept and the preview says why.
+    let (_directory, context) = setup().await;
+    let (a, b, c) = (
+        Ulid::from_parts(10, 1),
+        Ulid::from_parts(11, 1),
+        Ulid::from_parts(12, 1),
+    );
+    let named = file(&format!("raw/gone/{a}_a"), Ulid::from_parts(20, 1));
+    let plain = file("raw/gone/b", Ulid::from_parts(21, 1));
+    let untagged = file(&format!("raw/gone/{c}_c"), Ulid::from_parts(22, 1));
+    for ((key, id), location, etag) in [
+        (("gone/a", a), &named, Some("\"e1\"")),
+        (("gone/b", b), &plain, Some("\"e2\"")),
+        (("gone/c", c), &untagged, None),
+    ] {
+        store(&context, (key, id), location, None).await;
+        let row = ImportedObject::written(id, key.to_string(), 10, etag.map(str::to_string));
+        let row_key = object_key(rule().import_id, &location.backend_path).to_vec();
+        put(
+            &context,
+            IMPORTED_OBJECT_KEYSPACE,
+            row_key,
+            row.to_bytes().unwrap(),
+        )
+        .await;
+    }
+    let versions =
+        [("gone/a", a), ("gone/b", b), ("gone/c", c)].map(|(key, id)| (key.to_string(), id));
+    let found = storage_files(&context, (BUCKET, group()), &versions, Some(&scope()))
+        .await
+        .unwrap();
+    let planned: Vec<_> = (found.iter())
+        .map(|file| (file.version.as_deref(), file.kept.is_some()))
+        .collect();
+    assert_eq!(planned, [(Some(""), false), (None, true), (None, true)]);
+}
