@@ -828,8 +828,6 @@ mod tests {
     }
 
     /// Answers the intent write and its sync; the write waits for both.
-    /// Answers the read of the rule after an intent or its evidence is stored.
-
     fn past_intent(operation: &mut PutObjectOperation) -> Effects {
         if operation.fence.as_ref().is_some_and(FencedWrite::starting) {
             let effects = smallvec![Effect::Storage(StorageEffect::StartTransaction {
