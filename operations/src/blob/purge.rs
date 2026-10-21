@@ -244,6 +244,7 @@ pub async fn scope_totals(
     let mut seen = std::collections::HashSet::new();
     let (mut key_marker, mut version_marker) = (None, None);
     let mut last_key = None::<String>;
+    let mut scanned = 0u64;
     loop {
         let input = ListVersionsInput {
             bucket: scope.bucket().to_string(),
@@ -261,6 +262,8 @@ pub async fn scope_totals(
                 ListVersionsItem::Version { key, location, .. } => (key, location.as_ref()),
                 ListVersionsItem::DeleteMarker { key, .. } => (key, None),
             };
+            // The bound counts every version passed over, also the hidden ones.
+            scanned += 1;
             if !scope.matches_key(scope.bucket(), key) || !readable(key) {
                 continue;
             }
@@ -279,7 +282,7 @@ pub async fn scope_totals(
                 totals.storage_bytes += location.blob_size;
             }
         }
-        if totals.versions >= TOTAL_VERSIONS && page.is_truncated {
+        if scanned >= TOTAL_VERSIONS && page.is_truncated {
             return Ok(totals);
         }
         match (page.is_truncated, page.next_key_marker) {

@@ -458,6 +458,32 @@ async fn previews_storage_files() {
         .unwrap();
     let keys: Vec<_> = only.items.iter().map(|item| item.key.as_str()).collect();
     assert_eq!((keys, only.versions), (vec!["linked/b.faa.gz"], 2));
+    // A reader limited to one key sees only that key, in the page and in the totals.
+    let bucket_path = aruna_core::structs::storage::blob::bucket_permission_path(
+        fixture.state.get_realm_id(),
+        Ulid::from_bytes([10u8; 16]),
+        fixture.state.get_node_id(),
+        "data",
+    );
+    let allow = |pattern: String| aruna_core::structs::identity::auth::PathRestriction {
+        pattern,
+        permission: aruna_core::structs::identity::auth::Permission::READ,
+    };
+    let mut limited = fixture.auth.clone();
+    limited.path_restrictions = Some(vec![
+        allow(bucket_path.clone()),
+        allow(format!("{bucket_path}/linked/a.faa.gz")),
+    ]);
+    let whole = DeleteImpactRequest {
+        limit: Some(10),
+        ..request(None)
+    };
+    let Json(seen) = delete_preview(state(), Extension(Some(limited)), bucket(), Json(whole))
+        .await
+        .unwrap();
+    let keys: Vec<_> = seen.items.iter().map(|item| item.key.as_str()).collect();
+    assert_eq!(keys, ["linked/a.faa.gz"]);
+    assert_eq!((seen.versions, seen.storage_files), (1, 1));
     let bad = DeleteImpactRequest {
         kind: "everything".to_string(),
         ..request(None)

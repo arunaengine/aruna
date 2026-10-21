@@ -587,7 +587,8 @@ pub struct DeleteImpact {
 - Keys the caller may not read are neither counted nor listed.
 
 **Limits**
-- 1 to 1000 entries per page. Totals count at most 1,000,000 versions; `complete` is then false."#,
+- 1 to 1000 entries per page. Totals pass over at most 1,000,000 versions, hidden ones
+  included; `complete` is then false. 64 listing pages of only hidden versions answer 409."#,
     params(("bucket" = String, Path, description = "Bucket to inspect")),
     request_body(content = DeleteImpactRequest, example = json!({"kind": "folder", "key": "raw/"})),
     responses(
@@ -600,6 +601,7 @@ pub struct DeleteImpact {
             }]
         })),
         (status = 400, description = "Invalid kind, key, limit or cursor", body = ErrorResponse),
+        (status = 409, description = "Too many versions in a row are hidden from the caller", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller cannot read the scope", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse)
