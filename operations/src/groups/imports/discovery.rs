@@ -539,6 +539,41 @@ mod tests {
     }
 
     #[test]
+    fn previews_run_identity() {
+        let mut rule = import_rule();
+        rule.write_pattern = "{dir}{name}~{id}".to_string();
+        let id = Ulid::from_parts(5, 5);
+        // A name the write pattern wrote keeps its version and goes where the rules place it.
+        let file = named((&rule, &[], &rules()), format!("raw/run/s.faa.gz~{id}"));
+        let key = Some("proteins/run/s.faa.gz".to_string());
+        assert_eq!((file.key, file.version_id), (key, Some(id)));
+        assert_eq!(file.outcome, FileOutcome::Matched);
+        let file = named((&rule, &[], &rules()), "raw/baz".to_string());
+        assert_eq!(
+            (file.key.as_deref(), file.outcome),
+            (Some("baz"), FileOutcome::Root)
+        );
+        // An unfinished write names the file only while all its intents agree.
+        let intent = |key: &str| {
+            let intent = WriteIntent {
+                key: key.to_string(),
+                version_id: id,
+                backend: BackendRef::Group(rule.backend_id),
+                created_by: Default::default(),
+                written: None,
+            };
+            (Key::from(Vec::new()), intent)
+        };
+        let file = intended("raw/a".to_string(), &[intent("in/a")]);
+        assert_eq!(
+            (file.key.as_deref(), file.version_id),
+            (Some("in/a"), Some(id))
+        );
+        let file = intended("raw/a".to_string(), &[intent("in/a"), intent("in/b")]);
+        assert_eq!(file.outcome, FileOutcome::Conflict(Vec::new()));
+    }
+
+    #[test]
     fn rejects_bad_rules() {
         assert!(check_rules(&rules()).is_ok());
         for folder in ["", "proteins", "../x/", "/abs/"] {
