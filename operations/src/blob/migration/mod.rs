@@ -1472,18 +1472,18 @@ async fn stage_progress(
         Event::Storage(StorageEvent::WriteResult { .. }) => {}
         other => return Err(format!("could not write migration progress: {other:?}")),
     }
-    // A finished migration leaves the queue together with its last progress.
+    // A finished migration leaves the queue and its rename request with its last progress.
     if record.finished_at_ms.is_some() {
-        match storage
-            .send_storage_effect(StorageEffect::Delete {
-                key_space: COMPRESSION_QUEUE_KEYSPACE.to_string(),
-                key,
+        for space in [COMPRESSION_QUEUE_KEYSPACE, RENAME_MOVE_KEYSPACE] {
+            let delete = StorageEffect::Delete {
+                key_space: space.to_string(),
+                key: key.clone(),
                 txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::DeleteResult { .. }) => {}
-            other => return Err(format!("could not leave the migration queue: {other:?}")),
+            };
+            match storage.send_storage_effect(delete).await {
+                Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+                other => return Err(format!("could not leave the migration queue: {other:?}")),
+            }
         }
     }
     Ok(true)
@@ -1870,6 +1870,7 @@ mod tests {
             (COMPRESSION_QUEUE_KEYSPACE, Vec::new()),
             (COMPRESSION_MIGRATION_KEYSPACE, record.to_bytes().unwrap()),
             (BUCKET_ENCRYPTION_KEYSPACE, settings.to_bytes().unwrap()),
+            (RENAME_MOVE_KEYSPACE, b"1".to_vec()),
         ] {
             storage
                 .send_storage_effect(StorageEffect::Write {
@@ -1892,6 +1893,18 @@ mod tests {
             .unwrap();
         assert!(stored.finished_at_ms.is_some());
         assert_eq!(stored.retry_at_ms, None);
+        // The finished move takes its rename request along.
+        let marker = storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: RENAME_MOVE_KEYSPACE.to_string(),
+                key: b"b".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            marker,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
     }
 
     #[test]

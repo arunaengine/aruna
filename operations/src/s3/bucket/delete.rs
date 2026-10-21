@@ -12,7 +12,8 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE,
     BUCKET_KEY_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE,
     IMPORT_REMOVAL_KEYSPACE, KEY_COPY_KEYSPACE, NODE_VAULT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
-    RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
+    RELATIONSHIP_OUT_KEYSPACE, RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    UPLOAD_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
@@ -553,7 +554,11 @@ impl DeleteBucketOperation {
         let mut deletes = vec![
             (S3_BUCKET_KEYSPACE.to_string(), bucket.clone().into()),
             // A bucket created again under this name starts without encryption.
-            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.into()),
+            (
+                BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                bucket.clone().into(),
+            ),
+            (RENAME_MOVE_KEYSPACE.to_string(), bucket.into()),
         ];
         if let Some(group_id) = self.group_id {
             let key = crate::s3::bucket::key::rows::group_bucket_key(group_id, &self.bucket);
@@ -884,6 +889,8 @@ mod link_tests {
         let (writes, deletes, effects) = delete("delete_empty");
         assert!(deletes.contains(&(BACKEND_IMPORT_KEYSPACE.to_string(), rule().key())));
         assert!(deletes.contains(&(IMPORT_DISCOVERY_KEYSPACE.to_string(), rule().key())));
+        let marker = (RENAME_MOVE_KEYSPACE.to_string(), b"x".to_vec().into());
+        assert!(deletes.contains(&marker));
         let record = writes
             .iter()
             .find(|(space, ..)| space == STORAGE_BACKEND_KEYSPACE)
