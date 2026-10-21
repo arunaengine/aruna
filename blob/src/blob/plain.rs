@@ -108,19 +108,23 @@ impl BlobHandler {
         plain: PlainPath,
         source: BackendLocation,
     ) -> BlobEvent {
-        let version = match self.read_version(&source).await {
+        // Without a version the node streams the newest bytes; the caller checks their hash.
+        let exact = match self.read_version(&source).await {
             Ok(version) => version,
             Err(error) => return BlobEvent::Error(error),
         };
-        // A "null" version names whatever the path holds now, never the recorded bytes.
-        let exact = version.as_deref().filter(|version| *version != "null");
         let inside = resolved.backend == source.backend && !is_folder(&source);
-        let native = match (inside, exact) {
+        let native = match (inside, exact.as_deref()) {
             (true, Some(_)) => self.native_for(&source).ok().flatten(),
             _ => None,
         };
         if let Some(native) = native {
-            let copied = self.copy_inside(resolved.clone(), &plain, &source, (&native, exact));
+            let copied = self.copy_inside(
+                resolved.clone(),
+                &plain,
+                &source,
+                (&native, exact.as_deref()),
+            );
             match Box::pin(copied).await {
                 Ok(Some(event)) => return event,
                 Ok(None) => {}
@@ -593,7 +597,8 @@ impl BlobHandler {
         }
     }
 
-    /// The backend version a write recorded for a tenant path; `None` reads the newest bytes.
+    /// The backend version a write recorded for a tenant path; `None`, also for an unversioned
+    /// "null" one, reads the newest bytes.
     pub(super) async fn read_version(
         &self,
         location: &BackendLocation,
@@ -610,6 +615,7 @@ impl BlobHandler {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => value
                 .map(|value| String::from_utf8(value.to_vec()))
                 .transpose()
+                .map(|version| version.filter(|version| version != "null"))
                 .map_err(|error| BlobError::ReadError(error.to_string())),
             other => Err(BlobError::ReadError(format!(
                 "failed to read the backend version: {other:?}"

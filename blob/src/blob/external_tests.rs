@@ -259,6 +259,18 @@ async fn reads_recorded_version() {
         .send_effect(Effect::Storage(write))
         .await;
     assert_eq!(handler.read_version(&location).await, Ok(Some("v1".into())));
+    // An unversioned "null" version reads the newest bytes, like no version.
+    let write = StorageEffect::Write {
+        key_space: BACKEND_VERSION_KEYSPACE.to_string(),
+        key: version_key(location.ulid),
+        value: b"null".to_vec().into(),
+        txn_id: None,
+    };
+    context
+        .storage_handle
+        .send_effect(Effect::Storage(write))
+        .await;
+    assert_eq!(handler.read_version(&location).await, Ok(None));
 
     // Aruna's own layout never names a backend version.
     location.storage_bucket = "bucket".to_string();
