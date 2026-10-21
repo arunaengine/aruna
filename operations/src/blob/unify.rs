@@ -509,7 +509,9 @@ impl Stage<'_> {
         }
         let mut values = self.batch(reads).await?.into_iter();
         let kept = values.next().flatten();
-        if kept.as_deref() != Some(found.keep.to_bytes().map_err(error)?.as_slice()) {
+        // Compared decoded: the encoding of a location's hash map is not stable.
+        let kept = kept.as_deref().map(BackendLocation::from_bytes).transpose();
+        if kept.map_err(error)?.as_ref() != Some(&found.keep) {
             return Ok(Unified::Changed);
         }
         // A kept file whose backend version a release is deleting takes no new reader.
