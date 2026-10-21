@@ -698,6 +698,13 @@ pub struct BucketInfo {
 }
 
 impl BucketInfo {
+    /// When this bucket was created, in milliseconds; older deletes under its name were of
+    /// an earlier bucket.
+    pub fn created_ms(&self) -> u64 {
+        let since = self.created_at.duration_since(SystemTime::UNIX_EPOCH);
+        since.map_or(0, |since| since.as_millis() as u64)
+    }
+
     /// The only ingress that changes the bucket default ref set.
     pub fn with_policies(
         mut self,

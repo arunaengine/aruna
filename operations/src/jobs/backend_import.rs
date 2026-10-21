@@ -458,7 +458,7 @@ async fn import_object(
         .as_ref()
         .filter(|row| row.key.is_some() && head.is_none());
     if let Some(row) = keyed
-        && deleted_on_purpose(&ctx.driver, rule, &key, row.version_id).await?
+        && deleted_on_purpose(&ctx.driver, run, &key, row.version_id).await?
     {
         return Ok(Outcome::Skipped);
     }
@@ -989,10 +989,20 @@ async fn hide_alias(
 }
 
 /// Whether the delete trail removed version `id` of `key`, or the key without a head. Only the
-/// deletes of this key and the purges of its group are read.
+/// deletes of this key and the purges of its group since the bucket was created are read.
 async fn deleted_on_purpose(
     context: &DriverContext,
+    run: &ImportRun,
+    key: &str,
+    id: Ulid,
+) -> Result<bool, ItemError> {
+    trail_since(context, &run.rule, run.bucket.created_ms(), key, id).await
+}
+
+async fn trail_since(
+    context: &DriverContext,
     rule: &BackendImport,
+    since_ms: u64,
     key: &str,
     id: Ulid,
 ) -> Result<bool, ItemError> {
@@ -1002,7 +1012,9 @@ async fn deleted_on_purpose(
         for (_, value) in iterate(context, DELETE_TRAIL_KEYSPACE, prefix).await? {
             let record = BlobAuditRecord::from_bytes(&value);
             let record = record.map_err(|error| ItemError::System(error.to_string()))?;
-            trail = trail.add(&record, bucket, key, id);
+            if record.occurred_at_ms >= since_ms {
+                trail = trail.add(&record, bucket, key, id);
+            }
         }
     }
     Ok(trail != Trail::Clean)
@@ -1949,7 +1961,7 @@ mod tests {
         let context = crate::tests::s3::test_context(storage);
         let rule = recovery_rule("{dir}{name}");
         let id = Ulid::from_parts(1_000, 1);
-        let deleted = || deleted_on_purpose(&context, &rule, "in/a.csv", id);
+        let deleted = || trail_since(&context, &rule, 0, "in/a.csv", id);
         assert!(!deleted().await.ok().unwrap());
         let record = |key: &str| aruna_core::structs::storage::delete_audit::BlobAuditRecord {
             realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]),
@@ -1971,6 +1983,9 @@ mod tests {
             assert!(write.await.is_ok());
             assert_eq!(deleted().await.ok().unwrap(), key == "in/a.csv");
         }
+        // A bucket created again under the name starts with a clean trail.
+        let fresh = trail_since(&context, &rule, 3_000, "in/a.csv", id).await;
+        assert!(!fresh.ok().unwrap());
     }
 
     #[tokio::test]

@@ -121,11 +121,17 @@ impl PutObjectOperation {
             _ => return self.emit_error(PutObjectError::InvalidOperationState),
         };
         let request = &self.config.request;
+        // Deletes before the bucket was created were of an earlier bucket of the name.
+        let since = self
+            .expected_bucket
+            .as_ref()
+            .map_or(0, BucketInfo::created_ms);
         let Some(scan) = self.trail_scan.as_mut() else {
             return self.emit_error(PutObjectError::InvalidOperationState);
         };
         for (_, value) in values {
             match BlobAuditRecord::from_bytes(&value) {
+                Ok(record) if record.occurred_at_ms < since => {}
                 Ok(record) => {
                     let id = scan.version_id;
                     scan.trail = scan.trail.add(&record, &request.bucket, &request.key, id);

@@ -1828,6 +1828,24 @@ fn writer_reads_trail() {
         panic!("expected the head write, got {effects:?}")
     };
     assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
+    // A delete from before the bucket was created again under its name is of the old bucket.
+    let mut op = writer();
+    op.expected_bucket = Some(BucketInfo {
+        group_id,
+        created_at: std::time::UNIX_EPOCH + std::time::Duration::from_millis(5),
+        created_by: op.config.user_id,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+    });
+    let old = BlobAuditRecord {
+        version_id: op.version_id,
+        ..record
+    };
+    op.trail_read(page(vec![(vec![0].into(), old.to_bytes().unwrap().into())]));
+    assert!(op.output.is_none());
 }
 
 #[tokio::test]
