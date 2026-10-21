@@ -177,7 +177,9 @@ fn rename_input(
   unfinished versions.
 
 **Limits**
-- At most 1000 keys; `truncated` is `true` when more lie under `from`. Rename in parts.
+- At most 1000 keys; `truncated` is `true` when more lie under `from`. Rename in parts, except
+  into a folder inside `from` (such as `""` to `archive/`): a later part would select the keys
+  an earlier one moved, so more than 1000 keys there answer 409.
 - Encrypted buckets and buckets that replicate or have queued copies to other nodes answer 409,
   as do buckets with a running permanent purge, import, compression or storage move."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
