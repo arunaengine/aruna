@@ -2059,23 +2059,25 @@ async fn abandon(
         backend: intent.backend.clone(),
         path: path.clone(),
     };
-    let version = match blob_handle.send_blob_effect(stat).await {
-        Event::Blob(BlobEvent::PlainStat {
-            exists: true,
-            version: Some(version),
-        }) => version,
-        // Nothing there, or no exact version to delete: the file, if any, stays.
+    match blob_handle.send_blob_effect(stat).await {
+        Event::Blob(BlobEvent::PlainStat { exists: true, .. }) => {}
+        // Nothing there: nothing to release.
         Event::Blob(BlobEvent::PlainStat { .. }) => return Ok(true),
         _ => return Ok(false),
-    };
+    }
     let resolved = ResolvedBackend::new(intent.backend.clone(), None);
     let hash = BlobEffect::HashExternal {
         resolved,
         path,
         created_by: intent.created_by,
     };
-    let mut location = match blob_handle.send_blob_effect(hash).await {
-        Event::Blob(BlobEvent::ExternalHashed { location, .. }) => location,
+    // Only the backend version whose bytes were hashed may go; without one the file stays.
+    let (mut location, version) = match blob_handle.send_blob_effect(hash).await {
+        Event::Blob(BlobEvent::ExternalHashed {
+            location,
+            version: Some(version),
+        }) => (location, version),
+        Event::Blob(BlobEvent::ExternalHashed { version: None, .. }) => return Ok(true),
         _ => return Ok(false),
     };
     let written = intent.written.map(|hash| hash.to_vec());
