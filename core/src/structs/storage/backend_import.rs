@@ -778,9 +778,15 @@ mod tests {
         let current = rule(DEFAULT_PATTERN);
         let old = format!("raw/{id}_a.csv");
         assert_eq!(current.decode_path(&old), PathIdentity::Unmatched);
-        assert_eq!(current.decode_any(&old, &[prefix.clone()]), decoded);
+        assert_eq!(
+            current.decode_any(&old, std::slice::from_ref(&prefix)),
+            decoded
+        );
         let new = format!("raw/a.csv~{id}");
-        assert_eq!(current.decode_any(&new, &[prefix.clone()]), decoded);
+        assert_eq!(
+            current.decode_any(&new, std::slice::from_ref(&prefix)),
+            decoded
+        );
         // Two earlier patterns that read one path differently name no single version.
         let path = format!("raw/{id}_{}", Ulid::from_parts(3, 4));
         let both = [
