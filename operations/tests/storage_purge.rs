@@ -910,6 +910,21 @@ async fn seed_linked(context: &TestContext, key: &str, version_id: Ulid) -> Back
             version_key(ulid).to_vec(),
             b"p1".to_vec(),
         ),
+        (
+            aruna_core::keyspaces::PATHS_INDEX_KEYSPACE,
+            aruna_core::structs::storage::blob::HashIndex::new(
+                [5; 32],
+                version_id,
+                context.realm_id,
+                context.group_id,
+                context.node_id,
+                "bucket",
+                key,
+            )
+            .to_bytes()
+            .unwrap(),
+            Vec::new(),
+        ),
     ];
     for (space, key, value) in rows {
         write_value(storage, space, key, value).await;
@@ -1044,4 +1059,77 @@ async fn list_linked(context: &TestContext) -> Vec<(String, Ulid)> {
             (key.key, key.version_id)
         })
         .collect()
+}
+
+#[tokio::test]
+async fn cancelled_queue_releases() {
+    // A purge cancelled while queued ends at once; the files it planned before are released
+    // by the cleanup queue, because the job ended.
+    use aruna_operations::jobs::runtime::JobsRuntime;
+    use aruna_operations::jobs::service::cancel_owned_job;
+    let context = setup_context().await;
+    seed_linked(&context, "linked/a.txt", Ulid::generate()).await;
+    let spec = files_spec(&context);
+    let job_id = JobId::from_bytes([0xE3; 16]);
+    let record = JobRecord::new(
+        job_id,
+        JobPayload::StoragePurgeFiles(spec),
+        context.user_id,
+        context.node_id,
+        1,
+        1,
+        None,
+    );
+    insert_job(&context.driver.storage_handle, &record)
+        .await
+        .unwrap();
+    let versions = list_linked(&context).await;
+    let found = aruna_operations::blob::purge::storage_files(
+        &context.driver,
+        ("bucket", context.group_id),
+        &versions,
+        None,
+    )
+    .await
+    .unwrap();
+    aruna_operations::blob::purge::plan_files(&context.driver, job_id.as_ulid(), &found)
+        .await
+        .unwrap();
+    let storage = &context.driver.storage_handle;
+    assert_eq!(releases(storage).await.len(), 1);
+
+    let runtime = JobsRuntime::new_paused();
+    cancel_owned_job(&context.driver, &runtime, context.user_id, job_id)
+        .await
+        .unwrap();
+    let stored = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.state.is_terminal());
+    // The version still reads its file, so the release keeps it and the plan is settled.
+    let backend = aruna_core::structs::storage::group_backend::GroupStorage {
+        backend_id: Ulid::from_parts(3, 3),
+        group_id: context.group_id,
+        name: "tenant".to_string(),
+        kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
+        public_config: HashMap::new(),
+        created_at: UNIX_EPOCH,
+        updated_at: UNIX_EPOCH,
+        created_by: context.user_id,
+        disabled: false,
+        cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
+    };
+    write_value(
+        storage,
+        aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE,
+        aruna_operations::groups::backends::backend_key(backend.backend_id).to_vec(),
+        backend.to_bytes().unwrap(),
+    )
+    .await;
+    let outcome = aruna_operations::blob::cleanup::process_cleanup_batch(&context.driver)
+        .await
+        .unwrap();
+    assert_eq!((outcome.processed, outcome.dropped), (1, 0), "{outcome:?}");
+    assert!(releases(storage).await.is_empty());
 }
