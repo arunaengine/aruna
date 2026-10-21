@@ -2585,6 +2585,127 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn settles_before_abort() {
+        // An aborted rename first runs each version with a move intent again; one that fails
+        // keeps the move open for a retry, one that is gone lets it end.
+        use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
+        let temp = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let context = crate::tests::s3::test_context(storage.clone());
+        let group = Ulid::from_parts(1, 1);
+        let rule = BackendImport {
+            import_id: Ulid::from_parts(2, 2),
+            group_id: group,
+            backend_id: Ulid::from_parts(3, 3),
+            backend_prefix: "raw/".to_string(),
+            bucket: "b".to_string(),
+            key_prefix: String::new(),
+            schedule: None,
+            created_by: Default::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: DEFAULT_PATTERN.to_string(),
+        };
+        let info = BucketInfo {
+            group_id: group,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+        };
+        let id = Ulid::from_parts(9, 9);
+        let intent = WriteIntent {
+            key: "a.csv".to_string(),
+            version_id: id,
+            backend: BackendRef::Group(rule.backend_id),
+            created_by: Default::default(),
+            written: Some([1; 32]),
+        };
+        let write = |key_space: &str, key: Vec<u8>, value: Vec<u8>| StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        };
+        let intent_row = intent_key(rule.import_id, "raw/a.csv~X", id).to_vec();
+        let version = VersionKey::new("b", "a.csv", id).to_bytes().unwrap();
+        let backend = aruna_core::structs::storage::group_backend::GroupStorage {
+            backend_id: rule.backend_id,
+            group_id: group,
+            name: "tenant".to_string(),
+            kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
+            public_config: Default::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            disabled: false,
+            cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
+        };
+        let backend_row = (
+            rule.backend_id.to_bytes().to_vec(),
+            backend.to_bytes().unwrap(),
+        );
+        for effect in [
+            write(
+                aruna_core::keyspaces::BACKEND_INDEX_KEYSPACE,
+                crate::groups::backends::index_key(group, rule.backend_id).to_vec(),
+                backend.to_bytes().unwrap(),
+            ),
+            write(S3_BUCKET_KEYSPACE, b"b".to_vec(), info.to_bytes().unwrap()),
+            write(
+                BACKEND_IMPORT_KEYSPACE,
+                rule.key().to_vec(),
+                rule.to_bytes().unwrap(),
+            ),
+            write(
+                IMPORT_INTENT_KEYSPACE,
+                intent_row,
+                intent.to_bytes().unwrap(),
+            ),
+            // A version row that cannot be read makes its run fail.
+            write(BLOB_VERSIONS_KEYSPACE, version.clone(), vec![0xff; 3]),
+        ] {
+            storage.send_storage_effect(effect).await;
+        }
+        let mut record = CompressionMigration::new(Compression::Off, 7);
+        record.moving = true;
+        let key: Key = b"b".to_vec().into();
+        let stored = write(
+            COMPRESSION_MIGRATION_KEYSPACE,
+            b"b".to_vec(),
+            record.to_bytes().unwrap(),
+        );
+        storage.send_storage_effect(stored).await;
+
+        assert!(
+            end_aborted(&context, "b", record.clone())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let waiting = read_progress(&context, &key).await.unwrap().unwrap();
+        assert_eq!((waiting.finished_at_ms, waiting.retries), (None, 1));
+
+        // Once the version is gone, its intent settles and the move ends.
+        let delete = StorageEffect::Delete {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: version.into(),
+            txn_id: None,
+        };
+        storage.send_storage_effect(delete).await;
+        assert_eq!(end_aborted(&context, "b", waiting).await.unwrap(), None);
+        let ended = read_progress(&context, &key).await.unwrap().unwrap();
+        assert!(ended.finished_at_ms.is_some());
+    }
+
     #[test]
     fn rejects_wrong_event() {
         let mut operation = operation();
