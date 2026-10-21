@@ -1210,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn keyless_row_owns_nothing() {
+    fn ignores_keyless_rows() {
         // An imported `raw/a.csv` maps to `in/a.csv`, yet `in/x/a.csv` can give the same path.
         let listed = aruna_core::structs::storage::backend_import::ExternalObject {
             key: "raw/a.csv".to_string(),

@@ -1089,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_file_without_rule() {
+    fn keeps_unclaimed_file() {
         // The rule was removed before completion, so nothing proves the file there is ours.
         let id = Ulid::from_parts(6, 6);
         let mut operation = in_place_for(id, None);
@@ -1103,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_owner_at_path() {
+    fn reads_path_owner() {
         // An upload opened at a tagged path asks who owns that path, not the plain one.
         let mut operation = in_place(Ulid::from_parts(6, 6));
         let effects = operation.read_owner((

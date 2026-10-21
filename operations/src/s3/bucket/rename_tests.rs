@@ -607,7 +607,7 @@ async fn waits_for_uploads() {
 }
 
 #[tokio::test]
-async fn hides_names_in_errors() {
+async fn hides_error_names() {
     let (_directory, context) = setup().await;
     object(&context, "secret/x", &[Ulid::from_parts(10, 1)], false).await;
     let long = format!("{}/", "a".repeat(MAX_KEY_LEN));

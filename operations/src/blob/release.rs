@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keeps_other_rule_file() {
+    async fn keeps_shared_file() {
         // Another rule on the same storage, as one sharing the folder, still lists the file.
         let (_dir, context) = setup();
         renamed_row(&context, IMPORT).await;

@@ -1469,9 +1469,8 @@ mod pure_tests {
 
     #[test]
     fn opens_plain_path() {
-        // A same-name upload looks at the path first and opens where a single write would go.
-        // A foreign file without versions keeps its path; the upload takes its tagged path.
-        // A file the rule recorded for another key or not at all is kept even with versions.
+        // A same-name upload opens where a single write would go. A file the rule did not record
+        // for this key keeps its path, with or without versions; the upload takes its tagged path.
         let own = Some("archive/one");
         let cases = [
             (own, false, None, false, true),
