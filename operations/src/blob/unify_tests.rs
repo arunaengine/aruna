@@ -112,7 +112,7 @@ async fn unifies_twin_files() {
     store(&context, "b.faa.gz", Ulid::from_parts(30, 1), &single).await;
     let access = load(&context).await;
 
-    let page = preview_page(&context, (BUCKET, ""), &access, (None, 100))
+    let page = preview_page(&context, (BUCKET, ""), &access, (None, None, 100))
         .await
         .unwrap();
     assert_eq!((page.keys, page.bytes, page.complete), (1, 10, true));
@@ -163,7 +163,7 @@ async fn unifies_twin_files() {
         }]
     );
     // Nothing is left to unify.
-    let page = preview_page(&context, (BUCKET, ""), &access, (None, 100))
+    let page = preview_page(&context, (BUCKET, ""), &access, (None, None, 100))
         .await
         .unwrap();
     assert_eq!(page.keys, 0);
@@ -178,7 +178,7 @@ async fn pages_all_keys() {
     let access = load(&context).await;
     let (mut after, mut seen) = (None, Vec::new());
     loop {
-        let page = preview_page(&context, (BUCKET, ""), &access, (after, 100))
+        let page = preview_page(&context, (BUCKET, ""), &access, (None, after, 100))
             .await
             .unwrap();
         assert_eq!((page.keys, page.bytes), (150, 1500));

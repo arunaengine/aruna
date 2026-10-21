@@ -70,18 +70,18 @@ pub struct UnifyPage {
 }
 
 /// The versions of the keys of a bucket in storage order, one key at a time.
-struct KeyWalk<'a> {
+pub(crate) struct KeyWalk<'a> {
     context: &'a DriverContext,
     bucket: &'a str,
     start: Option<Key>,
     rows: std::collections::VecDeque<(Key, Value)>,
     end: bool,
-    scanned: usize,
+    pub(crate) scanned: usize,
 }
 
 impl<'a> KeyWalk<'a> {
     /// Starts after every version of `after`.
-    fn new(context: &'a DriverContext, bucket: &'a str, after: Option<&str>) -> Self {
+    pub(crate) fn new(context: &'a DriverContext, bucket: &'a str, after: Option<&str>) -> Self {
         let start = after.and_then(|key| VersionKey::object_prefix(bucket, key).ok());
         // Every version of the key sorts before its prefix followed by these bytes.
         let start = start.map(|mut prefix| {
@@ -116,7 +116,7 @@ impl<'a> KeyWalk<'a> {
     }
 
     /// The next key and its versions; `None` at the end of the bucket.
-    async fn next(&mut self) -> Result<Option<(String, Vec<(Ulid, Vec<u8>)>)>, String> {
+    pub(crate) async fn next(&mut self) -> Result<Option<(String, Vec<(Ulid, Vec<u8>)>)>, String> {
         let mut key = None::<String>;
         let mut versions = Vec::new();
         loop {
@@ -235,11 +235,14 @@ pub async fn preview_page(
     context: &DriverContext,
     (bucket, prefix): (&str, &str),
     access: &BucketAccess,
-    (after, limit): (Option<String>, usize),
+    (filter, after, limit): (Option<&str>, Option<String>, usize),
 ) -> Result<UnifyPage, String> {
     let routing = move_routing(context, bucket).await?;
-    let readable =
-        |key: &str| key.starts_with(prefix) && access.allows(Some(key), &Permission::READ);
+    let readable = |key: &str| {
+        key.starts_with(prefix)
+            && filter.is_none_or(|filter| key.contains(filter))
+            && access.allows(Some(key), &Permission::READ)
+    };
     let mut page = UnifyPage {
         complete: true,
         ..UnifyPage::default()
