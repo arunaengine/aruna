@@ -48,9 +48,10 @@ async fn stores_rules() {
     let Json(read) = get_discovery(state(), auth(), path()).await.unwrap();
     assert_eq!(read, body.0);
     // An empty list removes every rule.
-    put_discovery(state(), auth(), path(), rules(&[]))
+    let Json(emptied) = put_discovery(state(), auth(), path(), rules(&[]))
         .await
         .unwrap();
+    assert!(emptied.rules.is_empty());
     let Json(cleared) = get_discovery(state(), auth(), path()).await.unwrap();
     assert!(cleared.rules.is_empty());
 }
