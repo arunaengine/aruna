@@ -500,12 +500,16 @@ async fn import_object(
     {
         return Ok(Outcome::Skipped);
     }
-    let (location, version) = hash_object(ctx, spec, resolved, object).await?;
+    let (location, version, verified) = hash_object(ctx, spec, resolved, object).await?;
     if location.blob_size != object.size {
         return Err(ItemError::Item(
             "the object changed while it was read".to_string(),
         ));
     }
+    let committed = ImportedObject {
+        etag: observed(object, verified).etag,
+        ..committed
+    };
     let size = location.blob_size;
     let fence = Fence {
         head,
@@ -688,7 +692,7 @@ async fn hash_listed(
     spec: &BackendImportSpec,
     resolved: &ResolvedBackend,
     object: &ExternalObject,
-) -> Result<(BackendLocation, Option<String>), ItemError> {
+) -> Result<Hashed, ItemError> {
     let hashed = hash_object(ctx, spec, resolved.clone(), object).await?;
     if hashed.0.blob_size != object.size {
         return Err(item("the object changed while it was read"));
@@ -835,7 +839,7 @@ async fn recover(
     }
     let hash = hashed
         .as_ref()
-        .and_then(|(location, _)| location.get_blake3());
+        .and_then(|(location, ..)| location.get_blake3());
     let hash = hash.and_then(|hash| <[u8; 32]>::try_from(hash).ok());
     let names = (rule, run.earlier.as_slice(), run.discovery.as_slice());
     let Some(identity) = choose_identity(names, &object.key, claims, hash.as_ref())? else {
@@ -854,10 +858,11 @@ async fn recover(
     {
         return Ok(Some(outcome));
     }
-    let (mut location, version) = match hashed {
+    let (mut location, version, verified) = match hashed {
         Some(hashed) => hashed,
         None => hash_listed(ctx, spec, resolved, object).await?,
     };
+    let object = &observed(object, verified);
     if let Some((_, writer)) = &intent {
         location.created_by = *writer;
     }
@@ -1236,10 +1241,11 @@ async fn register_twin(
 ) -> Result<Outcome, ItemError> {
     let rule = &run.rule;
     let candidates = candidates(&ctx.driver, rule, key, object).await?;
-    let (mut location, version) = hash_object(ctx, spec, resolved, object).await?;
+    let (mut location, version, verified) = hash_object(ctx, spec, resolved, object).await?;
     if location.blob_size != object.size {
         return Err(item("the object changed while it was read"));
     }
+    let object = &observed(object, verified);
     let same = (candidates.into_iter()).find(|(.., hash)| location.get_blake3() == Some(&hash[..]));
     let Some((stored, value, version_id, _)) = same else {
         return add_version(ctx, spec, run, object, (key, head), (location, version)).await;
@@ -1558,6 +1564,9 @@ async fn exact_version(
     Ok((version_key, exact))
 }
 
+/// A hashed file, its backend version, and whether its read showed the listing's ETag.
+type Hashed = (BackendLocation, Option<String>, bool);
+
 /// Hashes the listed `object`; bytes with another ETag than the listing's are left for the
 /// next run, so a row never pairs one file's hash with another's ETag.
 async fn hash_object(
@@ -1565,7 +1574,7 @@ async fn hash_object(
     spec: &BackendImportSpec,
     resolved: ResolvedBackend,
     object: &ExternalObject,
-) -> Result<(BackendLocation, Option<String>), ItemError> {
+) -> Result<Hashed, ItemError> {
     let effect = BlobEffect::HashExternal {
         resolved,
         path: object.key.clone(),
@@ -1577,19 +1586,31 @@ async fn hash_object(
             version,
             etag,
         }) => match read_listed(object.etag.as_deref(), etag.as_deref()) {
-            true => Ok((location, version)),
-            false => Err(ItemError::Changed),
+            Some(verified) => Ok((location, version, verified)),
+            None => Err(ItemError::Changed),
         },
         Ok(other) => Err(ItemError::System(format!("unexpected answer {other:?}"))),
         Err(error) => Err(hash_failure(error)),
     }
 }
 
-/// Whether the hashed read answered with the listing's ETag; a listing without one proves
-/// nothing, a read without one proves no match.
-fn read_listed(listed: Option<&str>, read: Option<&str>) -> bool {
+/// `None` when the hashed read answered with another ETag than the listing; else whether it
+/// showed the listing's ETag, which only then may be recorded for the hashed bytes.
+fn read_listed(listed: Option<&str>, read: Option<&str>) -> Option<bool> {
     let unquoted = |etag: &str| etag.trim_matches('"').to_string();
-    listed.is_none_or(|listed| read.is_some_and(|read| unquoted(read) == unquoted(listed)))
+    match (listed, read) {
+        (Some(listed), Some(read)) => (unquoted(listed) == unquoted(read)).then_some(true),
+        (Some(_), None) => Some(false),
+        (None, _) => Some(true),
+    }
+}
+
+/// The listed object as its rows record it: without an ETag its read did not show.
+fn observed(object: &ExternalObject, verified: bool) -> ExternalObject {
+    ExternalObject {
+        etag: object.etag.clone().filter(|_| verified),
+        ..object.clone()
+    }
 }
 
 /// Only an object that is gone or unreadable by its key fails alone; a backend outage
@@ -2178,10 +2199,14 @@ mod tests {
 
     #[test]
     fn checks_read_etags() {
-        assert!(read_listed(None, None));
-        assert!(read_listed(Some("\"a\""), Some("a")));
-        assert!(!read_listed(Some("a"), Some("b")));
-        assert!(!read_listed(Some("a"), None));
+        assert_eq!(read_listed(None, None), Some(true));
+        assert_eq!(read_listed(Some("\"a\""), Some("a")), Some(true));
+        assert_eq!(read_listed(Some("a"), Some("b")), None);
+        // A read without an ETag imports the file, which then records none.
+        assert_eq!(read_listed(Some("a"), None), Some(false));
+        let listed = object("\"a\"");
+        assert_eq!(observed(&listed, false).etag, None);
+        assert_eq!(observed(&listed, true), listed);
     }
 
     #[test]

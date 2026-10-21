@@ -622,9 +622,11 @@ impl ImportedObject {
     /// around an ETag do not count, as write answers and listings differ there.
     pub fn matches(&self, object: &ExternalObject) -> bool {
         let unquoted = |etag: Option<&str>| etag.map(|etag| etag.trim_matches('"').to_string());
+        // A row whose read showed no ETag records none; its modification time decides.
+        let timed = self.etag.is_none() && self.modified_ms.is_some();
         self.size == object.size
-            && unquoted(self.etag.as_deref()) == unquoted(object.etag.as_deref())
-            && (object.etag.is_some() || self.modified_ms == object.modified_ms)
+            && (timed || unquoted(self.etag.as_deref()) == unquoted(object.etag.as_deref()))
+            && ((object.etag.is_some() && !timed) || self.modified_ms == object.modified_ms)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -968,6 +970,9 @@ mod tests {
         let untagged = ImportedObject::new(Ulid::nil(), &object(None, Some(1)));
         assert!(untagged.matches(&object(None, Some(1))));
         assert!(!untagged.matches(&object(None, Some(2))));
+        // A row recorded without the listed ETag compares by time.
+        assert!(untagged.matches(&object(Some("e1"), Some(1))));
+        assert!(!untagged.matches(&object(Some("e1"), Some(2))));
     }
 
     #[test]
