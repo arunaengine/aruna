@@ -698,7 +698,9 @@ impl BlobHandler {
 fn conditional_unsupported(error: &opendal::Error) -> bool {
     match error.kind() {
         ErrorKind::Unsupported => true,
-        ErrorKind::Unexpected => error.to_string().contains("NotImplemented"),
+        ErrorKind::Unexpected => error
+            .message()
+            .starts_with("S3Error { code: \"NotImplemented\""),
         _ => false,
     }
 }
@@ -749,6 +751,12 @@ mod tests {
             ErrorKind::Unexpected,
             "S3Error { code: \"AccessDenied\" }"
         ));
+        let uri = opendal::Error::new(
+            ErrorKind::Unexpected,
+            "S3Error { code: \"InternalError\", message: \"\" }",
+        )
+        .with_context("uri", "https://s3/b/01M5G_NotImplementedError.py");
+        assert!(!conditional_unsupported(&uri));
     }
 
     #[test]
