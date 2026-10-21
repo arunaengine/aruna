@@ -598,7 +598,11 @@ async fn run_job(
 
     let storage = &context.storage_handle;
     let job_id = record.job_id;
-    let import_cleanup = matches!(&record.payload, JobPayload::ImportRoCrate(_));
+    // These jobs settle their own cancellation: an import cleans up, a purge hands over files.
+    let import_cleanup = matches!(
+        &record.payload,
+        JobPayload::ImportRoCrate(_) | JobPayload::StoragePurgeFiles(_)
+    );
 
     if record.cancel_requested && !import_cleanup {
         run_cleanup(&record.payload);
