@@ -45,6 +45,11 @@ pub(crate) async fn release_renamed(
     // A completed tombstone is never written over or cleared: those bytes are gone.
     match read_value(context, DELETE_CLAIM_KEYSPACE, claim.clone()).await {
         Ok(Some(value)) if value == TOMBSTONE => return true,
+        // A delete was sent without a known outcome: only that delete is finished, never undone.
+        Ok(Some(value)) if value == DELETING => {
+            return finish_delete(context, location, (import_id, version_id), (version, keys))
+                .await;
+        }
         Ok(_) => {}
         Err(error) => {
             warn!(%error, "Delete claim could not be read");
@@ -62,9 +67,51 @@ pub(crate) async fn release_renamed(
     }
 }
 
-/// The value of a pending delete claim, and of the tombstone of a deleted backend version.
+/// The value of a pending delete claim, of one whose delete was sent, and of the tombstone of
+/// a deleted backend version. Only a pending claim is ever cleared.
 const PENDING: &[u8] = b"";
+const DELETING: &[u8] = b"deleting";
 const TOMBSTONE: &[u8] = b"deleted";
+
+/// Sends the delete of a claim marked deleting once more; it answers for a missing file too.
+/// The tombstone follows, then the row that named the version.
+async fn finish_delete(
+    context: &DriverContext,
+    location: BackendLocation,
+    (import_id, version_id): (Ulid, Ulid),
+    (version, claim): (String, (&Key, &Key)),
+) -> bool {
+    let Some(blob_handle) = context.blob_handle.as_ref() else {
+        return false;
+    };
+    let key = object_key(import_id, &location.backend_path);
+    let effect = BlobEffect::DeletePlain {
+        location: location.clone(),
+        version: version.clone(),
+    };
+    match blob_handle.send_blob_effect(effect).await {
+        Event::Blob(BlobEvent::DeleteFinished) => {}
+        event => {
+            warn!(?event, "A sent delete could not be finished");
+            return false;
+        }
+    }
+    if !claimed(context, claim, Some(TOMBSTONE)).await || !synced(context).await {
+        return false;
+    }
+    let observed = match read_value(context, IMPORTED_OBJECT_KEYSPACE, key.clone()).await {
+        Ok(observed) => observed,
+        Err(_) => return false,
+    };
+    let row = observed.as_deref().map(ImportedObject::from_bytes);
+    let named = matches!(row, Some(Ok(row)) if row.version_id == version_id);
+    // Another location of the path at another backend version keeps the path's row.
+    let shared = !matches!(pinned(context, &location, &version).await, Ok(Some(false)));
+    match (observed, named && !shared) {
+        (Some(observed), true) => drop_row(context, key, observed).await,
+        _ => true,
+    }
+}
 
 /// How a release ended.
 enum Released {
@@ -166,6 +213,10 @@ async fn release_claimed(
     let Some(blob_handle) = context.blob_handle.as_ref() else {
         return Released::Retry;
     };
+    // From here the claim is never cleared: the delete may land whatever its answer says.
+    if !claimed(context, claim, Some(DELETING)).await || !synced(context).await {
+        return Released::Retry;
+    }
     let effect = BlobEffect::DeletePlain { location, version };
     match blob_handle.send_blob_effect(effect).await {
         // The tombstone is on disk before anything else may fail.
@@ -174,7 +225,7 @@ async fn release_claimed(
                 return Released::Retry;
             }
         }
-        // A storage that cannot delete this exact version keeps the file and its row.
+        // A storage that cannot delete this exact version surely kept the file and its row.
         Event::Blob(BlobEvent::Error(BlobError::CleanupUnsupported)) => return Released::Kept,
         event => {
             warn!(?event, "Renamed file could not be deleted");
@@ -801,6 +852,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored.as_deref(), Some(TOMBSTONE));
+    }
+
+    #[tokio::test]
+    async fn finishes_sent_deletes() {
+        // A delete that was sent keeps its claim until it is finished, also when a version now
+        // reads the path; without the blob storage it waits.
+        let (_dir, context) = setup();
+        let claim = claim_key(&old(), "v1").unwrap();
+        let index: Key = [&IMPORT.to_bytes()[..], &claim[..]].concat().into();
+        assert!(claimed(&context, (&claim, &index), Some(DELETING)).await);
+        alias_version(&context, old().format.encoding()).await;
+        assert!(!release(&context).await);
+        let stored = read_value(&context, DELETE_CLAIM_KEYSPACE, claim)
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(DELETING));
     }
 
     #[tokio::test]
