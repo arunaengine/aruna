@@ -7,7 +7,9 @@ use crate::s3::object::put::{
     PlainRecord, intent_deletes, intent_keys, intent_writes, owner_read, owns_path, same_name_path,
     version_row,
 };
-use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, IMPORT_INTENT_KEYSPACE};
+use aruna_core::keyspaces::{
+    BACKEND_IMPORT_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, IMPORT_INTENT_KEYSPACE,
+};
 use aruna_core::structs::storage::backend_import::{
     WriteIntent, import_key, intent_key, tagged_path,
 };
@@ -357,7 +359,26 @@ impl CompleteUploadOperation {
             return self.schedule_error(CompleteUploadError::VersionExists);
         }
         self.registered = true;
-        self.delete_upload_records()
+        // The import's own location reads the file, so a second one would count it twice.
+        let staged = self.final_location.as_ref().filter(|_| self.new_blob);
+        let Some(key) = staged.and_then(|location| location.location_key().ok()) else {
+            return self.delete_upload_records();
+        };
+        self.new_blob = false;
+        self.state = CompleteUploadState::DropStagedLocation;
+        smallvec![Effect::Storage(StorageEffect::Delete {
+            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+            key: key.to_bytes().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    pub(super) fn staged_dropped(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::DeleteResult { .. }) => self.delete_upload_records(),
+            Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
+            _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
+        }
     }
 
     /// Reads the rule of a listed plain object in the finalize transaction, so its import
@@ -569,8 +590,9 @@ mod tests {
 
     #[test]
     fn adopts_registered_version() {
-        let found = |stored: Option<[u8; 32]>| {
+        let found = |stored: Option<[u8; 32]>, staged: bool| {
             let (mut operation, _) = recorded(true, None);
+            operation.new_blob = staged;
             operation.state = CompleteUploadState::ReadLivenessVersion;
             // The version is read in the finalize transaction before the head moves.
             let effects = operation.write_current_lookup(None);
@@ -596,21 +618,31 @@ mod tests {
             }));
             (operation, effects)
         };
-        let (_, effects) = found(None);
+        let (_, effects) = found(None, false);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Write { key_space, .. })]
                 if key_space == aruna_core::keyspaces::BLOB_HEAD_KEYSPACE
         ));
         // The same bytes registered by an import: only the upload is cleared, then committed.
-        let (mut operation, _) = found(Some([7u8; 32]));
+        let (mut operation, _) = found(Some([7u8; 32]), false);
         assert_eq!(operation.state, CompleteUploadState::DeleteUploadRecords);
+        // A location the upload staged for that file goes, so the file counts once.
+        let (mut staged, effects) = found(Some([7u8; 32]), true);
+        let [Effect::Storage(StorageEffect::Delete { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the staged location delete, got {effects:?}")
+        };
+        assert_eq!(key_space, BLOB_LOCATIONS_KEYSPACE);
+        staged.step(Event::Storage(StorageEvent::DeleteResult {
+            key: Vec::new().into(),
+        }));
+        assert_eq!(staged.state, CompleteUploadState::DeleteUploadRecords);
         let effects = operation.write_obligation();
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { .. })]
         ));
-        let (mut operation, _) = found(Some([8u8; 32]));
+        let (mut operation, _) = found(Some([8u8; 32]), false);
         assert_eq!(
             operation.cleanup.take_error(),
             Some(CompleteUploadError::VersionExists)

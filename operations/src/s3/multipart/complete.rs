@@ -119,6 +119,8 @@ pub enum CompleteUploadState {
     WriteEvidence,
     /// Reads the version an import may have registered already.
     ReadRegistered,
+    /// Drops the location the upload staged for bytes an import registered already.
+    DropStagedLocation,
     WriteCleanupRecords,
     WriteReplicationObligation,
     EnforceQuota,
@@ -2354,6 +2356,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::ReadLivenessVersion => self.liveness_read(event),
             CompleteUploadState::WriteBlobHead => self.head_written(event),
             CompleteUploadState::ReadRegistered => self.registered_read(event),
+            CompleteUploadState::DropStagedLocation => self.staged_dropped(event),
             CompleteUploadState::WritePathIndex => self.path_index_written(event),
             CompleteUploadState::WriteVersionRecord => self.version_written(event),
             CompleteUploadState::WriteEnvelope => self.envelope_written(event),
