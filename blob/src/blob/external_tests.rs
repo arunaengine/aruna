@@ -374,3 +374,47 @@ async fn deletes_renamed_files() {
         BlobEvent::Error(BlobError::DeleteError(_))
     ));
 }
+
+#[tokio::test]
+async fn copies_plain_files() {
+    use aruna_core::structs::storage::backend_import::PlainPath;
+    use ulid::Ulid;
+
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let root = context._temp_dir.path().join("hot");
+    place(&root, "raw/7_a.txt", b"copied bytes");
+    let resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
+    let BlobEvent::ExternalHashed { location, .. } = handler
+        .hash_external(resolved.clone(), "raw/7_a.txt".to_string(), test_user_id())
+        .await
+    else {
+        panic!("hash failed")
+    };
+    let plain = PlainPath {
+        path: "raw/a.txt~7".to_string(),
+        ulid: Ulid::generate(),
+        if_not_exists: true,
+        exact: true,
+    };
+
+    // A storage without provider copies streams the bytes and hashes them again.
+    let event = handler
+        .copy_plain(resolved, plain.clone(), location.clone())
+        .await;
+    let (BlobEvent::WriteFinished { location: copy }
+    | BlobEvent::PlainWritten { location: copy, .. }) = event
+    else {
+        panic!("copy failed: {event:?}")
+    };
+    assert_eq!(copy.backend_path, plain.path);
+    assert_eq!(copy.get_blake3(), location.get_blake3());
+    assert_eq!(
+        std::fs::read(root.join("raw/a.txt~7")).unwrap(),
+        b"copied bytes"
+    );
+    assert_eq!(
+        std::fs::read(root.join("raw/7_a.txt")).unwrap(),
+        b"copied bytes"
+    );
+}

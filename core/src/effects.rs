@@ -353,6 +353,14 @@ pub enum BlobEffect {
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
+    /// Copies the file at `source`, at its recorded backend version, raw to `plain.path` on
+    /// `resolved` and answers `PlainWritten` with the source's hashes. An S3 storage copies
+    /// inside the provider; other storages stream the bytes through the node and hash them.
+    CopyPlain {
+        resolved: ResolvedBackend,
+        plain: PlainPath,
+        source: BackendLocation,
+    },
     /// Answers `CopyStat`: whether the backend still has the object of `location`.
     StatCopy {
         location: BackendLocation,

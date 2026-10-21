@@ -98,6 +98,116 @@ impl BlobHandler {
         Box::pin(self.write_tenant(location, operator, blob, conditional)).await
     }
 
+    /// Copies `source` to `plain.path`: inside the provider where both lie on one S3 storage
+    /// and the source has a recorded version, else through the node.
+    pub(super) async fn copy_plain(
+        &self,
+        resolved: ResolvedBackend,
+        plain: PlainPath,
+        source: BackendLocation,
+    ) -> BlobEvent {
+        let version = match self.read_version(&source).await {
+            Ok(version) => version,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let inside = resolved.backend == source.backend && !is_folder(&source);
+        let native = match (inside, version.as_deref()) {
+            (true, Some(_)) => self.native_for(&source).ok().flatten(),
+            _ => None,
+        };
+        let Some(native) = native else {
+            return match self.read_blob(source.clone()).await {
+                BlobEvent::ReadFinished { blob, .. } => {
+                    let created_by = source.created_by;
+                    Box::pin(self.write_plain(resolved, plain, created_by, blob)).await
+                }
+                other => other,
+            };
+        };
+        let copied = self.copy_inside(resolved, plain, &source, (&native, version.as_deref()));
+        match Box::pin(copied).await {
+            Ok(event) => event,
+            Err(error) => BlobEvent::Error(error),
+        }
+    }
+
+    /// The provider copies the exact source version in parts of at most `COPY_PART` bytes and
+    /// completes create-only where asked. The size is checked, and the MD5 of a one-part copy.
+    async fn copy_inside(
+        &self,
+        resolved: ResolvedBackend,
+        plain: PlainPath,
+        source: &BackendLocation,
+        (native, version): (&crate::s3::NativeMultipart, Option<&str>),
+    ) -> Result<BlobEvent, BlobError> {
+        let class = resolved.storage_class.clone();
+        let mut location =
+            self.plain_location(resolved.backend, class, &plain, source.created_by)?;
+        let operator = self.operator_from_location(&location)?;
+        let if_not_exists = conditional(&operator, &mut location, &plain)?;
+        let target = self.native_upload(&location)?;
+        let (path, source_path) = (self.object_path(&location)?, self.object_path(source)?);
+        let size = source.blob_size;
+        let ranges = copy_ranges(size);
+        let upload_id = target.create(&path).await?;
+        let mut parts = Vec::with_capacity(ranges.len());
+        for (index, range) in ranges.iter().enumerate() {
+            let number = u16::try_from(index + 1)
+                .map_err(|_| BlobError::WriteError("too many copy parts".to_string()));
+            let copied = match number {
+                Ok(number) => {
+                    let part = (number, *range);
+                    let from = (native, source_path.as_str(), version);
+                    target.copy_range(&path, &upload_id, part, from).await
+                }
+                Err(error) => Err(error),
+            };
+            match copied {
+                Ok(etag) => parts.push((index as u16 + 1, etag)),
+                Err(error) => {
+                    let _ = target.abort(&path, &upload_id).await;
+                    return Err(error);
+                }
+            }
+        }
+        let md5 = source.hashes.get(aruna_core::structs::checksum::HASH_MD5);
+        if let ([(_, etag)], Some(md5)) = (parts.as_slice(), md5)
+            && etag.trim_matches('"') != hex::encode(md5)
+        {
+            let _ = target.abort(&path, &upload_id).await;
+            return Err(BlobError::IntegrityCheckFailed(
+                "the copied part does not match the source MD5".to_string(),
+            ));
+        }
+        let (written, etag) = target
+            .complete(&path, &upload_id, &parts, if_not_exists)
+            .await?;
+        let stat = operator.stat_with(&path);
+        let stat = match written.as_deref() {
+            Some(version) if operator.info().capability().stat_with_version => {
+                stat.version(version)
+            }
+            _ => stat,
+        };
+        let found = timeout(self.io_timeout(), stat.into_future())
+            .await
+            .map_err(|_| BlobError::ReadError("timed out reading the copy".to_string()))?
+            .map_err(|error| BlobError::ReadError(error.to_string()))?;
+        if found.content_length() != size {
+            return Err(BlobError::IntegrityCheckFailed(format!(
+                "the copy holds {} bytes, the source {size}",
+                found.content_length()
+            )));
+        }
+        location.blob_size = size;
+        location.hashes = source.hashes.clone();
+        Ok(BlobEvent::PlainWritten {
+            location,
+            version: written,
+            etag: etag.map(|etag| etag.trim_matches('"').to_string()),
+        })
+    }
+
     /// A key that ends in `/` is an empty folder object at that exact key.
     async fn write_folder(
         &self,
@@ -295,6 +405,22 @@ impl BlobHandler {
     }
 }
 
+/// Bytes one copied part takes at most; the provider limit is 5 GiB.
+const COPY_PART: u64 = 1 << 30;
+
+/// The inclusive byte ranges of a copy; `None` copies an object of one part whole.
+fn copy_ranges(size: u64) -> Vec<Option<(u64, u64)>> {
+    if size <= COPY_PART {
+        return vec![None];
+    }
+    (0..size.div_ceil(COPY_PART))
+        .map(|part| {
+            let first = part * COPY_PART;
+            Some((first, (first + COPY_PART).min(size) - 1))
+        })
+        .collect()
+}
+
 /// A folder object: its key ends in `/` and it holds no bytes.
 pub(super) fn is_folder(location: &BackendLocation) -> bool {
     location.blob_size == 0 && location.backend_path.ends_with('/')
@@ -306,4 +432,24 @@ pub(super) fn folder_read(location: &BackendLocation) -> Option<BlobEvent> {
         blob: BackendStream::new(futures::stream::empty::<Result<Bytes, BlobError>>()),
         stream_size: 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_large_copies() {
+        assert_eq!(copy_ranges(0), vec![None]);
+        assert_eq!(copy_ranges(COPY_PART), vec![None]);
+        let ranges = copy_ranges(2 * COPY_PART + 5);
+        assert_eq!(
+            ranges,
+            vec![
+                Some((0, COPY_PART - 1)),
+                Some((COPY_PART, 2 * COPY_PART - 1)),
+                Some((2 * COPY_PART, 2 * COPY_PART + 4)),
+            ]
+        );
+    }
 }

@@ -569,6 +569,20 @@ impl MigrateVersionOperation {
         let Some(old) = self.old.clone() else {
             return self.fail(MigrateVersionError::NotFinished);
         };
+        // A rename copies the old file; an S3 storage does so without passing the bytes.
+        if let (true, Some(plain), Some(resolved)) = (
+            self.renaming,
+            self.plain_path.clone(),
+            self.resolved.clone(),
+        ) {
+            let created_by = old.created_by;
+            let copy = smallvec![Effect::Blob(BlobEffect::CopyPlain {
+                resolved,
+                plain,
+                source: old,
+            })];
+            return self.intent_first(copy, created_by);
+        }
         self.state = MigrateState::ReadBlob;
         smallvec![Effect::Blob(BlobEffect::Read { location: old })]
     }
@@ -3160,8 +3174,8 @@ mod tests {
                 })
             };
             operation.step(absent());
-            operation.step(absent());
-            let effects = operation.step(empty_blob());
+            // A rename copies the old file instead of reading it.
+            let effects = operation.step(absent());
             past_intent(&mut operation, effects);
             let refused = || BlobError::ConditionalUnsupported;
             let effects = operation.step(Event::Blob(BlobEvent::Error(refused())));
@@ -3196,15 +3210,16 @@ mod tests {
             };
             let attempt = Ulid::from(u128::from(old.ulid) ^ 1);
             assert!(path.ends_with(&format!("~{attempt}")));
-            operation.step(Event::Blob(BlobEvent::PlainStat {
+            let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
                 exists: false,
                 version: None,
             }));
-            let effects = operation.step(empty_blob());
             let effects = past_intent(&mut operation, effects);
-            let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
-                panic!("expected the new file, got {effects:?}")
+            let [Effect::Blob(BlobEffect::CopyPlain { plain, source, .. })] = effects.as_slice()
+            else {
+                panic!("expected the copy to the new file, got {effects:?}")
             };
+            assert_eq!(source, &old);
             // A rename takes its exact new name or nothing.
             assert!(plain.if_not_exists && plain.exact);
             let plain = plain.clone();
