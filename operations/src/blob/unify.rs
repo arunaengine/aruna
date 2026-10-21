@@ -616,12 +616,22 @@ impl Stage<'_> {
                 return Ok(Unified::Changed);
             }
             let version = BlobVersion::from_bytes(stored).map_err(error)?;
-            if let BlobVersionState::Materialized {
-                encoding: EncodingClass::Plain { location },
-                ..
-            } = &version.state
-            {
-                readers.entry(*location).or_default().push((*id, version));
+            // A raw copy is the copy whose location row the version reads.
+            let file = match &version.state {
+                BlobVersionState::Materialized {
+                    encoding: EncodingClass::Plain { location },
+                    ..
+                } => Some(*location),
+                BlobVersionState::Materialized {
+                    encoding: EncodingClass::Raw,
+                    ..
+                } => (found.copies.iter())
+                    .find(|copy| copy.location_key().ok() == version.location_key())
+                    .map(|copy| copy.ulid),
+                _ => None,
+            };
+            if let Some(file) = file {
+                readers.entry(file).or_default().push((*id, version));
             }
         }
         let encoding = found.keep.format.encoding();
