@@ -9,9 +9,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use aruna_api::error::ServerError;
 use aruna_api::routes::storage::deletion::{
-    DeletionPreflightRequest, PurgeScopeRequest, SubmitPurgeRequest, deletion_preflight,
-    submit_purge,
+    DeleteImpactRequest, DeletionPreflightRequest, PurgeScopeRequest, SubmitPurgeRequest,
+    delete_preview, deletion_preflight, submit_purge,
 };
 use aruna_api::server::state::ServerState;
 use aruna_core::UserId;
@@ -302,6 +303,8 @@ async fn submission_is_idempotent() {
             prefix: "reads/".to_string(),
         },
         idempotency_key: Some("purge-reads".to_string()),
+        delete_storage_files: false,
+        confirm: None,
     };
     let (status, Json(first)) = submit_purge(
         State(fixture.state.clone()),
@@ -327,4 +330,126 @@ async fn submission_is_idempotent() {
     assert_eq!(status, StatusCode::OK);
     assert!(!replayed.created);
     assert_eq!(replayed.job_id, first.job_id);
+}
+
+#[tokio::test]
+async fn storage_files_confirmed() {
+    let fixture = setup().await;
+    let request = |confirm: Option<&str>| SubmitPurgeRequest {
+        scope: PurgeScopeRequest::Bucket {
+            bucket: "data".to_string(),
+        },
+        idempotency_key: None,
+        delete_storage_files: true,
+        confirm: confirm.map(str::to_string),
+    };
+    let state = || State(fixture.state.clone());
+    let auth = || Extension(Some(fixture.auth.clone()));
+    // The bucket's storage files go only with the bucket name typed back.
+    for confirm in [None, Some("other")] {
+        let refused = submit_purge(state(), auth(), Json(request(confirm))).await;
+        assert!(matches!(refused, Err(ServerError::BadRequestMessage(_))));
+    }
+    // A token limited to some paths may not delete files other keys could read.
+    let mut restricted = fixture.auth.clone();
+    restricted.path_restrictions = Some(Vec::new());
+    let refused = submit_purge(
+        state(),
+        Extension(Some(restricted)),
+        Json(request(Some("data"))),
+    );
+    assert!(matches!(refused.await, Err(ServerError::Forbidden)));
+    let (status, _) = submit_purge(state(), auth(), Json(request(Some("data"))))
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn previews_storage_files() {
+    let fixture = setup().await;
+    let backend = BackendRef::Group(Ulid::from_bytes([20u8; 16]));
+    for (tag, key) in [(30u8, "linked/a.faa.gz"), (31u8, "linked/b.faa.gz")] {
+        let ulid = Ulid::from_bytes([tag; 16]);
+        let location = BackendLocation {
+            backend: backend.clone(),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: format!("raw/{key}"),
+            ulid,
+            format: StoredFormat {
+                layout: aruna_core::structs::storage::format::StoredLayout::Plain(ulid),
+                ..StoredFormat::default()
+            },
+            created_by: fixture.auth.user_id,
+            created_at: UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 100,
+            hashes: HashMap::from([(
+                aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+                vec![tag; 32],
+            )]),
+        };
+        let version = BlobVersion::materialized(
+            [tag; 32],
+            backend.clone(),
+            location.format.encoding(),
+            UNIX_EPOCH,
+            fixture.auth.user_id,
+            None,
+        );
+        let id = Ulid::from_bytes([tag; 16]);
+        let rows = [
+            (
+                BLOB_VERSIONS_KEYSPACE,
+                VersionKey::new("data", key, id).to_bytes().unwrap(),
+                version.to_bytes().unwrap(),
+            ),
+            (
+                BLOB_HEAD_KEYSPACE,
+                BlobHeadKey::new("data", key).to_bytes().unwrap(),
+                CurrentVersionPointer::new(id).to_bytes().unwrap(),
+            ),
+            (
+                BLOB_LOCATIONS_KEYSPACE,
+                location.location_key().unwrap().to_bytes(),
+                location.to_bytes().unwrap(),
+            ),
+        ];
+        for (space, key, value) in rows {
+            write_value(&fixture.state, space, key, value).await;
+        }
+    }
+    let request = |after: Option<String>| DeleteImpactRequest {
+        kind: "folder".to_string(),
+        key: "linked/".to_string(),
+        limit: Some(1),
+        after,
+    };
+    let state = || State(fixture.state.clone());
+    let auth = || Extension(Some(fixture.auth.clone()));
+    let bucket = || axum::extract::Path("data".to_string());
+    let Json(first) = delete_preview(state(), auth(), bucket(), Json(request(None)))
+        .await
+        .unwrap();
+    assert_eq!((first.files, first.versions, first.complete), (2, 2, true));
+    assert_eq!((first.storage_files, first.storage_bytes), (2, 200));
+    assert_eq!(first.items.len(), 1);
+    // Without a backend version the file would stay; the preview says so.
+    let file = first.items[0].storage_file.as_ref().unwrap();
+    assert_eq!(file.path, "raw/linked/a.faa.gz");
+    assert!(file.kept.is_some());
+    let Json(second) = delete_preview(state(), auth(), bucket(), Json(request(first.next)))
+        .await
+        .unwrap();
+    assert_eq!(second.items[0].key, "linked/b.faa.gz");
+    assert!(second.next.is_none());
+    let bad = DeleteImpactRequest {
+        kind: "everything".to_string(),
+        ..request(None)
+    };
+    let refused = delete_preview(state(), auth(), bucket(), Json(bad)).await;
+    assert!(matches!(refused, Err(ServerError::BadRequest)));
 }
