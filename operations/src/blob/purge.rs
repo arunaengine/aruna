@@ -218,6 +218,83 @@ async fn read_elsewhere(
     }
 }
 
+/// Versions a deletion preview counts at most before its totals become lower bounds.
+const TOTAL_VERSIONS: u64 = 1_000_000;
+const LIST_PAGE: usize = 1000;
+
+/// What a purge of a scope removes: keys and versions in Aruna, files in linked storage.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScopeTotals {
+    pub keys: u64,
+    pub versions: u64,
+    /// Bytes of the versions' content in Aruna, each version counted.
+    pub bytes: u64,
+    pub storage_files: u64,
+    pub storage_bytes: u64,
+    /// `false` when the count stopped at its limit; the numbers are then lower bounds.
+    pub complete: bool,
+}
+
+/// Counts what a purge of `scope` removes, from the version listing alone.
+pub async fn scope_totals(
+    context: &DriverContext,
+    scope: &StoragePurgeScope,
+) -> Result<ScopeTotals, String> {
+    use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
+    let mut totals = ScopeTotals::default();
+    let mut seen = std::collections::HashSet::new();
+    let (mut key_marker, mut version_marker) = (None, None);
+    let mut last_key = None::<String>;
+    loop {
+        let input = ListVersionsInput {
+            bucket: scope.bucket().to_string(),
+            prefix: scope.list_prefix().map(str::to_string),
+            delimiter: None,
+            key_marker: key_marker.take(),
+            version_id_marker: version_marker.take(),
+            max_keys: Some(LIST_PAGE),
+        };
+        let page = crate::driver::drive(ListVersionsOperation::new(input), context)
+            .await
+            .map_err(|error| error.to_string())?;
+        for item in &page.items {
+            let (key, location) = match item {
+                ListVersionsItem::Version { key, location, .. } => (key, location.as_ref()),
+                ListVersionsItem::DeleteMarker { key, .. } => (key, None),
+            };
+            if !scope.matches_key(scope.bucket(), key) {
+                continue;
+            }
+            totals.versions += 1;
+            if last_key.as_deref() != Some(key.as_str()) {
+                totals.keys += 1;
+                last_key = Some(key.clone());
+            }
+            let Some(location) = location else {
+                continue;
+            };
+            totals.bytes += location.blob_size;
+            let linked = location.is_external() && !location.staging && !location.partial;
+            if linked && seen.insert(location.ulid) {
+                totals.storage_files += 1;
+                totals.storage_bytes += location.blob_size;
+            }
+        }
+        if totals.versions >= TOTAL_VERSIONS && page.is_truncated {
+            return Ok(totals);
+        }
+        match (page.is_truncated, page.next_key_marker) {
+            (true, Some(next)) => {
+                (key_marker, version_marker) = (Some(next), page.next_version_marker)
+            }
+            _ => {
+                totals.complete = true;
+                return Ok(totals);
+            }
+        }
+    }
+}
+
 fn plan_key(job_id: Ulid, location: Ulid) -> Key {
     [&job_id.to_bytes()[..], b"f", &location.to_bytes()[..]]
         .concat()
