@@ -598,7 +598,9 @@ impl CompleteUploadOperation {
             version_id,
             key: &self.input.key,
         };
-        record.writes(rule_exists)
+        let mut writes = record.writes(rule_exists)?;
+        writes.extend(self.dedup_release().transpose()?);
+        Ok(writes)
     }
 }
 
@@ -1490,5 +1492,66 @@ mod tests {
             effects.as_slice(),
             [Effect::Blob(BlobEffect::CompleteUpload { .. })]
         ));
+    }
+
+    fn read(value: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: value.map(Into::into),
+        })
+    }
+
+    #[test]
+    fn reuses_current_file() {
+        use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE};
+        use aruna_core::structs::storage::blob::{
+            BlobCleanupWork, BlobVersion, CurrentVersionPointer,
+        };
+        use aruna_core::structs::storage::format::StoredLayout;
+        // A completed upload of the current version's bytes reads that version's file.
+        let (mut operation, _) = recorded(false, None);
+        let written = operation.composed_location.clone().unwrap();
+        let mut old = written.clone();
+        (old.ulid, old.backend_path) = (Ulid::from_parts(8, 8), "raw/object~old".to_string());
+        old.format.layout = StoredLayout::Plain(old.ulid);
+        operation.plain_version = Some("v2".to_string());
+        (operation.dedup, operation.dedup_checked) = (None, false);
+        operation.txn_id = Some(Ulid::nil());
+        let effects = operation.check_hash_lookup();
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the head read, got {effects:?}")
+        };
+        assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
+        let head = CurrentVersionPointer::new(Ulid::from_parts(6, 6));
+        operation.step(read(Some(head.to_bytes().unwrap())));
+        let version = BlobVersion::materialized(
+            [7u8; 32],
+            BackendRef::Group(backend_id()),
+            old.format.encoding(),
+            SystemTime::UNIX_EPOCH,
+            UserId::default(),
+            None,
+        );
+        operation.step(read(Some(version.to_bytes().unwrap())));
+        operation.step(read(Some(old.to_bytes().unwrap())));
+        assert_eq!(operation.final_location.as_ref(), Some(&old));
+        // The assembled file is released after the commit, at its exact backend version.
+        let writes = operation.plain_records(true).unwrap();
+        let release = writes
+            .iter()
+            .find(|(space, ..)| space == BLOB_CLEANUP_KEYSPACE)
+            .map(|(_, _, value)| BlobCleanupWork::from_bytes(value).unwrap());
+        let Some(BlobCleanupWork::ReleaseRenamed {
+            location, version, ..
+        }) = release
+        else {
+            panic!("expected the release of the assembled file, got {writes:?}")
+        };
+        assert_eq!((location, version.as_str()), (written, "v2"));
+        // Without a backend version the assembled file stays the version's own.
+        let (mut operation, _) = recorded(false, None);
+        (operation.plain_version, operation.dedup_checked) = (None, false);
+        operation.check_hash_lookup();
+        assert_eq!(operation.state, CompleteUploadState::CheckHashLookup);
     }
 }

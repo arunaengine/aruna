@@ -92,6 +92,11 @@ pub enum CompleteUploadState {
     FenceAbe,
     FenceBackend,
     CheckHashLookup,
+    /// Reads the current version and its file, which a re-upload of the same bytes reads too.
+    ReadDedupHead,
+    ReadDedupVersion,
+    ReadDedupLocation,
+    ReadDedupProvider,
     WriteBlobLocation,
     ReadObjectLookup,
     ReadLivenessVersion,
@@ -338,6 +343,9 @@ pub struct CompleteUploadOperation {
     pending_compose: Option<Effects>,
     /// An import registered this version with the same bytes before the finalize.
     registered: bool,
+    /// The assembled linked file the version gives up for the current version's identical one.
+    dedup: Option<BackendLocation>,
+    dedup_checked: bool,
     /// The delete trail read for a listed upload's version before its head moves.
     trail_scan: Option<crate::s3::object::put::TrailScan>,
     /// The intent record of the compose in flight.
@@ -399,6 +407,8 @@ impl CompleteUploadOperation {
             plain_etag: None,
             pending_compose: None,
             registered: false,
+            dedup: None,
+            dedup_checked: false,
             trail_scan: None,
             written_intent: Vec::new(),
             fence: None,
@@ -1216,6 +1226,7 @@ impl CompleteUploadOperation {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
+        (self.dedup, self.dedup_checked) = (None, false);
         self.state = CompleteUploadState::CheckPurgeFinalize;
         smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
     }
@@ -1380,6 +1391,9 @@ impl CompleteUploadOperation {
     }
 
     fn check_hash_lookup(&mut self) -> Effects {
+        if let Some(effects) = self.read_current() {
+            return effects;
+        }
         let Some(location) = self.composed_location.clone() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
@@ -1857,7 +1871,9 @@ impl CompleteUploadOperation {
             self.composed_location.as_ref(),
             self.final_location.as_ref(),
         ) {
-            if composed != chosen {
+            // A linked file that gave way goes only through its exact release.
+            if self.dedup.is_some() {
+            } else if composed != chosen {
                 works.push(BlobCleanupWork::DeleteBlob {
                     location: composed.clone(),
                 });
@@ -2369,6 +2385,10 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::FenceAbe => self.abe_fenced(event),
             CompleteUploadState::FenceBackend => self.handle_backend_fenced(event),
             CompleteUploadState::CheckHashLookup => self.hash_checked(event),
+            CompleteUploadState::ReadDedupHead
+            | CompleteUploadState::ReadDedupVersion
+            | CompleteUploadState::ReadDedupLocation
+            | CompleteUploadState::ReadDedupProvider => self.dedup_read(event),
             CompleteUploadState::WriteBlobLocation => self.location_written(event),
             CompleteUploadState::ReadObjectLookup => self.object_lookup_read(event),
             CompleteUploadState::ReadLivenessVersion => self.liveness_read(event),
@@ -2564,6 +2584,8 @@ fn composite_digest(algorithm: ChecksumAlgorithm, bytes: &[u8]) -> Vec<u8> {
     }
 }
 
+#[path = "dedup.rs"]
+mod dedup;
 #[path = "plain.rs"]
 mod plain;
 
