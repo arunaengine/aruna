@@ -1791,10 +1791,22 @@ fn writer_reads_trail() {
             key: vec![0].into(),
             value: None,
         }));
-        let [Effect::Storage(StorageEffect::Iter { key_space, .. })] = effects.as_slice() else {
+        let [
+            Effect::Storage(StorageEffect::Iter {
+                key_space, start, ..
+            }),
+        ] = effects.as_slice()
+        else {
             panic!("expected the trail read, got {effects:?}")
         };
         assert_eq!(key_space, DELETE_TRAIL_KEYSPACE);
+        // Only deletes since the version was created are read.
+        let id = op.version_id.unwrap();
+        let floor = Ulid::from_parts(id.timestamp_ms(), 0).to_bytes();
+        let Some(aruna_core::effects::IterStart::At(at)) = start else {
+            panic!("expected a bounded start, got {start:?}")
+        };
+        assert!(at.ends_with(&floor));
         op
     };
     let page = |values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>| {

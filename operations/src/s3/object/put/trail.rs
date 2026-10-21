@@ -83,6 +83,17 @@ impl TrailScan {
         }
     }
 
+    /// Where a page of `prefix` starts. The original write needs only the deletes and purges
+    /// recorded since its version was created; their audit ids are time ordered.
+    pub(crate) fn start(&self, prefix: &Key) -> Option<IterStart> {
+        if let Some(after) = &self.after {
+            return Some(IterStart::After(after.clone()));
+        }
+        let floor = Ulid::from_parts(self.version_id.timestamp_ms(), 0);
+        let at = [prefix.as_ref(), &floor.to_bytes()[..]].concat();
+        self.writer.then(|| IterStart::At(at.into()))
+    }
+
     /// A retried transaction reads the whole trail again.
     pub(super) fn restart(&mut self) {
         let writer = self.writer;
@@ -101,8 +112,8 @@ impl PutObjectOperation {
         self.state = PutObjectState::ReadTrail;
         Some(smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: DELETE_TRAIL_KEYSPACE.to_string(),
+            start: scan.start(&prefix),
             prefix: Some(prefix),
-            start: scan.after.clone().map(IterStart::After),
             limit: TRAIL_PAGE,
             txn_id: Some(txn_id),
         })])

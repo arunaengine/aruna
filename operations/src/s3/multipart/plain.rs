@@ -7,7 +7,6 @@ use crate::s3::object::put::{
     PlainRecord, Trail, TrailScan, intent_deletes, intent_keys, intent_writes, owner_read,
     owns_path, same_name_path, trail_ranges, version_row,
 };
-use aruna_core::effects::IterStart;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, DELETE_TRAIL_KEYSPACE,
     IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
@@ -394,11 +393,12 @@ impl CompleteUploadOperation {
         let scan = self
             .trail_scan
             .get_or_insert_with(|| TrailScan::new(version_id));
+        scan.writer = true;
         let Some(prefix) = ranges.get(scan.range).cloned() else {
             let existing = self.existing_pointer.clone();
             return self.write_head(existing.as_ref(), version_id);
         };
-        let start = scan.after.clone().map(IterStart::After);
+        let start = scan.start(&prefix);
         self.state = CompleteUploadState::ReadTrail;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: DELETE_TRAIL_KEYSPACE.to_string(),
