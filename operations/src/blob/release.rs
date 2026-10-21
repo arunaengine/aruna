@@ -10,11 +10,12 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE,
 };
 use aruna_core::structs::storage::backend_import::{BackendImport, ImportedObject, object_key};
 use aruna_core::structs::storage::blob::{
-    ArchiveKey, BackendLocation, BackendRef, BlobVersion, HashIndex, VersionKey,
+    ArchiveKey, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, HashIndex, VersionKey,
 };
 use aruna_core::types::Key;
 use tracing::warn;
@@ -108,7 +109,12 @@ async fn referenced(
                 return Ok(true);
             };
             let version = BlobVersion::from_bytes(&value).map_err(|error| error.to_string())?;
-            if version.location_key() == Some(wanted.clone()) {
+            let Some(other) = version.location_key() else {
+                continue;
+            };
+            if other == wanted
+                || (other.backend == wanted.backend && same_file(context, &other, location).await?)
+            {
                 return Ok(true);
             }
         }
@@ -124,6 +130,27 @@ async fn referenced(
         other => return Err(format!("could not read archive owners: {other:?}")),
     }
     other_rows(context, location, import_id).await
+}
+
+/// Whether another copy of the same bytes, such as a literal-name import, reads the same file.
+async fn same_file(
+    context: &DriverContext,
+    key: &BlobLocationKey,
+    location: &BackendLocation,
+) -> Result<bool, String> {
+    let Some(value) = read_value(context, BLOB_LOCATIONS_KEYSPACE, key.to_bytes().into()).await?
+    else {
+        return Ok(false);
+    };
+    let other = BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
+    let file = |copy: &BackendLocation| {
+        (
+            copy.root.clone(),
+            copy.storage_bucket.clone(),
+            copy.backend_path.clone(),
+        )
+    };
+    Ok(file(&other) == file(location))
 }
 
 /// Whether another rule on the same storage, such as one sharing the folder, has a row there.
@@ -325,15 +352,10 @@ mod tests {
         release_renamed(context, old(), IMPORT, VERSION, "v1".to_string()).await
     }
 
-    #[tokio::test]
-    async fn keeps_shared_copy() {
-        // A successor version that still names the old copy keeps the file and its row.
-        let (_dir, context) = setup();
-        renamed_row(&context, IMPORT).await;
+    /// A version of the same bytes on the old file's storage, stored with `encoding`.
+    async fn alias_version(context: &DriverContext, encoding: EncodingClass) {
         let successor = VersionKey::new("b", "in/a.csv", Ulid::from_parts(5, 5));
         let location = old();
-        let encoding = location.format.encoding();
-        assert!(matches!(encoding, EncodingClass::Plain { .. }));
         let version = BlobVersion::materialized(
             [7u8; 32],
             location.backend.clone(),
@@ -344,7 +366,7 @@ mod tests {
         );
         let key = successor.to_bytes().unwrap().into();
         put(
-            &context,
+            context,
             BLOB_VERSIONS_KEYSPACE,
             key,
             version.to_bytes().unwrap(),
@@ -361,10 +383,54 @@ mod tests {
             "in/a.csv",
         );
         let alias = alias.to_bytes().unwrap().into();
-        put(&context, PATHS_INDEX_KEYSPACE, alias, Vec::new()).await;
+        put(context, PATHS_INDEX_KEYSPACE, alias, Vec::new()).await;
+    }
 
+    #[tokio::test]
+    async fn keeps_shared_copy() {
+        // A successor version that still names the old copy keeps the file and its row.
+        let (_dir, context) = setup();
+        renamed_row(&context, IMPORT).await;
+        let encoding = old().format.encoding();
+        assert!(matches!(encoding, EncodingClass::Plain { .. }));
+        alias_version(&context, encoding).await;
         assert!(release(&context).await);
         assert!(row(&context, IMPORT).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn keeps_literal_alias() {
+        // A literal-name import reads the same file through its own raw location.
+        let (_dir, context) = setup();
+        renamed_row(&context, IMPORT).await;
+        alias_version(&context, EncodingClass::Raw).await;
+        let mut raw = old();
+        raw.format = StoredFormat::default();
+        let key = raw.location_key().unwrap().to_bytes().into();
+        put(
+            &context,
+            BLOB_LOCATIONS_KEYSPACE,
+            key,
+            raw.to_bytes().unwrap(),
+        )
+        .await;
+        assert!(release(&context).await);
+        assert!(row(&context, IMPORT).await.is_some());
+
+        // A raw copy elsewhere on the storage does not keep the file.
+        let (_dir, context) = setup();
+        renamed_row(&context, IMPORT).await;
+        alias_version(&context, EncodingClass::Raw).await;
+        raw.backend_path = "raw/a.csv".to_string();
+        let key = raw.location_key().unwrap().to_bytes().into();
+        put(
+            &context,
+            BLOB_LOCATIONS_KEYSPACE,
+            key,
+            raw.to_bytes().unwrap(),
+        )
+        .await;
+        assert!(!release(&context).await);
     }
 
     #[tokio::test]
