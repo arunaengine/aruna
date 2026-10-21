@@ -1543,6 +1543,25 @@ mod tests {
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::time::SystemTime;
+
+    #[test]
+    fn keeps_cleanup_tags() {
+        // Postcard writes the variant index first; stored rows keep their meaning only while
+        // new kinds of work are appended.
+        let dht = super::BlobCleanupWork::RegisterDht {
+            blake3: [0; 32],
+            realm_id: RealmId::from_bytes([0; 32]),
+            ttl_ms: 0,
+        };
+        assert_eq!(dht.to_bytes().unwrap()[0], 1);
+        let release = super::BlobCleanupWork::ReleaseRenamed {
+            location: sample_location(BackendRef::node_default()),
+            import_id: Ulid::nil(),
+            version_id: Ulid::nil(),
+            version: String::new(),
+        };
+        assert_eq!(release.to_bytes().unwrap()[0], 4);
+    }
     use ulid::Ulid;
 
     fn pointer(generation: u64, seed: u8) -> CurrentVersionPointer {
