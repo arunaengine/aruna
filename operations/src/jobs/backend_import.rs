@@ -31,7 +31,7 @@ use aruna_core::structs::storage::routing::{RoutingSnapshot, RoutingTarget, Rule
 use aruna_core::types::{Effects, Key, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use ulid::Ulid;
@@ -116,6 +116,18 @@ struct ImportRun {
     discovery: Vec<DiscoveryRule>,
     /// Other rules that read an overlapping folder; they may own a listed file.
     shared: Vec<SharedRule>,
+    /// The page's rows, heads and committed versions, read in two batches.
+    page: PageReads,
+}
+
+/// Values read once per listing page. Only the skip of an unchanged file trusts them; every
+/// other path reads again, and every write checks again in its transaction.
+#[derive(Default)]
+struct PageReads {
+    rows: HashMap<String, Option<Value>>,
+    heads: HashMap<String, Option<Ulid>>,
+    /// The version each row names, by listed path.
+    versions: HashMap<String, Option<Value>>,
 }
 
 fn permanent(message: impl Into<String>) -> JobRunOutcome {
@@ -178,6 +190,10 @@ pub async fn run_backend_import(ctx: &JobContext, spec: &BackendImportSpec) -> J
         };
         run.intents = match page_intents(&ctx.driver, &run.rule, &objects).await {
             Ok(intents) => intents,
+            Err(ItemError::Item(error) | ItemError::System(error)) => return retryable(error),
+        };
+        run.page = match page_reads(&ctx.driver, &run.rule, &objects).await {
+            Ok(page) => page,
             Err(ItemError::Item(error) | ItemError::System(error)) => return retryable(error),
         };
         for object in objects {
@@ -308,6 +324,7 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
         intents: BTreeMap::new(),
         discovery,
         shared,
+        page: PageReads::default(),
     })
 }
 
@@ -339,6 +356,14 @@ async fn import_object(
     let rule = &run.rule;
     if rule.aruna_key(&object.key).is_none() || run.backend.is_reserved(&object.key) {
         return Ok(Outcome::Ignored);
+    }
+    if page_skip(
+        rule,
+        &run.page,
+        run.intents.contains_key(&object.key),
+        object,
+    ) {
+        return Ok(Outcome::Skipped);
     }
     let row_key = object_key(rule.import_id, &object.key);
     let [stored] = read_values(&ctx.driver, [(IMPORTED_OBJECT_KEYSPACE, row_key.clone())]).await?;
@@ -391,15 +416,10 @@ async fn import_object(
         && !etag_differs(object.etag.as_deref(), md5.as_deref())
     {
         let listed = encode(&listed)?;
-        note_listing(
-            &ctx.driver,
-            rule,
-            row_key,
-            Some(&seen),
-            listed,
-            Note::default(),
-        )
-        .await?;
+        if listed.as_slice() != seen.as_ref() {
+            let note = Note::default();
+            note_listing(&ctx.driver, rule, row_key, Some(&seen), listed, note).await?;
+        }
         return Ok(Outcome::Skipped);
     }
     let head_key = BlobHeadKey::new(&rule.bucket, &key)
@@ -585,6 +605,85 @@ async fn hash_listed(
 
 fn item(message: impl Into<String>) -> ItemError {
     ItemError::Item(message.into())
+}
+
+/// Reads the rows of a page in one batch, then the heads and named versions of their keys.
+async fn page_reads(
+    context: &DriverContext,
+    rule: &BackendImport,
+    objects: &[ExternalObject],
+) -> Result<PageReads, ItemError> {
+    let mut page = PageReads::default();
+    let space = IMPORTED_OBJECT_KEYSPACE.to_string();
+    let reads = objects
+        .iter()
+        .map(|object| (space.clone(), object_key(rule.import_id, &object.key)));
+    let rows = batch_read(context, reads.collect()).await?;
+    let mut reads = Vec::new();
+    let mut named = Vec::new();
+    for (object, row) in objects.iter().zip(rows) {
+        let parsed = parse(row.clone(), ImportedObject::from_bytes)?;
+        page.rows.insert(object.key.clone(), row);
+        let Some(parsed) = parsed else { continue };
+        let Some(key) = parsed.key.clone().or_else(|| rule.aruna_key(&object.key)) else {
+            continue;
+        };
+        let head = BlobHeadKey::new(&rule.bucket, &key).to_bytes();
+        let version = VersionKey::new(&rule.bucket, &key, parsed.version_id).to_bytes();
+        let (Ok(head), Ok(version)) = (head, version) else {
+            continue;
+        };
+        reads.push((BLOB_HEAD_KEYSPACE.to_string(), head.into()));
+        reads.push((BLOB_VERSIONS_KEYSPACE.to_string(), version.into()));
+        named.push((object.key.clone(), key));
+    }
+    let mut values = batch_read(context, reads).await?.into_iter();
+    for (path, key) in named {
+        let (Some(head), Some(version)) = (values.next(), values.next()) else {
+            return Err(ItemError::System("short batch read".to_string()));
+        };
+        let head = parse(head, CurrentVersionPointer::from_bytes)?;
+        page.heads.insert(key, head.map(|head| head.version_id));
+        page.versions.insert(path, version);
+    }
+    Ok(page)
+}
+
+/// Whether the page reads alone prove a known file unchanged, as the full checks would find.
+fn page_skip(
+    rule: &BackendImport,
+    page: &PageReads,
+    intents: bool,
+    object: &ExternalObject,
+) -> bool {
+    let Some(Some(stored)) = page.rows.get(&object.key) else {
+        return false;
+    };
+    let Ok(row) = ImportedObject::from_bytes(stored) else {
+        return false;
+    };
+    if needs_lookup(rule, object, Some(&row), intents) {
+        return false;
+    }
+    let Some(key) = row.key.clone().or_else(|| rule.aruna_key(&object.key)) else {
+        return false;
+    };
+    if key.is_empty() || ensure_confined_path(Path::new(&key)).is_err() {
+        return false;
+    }
+    let (Some(head), Some(version)) = (page.heads.get(&key), page.versions.get(&object.key)) else {
+        return false;
+    };
+    if let Some(listed) = trusted_listing(Some(&row), object) {
+        // A listed ETag is checked against the MD5 of the copy, which the page does not read.
+        let version = version.as_ref().map(|value| BlobVersion::from_bytes(value));
+        let located = matches!(version, Some(Ok(version)) if version.location_key().is_some());
+        let unchanged = listed
+            .to_bytes()
+            .is_ok_and(|listed| listed == stored.as_ref());
+        return located && object.etag.is_none() && unchanged;
+    }
+    decide(object, Some(&row), *head, version.is_some()) == Decision::Skip
 }
 
 /// Whether a file may be an uncommitted write, so its intents are read. A new file, a literal
@@ -1225,20 +1324,31 @@ async fn read_values<const N: usize>(
         .into_iter()
         .map(|(key_space, key)| (key_space.to_string(), key))
         .collect();
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values
-            .into_iter()
-            .map(|(_, value)| value)
-            .collect::<Vec<_>>()
-            .try_into()
-            .map_err(|_| ItemError::System("short batch read".to_string())),
+    batch_read(context, reads)
+        .await?
+        .try_into()
+        .map_err(|_| ItemError::System("short batch read".to_string()))
+}
+
+async fn batch_read(
+    context: &DriverContext,
+    reads: Vec<(String, Key)>,
+) -> Result<Vec<Option<Value>>, ItemError> {
+    if reads.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wanted = reads.len();
+    let effect = StorageEffect::BatchRead {
+        reads,
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::BatchReadResult { values }) if values.len() == wanted => {
+            Ok(values.into_iter().map(|(_, value)| value).collect())
+        }
+        Event::Storage(StorageEvent::BatchReadResult { .. }) => {
+            Err(ItemError::System("short batch read".to_string()))
+        }
         Event::Storage(StorageEvent::Error { error }) => Err(ItemError::System(error.to_string())),
         other => Err(ItemError::System(format!("unexpected answer {other:?}"))),
     }
@@ -2074,9 +2184,7 @@ mod tests {
         // The intent of the write that never committed names the full key.
         let open = claim(&stripped, "in/deep/a.csv", false);
         let done = claim(&stripped, "in/other/a.csv", true);
-        let chosen = choose_identity(
-            &stripped,
-            &[],
+        let chosen = choose_identity(&stripped, &[],
             &path,
             vec![done.clone(), open.clone()],
             Some(&HASH),
@@ -2096,9 +2204,7 @@ mod tests {
         );
         let second = claim(&stripped, "in/b.csv", false);
         assert!(
-            choose_identity(
-                &stripped,
-                &[],
+            choose_identity(&stripped, &[],
                 &path,
                 vec![open.clone(), second],
                 Some(&HASH)
@@ -2292,6 +2398,43 @@ mod tests {
             decide(&object("e1"), Some(&row), newer, true),
             Decision::Skip
         );
+    }
+
+    #[test]
+    fn skips_known_pages() {
+        let rule = rule_at("");
+        let id = Ulid::generate();
+        let key = rule.aruna_key("raw/a.csv").unwrap();
+        let version = BlobVersion::materialized(
+            [1u8; 32],
+            BackendRef::Group(Ulid::nil()),
+            aruna_core::structs::storage::format::EncodingClass::Raw,
+            std::time::SystemTime::UNIX_EPOCH,
+            Default::default(),
+            None,
+        );
+        let mut page = PageReads::default();
+        let stored = row(id, "e1").to_bytes().unwrap().into();
+        page.rows.insert("raw/a.csv".to_string(), Some(stored));
+        page.heads.insert(key, Some(id));
+        let version = version.to_bytes().unwrap().into();
+        page.versions.insert("raw/a.csv".to_string(), Some(version));
+        assert!(page_skip(&rule, &page, false, &object("e1")));
+        // A changed file, an open intent or an unread page takes the full path.
+        assert!(!page_skip(&rule, &page, false, &object("e2")));
+        assert!(!page_skip(&rule, &page, true, &object("e1")));
+        assert!(!page_skip(
+            &rule,
+            &PageReads::default(),
+            false,
+            &object("e1")
+        ));
+        // Without ETag and time an equal size skips only when the row would stay the same.
+        let mut unmarked = object("e1");
+        unmarked.etag = None;
+        assert!(page_skip(&rule, &page, false, &unmarked));
+        page.versions.insert("raw/a.csv".to_string(), None);
+        assert!(!page_skip(&rule, &page, false, &unmarked));
     }
 
     #[test]
