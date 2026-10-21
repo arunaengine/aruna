@@ -2954,7 +2954,7 @@ mod tests {
         }
 
         #[test]
-        fn keeps_other_key_file() {
+        fn keeps_owned_file() {
             // The rule recorded the new name for another key, as an earlier pattern's write of
             // equal bytes; the move does not take that file over.
             let mut moved = operation("in/x/one.csv", vec![rule()]);

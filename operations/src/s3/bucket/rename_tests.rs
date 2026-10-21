@@ -1,3 +1,6 @@
+//! Tests folder renames of bucket keys: selection, conflicts, access and guards.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::tests::records::node;
