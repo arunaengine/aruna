@@ -632,9 +632,35 @@ impl BlobHandler {
         if metadata.content_length() != location.blob_size || !same {
             return BlobEvent::Error(BlobError::CleanupUnsupported);
         }
-        match timeout(self.io_timeout(), operator.delete(path)).await {
+        // The delete itself names the ETag where the storage can; elsewhere a write between
+        // the check and the delete is the accepted remaining risk.
+        let guarded = operator.info().capability().delete_with_if_match;
+        let unsupported = || opendal::Error::new(ErrorKind::Unsupported, "no conditional delete");
+        let delete = match guarded {
+            true => {
+                let delete = operator.delete_with(path).if_match(&recorded);
+                timeout(self.io_timeout(), delete.into_future()).await
+            }
+            false => Ok(Err(unsupported())),
+        };
+        let delete = match delete {
+            Ok(Err(error)) if error.kind() == ErrorKind::Unsupported => {
+                timeout(self.io_timeout(), operator.delete(path)).await
+            }
+            delete => delete,
+        };
+        match delete {
             Ok(Ok(())) => BlobEvent::DeleteFinished,
             Ok(Err(error)) if error.kind() == ErrorKind::NotFound => BlobEvent::DeleteFinished,
+            // A failed condition means other bytes, or none, at the path now.
+            Ok(Err(error)) if error.kind() == ErrorKind::ConditionNotMatch => {
+                match timeout(self.io_timeout(), operator.stat(path)).await {
+                    Ok(Err(error)) if error.kind() == ErrorKind::NotFound => {
+                        BlobEvent::DeleteFinished
+                    }
+                    _ => BlobEvent::Error(BlobError::CleanupUnsupported),
+                }
+            }
             Ok(Err(error)) => BlobEvent::Error(BlobError::DeleteError(error.to_string())),
             Err(_) => BlobEvent::Error(BlobError::DeleteError("timed out deleting".into())),
         }

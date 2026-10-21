@@ -48,6 +48,10 @@ pub(crate) async fn release_renamed(
     let keys = (&claim, &index);
     // A completed tombstone is never written over or cleared: those bytes are gone.
     match read_value(context, DELETE_CLAIM_KEYSPACE, claim.clone()).await {
+        // An unversioned tombstone lasts only until the row of the deleted file is gone.
+        Ok(Some(value)) if value == TOMBSTONE && version.is_empty() => {
+            return forget_deleted(context, &location, (import_id, version_id), ("", keys)).await;
+        }
         Ok(Some(value)) if value == TOMBSTONE => return true,
         // A delete was sent without a known outcome: only that delete is finished, never undone.
         Ok(Some(value)) if value == DELETING => {
@@ -104,9 +108,10 @@ async fn finish_delete(
     };
     match blob_handle.send_blob_effect(effect).await {
         Event::Blob(BlobEvent::DeleteFinished) => {}
-        // Other bytes at an unversioned path prove that no earlier send deleted them.
+        // Other bytes at an unversioned path stay, and so does the claim: an earlier send
+        // may still land.
         Event::Blob(BlobEvent::Error(BlobError::CleanupUnsupported)) if version.is_empty() => {
-            return claimed(context, claim, None).await;
+            return true;
         }
         event => {
             warn!(?event, "A sent delete could not be finished");
@@ -116,6 +121,24 @@ async fn finish_delete(
     if !claimed(context, claim, Some(TOMBSTONE)).await || !synced(context).await {
         return false;
     }
+    forget_deleted(
+        context,
+        &location,
+        (import_id, version_id),
+        (&version, claim),
+    )
+    .await
+}
+
+/// Drops the row that named the deleted file, unless another location of the path keeps it;
+/// an unversioned claim goes after it.
+async fn forget_deleted(
+    context: &DriverContext,
+    location: &BackendLocation,
+    (import_id, version_id): (Ulid, Ulid),
+    (version, claim): (&str, (&Key, &Key)),
+) -> bool {
+    let key = object_key(import_id, &location.backend_path);
     let observed = match read_value(context, IMPORTED_OBJECT_KEYSPACE, key.clone()).await {
         Ok(observed) => observed,
         Err(_) => return false,
@@ -123,7 +146,7 @@ async fn finish_delete(
     let row = observed.as_deref().map(ImportedObject::from_bytes);
     let named = matches!(row, Some(Ok(row)) if row.version_id == version_id);
     // Another location of the path at another backend version keeps the path's row.
-    let shared = !matches!(pinned(context, &location, &version).await, Ok(Some(false)));
+    let shared = !matches!(pinned(context, location, version).await, Ok(Some(false)));
     let dropped = match (observed, named && !shared) {
         (Some(observed), true) => drop_row(context, key, observed).await,
         _ => true,
@@ -924,6 +947,21 @@ mod tests {
         let released = release_renamed(&context, location.clone(), IMPORT, VERSION, String::new());
         assert!(released.await);
         let claim = claim_key(&location, "").unwrap();
+        let stored = read_value(&context, DELETE_CLAIM_KEYSPACE, claim).await;
+        assert!(stored.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn finishes_unversioned_tombstones() {
+        // A tombstone left by a crash is finished without another delete: row and claim go.
+        let (_dir, context) = setup();
+        let claim = claim_key(&old(), "").unwrap();
+        let index: Key = [&IMPORT.to_bytes()[..], &claim[..]].concat().into();
+        assert!(claimed(&context, (&claim, &index), Some(TOMBSTONE)).await);
+        renamed_row(&context, IMPORT).await;
+        let released = release_renamed(&context, old(), IMPORT, VERSION, String::new());
+        assert!(released.await);
+        assert!(row(&context, IMPORT).await.is_none());
         let stored = read_value(&context, DELETE_CLAIM_KEYSPACE, claim).await;
         assert!(stored.unwrap().is_none());
     }
