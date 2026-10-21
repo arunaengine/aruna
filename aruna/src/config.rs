@@ -1023,7 +1023,7 @@ mod tests {
         // than mint a second identity.
         let tempdir = tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let store = crate::identity::IdentityStore::from_storage(storage);
+        let store = crate::identity::IdentityStore::from_storage(storage.clone());
         let generated = store.generate().unwrap();
         assert!(matches!(
             generated.status,
@@ -1031,6 +1031,7 @@ mod tests {
         ));
         store.persist(&generated).await.unwrap();
         drop(store);
+        storage.close().await;
 
         let env = settings_env(&[("STORAGE_PATH", tempdir.path().to_str().unwrap())]);
         let (config, _storage) = resolve_settings(read_settings_from(&env).unwrap())
