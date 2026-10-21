@@ -708,3 +708,43 @@ pub(crate) async fn store_job(
     put(context, LINKED_JOB_KEYSPACE, key, job.to_bytes().unwrap()).await;
     job
 }
+
+#[tokio::test]
+async fn renames_shared_imports() {
+    // Identical imports share the first file's location; the second keeps its own row.
+    let (_directory, context) = setup().await;
+    let (v1, v2) = (Ulid::from_parts(10, 1), Ulid::from_parts(11, 1));
+    object(&context, "x", &[v1], false).await;
+    object(&context, "y", &[v2], false).await;
+    link(&context, 1, "raw/x").await;
+    for (path, id) in [("raw/x", v1), ("raw/y", v2)] {
+        let external = ExternalObject {
+            key: path.to_string(),
+            size: 4,
+            etag: Some("e".to_string()),
+            modified_ms: None,
+        };
+        let row = ImportedObject::new(id, &external);
+        let key = object_key(rule().import_id, path).to_vec();
+        put(
+            &context,
+            IMPORTED_OBJECT_KEYSPACE,
+            key,
+            row.to_bytes().unwrap(),
+        )
+        .await;
+    }
+    let keys = Some(vec!["y"]);
+    let plan = drive(
+        RenameKeysOperation::new(input("", "archive/", keys, true)),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.items[0].files, ["raw/y"]);
+    assert_eq!(
+        row(&context, "raw/y").await.key.as_deref(),
+        Some("archive/y")
+    );
+    assert_eq!(row(&context, "raw/x").await.key, None);
+}

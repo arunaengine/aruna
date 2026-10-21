@@ -578,8 +578,11 @@ impl RenameKeysOperation {
             }
         }
         self.row_reads = Some(Vec::new());
-        if reads.is_empty() || self.rules.is_empty() {
+        if self.rules.is_empty() {
             return self.read_index();
+        }
+        if reads.is_empty() {
+            return self.locations_read(Vec::new());
         }
         self.state = RenameState::Locations;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -620,6 +623,26 @@ impl RenameKeysOperation {
                     && seen.insert((index, rule, path.clone()))
                 {
                     reads.push((index, rule, path));
+                }
+            }
+        }
+        // A file whose version reads another file's location, as identical imports do, has
+        // its row at the path its rule gives the key.
+        for (index, item) in self.items.iter().enumerate() {
+            let versions = &self.found[index].versions;
+            for (rule, import) in self.rules.iter().enumerate() {
+                let rest = item.from.strip_prefix(&import.key_prefix);
+                let named = [Some(item.from.as_str()), rest]
+                    .into_iter()
+                    .flatten()
+                    .map(|rest| format!("{}{rest}", import.backend_prefix));
+                let written = versions
+                    .iter()
+                    .filter_map(|(key, _)| import.plain_path(&item.from, key.version_id));
+                for path in named.chain(written) {
+                    if seen.insert((index, rule, path.clone())) {
+                        reads.push((index, rule, path));
+                    }
                 }
             }
         }
