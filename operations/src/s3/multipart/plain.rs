@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::s3::object::put::fenced::{Fenced, FencedWrite};
 use crate::s3::object::put::{
-    PlainRecord, Trail, TrailScan, intent_deletes, intent_keys, intent_writes, owner_read,
-    owns_path, same_name_path, trail_ranges, version_row,
+    PlainRecord, Trail, TrailScan, intent_deletes, intent_keys, intent_rows, owner_read, owns_path,
+    same_name_path, trail_ranges, version_row,
 };
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, DELETE_TRAIL_KEYSPACE,
@@ -216,15 +217,25 @@ impl CompleteUploadOperation {
             written: None,
         };
         let keys = intent_keys(target.import_id, path, version_id, if_not_exists);
-        match intent_writes(&keys, &intent) {
-            Ok(effect) => {
+        let (rows, Some(rule)) = (intent_rows(&keys, &intent), self.rule_key()) else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        match rows {
+            Ok(rows) => {
                 self.written_intent = keys;
                 self.pending_compose = Some(compose);
                 self.state = CompleteUploadState::WriteIntent;
-                smallvec![effect]
+                self.fence.insert(FencedWrite::new(rule, rows)).start()
             }
             Err(error) => self.schedule_error(error.into()),
         }
+    }
+
+    /// The key of the import rule of a listed object.
+    fn rule_key(&self) -> Option<Key> {
+        let target = self.plain.as_ref().filter(|target| target.listed)?;
+        let group_id = self.upload_record.as_ref()?.group_id;
+        Some(import_key(group_id, target.import_id))
     }
 
     /// The refused compose goes on only once its intents are gone for good; a failed delete or
@@ -238,10 +249,7 @@ impl CompleteUploadOperation {
             }
             Event::Storage(StorageEvent::SyncAllFinished) if syncing => {
                 self.written_intent.clear();
-                match self.rule_removed {
-                    true => self.schedule_error(CompleteUploadError::ImportRemoved),
-                    false => self.plain_taken(),
-                }
+                self.plain_taken()
             }
             Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
             _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
@@ -265,87 +273,65 @@ impl CompleteUploadOperation {
         };
         let path = &written.backend_path;
         let key = intent_key(target.import_id, path, intent.version_id);
-        let effect = match intent_writes(&[key], &intent) {
-            Ok(effect) => effect,
+        let (rows, rule) = (intent_rows(&[key], &intent), self.rule_key()?);
+        let rows = match rows {
+            Ok(rows) => rows,
             Err(error) => return Some(self.schedule_error(error.into())),
         };
         self.state = CompleteUploadState::WriteEvidence;
-        Some(smallvec![effect])
+        Some(self.fence.insert(FencedWrite::new(rule, rows)).start())
     }
 
+    /// The hash is stored with a read of the rule; a removed rule gets none, and the upload
+    /// goes on as one without its rule.
     pub(super) fn evidence_written(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                self.state = CompleteUploadState::CheckEvidenceRule;
-                self.rule_read().unwrap_or_else(|| self.start_finalize())
+        let Some(fence) = self.fence.as_mut() else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        let effects = fence.step(event);
+        match fence.outcome().cloned() {
+            None => effects,
+            Some(Fenced::Written | Fenced::RuleGone) => self.start_finalize(),
+            Some(Fenced::Failed(Some(error))) => self.schedule_error(error.into()),
+            Some(Fenced::Failed(None)) => {
+                self.schedule_error(CompleteUploadError::InvalidOperationState)
             }
-            Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
-            _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
         }
     }
 
-    /// A removal deletes the rule before it drains the rule's records, so a record stored
-    /// while the rule still reads as present is drained with the others.
-    fn rule_read(&self) -> Option<Effects> {
-        let target = self.plain.as_ref().filter(|target| target.listed)?;
-        let group_id = self.upload_record.as_ref()?.group_id;
-        Some(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
-            key: import_key(group_id, target.import_id),
-            txn_id: None,
-        })])
-    }
-
-    /// A hash stored after the rule went is dropped with the records; the upload goes on.
-    pub(super) fn evidence_checked(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {
-                self.start_finalize()
-            }
-            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                self.rule_removed = true;
-                smallvec![intent_deletes(&self.written_intent)]
-            }
-            Event::Storage(StorageEvent::BatchDeleteResult { .. }) if self.rule_removed => {
-                self.written_intent.clear();
-                self.start_finalize()
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
-            _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
-        }
-    }
-
-    /// The compose waits until its intent is synced to disk.
+    /// The compose waits until its intent is stored with a read of the rule and synced to
+    /// disk; a removed rule stores nothing and fails the upload.
     pub(super) fn intent_written(&mut self, event: Event) -> Effects {
-        let (writing, checking, syncing) = (
-            self.state == CompleteUploadState::WriteIntent,
-            self.state == CompleteUploadState::CheckIntentRule,
-            self.state == CompleteUploadState::SyncIntent,
-        );
-        match (event, self.pending_compose.take()) {
-            (Event::Storage(StorageEvent::BatchWriteResult { .. }), Some(compose)) if writing => {
-                self.pending_compose = Some(compose);
-                self.state = CompleteUploadState::CheckIntentRule;
-                let invalid = CompleteUploadError::InvalidOperationState;
-                self.rule_read()
-                    .unwrap_or_else(|| self.schedule_error(invalid))
-            }
-            (Event::Storage(StorageEvent::ReadResult { value, .. }), Some(compose)) if checking => {
-                if value.is_none() {
-                    self.rule_removed = true;
-                    self.state = CompleteUploadState::DropIntent;
-                    return smallvec![intent_deletes(&self.written_intent)];
+        if self.state == CompleteUploadState::SyncIntent {
+            return match (event, self.pending_compose.take()) {
+                (Event::Storage(StorageEvent::SyncAllFinished), Some(compose)) => {
+                    self.state = CompleteUploadState::ComposeBlob;
+                    compose
                 }
-                self.pending_compose = Some(compose);
+                (Event::Storage(StorageEvent::Error { error }), _) => {
+                    self.schedule_error(error.into())
+                }
+                _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
+            };
+        }
+        let Some(fence) = self.fence.as_mut() else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        let effects = fence.step(event);
+        match fence.outcome().cloned() {
+            None => effects,
+            Some(Fenced::Written) => {
                 self.state = CompleteUploadState::SyncIntent;
                 smallvec![Effect::Storage(StorageEffect::SyncAll)]
             }
-            (Event::Storage(StorageEvent::SyncAllFinished), Some(compose)) if syncing => {
-                self.state = CompleteUploadState::ComposeBlob;
-                compose
+            Some(Fenced::RuleGone) => {
+                self.written_intent.clear();
+                self.schedule_error(CompleteUploadError::ImportRemoved)
             }
-            (Event::Storage(StorageEvent::Error { error }), _) => self.schedule_error(error.into()),
-            _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
+            Some(Fenced::Failed(Some(error))) => self.schedule_error(error.into()),
+            Some(Fenced::Failed(None)) => {
+                self.schedule_error(CompleteUploadError::InvalidOperationState)
+            }
         }
     }
 
@@ -733,28 +719,21 @@ mod tests {
 
     #[test]
     fn drops_orphan_record() {
-        // A removal drained the rule's records before this one was stored; it goes again.
+        // A removed rule gets no record: the transaction that read it writes nothing.
         let mut operation = operation(DEFAULT_PATTERN);
-        let effects = operation.compose_blob();
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchWrite { .. })]
-        ));
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
+        operation.compose_blob();
+        let txn_id = Ulid::from_parts(77, 7);
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: Vec::new().into(),
             value: None,
         }));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchDelete { .. })]
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
         ));
-        operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
-        operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+        operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
+        assert!(operation.written_intent.is_empty());
         assert_eq!(
             operation.cleanup.take_error(),
             Some(CompleteUploadError::ImportRemoved)
@@ -954,9 +933,19 @@ mod tests {
     }
 
     /// Answers the read of the rule after a record or its hash is stored.
-    fn past_rule(operation: &mut CompleteUploadOperation, effects: Effects) -> Effects {
-        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+    /// Answers the transaction and rule read of a fenced record write, up to its rows.
+    fn past_fence(operation: &mut CompleteUploadOperation, effects: Effects) -> Effects {
+        let starting = operation.fence.as_ref().is_some_and(FencedWrite::starting);
+        let [Effect::Storage(StorageEffect::StartTransaction { .. })] = effects.as_slice() else {
             return effects;
+        };
+        if !starting {
+            return effects;
+        }
+        let txn_id = Ulid::from_parts(77, 7);
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the rule read, got {effects:?}")
         };
         assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
         operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -965,16 +954,24 @@ mod tests {
         }))
     }
 
+    /// Answers the rows and the commit of a fenced record write.
+    fn fence_done(operation: &mut CompleteUploadOperation) -> Effects {
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: Ulid::from_parts(77, 7),
+        }))
+    }
+
     /// Answers the stored and synced write intent that comes before a plain compose.
     fn past_intent(operation: &mut CompleteUploadOperation, effects: Effects) -> Effects {
+        let effects = past_fence(operation, effects);
         match effects.as_slice() {
             [Effect::Storage(StorageEffect::BatchWrite { writes, .. })]
                 if writes[0].0 == aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE =>
             {
-                let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-                    entries: Vec::new(),
-                }));
-                let effects = past_rule(operation, effects);
+                let effects = fence_done(operation);
                 assert!(matches!(
                     effects.as_slice(),
                     [Effect::Storage(StorageEffect::SyncAll)]
@@ -990,6 +987,7 @@ mod tests {
         // The compose waits for the intent write and then its sync, each answered once.
         let mut operation = operation(DEFAULT_PATTERN);
         let effects = operation.compose_blob();
+        let effects = past_fence(&mut operation, effects);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::BatchWrite { .. })]
@@ -1004,6 +1002,7 @@ mod tests {
     fn composes_plain_path() {
         let mut operation = operation(DEFAULT_PATTERN);
         let effects = operation.compose_blob();
+        let effects = past_fence(&mut operation, effects);
 
         // No byte moves before the identity of the object is stored.
         let id = operation.version_id.expect("the path names the version");
@@ -1235,6 +1234,7 @@ mod tests {
             exists: false,
             version: None,
         }));
+        let effects = past_fence(&mut operation, effects);
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected the write intent, got {effects:?}")
         };
@@ -1315,14 +1315,12 @@ mod tests {
             etag: None,
         }));
         // A listed object's intent records the hash of the bytes before the finalize.
+        let effects = past_fence(operation, effects);
         let effects = match effects.as_slice() {
             [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] => {
                 let intent = WriteIntent::from_bytes(&writes[0].2).unwrap();
                 assert_eq!(intent.written, Some([7u8; 32]));
-                let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-                    entries: Vec::new(),
-                }));
-                past_rule(operation, effects)
+                fence_done(operation)
             }
             _ => effects,
         };

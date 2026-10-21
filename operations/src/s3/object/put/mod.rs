@@ -124,9 +124,6 @@ pub enum PutObjectState {
     WriteIntent,
     /// Syncs that intent to disk before the bytes move.
     SyncIntent,
-    /// Reads the rule after its intent or evidence is stored; a removal drained it already.
-    CheckIntentRule,
-    CheckEvidenceRule,
     /// Reads the version a history write registers, inside the version transaction.
     ReadHistory,
     /// Deletes the write intents the committed version makes obsolete.
@@ -311,8 +308,8 @@ pub struct PutObjectOperation {
     pending_write: Option<Effects>,
     /// The intent record of the plain write in flight.
     written_intent: Vec<aruna_core::types::Key>,
-    /// The import rule was gone after the intent was stored, so the intent is dropped.
-    rule_removed: bool,
+    /// The intent or hash write in flight, in one transaction with a read of its rule.
+    fence: Option<fenced::FencedWrite>,
     /// The delete trail the version transaction reads before an import registers a version.
     trail_scan: Option<trail::TrailScan>,
     rule_scan: Option<sharing::RuleScan>,
@@ -367,7 +364,7 @@ impl PutObjectOperation {
             keep_head: false,
             pending_write: None,
             written_intent: Vec::new(),
-            rule_removed: false,
+            fence: None,
             trail_scan: None,
             rule_scan: None,
         }
@@ -1970,10 +1967,7 @@ impl Operation for PutObjectOperation {
                 self.plain_written(event)
             }
             PutObjectState::ReadImportRule => self.import_rule_read(event),
-            PutObjectState::WriteIntent
-            | PutObjectState::CheckIntentRule
-            | PutObjectState::SyncIntent => self.intent_written(event),
-            PutObjectState::CheckEvidenceRule => self.evidence_checked(event),
+            PutObjectState::WriteIntent | PutObjectState::SyncIntent => self.intent_written(event),
             PutObjectState::DropIntent | PutObjectState::SyncDroppedIntent => {
                 self.intent_dropped(event)
             }
@@ -2040,6 +2034,11 @@ impl Operation for PutObjectOperation {
         if let Some(txn_id) = self.txn_id.take() {
             actions.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
         }
+        actions.extend(
+            self.fence
+                .as_mut()
+                .and_then(fenced::FencedWrite::abort_open),
+        );
         actions
     }
 }
@@ -2789,6 +2788,7 @@ mod decision_tests {
     }
 }
 
+pub(crate) mod fenced;
 mod plain;
 mod sharing;
 mod trail;
@@ -2796,7 +2796,7 @@ pub(crate) use sharing::RuleScan;
 pub(crate) use trail::{Trail, TrailScan, trail_ranges};
 
 pub(crate) use plain::{
-    PlainRecord, intent_deletes, intent_keys, intent_writes, owner_read, owns_path, same_name_path,
+    PlainRecord, intent_deletes, intent_keys, intent_rows, owner_read, owns_path, same_name_path,
     version_row,
 };
 

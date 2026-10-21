@@ -109,9 +109,6 @@ pub enum CompleteUploadState {
     WriteIntent,
     /// Syncs that record to disk before the compose.
     SyncIntent,
-    /// Reads the rule after the record or its hash is stored; a removal drained it already.
-    CheckIntentRule,
-    CheckEvidenceRule,
     /// Deletes that record in the version transaction.
     RetireIntent,
     /// Deletes the record of a compose the provider refused before any byte moved.
@@ -343,8 +340,8 @@ pub struct CompleteUploadOperation {
     trail_scan: Option<crate::s3::object::put::TrailScan>,
     /// The intent record of the compose in flight.
     written_intent: Vec<Key>,
-    /// The import rule was gone after the record was stored, so the record is dropped.
-    rule_removed: bool,
+    /// The record or hash write in flight, in one transaction with a read of its rule.
+    fence: Option<crate::s3::object::put::fenced::FencedWrite>,
 }
 
 impl CompleteUploadOperation {
@@ -400,7 +397,7 @@ impl CompleteUploadOperation {
             registered: false,
             trail_scan: None,
             written_intent: Vec::new(),
-            rule_removed: false,
+            fence: None,
         }
     }
 
@@ -2380,10 +2377,9 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::WriteObjectMetadata => self.metadata_written(event),
             CompleteUploadState::DeleteUploadRecords => self.records_deleted(event),
             CompleteUploadState::ReadImportRule => self.import_rule_read(event),
-            CompleteUploadState::CheckEvidenceRule => self.evidence_checked(event),
-            CompleteUploadState::WriteIntent
-            | CompleteUploadState::CheckIntentRule
-            | CompleteUploadState::SyncIntent => self.intent_written(event),
+            CompleteUploadState::WriteIntent | CompleteUploadState::SyncIntent => {
+                self.intent_written(event)
+            }
             CompleteUploadState::RetireIntent => self.intent_retired(event),
             CompleteUploadState::WriteEvidence => self.evidence_written(event),
             CompleteUploadState::DropIntent | CompleteUploadState::SyncDroppedIntent => {

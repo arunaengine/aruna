@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::fenced::{Fenced, FencedWrite};
 use super::*;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, IMPORT_INTENT_KEYSPACE,
@@ -154,12 +155,16 @@ impl PutObjectOperation {
         let Some(intent) = intent else {
             return smallvec![write];
         };
-        match intent_writes(&keys, &intent) {
-            Ok(effect) => {
+        let (rows, Some(rule)) = (intent_rows(&keys, &intent), self.rule_fence()) else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        match rows {
+            Ok(rows) => {
                 self.written_intent = keys;
                 self.pending_write = Some(smallvec![write]);
                 self.state = PutObjectState::WriteIntent;
-                smallvec![effect]
+                let fence = self.fence.insert(FencedWrite::new(rule, rows));
+                fence.start()
             }
             Err(error) => self.emit_error(error.into()),
         }
@@ -195,93 +200,61 @@ impl PutObjectOperation {
             &written.backend_path,
             intent.version_id,
         );
-        let effect = match intent_writes(&[key], &intent) {
-            Ok(effect) => effect,
+        let (rows, rule) = (intent_rows(&[key], &intent), self.rule_fence()?);
+        let rows = match rows {
+            Ok(rows) => rows,
             Err(error) => return Some(self.emit_error(error.into())),
         };
         self.state = PutObjectState::WriteEvidence;
-        Some(smallvec![effect])
+        Some(self.fence.insert(FencedWrite::new(rule, rows)).start())
     }
 
+    /// The hash is stored with a read of the rule; a removed rule gets none, and the write
+    /// goes on as one without its rule.
     pub(super) fn evidence_written(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                self.state = PutObjectState::CheckEvidenceRule;
-                self.rule_read().unwrap_or_else(|| self.start_transaction())
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
+        let Some(fence) = self.fence.as_mut() else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let effects = fence.step(event);
+        match fence.outcome().cloned() {
+            None => effects,
+            Some(Fenced::Written | Fenced::RuleGone) => self.start_transaction(),
+            Some(Fenced::Failed(Some(error))) => {
                 self.cleanup_failed_write(PutObjectError::StorageError(error))
             }
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
+            Some(Fenced::Failed(None)) => self.emit_error(PutObjectError::InvalidOperationState),
         }
     }
 
-    /// A removal deletes the rule before it drains the rule's intents, so an intent stored
-    /// while the rule still reads as present is drained with the others.
-    fn rule_read(&self) -> Option<Effects> {
-        let key = self.rule_fence()?;
-        Some(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        })])
-    }
-
-    /// Evidence stored after the rule went is dropped with the intents; the write goes on.
-    pub(super) fn evidence_checked(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {
-                self.start_transaction()
-            }
-            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                self.rule_removed = true;
-                smallvec![intent_deletes(&self.written_intent)]
-            }
-            Event::Storage(StorageEvent::BatchDeleteResult { .. }) if self.rule_removed => {
-                self.written_intent.clear();
-                self.start_transaction()
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                self.cleanup_failed_write(PutObjectError::StorageError(error))
-            }
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
-        }
-    }
-
-    /// Bytes move only once their identity is stored and synced to disk, and only while the
-    /// rule exists after the intent was stored.
+    /// Bytes move only once their identity is stored with a read of the rule and synced to
+    /// disk; a removed rule stores nothing and refuses the write.
     pub(super) fn intent_written(&mut self, event: Event) -> Effects {
-        let (writing, checking) = (
-            self.state == PutObjectState::WriteIntent,
-            self.state == PutObjectState::CheckIntentRule,
-        );
-        match (event, self.pending_write.take()) {
-            (Event::Storage(StorageEvent::BatchWriteResult { .. }), Some(write)) if writing => {
-                self.pending_write = Some(write);
-                self.state = PutObjectState::CheckIntentRule;
-                self.rule_read()
-                    .unwrap_or_else(|| self.emit_error(PutObjectError::InvalidOperationState))
-            }
-            (Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }), Some(write))
-                if checking =>
-            {
-                self.pending_write = Some(write);
+        if self.state == PutObjectState::SyncIntent {
+            return match (event, self.pending_write.take()) {
+                (Event::Storage(StorageEvent::SyncAllFinished), Some(write)) => {
+                    self.state = PutObjectState::WriteBlob;
+                    write
+                }
+                (Event::Storage(StorageEvent::Error { error }), _) => self.emit_error(error.into()),
+                _ => self.emit_error(PutObjectError::InvalidOperationState),
+            };
+        }
+        let Some(fence) = self.fence.as_mut() else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let effects = fence.step(event);
+        match fence.outcome().cloned() {
+            None => effects,
+            Some(Fenced::Written) => {
                 self.state = PutObjectState::SyncIntent;
                 smallvec![Effect::Storage(StorageEffect::SyncAll)]
             }
-            (Event::Storage(StorageEvent::ReadResult { value: None, .. }), Some(_)) if checking => {
-                self.rule_removed = true;
-                self.state = PutObjectState::DropIntent;
-                smallvec![intent_deletes(&self.written_intent)]
+            Some(Fenced::RuleGone) => {
+                self.written_intent.clear();
+                self.emit_error(PutObjectError::ImportRemoved)
             }
-            (Event::Storage(StorageEvent::SyncAllFinished), Some(write))
-                if self.state == PutObjectState::SyncIntent =>
-            {
-                self.state = PutObjectState::WriteBlob;
-                write
-            }
-            (Event::Storage(StorageEvent::Error { error }), _) => self.emit_error(error.into()),
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
+            Some(Fenced::Failed(Some(error))) => self.emit_error(error.into()),
+            Some(Fenced::Failed(None)) => self.emit_error(PutObjectError::InvalidOperationState),
         }
     }
 
@@ -306,11 +279,8 @@ impl PutObjectOperation {
             }
             Event::Storage(StorageEvent::SyncAllFinished) if syncing => {
                 self.written_intent.clear();
-                let error = match self.rule_removed {
-                    true => PutObjectError::ImportRemoved,
-                    false => PutObjectError::BlobWriteFailed(BlobError::PathTaken),
-                };
-                self.cleanup_failed_write(error)
+                let taken = PutObjectError::BlobWriteFailed(BlobError::PathTaken);
+                self.cleanup_failed_write(taken)
             }
             Event::Storage(StorageEvent::Error { error }) => {
                 self.cleanup_failed_write(PutObjectError::StorageError(error))
@@ -628,17 +598,17 @@ pub(crate) fn intent_keys(import_id: Ulid, path: &str, id: Ulid, if_not_exists: 
     keys
 }
 
-/// Stores the identity of a write under each of its intent keys.
-pub(crate) fn intent_writes(keys: &[Key], intent: &WriteIntent) -> Result<Effect, ConversionError> {
+/// The intent rows of `keys`, for a write in a transaction.
+pub(crate) fn intent_rows(
+    keys: &[Key],
+    intent: &WriteIntent,
+) -> Result<Vec<(String, Key, Value)>, ConversionError> {
     let value: Value = intent.to_bytes()?.into();
     let space = IMPORT_INTENT_KEYSPACE.to_string();
-    let writes = keys
+    Ok(keys
         .iter()
-        .map(|key| (space.clone(), key.clone(), value.clone()));
-    Ok(Effect::Storage(StorageEffect::BatchWrite {
-        writes: writes.collect(),
-        txn_id: None,
-    }))
+        .map(|key| (space.clone(), key.clone(), value.clone()))
+        .collect())
 }
 
 /// Deletes the intents of a write that moved no byte.
@@ -739,11 +709,38 @@ mod tests {
     }
 
     /// Runs the gate reads of a bucket without policies, fence or encryption.
+    /// Starts the write up to the intent rows its transaction writes after reading the rule.
     fn begin(operation: &mut PutObjectOperation) -> Effects {
         operation.start();
         operation.step(read(None));
         operation.step(read(None));
-        operation.step(read(None))
+        let effects = operation.step(read(None));
+        past_fence(operation, effects)
+    }
+
+    /// Answers the transaction and rule read of a fenced intent write, up to its rows.
+    fn past_fence(operation: &mut PutObjectOperation, effects: Effects) -> Effects {
+        let [Effect::Storage(StorageEffect::StartTransaction { .. })] = effects.as_slice() else {
+            return effects;
+        };
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_parts(77, 7),
+        }));
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the rule read, got {effects:?}")
+        };
+        assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
+        operation.step(read(Some(vec![1])))
+    }
+
+    /// Answers the rows and the commit of a fenced intent write.
+    fn fence_done(operation: &mut PutObjectOperation) -> Effects {
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: Ulid::from_parts(77, 7),
+        }))
     }
 
     fn written(path: String, ulid: Ulid) -> BackendLocation {
@@ -804,19 +801,15 @@ mod tests {
 
     /// Answers the intent write and its sync; the write waits for both.
     /// Answers the read of the rule after an intent or its evidence is stored.
-    fn past_rule(operation: &mut PutObjectOperation, effects: Effects) -> Effects {
-        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
-            return effects;
-        };
-        assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
-        operation.step(read(Some(vec![1])))
-    }
 
     fn past_intent(operation: &mut PutObjectOperation) -> Effects {
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        let effects = past_rule(operation, effects);
+        if operation.fence.as_ref().is_some_and(FencedWrite::starting) {
+            let effects = smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })];
+            past_fence(operation, effects);
+        }
+        let effects = fence_done(operation);
         assert!(
             matches!(
                 effects.as_slice(),
@@ -872,9 +865,15 @@ mod tests {
     #[test]
     fn orders_intent_acks() {
         // A sync answer before the intent write, or a second write answer, is refused.
+        let aborted = || {
+            Event::Storage(StorageEvent::TransactionAborted {
+                txn_id: Ulid::from_parts(77, 7),
+            })
+        };
         let mut early = operation(DEFAULT_PATTERN);
         begin(&mut early);
         early.step(Event::Storage(StorageEvent::SyncAllFinished));
+        early.step(aborted());
         let error = early.finalize().unwrap_err();
         assert_eq!(error, PutObjectError::InvalidOperationState);
         let mut twice = operation(DEFAULT_PATTERN);
@@ -891,6 +890,7 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::Blob(_)))
         );
+        twice.step(aborted());
         let error = twice.finalize().unwrap_err();
         assert_eq!(error, PutObjectError::InvalidOperationState);
     }
@@ -912,7 +912,8 @@ mod tests {
         let path = format!("raw/x/one.csv~{id}");
         assert_eq!(key_space, IMPORT_INTENT_KEYSPACE);
         assert_eq!(*key, intent_key(Ulid::from_bytes([4u8; 16]), &path, id));
-        assert_eq!(*txn_id, None);
+        // The rows go in the transaction that read the rule.
+        assert!(txn_id.is_some());
         let intent = WriteIntent::from_bytes(value).unwrap();
         assert_eq!(
             (intent.key.as_str(), intent.version_id),
@@ -1501,6 +1502,7 @@ mod tests {
             version: None,
             etag: None,
         }));
+        let effects = past_fence(&mut operation, effects);
         let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice()
         else {
             panic!("expected the written hash, got {effects:?}")
@@ -1508,15 +1510,13 @@ mod tests {
         let [(space, key, value)] = writes.as_slice() else {
             panic!("only the reached path gets the hash, got {writes:?}")
         };
-        assert_eq!((space.as_str(), *txn_id), (IMPORT_INTENT_KEYSPACE, None));
+        assert_eq!(space.as_str(), IMPORT_INTENT_KEYSPACE);
+        assert!(txn_id.is_some());
         assert_eq!(*key, intent_key(Ulid::from_bytes([4u8; 16]), &tagged, id));
         let intent = WriteIntent::from_bytes(value).unwrap();
         assert_eq!(intent.written, Some([7u8; 32]));
-        // The version transaction starts only after the hash is stored and the rule still reads.
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        let effects = past_rule(&mut operation, effects);
+        // The version transaction starts only after the hash is stored with the rule read.
+        let effects = fence_done(&mut operation);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::StartTransaction { .. })]
@@ -1524,23 +1524,25 @@ mod tests {
     }
 
     #[test]
-    fn drops_orphan_intent() {
-        // A removal drained the rule's intents before this one was stored; it goes again.
+    fn stores_with_rule() {
+        // A removed rule gets no intent: the transaction that read it writes nothing.
         let mut operation = operation(DEFAULT_PATTERN);
-        begin(&mut operation);
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
+        operation.start();
+        operation.step(read(None));
+        operation.step(read(None));
+        operation.step(read(None));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_parts(77, 7),
         }));
         let effects = operation.step(read(None));
-        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice()
-        else {
-            panic!("expected the intent delete, got {effects:?}")
-        };
-        assert!(!deletes.is_empty());
-        operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: Ulid::from_parts(77, 7),
         }));
-        operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+        assert!(operation.written_intent.is_empty());
         assert_eq!(
             operation.finalize().unwrap_err(),
             PutObjectError::ImportRemoved

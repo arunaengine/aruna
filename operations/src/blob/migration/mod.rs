@@ -15,8 +15,9 @@ use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::groups::storage_routing::routing_key;
 use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use crate::s3::bucket::key::rows::settings_read;
+use crate::s3::object::put::fenced::{Fenced, FencedWrite};
 use crate::s3::object::put::{
-    PlainRecord, intent_deletes, intent_writes, owner_read, owns_path, same_name_path,
+    PlainRecord, intent_deletes, intent_rows, owner_read, owns_path, same_name_path,
 };
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -70,8 +71,6 @@ pub enum MigrateState {
     WriteIntent,
     /// Syncs that intent to disk.
     SyncIntent,
-    /// Reads the rule after the intent is stored; a removal drained its intents already.
-    CheckIntentRule,
     WriteBlob,
     /// Deletes the intents of a write the storage refused, then syncs that delete.
     DropIntent,
@@ -157,8 +156,8 @@ pub struct MigrateVersionOperation {
     backend_version: Option<String>,
     /// A rename looked at its tagged path too before writing.
     tag_checked: bool,
-    /// The rule was gone after the intent was stored, so the move leaves the version.
-    rule_removed: bool,
+    /// The intent write in flight, in one transaction with a read of its rule.
+    fence: Option<FencedWrite>,
     /// The write intents stored for a write to a linked folder, at both paths it may reach.
     written_intent: Vec<Key>,
     /// The write that waits for its intent to be on disk.
@@ -197,7 +196,7 @@ impl MigrateVersionOperation {
             plain_owned: false,
             backend_version: None,
             tag_checked: false,
-            rule_removed: false,
+            fence: None,
             written_intent: Vec::new(),
             pending_write: None,
             backend_etag: None,
@@ -597,8 +596,6 @@ impl MigrateVersionOperation {
         smallvec![effect]
     }
 
-    /// A write to a linked folder stores its identity at the path and at its tagged path, and
-    /// syncs it, before any byte moves; an import then registers the file as this version.
     /// A rename keeps one attempt id per old file, apart from the old file's own id, so a
     /// retry stores the same intents and names the same copy.
     fn attempt(&self) -> Ulid {
@@ -623,6 +620,8 @@ impl MigrateVersionOperation {
             .into()
     }
 
+    /// A write to a linked folder stores its identity at the path and at its tagged path, and
+    /// syncs it, before any byte moves; an import then registers the file as this version.
     fn intent_first(&mut self, write: Effects, created_by: aruna_core::UserId) -> Effects {
         let listed = self.plain.as_ref().filter(|target| target.listed);
         let (Some(target), Some(path)) = (listed, self.plain_path.as_ref()) else {
@@ -640,56 +639,49 @@ impl MigrateVersionOperation {
             created_by,
             written: source.and_then(|hash| hash.try_into().ok()),
         };
-        match intent_writes(&keys, &intent) {
-            Ok(effect) => {
+        let Some(routing) = self.routing.as_ref() else {
+            return self.fail(MigrateVersionError::NotFinished);
+        };
+        let rule = import_key(routing.group_id, target.import_id);
+        match intent_rows(&keys, &intent) {
+            Ok(rows) => {
                 self.written_intent = keys;
                 self.pending_write = Some(write);
                 self.state = MigrateState::WriteIntent;
-                smallvec![effect]
+                self.fence.insert(FencedWrite::new(rule, rows)).start()
             }
             Err(error) => self.fail(error.into()),
         }
     }
 
-    /// A removal deletes the rule before it drains the rule's intents, so an intent stored
-    /// while the rule still reads as present is drained with the others.
+    /// The intent is stored with a read of its rule, then synced before the bytes move; a
+    /// removed rule stores nothing and the move leaves the version.
     fn handle_intent(&mut self, event: Event) -> Effects {
-        let state = self.state;
-        match (event, self.pending_write.take()) {
-            (Event::Storage(StorageEvent::BatchWriteResult { .. }), Some(write))
-                if state == MigrateState::WriteIntent =>
-            {
-                let (Some(target), Some(routing)) = (&self.plain, &self.routing) else {
-                    return self.fail(MigrateVersionError::NotFinished);
-                };
-                let key = import_key(routing.group_id, target.import_id);
-                self.pending_write = Some(write);
-                self.state = MigrateState::CheckIntentRule;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
-                    key,
-                    txn_id: None,
-                })]
-            }
-            (Event::Storage(StorageEvent::ReadResult { value, .. }), Some(write))
-                if state == MigrateState::CheckIntentRule =>
-            {
-                if value.is_none() {
-                    self.rule_removed = true;
-                    self.state = MigrateState::DropIntent;
-                    return smallvec![intent_deletes(&self.written_intent)];
+        if self.state == MigrateState::SyncIntent {
+            return match (event, self.pending_write.take()) {
+                (Event::Storage(StorageEvent::SyncAllFinished), Some(write)) => {
+                    self.state = MigrateState::WriteBlob;
+                    write
                 }
-                self.pending_write = Some(write);
+                (other, _) => self.unexpected(other),
+            };
+        }
+        let Some(fence) = self.fence.as_mut() else {
+            return self.fail(MigrateVersionError::NotFinished);
+        };
+        let effects = fence.step(event);
+        match fence.outcome().cloned() {
+            None => effects,
+            Some(Fenced::Written) => {
                 self.state = MigrateState::SyncIntent;
                 smallvec![Effect::Storage(StorageEffect::SyncAll)]
             }
-            (Event::Storage(StorageEvent::SyncAllFinished), Some(write))
-                if state == MigrateState::SyncIntent =>
-            {
-                self.state = MigrateState::WriteBlob;
-                write
+            Some(Fenced::RuleGone) => {
+                self.written_intent.clear();
+                self.skip()
             }
-            (other, _) => self.unexpected(other),
+            Some(Fenced::Failed(Some(error))) => self.fail(error.into()),
+            Some(Fenced::Failed(None)) => self.fail(MigrateVersionError::NotFinished),
         }
     }
 
@@ -709,10 +701,7 @@ impl MigrateVersionOperation {
             }
             (MigrateState::SyncDroppedIntent, Event::Storage(StorageEvent::SyncAllFinished)) => {
                 self.written_intent.clear();
-                match self.rule_removed {
-                    true => self.skip(),
-                    false => self.fail(BlobError::PathTaken.into()),
-                }
+                self.fail(BlobError::PathTaken.into())
             }
             (_, other) => self.unexpected(other),
         }
@@ -1224,7 +1213,10 @@ impl Operation for MigrateVersionOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::Error { error }) = &event
-            && !matches!(self.state, MigrateState::Commit | MigrateState::Abort)
+            && !matches!(
+                self.state,
+                MigrateState::Commit | MigrateState::Abort | MigrateState::WriteIntent
+            )
         {
             let error = error.clone();
             return self.fail(error.into());
@@ -1241,9 +1233,7 @@ impl Operation for MigrateVersionOperation {
             MigrateState::ReadPlainOwner => self.handle_owner(event),
             MigrateState::StatPlain => self.handle_stat(event),
             MigrateState::ReadBlob => self.handle_read(event),
-            MigrateState::WriteIntent
-            | MigrateState::CheckIntentRule
-            | MigrateState::SyncIntent => self.handle_intent(event),
+            MigrateState::WriteIntent | MigrateState::SyncIntent => self.handle_intent(event),
             MigrateState::WriteBlob => self.handle_written(event),
             MigrateState::DropIntent | MigrateState::SyncDroppedIntent => {
                 self.handle_dropped(event)
@@ -1284,11 +1274,14 @@ impl Operation for MigrateVersionOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id
+        let mut effects: Effects = self
+            .txn_id
             .take()
             .map_or_else(smallvec::SmallVec::new, |txn_id| {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+            });
+        effects.extend(self.fence.as_mut().and_then(FencedWrite::abort_open));
+        effects
     }
 }
 
@@ -2303,29 +2296,40 @@ mod tests {
 
         /// Answers the stored and synced intent before a linked write, and returns the write.
         fn past_intent(operation: &mut MigrateVersionOperation, effects: Effects) -> Effects {
-            let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] =
-                effects.as_slice()
+            let [Effect::Storage(StorageEffect::StartTransaction { .. })] = effects.as_slice()
             else {
                 return effects;
             };
-            assert_eq!(
-                (writes[0].0.as_str(), *txn_id),
-                (IMPORT_INTENT_KEYSPACE, None)
-            );
+            // The rule is read in the transaction that stores the intent.
+            let txn_id = TxnId::from(9);
+            let effects =
+                operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::Read { key_space, txn_id: Some(_), .. })]
+                    if key_space == BACKEND_IMPORT_KEYSPACE
+            ));
+            let effects = operation.step(read_result(Some(vec![1])));
+            let [
+                Effect::Storage(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: Some(_),
+                }),
+            ] = effects.as_slice()
+            else {
+                panic!("expected the intent rows, got {effects:?}")
+            };
+            assert_eq!(writes[0].0.as_str(), IMPORT_INTENT_KEYSPACE);
             // The source bytes are known, so the intent proves the copy before it is written.
             let intent = WriteIntent::from_bytes(&writes[0].2).unwrap();
             let source = operation.old.as_ref().and_then(|old| old.get_blake3());
             assert_eq!(intent.written.as_ref().map(|hash| &hash[..]), source);
-            let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            operation.step(Event::Storage(StorageEvent::BatchWriteResult {
                 entries: Vec::new(),
             }));
-            // The rule still reads after the intent is stored.
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                    if key_space == BACKEND_IMPORT_KEYSPACE
-            ));
-            let effects = operation.step(read_result(Some(vec![1])));
+            let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id,
+            }));
             assert!(matches!(
                 effects.as_slice(),
                 [Effect::Storage(StorageEffect::SyncAll)]
@@ -2631,7 +2635,7 @@ mod tests {
 
         #[test]
         fn drops_orphan_intents() {
-            // The rule went before the intents were stored, so they go again and the move stops.
+            // The rule went before the intents were stored, so none are and the move stops.
             let mut moved = operation("in/x/one.csv", vec![rule()]);
             let version = raw_version();
             moved.start();
@@ -2644,18 +2648,14 @@ mod tests {
                 version: None,
             }));
             moved.step(empty_blob());
-            moved.step(Event::Storage(StorageEvent::BatchWriteResult {
-                entries: Vec::new(),
-            }));
+            let txn_id = TxnId::from(9);
+            moved.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
             let effects = moved.step(read_result(None));
             assert!(matches!(
                 effects.as_slice(),
-                [Effect::Storage(StorageEffect::BatchDelete { .. })]
+                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
             ));
-            moved.step(Event::Storage(StorageEvent::BatchDeleteResult {
-                entries: Vec::new(),
-            }));
-            moved.step(Event::Storage(StorageEvent::SyncAllFinished));
+            moved.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
             assert!(moved.written_intent.is_empty());
             assert_eq!(moved.output, Some(Ok(MigrateOutcome::Skipped)));
         }
