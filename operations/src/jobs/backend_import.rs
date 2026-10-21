@@ -1571,21 +1571,25 @@ async fn hash_object(
         path: object.key.clone(),
         created_by: spec.auth_context.user_id,
     };
-    let unquoted = |etag: &str| etag.trim_matches('"').to_string();
     match drive(BlobRequest::new(effect), &ctx.driver).await {
         Ok(BlobEvent::ExternalHashed {
             location,
             version,
             etag,
-        }) => match (object.etag.as_deref(), etag.as_deref()) {
-            (Some(listed), Some(read)) if unquoted(listed) != unquoted(read) => {
-                Err(ItemError::Changed)
-            }
-            _ => Ok((location, version)),
+        }) => match read_listed(object.etag.as_deref(), etag.as_deref()) {
+            true => Ok((location, version)),
+            false => Err(ItemError::Changed),
         },
         Ok(other) => Err(ItemError::System(format!("unexpected answer {other:?}"))),
         Err(error) => Err(hash_failure(error)),
     }
+}
+
+/// Whether the hashed read answered with the listing's ETag; a listing without one proves
+/// nothing, a read without one proves no match.
+fn read_listed(listed: Option<&str>, read: Option<&str>) -> bool {
+    let unquoted = |etag: &str| etag.trim_matches('"').to_string();
+    listed.is_none_or(|listed| read.is_some_and(|read| unquoted(read) == unquoted(listed)))
 }
 
 /// Only an object that is gone or unreadable by its key fails alone; a backend outage
@@ -2170,6 +2174,14 @@ mod tests {
         request.step(listed());
         request.step(listed());
         assert!(request.finalize().is_err());
+    }
+
+    #[test]
+    fn checks_read_etags() {
+        assert!(read_listed(None, None));
+        assert!(read_listed(Some("\"a\""), Some("a")));
+        assert!(!read_listed(Some("a"), Some("b")));
+        assert!(!read_listed(Some("a"), None));
     }
 
     #[test]

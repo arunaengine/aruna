@@ -174,10 +174,17 @@ impl BlobHandler {
             .await
             .map_err(|_| read_error("timed out opening the object"))?
             .map_err(open_error)?;
-        let stream = timeout(self.io_timeout(), reader.into_bytes_stream(..))
+        let mut stream = timeout(self.io_timeout(), reader.into_bytes_stream(..))
             .await
             .map_err(|_| read_error("timed out starting the object read"))?
             .map_err(|error| read_error(&error.to_string()))?;
+        // The ETag is the one of the response hashed; a storage that reports none has none.
+        let etag = match timeout(self.io_timeout(), stream.metadata()).await {
+            Ok(Ok(read)) => read.etag().map(str::to_string),
+            Ok(Err(error)) if error.kind() == opendal::ErrorKind::Unsupported => None,
+            Ok(Err(error)) => return Err(read_error(&error.to_string())),
+            Err(_) => return Err(read_error("timed out opening the object read")),
+        };
         let mut stream = Box::pin(stream);
         let mut hasher = Hasher::new();
         let mut size = 0u64;
