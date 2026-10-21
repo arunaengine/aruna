@@ -4,8 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::keyspaces::{BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
-use aruna_core::structs::storage::backend_import::version_key;
+use aruna_core::keyspaces::{
+    BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DELETE_CLAIM_KEYSPACE,
+};
+use aruna_core::structs::storage::backend_import::{claim_key, version_key};
 use aruna_core::structs::storage::blob::{BlobHeadKey, BlobVersion, VersionKey};
 use aruna_core::types::Value;
 
@@ -98,29 +100,49 @@ impl CompleteUploadOperation {
                 if !usable {
                     return self.check_hash_lookup();
                 }
-                // At the same path only another backend version of it is another file.
-                if existing.same_object(&written) {
-                    self.state = CompleteUploadState::ReadDedupProvider;
-                    self.final_location = Some(existing.clone());
-                    return smallvec![Effect::Storage(StorageEffect::Read {
-                        key_space: BACKEND_VERSION_KEYSPACE.to_string(),
-                        key: version_key(existing.ulid),
-                        txn_id: self.txn_id,
-                    })];
-                }
-                self.reuse(written, existing)
+                // The kept file's backend version decides a same-path reuse and its claim.
+                self.state = CompleteUploadState::ReadDedupProvider;
+                self.final_location = Some(existing.clone());
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: BACKEND_VERSION_KEYSPACE.to_string(),
+                    key: version_key(existing.ulid),
+                    txn_id: self.txn_id,
+                })]
             }
             (CompleteUploadState::ReadDedupProvider, value) => {
-                let kept = self.final_location.take();
-                let fresh = self.plain_version.clone();
-                match (kept, value, fresh) {
-                    (Some(kept), Some(other), Some(fresh))
-                        if other.as_ref() != fresh.as_bytes() =>
-                    {
-                        self.reuse(written, kept)
-                    }
-                    _ => self.check_hash_lookup(),
+                let Some(kept) = self.final_location.clone() else {
+                    return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
+                };
+                let other = value.map(|value| String::from_utf8_lossy(&value).into_owned());
+                // At the same path only another backend version of it is another file.
+                let other_bytes = other.is_some() && other != self.plain_version;
+                if kept.same_object(&written) && !other_bytes {
+                    self.final_location = None;
+                    return self.check_hash_lookup();
                 }
+                let Some(other) = other else {
+                    return self.reuse(written, kept);
+                };
+                // A version a release is deleting takes no new reader.
+                match claim_key(&kept, &other) {
+                    Ok(claim) => {
+                        self.state = CompleteUploadState::ReadDedupClaim;
+                        smallvec![Effect::Storage(StorageEffect::Read {
+                            key_space: DELETE_CLAIM_KEYSPACE.to_string(),
+                            key: claim,
+                            txn_id: self.txn_id,
+                        })]
+                    }
+                    Err(error) => self.schedule_error(error.into()),
+                }
+            }
+            (CompleteUploadState::ReadDedupClaim, None) => match self.final_location.clone() {
+                Some(kept) => self.reuse(written, kept),
+                None => self.schedule_error(CompleteUploadError::CompleteUploadFailed),
+            },
+            (CompleteUploadState::ReadDedupClaim, Some(_)) => {
+                self.final_location = None;
+                self.check_hash_lookup()
             }
             _ => self.check_hash_lookup(),
         }

@@ -1534,6 +1534,8 @@ mod tests {
         );
         operation.step(read(Some(version.to_bytes().unwrap())));
         operation.step(read(Some(old.to_bytes().unwrap())));
+        operation.step(read(Some(b"v1".to_vec())));
+        operation.step(read(None));
         assert_eq!(operation.final_location.as_ref(), Some(&old));
         // The assembled file is released after the commit, at its exact backend version.
         let writes = operation.plain_records(true).unwrap();

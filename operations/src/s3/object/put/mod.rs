@@ -148,6 +148,7 @@ pub enum PutObjectState {
     ReadDedupVersion,
     ReadDedupLocation,
     ReadDedupProvider,
+    ReadDedupClaim,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -2012,7 +2013,8 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadDedupHead
             | PutObjectState::ReadDedupVersion
             | PutObjectState::ReadDedupLocation
-            | PutObjectState::ReadDedupProvider => self.dedup_read(event),
+            | PutObjectState::ReadDedupProvider
+            | PutObjectState::ReadDedupClaim => self.dedup_read(event),
             PutObjectState::CreateBlobLocation => self.location_created(event),
             PutObjectState::ReadObjectLookup => self.object_lookup_read(event),
             PutObjectState::ReadLivenessVersion => self.liveness_read(event),

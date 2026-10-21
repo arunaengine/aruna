@@ -12,10 +12,10 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, DELETE_CLAIM_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
 };
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, object_key, version_key,
+    BackendImport, ImportedObject, claim_key, object_key, version_key,
 };
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, HashIndex, VersionKey,
@@ -28,12 +28,52 @@ use ulid::Ulid;
 const RULE_PAGE: usize = 128;
 
 /// Deletes the old file of a rename at its recorded backend `version`, then the import row
-/// that named it as `version_id`. Any other reference to the copy keeps both; `false` retries.
+/// naming it as `version_id`; any other reference keeps both, and `false` retries. A durable
+/// claim of that version comes first and holds until the release settles, against new readers.
 pub(crate) async fn release_renamed(
     context: &DriverContext,
     location: BackendLocation,
     import_id: Ulid,
     version_id: Ulid,
+    version: String,
+) -> bool {
+    let Ok(claim) = claim_key(&location, &version) else {
+        return false;
+    };
+    if !claimed(context, &claim, true).await || !synced(context).await {
+        return false;
+    }
+    match release_claimed(context, location, (import_id, version_id), version).await {
+        true => claimed(context, &claim, false).await,
+        false => false,
+    }
+}
+
+/// Stores or drops the delete claim `key`.
+async fn claimed(context: &DriverContext, key: &Key, stored: bool) -> bool {
+    let effect = match stored {
+        true => StorageEffect::Write {
+            key_space: DELETE_CLAIM_KEYSPACE.to_string(),
+            key: key.clone(),
+            value: Vec::new().into(),
+            txn_id: None,
+        },
+        false => StorageEffect::Delete {
+            key_space: DELETE_CLAIM_KEYSPACE.to_string(),
+            key: key.clone(),
+            txn_id: None,
+        },
+    };
+    matches!(
+        send(context, effect).await,
+        Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. })
+    )
+}
+
+async fn release_claimed(
+    context: &DriverContext,
+    location: BackendLocation,
+    (import_id, version_id): (Ulid, Ulid),
     version: String,
 ) -> bool {
     let key = object_key(import_id, &location.backend_path);
@@ -641,6 +681,20 @@ mod tests {
         let value = b"v0".to_vec();
         put(&context, BACKEND_VERSION_KEYSPACE, other.into(), value).await;
         assert_eq!(pinned(&context, &old(), "v1").await.unwrap(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn claims_before_delete() {
+        // The claim of the backend version stays while the release waits and goes once it ends.
+        let claim = claim_key(&old(), "v1").unwrap();
+        let (_dir, context) = setup();
+        renamed_row(&context, IMPORT).await;
+        assert!(!release(&context).await);
+        let space = DELETE_CLAIM_KEYSPACE;
+        assert!(read_value(&context, space, claim.clone()).await.unwrap().is_some());
+        alias_version(&context, old().format.encoding()).await;
+        assert!(release(&context).await);
+        assert!(read_value(&context, space, claim).await.unwrap().is_none());
     }
 
     #[tokio::test]

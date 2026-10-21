@@ -424,6 +424,22 @@ pub fn version_key(location: Ulid) -> Key {
     location.to_bytes().to_vec().into()
 }
 
+/// The claim of a delete of backend `version` of the file at `location`, keyed by the file
+/// itself, so every location row of those bytes meets the same claim.
+pub fn claim_key(
+    location: &crate::structs::storage::blob::BackendLocation,
+    version: &str,
+) -> Result<Key, ConversionError> {
+    let file = (
+        &location.backend,
+        &location.root,
+        &location.storage_bucket,
+        &location.backend_path,
+        version,
+    );
+    Ok(postcard::to_allocvec(&file)?.into())
+}
+
 pub fn object_prefix(import_id: Ulid) -> Key {
     import_id.to_bytes().to_vec().into()
 }

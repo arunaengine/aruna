@@ -1755,6 +1755,10 @@ mod tests {
         };
         assert_eq!(key_space, BLOB_LOCATIONS_KEYSPACE);
         operation.step(read(Some(old.to_bytes().unwrap())));
+        operation.step(read(Some(b"v1".to_vec())));
+        // The older file's version is not being deleted, so it takes the new version.
+        assert_eq!(operation.state, PutObjectState::ReadDedupClaim);
+        operation.step(read(None));
         // The version reads the older file; the written one is released after the commit.
         assert_eq!(operation.output, Some(Ok(old.clone())));
         let (space, _, value) = operation.dedup_release().unwrap().unwrap();
@@ -1813,6 +1817,9 @@ mod tests {
             };
             assert_eq!(key_space, BACKEND_VERSION_KEYSPACE);
             operation.step(read(Some(stored.to_vec())));
+            if operation.state == PutObjectState::ReadDedupClaim {
+                operation.step(read(None));
+            }
             (operation, old)
         };
         let (operation, old) = reuse(b"v1");
@@ -1820,6 +1827,20 @@ mod tests {
         assert!(operation.dedup_release().is_some());
         // The same backend version is the same file; nothing is released.
         let (operation, _) = reuse(b"v2");
+        assert_eq!(operation.state, PutObjectState::CheckHashLookup);
+        assert!(operation.dedup_release().is_none());
+    }
+
+    #[test]
+    fn skips_claimed_file() {
+        // A backend version a release is deleting takes no new reader.
+        let mut old = written("raw/x/one.csv~old".to_string(), Ulid::from_parts(4, 4));
+        old.format.layout = StoredLayout::Plain(old.ulid);
+        let mut operation = rewritten(7);
+        current(&mut operation, &old);
+        operation.step(read(Some(old.to_bytes().unwrap())));
+        operation.step(read(Some(b"v1".to_vec())));
+        operation.step(read(Some(Vec::new())));
         assert_eq!(operation.state, PutObjectState::CheckHashLookup);
         assert!(operation.dedup_release().is_none());
     }

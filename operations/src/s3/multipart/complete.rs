@@ -97,6 +97,7 @@ pub enum CompleteUploadState {
     ReadDedupVersion,
     ReadDedupLocation,
     ReadDedupProvider,
+    ReadDedupClaim,
     WriteBlobLocation,
     ReadObjectLookup,
     ReadLivenessVersion,
@@ -2388,7 +2389,8 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::ReadDedupHead
             | CompleteUploadState::ReadDedupVersion
             | CompleteUploadState::ReadDedupLocation
-            | CompleteUploadState::ReadDedupProvider => self.dedup_read(event),
+            | CompleteUploadState::ReadDedupProvider
+            | CompleteUploadState::ReadDedupClaim => self.dedup_read(event),
             CompleteUploadState::WriteBlobLocation => self.location_written(event),
             CompleteUploadState::ReadObjectLookup => self.object_lookup_read(event),
             CompleteUploadState::ReadLivenessVersion => self.liveness_read(event),

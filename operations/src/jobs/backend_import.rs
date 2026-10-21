@@ -8,7 +8,7 @@ use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, BUCKET_CREATION_KEYSPACE, DELETE_TRAIL_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, BUCKET_CREATION_KEYSPACE, DELETE_CLAIM_KEYSPACE, DELETE_TRAIL_KEYSPACE,
     IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
@@ -1387,6 +1387,12 @@ async fn put_version(
     row: ImportedObject,
     fence: Fence,
 ) -> Result<(), PutObjectError> {
+    let mut guards = fence.guards;
+    // A backend version a release is deleting is not registered again.
+    if let Some(version) = version.as_deref() {
+        let claim = aruna_core::structs::storage::backend_import::claim_key(&location, version)?;
+        guards.push((DELETE_CLAIM_KEYSPACE.to_string(), claim, None));
+    }
     let rows = import_rows(&run.rule, &location, version, &row, fence.keep_row)?;
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: spec.auth_context.user_id,
@@ -1413,7 +1419,7 @@ async fn put_version(
     .with_restrictions(spec.auth_context.path_restrictions.clone())
     .with_expected_head(fence.head)
     .with_import_rows(run.rule.import_id, rows)
-    .with_import_guards(fence.guards)
+    .with_import_guards(guards)
     .with_rule_scan(RuleScan::new(run.rule.clone(), sharing(run)));
     if fence.keep_head {
         operation = operation.keep_head();
