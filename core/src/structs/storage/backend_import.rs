@@ -7,6 +7,7 @@ use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::execution::job::JobId;
 use crate::structs::identity::auth::AuthContext;
+use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::BackendRef;
 use crate::structs::storage::group_backend::path_bucket;
 use crate::types::{GroupId, Key};
@@ -434,6 +435,20 @@ pub struct RenameRequest {
     pub started_at_ms: u64,
     pub auth: AuthContext,
     pub node_id: NodeId,
+    /// The bearer token the caller asked with, checked again before each page.
+    pub grant: TokenGrant,
+}
+
+/// The non-secret identity of a bearer token: enough to tell later whether it was revoked,
+/// cut off or expired, never enough to use it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenGrant {
+    pub token_hash: String,
+    pub issuer: RealmId,
+    pub issued_at_secs: u64,
+    pub expires_at_secs: u64,
+    /// The linked login of another realm the token came through.
+    pub via: Option<UserId>,
 }
 
 impl RenameRequest {

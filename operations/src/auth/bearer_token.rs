@@ -13,6 +13,7 @@ use aruna_core::link::{alias_claims_key, alias_owner};
 use aruna_core::structs::identity::auth::{AuthContext, TokenClaims};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
+use aruna_core::structs::storage::backend_import::TokenGrant;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
@@ -133,6 +134,46 @@ pub async fn realm_token_revoked(
             Err(ArunaBearerError::RevocationUnavailable)
         }
     }
+}
+
+/// The non-secret identity of a token the request already validated, for work that runs as its
+/// caller later.
+pub fn token_grant(token: &str) -> Result<TokenGrant, ArunaBearerError> {
+    let claims = insecure_decode::<TokenClaims>(token)?.claims;
+    let issuer =
+        RealmId::from_base64(&claims.iss).map_err(|_| ArunaBearerError::InvalidIssuerKey)?;
+    let via = claims.via.as_deref().map(UserId::from_string).transpose()?;
+    Ok(TokenGrant {
+        token_hash: bearer_token_hash(token),
+        issuer,
+        issued_at_secs: claims.iat,
+        expires_at_secs: claims.exp,
+        via,
+    })
+}
+
+/// Whether a token still authorizes `user_id`, as the request checks did: not expired, not
+/// revoked, issued after any cutoff of the user or of the linked login, and that link still
+/// resolving to the user. A failed read is reported as unavailable, never as a verdict.
+pub async fn grant_valid(
+    storage: &StorageHandle,
+    grant: &TokenGrant,
+    user_id: &UserId,
+) -> Result<bool, ArunaBearerError> {
+    if unix_timestamp_secs() > grant.expires_at_secs
+        || realm_token_revoked(storage, grant.issuer, &grant.token_hash).await?
+    {
+        return Ok(false);
+    }
+    let cut = |cutoff: Option<u64>| cutoff.is_some_and(|cutoff| grant.issued_at_secs < cutoff);
+    if cut(realm_user_cutoff(storage, grant.issuer, user_id).await?) {
+        return Ok(false);
+    }
+    let Some(via) = grant.via.as_ref() else {
+        return Ok(true);
+    };
+    let linked = realm_linked_owner(storage, via).await? == Some(*user_id);
+    Ok(linked && !cut(realm_user_cutoff(storage, grant.issuer, via).await?))
 }
 
 /// The user's cutoff in the realm's replicated revocation set, read like the token revocation.
@@ -406,6 +447,28 @@ impl IssuerKeyCache {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn checks_saved_grant() {
+        // A realm without its config denies, like a revoked token; an expired grant too.
+        let temp = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let realm = RealmId::from_bytes([1; 32]);
+        let user = UserId::local(ulid::Ulid::from_parts(5, 5), realm);
+        let grant = TokenGrant {
+            token_hash: "hash".to_string(),
+            issuer: realm,
+            issued_at_secs: 1,
+            expires_at_secs: u64::MAX,
+            via: None,
+        };
+        assert!(!grant_valid(&storage, &grant, &user).await.unwrap());
+        let expired = TokenGrant {
+            expires_at_secs: 1,
+            ..grant
+        };
+        assert!(!grant_valid(&storage, &expired, &user).await.unwrap());
+    }
     use super::*;
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;

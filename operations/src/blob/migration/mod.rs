@@ -1455,23 +1455,31 @@ pub async fn rename_request(
 }
 
 /// The caller's WRITE on the bucket's keys, loaded once for a page of a rename; `None` when
-/// the caller may not use the bucket at all any more.
+/// the caller's token no longer holds or the caller may not use the bucket any more. State
+/// that cannot be read is an error, so the page is retried rather than passed over.
 async fn rename_access(
     context: &crate::driver::DriverContext,
     request: &RenameRequest,
     routing: &RoutingSnapshot,
     bucket: &str,
-) -> Option<crate::auth::request_authorization::BucketAccess> {
-    let scope = (request.auth.realm_id, routing.group_id, request.node_id);
-    let access = crate::auth::request_authorization::BucketAccess::load(
-        context,
-        &request.auth,
-        scope,
-        bucket,
+) -> Result<Option<crate::auth::request_authorization::BucketAccess>, String> {
+    use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
+    let valid = crate::auth::bearer_token::grant_valid(
+        &context.storage_handle,
+        &request.grant,
+        &request.auth.user_id,
     );
-    let access = access.await.ok()?;
+    if !valid.await.map_err(|error| error.to_string())? {
+        return Ok(None);
+    }
+    let scope = (request.auth.realm_id, routing.group_id, request.node_id);
+    let access = match BucketAccess::load(context, &request.auth, scope, bucket).await {
+        Ok(access) => access,
+        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
     let write = aruna_core::structs::identity::auth::Permission::WRITE;
-    access.allows(None, &write).then_some(access)
+    Ok(access.allows(None, &write).then_some(access))
 }
 
 /// Reads the earlier patterns of the rules a move resolves against.
@@ -1649,7 +1657,7 @@ async fn migrate_page(
     // file is renamed only while the caller who asked may still write its key.
     let (earlier, access) = match routing.as_ref() {
         Some(routing) => match rename_request(context, bucket, &record).await? {
-            Some(request) => match rename_access(context, &request, routing, bucket).await {
+            Some(request) => match rename_access(context, &request, routing, bucket).await? {
                 Some(access) => (read_earlier(context, routing).await?, Some(access)),
                 None => (Earlier::new(), None),
             },
@@ -2278,10 +2286,18 @@ mod tests {
         let auth = crate::tests::access::seed_access(&context, (realm, group, node), &secret).await;
         let mut record = CompressionMigration::new(Compression::Off, 1);
         (record.moving, record.started_at_ms) = (true, 7);
+        let grant = aruna_core::structs::storage::backend_import::TokenGrant {
+            token_hash: "hash".to_string(),
+            issuer: realm,
+            issued_at_secs: 1,
+            expires_at_secs: u64::MAX,
+            via: None,
+        };
         let request = RenameRequest {
             started_at_ms: 7,
             auth,
             node_id: node,
+            grant,
         };
         let write = StorageEffect::Write {
             key_space: RENAME_MOVE_KEYSPACE.to_string(),
@@ -2296,12 +2312,16 @@ mod tests {
         record.started_at_ms = 8;
         assert_eq!(rename_request(&context, "b", &record).await.unwrap(), None);
         let routing = RoutingSnapshot::single(group);
-        let access = rename_access(&context, &request, &routing, "b")
-            .await
-            .unwrap();
+        let access = rename_access(&context, &request, &routing, "b").await;
+        let access = access.unwrap().unwrap();
         let write = aruna_core::structs::identity::auth::Permission::WRITE;
         assert!(access.allows(Some("in/a.csv"), &write));
         assert!(!access.allows(Some("secret/a.csv"), &write));
+        // An expired token renames nothing more.
+        let mut expired = request.clone();
+        expired.grant.expires_at_secs = 1;
+        let access = rename_access(&context, &expired, &routing, "b").await;
+        assert!(access.unwrap().is_none());
     }
 
     #[test]

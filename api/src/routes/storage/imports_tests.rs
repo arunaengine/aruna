@@ -219,6 +219,29 @@ async fn manages_rule() {
     assert!(matches!(gone, Err(ServerError::NotFound)));
 }
 
+/// A token of the test realm; its signature is never checked here, as the middleware did that.
+fn bearer(test: &TestState) -> Extension<Option<crate::auth::ValidatedBearer>> {
+    use aruna_core::structs::identity::auth::TokenClaims;
+    let claims = TokenClaims {
+        sub: test.auth.user_id.to_string(),
+        iss: test.state.get_realm_id().to_base64(),
+        iat: 1,
+        exp: u64::MAX / 2,
+        jti: Ulid::generate().to_string(),
+        sid: None,
+        session_kind: None,
+        restrictions: None,
+        issuer_pubkey: None,
+        delegation_signature: None,
+        name: None,
+        via: None,
+        auth_time: None,
+    };
+    let key = jsonwebtoken::EncodingKey::from_secret(b"test");
+    let token = jsonwebtoken::encode(&jsonwebtoken::Header::default(), &claims, &key).unwrap();
+    Extension(Some(crate::auth::ValidatedBearer::new_for_test(token)))
+}
+
 #[tokio::test]
 async fn starts_renames() {
     let test = setup_state().await;
@@ -246,7 +269,13 @@ async fn starts_renames() {
     };
     let listed = get_renames(State(test.state.clone()), restricted(), rule()).await;
     assert!(matches!(listed, Err(ServerError::Forbidden)));
-    let started = start_renames(State(test.state.clone()), restricted(), rule()).await;
+    let started = start_renames(
+        State(test.state.clone()),
+        restricted(),
+        bearer(&test),
+        rule(),
+    )
+    .await;
     assert!(matches!(started, Err(ServerError::Forbidden)));
 
     let Json(found) = get_renames(State(test.state.clone()), auth(), rule())
@@ -255,9 +284,13 @@ async fn starts_renames() {
     assert_eq!((found.count, found.files.len()), (0, 0));
     assert!(found.progress.is_none());
     // The rename is a move of the rule's folder, shown as the rule's progress.
-    let (status, Json(started)) = start_renames(State(test.state.clone()), auth(), rule())
-        .await
-        .unwrap();
+    // Without a bearer token nothing could check its revocation later.
+    let unsigned = start_renames(State(test.state.clone()), auth(), Extension(None), rule()).await;
+    assert!(matches!(unsigned, Err(ServerError::Unauthorized)));
+    let (status, Json(started)) =
+        start_renames(State(test.state.clone()), auth(), bearer(&test), rule())
+            .await
+            .unwrap();
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(started.prefix, "imported/");
     let Json(found) = get_renames(State(test.state.clone()), auth(), rule())

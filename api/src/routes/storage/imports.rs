@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ensure_permission, parse_group_id, require_realm_auth};
+use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::compression::MigrationProgress;
 use crate::routes::storage::moves::{BucketMoveStarted, move_refusal};
@@ -12,6 +12,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::auth::bearer_token::token_grant;
 use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::groups::imports::change::{ChangeImportOperation, ImportChange};
 use aruna_operations::groups::imports::create::{CreateImportInput, CreateImportOperation};
@@ -818,7 +819,8 @@ restrictions are refused.
   still used when its bytes match.
 - The rename runs as the caller: a file is renamed only while the caller may still write its
   key when the rename reaches it, including files written after the start. Others keep their
-  name."#,
+  name. Once the caller's token expires, is revoked or is cut off, the rename renames nothing
+  more."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
         ("import_id" = String, Path, description = "Rule whose files get their name, as a 26-character ULID")
@@ -851,8 +853,12 @@ restrictions are refused.
 pub async fn start_renames(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<BucketMoveStarted>)> {
+    // The rename runs as the caller later, so the token itself must keep holding.
+    let bearer = bearer.ok_or(ServerError::Unauthorized)?;
+    let grant = token_grant(bearer.as_str()).map_err(|_| ServerError::Unauthorized)?;
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let rule = existing_rule(&state, group_id, &import_id).await?;
     let caller = (&auth, state.get_node_id());
@@ -875,7 +881,7 @@ pub async fn start_renames(
     }
     let (bucket, prefix) = (rule.bucket, rule.key_prefix);
     let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms())
-        .renaming(auth.clone(), state.get_node_id())
+        .renaming((auth.clone(), state.get_node_id()), grant)
         .with_guards(guards);
     let record = drive(operation, &state.get_ctx())
         .await
