@@ -41,16 +41,30 @@ pub(crate) async fn release_renamed(
         return false;
     };
     let index: Key = [&import_id.to_bytes()[..], &claim[..]].concat().into();
-    if !claimed(context, (&claim, &index), true).await || !synced(context).await {
+    let keys = (&claim, &index);
+    // A completed tombstone is never written over or cleared: those bytes are gone.
+    match read_value(context, DELETE_CLAIM_KEYSPACE, claim.clone()).await {
+        Ok(Some(value)) if value == TOMBSTONE => return true,
+        Ok(_) => {}
+        Err(error) => {
+            warn!(%error, "Delete claim could not be read");
+            return false;
+        }
+    }
+    if !claimed(context, keys, Some(PENDING)).await || !synced(context).await {
         return false;
     }
     // A deleted version keeps its claim as a tombstone; only a kept file frees its claim.
-    match release_claimed(context, location, (import_id, version_id), version).await {
-        Released::Kept => claimed(context, (&claim, &index), false).await,
+    match release_claimed(context, location, (import_id, version_id), (version, keys)).await {
+        Released::Kept => claimed(context, keys, None).await,
         Released::Deleted => true,
         Released::Retry => false,
     }
 }
+
+/// The value of a pending delete claim, and of the tombstone of a deleted backend version.
+const PENDING: &[u8] = b"";
+const TOMBSTONE: &[u8] = b"deleted";
 
 /// How a release ended.
 enum Released {
@@ -60,23 +74,34 @@ enum Released {
     Retry,
 }
 
-/// Stores or drops the delete claim `key` and its entry under the file's rule, which removes
-/// the rule's claims with the rule.
-async fn claimed(context: &DriverContext, (key, index): (&Key, &Key), stored: bool) -> bool {
+/// Stores the delete claim `key` with `value` and its entry under the file's rule, which
+/// removes the rule's claims with the rule, or drops both with `None`.
+async fn claimed(
+    context: &DriverContext,
+    (key, index): (&Key, &Key),
+    value: Option<&[u8]>,
+) -> bool {
     let rows = [
-        (DELETE_CLAIM_KEYSPACE.to_string(), key.clone()),
-        (CLAIM_INDEX_KEYSPACE.to_string(), index.clone()),
+        (DELETE_CLAIM_KEYSPACE.to_string(), key.clone(), value),
+        (
+            CLAIM_INDEX_KEYSPACE.to_string(),
+            index.clone(),
+            Some(&[][..]),
+        ),
     ];
-    let effect = match stored {
-        true => StorageEffect::BatchWrite {
+    let effect = match value {
+        Some(_) => StorageEffect::BatchWrite {
             writes: rows
                 .into_iter()
-                .map(|(space, key)| (space, key, Vec::new().into()))
+                .map(|(space, key, value)| (space, key, value.unwrap_or_default().to_vec().into()))
                 .collect(),
             txn_id: None,
         },
-        false => StorageEffect::BatchDelete {
-            deletes: rows.into(),
+        None => StorageEffect::BatchDelete {
+            deletes: rows
+                .into_iter()
+                .map(|(space, key, _)| (space, key))
+                .collect(),
             txn_id: None,
         },
     };
@@ -92,7 +117,7 @@ async fn release_claimed(
     context: &DriverContext,
     location: BackendLocation,
     (import_id, version_id): (Ulid, Ulid),
-    version: String,
+    (version, claim): (String, (&Key, &Key)),
 ) -> Released {
     let key = object_key(import_id, &location.backend_path);
     let observed = match read_value(context, IMPORTED_OBJECT_KEYSPACE, key.clone()).await {
@@ -143,7 +168,12 @@ async fn release_claimed(
     };
     let effect = BlobEffect::DeletePlain { location, version };
     match blob_handle.send_blob_effect(effect).await {
-        Event::Blob(BlobEvent::DeleteFinished) => {}
+        // The tombstone is on disk before anything else may fail.
+        Event::Blob(BlobEvent::DeleteFinished) => {
+            if !claimed(context, claim, Some(TOMBSTONE)).await || !synced(context).await {
+                return Released::Retry;
+            }
+        }
         // A storage that cannot delete this exact version keeps the file and its row.
         Event::Blob(BlobEvent::Error(BlobError::CleanupUnsupported)) => return Released::Kept,
         event => {
@@ -757,6 +787,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keeps_tombstones() {
+        // A replay after the bytes went never clears their tombstone, also when the path
+        // holds something else that a version reads now.
+        let (_dir, context) = setup();
+        let claim = claim_key(&old(), "v1").unwrap();
+        let index: Key = [&IMPORT.to_bytes()[..], &claim[..]].concat().into();
+        assert!(claimed(&context, (&claim, &index), Some(TOMBSTONE)).await);
+        alias_version(&context, old().format.encoding()).await;
+        renamed_row(&context, IMPORT).await;
+        assert!(release(&context).await);
+        let stored = read_value(&context, DELETE_CLAIM_KEYSPACE, claim)
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(TOMBSTONE));
+    }
+
+    #[tokio::test]
     async fn drops_rule_claims() {
         // A removed rule's claims and tombstones go page by page, and only that rule's.
         let (_dir, context) = setup();
@@ -764,7 +811,7 @@ mod tests {
         let other = Ulid::from_parts(8, 8);
         for import in [IMPORT, other] {
             let index: Key = [&import.to_bytes()[..], &claim[..]].concat().into();
-            assert!(claimed(&context, (&claim, &index), true).await);
+            assert!(claimed(&context, (&claim, &index), Some(PENDING)).await);
         }
         assert_eq!(drop_claims(&context, IMPORT).await, Some(false));
         assert_eq!(drop_claims(&context, IMPORT).await, Some(true));
