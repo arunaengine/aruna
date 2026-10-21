@@ -9,13 +9,13 @@ use crate::groups::fence::{parse_group_record, read_group_record};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE, IMPORT_INTENT_KEYSPACE,
-    IMPORT_PATTERN_KEYSPACE, IMPORT_REMOVAL_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
-    STORAGE_BACKEND_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BLOB_CLEANUP_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE,
+    IMPORT_INTENT_KEYSPACE, IMPORT_PATTERN_KEYSPACE, IMPORT_REMOVAL_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{ProviderCleanup, import_key, object_prefix};
-use aruna_core::structs::storage::blob::BackendRef;
+use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork};
 use aruna_core::structs::storage::group_backend::{BUCKET_DELETING, BUCKET_STATE, GroupStorage};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -34,6 +34,7 @@ enum RemoveState {
     ReadMark,
     Scan,
     Purge,
+    QueueClaims,
     Unmark,
     DropProvider,
     StartRecord,
@@ -59,6 +60,7 @@ pub struct RemoveImportOperation {
     deleted: bool,
     /// The rows go first, then the write intents.
     space: &'static str,
+    claims_queued: bool,
     output: Option<Result<(), ImportRuleError>>,
 }
 
@@ -72,6 +74,7 @@ impl RemoveImportOperation {
             cleanup: None,
             deleted: false,
             space: IMPORTED_OBJECT_KEYSPACE,
+            claims_queued: false,
             output: None,
         }
     }
@@ -86,6 +89,7 @@ impl RemoveImportOperation {
             cleanup: None,
             deleted: false,
             space: IMPORTED_OBJECT_KEYSPACE,
+            claims_queued: false,
             output: None,
         }
     }
@@ -119,6 +123,23 @@ impl RemoveImportOperation {
         if values.is_empty() && self.space == IMPORT_INTENT_KEYSPACE {
             self.space = IMPORT_PATTERN_KEYSPACE;
             return self.scan();
+        }
+        // The rule's delete claims go with it, through the cleanup queue.
+        if values.is_empty() && !self.claims_queued {
+            let work = BlobCleanupWork::DropClaims {
+                import_id: self.import_id,
+            };
+            let value = match work.to_bytes() {
+                Ok(value) => value,
+                Err(error) => return self.fail(error.into()),
+            };
+            self.state = RemoveState::QueueClaims;
+            return smallvec![Effect::Storage(StorageEffect::Write {
+                key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+                key: self.import_id.to_bytes().to_vec().into(),
+                value: value.into(),
+                txn_id: None,
+            })];
         }
         if let (true, Some(cleanup)) = (values.is_empty(), self.cleanup.as_ref()) {
             self.state = RemoveState::DropProvider;
@@ -268,6 +289,10 @@ impl Operation for RemoveImportOperation {
             (RemoveState::Purge, _, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
                 self.scan()
             }
+            (RemoveState::QueueClaims, _, Event::Storage(StorageEvent::WriteResult { .. })) => {
+                self.claims_queued = true;
+                self.purge(Vec::new())
+            }
             (RemoveState::ReadMark, _, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
                 let mark = value.as_deref().map(ProviderCleanup::from_mark).transpose();
                 match mark {
@@ -385,6 +410,20 @@ mod tests {
                 [IMPORT_INTENT_KEYSPACE, IMPORT_PATTERN_KEYSPACE].contains(&key_space.as_str())
             );
             return drain(operation, 0);
+        }
+        // The rule's delete claims are queued for removal before the mark goes.
+        if let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = effects.as_slice()
+            && key_space == BLOB_CLEANUP_KEYSPACE
+        {
+            let work = BlobCleanupWork::from_bytes(value).unwrap();
+            assert!(matches!(work, BlobCleanupWork::DropClaims { .. }));
+            return operation.step(storage(StorageEvent::WriteResult {
+                key: Vec::new().into(),
+            }));
         }
         effects
     }

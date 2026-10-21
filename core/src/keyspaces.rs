@@ -103,9 +103,11 @@ pub const COMPRESSION_QUEUE_KEYSPACE: &str = "compression_migration_queue";
 pub const RENAME_MOVE_KEYSPACE: &str = "compression_migration_renames";
 /// The re-mapping or duplicate cleanup job of each bucket, keyed by bucket name.
 pub const LINKED_JOB_KEYSPACE: &str = "linked_storage_jobs";
-/// Backend versions of linked files a release deletes, claimed before its last checks; no
-/// new reader may name a claimed version.
+/// Backend versions of linked files a release deletes, claimed before its last checks and kept
+/// as tombstones once deleted; no new reader may name a claimed version.
 pub const DELETE_CLAIM_KEYSPACE: &str = "linked_delete_claims";
+/// The delete claims by the rule whose file they name, keyed by import id and claim key.
+pub const CLAIM_INDEX_KEYSPACE: &str = "linked_delete_claim_rules";
 /// Provider uploads of linked file copies, keyed by the copy's attempt id until they settle.
 pub const COPY_UPLOAD_KEYSPACE: &str = "linked_copy_uploads";
 /// Import rows a key rename moved to a key, keyed by the key's version prefix and the row key.
@@ -456,6 +458,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     RENAME_MOVE_KEYSPACE,
     LINKED_JOB_KEYSPACE,
     DELETE_CLAIM_KEYSPACE,
+    CLAIM_INDEX_KEYSPACE,
     COPY_UPLOAD_KEYSPACE,
     RENAMED_ROW_KEYSPACE,
     STORAGE_CHECK_KEYSPACE,

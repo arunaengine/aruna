@@ -336,6 +336,11 @@ pub enum BlobCleanupWork {
         bucket: Option<String>,
         incarnation: u128,
     },
+    /// The delete claims and tombstones of a removed import rule's files; they go a page at
+    /// a time.
+    DropClaims {
+        import_id: Ulid,
+    },
 }
 
 /// The record a write's commit would have made the owner of its bytes.
@@ -383,7 +388,7 @@ impl BlobCleanupWork {
             | Self::ReconcileWrite { location, .. }
             | Self::ReconcileReservation { location }
             | Self::ReleaseRenamed { location, .. } => Some(location),
-            Self::RegisterDht { .. } | Self::DropTrail { .. } => None,
+            Self::RegisterDht { .. } | Self::DropTrail { .. } | Self::DropClaims { .. } => None,
         }
     }
 }

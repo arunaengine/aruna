@@ -12,7 +12,7 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, DELETE_CLAIM_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, CLAIM_INDEX_KEYSPACE, DELETE_CLAIM_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
 };
 use aruna_core::structs::storage::backend_import::{
     BackendImport, ImportedObject, claim_key, object_key, version_key,
@@ -40,33 +40,51 @@ pub(crate) async fn release_renamed(
     let Ok(claim) = claim_key(&location, &version) else {
         return false;
     };
-    if !claimed(context, &claim, true).await || !synced(context).await {
+    let index: Key = [&import_id.to_bytes()[..], &claim[..]].concat().into();
+    if !claimed(context, (&claim, &index), true).await || !synced(context).await {
         return false;
     }
+    // A deleted version keeps its claim as a tombstone; only a kept file frees its claim.
     match release_claimed(context, location, (import_id, version_id), version).await {
-        true => claimed(context, &claim, false).await,
-        false => false,
+        Released::Kept => claimed(context, (&claim, &index), false).await,
+        Released::Deleted => true,
+        Released::Retry => false,
     }
 }
 
-/// Stores or drops the delete claim `key`.
-async fn claimed(context: &DriverContext, key: &Key, stored: bool) -> bool {
+/// How a release ended.
+enum Released {
+    /// Something still reads the file, or the storage cannot delete one version: it stays.
+    Kept,
+    Deleted,
+    Retry,
+}
+
+/// Stores or drops the delete claim `key` and its entry under the file's rule, which removes
+/// the rule's claims with the rule.
+async fn claimed(context: &DriverContext, (key, index): (&Key, &Key), stored: bool) -> bool {
+    let rows = [
+        (DELETE_CLAIM_KEYSPACE.to_string(), key.clone()),
+        (CLAIM_INDEX_KEYSPACE.to_string(), index.clone()),
+    ];
     let effect = match stored {
-        true => StorageEffect::Write {
-            key_space: DELETE_CLAIM_KEYSPACE.to_string(),
-            key: key.clone(),
-            value: Vec::new().into(),
+        true => StorageEffect::BatchWrite {
+            writes: rows
+                .into_iter()
+                .map(|(space, key)| (space, key, Vec::new().into()))
+                .collect(),
             txn_id: None,
         },
-        false => StorageEffect::Delete {
-            key_space: DELETE_CLAIM_KEYSPACE.to_string(),
-            key: key.clone(),
+        false => StorageEffect::BatchDelete {
+            deletes: rows.into(),
             txn_id: None,
         },
     };
     matches!(
         send(context, effect).await,
-        Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. })
+        Event::Storage(
+            StorageEvent::BatchWriteResult { .. } | StorageEvent::BatchDeleteResult { .. }
+        )
     )
 }
 
@@ -75,13 +93,13 @@ async fn release_claimed(
     location: BackendLocation,
     (import_id, version_id): (Ulid, Ulid),
     version: String,
-) -> bool {
+) -> Released {
     let key = object_key(import_id, &location.backend_path);
     let observed = match read_value(context, IMPORTED_OBJECT_KEYSPACE, key.clone()).await {
         Ok(observed) => observed,
         Err(error) => {
             warn!(%error, "Renamed file row could not be read");
-            return false;
+            return Released::Retry;
         }
     };
     let row = observed
@@ -90,52 +108,88 @@ async fn release_claimed(
         .transpose();
     match row {
         // Another write took the path, so the file there is not the renamed one.
-        Ok(Some(row)) if row.version_id != version_id => return true,
+        Ok(Some(row)) if row.version_id != version_id => return Released::Kept,
         Ok(_) => {}
         Err(error) => {
             warn!(%error, "Renamed file row could not be decoded");
-            return false;
+            return Released::Retry;
         }
     }
     match referenced(context, &location, (import_id, &version)).await {
-        Ok(true) => return true,
+        Ok(true) => return Released::Kept,
         Ok(false) => {}
         Err(error) => {
             warn!(%error, "References of a renamed file could not be read");
-            return false;
+            return Released::Retry;
         }
     }
     // A stored location of the file, also one waiting for reclaim, may still be reused; one
     // of another backend version at the path keeps the path's row.
     let shared = match pinned(context, &location, &version).await {
         Ok(Some(shared)) => shared,
-        Ok(None) => return false,
+        Ok(None) => return Released::Retry,
         Err(error) => {
             warn!(%error, "Locations of a renamed file could not be read");
-            return false;
+            return Released::Retry;
         }
     };
     // The rename's own old location goes first, whatever the storage's cleanup strategy, and
     // the rename and that retirement are on disk before the file is deleted.
     if !retire_source(context, &location).await || !synced(context).await {
-        return false;
+        return Released::Retry;
     }
     let Some(blob_handle) = context.blob_handle.as_ref() else {
-        return false;
+        return Released::Retry;
     };
     let effect = BlobEffect::DeletePlain { location, version };
     match blob_handle.send_blob_effect(effect).await {
         Event::Blob(BlobEvent::DeleteFinished) => {}
         // A storage that cannot delete this exact version keeps the file and its row.
-        Event::Blob(BlobEvent::Error(BlobError::CleanupUnsupported)) => return true,
+        Event::Blob(BlobEvent::Error(BlobError::CleanupUnsupported)) => return Released::Kept,
         event => {
             warn!(?event, "Renamed file could not be deleted");
-            return false;
+            return Released::Retry;
         }
     }
-    match observed {
+    let dropped = match observed {
         Some(observed) if !shared => drop_row(context, key, observed).await,
         _ => true,
+    };
+    match dropped {
+        true => Released::Deleted,
+        false => Released::Retry,
+    }
+}
+
+/// Drops a page of the claims and tombstones of the removed rule `import_id`; `Some(true)`
+/// once none is left.
+pub(crate) async fn drop_claims(context: &DriverContext, import_id: Ulid) -> Option<bool> {
+    let prefix: Key = import_id.to_bytes().to_vec().into();
+    let page = iter_prefix_page(
+        &context.storage_handle,
+        CLAIM_INDEX_KEYSPACE,
+        Some(prefix),
+        None,
+        RULE_PAGE,
+        None,
+    );
+    let (rows, _) = page.await.ok()?;
+    if rows.is_empty() {
+        return Some(true);
+    }
+    let mut deletes = Vec::with_capacity(rows.len() * 2);
+    for (key, _) in rows {
+        let claim: Key = key.get(16..).unwrap_or_default().to_vec().into();
+        deletes.push((DELETE_CLAIM_KEYSPACE.to_string(), claim));
+        deletes.push((CLAIM_INDEX_KEYSPACE.to_string(), key));
+    }
+    let effect = StorageEffect::BatchDelete {
+        deletes,
+        txn_id: None,
+    };
+    match send(context, effect).await {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Some(false),
+        _ => None,
     }
 }
 
@@ -700,6 +754,25 @@ mod tests {
         alias_version(&context, old().format.encoding()).await;
         assert!(release(&context).await);
         assert!(read_value(&context, space, claim).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn drops_rule_claims() {
+        // A removed rule's claims and tombstones go page by page, and only that rule's.
+        let (_dir, context) = setup();
+        let claim = claim_key(&old(), "v1").unwrap();
+        let other = Ulid::from_parts(8, 8);
+        for import in [IMPORT, other] {
+            let index: Key = [&import.to_bytes()[..], &claim[..]].concat().into();
+            assert!(claimed(&context, (&claim, &index), true).await);
+        }
+        assert_eq!(drop_claims(&context, IMPORT).await, Some(false));
+        assert_eq!(drop_claims(&context, IMPORT).await, Some(true));
+        let index: Key = [&other.to_bytes()[..], &claim[..]].concat().into();
+        let kept = read_value(&context, CLAIM_INDEX_KEYSPACE, index)
+            .await
+            .unwrap();
+        assert!(kept.is_some());
     }
 
     #[tokio::test]

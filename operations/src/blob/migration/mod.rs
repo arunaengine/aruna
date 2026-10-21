@@ -26,13 +26,13 @@ use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE,
     BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE,
-    IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, MANAGED_COPY_KEYSPACE, RENAME_MOVE_KEYSPACE,
-    S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+    DELETE_CLAIM_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, MANAGED_COPY_KEYSPACE,
+    RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, PlainPath, RenameRequest, WriteIntent, import_key, intent_key,
-    intent_prefix, object_key, tagged_path, version_key,
+    BackendImport, ImportedObject, PlainPath, RenameRequest, WriteIntent, claim_key, import_key,
+    intent_key, intent_prefix, object_key, tagged_path, version_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion, BlobVersionState,
@@ -158,6 +158,8 @@ pub struct MigrateVersionOperation {
     backend_version: Option<String>,
     /// A rename looked at its tagged path too before writing.
     tag_checked: bool,
+    /// The delete claim of the file a rename adopts, which its publication must not find.
+    adopt_claim: Option<Key>,
     /// The intent write in flight, in one transaction with a read of its rule.
     fence: Option<FencedWrite>,
     /// The target row the publication read, kept while the peers' intents are read.
@@ -204,6 +206,7 @@ impl MigrateVersionOperation {
             plain_owned: false,
             backend_version: None,
             tag_checked: false,
+            adopt_claim: None,
             fence: None,
             target_row: None,
             peers: Vec::new(),
@@ -555,6 +558,15 @@ impl MigrateVersionOperation {
             return self.fail(BlobError::PathTaken.into());
         }
         location.format.layout = StoredLayout::Plain(location.ulid);
+        // An adopted file whose backend version a release deleted is no copy to take.
+        self.adopt_claim = match version
+            .as_deref()
+            .map(|version| claim_key(&location, version))
+        {
+            Some(Ok(claim)) => Some(claim),
+            Some(Err(error)) => return self.fail(error.into()),
+            None => None,
+        };
         self.backend_version = version;
         self.new = Some(location);
         // An earlier attempt left this copy and its intents; the publication retires them.
@@ -996,10 +1008,13 @@ impl MigrateVersionOperation {
             Err(error) => return self.fail(error),
         };
         self.state = MigrateState::ReadTarget;
+        let claim =
+            (self.adopt_claim.clone()).map(|claim| (DELETE_CLAIM_KEYSPACE.to_string(), claim));
         let others: Vec<_> = self
             .own_row()
             .into_iter()
             .chain(self.shared_rows())
+            .chain(claim)
             .collect();
         if others.is_empty() {
             return smallvec![blob_location_read(&key, self.txn_id)];
@@ -1044,7 +1059,7 @@ impl MigrateVersionOperation {
     /// becomes the row owner. The old copy goes to the reclaim queue either way.
     fn handle_target(&mut self, event: Event) -> Effects {
         let own = self.own_row().is_some();
-        let batched = own || !self.shared_rows().is_empty();
+        let batched = own || !self.shared_rows().is_empty() || self.adopt_claim.is_some();
         let value = match event {
             Event::Storage(StorageEvent::ReadResult { value, .. }) if !batched => value,
             Event::Storage(StorageEvent::BatchReadResult { values }) if batched => {
@@ -3650,6 +3665,47 @@ mod tests {
                 let error = MigrateVersionError::Blob(BlobError::PathTaken);
                 assert_eq!(operation.finalize(), Err(error));
             }
+        }
+
+        #[test]
+        fn skips_deleted_version() {
+            // A copy at the new name whose backend version a release deleted is not adopted.
+            let (version, old) = prefixed();
+            let mut operation = renaming(&version, &old, Some(b"v1"));
+            let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+                exists: true,
+                version: None,
+            }));
+            let [Effect::Blob(BlobEffect::HashExternal { path, .. })] = effects.as_slice() else {
+                panic!("expected the hash of the taken name, got {effects:?}")
+            };
+            let mut found = on_storage(location(false));
+            (found.storage_bucket, found.backend_path) = (String::new(), path.clone());
+            found.hashes = HashMap::from([(HASH_BLAKE3.to_string(), vec![4; 32])]);
+            operation.step(Event::Blob(BlobEvent::ExternalHashed {
+                location: found,
+                version: Some("p9".to_string()),
+            }));
+            operation.step(Event::Storage(StorageEvent::TransactionStarted {
+                txn_id: TxnId::default(),
+            }));
+            published(&mut operation, Some(rule()));
+            let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
+            let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
+            else {
+                panic!("expected the target reads, got {effects:?}")
+            };
+            assert_eq!(reads.last().unwrap().0, DELETE_CLAIM_KEYSPACE);
+            let mut values: Vec<(Key, Option<Value>)> =
+                reads.iter().map(|(_, key)| (key.clone(), None)).collect();
+            values.last_mut().unwrap().1 = Some(Vec::new().into());
+            let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+            assert!(aborted(&effects), "{effects:?}");
+            let error = MigrateVersionError::Blob(BlobError::PathTaken);
+            operation.step(Event::Storage(StorageEvent::TransactionAborted {
+                txn_id: TxnId::default(),
+            }));
+            assert_eq!(operation.output, Some(Err(error)));
         }
 
         #[test]

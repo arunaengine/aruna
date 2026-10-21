@@ -105,7 +105,8 @@ fn cleanup_row_key(work: &BlobCleanupWork) -> Key {
         | BlobCleanupWork::RegisterDht { .. }
         | BlobCleanupWork::ReconcileReservation { .. }
         | BlobCleanupWork::ReleaseRenamed { .. }
-        | BlobCleanupWork::DropTrail { .. } => Ulid::generate().to_bytes().to_vec().into(),
+        | BlobCleanupWork::DropTrail { .. }
+        | BlobCleanupWork::DropClaims { .. } => Ulid::generate().to_bytes().to_vec().into(),
     }
 }
 
@@ -409,6 +410,13 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
         } => release_renamed(context, location, import_id, version_id, version)
             .await
             .into(),
+        BlobCleanupWork::DropClaims { import_id } => {
+            match crate::blob::release::drop_claims(context, import_id).await {
+                Some(true) => RowOutcome::Done,
+                Some(false) => RowOutcome::Kept,
+                None => RowOutcome::Failed,
+            }
+        }
         BlobCleanupWork::DropTrail {
             group_id,
             bucket,
