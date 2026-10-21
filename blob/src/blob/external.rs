@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::BlobHandler;
-use super::io::{backend_version, reader_at};
+use super::io::backend_version;
 use crate::hash::Hasher;
 use aruna_core::UserId;
 use aruna_core::errors::BlobError;
@@ -160,7 +160,16 @@ impl BlobHandler {
             .map_err(|_| read_error("timed out reading the object"))?
             .map_err(open_error)?;
         let version = backend_version(&operator, &metadata);
-        let opened = reader_at(&operator, &storage_path, version.as_deref());
+        let etag = metadata.etag().map(str::to_string);
+        // Without a version the read names the stated ETag where the storage can, so the hash
+        // and the ETag belong to the same bytes.
+        let reader = operator.reader_with(&storage_path);
+        let capability = operator.info().capability();
+        let opened = match (&version, &etag) {
+            (Some(version), _) if capability.read_with_version => reader.version(version),
+            (None, Some(etag)) if capability.read_with_if_match => reader.if_match(etag),
+            _ => reader,
+        };
         let reader = timeout(self.io_timeout(), opened)
             .await
             .map_err(|_| read_error("timed out opening the object"))?
@@ -187,6 +196,7 @@ impl BlobHandler {
                 ..location
             },
             version,
+            etag,
         })
     }
 }

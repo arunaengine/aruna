@@ -102,6 +102,17 @@ enum Outcome {
 enum ItemError {
     Item(String),
     System(String),
+    /// The file changed between its listing and its read; the next run looks again.
+    Changed,
+}
+
+impl ItemError {
+    fn reason(self) -> String {
+        match self {
+            Self::Item(error) | Self::System(error) => error,
+            Self::Changed => "the file changed while it was read".to_string(),
+        }
+    }
 }
 
 /// What every object of one listing page is checked against.
@@ -198,11 +209,11 @@ pub async fn run_backend_import(ctx: &JobContext, spec: &BackendImportSpec) -> J
         };
         run.intents = match page_intents(&ctx.driver, &run.rule, &objects).await {
             Ok(intents) => intents,
-            Err(ItemError::Item(error) | ItemError::System(error)) => return retryable(error),
+            Err(error) => return retryable(error.reason()),
         };
         run.page = match page_reads(&ctx.driver, &run.rule, &objects).await {
             Ok(page) => page,
-            Err(ItemError::Item(error) | ItemError::System(error)) => return retryable(error),
+            Err(error) => return retryable(error.reason()),
         };
         let paths: Vec<&str> = objects.iter().map(|object| object.key.as_str()).collect();
         run.page.taken = match taken_paths(&ctx.driver, &run.shared, &paths).await {
@@ -268,6 +279,10 @@ fn tally(
             checkpoint.fail(key, error);
             true
         }
+        Err(ItemError::Changed) => {
+            checkpoint.skipped += 1;
+            false
+        }
         Err(ItemError::System(error)) => return Err(error),
     };
     checkpoint.cursor = Some(key.to_string());
@@ -303,7 +318,7 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
     )];
     let [creation] = read_values(&ctx.driver, creation)
         .await
-        .map_err(|(ItemError::Item(error) | ItemError::System(error))| retryable(error))?;
+        .map_err(|error| retryable(error.reason()))?;
     let incarnation = incarnation(creation.as_ref().map(|value| value.as_ref()));
     let realm_id = spec.auth_context.realm_id;
     let allowed = drive(
@@ -485,7 +500,7 @@ async fn import_object(
     {
         return Ok(Outcome::Skipped);
     }
-    let (location, version) = hash_object(ctx, spec, resolved, &object.key).await?;
+    let (location, version) = hash_object(ctx, spec, resolved, object).await?;
     if location.blob_size != object.size {
         return Err(ItemError::Item(
             "the object changed while it was read".to_string(),
@@ -674,7 +689,7 @@ async fn hash_listed(
     resolved: &ResolvedBackend,
     object: &ExternalObject,
 ) -> Result<(BackendLocation, Option<String>), ItemError> {
-    let hashed = hash_object(ctx, spec, resolved.clone(), &object.key).await?;
+    let hashed = hash_object(ctx, spec, resolved.clone(), object).await?;
     if hashed.0.blob_size != object.size {
         return Err(item("the object changed while it was read"));
     }
@@ -1065,7 +1080,7 @@ pub(crate) async fn listed_intents(
 ) -> Result<BTreeMap<String, Vec<(Key, WriteIntent)>>, String> {
     page_intents(context, rule, objects)
         .await
-        .map_err(|(ItemError::Item(error) | ItemError::System(error))| error)
+        .map_err(ItemError::reason)
 }
 
 /// The path of an intent key: the import id, the path, a zero byte and the version id.
@@ -1221,7 +1236,7 @@ async fn register_twin(
 ) -> Result<Outcome, ItemError> {
     let rule = &run.rule;
     let candidates = candidates(&ctx.driver, rule, key, object).await?;
-    let (mut location, version) = hash_object(ctx, spec, resolved, &object.key).await?;
+    let (mut location, version) = hash_object(ctx, spec, resolved, object).await?;
     if location.blob_size != object.size {
         return Err(item("the object changed while it was read"));
     }
@@ -1543,19 +1558,31 @@ async fn exact_version(
     Ok((version_key, exact))
 }
 
+/// Hashes the listed `object`; bytes with another ETag than the listing's are left for the
+/// next run, so a row never pairs one file's hash with another's ETag.
 async fn hash_object(
     ctx: &JobContext,
     spec: &BackendImportSpec,
     resolved: ResolvedBackend,
-    path: &str,
+    object: &ExternalObject,
 ) -> Result<(BackendLocation, Option<String>), ItemError> {
     let effect = BlobEffect::HashExternal {
         resolved,
-        path: path.to_string(),
+        path: object.key.clone(),
         created_by: spec.auth_context.user_id,
     };
+    let unquoted = |etag: &str| etag.trim_matches('"').to_string();
     match drive(BlobRequest::new(effect), &ctx.driver).await {
-        Ok(BlobEvent::ExternalHashed { location, version }) => Ok((location, version)),
+        Ok(BlobEvent::ExternalHashed {
+            location,
+            version,
+            etag,
+        }) => match (object.etag.as_deref(), etag.as_deref()) {
+            (Some(listed), Some(read)) if unquoted(listed) != unquoted(read) => {
+                Err(ItemError::Changed)
+            }
+            _ => Ok((location, version)),
+        },
         Ok(other) => Err(ItemError::System(format!("unexpected answer {other:?}"))),
         Err(error) => Err(hash_failure(error)),
     }
@@ -2153,9 +2180,14 @@ mod tests {
         let failed = Err(ItemError::Item("broken".to_string()));
         assert_eq!(tally(&mut checkpoint, "c", failed), Ok(true));
         assert_eq!(tally(&mut checkpoint, "d", Ok(Outcome::Ignored)), Ok(false));
+        // A file changed since its listing is skipped and read again by the next run.
+        assert_eq!(
+            tally(&mut checkpoint, "d", Err(ItemError::Changed)),
+            Ok(false)
+        );
         assert_eq!(
             (checkpoint.skipped, checkpoint.imported, checkpoint.failed),
-            (1, 1, 1)
+            (2, 1, 1)
         );
         assert_eq!(checkpoint.cursor.as_deref(), Some("d"));
 

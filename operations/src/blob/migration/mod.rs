@@ -559,7 +559,9 @@ impl MigrateVersionOperation {
     /// The file at the new name is a copy an interrupted rename left, if its bytes match.
     fn handle_hashed(&mut self, event: Event) -> Effects {
         let (mut location, version) = match event {
-            Event::Blob(BlobEvent::ExternalHashed { location, version }) => (location, version),
+            Event::Blob(BlobEvent::ExternalHashed {
+                location, version, ..
+            }) => (location, version),
             Event::Blob(BlobEvent::Error(error)) => return self.fail(error.into()),
             other => return self.unexpected(other),
         };
@@ -2166,6 +2168,7 @@ async fn abandon(
         Event::Blob(BlobEvent::ExternalHashed {
             location,
             version: Some(version),
+            ..
         }) => (location, version),
         Event::Blob(BlobEvent::ExternalHashed { version: None, .. }) => return Ok(true),
         _ => return Ok(false),
@@ -4041,6 +4044,7 @@ mod tests {
                 let effects = operation.step(Event::Blob(BlobEvent::ExternalHashed {
                     location: found,
                     version: None,
+                    etag: None,
                 }));
                 if adopted {
                     // The upload the earlier attempt recorded is settled before the adoption.
@@ -4088,6 +4092,7 @@ mod tests {
             operation.step(Event::Blob(BlobEvent::ExternalHashed {
                 location: found,
                 version: Some("p9".to_string()),
+                etag: None,
             }));
             operation.step(Event::Blob(BlobEvent::UploadAborted));
             operation.step(Event::Storage(StorageEvent::TransactionStarted {
