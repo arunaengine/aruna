@@ -217,8 +217,8 @@ struct Found {
     /// Path index rows that exist for the key's versions.
     indexed: Vec<HashIndex>,
     rows: Vec<(Key, ImportedObject)>,
-    /// Rows an earlier rename moved to this key, as their index row and their own key.
-    renamed: Vec<(Key, Vec<u8>)>,
+    /// Rows an earlier rename or a second copy put at this key: index row, own key, value.
+    renamed: Vec<(Key, Vec<u8>, Value)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -566,12 +566,12 @@ impl RenameKeysOperation {
             ScanKind::Renamed(index) => {
                 let from = &self.items[index].from;
                 let prefix = VersionKey::object_prefix(&self.input.bucket, from)?;
-                for (key, _) in values {
+                for (key, value) in values {
                     // The index key is the rule, the key's prefix, then the row's path.
                     let import = key.get(..16).unwrap_or_default();
                     let path = key.get(16 + prefix.len()..).unwrap_or_default();
                     let row = [import, path].concat();
-                    self.found[index].renamed.push((key, row));
+                    self.found[index].renamed.push((key, row, value));
                 }
                 Ok(true)
             }
@@ -643,7 +643,7 @@ impl RenameKeysOperation {
         }
         // Rows an earlier rename moved to the key are read where they are.
         for (index, found) in self.found.iter().enumerate() {
-            for (_, row) in &found.renamed {
+            for (_, row, _) in &found.renamed {
                 let (import, path) = row.split_at(row.len().min(16));
                 let path = String::from_utf8_lossy(path).into_owned();
                 let rule = (self.rules.iter()).position(|rule| rule.import_id.to_bytes() == import);
@@ -1003,7 +1003,7 @@ impl RenameKeysOperation {
                     empty,
                 ));
             }
-            for (key, _) in &found.renamed {
+            for (key, ..) in &found.renamed {
                 deletes.push((RENAMED_ROW_KEYSPACE.to_string(), key.clone()));
             }
             let moved_to = VersionKey::object_prefix(bucket, &item.to)?;
@@ -1020,8 +1020,11 @@ impl RenameKeysOperation {
                 // The row is found again by its new key, also when no version names its file.
                 let (import, path) = key.split_at(key.len().min(16));
                 let index = [import, &moved_to[..], path].concat();
-                let empty = Value::from(Vec::new());
-                writes.push((RENAMED_ROW_KEYSPACE.to_string(), index.into(), empty));
+                // A second copy keeps the file it names.
+                let value = (found.renamed.iter())
+                    .find(|(_, row, _)| row.as_slice() == key.as_ref())
+                    .map_or_else(|| Value::from(Vec::new()), |(.., value)| value.clone());
+                writes.push((RENAMED_ROW_KEYSPACE.to_string(), index.into(), value));
             }
         }
         if let Some((_, next)) = &self.input.job {

@@ -14,7 +14,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE,
     BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DELETE_CLAIM_KEYSPACE,
-    IMPORTED_OBJECT_KEYSPACE, LINKED_JOB_KEYSPACE, MANAGED_COPY_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE, LINKED_JOB_KEYSPACE, MANAGED_COPY_KEYSPACE, RENAMED_ROW_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::backend_import::{
@@ -51,6 +51,8 @@ pub struct Duplicate {
     pub copies: Vec<BackendLocation>,
     /// The versions that read a copy now, with their stored rows.
     versions: Vec<(Ulid, Vec<u8>)>,
+    /// Copies no version reads, which only a row names, by location id with their index row.
+    twins: Vec<(Ulid, Key)>,
 }
 
 impl Duplicate {
@@ -172,21 +174,31 @@ async fn duplicates(
         let BlobVersionState::Materialized {
             blob_hash,
             backend: backend @ BackendRef::Group(_),
-            encoding: EncodingClass::Plain { location },
+            encoding,
             ..
         } = &version.state
         else {
             continue;
         };
+        // An import's shared raw copy is one file for all its readers.
+        let file = match encoding {
+            EncodingClass::Plain { location } => *location,
+            EncodingClass::Raw => Ulid::nil(),
+            _ => continue,
+        };
         let group = (*blob_hash, backend.key_bytes());
-        groups
-            .entry(group)
-            .or_default()
-            .push((id, value, *location));
+        groups.entry(group).or_default().push((id, value, file));
     }
-    for members in groups.into_values() {
+    let twins = second_copies(context, routing, (bucket, key), &versions_of(&groups)).await?;
+    for ((hash, backend), members) in groups {
+        let twins: Vec<_> = (twins.iter())
+            .filter(|(file, _)| {
+                file.get_blake3() == Some(&hash[..]) && file.backend.key_bytes() == backend
+            })
+            .collect();
         // Only content that two files hold needs its location rows read.
-        let files: std::collections::HashSet<_> = members.iter().map(|(.., at)| *at).collect();
+        let mut files: std::collections::HashSet<_> = members.iter().map(|(.., at)| *at).collect();
+        files.extend(twins.iter().map(|(file, _)| file.ulid));
         if files.len() < 2 {
             continue;
         }
@@ -216,6 +228,11 @@ async fn duplicates(
                 None => files.push((location, vec![(*id, value.clone())])),
             }
         }
+        for (file, _) in &twins {
+            if !files.iter().any(|(known, _)| known.ulid == file.ulid) {
+                files.push((file.clone(), Vec::new()));
+            }
+        }
         if files.len() < 2 {
             continue;
         }
@@ -240,13 +257,74 @@ async fn duplicates(
             .iter()
             .flat_map(|(_, readers)| readers.clone())
             .collect();
-        let copies = files.into_iter().map(|(file, _)| file).collect();
+        let copies: Vec<BackendLocation> = files.into_iter().map(|(file, _)| file).collect();
+        let twins = (twins.into_iter())
+            .filter(|(file, _)| copies.iter().any(|copy| copy.ulid == file.ulid))
+            .map(|(file, index)| (file.ulid, index.clone()))
+            .collect();
         found.push(Duplicate {
             key: key.to_string(),
             keep,
             copies,
             versions,
+            twins,
         });
+    }
+    Ok(found)
+}
+
+/// The ids of the versions grouped by content.
+fn versions_of(groups: &BTreeMap<([u8; 32], Vec<u8>), Vec<Member>>) -> Vec<Ulid> {
+    groups.values().flatten().map(|(id, ..)| *id).collect()
+}
+
+/// The second copies of `key` an import registered for one of `versions`: files with a
+/// version's content whose row names that version, with their index rows.
+async fn second_copies(
+    context: &DriverContext,
+    routing: Option<&RoutingSnapshot>,
+    (bucket, key): (&str, &str),
+    versions: &[Ulid],
+) -> Result<Vec<(BackendLocation, Key)>, String> {
+    let error = |error: aruna_core::errors::ConversionError| error.to_string();
+    let rules = routing.map_or(&[][..], |routing| routing.imports.as_slice());
+    let prefix = VersionKey::object_prefix(bucket, key).map_err(error)?;
+    let mut found = Vec::new();
+    for rule in rules.iter().filter(|rule| rule.bucket == bucket) {
+        let import = rule.import_id.to_bytes();
+        let scan = [&import[..], &prefix[..]].concat();
+        let mut after = None;
+        loop {
+            let page = iter_prefix_page(
+                &context.storage_handle,
+                RENAMED_ROW_KEYSPACE,
+                Some(scan.clone().into()),
+                after.take(),
+                RULE_PAGE,
+                None,
+            );
+            let (rows, next) = page.await?;
+            for (index, value) in rows {
+                // A renamed row names no file of its own.
+                if value.is_empty() {
+                    continue;
+                }
+                let path = index.get(scan.len()..).unwrap_or_default();
+                let row_key: Key = [&import[..], path].concat().into();
+                let Some(row) = read(context, IMPORTED_OBJECT_KEYSPACE, row_key).await? else {
+                    continue;
+                };
+                let row = ImportedObject::from_bytes(&row).map_err(error)?;
+                if row.key.as_deref() != Some(key) || !versions.contains(&row.version_id) {
+                    continue;
+                }
+                found.push((BackendLocation::from_bytes(&value).map_err(error)?, index));
+            }
+            match next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
     }
     Ok(found)
 }
@@ -544,9 +622,11 @@ impl Stage<'_> {
         }
         let encoding = found.keep.format.encoding();
         let mut changed = 0;
+        let mut deletes = Vec::new();
         for copy in &found.copies {
             let provider = values.next().flatten();
             let mine = readers.remove(&copy.ulid).unwrap_or_default();
+            let twin = found.twins.iter().find(|(ulid, _)| *ulid == copy.ulid);
             let mut owner = None;
             let mut foreign = false;
             for rule in self.rules {
@@ -557,14 +637,18 @@ impl Stage<'_> {
                 };
                 // A row of another key or version makes the file that version's own.
                 let ours = row.key.as_deref().is_none_or(|key| key == found.key)
-                    && mine.iter().any(|(id, _)| *id == row.version_id);
+                    && (twin.is_some() || mine.iter().any(|(id, _)| *id == row.version_id));
                 match ours {
                     true => owner = owner.or(Some((rule.import_id, row.version_id))),
                     false => foreign = true,
                 }
             }
-            if foreign || mine.is_empty() {
+            if foreign || (mine.is_empty() && twin.is_none()) {
                 continue;
+            }
+            // A second copy goes with its row; its index row goes now.
+            if let Some((_, index)) = twin {
+                deletes.push((RENAMED_ROW_KEYSPACE.to_string(), index.clone()));
             }
             for (id, mut version) in mine {
                 if let BlobVersionState::Materialized { encoding: old, .. } = &mut version.state {
@@ -581,6 +665,21 @@ impl Stage<'_> {
         }
         if changed == 0 {
             return Ok(Unified::Kept);
+        }
+        if !deletes.is_empty() {
+            let delete = StorageEffect::BatchDelete {
+                deletes,
+                txn_id: Some(self.txn_id),
+            };
+            match self
+                .context
+                .storage_handle
+                .send_storage_effect(delete)
+                .await
+            {
+                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
+                other => return Err(format!("could not drop the copy index: {other:?}")),
+            }
         }
         let write = StorageEffect::BatchWrite {
             writes,

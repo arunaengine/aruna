@@ -36,6 +36,8 @@ use aruna_core::structs::storage::group_backend::{
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::{NetConfig, NetHandle};
+use aruna_operations::auth::request_authorization::BucketAccess;
+use aruna_operations::blob::unify::{Unified, preview_page, unify};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::groups::backends::record_writes;
 use aruna_operations::groups::fence::GroupWriteOperation;
@@ -133,6 +135,11 @@ async fn seed_group(driver: &DriverContext, actor: &Actor, group_id: GroupId) {
 /// A node whose own data stays on its filesystem, with a group storage on the S3 endpoint
 /// and a rule that links the folder `raw/` of a new provider bucket to the bucket root.
 async fn setup_context() -> TestContext {
+    setup_pattern(DEFAULT_PATTERN).await
+}
+
+/// The same with the rule's write pattern `pattern`.
+async fn setup_pattern(pattern: &str) -> TestContext {
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().to_str().unwrap().to_string();
     let storage_handle = storage::FjallStorage::open(&root).unwrap();
@@ -236,7 +243,7 @@ async fn setup_context() -> TestContext {
         schedule: None,
         write_backend_id: None,
         write_prefix: None,
-        write_pattern: DEFAULT_PATTERN.to_string(),
+        write_pattern: pattern.to_string(),
         now: SystemTime::now(),
         move_existing: false,
     });
@@ -430,4 +437,53 @@ async fn current(context: &TestContext, key: &str) -> Option<Ulid> {
             .unwrap()
             .version_id
     })
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_finds_copies() {
+    // A plain file with the bytes of a recovered upload of its key is that version's second
+    // copy, which the duplicates preview lists; other bytes stay a conflict.
+    let context = setup_pattern("{dir}{id}_{name}").await;
+    let (id, other) = (Ulid::generate(), Ulid::generate());
+    place(&context, &format!("old/{id}_sample.faa.gz"), b"same bytes").await;
+    place(&context, "old/sample.faa.gz", b"same bytes").await;
+    place(&context, &format!("old/{other}_x.txt"), b"first").await;
+    place(&context, "old/x.txt", b"second").await;
+    assert_eq!(run_import(&context, 0xC3).await, (3, 0, 1));
+    assert_eq!(current(&context, "old/sample.faa.gz").await, Some(id));
+    assert_eq!(current(&context, "old/x.txt").await, Some(other));
+    // A second run knows both copies.
+    assert_eq!(run_import(&context, 0xD4).await, (0, 3, 1));
+
+    let scope = (context.auth.realm_id, context.group_id, context.node_id);
+    let access = BucketAccess::load(&context.driver, &context.auth, scope, BUCKET)
+        .await
+        .unwrap();
+    let page = preview_page(&context.driver, (BUCKET, ""), &access, (None, None, 100))
+        .await
+        .unwrap();
+    assert_eq!((page.keys, page.bytes), (1, 10));
+    let [found] = page.entries.as_slice() else {
+        panic!("expected one key with copies: {page:?}")
+    };
+    assert_eq!(found.key, "old/sample.faa.gz");
+    assert!(
+        found
+            .keep
+            .backend_path
+            .ends_with(&format!("old/{id}_sample.faa.gz"))
+    );
+    let [copy] = found.copies.as_slice() else {
+        panic!("expected one copy: {found:?}")
+    };
+    assert!(copy.backend_path.ends_with("raw/old/sample.faa.gz"));
+    // The cleanup lets the key keep one file, and the preview has nothing left to tidy.
+    let bucket = (BUCKET, context.group_id);
+    let unified = unify(&context.driver, bucket, found, None).await.unwrap();
+    assert_eq!(unified, Unified::Done);
+    let page = preview_page(&context.driver, (BUCKET, ""), &access, (None, None, 100))
+        .await
+        .unwrap();
+    assert_eq!((page.keys, page.entries.len()), (0, 0));
 }
