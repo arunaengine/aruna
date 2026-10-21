@@ -356,3 +356,7 @@ pub async fn preview_rules(
         next: preview.next,
     }))
 }
+
+#[cfg(test)]
+#[path = "discovery_tests.rs"]
+mod tests;
