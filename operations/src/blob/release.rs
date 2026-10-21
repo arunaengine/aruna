@@ -6,7 +6,7 @@ use crate::blob::records::{iter_index_effect, owners_scan_effect};
 use crate::driver::DriverContext;
 use crate::groups::backends::parse_read;
 use crate::jobs::store::iter_prefix_page;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -58,6 +58,15 @@ pub(crate) async fn release_renamed(
         Ok(false) => {}
         Err(error) => {
             warn!(%error, "References of a renamed file could not be read");
+            return false;
+        }
+    }
+    // A stored location of the file, also one waiting for reclaim, may still be reused.
+    match pinned(context, &location).await {
+        Ok(false) => {}
+        Ok(true) => return false,
+        Err(error) => {
+            warn!(%error, "Locations of a renamed file could not be read");
             return false;
         }
     }
@@ -132,6 +141,44 @@ async fn referenced(
     other_rows(context, location, import_id).await
 }
 
+/// Whether any location row of these bytes on the same storage reads the same file. Reclaim
+/// drops such rows without touching the file, so the release waits for them.
+async fn pinned(context: &DriverContext, location: &BackendLocation) -> Result<bool, String> {
+    let wanted = location.location_key().map_err(|error| error.to_string())?;
+    let mut start = None;
+    loop {
+        let effect = StorageEffect::Iter {
+            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+            prefix: Some(wanted.blake3_hash.to_vec().into()),
+            start: start.take().map(IterStart::After),
+            limit: RULE_PAGE,
+            txn_id: None,
+        };
+        let (rows, next) = match send(context, effect).await {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            other => return Err(format!("could not read locations: {other:?}")),
+        };
+        for (_, value) in rows {
+            let row = BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
+            if row.backend == location.backend && same_path(&row, location) {
+                return Ok(true);
+            }
+        }
+        match next {
+            Some(next) => start = Some(next),
+            None => return Ok(false),
+        }
+    }
+}
+
+fn same_path(left: &BackendLocation, right: &BackendLocation) -> bool {
+    (&left.root, &left.storage_bucket, &left.backend_path)
+        == (&right.root, &right.storage_bucket, &right.backend_path)
+}
+
 /// Whether another copy of the same bytes, such as a literal-name import, reads the same file.
 async fn same_file(
     context: &DriverContext,
@@ -143,14 +190,7 @@ async fn same_file(
         return Ok(false);
     };
     let other = BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
-    let file = |copy: &BackendLocation| {
-        (
-            copy.root.clone(),
-            copy.storage_bucket.clone(),
-            copy.backend_path.clone(),
-        )
-    };
-    Ok(file(&other) == file(location))
+    Ok(same_path(&other, location))
 }
 
 /// Whether another rule on the same storage, such as one sharing the folder, has a row there.
@@ -469,6 +509,38 @@ mod tests {
 
         // Without any reference the delete waits for the blob storage.
         let (_dir, context) = setup();
+        renamed_row(&context, IMPORT).await;
+        assert!(!release(&context).await);
+        assert!(row(&context, IMPORT).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn waits_for_locations() {
+        // A stored location of the file, referenced or not, keeps the release waiting.
+        let (_dir, context) = setup();
+        assert!(!pinned(&context, &old()).await.unwrap());
+        let mut raw = old();
+        raw.format = StoredFormat::default();
+        raw.backend_path = "raw/elsewhere.csv".to_string();
+        let key = raw.location_key().unwrap().to_bytes().into();
+        put(
+            &context,
+            BLOB_LOCATIONS_KEYSPACE,
+            key,
+            raw.to_bytes().unwrap(),
+        )
+        .await;
+        assert!(!pinned(&context, &old()).await.unwrap());
+        raw.backend_path = old().backend_path;
+        let key = raw.location_key().unwrap().to_bytes().into();
+        put(
+            &context,
+            BLOB_LOCATIONS_KEYSPACE,
+            key,
+            raw.to_bytes().unwrap(),
+        )
+        .await;
+        assert!(pinned(&context, &old()).await.unwrap());
         renamed_row(&context, IMPORT).await;
         assert!(!release(&context).await);
         assert!(row(&context, IMPORT).await.is_some());
