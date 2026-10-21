@@ -330,7 +330,7 @@ async fn settles_gone_versions() {
         .await;
     let version = VersionKey::new(BUCKET, "a.csv", id);
     assert!(
-        settle_move(&context.driver, &version, std::slice::from_ref(&key))
+        settle_move(&context.driver, &version, &[(key.clone(), intent)])
             .await
             .unwrap()
     );

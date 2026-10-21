@@ -27,7 +27,7 @@ use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE,
     DELETE_CLAIM_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, MANAGED_COPY_KEYSPACE,
-    RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+    MOVE_HANDOVER_KEYSPACE, RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{
@@ -1628,6 +1628,10 @@ pub async fn process_migrations(
         let bucket = String::from_utf8(key.to_vec()).map_err(|error| error.to_string())?;
         // Encryption replaced this work: its transition converts every version.
         if encrypting(context, &key).await? {
+            if record.moving && !hand_over_moves(context, &bucket, record.started_at_ms).await? {
+                soon(MIGRATION_CONTINUE);
+                continue;
+            }
             let mut retired = record;
             retired.retry_at_ms = None;
             retired.finished_at_ms = Some(now);
@@ -1710,6 +1714,15 @@ async fn migrate_page(
     bucket: &str,
     mut record: CompressionMigration,
 ) -> Result<Option<Duration>, String> {
+    // A hand-over under way finishes before anything else of the move.
+    if record.moving && handing_over(context, bucket, record.started_at_ms).await? {
+        if !hand_over_moves(context, bucket, record.started_at_ms).await? {
+            return Ok(Some(MIGRATION_CONTINUE));
+        }
+        record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
+        store_progress(context, bucket, &record).await?;
+        return Ok(None);
+    }
     // A due retry pass counts its own skips and failures.
     if record.retry_at_ms.take().is_some() {
         record.skipped = 0;
@@ -1834,98 +1847,191 @@ async fn migrate_page(
             Some(wait)
         }
         (false, _) => {
-            // A move ending with failures hands its unsettled attempts to the cleanup queue.
-            if record.moving && record.failed > 0 {
-                hand_over_moves(context, bucket, record.started_at_ms).await?;
+            // A move that ends hands every attempt it still owns to the cleanup queue first;
+            // a long hand-over goes on in the next runs.
+            match record.moving && !hand_over_moves(context, bucket, record.started_at_ms).await? {
+                true => Some(MIGRATION_CONTINUE),
+                false => {
+                    record.finished_at_ms = Some(now);
+                    None
+                }
             }
-            record.finished_at_ms = Some(now);
-            None
         }
     };
     store_progress(context, bucket, &record).await?;
     Ok(after)
 }
 
-/// Ends an aborted rename's move with its last progress; its request stays to show the abort.
-/// Hands every version with an outstanding move intent to the cleanup queue, which settles it
-/// independently of this move, then ends the move with its counts.
+/// Ends an aborted rename's move once its intents are handed to the cleanup queue, which
+/// settles them apart from this move; its request stays to show the abort.
 async fn end_aborted(
     context: &crate::driver::DriverContext,
     bucket: &str,
     mut record: CompressionMigration,
 ) -> Result<Option<Duration>, String> {
-    hand_over_moves(context, bucket, record.started_at_ms).await?;
+    if !hand_over_moves(context, bucket, record.started_at_ms).await? {
+        return Ok(Some(MIGRATION_CONTINUE));
+    }
     record.retry_at_ms = None;
     record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
     store_progress(context, bucket, &record).await?;
     Ok(None)
 }
 
-/// Writes one `SettleMove` work per intent this move still owns, a page at a time, keyed by
-/// the intent, so a repeated hand-over writes the same rows.
+/// Where a move's hand-over of its intents stands: the move, the rule and the last intent.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Handover {
+    started_ms: u64,
+    import_id: Option<Ulid>,
+    after: Option<Vec<u8>>,
+}
+
+/// Intent pages one hand-over run writes at most before it stores its place.
+const HANDOVER_PAGES: usize = 16;
+
+/// Whether the move started at `started_ms` has a hand-over under way.
+async fn handing_over(
+    context: &crate::driver::DriverContext,
+    bucket: &str,
+    started_ms: u64,
+) -> Result<bool, String> {
+    Ok(read_handover(context, bucket)
+        .await?
+        .is_some_and(|handover| handover.started_ms == started_ms))
+}
+
+async fn read_handover(
+    context: &crate::driver::DriverContext,
+    bucket: &str,
+) -> Result<Option<Handover>, String> {
+    let read = StorageEffect::Read {
+        key_space: MOVE_HANDOVER_KEYSPACE.to_string(),
+        key: bucket.as_bytes().to_vec().into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|value| postcard::from_bytes(&value))
+            .transpose()
+            .map_err(|error| error.to_string()),
+        other => Err(format!("could not read the hand-over: {other:?}")),
+    }
+}
+
+async fn store_handover(
+    context: &crate::driver::DriverContext,
+    bucket: &str,
+    handover: Option<&Handover>,
+) -> Result<(), String> {
+    let key: Key = bucket.as_bytes().to_vec().into();
+    let effect = match handover {
+        Some(handover) => StorageEffect::Write {
+            key_space: MOVE_HANDOVER_KEYSPACE.to_string(),
+            key,
+            value: postcard::to_allocvec(handover)
+                .map_err(|error| error.to_string())?
+                .into(),
+            txn_id: None,
+        },
+        None => StorageEffect::Delete {
+            key_space: MOVE_HANDOVER_KEYSPACE.to_string(),
+            key,
+            txn_id: None,
+        },
+    };
+    match context.storage_handle.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
+            Ok(())
+        }
+        other => Err(format!("could not store the hand-over: {other:?}")),
+    }
+}
+
+/// Writes one `SettleMove` work per intent this move still owns, with the intent itself, a
+/// bounded number of pages per run from a stored place; `true` once all are handed over.
 async fn hand_over_moves(
     context: &crate::driver::DriverContext,
     bucket: &str,
     started_ms: u64,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let Some(routing) = move_routing(context, bucket).await? else {
-        return Ok(());
+        store_handover(context, bucket, None).await?;
+        return Ok(true);
     };
-    for rule in routing.imports.iter().filter(|rule| rule.bucket == bucket) {
-        let mut after = None;
-        loop {
-            let (rows, next) = crate::jobs::store::iter_prefix_page(
-                &context.storage_handle,
-                IMPORT_INTENT_KEYSPACE,
-                Some(aruna_core::structs::storage::backend_import::object_prefix(
-                    rule.import_id,
-                )),
-                after.take(),
-                RULE_PAGE,
-                None,
-            )
-            .await?;
-            let mut writes = Vec::new();
-            for (key, value) in rows {
-                let intent = WriteIntent::from_bytes(&value).map_err(|error| error.to_string())?;
-                // Only this move's own intents; an upload's or another move's stay.
-                if intent.mover != Some(started_ms) {
-                    continue;
-                }
-                let version = VersionKey::new(bucket, &intent.key, intent.version_id);
-                let work = BlobCleanupWork::SettleMove {
-                    version,
-                    intents: vec![key.to_vec()],
-                };
-                let value = work.to_bytes().map_err(|error| error.to_string())?;
-                writes.push((BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into()));
+    let mut rules: Vec<Ulid> = (routing.imports.iter())
+        .filter(|rule| rule.bucket == bucket)
+        .map(|rule| rule.import_id)
+        .collect();
+    rules.sort();
+    let stored = read_handover(context, bucket).await?;
+    let mut place = match stored.filter(|handover| handover.started_ms == started_ms) {
+        Some(handover) => handover,
+        None => Handover {
+            started_ms,
+            import_id: rules.first().copied(),
+            after: None,
+        },
+    };
+    for _ in 0..HANDOVER_PAGES {
+        let Some(import_id) = place.import_id else {
+            store_handover(context, bucket, None).await?;
+            return Ok(true);
+        };
+        let (rows, next) = crate::jobs::store::iter_prefix_page(
+            &context.storage_handle,
+            IMPORT_INTENT_KEYSPACE,
+            Some(aruna_core::structs::storage::backend_import::object_prefix(
+                import_id,
+            )),
+            place.after.take().map(Into::into),
+            RULE_PAGE,
+            None,
+        )
+        .await?;
+        let mut writes = Vec::new();
+        for (key, value) in rows {
+            let intent = WriteIntent::from_bytes(&value).map_err(|error| error.to_string())?;
+            // Only this move's own intents; an upload's or another move's stay.
+            if intent.mover != Some(started_ms) {
+                continue;
             }
-            if !writes.is_empty() {
-                let write = StorageEffect::BatchWrite {
-                    writes,
-                    txn_id: None,
-                };
-                match context.storage_handle.send_storage_effect(write).await {
-                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-                    other => return Err(format!("could not hand over the moves: {other:?}")),
-                }
+            let version = VersionKey::new(bucket, &intent.key, intent.version_id);
+            let work = BlobCleanupWork::SettleMove {
+                version,
+                intents: vec![(key.to_vec(), intent)],
+            };
+            let value = work.to_bytes().map_err(|error| error.to_string())?;
+            writes.push((BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into()));
+        }
+        if !writes.is_empty() {
+            let write = StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            };
+            match context.storage_handle.send_storage_effect(write).await {
+                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+                other => return Err(format!("could not hand over the moves: {other:?}")),
             }
-            match next {
-                Some(next) => after = Some(next),
-                None => break,
+        }
+        match next {
+            Some(next) => place.after = Some(next.to_vec()),
+            None => {
+                let at = rules.iter().position(|rule| *rule == import_id);
+                place.import_id = at.and_then(|at| rules.get(at + 1)).copied();
             }
         }
     }
-    Ok(())
+    store_handover(context, bucket, Some(&place)).await?;
+    Ok(false)
 }
 
-/// Runs `version` once more as a rename, which adopts a copy that reached its new name or
-/// drops the intents of one that did not; a version that is gone only loses its intents.
-/// `true` once none of `intents` stays.
+/// Runs `version` once more as a rename, which adopts a copy that reached its new name, then
+/// retires `intents`; a copy no version reads goes to the release first. `true` once settled,
+/// `false` while the version cannot run yet.
 pub async fn settle_move(
     context: &crate::driver::DriverContext,
     version: &VersionKey,
-    intents: &[Vec<u8>],
+    intents: &[(Vec<u8>, WriteIntent)],
 ) -> Result<bool, String> {
     let storage = &context.storage_handle;
     let read = StorageEffect::Read {
@@ -1953,22 +2059,12 @@ pub async fn settle_move(
             .with_routing(routing)
             .with_earlier(earlier);
     // A run that ends on its own decided the version's file; any intent it leaves is stale.
-    if crate::driver::drive(operation, context).await.is_ok() {
-        return retire_intents(context, version, intents).await;
-    }
-    let reads = intents
-        .iter()
-        .map(|key| (IMPORT_INTENT_KEYSPACE.to_string(), key.clone().into()))
-        .collect();
-    let read = StorageEffect::BatchRead {
-        reads,
-        txn_id: None,
-    };
-    match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            Ok(values.iter().all(|(_, value)| value.is_none()))
+    match crate::driver::drive(operation, context).await {
+        Ok(_) => retire_intents(context, version, intents).await,
+        Err(error) => {
+            tracing::warn!(%error, "A move did not settle yet");
+            Ok(false)
         }
-        other => Err(format!("could not read the move's intents: {other:?}")),
     }
 }
 
@@ -1977,23 +2073,10 @@ pub async fn settle_move(
 async fn retire_intents(
     context: &crate::driver::DriverContext,
     version: &VersionKey,
-    intents: &[Vec<u8>],
+    intents: &[(Vec<u8>, WriteIntent)],
 ) -> Result<bool, String> {
     let read_path = read_path(context, version).await?;
-    for key in intents {
-        let read = StorageEffect::Read {
-            key_space: IMPORT_INTENT_KEYSPACE.to_string(),
-            key: key.clone().into(),
-            txn_id: None,
-        };
-        let value = match context.storage_handle.send_storage_effect(read).await {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-            other => return Err(format!("could not read a move intent: {other:?}")),
-        };
-        let Some(value) = value else {
-            continue;
-        };
-        let intent = WriteIntent::from_bytes(&value).map_err(|error| error.to_string())?;
+    for (key, intent) in intents {
         // The key is the rule, the path, a zero byte and the version id.
         let (Some(import), Some(path)) = (key.get(..16), key.get(16..key.len().saturating_sub(17)))
         else {
@@ -2004,13 +2087,13 @@ async fn retire_intents(
             continue;
         }
         let import = Ulid::from_bytes(import.try_into().map_err(|_| "bad intent key")?);
-        if !abandon(context, (&intent, import), path).await? {
+        if !abandon(context, (intent, import), path).await? {
             return Ok(false);
         }
     }
-    drop_intents(context, intents).await
+    let keys: Vec<Vec<u8>> = intents.iter().map(|(key, _)| key.clone()).collect();
+    drop_intents(context, &keys).await
 }
-
 /// The path of the linked file `version` reads now, if any.
 async fn read_path(
     context: &crate::driver::DriverContext,
@@ -2990,7 +3073,7 @@ mod tests {
         assert!(!settle_move(&context, &moved, &intents).await.unwrap());
         let read = StorageEffect::Read {
             key_space: IMPORT_INTENT_KEYSPACE.to_string(),
-            key: intents[0].clone().into(),
+            key: intents[0].0.clone().into(),
             txn_id: None,
         };
         assert!(matches!(

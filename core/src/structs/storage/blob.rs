@@ -362,7 +362,10 @@ pub enum BlobCleanupWork {
     /// `intents` stays, and a version that is gone only loses its intents.
     SettleMove {
         version: VersionKey,
-        intents: Vec<Vec<u8>>,
+        intents: Vec<(
+            Vec<u8>,
+            crate::structs::storage::backend_import::WriteIntent,
+        )>,
     },
     /// Rows of `key_space` under `prefix` that belong to something removed; they go a page at
     /// a time.
