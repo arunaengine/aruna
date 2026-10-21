@@ -246,37 +246,66 @@ async fn release_claimed(
     }
 }
 
-/// Drops a page of the claims and tombstones of the removed rule `import_id`; `Some(true)`
-/// once none is left.
+/// Drops a page of the claims and tombstones of the removed rule `import_id`; a claim whose
+/// delete was sent stays until its release settles it. `Some(true)` once none is left.
 pub(crate) async fn drop_claims(context: &DriverContext, import_id: Ulid) -> Option<bool> {
     let prefix: Key = import_id.to_bytes().to_vec().into();
-    let page = iter_prefix_page(
-        &context.storage_handle,
-        CLAIM_INDEX_KEYSPACE,
-        Some(prefix),
-        None,
-        RULE_PAGE,
-        None,
-    );
-    let (rows, _) = page.await.ok()?;
-    if rows.is_empty() {
-        return Some(true);
+    let mut after = None;
+    let mut seen = false;
+    for _ in 0..DROP_PAGES {
+        let page = iter_prefix_page(
+            &context.storage_handle,
+            CLAIM_INDEX_KEYSPACE,
+            Some(prefix.clone()),
+            after.take(),
+            RULE_PAGE,
+            None,
+        );
+        let (rows, next) = page.await.ok()?;
+        seen |= !rows.is_empty();
+        let claims: Vec<(String, Key)> = (rows.iter())
+            .map(|(key, _)| {
+                let claim = key.get(16..).unwrap_or_default().to_vec().into();
+                (DELETE_CLAIM_KEYSPACE.to_string(), claim)
+            })
+            .collect();
+        let read = StorageEffect::BatchRead {
+            reads: claims.clone(),
+            txn_id: None,
+        };
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = send(context, read).await
+        else {
+            return None;
+        };
+        let mut deletes = Vec::with_capacity(rows.len() * 2);
+        for ((key, _), (_, value)) in rows.into_iter().zip(values) {
+            if value.as_deref() == Some(DELETING) {
+                continue;
+            }
+            let claim: Key = key.get(16..).unwrap_or_default().to_vec().into();
+            deletes.push((DELETE_CLAIM_KEYSPACE.to_string(), claim));
+            deletes.push((CLAIM_INDEX_KEYSPACE.to_string(), key));
+        }
+        if !deletes.is_empty() {
+            let effect = StorageEffect::BatchDelete {
+                deletes,
+                txn_id: None,
+            };
+            return match send(context, effect).await {
+                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Some(false),
+                _ => None,
+            };
+        }
+        match next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
     }
-    let mut deletes = Vec::with_capacity(rows.len() * 2);
-    for (key, _) in rows {
-        let claim: Key = key.get(16..).unwrap_or_default().to_vec().into();
-        deletes.push((DELETE_CLAIM_KEYSPACE.to_string(), claim));
-        deletes.push((CLAIM_INDEX_KEYSPACE.to_string(), key));
-    }
-    let effect = StorageEffect::BatchDelete {
-        deletes,
-        txn_id: None,
-    };
-    match send(context, effect).await {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Some(false),
-        _ => None,
-    }
+    Some(!seen)
 }
+
+/// Claim index pages one pass reads past claims whose delete was sent.
+const DROP_PAGES: usize = 16;
 
 /// The backend version a location row's file was written as, if one is recorded.
 async fn provider(
@@ -868,10 +897,17 @@ mod tests {
         assert!(claimed(&context, (&claim, &index), Some(DELETING)).await);
         alias_version(&context, old().format.encoding()).await;
         assert!(!release(&context).await);
-        let stored = read_value(&context, DELETE_CLAIM_KEYSPACE, claim)
+        let stored = read_value(&context, DELETE_CLAIM_KEYSPACE, claim.clone())
             .await
             .unwrap();
         assert_eq!(stored.as_deref(), Some(DELETING));
+        // A removed rule keeps the claim until its delete is finished, then drops it.
+        assert_eq!(drop_claims(&context, IMPORT).await, Some(false));
+        let kept = read_value(&context, CLAIM_INDEX_KEYSPACE, index.clone()).await;
+        assert!(kept.unwrap().is_some());
+        assert!(claimed(&context, (&claim, &index), Some(TOMBSTONE)).await);
+        assert_eq!(drop_claims(&context, IMPORT).await, Some(false));
+        assert_eq!(drop_claims(&context, IMPORT).await, Some(true));
     }
 
     #[tokio::test]
