@@ -33,6 +33,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
+use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::{NetConfig, NetHandle};
@@ -51,6 +52,7 @@ use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReport
 use aruna_operations::jobs::store::{ClaimOutcome, claim_job, insert_job, transition_to_running};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_operations::s3::purge_fence::acquire_purge_fence;
 use aruna_storage::storage;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -515,12 +517,43 @@ async fn s3_replaces_copies() {
     place(&context, &format!("old/{id}_a.txt"), b"same").await;
     place(&context, "old/a.txt", b"same").await;
     assert_eq!(run_import(&context, 0xC3).await, (2, 0, 0));
-    assert_eq!(duplicates(&context).await.keys, 1);
+    let page = duplicates(&context).await;
+    let [found] = page.entries.as_slice() else {
+        panic!("expected one key with copies: {page:?}")
+    };
     place(&context, "old/a.txt", b"other bytes").await;
     assert_eq!(run_import(&context, 0xD4).await, (1, 1, 0));
-    assert_ne!(current(&context, "old/a.txt").await, Some(id));
+    let replaced = current(&context, "old/a.txt").await;
+    assert_ne!(replaced, Some(id));
     let page = duplicates(&context).await;
     assert_eq!((page.keys, page.entries.len()), (0, 0));
+    // A cleanup found before the overwrite leaves the new version's file alone.
+    let bucket = (BUCKET, context.group_id);
+    let unified = unify(&context.driver, bucket, found, None).await.unwrap();
+    assert_eq!(unified, Unified::Kept);
+    assert_eq!(run_import(&context, 0xE5).await, (0, 2, 0));
+    assert_eq!(current(&context, "old/a.txt").await, replaced);
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_fences_copies() {
+    // A running permanent purge of the key keeps a second copy from being registered.
+    let context = setup_pattern("{dir}{id}_{name}").await;
+    let id = Ulid::generate();
+    place(&context, &format!("old/{id}_a.txt"), b"same").await;
+    assert_eq!(run_import(&context, 0xC3).await, (1, 0, 0));
+    place(&context, "old/a.txt", b"same").await;
+    let scope = StoragePurgeScope::Prefix {
+        bucket: BUCKET.to_string(),
+        prefix: "old/".to_string(),
+    };
+    let job = JobId::from_bytes([0xA1; 16]);
+    acquire_purge_fence(&context.driver.storage_handle, job, &scope)
+        .await
+        .unwrap();
+    assert_eq!(run_import(&context, 0xD4).await, (0, 2, 0));
+    assert_eq!(duplicates(&context).await.keys, 0);
 }
 
 #[tokio::test]
