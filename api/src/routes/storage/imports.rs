@@ -811,9 +811,9 @@ restrictions are refused.
 **Limits**
 - Only files on the rule's own folder storage are renamed. Encrypted buckets answer 409
   `bucket_encrypted`, and a move with another prefix answers 409 `move_running`.
-- The keys are checked with the limits of `GET` on this path; a folder beyond them answers 409
-  `rename_unchecked`. A pattern change between that check and the start answers 409
-  `rule_changed`; once the rename runs, pattern changes are refused.
+- The keys `GET` on this path reaches are checked before the start; files beyond its limits
+  are checked when the rename reaches them. A pattern change between that check and the start
+  answers 409 `rule_changed`; once the rename runs, pattern changes are refused.
 - A storage that cannot create a file only while its name is free renames nothing: each such
   file keeps its name and counts as failed. A copy an earlier rename left at the new name is
   still used when its bytes match.
@@ -846,7 +846,7 @@ restrictions are refused.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path, the bucket or a key, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
-        (status = 409, description = "`bucket_encrypted`, `move_running`, `rename_unchecked` or `rule_changed`", body = ErrorResponse)
+        (status = 409, description = "`bucket_encrypted`, `move_running` or `rule_changed`", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -872,13 +872,7 @@ pub async fn start_renames(
     if checked.withheld > 0 {
         return Err(ServerError::Forbidden);
     }
-    if !checked.complete {
-        return Err(ServerError::Refused(
-            StatusCode::CONFLICT,
-            "rename_unchecked",
-            "the folder has more files than one request can check".to_string(),
-        ));
-    }
+    // Files past the check's limits are authorized one by one when the rename reaches them.
     let (bucket, prefix) = (rule.bucket, rule.key_prefix);
     let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms())
         .renaming((auth.clone(), state.get_node_id()), grant)
