@@ -482,6 +482,11 @@ impl CompleteUploadOperation {
     pub(super) fn plain_fence(&mut self) -> Option<Effects> {
         let target = self.plain.as_ref().filter(|target| target.listed)?;
         let group_id = self.upload_record.as_ref()?.group_id;
+        // Which other rules read the composed path is read in this transaction first.
+        if !self.readers.done() {
+            self.state = CompleteUploadState::ReadReaders;
+            return Some(smallvec![self.readers.page(group_id, self.txn_id)]);
+        }
         let rule = (
             BACKEND_IMPORT_KEYSPACE.to_string(),
             import_key(group_id, target.import_id),
@@ -491,6 +496,29 @@ impl CompleteUploadOperation {
             reads: std::iter::once(rule).chain(self.shared_rows()).collect(),
             txn_id: self.txn_id,
         })])
+    }
+
+    pub(super) fn readers_read(&mut self, event: Event) -> Effects {
+        let path = self
+            .composed_location
+            .as_ref()
+            .map(|written| written.backend_path.clone());
+        let group_id = self.upload_record.as_ref().map(|record| record.group_id);
+        let (Some(target), Some(path), Some(group_id)) = (self.plain.as_mut(), path, group_id)
+        else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        let reading = (target.import_id, &target.backend, path.as_str());
+        match self.readers.read(event, reading) {
+            Ok(Some(readers)) => {
+                target.shared = readers;
+                let invalid = CompleteUploadError::InvalidOperationState;
+                self.plain_fence()
+                    .unwrap_or_else(|| self.schedule_error(invalid))
+            }
+            Ok(None) => smallvec![self.readers.page(group_id, self.txn_id)],
+            Err(_) => self.schedule_error(CompleteUploadError::InvalidOperationState),
+        }
     }
 
     /// The records other rules sharing the folder would keep of the composed path.
@@ -698,12 +726,33 @@ mod tests {
     }
 
     /// Answers the read of the rule and of the rows other rules keep of the path.
+    /// Answers the scan of the rules that read the path with `readers`.
+    fn past_readers(
+        operation: &mut CompleteUploadOperation,
+        effects: Effects,
+        readers: &[BackendImport],
+    ) -> Effects {
+        let [Effect::Storage(StorageEffect::Iter { key_space, .. })] = effects.as_slice() else {
+            return effects;
+        };
+        assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
+        let values = readers
+            .iter()
+            .map(|rule| (rule.key(), rule.to_bytes().unwrap().into()))
+            .collect();
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        }))
+    }
+
     fn fence_read(
         operation: &mut CompleteUploadOperation,
         effects: Effects,
         exists: bool,
         other: Option<Value>,
     ) -> Effects {
+        let effects = past_readers(operation, effects, &[]);
         let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
             panic!("expected the rule read, got {effects:?}")
         };
@@ -745,13 +794,30 @@ mod tests {
         // Another rule of the folder recorded the path, so the upload does not take it.
         let (mut operation, _) = recorded(true, None);
         let other = Ulid::from_parts(9, 9);
-        if let Some(target) = operation.plain.as_mut() {
-            target.shared = vec![other];
-        }
+        // The rule reads the folder, created after the upload was routed.
+        let reader = BackendImport {
+            import_id: other,
+            group_id: Ulid::from_parts(3, 3),
+            backend_id: backend_id(),
+            backend_prefix: "raw/".to_string(),
+            bucket: "other".to_string(),
+            key_prefix: String::new(),
+            schedule: None,
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: DEFAULT_PATTERN.to_string(),
+        };
+        operation.readers = Default::default();
         operation.state = CompleteUploadState::DeleteUploadRecords;
         let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
             entries: Vec::new(),
         }));
+        let effects = past_readers(&mut operation, effects, &[reader]);
         let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
             panic!("expected the fence read, got {effects:?}")
         };

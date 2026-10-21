@@ -140,6 +140,8 @@ pub enum PutObjectState {
     ReadTrail,
     /// Reads the group's import rules inside the version transaction.
     ReadRules,
+    /// Reads which rules read a linked write's path, inside the version transaction.
+    ReadReaders,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -313,6 +315,7 @@ pub struct PutObjectOperation {
     /// The delete trail the version transaction reads before an import registers a version.
     trail_scan: Option<trail::TrailScan>,
     rule_scan: Option<sharing::RuleScan>,
+    readers: sharing::ReaderScan,
 }
 
 impl PutObjectOperation {
@@ -367,6 +370,7 @@ impl PutObjectOperation {
             fence: None,
             trail_scan: None,
             rule_scan: None,
+            readers: sharing::ReaderScan::default(),
         }
     }
 
@@ -1705,6 +1709,7 @@ impl PutObjectOperation {
         if let Some(scan) = self.rule_scan.as_mut() {
             scan.restart();
         }
+        self.readers = sharing::ReaderScan::default();
         self.state = PutObjectState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -1973,6 +1978,7 @@ impl Operation for PutObjectOperation {
             }
             PutObjectState::ReadTrail => self.trail_read(event),
             PutObjectState::ReadRules => self.rules_read(event),
+            PutObjectState::ReadReaders => self.readers_read(event),
             PutObjectState::WriteEvidence => self.evidence_written(event),
             PutObjectState::AbortRegistered => self.registered_aborted(event),
             PutObjectState::ReadHistory => self.history_read(event),
@@ -2792,7 +2798,7 @@ pub(crate) mod fenced;
 mod plain;
 mod sharing;
 mod trail;
-pub(crate) use sharing::RuleScan;
+pub(crate) use sharing::{ReaderScan, RuleScan};
 pub(crate) use trail::{Trail, TrailScan, trail_ranges};
 
 pub(crate) use plain::{

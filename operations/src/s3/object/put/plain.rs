@@ -389,6 +389,12 @@ impl PutObjectOperation {
     }
 
     pub(super) fn plain_records(&mut self, txn_id: Ulid) -> Option<Effects> {
+        // Which other rules read the written path is read in this transaction.
+        if self.listed_write() && self.rule_exists.is_none() && !self.readers.done() {
+            self.state = PutObjectState::ReadReaders;
+            let page = self.readers.page(self.config.group_id, Some(txn_id));
+            return Some(smallvec![page]);
+        }
         if self.rule_exists.is_none()
             && let Some(key) = self.rule_fence()
         {
@@ -467,6 +473,27 @@ impl PutObjectOperation {
             writes,
             txn_id: Some(txn_id),
         })])
+    }
+
+    pub(super) fn readers_read(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(PutObjectError::NoTransactionFound);
+        };
+        let path = self
+            .get_written_location()
+            .map(|written| written.backend_path.clone());
+        let (Some(plain), Some(path)) = (self.plain.as_mut(), path) else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let target = (plain.target.import_id, &plain.target.backend, path.as_str());
+        match self.readers.read(event, target) {
+            Ok(Some(readers)) => {
+                plain.target.shared = readers;
+                self.write_cleanup_row(txn_id)
+            }
+            Ok(None) => smallvec![self.readers.page(self.config.group_id, Some(txn_id))],
+            Err(_) => self.emit_error(PutObjectError::InvalidOperationState),
+        }
     }
 
     pub(super) fn import_rule_read(&mut self, event: Event) -> Effects {
@@ -820,20 +847,60 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::SyncAllFinished))
     }
 
+    /// The version transaction's records, after the scan of the rules that read the path
+    /// finds `readers`.
+    fn records(operation: &mut PutObjectOperation, readers: &[BackendImport]) -> Option<Effects> {
+        let effects = operation.plain_records(Ulid::nil())?;
+        let [Effect::Storage(StorageEffect::Iter { key_space, .. })] = effects.as_slice() else {
+            return Some(effects);
+        };
+        if key_space != BACKEND_IMPORT_KEYSPACE {
+            return Some(effects);
+        }
+        operation.txn_id = Some(Ulid::nil());
+        let values = readers
+            .iter()
+            .map(|rule| (rule.key(), rule.to_bytes().unwrap().into()))
+            .collect();
+        Some(operation.step(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        })))
+    }
+
+    /// Another rule that reads the folder, created after the write was routed.
+    fn reader() -> BackendImport {
+        BackendImport {
+            import_id: Ulid::from_parts(9, 9),
+            group_id: Ulid::from_parts(2, 2),
+            backend_id: backend_id(),
+            backend_prefix: "raw/".to_string(),
+            bucket: "other".to_string(),
+            key_prefix: String::new(),
+            schedule: None,
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: DEFAULT_PATTERN.to_string(),
+        }
+    }
+
     #[test]
     fn keeps_shared_path() {
         // Another rule of the folder recorded the written path: the version is refused.
         let mut put = operation(DEFAULT_PATTERN);
         begin(&mut put);
         let id = put.version_id.unwrap();
-        let other = Ulid::from_parts(9, 9);
-        if let Some(plain) = put.plain.as_mut() {
-            plain.target.shared = vec![other];
-        }
+        // The rule that reads the folder is found in the version transaction.
+        let other = reader().import_id;
         let path = format!("raw/x/one.csv~{id}");
         put.written_location = Some(written(path.clone(), id));
         put.output = Some(Ok(written(path.clone(), id)));
-        let effects = put.plain_records(Ulid::nil()).unwrap();
+        let effects = records(&mut put, &[reader()]).unwrap();
         let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
             panic!("expected the fence read, got {effects:?}")
         };
@@ -954,7 +1021,7 @@ mod tests {
                     Some(Value::from(vec![2u8])),
                 )]);
             operation.txn_id = Some(Ulid::nil());
-            let Some(effects) = operation.plain_records(Ulid::nil()) else {
+            let Some(effects) = records(&mut operation, &[]) else {
                 panic!("expected the guarded rule read")
             };
             let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
@@ -1003,7 +1070,7 @@ mod tests {
                 operation.existing_pointer = Some(CurrentVersionPointer::new(Ulid::nil()));
             }
             // The trail is read in the version transaction, so a later delete conflicts.
-            let Some(effects) = operation.plain_records(Ulid::nil()) else {
+            let Some(effects) = records(&mut operation, &[]) else {
                 panic!("expected the trail read")
             };
             let [
@@ -1072,7 +1139,7 @@ mod tests {
             operation.txn_id = Some(Ulid::nil());
 
             // The import row needs the rule, read in the version transaction.
-            let Some(effects) = operation.plain_records(Ulid::nil()) else {
+            let Some(effects) = records(&mut operation, &[]) else {
                 panic!("expected the rule read")
             };
             assert!(matches!(
@@ -1138,7 +1205,7 @@ mod tests {
         put.txn_id = Some(Ulid::nil());
         let keys = intent_keys(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv", id, true);
         put.written_intent = keys.clone();
-        put.plain_records(Ulid::nil());
+        records(&mut put, &[]);
         put.step(read(Some(vec![0u8])));
 
         // The committed version makes its intent obsolete in the same transaction.
@@ -1186,7 +1253,7 @@ mod tests {
             let mut operation =
                 operation(DEFAULT_PATTERN).with_import_rows(import_id, vec![row.clone()]);
             operation.txn_id = Some(Ulid::nil());
-            let effects = operation.plain_records(Ulid::nil()).expect("a rule read");
+            let effects = records(&mut operation, &[]).expect("a rule read");
             let [
                 Effect::Storage(StorageEffect::Read {
                     key_space,
@@ -1239,7 +1306,7 @@ mod tests {
                 Some(written("raw/a.csv".to_string(), Ulid::from_parts(5, 5)));
             operation.output = Some(Ok(written("raw/a.csv".to_string(), committed)));
             operation.txn_id = Some(Ulid::nil());
-            operation.plain_records(Ulid::nil()).expect("a rule read");
+            records(&mut operation, &[]).expect("a rule read");
             operation.step(read(Some(vec![0u8])))
         };
 

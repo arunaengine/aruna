@@ -105,6 +105,8 @@ pub enum CompleteUploadState {
     DeleteUploadRecords,
     /// Reads the import rule a plain object's import row belongs to.
     ReadImportRule,
+    /// Reads which rules read the composed path, inside the finalize transaction.
+    ReadReaders,
     /// Records what a plain object will be before its bytes reach the path.
     WriteIntent,
     /// Syncs that record to disk before the compose.
@@ -342,6 +344,8 @@ pub struct CompleteUploadOperation {
     written_intent: Vec<Key>,
     /// The record or hash write in flight, in one transaction with a read of its rule.
     fence: Option<crate::s3::object::put::fenced::FencedWrite>,
+    /// The rules that read the composed path, as the finalize transaction reads them.
+    readers: crate::s3::object::put::ReaderScan,
 }
 
 impl CompleteUploadOperation {
@@ -398,6 +402,7 @@ impl CompleteUploadOperation {
             trail_scan: None,
             written_intent: Vec::new(),
             fence: None,
+            readers: Default::default(),
         }
     }
 
@@ -2377,6 +2382,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::WriteObjectMetadata => self.metadata_written(event),
             CompleteUploadState::DeleteUploadRecords => self.records_deleted(event),
             CompleteUploadState::ReadImportRule => self.import_rule_read(event),
+            CompleteUploadState::ReadReaders => self.readers_read(event),
             CompleteUploadState::WriteIntent | CompleteUploadState::SyncIntent => {
                 self.intent_written(event)
             }

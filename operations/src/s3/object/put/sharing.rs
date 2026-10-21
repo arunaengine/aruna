@@ -8,6 +8,7 @@ use crate::groups::imports::shared::shares_folder;
 use aruna_core::effects::IterStart;
 use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
 use aruna_core::structs::storage::backend_import::BackendImport;
+use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::types::Key;
 use std::collections::BTreeSet;
 
@@ -37,6 +38,58 @@ impl RuleScan {
     /// A retried transaction reads all rules again.
     pub(super) fn restart(&mut self) {
         (self.found, self.after, self.done) = (BTreeSet::new(), None, false);
+    }
+}
+
+/// The other rules of a group that read one path, read page by page in a transaction, so a
+/// rule created since the write was routed counts too.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct ReaderScan {
+    after: Option<Key>,
+    found: Vec<Ulid>,
+    done: bool,
+}
+
+impl ReaderScan {
+    pub(crate) fn done(&self) -> bool {
+        self.done
+    }
+
+    /// The next page of the group's rules.
+    pub(crate) fn page(&self, group_id: Ulid, txn_id: Option<Ulid>) -> Effect {
+        Effect::Storage(StorageEffect::Iter {
+            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            prefix: Some(group_id.to_bytes().to_vec().into()),
+            start: self.after.clone().map(IterStart::After),
+            limit: RULE_PAGE,
+            txn_id,
+        })
+    }
+
+    /// Adds a page; the readers once all pages are read.
+    pub(crate) fn read(
+        &mut self,
+        event: Event,
+        (import_id, backend, path): (Ulid, &BackendRef, &str),
+    ) -> Result<Option<Vec<Ulid>>, String> {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return Err(format!("unexpected answer {event:?}"));
+        };
+        for (_, value) in values {
+            let rule = BackendImport::from_bytes(&value).map_err(|error| error.to_string())?;
+            let reads = *backend == BackendRef::Group(rule.backend_id)
+                && path.starts_with(&rule.backend_prefix);
+            if rule.import_id != import_id && reads {
+                self.found.push(rule.import_id);
+            }
+        }
+        self.after = next_start_after;
+        self.done = self.after.is_none();
+        Ok(self.done.then(|| self.found.clone()))
     }
 }
 
