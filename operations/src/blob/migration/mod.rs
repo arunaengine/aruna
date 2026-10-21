@@ -164,6 +164,8 @@ pub struct MigrateVersionOperation {
     target_row: Option<Option<Vec<u8>>>,
     /// The other rules of the path whose intents are still to read.
     peers: Vec<Ulid>,
+    /// Why the storage refused the write, reported once its intents are gone.
+    refusal: Option<BlobError>,
     /// The write intents stored for a write to a linked folder, at both paths it may reach.
     written_intent: Vec<Key>,
     /// The write that waits for its intent to be on disk.
@@ -205,6 +207,7 @@ impl MigrateVersionOperation {
             fence: None,
             target_row: None,
             peers: Vec::new(),
+            refusal: None,
             written_intent: Vec::new(),
             pending_write: None,
             backend_etag: None,
@@ -533,6 +536,7 @@ impl MigrateVersionOperation {
             path,
             ulid: attempt,
             if_not_exists,
+            exact: self.renaming,
         });
         self.read_blob()
     }
@@ -709,7 +713,8 @@ impl MigrateVersionOperation {
             }
             (MigrateState::SyncDroppedIntent, Event::Storage(StorageEvent::SyncAllFinished)) => {
                 self.written_intent.clear();
-                self.fail(BlobError::PathTaken.into())
+                let refusal = self.refusal.take().unwrap_or(BlobError::PathTaken);
+                self.fail(refusal.into())
             }
             (_, other) => self.unexpected(other),
         }
@@ -727,9 +732,11 @@ impl MigrateVersionOperation {
                 self.backend_etag = etag;
                 location
             }
-            Event::Blob(BlobEvent::Error(BlobError::PathTaken))
-                if !self.written_intent.is_empty() =>
-            {
+            // A refused write moved no byte; its intents go before the move fails with it.
+            Event::Blob(BlobEvent::Error(
+                error @ (BlobError::PathTaken | BlobError::ConditionalUnsupported),
+            )) if !self.written_intent.is_empty() => {
+                self.refusal = Some(error);
                 self.state = MigrateState::DropIntent;
                 return smallvec![intent_deletes(&self.written_intent)];
             }
@@ -3014,6 +3021,38 @@ mod tests {
             operation
         }
 
+        #[test]
+        fn refuses_unconditional_rename() {
+            // A storage that cannot create only a free name refuses the rename; no intent stays.
+            let (version, old) = prefixed();
+            let mut operation = renaming(&version, &old, Some(b"v1"));
+            let absent = || {
+                Event::Blob(BlobEvent::PlainStat {
+                    exists: false,
+                    version: None,
+                })
+            };
+            operation.step(absent());
+            operation.step(absent());
+            let effects = operation.step(empty_blob());
+            past_intent(&mut operation, effects);
+            let refused = || BlobError::ConditionalUnsupported;
+            let effects = operation.step(Event::Blob(BlobEvent::Error(refused())));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::BatchDelete { .. })]
+            ));
+            operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+                entries: Vec::new(),
+            }));
+            operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+            assert!(operation.written_intent.is_empty());
+            assert_eq!(
+                operation.output,
+                Some(Err(MigrateVersionError::Blob(refused())))
+            );
+        }
+
         /// Drives a rename to its publication rows.
         fn renamed(
             source: Option<&[u8]>,
@@ -3039,7 +3078,8 @@ mod tests {
             let [Effect::Blob(BlobEffect::WritePlain { plain, .. })] = effects.as_slice() else {
                 panic!("expected the new file, got {effects:?}")
             };
-            assert!(plain.if_not_exists);
+            // A rename takes its exact new name or nothing.
+            assert!(plain.if_not_exists && plain.exact);
             let plain = plain.clone();
             after_write(&mut operation, plain_written(&plain));
             operation.step(Event::Storage(StorageEvent::TransactionStarted {

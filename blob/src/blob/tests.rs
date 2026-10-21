@@ -3944,6 +3944,7 @@ async fn s3_plain_upload() {
             path: "raw/a.bin".to_string(),
             ulid,
             if_not_exists: true,
+            exact: false,
         };
         let event = handler.open_upload(
             Ulid::generate(),

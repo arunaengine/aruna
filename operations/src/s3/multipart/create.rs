@@ -258,6 +258,7 @@ impl CreateMultipartOperation {
             path: target.path.clone(),
             ulid: id,
             if_not_exists: false,
+            exact: false,
         };
         if !target.same_name {
             return self.open_native(Some(plain));

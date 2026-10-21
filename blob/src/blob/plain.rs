@@ -23,19 +23,22 @@ use std::time::SystemTime;
 use tokio::time::timeout;
 
 /// Without conditional writes a stat proves nothing, so a write that must find its path
-/// free goes to its tagged path, chosen before any byte is read.
+/// free goes to its tagged path, chosen before any byte is read; an exact one is refused.
 pub(super) fn conditional(
     operator: &Operator,
     location: &mut BackendLocation,
     plain: &PlainPath,
-) -> bool {
+) -> Result<bool, BlobError> {
     if operator.info().capability().write_with_if_not_exists || !plain.if_not_exists {
-        return plain.if_not_exists;
+        return Ok(plain.if_not_exists);
+    }
+    if plain.exact {
+        return Err(BlobError::ConditionalUnsupported);
     }
     if !plain.path.ends_with(&format!("~{}", plain.ulid)) {
         location.backend_path = tagged_path(&plain.path, plain.ulid);
     }
-    false
+    Ok(false)
 }
 
 impl BlobHandler {
@@ -88,7 +91,10 @@ impl BlobHandler {
         if plain.path.ends_with('/') {
             return self.write_folder(location, operator, blob).await;
         }
-        let conditional = conditional(&operator, &mut location, &plain);
+        let conditional = match conditional(&operator, &mut location, &plain) {
+            Ok(conditional) => conditional,
+            Err(error) => return BlobEvent::Error(error),
+        };
         Box::pin(self.write_tenant(location, operator, blob, conditional)).await
     }
 
@@ -155,7 +161,10 @@ impl BlobHandler {
         };
         let total = parts.iter().map(|part| part.blob_size).sum();
         let chunk = compose_chunk(&backend_type, total, false);
-        let conditional = conditional(&operator, &mut location, &plain);
+        let conditional = match conditional(&operator, &mut location, &plain) {
+            Ok(conditional) => conditional,
+            Err(error) => return BlobEvent::Error(error),
+        };
         let composed = self.compose_parts(
             location,
             operator,

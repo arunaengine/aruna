@@ -453,6 +453,9 @@ pub struct PlainPath {
     pub ulid: Ulid,
     /// Fails the write with `PathTaken` if a file is already at the path.
     pub if_not_exists: bool,
+    /// Only `path` itself may take the file: a storage that cannot create a file only while
+    /// its name is free refuses the write instead of using the tagged path.
+    pub exact: bool,
 }
 
 /// What a removal mark does after the rows: delete this provider bucket while it is empty.

@@ -182,6 +182,7 @@ impl CompleteUploadOperation {
             path,
             ulid,
             if_not_exists,
+            exact: false,
         };
         self.plain_path = Some(plain.clone());
         self.state = CompleteUploadState::ComposeBlob;

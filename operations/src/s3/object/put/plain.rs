@@ -147,6 +147,7 @@ impl PutObjectOperation {
                 path,
                 ulid,
                 if_not_exists,
+                exact: false,
             },
             created_by: self.config.user_id,
             blob,

@@ -44,6 +44,8 @@ pub enum BlobError {
     ChannelClosed,
     #[error("Cleanup is unsupported by the backend")]
     CleanupUnsupported,
+    #[error("The storage cannot create a file only while its name is free")]
+    ConditionalUnsupported,
     #[error("Failed to send message")]
     SendError,
     #[error("Invalid effect type")]

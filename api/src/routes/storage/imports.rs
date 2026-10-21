@@ -813,6 +813,9 @@ restrictions are refused.
 - The keys are checked with the limits of `GET` on this path; a folder beyond them answers 409
   `rename_unchecked`. A pattern change between that check and the start answers 409
   `rule_changed`; once the rename runs, pattern changes are refused.
+- A storage that cannot create a file only while its name is free renames nothing: each such
+  file keeps its name and counts as failed. A copy an earlier rename left at the new name is
+  still used when its bytes match.
 - The rename runs as the caller: a file is renamed only while the caller may still write its
   key when the rename reaches it, including files written after the start. Others keep their
   name."#,

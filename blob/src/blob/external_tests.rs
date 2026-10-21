@@ -118,6 +118,7 @@ async fn writes_plain_paths() {
         path: path.to_string(),
         ulid: Ulid::generate(),
         if_not_exists,
+        exact: false,
     };
     let write = |plain: PlainPath, body: &'static [u8]| {
         let handler = handler.clone();
@@ -192,6 +193,7 @@ async fn writes_folder_objects() {
         path: path.to_string(),
         ulid: Ulid::generate(),
         if_not_exists: false,
+        exact: false,
     };
     let event = handler
         .write_plain(
@@ -318,16 +320,21 @@ fn tags_without_condition() {
         path: "raw/a.txt".to_string(),
         ulid,
         if_not_exists: true,
+        exact: false,
     };
 
-    assert!(!conditional(&operator, &mut location, &plain));
+    assert_eq!(conditional(&operator, &mut location, &plain), Ok(false));
     assert_eq!(location.backend_path, tagged_path("raw/a.txt", ulid));
 
     // An already tagged path is not tagged twice.
     plain.path = tagged_path("raw/a.txt", ulid);
     location.backend_path = plain.path.clone();
-    assert!(!conditional(&operator, &mut location, &plain));
+    assert_eq!(conditional(&operator, &mut location, &plain), Ok(false));
     assert_eq!(location.backend_path, plain.path);
+    // A rename must create its exact name, so such a storage refuses it.
+    plain.exact = true;
+    let refused = conditional(&operator, &mut location, &plain);
+    assert_eq!(refused, Err(BlobError::ConditionalUnsupported));
 }
 
 #[tokio::test]
@@ -344,6 +351,7 @@ async fn deletes_renamed_files() {
         path: "raw/old.txt".to_string(),
         ulid: Ulid::generate(),
         if_not_exists: true,
+        exact: false,
     };
     let blob = stream_from_bytes(b"old");
     let written = handler.write_plain(resolved, plain, test_user_id(), blob);
