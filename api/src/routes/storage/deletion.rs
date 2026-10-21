@@ -805,7 +805,7 @@ pub async fn control_purge(
                 .map_err(failed)?;
             // A purge cancelled before it ran again still releases what it planned.
             if let CancelJobOutcome::AlreadyTerminal(_) | CancelJobOutcome::Requested(_) = outcome
-                && read_job_record_terminal(&state, job_id).await?
+                && purge_ended(&state, job_id).await?
             {
                 aruna_operations::blob::purge::hand_over(&context, id)
                     .await
@@ -820,7 +820,7 @@ pub async fn control_purge(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn read_job_record_terminal(
+async fn purge_ended(
     state: &ServerState,
     job_id: aruna_core::structs::execution::job::JobId,
 ) -> ServerResult<bool> {
