@@ -10,8 +10,8 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, COPY_OWNER_KEYSPACE, PENDING_LOCATION_KEYSPACE,
-    STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, CLEANUP_CURSOR_KEYSPACE, COPY_OWNER_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
@@ -194,7 +194,14 @@ pub struct BlobCleanupOutcome {
     pub dropped: usize,
     /// Rows that must stay queued without being failures, such as a live upload's target.
     pub kept: usize,
+    /// The pass stopped at its row limit; the next one continues after it.
+    pub more: bool,
 }
+
+/// Rows one drain pass looks at, at most; the next pass continues after the last one.
+const PASS_ROWS: usize = 4096;
+/// Where the next drain pass starts.
+const CURSOR_KEY: &[u8] = b"cursor";
 
 /// What one drain pass did with a row.
 enum RowOutcome {
@@ -217,7 +224,8 @@ impl From<bool> for RowOutcome {
 // rows behind them, deleting each page's completed rows before the next fetch.
 pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanupOutcome, String> {
     let mut outcome = BlobCleanupOutcome::default();
-    let mut start_after = None;
+    let mut start_after = read_cursor(context).await?;
+    let mut seen = 0usize;
 
     loop {
         let (values, next) = iter_prefix_page(
@@ -231,6 +239,8 @@ pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanu
         .await?;
 
         let mut done: Vec<(String, Key)> = Vec::new();
+        let last = values.last().map(|(key, _)| key.clone());
+        seen += values.len();
         for (key, value) in values {
             // A row nobody can decode would wedge the drain forever.
             let work = match BlobCleanupWork::from_bytes(&value) {
@@ -265,9 +275,51 @@ pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanu
         delete_cleanup_rows(context, done).await?;
 
         let Some(next) = next else {
+            store_cursor(context, None).await?;
             return Ok(outcome);
         };
+        // A bounded pass keeps its place, so every row gets its turn over the passes.
+        if seen >= PASS_ROWS {
+            store_cursor(context, last).await?;
+            outcome.more = true;
+            return Ok(outcome);
+        }
         start_after = Some(next);
+    }
+}
+
+async fn read_cursor(context: &DriverContext) -> Result<Option<Key>, String> {
+    let read = StorageEffect::Read {
+        key_space: CLEANUP_CURSOR_KEYSPACE.to_string(),
+        key: CURSOR_KEY.to_vec().into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+        other => Err(format!("could not read the cleanup cursor: {other:?}")),
+    }
+}
+
+async fn store_cursor(context: &DriverContext, cursor: Option<Key>) -> Result<(), String> {
+    let key: Key = CURSOR_KEY.to_vec().into();
+    let effect = match cursor {
+        Some(value) => StorageEffect::Write {
+            key_space: CLEANUP_CURSOR_KEYSPACE.to_string(),
+            key,
+            value,
+            txn_id: None,
+        },
+        None => StorageEffect::Delete {
+            key_space: CLEANUP_CURSOR_KEYSPACE.to_string(),
+            key,
+            txn_id: None,
+        },
+    };
+    match context.storage_handle.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
+            Ok(())
+        }
+        other => Err(format!("could not store the cleanup cursor: {other:?}")),
     }
 }
 
@@ -1135,6 +1187,29 @@ mod tests {
             assert_eq!(outcome.failed, 0);
             assert_eq!(remaining_rows(&storage).await, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn bounds_each_pass() {
+        // A long queue is worked in bounded passes that continue where the last one stopped.
+        let (_dir, storage, context) = setup_context();
+        let writes = (0..super::PASS_ROWS + 10)
+            .map(|index| {
+                let key = (index as u32).to_be_bytes().to_vec().into();
+                (BLOB_CLEANUP_KEYSPACE.to_string(), key, vec![0xff].into())
+            })
+            .collect();
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        storage.send_storage_effect(write).await;
+        let first = process_cleanup_batch(&context).await.unwrap();
+        assert!(first.more);
+        assert!(first.dropped >= super::PASS_ROWS);
+        let second = process_cleanup_batch(&context).await.unwrap();
+        assert!(!second.more);
+        assert_eq!(first.dropped + second.dropped, super::PASS_ROWS + 10);
     }
 
     #[tokio::test]

@@ -101,6 +101,8 @@ pub const COMPRESSION_QUEUE_KEYSPACE: &str = "compression_migration_queue";
 /// Moves asked to rename linked files of earlier patterns: the start time of the move record
 /// they belong to, keyed by bucket name.
 pub const RENAME_MOVE_KEYSPACE: &str = "compression_migration_renames";
+/// Where the next pass over the blob cleanup queue starts.
+pub const CLEANUP_CURSOR_KEYSPACE: &str = "blob_cleanup_cursor";
 /// The re-mapping or duplicate cleanup job of each bucket, keyed by bucket name.
 pub const LINKED_JOB_KEYSPACE: &str = "linked_storage_jobs";
 /// Backend versions of linked files a release deletes, claimed before its last checks and kept
@@ -456,6 +458,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     COMPRESSION_QUEUE_KEYSPACE,
     RENAME_MOVE_KEYSPACE,
     LINKED_JOB_KEYSPACE,
+    CLEANUP_CURSOR_KEYSPACE,
     DELETE_CLAIM_KEYSPACE,
     CLAIM_INDEX_KEYSPACE,
     RENAMED_ROW_KEYSPACE,

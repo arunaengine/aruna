@@ -1024,6 +1024,7 @@ impl OperationsTaskHandler {
     pub(super) async fn drain_blob_cleanup(&self) {
         let after = match process_cleanup_batch(&self.context).await {
             Ok(outcome) if outcome.failed > 0 => BLOB_CLEANUP_RETRY,
+            Ok(outcome) if outcome.more => std::time::Duration::from_secs(1),
             Ok(_) => BLOB_CLEANUP_AFTER,
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainCleanupQueue, error = %error, "Failed to drain blob cleanup");
