@@ -1797,4 +1797,30 @@ mod tests {
         operation.start_hash_lookup();
         assert_eq!(operation.state, PutObjectState::CheckHashLookup);
     }
+
+    #[test]
+    fn reuses_older_version() {
+        // A same-name re-upload on a versioned storage gives way to the older backend version.
+        let reuse = |stored: &[u8]| {
+            let mut old = written("raw/x/one.csv~new".to_string(), Ulid::from_parts(4, 4));
+            old.format.layout = StoredLayout::Plain(old.ulid);
+            let mut operation = rewritten(7);
+            current(&mut operation, &old);
+            let effects = operation.step(read(Some(old.to_bytes().unwrap())));
+            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
+            else {
+                panic!("expected the backend version read, got {effects:?}")
+            };
+            assert_eq!(key_space, BACKEND_VERSION_KEYSPACE);
+            operation.step(read(Some(stored.to_vec())));
+            (operation, old)
+        };
+        let (operation, old) = reuse(b"v1");
+        assert_eq!(operation.output, Some(Ok(old)));
+        assert!(operation.dedup_release().is_some());
+        // The same backend version is the same file; nothing is released.
+        let (operation, _) = reuse(b"v2");
+        assert_eq!(operation.state, PutObjectState::CheckHashLookup);
+        assert!(operation.dedup_release().is_none());
+    }
 }

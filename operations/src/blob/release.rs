@@ -11,10 +11,12 @@ use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    IMPORTED_OBJECT_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
 };
-use aruna_core::structs::storage::backend_import::{BackendImport, ImportedObject, object_key};
+use aruna_core::structs::storage::backend_import::{
+    BackendImport, ImportedObject, object_key, version_key,
+};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, HashIndex, VersionKey,
 };
@@ -55,7 +57,7 @@ pub(crate) async fn release_renamed(
             return false;
         }
     }
-    match referenced(context, &location, import_id).await {
+    match referenced(context, &location, (import_id, &version)).await {
         Ok(true) => return true,
         Ok(false) => {}
         Err(error) => {
@@ -63,15 +65,16 @@ pub(crate) async fn release_renamed(
             return false;
         }
     }
-    // A stored location of the file, also one waiting for reclaim, may still be reused.
-    match pinned(context, &location).await {
-        Ok(false) => {}
-        Ok(true) => return false,
+    // A stored location of the file, also one waiting for reclaim, may still be reused; one
+    // of another backend version at the path keeps the path's row.
+    let shared = match pinned(context, &location, &version).await {
+        Ok(Some(shared)) => shared,
+        Ok(None) => return false,
         Err(error) => {
             warn!(%error, "Locations of a renamed file could not be read");
             return false;
         }
-    }
+    };
     // The rename's own old location goes first, whatever the storage's cleanup strategy, and
     // the rename and that retirement are on disk before the file is deleted.
     if !retire_source(context, &location).await || !synced(context).await {
@@ -91,16 +94,42 @@ pub(crate) async fn release_renamed(
         }
     }
     match observed {
-        Some(observed) => drop_row(context, key, observed).await,
-        None => true,
+        Some(observed) if !shared => drop_row(context, key, observed).await,
+        _ => true,
     }
+}
+
+/// The backend version a location row's file was written as, if one is recorded.
+async fn provider(
+    context: &DriverContext,
+    location: &BackendLocation,
+) -> Result<Option<String>, String> {
+    let value = read_value(
+        context,
+        BACKEND_VERSION_KEYSPACE,
+        version_key(location.ulid),
+    )
+    .await?;
+    let value = value.map(String::from_utf8).transpose();
+    value.map_err(|error| error.to_string())
+}
+
+/// Whether `other` names other bytes at the same path: another known backend version.
+async fn other_version(
+    context: &DriverContext,
+    other: &BackendLocation,
+    version: &str,
+) -> Result<bool, String> {
+    Ok(provider(context, other)
+        .await?
+        .is_some_and(|other| other != version))
 }
 
 /// Whether a version, an archive owner or another rule's row still names the copy.
 async fn referenced(
     context: &DriverContext,
     location: &BackendLocation,
-    import_id: Ulid,
+    (import_id, provider): (Ulid, &str),
 ) -> Result<bool, String> {
     let wanted = location.location_key().map_err(|error| error.to_string())?;
     let mut start = None;
@@ -129,7 +158,8 @@ async fn referenced(
                 continue;
             };
             if other == wanted
-                || (other.backend == wanted.backend && same_file(context, &other, location).await?)
+                || (other.backend == wanted.backend
+                    && same_file(context, &other, (location, provider)).await?)
             {
                 return Ok(true);
             }
@@ -181,9 +211,15 @@ async fn retire_source(context: &DriverContext, location: &BackendLocation) -> b
     }
 }
 
-/// Whether any other location row of these bytes on the same storage reads the same file.
-/// Reclaim drops such rows without touching the file, so the release waits for them.
-async fn pinned(context: &DriverContext, location: &BackendLocation) -> Result<bool, String> {
+/// `None` while another location row of these bytes on the same storage reads the same file:
+/// reclaim drops such rows without touching the file, so the release waits for them. Else
+/// whether a row reads another backend version at the same path, which keeps the path in use.
+async fn pinned(
+    context: &DriverContext,
+    location: &BackendLocation,
+    version: &str,
+) -> Result<Option<bool>, String> {
+    let mut shared = false;
     let wanted = location.location_key().map_err(|error| error.to_string())?;
     let mut start = None;
     loop {
@@ -205,12 +241,15 @@ async fn pinned(context: &DriverContext, location: &BackendLocation) -> Result<b
             let row = BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
             let own = key.as_ref() == wanted.to_bytes().as_slice();
             if !own && row.backend == location.backend && same_path(&row, location) {
-                return Ok(true);
+                match other_version(context, &row, version).await? {
+                    true => shared = true,
+                    false => return Ok(None),
+                }
             }
         }
         match next {
             Some(next) => start = Some(next),
-            None => return Ok(false),
+            None => return Ok(Some(shared)),
         }
     }
 }
@@ -220,18 +259,19 @@ fn same_path(left: &BackendLocation, right: &BackendLocation) -> bool {
         == (&right.root, &right.storage_bucket, &right.backend_path)
 }
 
-/// Whether another copy of the same bytes, such as a literal-name import, reads the same file.
+/// Whether another copy of the same bytes, such as a literal-name import, reads the same file:
+/// the same path and no other known backend version.
 async fn same_file(
     context: &DriverContext,
     key: &BlobLocationKey,
-    location: &BackendLocation,
+    (location, version): (&BackendLocation, &str),
 ) -> Result<bool, String> {
     let Some(value) = read_value(context, BLOB_LOCATIONS_KEYSPACE, key.to_bytes().into()).await?
     else {
         return Ok(false);
     };
     let other = BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
-    Ok(same_path(&other, location))
+    Ok(same_path(&other, location) && !other_version(context, &other, version).await?)
 }
 
 /// Whether another rule on the same storage, such as one sharing the folder, has a row there.
@@ -559,7 +599,7 @@ mod tests {
     async fn waits_for_locations() {
         // A stored location of the file, referenced or not, keeps the release waiting.
         let (_dir, context) = setup();
-        assert!(!pinned(&context, &old()).await.unwrap());
+        assert_eq!(pinned(&context, &old(), "v1").await.unwrap(), Some(false));
         // The rename's own old location is retired by the release, so it does not pin.
         let own = old().location_key().unwrap().to_bytes().into();
         put(
@@ -569,7 +609,7 @@ mod tests {
             old().to_bytes().unwrap(),
         )
         .await;
-        assert!(!pinned(&context, &old()).await.unwrap());
+        assert_eq!(pinned(&context, &old(), "v1").await.unwrap(), Some(false));
         let mut raw = old();
         raw.format = StoredFormat::default();
         raw.backend_path = "raw/elsewhere.csv".to_string();
@@ -581,7 +621,7 @@ mod tests {
             raw.to_bytes().unwrap(),
         )
         .await;
-        assert!(!pinned(&context, &old()).await.unwrap());
+        assert_eq!(pinned(&context, &old(), "v1").await.unwrap(), Some(false));
         raw.backend_path = old().backend_path;
         let key = raw.location_key().unwrap().to_bytes().into();
         put(
@@ -591,10 +631,16 @@ mod tests {
             raw.to_bytes().unwrap(),
         )
         .await;
-        assert!(pinned(&context, &old()).await.unwrap());
+        assert_eq!(pinned(&context, &old(), "v1").await.unwrap(), None);
         renamed_row(&context, IMPORT).await;
         assert!(!release(&context).await);
         assert!(row(&context, IMPORT).await.is_some());
+        // A row of another backend version at the path reads other bytes: no pin, but the
+        // path stays in use.
+        let other = version_key(raw.ulid).to_vec();
+        let value = b"v0".to_vec().into();
+        put(&context, BACKEND_VERSION_KEYSPACE, other.into(), value).await;
+        assert_eq!(pinned(&context, &old(), "v1").await.unwrap(), Some(true));
     }
 
     #[tokio::test]

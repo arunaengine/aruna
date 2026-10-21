@@ -4,6 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::keyspaces::BACKEND_VERSION_KEYSPACE;
+use aruna_core::structs::storage::backend_import::version_key;
 use aruna_core::types::{Key, Value};
 
 impl PutObjectOperation {
@@ -92,17 +94,44 @@ impl PutObjectOperation {
                 let usable = existing.is_external()
                     && !existing.staging
                     && !existing.partial
-                    && existing.blob_size == written.blob_size
-                    && !existing.same_object(&written);
+                    && existing.blob_size == written.blob_size;
                 if !usable {
                     return self.start_hash_lookup();
                 }
-                self.dedup = Some(written);
-                self.output = Some(Ok(existing));
-                self.create_blob_location()
+                // At the same path only another backend version of it is another file.
+                if existing.same_object(&written) {
+                    self.state = PutObjectState::ReadDedupProvider;
+                    self.output = Some(Ok(existing.clone()));
+                    return smallvec![Effect::Storage(StorageEffect::Read {
+                        key_space: BACKEND_VERSION_KEYSPACE.to_string(),
+                        key: version_key(existing.ulid),
+                        txn_id: self.txn_id,
+                    })];
+                }
+                self.reuse(written, existing)
+            }
+            (PutObjectState::ReadDedupProvider, value) => {
+                let kept = self.output.take().and_then(Result::ok);
+                let written = self.get_written_location().cloned();
+                let fresh = self.plain.as_ref().and_then(|plain| plain.version.clone());
+                let other = value.map(|value| value.to_vec());
+                match (kept, written, other, fresh) {
+                    (Some(kept), Some(written), Some(other), Some(fresh))
+                        if other != fresh.as_bytes() =>
+                    {
+                        self.reuse(written, kept)
+                    }
+                    _ => self.start_hash_lookup(),
+                }
             }
             _ => self.start_hash_lookup(),
         }
+    }
+
+    fn reuse(&mut self, written: BackendLocation, existing: BackendLocation) -> Effects {
+        self.dedup = Some(written);
+        self.output = Some(Ok(existing));
+        self.create_blob_location()
     }
 
     /// The release of the written file, committed with the version that reads the older one.
