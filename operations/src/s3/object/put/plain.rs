@@ -1307,8 +1307,21 @@ mod tests {
             let effects = put.step(read(version));
             (put, effects)
         };
-        // Nothing registered yet: the write moves the head as usual.
-        let (_, effects) = found(None);
+        // Nothing registered yet: the delete trail is read, then the head moves as usual.
+        let (mut put, effects) = found(None);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
+                if key_space == aruna_core::keyspaces::DELETE_TRAIL_KEYSPACE
+        ));
+        let page = || {
+            Event::Storage(StorageEvent::IterResult {
+                values: Vec::new(),
+                next_start_after: None,
+            })
+        };
+        put.step(page());
+        let effects = put.step(page());
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Write { key_space, .. })] if key_space == BLOB_HEAD_KEYSPACE

@@ -1171,7 +1171,7 @@ impl PutObjectOperation {
         self.write_head(existing, version_id)
     }
 
-    fn write_head(
+    pub(super) fn write_head(
         &mut self,
         existing: Option<&CurrentVersionPointer>,
         version_id: Ulid,
@@ -1212,6 +1212,12 @@ impl PutObjectOperation {
         let Some(value) = value else {
             if self.keep_head {
                 return self.write_path_index();
+            }
+            let Some(txn_id) = self.txn_id else {
+                return self.emit_error(PutObjectError::NoTransactionFound);
+            };
+            if self.trail_scan.as_ref().is_none_or(|scan| scan.writer) {
+                return self.writer_trail(txn_id);
             }
             let (existing, version_id) = (self.existing_pointer.clone(), self.version_id);
             let Some(version_id) = version_id else {
@@ -2768,7 +2774,7 @@ mod decision_tests {
 
 mod plain;
 mod trail;
-pub(crate) use trail::{Trail, trail_ranges};
+pub(crate) use trail::{Trail, TrailScan, trail_ranges};
 
 pub(crate) use plain::{
     PlainRecord, intent_deletes, intent_keys, intent_writes, owner_read, owns_path, same_name_path,

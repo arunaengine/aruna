@@ -119,6 +119,8 @@ pub enum CompleteUploadState {
     WriteEvidence,
     /// Reads the version an import may have registered already.
     ReadRegistered,
+    /// Reads the delete trail of an upload no import registered, before its head moves.
+    ReadTrail,
     /// Drops the location the upload staged for bytes an import registered already.
     DropStagedLocation,
     WriteCleanupRecords,
@@ -204,6 +206,8 @@ pub enum CompleteUploadError {
     CompleteUploadFailed,
     #[error("the version already exists with other content")]
     VersionExists,
+    #[error("the version was deleted on purpose")]
+    HistoryDeleted,
     #[error("operation did not finish")]
     NotFinished,
     #[error(transparent)]
@@ -330,6 +334,8 @@ pub struct CompleteUploadOperation {
     pending_compose: Option<Effects>,
     /// An import registered this version with the same bytes before the finalize.
     registered: bool,
+    /// The delete trail read for a listed upload's version before its head moves.
+    trail_scan: Option<crate::s3::object::put::TrailScan>,
     /// The intent record of the compose in flight.
     written_intent: Vec<Key>,
 }
@@ -385,6 +391,7 @@ impl CompleteUploadOperation {
             plain_etag: None,
             pending_compose: None,
             registered: false,
+            trail_scan: None,
             written_intent: Vec::new(),
         }
     }
@@ -2357,6 +2364,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::WriteBlobHead => self.head_written(event),
             CompleteUploadState::ReadRegistered => self.registered_read(event),
             CompleteUploadState::DropStagedLocation => self.staged_dropped(event),
+            CompleteUploadState::ReadTrail => self.trail_read(event),
             CompleteUploadState::WritePathIndex => self.path_index_written(event),
             CompleteUploadState::WriteVersionRecord => self.version_written(event),
             CompleteUploadState::WriteEnvelope => self.envelope_written(event),

@@ -62,27 +62,32 @@ pub(crate) fn trail_ranges(group_id: GroupId, bucket: &str, key: &str) -> [Key; 
 /// The trail scan of one version transaction. Its range read makes a delete recorded meanwhile
 /// conflict with the commit, so the retried transaction reads it.
 #[derive(Debug, PartialEq)]
-pub(super) struct TrailScan {
-    version_id: Ulid,
-    after: Option<Key>,
-    trail: Trail,
+pub(crate) struct TrailScan {
+    pub(crate) version_id: Ulid,
+    pub(crate) after: Option<Key>,
+    pub(crate) trail: Trail,
     /// The next of the two trail ranges to read; both read means done.
-    range: usize,
+    pub(crate) range: usize,
+    /// The original write of the version, which only an exact removal refuses.
+    pub(crate) writer: bool,
 }
 
 impl TrailScan {
-    pub(super) fn new(version_id: Ulid) -> Self {
+    pub(crate) fn new(version_id: Ulid) -> Self {
         Self {
             version_id,
             after: None,
             trail: Trail::Clean,
             range: 0,
+            writer: false,
         }
     }
 
     /// A retried transaction reads the whole trail again.
     pub(super) fn restart(&mut self) {
+        let writer = self.writer;
         *self = Self::new(self.version_id);
+        self.writer = writer;
     }
 }
 
@@ -130,11 +135,32 @@ impl PutObjectOperation {
         }
         scan.range += usize::from(next.is_none());
         scan.after = next;
-        let (trail, done) = (scan.trail, scan.range >= 2);
-        if trail == Trail::Removed || (done && trail == Trail::Touched && !self.has_head()) {
+        let (trail, done, writer) = (scan.trail, scan.range >= 2, scan.writer);
+        let headless = !writer && done && trail == Trail::Touched && !self.has_head();
+        if trail == Trail::Removed || headless {
             return self.emit_error(PutObjectError::HistoryDeleted);
         }
+        if writer {
+            return self.writer_trail(txn_id);
+        }
         self.write_cleanup_row(txn_id)
+    }
+
+    /// A listed write whose version an import registered and a user then deleted or purged
+    /// must not publish it again, so its unregistered version reads the trail before the head.
+    pub(super) fn writer_trail(&mut self, txn_id: Ulid) -> Effects {
+        let Some(version_id) = self.version_id else {
+            return self.emit_error(PutObjectError::PutObjectFailed);
+        };
+        let scan = self
+            .trail_scan
+            .get_or_insert_with(|| TrailScan::new(version_id));
+        scan.writer = true;
+        if let Some(effects) = self.trail_page(txn_id) {
+            return effects;
+        }
+        let existing = self.existing_pointer.clone();
+        self.write_head(existing.as_ref(), version_id)
     }
 
     fn has_head(&self) -> bool {

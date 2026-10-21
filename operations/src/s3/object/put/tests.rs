@@ -18,8 +18,8 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
-    PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DELETE_TRAIL_KEYSPACE,
+    DHT_KEYSPACE, PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
@@ -1752,6 +1752,82 @@ fn history_keeps_head() {
         op.output,
         Some(Err(PutObjectError::VersionExists))
     ));
+}
+
+#[test]
+fn writer_reads_trail() {
+    use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobAuditRecord};
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let writer = || {
+        let mut op = PutObjectOperation::new(PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            group_id,
+            realm_id,
+            node_id: iroh::SecretKey::generate().public(),
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "some-file.txt".to_string(),
+                content_length: None,
+                body: None,
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(Ulid::generate()),
+        });
+        op.version_id = Some(Ulid::generate());
+        op.txn_id = Some(Ulid::generate());
+        op.state = PutObjectState::ReadHistory;
+        // The version is not registered, so the trail is read before the head moves.
+        let effects = op.history_read(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0].into(),
+            value: None,
+        }));
+        let [Effect::Storage(StorageEffect::Iter { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the trail read, got {effects:?}")
+        };
+        assert_eq!(key_space, DELETE_TRAIL_KEYSPACE);
+        op
+    };
+    let page = |values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>| {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        })
+    };
+    // An import registered the version and a user deleted it: it is not published again.
+    let mut op = writer();
+    let record = BlobAuditRecord {
+        realm_id,
+        group_id,
+        node_id: iroh::SecretKey::generate().public(),
+        user_id: op.config.user_id,
+        kind: BlobAuditKind::DeleteVersion,
+        bucket: "mybucket".to_string(),
+        key: "some-file.txt".to_string(),
+        version_id: op.version_id,
+        occurred_at_ms: 1,
+    };
+    op.trail_read(page(vec![(
+        vec![0].into(),
+        record.to_bytes().unwrap().into(),
+    )]));
+    assert!(matches!(
+        op.output,
+        Some(Err(PutObjectError::HistoryDeleted))
+    ));
+    // A clean trail moves the head after both ranges.
+    let mut op = writer();
+    op.trail_read(page(Vec::new()));
+    let effects = op.trail_read(page(Vec::new()));
+    let [Effect::Storage(StorageEffect::Write { key_space, .. })] = effects.as_slice() else {
+        panic!("expected the head write, got {effects:?}")
+    };
+    assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
 }
 
 #[tokio::test]

@@ -4,12 +4,17 @@
 
 use super::*;
 use crate::s3::object::put::{
-    PlainRecord, intent_deletes, intent_keys, intent_writes, owner_read, owns_path, same_name_path,
-    version_row,
+    PlainRecord, Trail, TrailScan, intent_deletes, intent_keys, intent_writes, owner_read,
+    owns_path, same_name_path, trail_ranges, version_row,
 };
+use aruna_core::effects::IterStart;
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, IMPORT_INTENT_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, DELETE_TRAIL_KEYSPACE, IMPORT_INTENT_KEYSPACE,
 };
+use aruna_core::structs::storage::delete_audit::BlobAuditRecord;
+
+/// Trail entries one read of the finalize transaction returns.
+const TRAIL_PAGE: usize = 500;
 use aruna_core::structs::storage::backend_import::{
     WriteIntent, import_key, intent_key, tagged_path,
 };
@@ -343,11 +348,7 @@ impl CompleteUploadOperation {
         };
         let Some(value) = value else {
             self.registered = false;
-            let (existing, version_id) = (self.existing_pointer.clone(), self.version_id);
-            let Some(version_id) = version_id else {
-                return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
-            };
-            return self.write_head(existing.as_ref(), version_id);
+            return self.writer_trail();
         };
         let stored = BlobVersion::from_bytes(value.as_ref()).ok();
         let hash = stored.as_ref().and_then(|version| version.blob_hash());
@@ -379,6 +380,61 @@ impl CompleteUploadOperation {
             Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
             _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
         }
+    }
+
+    /// An upload whose version an import registered and a user then deleted or purged must not
+    /// publish it again, so its unregistered version reads the trail before the head moves.
+    fn writer_trail(&mut self) -> Effects {
+        let (Some(version_id), Some(record)) = (self.version_id, self.upload_record.as_ref())
+        else {
+            return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
+        };
+        let ranges = trail_ranges(record.group_id, &self.input.bucket, &self.input.key);
+        let scan = self
+            .trail_scan
+            .get_or_insert_with(|| TrailScan::new(version_id));
+        let Some(prefix) = ranges.get(scan.range).cloned() else {
+            let existing = self.existing_pointer.clone();
+            return self.write_head(existing.as_ref(), version_id);
+        };
+        let start = scan.after.clone().map(IterStart::After);
+        self.state = CompleteUploadState::ReadTrail;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: DELETE_TRAIL_KEYSPACE.to_string(),
+            prefix: Some(prefix),
+            start,
+            limit: TRAIL_PAGE,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    pub(super) fn trail_read(&mut self, event: Event) -> Effects {
+        let (values, next) = match event {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => {
+                return self.schedule_error(error.into());
+            }
+            _ => return self.schedule_error(CompleteUploadError::InvalidOperationState),
+        };
+        let (bucket, key) = (&self.input.bucket, &self.input.key);
+        let Some(scan) = self.trail_scan.as_mut() else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        for (_, value) in values {
+            match BlobAuditRecord::from_bytes(&value) {
+                Ok(record) => scan.trail = scan.trail.add(&record, bucket, key, scan.version_id),
+                Err(error) => return self.schedule_error(error.into()),
+            }
+        }
+        scan.range += usize::from(next.is_none());
+        scan.after = next;
+        if scan.trail == Trail::Removed {
+            return self.schedule_error(CompleteUploadError::HistoryDeleted);
+        }
+        self.writer_trail()
     }
 
     /// Reads the rule of a listed plain object in the finalize transaction, so its import
@@ -618,12 +674,45 @@ mod tests {
             }));
             (operation, effects)
         };
-        let (_, effects) = found(None, false);
+        // An unregistered version reads the delete trail before its head moves.
+        let (mut operation, effects) = found(None, false);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
+                if key_space == DELETE_TRAIL_KEYSPACE
+        ));
+        let page = |values| {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after: None,
+            })
+        };
+        operation.step(page(Vec::new()));
+        let effects = operation.step(page(Vec::new()));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Write { key_space, .. })]
                 if key_space == aruna_core::keyspaces::BLOB_HEAD_KEYSPACE
         ));
+        // A user deleted the version an import had registered: it is not published again.
+        let (mut operation, _) = found(None, false);
+        let record = BlobAuditRecord {
+            realm_id: RealmId::from_bytes([3u8; 32]),
+            group_id: Ulid::nil(),
+            node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+            user_id: UserId::default(),
+            kind: aruna_core::structs::storage::delete_audit::BlobAuditKind::DeleteVersion,
+            bucket: "bucket".to_string(),
+            key: "in/object".to_string(),
+            version_id: operation.version_id,
+            occurred_at_ms: 1,
+        };
+        let entry = (Vec::new().into(), record.to_bytes().unwrap().into());
+        operation.step(page(vec![entry]));
+        assert_eq!(
+            operation.cleanup.take_error(),
+            Some(CompleteUploadError::HistoryDeleted)
+        );
         // The same bytes registered by an import: only the upload is cleared, then committed.
         let (mut operation, _) = found(Some([7u8; 32]), false);
         assert_eq!(operation.state, CompleteUploadState::DeleteUploadRecords);
