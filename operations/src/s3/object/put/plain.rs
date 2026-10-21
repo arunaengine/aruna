@@ -333,6 +333,24 @@ impl PutObjectOperation {
         self
     }
 
+    /// Values the version transaction reads with the rule: the import guards, and for a
+    /// listed write the records other rules sharing the folder would keep of the written path.
+    fn fence_guards(&self) -> Vec<(String, Key, Option<Value>)> {
+        let mut guards = self
+            .import_rows
+            .as_ref()
+            .map_or_else(Vec::new, |rows| rows.guards.clone());
+        let plain = self.plain.as_ref().filter(|plain| plain.target.listed);
+        if let (Some(plain), Some(written)) = (plain, self.get_written_location()) {
+            let path = &written.backend_path;
+            guards.extend(plain.target.shared.iter().map(|import_id| {
+                let key = object_key(*import_id, path);
+                (IMPORTED_OBJECT_KEYSPACE.to_string(), key, None)
+            }));
+        }
+        guards
+    }
+
     /// The rule whose existence the version transaction must read before its rows.
     fn rule_fence(&self) -> Option<Key> {
         let import_id = match (&self.import_rows, &self.plain) {
@@ -348,10 +366,7 @@ impl PutObjectOperation {
             && let Some(key) = self.rule_fence()
         {
             self.state = PutObjectState::ReadImportRule;
-            let guards = self
-                .import_rows
-                .as_ref()
-                .map_or(&[][..], |rows| &rows.guards);
+            let guards = self.fence_guards();
             if !guards.is_empty() {
                 let rule = (BACKEND_IMPORT_KEYSPACE.to_string(), key);
                 let reads = guards
@@ -370,7 +385,7 @@ impl PutObjectOperation {
         }
         if self.import_rows.is_some()
             && self.rule_exists == Some(true)
-            && let Some(effects) = self.trail_page(txn_id)
+            && let Some(effects) = self.trail_page(txn_id).or_else(|| self.rule_page(txn_id))
         {
             return Some(effects);
         }
@@ -422,22 +437,25 @@ impl PutObjectOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(PutObjectError::NoTransactionFound);
         };
+        // Only the answer to the read that was sent counts.
+        let guards = self.fence_guards();
         match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) if guards.is_empty() => {
                 self.rule_exists = Some(value.is_some());
                 self.write_cleanup_row(txn_id)
             }
-            Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                let guards = self
-                    .import_rows
-                    .as_ref()
-                    .map_or(&[][..], |rows| &rows.guards);
+            Event::Storage(StorageEvent::BatchReadResult { values }) if !guards.is_empty() => {
                 let Some(((_, rule), seen)) = values.split_first() else {
                     return self.emit_error(PutObjectError::InvalidOperationState);
                 };
                 let expected = guards.iter().map(|(_, _, value)| value);
                 if seen.len() != guards.len() || !seen.iter().map(|(_, v)| v).eq(expected) {
-                    return self.emit_error(PutObjectError::HeadChanged);
+                    // Another rule recorded the written path, so the file there is its own.
+                    let error = match self.import_rows.is_some() {
+                        true => PutObjectError::HeadChanged,
+                        false => PutObjectError::BlobWriteFailed(BlobError::PathTaken),
+                    };
+                    return self.emit_error(error);
                 }
                 self.rule_exists = Some(rule.is_some());
                 self.write_cleanup_row(txn_id)
@@ -731,6 +749,48 @@ mod tests {
             "expected the intent sync, got {effects:?}"
         );
         operation.step(Event::Storage(StorageEvent::SyncAllFinished))
+    }
+
+    #[test]
+    fn keeps_shared_path() {
+        // Another rule of the folder recorded the written path: the version is refused.
+        let mut put = operation(DEFAULT_PATTERN);
+        begin(&mut put);
+        let id = put.version_id.unwrap();
+        let other = Ulid::from_parts(9, 9);
+        if let Some(plain) = put.plain.as_mut() {
+            plain.target.shared = vec![other];
+        }
+        let path = format!("raw/x/one.csv~{id}");
+        put.written_location = Some(written(path.clone(), id));
+        put.output = Some(Ok(written(path.clone(), id)));
+        let effects = put.plain_records(Ulid::nil()).unwrap();
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+            panic!("expected the fence read, got {effects:?}")
+        };
+        assert_eq!(reads[1].1, object_key(other, &path));
+        put.txn_id = Some(Ulid::nil());
+        let rows = vec![
+            (Key::from(Vec::new()), Some(Value::from(vec![1]))),
+            (Key::from(Vec::new()), Some(Value::from(vec![1]))),
+        ];
+        put.import_rule_read(Event::Storage(StorageEvent::BatchReadResult {
+            values: rows,
+        }));
+        let taken = PutObjectError::BlobWriteFailed(BlobError::PathTaken);
+        assert!(matches!(&put.output, Some(Err(error)) if *error == taken));
+
+        // A single read answer does not count for the batch that was sent.
+        let mut early = operation(DEFAULT_PATTERN);
+        begin(&mut early);
+        if let Some(plain) = early.plain.as_mut() {
+            plain.target.shared = vec![other];
+        }
+        early.written_location = Some(written(path, id));
+        early.txn_id = Some(Ulid::nil());
+        early.import_rule_read(read(None));
+        let invalid = PutObjectError::InvalidOperationState;
+        assert!(matches!(&early.output, Some(Err(error)) if *error == invalid));
     }
 
     #[test]

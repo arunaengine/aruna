@@ -124,6 +124,8 @@ pub struct PlainTarget {
     pub same_name: bool,
     /// `path` lies in the folder the rule imports from, so its importer must skip it.
     pub listed: bool,
+    /// Other rules of the group that read `path`; their record of it makes it theirs.
+    pub shared: Vec<Ulid>,
 }
 
 /// Operator-authored all-groups rule from the node's backends file. An unset
@@ -501,6 +503,7 @@ impl RoutingSnapshot {
             same_name: rule.same_name(),
             listed: *backend == BackendRef::Group(rule.backend_id)
                 && path.starts_with(&rule.backend_prefix),
+            shared: self.readers(rule.import_id, backend, path),
         })
     }
 
@@ -525,8 +528,23 @@ impl RoutingSnapshot {
             backend: BackendRef::Group(backend),
             same_name: rule.same_name() && !path.ends_with('/'),
             listed: backend == rule.backend_id && path.starts_with(&rule.backend_prefix),
+            shared: self.readers(rule.import_id, &BackendRef::Group(backend), &path),
             path,
         })
+    }
+
+    /// The other rules that import `path` from `backend`.
+    pub fn readers(&self, import_id: Ulid, backend: &BackendRef, path: &str) -> Vec<Ulid> {
+        let reads = |rule: &&BackendImport| {
+            rule.import_id != import_id
+                && *backend == BackendRef::Group(rule.backend_id)
+                && path.starts_with(&rule.backend_prefix)
+        };
+        self.imports
+            .iter()
+            .filter(reads)
+            .map(|rule| rule.import_id)
+            .collect()
     }
 }
 

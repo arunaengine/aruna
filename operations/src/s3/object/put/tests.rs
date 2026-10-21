@@ -88,7 +88,11 @@ fn test_location(created_by: aruna_core::UserId) -> BackendLocation {
     }
 }
 
-fn put_config(realm_id: RealmId, group_id: Ulid, node_id: aruna_core::NodeId) -> PutObjectConfig {
+pub(super) fn put_config(
+    realm_id: RealmId,
+    group_id: Ulid,
+    node_id: aruna_core::NodeId,
+) -> PutObjectConfig {
     PutObjectConfig {
         user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
         group_id,
@@ -2569,6 +2573,7 @@ async fn plain_owns_copy() {
             path: written.backend_path.clone(),
             same_name: false,
             listed: true,
+            shared: Vec::new(),
         };
         op.version_id = Some(Ulid::generate());
         op.start_plain(target, ResolvedBackend::new(backend.clone(), None));

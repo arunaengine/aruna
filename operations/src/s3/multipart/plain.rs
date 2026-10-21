@@ -9,14 +9,15 @@ use crate::s3::object::put::{
 };
 use aruna_core::effects::IterStart;
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, DELETE_TRAIL_KEYSPACE, IMPORT_INTENT_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, DELETE_TRAIL_KEYSPACE,
+    IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
 };
 use aruna_core::structs::storage::delete_audit::BlobAuditRecord;
 
 /// Trail entries one read of the finalize transaction returns.
 const TRAIL_PAGE: usize = 500;
 use aruna_core::structs::storage::backend_import::{
-    WriteIntent, import_key, intent_key, tagged_path,
+    WriteIntent, import_key, intent_key, object_key, tagged_path,
 };
 use aruna_core::structs::storage::multipart::BackendUpload;
 
@@ -442,19 +443,46 @@ impl CompleteUploadOperation {
     pub(super) fn plain_fence(&mut self) -> Option<Effects> {
         let target = self.plain.as_ref().filter(|target| target.listed)?;
         let group_id = self.upload_record.as_ref()?.group_id;
-        let key = import_key(group_id, target.import_id);
+        let rule = (
+            BACKEND_IMPORT_KEYSPACE.to_string(),
+            import_key(group_id, target.import_id),
+        );
         self.state = CompleteUploadState::ReadImportRule;
-        Some(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
-            key,
+        Some(smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: std::iter::once(rule).chain(self.shared_rows()).collect(),
             txn_id: self.txn_id,
         })])
     }
 
+    /// The records other rules sharing the folder would keep of the composed path.
+    fn shared_rows(&self) -> Vec<(String, Key)> {
+        let (Some(target), Some(written)) = (self.plain.as_ref(), self.composed_location.as_ref())
+        else {
+            return Vec::new();
+        };
+        let path = &written.backend_path;
+        let rows = target
+            .shared
+            .iter()
+            .map(|import_id| object_key(*import_id, path));
+        rows.map(|key| (IMPORTED_OBJECT_KEYSPACE.to_string(), key))
+            .collect()
+    }
+
+    /// The rule must exist, and no other rule sharing the folder may hold the path.
     pub(super) fn import_rule_read(&mut self, event: Event) -> Effects {
         match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                self.write_cleanup_records(value.is_some())
+            Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                let Some(((_, rule), others)) = values.split_first() else {
+                    return self.schedule_error(CompleteUploadError::InvalidOperationState);
+                };
+                if others.len() != self.shared_rows().len() {
+                    return self.schedule_error(CompleteUploadError::InvalidOperationState);
+                }
+                if others.iter().any(|(_, row)| row.is_some()) {
+                    return self.schedule_error(BlobError::PathTaken.into());
+                }
+                self.write_cleanup_records(rule.is_some())
             }
             Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
             _ => self.schedule_error(CompleteUploadError::InvalidOperationState),
@@ -623,18 +651,55 @@ mod tests {
         let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
             entries: Vec::new(),
         }));
-        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
-            panic!("expected the rule read, got {effects:?}")
-        };
-        assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: exists.then(|| vec![0u8].into()),
-        }));
+        let effects = fence_read(operation, effects, exists, None);
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected the records, got {effects:?}")
         };
         writes.clone()
+    }
+
+    /// Answers the read of the rule and of the rows other rules keep of the path.
+    fn fence_read(
+        operation: &mut CompleteUploadOperation,
+        effects: Effects,
+        exists: bool,
+        other: Option<Value>,
+    ) -> Effects {
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+            panic!("expected the rule read, got {effects:?}")
+        };
+        assert_eq!(reads[0].0, BACKEND_IMPORT_KEYSPACE);
+        let mut values = vec![(Key::from(Vec::new()), exists.then(|| vec![0u8].into()))];
+        values.extend(
+            reads[1..]
+                .iter()
+                .map(|(_, key)| (key.clone(), other.clone())),
+        );
+        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+    }
+
+    #[test]
+    fn keeps_shared_path() {
+        // Another rule of the folder recorded the path, so the upload does not take it.
+        let (mut operation, _) = recorded(true, None);
+        let other = Ulid::from_parts(9, 9);
+        if let Some(target) = operation.plain.as_mut() {
+            target.shared = vec![other];
+        }
+        operation.state = CompleteUploadState::DeleteUploadRecords;
+        let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+            panic!("expected the fence read, got {effects:?}")
+        };
+        assert_eq!(reads[1].1, object_key(other, "raw/object"));
+        fence_read(&mut operation, effects, true, Some(vec![1].into()));
+        let error = operation.cleanup.take_error();
+        assert_eq!(
+            error,
+            Some(CompleteUploadError::BlobError(BlobError::PathTaken))
+        );
     }
 
     fn count(writes: &[(String, Key, Value)], keyspace: &str) -> usize {

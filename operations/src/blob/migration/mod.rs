@@ -803,19 +803,27 @@ impl MigrateVersionOperation {
         let Some(routing) = self.fresh.as_mut() else {
             return self.fail(MigrateVersionError::NotFinished);
         };
+        // Rules of other buckets count too: they may read the same linked folder.
         for (_, value) in values {
             match BackendImport::from_bytes(value.as_ref()) {
-                Ok(rule) if rule.bucket == self.version_key.bucket => routing.imports.push(rule),
-                Ok(_) => {}
+                Ok(rule) => routing.imports.push(rule),
                 Err(error) => return self.fail(error.into()),
             }
         }
         if next_start_after.is_some() {
             return self.scan_rules(next_start_after);
         }
+        // Which other rules read the path is checked against their records at publication.
+        let unshared = |plain: Option<PlainTarget>| {
+            plain.map(|plain| PlainTarget {
+                shared: Vec::new(),
+                ..plain
+            })
+        };
         match place(routing, &self.version_key) {
             Ok((resolved, plain))
-                if Some(&resolved) == self.resolved.as_ref() && plain == self.plain =>
+                if Some(&resolved) == self.resolved.as_ref()
+                    && unshared(plain.clone()) == unshared(self.plain.clone()) =>
             {
                 self.fence_target()
             }
@@ -932,20 +940,52 @@ impl MigrateVersionOperation {
     }
 
     fn read_target(&mut self) -> Effects {
-        match self.target_key() {
-            Ok(key) => {
-                self.state = MigrateState::ReadTarget;
-                smallvec![blob_location_read(&key, self.txn_id)]
-            }
-            Err(error) => self.fail(error),
+        let key = match self.target_key() {
+            Ok(key) => key,
+            Err(error) => return self.fail(error),
+        };
+        self.state = MigrateState::ReadTarget;
+        let others = self.shared_rows();
+        if others.is_empty() {
+            return smallvec![blob_location_read(&key, self.txn_id)];
         }
+        let target = (BLOB_LOCATIONS_KEYSPACE.to_string(), key.to_bytes().into());
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: std::iter::once(target).chain(others).collect(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// The records other rules that read the linked file's path, as this transaction reads
+    /// the rules, would keep of it; any of them makes the file theirs.
+    fn shared_rows(&self) -> Vec<(String, Key)> {
+        let (Some(target), Some(new), Some(fresh)) = (&self.plain, &self.new, &self.fresh) else {
+            return Vec::new();
+        };
+        let path = &new.backend_path;
+        let readers = fresh
+            .readers(target.import_id, &target.backend, path)
+            .into_iter();
+        let rows = readers.map(|import_id| object_key(import_id, path));
+        rows.map(|key| (IMPORTED_OBJECT_KEYSPACE.to_string(), key))
+            .collect()
     }
 
     /// An existing copy in the target class is adopted; otherwise the new copy
     /// becomes the row owner. The old copy goes to the reclaim queue either way.
     fn handle_target(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
+        let shared = !self.shared_rows().is_empty();
+        let value = match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) if !shared => value,
+            Event::Storage(StorageEvent::BatchReadResult { values }) if shared => {
+                let mut values = values.into_iter().map(|(_, value)| value);
+                let value = values.next().flatten();
+                if values.any(|row| row.is_some()) {
+                    return self.fail(BlobError::PathTaken.into());
+                }
+                value
+            }
+            other => return self.unexpected(other),
         };
         match self.rows(value.map(|value| value.to_vec())) {
             Ok(writes) => {
@@ -2158,7 +2198,7 @@ mod tests {
         fn rules_read(
             operation: &mut MigrateVersionOperation,
             default: Option<RoutingTarget>,
-            rule: Option<BackendImport>,
+            rule: impl IntoIterator<Item = BackendImport>,
         ) -> Effects {
             let group = GroupStorageRouting {
                 group_id: GROUP,
@@ -2541,6 +2581,36 @@ mod tests {
             assert!(refused.written_intent.is_empty());
             let error = refused.finalize().unwrap_err();
             assert_eq!(error, MigrateVersionError::Blob(BlobError::PathTaken));
+        }
+
+        #[test]
+        fn keeps_shared_target() {
+            // Another rule of the folder recorded the new file, so the move does not take it.
+            let other = BackendImport {
+                import_id: Ulid::from_parts(9, 9),
+                key_prefix: "other/".to_string(),
+                ..rule()
+            };
+            let mut moved = operation("in/x/one.csv", vec![rule(), other.clone()]);
+            let version = raw_version();
+            copied(&mut moved, &version, false);
+            let default = Some(RoutingTarget::Backend(storage()));
+            rules_read(&mut moved, default, [rule(), other.clone()]);
+            moved.step(storage_record(false));
+            let effects = moved.step(read_result(Some(version.to_bytes().unwrap())));
+            let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
+            else {
+                panic!("expected the target and shared reads, got {effects:?}")
+            };
+            let path = &moved.new.as_ref().unwrap().backend_path;
+            assert_eq!(reads[1].1, object_key(other.import_id, path));
+            let values = vec![
+                (Key::from(Vec::new()), None),
+                (Key::from(Vec::new()), Some(Value::from(vec![1]))),
+            ];
+            moved.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+            let taken = MigrateVersionError::Blob(BlobError::PathTaken);
+            assert_eq!(moved.output, Some(Err(taken)));
         }
 
         #[test]
