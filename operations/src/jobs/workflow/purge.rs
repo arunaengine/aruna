@@ -193,8 +193,6 @@ fn purge_audit_record(spec: &StoragePurgeSpec, occurred_at_ms: u64) -> BlobAudit
     }
 }
 
-/// Records the completed purge once. The job id is the record id, so a
-/// re-driven job overwrites its own row instead of adding a second one.
 /// The audit row of a purge and its trail row. A purge that deleted its bucket leaves nothing
 /// to protect, and a bucket created again under the name must not meet its trail.
 fn audit_rows(
@@ -212,6 +210,8 @@ fn audit_rows(
     writes
 }
 
+/// Records the completed purge once. The job id is the record id, so a
+/// re-driven job overwrites its own row instead of adding a second one.
 async fn write_purge_audit(
     ctx: &JobContext,
     spec: &StoragePurgeSpec,
