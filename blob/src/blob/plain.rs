@@ -176,7 +176,16 @@ impl BlobHandler {
                 .copy_range(&path, &upload_id, (number, *range), from)
                 .await
             {
-                Ok(etag) => parts.push((number, etag)),
+                Ok(etag) => {
+                    parts.push((number, etag));
+                    // Each copied part renews the record, so a copy that progresses is never
+                    // taken for a leftover.
+                    let renewed = self.record_upload(plain.ulid, Some((&location, &upload_id)));
+                    if let Err(error) = renewed.await {
+                        let _ = target.abort(&path, &upload_id).await;
+                        return Err(error);
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(%error, "Provider copy refused; the bytes are streamed");
                     return self.settle(target, (&path, &upload_id), plain.ulid).await;

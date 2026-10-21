@@ -350,8 +350,8 @@ pub enum BlobCleanupWork {
         version_id: Ulid,
         version: String,
     },
-    /// The provider upload of a linked file copy; one that has not settled a grace after
-    /// `since_ms` is aborted, exactly this upload of exactly this attempt.
+    /// The provider upload of a linked file copy; `since_ms` is its last copied part, and one
+    /// without a part for a grace is aborted, exactly this upload of exactly this attempt.
     SettleUpload {
         attempt: Ulid,
         location: BackendLocation,

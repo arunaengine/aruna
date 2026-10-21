@@ -96,8 +96,9 @@ impl PendingCleanup {
     }
 }
 
-/// How long a recorded copy upload may run before the cleanup takes it for a leftover.
-const SETTLE_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
+/// How long a recorded copy upload may go without a copied part before the cleanup takes it
+/// for a leftover; each part renews it.
+const SETTLE_GRACE_MS: u64 = 60 * 60 * 1000;
 
 /// Drops a page of `key_space` rows under `prefix`; `true` once none is left.
 async fn drop_rows(
