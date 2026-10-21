@@ -1368,10 +1368,6 @@ pub async fn cancel_owned_job(
             if matches!(&record.payload, JobPayload::Execution(_)) {
                 finalize_followups(context, job_id).await;
             }
-            // A purge cancelled before it ran again still releases the files it planned.
-            if matches!(&record.payload, JobPayload::StoragePurgeFiles(_)) {
-                crate::blob::purge::hand_over(context, job_id.as_ulid()).await?;
-            }
             CancelJobOutcome::Requested(record)
         }
         CancelRequestOutcome::Flagged(record) => {

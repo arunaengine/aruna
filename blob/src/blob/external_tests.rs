@@ -426,15 +426,29 @@ async fn records_copy_uploads() {
     let handler = context.blob_handle.handler.clone();
     let attempt = ulid::Ulid::generate();
     assert_eq!(handler.copy_upload(attempt).await.unwrap(), None);
+    let resolved = ResolvedBackend::new(BackendRef::Node("default".to_string()), None);
+    let BlobEvent::WriteFinished { location } = handler
+        .write_plain(
+            resolved,
+            aruna_core::structs::storage::backend_import::PlainPath {
+                path: "raw/a.txt~7".to_string(),
+                ulid: attempt,
+                if_not_exists: true,
+                exact: true,
+            },
+            test_user_id(),
+            super::stream_from_bytes(b"x"),
+        )
+        .await
+    else {
+        panic!("plain write failed")
+    };
     handler
-        .record_upload(attempt, Some(("raw/a.txt~7", "upload-1")))
+        .record_upload(attempt, Some((&location, "upload-1")))
         .await
         .unwrap();
     let recorded = handler.copy_upload(attempt).await.unwrap();
-    assert_eq!(
-        recorded,
-        Some(("raw/a.txt~7".to_string(), "upload-1".to_string()))
-    );
+    assert_eq!(recorded, Some((location, "upload-1".to_string())));
     assert_eq!(
         handler.copy_upload(ulid::Ulid::generate()).await.unwrap(),
         None

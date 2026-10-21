@@ -96,6 +96,25 @@ impl PendingCleanup {
     }
 }
 
+/// How long a recorded copy upload may run before the cleanup takes it for a leftover.
+const SETTLE_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Whether the purge job `job_id` has ended, or is gone; `None` while unreadable.
+async fn purge_ended(context: &DriverContext, job_id: Ulid) -> Option<bool> {
+    let job_id = aruna_core::structs::execution::job::JobId::try_from_bytes(job_id.to_bytes());
+    let Ok(job_id) = job_id else {
+        return Some(true);
+    };
+    let record = crate::jobs::store::read_job_record(&context.storage_handle, job_id, None);
+    match record.await {
+        Ok(record) => Some(record.is_none_or(|record| record.state.is_terminal())),
+        Err(error) => {
+            warn!(%error, "A purge job could not be read");
+            None
+        }
+    }
+}
+
 fn cleanup_row_key(work: &BlobCleanupWork) -> Key {
     match work {
         BlobCleanupWork::ReconcileWrite { location, .. } => {
@@ -106,7 +125,10 @@ fn cleanup_row_key(work: &BlobCleanupWork) -> Key {
         | BlobCleanupWork::ReconcileReservation { .. }
         | BlobCleanupWork::ReleaseRenamed { .. }
         | BlobCleanupWork::DropTrail { .. }
-        | BlobCleanupWork::DropClaims { .. } => Ulid::generate().to_bytes().to_vec().into(),
+        | BlobCleanupWork::DropClaims { .. }
+        | BlobCleanupWork::ReleasePlanned { .. }
+        | BlobCleanupWork::SettleUpload { .. }
+        | BlobCleanupWork::SettleMove { .. } => Ulid::generate().to_bytes().to_vec().into(),
     }
 }
 
@@ -410,6 +432,49 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
         } => release_renamed(context, location, import_id, version_id, version)
             .await
             .into(),
+        BlobCleanupWork::ReleasePlanned {
+            job_id,
+            location,
+            import_id,
+            version_id,
+            version,
+        } => match purge_ended(context, job_id).await {
+            Some(true) => release_renamed(context, location, import_id, version_id, version)
+                .await
+                .into(),
+            Some(false) => RowOutcome::Kept,
+            None => RowOutcome::Failed,
+        },
+        BlobCleanupWork::SettleUpload {
+            attempt, since_ms, ..
+        } => {
+            let now = crate::effect_adapters::routing::now_ms();
+            // A copy may still be running; only an upload past the grace is its leftover.
+            if now < since_ms.saturating_add(SETTLE_GRACE_MS) {
+                return RowOutcome::Kept;
+            }
+            let Some(blob_handle) = context.blob_handle.as_ref() else {
+                return RowOutcome::Failed;
+            };
+            let effect = BlobEffect::SettleCopy { attempt };
+            match blob_handle.send_blob_effect(effect).await {
+                Event::Blob(BlobEvent::UploadAborted) => RowOutcome::Done,
+                event => {
+                    warn!(?event, "A copy upload could not be settled");
+                    RowOutcome::Failed
+                }
+            }
+        }
+        BlobCleanupWork::SettleMove { version, intents } => {
+            match crate::blob::migration::settle_move(context, &version, &intents).await {
+                Ok(true) => RowOutcome::Done,
+                Ok(false) => RowOutcome::Kept,
+                Err(error) => {
+                    warn!(%error, "A rename's move could not be settled");
+                    RowOutcome::Failed
+                }
+            }
+        }
         BlobCleanupWork::DropClaims { import_id } => {
             match crate::blob::release::drop_claims(context, import_id).await {
                 Some(true) => RowOutcome::Done,
@@ -1022,6 +1087,30 @@ mod tests {
             assert_eq!(outcome.failed, 0);
             assert_eq!(remaining_rows(&storage).await, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn waits_before_settling() {
+        // A recorded copy upload is left alone during its grace, so a copy that still runs
+        // keeps it; one past the grace is aborted through the blob storage.
+        let (_dir, _storage, context) = setup_context();
+        let BlobCleanupWork::DeleteBlob { location } =
+            BlobCleanupWork::from_bytes(&delete_work()).unwrap()
+        else {
+            panic!("expected a delete row")
+        };
+        let settle = |since_ms| BlobCleanupWork::SettleUpload {
+            attempt: Ulid::from_parts(4, 4),
+            location: location.clone(),
+            upload_id: "upload".to_string(),
+            since_ms,
+        };
+        let now = crate::effect_adapters::routing::now_ms();
+        let fresh = super::run_cleanup_work(&context, settle(now)).await;
+        assert!(matches!(fresh, super::RowOutcome::Kept));
+        // This context has no blob storage, so the abort cannot run and the row stays.
+        let stale = super::run_cleanup_work(&context, settle(0)).await;
+        assert!(matches!(stale, super::RowOutcome::Failed));
     }
 
     #[tokio::test]

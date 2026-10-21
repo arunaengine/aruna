@@ -125,6 +125,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::StatPlain { .. } => (EffectClass::Control, "stat_plain"),
         BlobEffect::DeletePlain { .. } => (EffectClass::Local, "delete_plain"),
         BlobEffect::StatCopy { .. } => (EffectClass::Control, "stat_copy"),
+        BlobEffect::SettleCopy { .. } => (EffectClass::Control, "settle_copy"),
         BlobEffect::EnsureBucket { .. } => (EffectClass::Control, "ensure_bucket"),
         BlobEffect::HeadBucket { .. } => (EffectClass::Control, "head_bucket"),
         BlobEffect::DeleteEmptyBucket { .. } => (EffectClass::Control, "delete_empty_bucket"),
@@ -157,6 +158,7 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::ReplicateLeased { .. }
             | BlobEffect::WritePlain { .. }
             | BlobEffect::CopyPlain { .. }
+            | BlobEffect::SettleCopy { .. }
             | BlobEffect::DeletePlain { .. }
     )
 }
@@ -930,6 +932,7 @@ impl BlobHandler {
                 source,
             } => Box::pin(self.copy_plain(resolved, plain, *source)).await,
             BlobEffect::StatCopy { location } => Box::pin(self.stat_copy(location)).await,
+            BlobEffect::SettleCopy { attempt } => Box::pin(self.settle_copy(attempt)).await,
             BlobEffect::StatPlain { backend, path } => {
                 Box::pin(self.stat_plain(backend, path)).await
             }

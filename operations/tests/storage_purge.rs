@@ -935,7 +935,7 @@ async fn releases(storage: &StorageHandle) -> Vec<BackendLocation> {
         .into_iter()
         .filter_map(
             |(_, value)| match BlobCleanupWork::from_bytes(&value).unwrap() {
-                BlobCleanupWork::ReleaseRenamed { location, .. } => Some(location),
+                BlobCleanupWork::ReleasePlanned { location, .. } => Some(location),
                 _ => None,
             },
         )
@@ -977,7 +977,8 @@ async fn purge_releases_files() {
             .await
             .is_none()
     );
-    // The file goes through the release, which deletes only its exact backend version.
+    // The file waits in the cleanup queue for its release, which deletes only its exact
+    // backend version once the purge has ended.
     assert_eq!(releases(storage).await, [location]);
 }
 
@@ -992,7 +993,7 @@ async fn aborted_purge_releases() {
         spec.clone(),
     )
     .await;
-    // A page planned before the abort still hands its files over; nothing stays planned.
+    // A page planned before the abort stays in the cleanup queue, released once it ended.
     let versions: Vec<_> = list_linked(&context).await;
     let found = aruna_operations::blob::purge::storage_files(
         &context.driver,

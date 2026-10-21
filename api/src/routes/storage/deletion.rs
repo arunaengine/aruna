@@ -865,13 +865,10 @@ pub async fn control_purge(
             let outcome = cancel_owned_job(&context, &runtime, record.created_by, job_id)
                 .await
                 .map_err(failed)?;
-            // A purge cancelled before it ran again still releases what it planned.
+            // Its planned files wait in the cleanup queue, which releases them once it ended.
             if let CancelJobOutcome::AlreadyTerminal(_) | CancelJobOutcome::Requested(_) = outcome
                 && purge_ended(&state, job_id).await?
             {
-                aruna_operations::blob::purge::hand_over(&context, id)
-                    .await
-                    .map_err(failed)?;
                 aruna_operations::blob::purge::set_paused(&context, id, false)
                     .await
                     .map_err(failed)?;

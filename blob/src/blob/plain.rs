@@ -10,10 +10,12 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle as _;
-use aruna_core::keyspaces::{BACKEND_VERSION_KEYSPACE, COPY_UPLOAD_KEYSPACE};
+use aruna_core::keyspaces::{BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::storage::backend_import::{PlainPath, tagged_path, version_key};
-use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, ResolvedBackend};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobCleanupWork, ResolvedBackend,
+};
 use aruna_core::structs::storage::format::{Compression, StoredFormat, StoredLayout};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -152,16 +154,13 @@ impl BlobHandler {
         let target = self.native_upload(&location)?;
         let (path, source_path) = (self.object_path(&location)?, self.object_path(source)?);
         // The upload an interrupted try of this copy recorded goes first, and only that one.
-        if let Some((left, upload_id)) = self.copy_upload(plain.ulid).await? {
-            target.abort(&left, &upload_id).await?;
-            self.record_upload(plain.ulid, None).await?;
-        }
+        self.settle_upload(plain.ulid).await?;
         let size = source.blob_size;
         let ranges = copy_ranges(size);
         let upload_id = target.create(&path).await?;
         // The upload is on disk before any part moves, so a crash leaves it reconcilable.
         if let Err(error) = self
-            .record_upload(plain.ulid, Some((&path, &upload_id)))
+            .record_upload(plain.ulid, Some((&location, &upload_id)))
             .await
         {
             let _ = target.abort(&path, &upload_id).await;
@@ -242,39 +241,79 @@ impl BlobHandler {
         Ok(None)
     }
 
-    /// The provider upload a copy attempt recorded: its path and upload id.
-    pub(super) async fn copy_upload(
-        &self,
-        attempt: ulid::Ulid,
-    ) -> Result<Option<(String, String)>, BlobError> {
-        let read = StorageEffect::Read {
-            key_space: COPY_UPLOAD_KEYSPACE.to_string(),
-            key: attempt.to_bytes().to_vec().into(),
-            txn_id: None,
+    /// Aborts the provider upload copy `attempt` recorded, if any, and forgets it.
+    pub(super) async fn settle_upload(&self, attempt: ulid::Ulid) -> Result<(), BlobError> {
+        let Some((location, upload_id)) = self.copy_upload(attempt).await? else {
+            return Ok(());
         };
-        match self.storage.send_effect(Effect::Storage(read)).await {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-                .map(|value| postcard::from_bytes(&value))
-                .transpose()
-                .map_err(|error| BlobError::ReadError(error.to_string())),
-            other => Err(BlobError::ReadError(format!(
-                "failed to read the copy upload: {other:?}"
-            ))),
+        let native = self.native_upload(&location)?;
+        native
+            .abort(&self.object_path(&location)?, &upload_id)
+            .await?;
+        self.record_upload(attempt, None).await
+    }
+
+    /// Answers `SettleCopy`.
+    pub(super) async fn settle_copy(&self, attempt: ulid::Ulid) -> BlobEvent {
+        match self.settle_upload(attempt).await {
+            Ok(()) => BlobEvent::UploadAborted,
+            Err(error) => BlobEvent::Error(error),
         }
     }
 
-    /// Records a copy attempt's provider upload durably, or forgets it with `None`.
+    /// The provider upload a copy attempt recorded: its target and upload id.
+    pub(super) async fn copy_upload(
+        &self,
+        attempt: ulid::Ulid,
+    ) -> Result<Option<(BackendLocation, String)>, BlobError> {
+        let read = StorageEffect::Read {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: attempt.to_bytes().to_vec().into(),
+            txn_id: None,
+        };
+        let value = match self.storage.send_effect(Effect::Storage(read)).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            other => {
+                return Err(BlobError::ReadError(format!(
+                    "failed to read the copy upload: {other:?}"
+                )));
+            }
+        };
+        let work = value
+            .as_deref()
+            .map(BlobCleanupWork::from_bytes)
+            .transpose();
+        match work.map_err(BlobError::ConversionError)? {
+            Some(BlobCleanupWork::SettleUpload {
+                location,
+                upload_id,
+                ..
+            }) => Ok(Some((location, upload_id))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Records a copy attempt's provider upload durably as cleanup work, which aborts it if
+    /// the copy never settles, or forgets it with `None`.
     pub(super) async fn record_upload(
         &self,
         attempt: ulid::Ulid,
-        upload: Option<(&str, &str)>,
+        upload: Option<(&BackendLocation, &str)>,
     ) -> Result<(), BlobError> {
         let key = attempt.to_bytes().to_vec().into();
-        let space = COPY_UPLOAD_KEYSPACE.to_string();
+        let space = BLOB_CLEANUP_KEYSPACE.to_string();
         let effect = match upload {
-            Some(upload) => {
-                let value = postcard::to_allocvec(&upload)
-                    .map_err(|error| BlobError::WriteError(error.to_string()))?;
+            Some((location, upload_id)) => {
+                let since_ms = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as u64);
+                let work = BlobCleanupWork::SettleUpload {
+                    attempt,
+                    location: location.clone(),
+                    upload_id: upload_id.to_string(),
+                    since_ms,
+                };
+                let value = work.to_bytes().map_err(BlobError::ConversionError)?;
                 StorageEffect::Write {
                     key_space: space,
                     key,

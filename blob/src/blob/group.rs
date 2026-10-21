@@ -168,6 +168,7 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
             push(&mut ids, &source.backend);
         }
         BlobEffect::StatPlain { backend, .. } => push(&mut ids, backend),
+        BlobEffect::SettleCopy { .. } => {}
         BlobEffect::StatCopy { location } | BlobEffect::DeletePlain { location, .. } => {
             push(&mut ids, &location.backend)
         }

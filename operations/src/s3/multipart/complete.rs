@@ -1918,7 +1918,10 @@ impl CompleteUploadOperation {
                 | BlobCleanupWork::RegisterDht { .. }
                 | BlobCleanupWork::ReleaseRenamed { .. }
                 | BlobCleanupWork::DropTrail { .. }
-                | BlobCleanupWork::DropClaims { .. } => Ulid::generate().to_bytes().to_vec().into(),
+                | BlobCleanupWork::DropClaims { .. }
+                | BlobCleanupWork::ReleasePlanned { .. }
+                | BlobCleanupWork::SettleUpload { .. }
+                | BlobCleanupWork::SettleMove { .. } => Ulid::generate().to_bytes().to_vec().into(),
                 BlobCleanupWork::ReconcileReservation { .. } => {
                     Ulid::generate().to_bytes().to_vec().into()
                 }

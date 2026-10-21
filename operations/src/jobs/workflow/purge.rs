@@ -51,17 +51,12 @@ pub async fn run_storage_purge(
     {
         return JobRunOutcome::Failed(fence_error(error));
     }
+    // The planned files wait in the cleanup queue until the job has ended.
     let outcome = run_fenced_purge(ctx, spec, files).await;
-    // The files of the versions gone so far go once the run ends, also when it is aborted or
-    // fails; an interrupted run keeps its plans for the next one.
     if !matches!(outcome, Err(PurgeRunError::Interrupted)) {
-        let job_id = ctx.job_id.as_ulid();
-        let released = crate::blob::purge::hand_over(&ctx.driver, job_id).await;
-        let unpaused = crate::blob::purge::set_paused(&ctx.driver, job_id, false).await;
-        if let Err(error) = released.and(unpaused) {
-            return JobRunOutcome::Failed(JobError::retryable(format!(
-                "purge file release failed: {error}"
-            )));
+        let unpaused = crate::blob::purge::set_paused(&ctx.driver, ctx.job_id.as_ulid(), false);
+        if let Err(error) = unpaused.await {
+            tracing::warn!(%error, "A purge's pause mark could not be removed");
         }
     }
     match outcome {

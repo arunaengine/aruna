@@ -341,6 +341,29 @@ pub enum BlobCleanupWork {
     DropClaims {
         import_id: Ulid,
     },
+    /// A linked file a purge planned to release; it waits until the purge job has ended,
+    /// whichever way, then goes like a renamed file.
+    ReleasePlanned {
+        job_id: Ulid,
+        location: BackendLocation,
+        import_id: Ulid,
+        version_id: Ulid,
+        version: String,
+    },
+    /// The provider upload of a linked file copy; one that has not settled a grace after
+    /// `since_ms` is aborted, exactly this upload of exactly this attempt.
+    SettleUpload {
+        attempt: Ulid,
+        location: BackendLocation,
+        upload_id: String,
+        since_ms: u64,
+    },
+    /// A version an aborted rename left with move intents; it runs once more until none of
+    /// `intents` stays, and a version that is gone only loses its intents.
+    SettleMove {
+        version: VersionKey,
+        intents: Vec<Vec<u8>>,
+    },
 }
 
 /// The record a write's commit would have made the owner of its bytes.
@@ -387,8 +410,13 @@ impl BlobCleanupWork {
             Self::DeleteBlob { location }
             | Self::ReconcileWrite { location, .. }
             | Self::ReconcileReservation { location }
-            | Self::ReleaseRenamed { location, .. } => Some(location),
-            Self::RegisterDht { .. } | Self::DropTrail { .. } | Self::DropClaims { .. } => None,
+            | Self::ReleaseRenamed { location, .. }
+            | Self::ReleasePlanned { location, .. }
+            | Self::SettleUpload { location, .. } => Some(location),
+            Self::RegisterDht { .. }
+            | Self::DropTrail { .. }
+            | Self::DropClaims { .. }
+            | Self::SettleMove { .. } => None,
         }
     }
 }

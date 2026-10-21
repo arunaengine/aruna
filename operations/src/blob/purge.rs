@@ -3,11 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::cleanup::schedule_cleanup_effect;
 use crate::blob::records::iter_hash_page;
 use crate::blob::unify::rules_on;
 use crate::driver::DriverContext;
-use crate::jobs::store::iter_prefix_page;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -25,7 +23,6 @@ use aruna_core::types::{GroupId, Key, Value};
 use std::collections::HashMap;
 use ulid::Ulid;
 
-const PLAN_PAGE: usize = 256;
 const ALIAS_PAGE: usize = 256;
 
 /// One linked-storage file of a purged version.
@@ -43,10 +40,12 @@ pub struct StorageFile {
 }
 
 impl StorageFile {
-    /// The release of this file, which deletes it only once nothing reads it.
-    fn work(&self) -> Option<BlobCleanupWork> {
+    /// The release of this file once purge `job_id` ended, which deletes it only once nothing
+    /// reads it.
+    fn work(&self, job_id: Ulid) -> Option<BlobCleanupWork> {
         let (import_id, version_id) = self.owner.unwrap_or((Ulid::nil(), self.version_id));
-        Some(BlobCleanupWork::ReleaseRenamed {
+        Some(BlobCleanupWork::ReleasePlanned {
+            job_id,
             location: self.location.clone(),
             import_id,
             version_id,
@@ -305,8 +304,9 @@ fn pause_key(job_id: Ulid) -> Key {
     [&job_id.to_bytes()[..], b"p"].concat().into()
 }
 
-/// Plans the release of `files` before their versions go, so a resumed or aborted purge
-/// still releases them; a file without a backend version is not planned.
+/// Plans the release of `files` in the cleanup queue before their versions go; the queue
+/// releases them once the purge has ended, whichever way. A file without a backend version
+/// is not planned.
 pub async fn plan_files(
     context: &DriverContext,
     job_id: Ulid,
@@ -314,12 +314,12 @@ pub async fn plan_files(
 ) -> Result<(), String> {
     let mut writes = Vec::new();
     for file in files {
-        let Some(work) = file.work() else {
+        let Some(work) = file.work(job_id) else {
             continue;
         };
         let value = work.to_bytes().map_err(|error| error.to_string())?;
         let key = plan_key(job_id, file.location.ulid);
-        writes.push((PURGE_FILES_KEYSPACE.to_string(), key, value.into()));
+        writes.push((BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into()));
     }
     if writes.is_empty() {
         return Ok(());
@@ -331,91 +331,6 @@ pub async fn plan_files(
     match context.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         other => Err(format!("could not plan the file releases: {other:?}")),
-    }
-}
-
-/// Moves every planned release of the purge to the cleanup queue, a page per transaction,
-/// and wakes the cleanup; answers how many files it handed over.
-pub async fn hand_over(context: &DriverContext, job_id: Ulid) -> Result<u64, String> {
-    let prefix: Key = [&job_id.to_bytes()[..], b"f"].concat().into();
-    let storage = &context.storage_handle;
-    let mut handed = 0u64;
-    loop {
-        let page = iter_prefix_page(
-            storage,
-            PURGE_FILES_KEYSPACE,
-            Some(prefix.clone()),
-            None,
-            PLAN_PAGE,
-            None,
-        );
-        let (rows, _) = page.await?;
-        if rows.is_empty() {
-            break;
-        }
-        let deletes = rows
-            .iter()
-            .map(|(key, _)| (PURGE_FILES_KEYSPACE.to_string(), key.clone()))
-            .collect();
-        let writes = rows
-            .iter()
-            .map(|(_, value)| {
-                let key = Ulid::generate().to_bytes().to_vec().into();
-                (BLOB_CLEANUP_KEYSPACE.to_string(), key, value.clone())
-            })
-            .collect();
-        transact(context, deletes, writes).await?;
-        handed += rows.len() as u64;
-    }
-    if handed > 0
-        && let Some(tasks) = context.task_handle.as_ref()
-    {
-        use aruna_core::handle::Handle as _;
-        tasks.send_effect(schedule_cleanup_effect()).await;
-    }
-    Ok(handed)
-}
-
-async fn transact(
-    context: &DriverContext,
-    deletes: Vec<(String, Key)>,
-    writes: Vec<(String, Key, Value)>,
-) -> Result<(), String> {
-    let storage = &context.storage_handle;
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("could not start a transaction: {other:?}")),
-    };
-    let steps = [
-        StorageEffect::BatchDelete {
-            deletes,
-            txn_id: Some(txn_id),
-        },
-        StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        },
-    ];
-    for step in steps {
-        match storage.send_storage_effect(step).await {
-            Event::Storage(StorageEvent::BatchDeleteResult { .. })
-            | Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-            other => {
-                let abort = StorageEffect::AbortTransaction { txn_id };
-                storage.send_storage_effect(abort).await;
-                return Err(format!("could not hand over the file releases: {other:?}"));
-            }
-        }
-    }
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        other => Err(format!("could not hand over the file releases: {other:?}")),
     }
 }
 

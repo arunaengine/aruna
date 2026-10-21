@@ -161,9 +161,9 @@ async fn finds_pinned_files() {
 }
 
 #[tokio::test]
-async fn hands_over_plans() {
+async fn plans_until_ended() {
     let (_directory, context) = setup().await;
-    let job = Ulid::from_parts(50, 1);
+    let job = aruna_core::structs::execution::job::JobId::from_bytes([0xE5; 16]).as_ulid();
     let id = Ulid::from_parts(10, 1);
     let unversioned = file("raw/gone/x", Ulid::from_parts(21, 1));
     let versioned = file("raw/gone/a", Ulid::from_parts(20, 1));
@@ -173,30 +173,98 @@ async fn hands_over_plans() {
     let found = storage_files(&context, (BUCKET, group()), &versions, None)
         .await
         .unwrap();
-    // Planning twice, as a resumed purge does, plans each file once.
+    let storage = aruna_core::structs::storage::group_backend::GroupStorage {
+        backend_id: rule().backend_id,
+        group_id: group(),
+        name: "tenant".to_string(),
+        kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
+        public_config: Default::default(),
+        created_at: SystemTime::UNIX_EPOCH,
+        updated_at: SystemTime::UNIX_EPOCH,
+        created_by: Default::default(),
+        disabled: false,
+        cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
+    };
+    let backend = crate::groups::backends::backend_key(rule().backend_id).to_vec();
+    let space = aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
+    put(&context, space, backend, storage.to_bytes().unwrap()).await;
+    // Planning twice, as a resumed purge does, plans each file once, in the cleanup queue.
     plan_files(&context, job, &found).await.unwrap();
     plan_files(&context, job, &found).await.unwrap();
-    assert_eq!(hand_over(&context, job).await.unwrap(), 1);
-    assert_eq!(hand_over(&context, job).await.unwrap(), 0);
-    let (works, _) = iter_prefix_page(
-        &context.storage_handle,
-        BLOB_CLEANUP_KEYSPACE,
-        None,
-        None,
-        10,
-        None,
-    )
-    .await
-    .unwrap();
-    let [(_, work)] = works.as_slice() else {
-        panic!("expected one release, got {works:?}")
+    let works = || async {
+        let page = crate::jobs::store::iter_prefix_page(
+            &context.storage_handle,
+            BLOB_CLEANUP_KEYSPACE,
+            None,
+            None,
+            10,
+            None,
+        );
+        page.await.unwrap().0
+    };
+    let planned = works().await;
+    let [(_, work)] = planned.as_slice() else {
+        panic!("expected one release, got {planned:?}")
     };
     let work = BlobCleanupWork::from_bytes(work).unwrap();
     assert!(matches!(
         work,
-        BlobCleanupWork::ReleaseRenamed { location, version, .. }
-            if location == versioned && version == "p1"
+        BlobCleanupWork::ReleasePlanned { job_id, location, version, .. }
+            if job_id == job && location == versioned && version == "p1"
     ));
+    // While the purge job runs, its planned files wait; a job that is gone has ended.
+    let record = aruna_core::structs::execution::job::JobRecord::new(
+        aruna_core::structs::execution::job::JobId::from_bytes(job.to_bytes()),
+        aruna_core::structs::execution::job::JobPayload::Probe {
+            steps: 1,
+            step_sleep_ms: 0,
+            fail_at: None,
+            panic_at: None,
+            cleanup_marker: None,
+        },
+        Default::default(),
+        node(4),
+        1,
+        1,
+        None,
+    );
+    crate::jobs::store::insert_job(&context.storage_handle, &record)
+        .await
+        .unwrap();
+    crate::blob::cleanup::process_cleanup_batch(&context)
+        .await
+        .unwrap();
+    assert_eq!(works().await.len(), 1);
+    let claim = aruna_core::structs::storage::backend_import::claim_key(&versioned, "p1").unwrap();
+    let claimed = |context: &DriverContext| {
+        let read = vec![(
+            aruna_core::keyspaces::DELETE_CLAIM_KEYSPACE.to_string(),
+            claim.clone(),
+        )];
+        let context = context.clone();
+        async move {
+            batch(&context, read)
+                .await
+                .unwrap()
+                .pop()
+                .flatten()
+                .is_some()
+        }
+    };
+    assert!(!claimed(&context).await);
+    let delete = aruna_core::effects::StorageEffect::Delete {
+        key_space: aruna_core::keyspaces::JOB_KEYSPACE.to_string(),
+        key: aruna_core::structs::execution::job::job_record_key(record.job_id),
+        txn_id: None,
+    };
+    context.storage_handle.send_storage_effect(delete).await;
+    crate::blob::cleanup::process_cleanup_batch(&context)
+        .await
+        .unwrap();
+    // The release ran once the job was gone; the version still reads the file, so it stays
+    // and its claim went again.
+    assert!(works().await.is_empty());
+    assert!(!claimed(&context).await);
 }
 
 #[tokio::test]
@@ -206,8 +274,6 @@ async fn pauses_purges() {
     assert!(!is_paused(&context, job).await.unwrap());
     set_paused(&context, job, true).await.unwrap();
     assert!(is_paused(&context, job).await.unwrap());
-    // A pause marker is not a planned file.
-    assert_eq!(hand_over(&context, job).await.unwrap(), 0);
     set_paused(&context, job, false).await.unwrap();
     assert!(!is_paused(&context, job).await.unwrap());
 }
