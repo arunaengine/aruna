@@ -34,6 +34,8 @@ pub enum StartMoveError {
     MoveRunning(String),
     #[error("the storage move did not finish")]
     NotFinished,
+    #[error("the import rule changed since its files were checked")]
+    RuleChanged,
     #[error("unexpected event: {0:?}")]
     Unexpected(Box<Event>),
 }
@@ -128,6 +130,9 @@ pub struct StartMoveOperation {
     now_ms: u64,
     /// Also gives linked files of earlier patterns their current name.
     renaming: bool,
+    /// Values read when the caller's access to the renamed files was checked; the move
+    /// starts only while they are unchanged.
+    guards: Vec<(String, Key, Option<Value>)>,
     state: StartMoveState,
     txn_id: Option<TxnId>,
     output: Option<Result<CompressionMigration, StartMoveError>>,
@@ -141,6 +146,7 @@ impl StartMoveOperation {
             prefix,
             now_ms,
             renaming: false,
+            guards: Vec::new(),
             state: StartMoveState::Init,
             txn_id: None,
             output: None,
@@ -153,13 +159,24 @@ impl StartMoveOperation {
         self
     }
 
+    /// Starts only while `guards` are stored as they were read.
+    pub fn with_guards(mut self, guards: Vec<(String, Key, Option<Value>)>) -> Self {
+        self.guards = guards;
+        self
+    }
+
     fn fail(&mut self, error: StartMoveError) -> Effects {
         self.state = StartMoveState::Finish;
         self.output = Some(Err(error));
         self.abort()
     }
 
-    fn write(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn write(&mut self, mut values: Vec<(Key, Option<Value>)>) -> Effects {
+        let seen = values.split_off(values.len().saturating_sub(self.guards.len()));
+        let expected = self.guards.iter().map(|(.., value)| value);
+        if seen.len() != self.guards.len() || !seen.iter().map(|(_, value)| value).eq(expected) {
+            return self.fail(StartMoveError::RuleChanged);
+        }
         match self.rows(values) {
             Ok(writes) => {
                 self.state = StartMoveState::Write;
@@ -225,8 +242,14 @@ impl Operation for StartMoveOperation {
             ) => {
                 self.txn_id = Some(txn_id);
                 self.state = StartMoveState::Read;
+                let guards = self
+                    .guards
+                    .iter()
+                    .map(|(space, key, _)| (space.clone(), key.clone()));
+                let mut reads = move_reads(&self.bucket);
+                reads.extend(guards);
                 smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: move_reads(&self.bucket),
+                    reads,
                     txn_id: Some(txn_id),
                 })]
             }
@@ -341,6 +364,35 @@ mod tests {
                 renaming.then(|| b"7".to_vec())
             );
         }
+    }
+
+    #[test]
+    fn refuses_changed_rule() {
+        // The rename starts only while the rule reads as it did when its files were checked.
+        let group_id = ulid::Ulid::from_parts(1, 1);
+        let guard = (
+            "rules".to_string(),
+            Key::from(vec![1]),
+            Some(Value::from(vec![2])),
+        );
+        let mut operation = StartMoveOperation::new("b".into(), group_id, "in/".into(), 7)
+            .renaming()
+            .with_guards(vec![guard]);
+        operation.start();
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from(1),
+        }));
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+            panic!("expected the reads, got {effects:?}")
+        };
+        assert_eq!(reads.last().map(|(space, _)| space.as_str()), Some("rules"));
+        let mut values: Vec<(Key, Option<Value>)> = vec![(vec![].into(), None); 4];
+        values.push((vec![1].into(), Some(vec![3].into())));
+        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        assert!(matches!(
+            operation.output,
+            Some(Err(StartMoveError::RuleChanged))
+        ));
     }
 
     #[test]

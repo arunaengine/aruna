@@ -15,18 +15,19 @@ use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE, IMPORT_PATTERN_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, PathIdentity, WriteIntent, import_key, object_key,
+    BackendImport, ImportedObject, PathIdentity, WriteIntent, import_key, object_key, object_prefix,
 };
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::discovery::{
     DiscoveryRule, DiscoveryRules, IdentityError, check_patterns, file_identity,
 };
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use ulid::Ulid;
 
@@ -233,6 +234,38 @@ pub async fn bucket_access(
     match access.allows(None, &Permission::WRITE) {
         true => Ok(access),
         false => Err(ImportRuleError::Forbidden),
+    }
+}
+
+/// The rule and its earlier patterns as stored, read before its renames are checked, so a
+/// rename starts only for the files the check saw.
+pub async fn rename_guards(
+    context: &DriverContext,
+    rule: &BackendImport,
+) -> Result<Vec<(String, Key, Option<Value>)>, ImportRuleError> {
+    let reads = vec![
+        (BACKEND_IMPORT_KEYSPACE.to_string(), rule.key()),
+        (
+            IMPORT_PATTERN_KEYSPACE.to_string(),
+            object_prefix(rule.import_id),
+        ),
+    ];
+    let effect = StorageEffect::BatchRead {
+        reads: reads.clone(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::BatchReadResult { values }) if values.len() == 2 => {
+            let values = values.into_iter().map(|(_, value)| value);
+            Ok(reads
+                .into_iter()
+                .zip(values)
+                .map(|((space, key), value)| (space, key, value))
+                .collect())
+        }
+        other => Err(ImportRuleError::Read(format!(
+            "unexpected answer {other:?}"
+        ))),
     }
 }
 

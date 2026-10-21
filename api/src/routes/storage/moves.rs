@@ -258,6 +258,11 @@ pub(crate) fn move_refusal(error: StartMoveError) -> ServerError {
             "move_running",
             format!("a move of the keys under `{prefix}` is still running; retry when it finishes"),
         ),
+        StartMoveError::RuleChanged => ServerError::Refused(
+            StatusCode::CONFLICT,
+            "rule_changed",
+            "the import rule changed since its files were checked; try again".to_string(),
+        ),
         StartMoveError::Encrypted => ServerError::Refused(
             StatusCode::CONFLICT,
             "bucket_encrypted",

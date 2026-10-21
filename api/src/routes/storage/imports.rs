@@ -15,7 +15,7 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::groups::imports::change::{ChangeImportOperation, ImportChange};
 use aruna_operations::groups::imports::create::{CreateImportInput, CreateImportOperation};
-use aruna_operations::groups::imports::discovery::authorized_renames;
+use aruna_operations::groups::imports::discovery::{authorized_renames, rename_guards};
 use aruna_operations::groups::imports::remove::RemoveImportOperation;
 use aruna_operations::groups::imports::schedule::{next_due, start_run, wake_schedule};
 use aruna_operations::groups::imports::{ImportRuleError, last_run, list_imports, read_import};
@@ -807,7 +807,8 @@ restrictions are refused.
 - Only files on the rule's own folder storage are renamed. Encrypted buckets answer 409
   `bucket_encrypted`, and a move with another prefix answers 409 `move_running`.
 - The keys are checked with the limits of `GET` on this path; a folder beyond them answers 409
-  `rename_unchecked`."#,
+  `rename_unchecked`. A pattern change between that check and the start answers 409
+  `rule_changed`; once the rename runs, pattern changes are refused."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
         ("import_id" = String, Path, description = "Rule whose files get their name, as a 26-character ULID")
@@ -833,7 +834,7 @@ restrictions are refused.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path, the bucket or a key, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
-        (status = 409, description = "`bucket_encrypted`, `move_running` or `rename_unchecked`", body = ErrorResponse)
+        (status = 409, description = "`bucket_encrypted`, `move_running`, `rename_unchecked` or `rule_changed`", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -845,6 +846,10 @@ pub async fn start_renames(
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let rule = existing_rule(&state, group_id, &import_id).await?;
     let caller = (&auth, state.get_node_id());
+    // The move starts only while the rule and its patterns are as they were when checked.
+    let guards = rename_guards(&state.get_ctx(), &rule)
+        .await
+        .map_err(map_error)?;
     let checked = authorized_renames(&state.get_ctx(), caller, &rule, Permission::WRITE)
         .await
         .map_err(map_error)?;
@@ -859,7 +864,9 @@ pub async fn start_renames(
         ));
     }
     let (bucket, prefix) = (rule.bucket, rule.key_prefix);
-    let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms()).renaming();
+    let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms())
+        .renaming()
+        .with_guards(guards);
     let record = drive(operation, &state.get_ctx())
         .await
         .map_err(move_refusal)?;
