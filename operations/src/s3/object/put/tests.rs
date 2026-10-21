@@ -1836,9 +1836,14 @@ fn writer_reads_trail() {
         op.output,
         Some(Err(PutObjectError::HistoryDeleted))
     ));
-    // A clean trail moves the head after both ranges.
+    // A clean trail moves the head after both ranges; every purge is read, as a purge is
+    // keyed by its job.
     let mut op = writer();
-    op.trail_read(page(Vec::new()));
+    let effects = op.trail_read(page(Vec::new()));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Iter { start: None, .. })]
+    ));
     let effects = op.trail_read(page(Vec::new()));
     let [Effect::Storage(StorageEffect::Write { key_space, .. })] = effects.as_slice() else {
         panic!("expected the head write, got {effects:?}")

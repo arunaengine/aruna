@@ -83,15 +83,16 @@ impl TrailScan {
         }
     }
 
-    /// Where a page of `prefix` starts. The original write needs only the deletes and purges
-    /// recorded since its version was created; their audit ids are time ordered.
+    /// Where a page of `prefix` starts. The original write needs only the deletes of its key
+    /// recorded since its version was created, as their audit ids are time ordered. A purge
+    /// is keyed by its job, which may predate the write, so all purges are read.
     pub(crate) fn start(&self, prefix: &Key) -> Option<IterStart> {
         if let Some(after) = &self.after {
             return Some(IterStart::After(after.clone()));
         }
         let floor = Ulid::from_parts(self.version_id.timestamp_ms(), 0);
         let at = [prefix.as_ref(), &floor.to_bytes()[..]].concat();
-        self.writer.then(|| IterStart::At(at.into()))
+        (self.writer && self.range == 0).then(|| IterStart::At(at.into()))
     }
 
     /// A retried transaction reads the whole trail again.
