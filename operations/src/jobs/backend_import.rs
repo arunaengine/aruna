@@ -44,7 +44,7 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::driver::{DriverContext, drive, gate_context, now_ms, routing_snapshot};
 use crate::groups::backends::query::GetBackendOperation;
 use crate::groups::imports::discovery::read_discovery;
-use crate::groups::imports::shared::{self, SharedRule, claim_file, read_shared};
+use crate::groups::imports::shared::{self, SharedRule, claim_file, read_shared, taken_paths};
 use crate::groups::imports::{read_earlier, read_import};
 use crate::placement::policy::{GateContext, PolicyGateError};
 use crate::realm::get_config::GetConfigOperation;
@@ -130,6 +130,8 @@ struct PageReads {
     heads: HashMap<String, Option<Ulid>>,
     /// The version each row names, by listed path.
     versions: HashMap<String, Option<Value>>,
+    /// Listed paths that another rule of a shared folder recorded or writes.
+    taken: HashSet<String>,
 }
 
 fn permanent(message: impl Into<String>) -> JobRunOutcome {
@@ -197,6 +199,11 @@ pub async fn run_backend_import(ctx: &JobContext, spec: &BackendImportSpec) -> J
         run.page = match page_reads(&ctx.driver, &run.rule, &objects).await {
             Ok(page) => page,
             Err(ItemError::Item(error) | ItemError::System(error)) => return retryable(error),
+        };
+        let paths: Vec<&str> = objects.iter().map(|object| object.key.as_str()).collect();
+        run.page.taken = match taken_paths(&ctx.driver, &run.shared, &paths).await {
+            Ok(taken) => taken,
+            Err(error) => return retryable(error),
         };
         for object in objects {
             if ctx.cancel.is_cancelled() {
@@ -469,7 +476,10 @@ async fn import_object(
     let fence = Fence {
         head,
         keep_head: false,
-        guards: Vec::new(),
+        guards: match row {
+            Some(_) => Vec::new(),
+            None => shared_guards(run, &object.key),
+        },
         retired: Vec::new(),
         trail: keyed.map(|row| row.version_id),
         keep_row: false,
@@ -753,6 +763,13 @@ async fn recover(
         intent,
     } = identity;
     ensure_confined_path(Path::new(&key)).map_err(|error| item(error.to_string()))?;
+    // A name alone proves no owner where several rules read the folder.
+    if intent.is_none()
+        && row.is_none()
+        && let Some(outcome) = claimed(run, &object.key)?
+    {
+        return Ok(Some(outcome));
+    }
     let (mut location, version) = match hashed {
         Some(hashed) => hashed,
         None => hash_listed(ctx, spec, resolved, object).await?,
@@ -790,7 +807,7 @@ async fn recover(
             // The version transaction reads the delete trail again, so a delete meanwhile
             // conflicts. An alias keeps its row until the alias is hidden.
             let head = read_head(&ctx.driver, &rule.bucket, &key).await?;
-            let guards = vec![
+            let mut guards = vec![
                 rule_guard(rule)?,
                 (
                     IMPORTED_OBJECT_KEYSPACE.to_string(),
@@ -798,6 +815,9 @@ async fn recover(
                     stored.cloned(),
                 ),
             ];
+            if row.is_none() {
+                guards.extend(shared_guards(run, &object.key));
+            }
             // Older history joins below a head; a key that never had one gets the file as head.
             let fence = Fence {
                 head,
@@ -1064,6 +1084,30 @@ async fn iterate(
             other => return Err(ItemError::System(format!("unexpected answer {other:?}"))),
         }
     }
+}
+
+/// `None` when this rule imports an unmapped file of a shared folder; else the outcome.
+fn claimed(run: &ImportRun, path: &str) -> Result<Option<Outcome>, ItemError> {
+    let own = (&run.rule, run.earlier.as_slice(), run.discovery.as_slice());
+    let taken = run.page.taken.contains(path);
+    match claim_file(own, &run.shared, taken, path) {
+        shared::Claim::Own => Ok(None),
+        shared::Claim::Other => Ok(Some(Outcome::Ignored)),
+        shared::Claim::Conflict => Err(item(SHARED_CONFLICT)),
+    }
+}
+
+/// The rows other rules of a shared folder would record for `path`, which the commit must
+/// still find absent; a rule importing the file at the same time then conflicts.
+fn shared_guards(run: &ImportRun, path: &str) -> Vec<(String, Key, Option<Value>)> {
+    let readers = run.shared.iter().map(|other| &other.rule);
+    readers
+        .filter(|other| path.starts_with(&other.backend_prefix))
+        .map(|other| {
+            let key = object_key(other.import_id, path);
+            (IMPORTED_OBJECT_KEYSPACE.to_string(), key, None)
+        })
+        .collect()
 }
 
 const SHARED_CONFLICT: &str =
