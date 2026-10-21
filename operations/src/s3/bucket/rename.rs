@@ -19,7 +19,7 @@ use aruna_core::keyspaces::{
     BROKEN_VERSION_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE, JOB_KEYSPACE, LINKED_JOB_KEYSPACE, MANAGED_COPY_KEYSPACE,
     PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
-    RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+    RELATIONSHIP_OUT_KEYSPACE, RENAMED_ROW_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::job_record_key;
@@ -181,6 +181,7 @@ enum ScanKind {
     Target(usize),
     Copies(usize),
     Broken(usize),
+    Renamed(usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -216,6 +217,8 @@ struct Found {
     /// Path index rows that exist for the key's versions.
     indexed: Vec<HashIndex>,
     rows: Vec<(Key, ImportedObject)>,
+    /// Rows an earlier rename moved to this key, as their index row and their own key.
+    renamed: Vec<(Key, Vec<u8>)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -560,6 +563,15 @@ impl RenameKeysOperation {
                 }
                 Ok(true)
             }
+            ScanKind::Renamed(index) => {
+                let from = &self.items[index].from;
+                let prefix = VersionKey::object_prefix(&self.input.bucket, from)?;
+                for (key, _) in values {
+                    let row = key.get(prefix.len()..).unwrap_or_default().to_vec();
+                    self.found[index].renamed.push((key, row));
+                }
+                Ok(true)
+            }
         }
     }
 
@@ -620,6 +632,19 @@ impl RenameKeysOperation {
                 let on = |id: Ulid| BackendRef::Group(id) == location.backend;
                 let path = location.backend_path.clone();
                 if (on(import.backend_id) || on(import.write_backend()))
+                    && seen.insert((index, rule, path.clone()))
+                {
+                    reads.push((index, rule, path));
+                }
+            }
+        }
+        // Rows an earlier rename moved to the key are read where they are.
+        for (index, found) in self.found.iter().enumerate() {
+            for (_, row) in &found.renamed {
+                let (import, path) = row.split_at(row.len().min(16));
+                let path = String::from_utf8_lossy(path).into_owned();
+                let rule = (self.rules.iter()).position(|rule| rule.import_id.to_bytes() == import);
+                if let Some(rule) = rule
                     && seen.insert((index, rule, path.clone()))
                 {
                     reads.push((index, rule, path));
@@ -799,9 +824,10 @@ impl RenameKeysOperation {
                 Scan::new(
                     ScanKind::Broken(index),
                     BROKEN_VERSION_KEYSPACE,
-                    source,
+                    source.clone(),
                     PAGE,
                 ),
+                Scan::new(ScanKind::Renamed(index), RENAMED_ROW_KEYSPACE, source, PAGE),
             ]);
         }
         Ok(scans)
@@ -970,6 +996,10 @@ impl RenameKeysOperation {
                     empty,
                 ));
             }
+            for (key, _) in &found.renamed {
+                deletes.push((RENAMED_ROW_KEYSPACE.to_string(), key.clone()));
+            }
+            let moved_to = VersionKey::object_prefix(bucket, &item.to)?;
             for (key, row) in &found.rows {
                 let row = ImportedObject {
                     key: Some(item.to.clone()),
@@ -980,6 +1010,10 @@ impl RenameKeysOperation {
                     key.clone(),
                     row.to_bytes()?.into(),
                 ));
+                // The row is found again by its new key, also when no version names its file.
+                let index = [&moved_to[..], &key[..]].concat();
+                let empty = Value::from(Vec::new());
+                writes.push((RENAMED_ROW_KEYSPACE.to_string(), index.into(), empty));
             }
         }
         if let Some((_, next)) = &self.input.job {

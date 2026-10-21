@@ -747,4 +747,14 @@ async fn renames_shared_imports() {
         Some("archive/y")
     );
     assert_eq!(row(&context, "raw/x").await.key, None);
+    // A second rename finds the row by its recorded move, not by its path.
+    let keys = Some(vec!["archive/y"]);
+    let plan = drive(
+        RenameKeysOperation::new(input("archive/", "done/", keys, true)),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.items[0].files, ["raw/y"]);
+    assert_eq!(row(&context, "raw/y").await.key.as_deref(), Some("done/y"));
 }

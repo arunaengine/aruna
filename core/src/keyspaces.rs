@@ -108,6 +108,8 @@ pub const LINKED_JOB_KEYSPACE: &str = "linked_storage_jobs";
 pub const DELETE_CLAIM_KEYSPACE: &str = "linked_delete_claims";
 /// Provider uploads of linked file copies, keyed by the copy's attempt id until they settle.
 pub const COPY_UPLOAD_KEYSPACE: &str = "linked_copy_uploads";
+/// Import rows a key rename moved to a key, keyed by the key's version prefix and the row key.
+pub const RENAMED_ROW_KEYSPACE: &str = "backend_import_renamed_rows";
 /// Node-local progress of checking a bucket's current versions for copies that cannot serve.
 pub const STORAGE_CHECK_KEYSPACE: &str = "storage_checks";
 /// Buckets whose check is unfinished; the migration worker scans only these.
@@ -455,6 +457,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     LINKED_JOB_KEYSPACE,
     DELETE_CLAIM_KEYSPACE,
     COPY_UPLOAD_KEYSPACE,
+    RENAMED_ROW_KEYSPACE,
     STORAGE_CHECK_KEYSPACE,
     CHECK_QUEUE_KEYSPACE,
     BROKEN_VERSION_KEYSPACE,
