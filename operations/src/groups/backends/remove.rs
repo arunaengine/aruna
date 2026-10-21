@@ -155,15 +155,11 @@ async fn backends_holding_data(context: &DriverContext) -> Result<BTreeSet<Backe
             None,
         )
         .await?;
+        // Every cleanup work that names a location holds its storage.
         for (_, value) in values {
-            if let Ok(
-                BlobCleanupWork::DeleteBlob { location }
-                | BlobCleanupWork::ReconcileWrite { location, .. }
-                | BlobCleanupWork::ReconcileReservation { location }
-                | BlobCleanupWork::ReleaseRenamed { location, .. },
-            ) = BlobCleanupWork::from_bytes(value.as_ref())
-            {
-                holding.insert(location.backend);
+            let work = BlobCleanupWork::from_bytes(value.as_ref());
+            if let Some(location) = work.as_ref().ok().and_then(BlobCleanupWork::location) {
+                holding.insert(location.backend.clone());
             }
         }
         match next {
@@ -613,19 +609,38 @@ mod tests {
 
         assert_eq!(remove_drained_backends(&ctx).await.unwrap(), 0);
 
-        let queued = BlobCleanupWork::DeleteBlob { location };
-        let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
-        seed(&ctx, backend_id, true).await;
-        write(
-            &ctx,
-            BLOB_CLEANUP_KEYSPACE,
-            Ulid::from_bytes([7u8; 16]).to_bytes().to_vec().into(),
-            queued.to_bytes().unwrap(),
-        )
-        .await;
-
-        assert_eq!(remove_drained_backends(&ctx).await.unwrap(), 0);
+        // Every queued work that names a location of the storage keeps it, also the newer ones.
+        let queued = [
+            BlobCleanupWork::DeleteBlob {
+                location: location.clone(),
+            },
+            BlobCleanupWork::ReleasePlanned {
+                job_id: Ulid::from_bytes([9u8; 16]),
+                location: location.clone(),
+                import_id: Ulid::nil(),
+                version_id: Ulid::nil(),
+                version: "v1".to_string(),
+            },
+            BlobCleanupWork::SettleUpload {
+                attempt: Ulid::from_bytes([9u8; 16]),
+                location,
+                upload_id: "upload".to_string(),
+                since_ms: 0,
+            },
+        ];
+        for queued in queued {
+            let dir = tempdir().unwrap();
+            let ctx = context(dir.path().to_str().unwrap());
+            seed(&ctx, backend_id, true).await;
+            write(
+                &ctx,
+                BLOB_CLEANUP_KEYSPACE,
+                Ulid::from_bytes([7u8; 16]).to_bytes().to_vec().into(),
+                queued.to_bytes().unwrap(),
+            )
+            .await;
+            assert_eq!(remove_drained_backends(&ctx).await.unwrap(), 0);
+        }
 
         // An open upload's parts have no location row, yet its abort still needs
         // the credentials to delete them.
