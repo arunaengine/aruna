@@ -162,7 +162,7 @@ async fn run_fenced_purge(
         false
     };
 
-    write_purge_audit(ctx, spec).await?;
+    write_purge_audit(ctx, spec, bucket_deleted).await?;
     ctx.progress.set_current(total);
     Ok(StoragePurgeResult {
         scope: spec.scope.clone(),
@@ -195,26 +195,38 @@ fn purge_audit_record(spec: &StoragePurgeSpec, occurred_at_ms: u64) -> BlobAudit
 
 /// Records the completed purge once. The job id is the record id, so a
 /// re-driven job overwrites its own row instead of adding a second one.
-async fn write_purge_audit(ctx: &JobContext, spec: &StoragePurgeSpec) -> Result<(), PurgeRunError> {
+/// The audit row of a purge and its trail row. A purge that deleted its bucket leaves nothing
+/// to protect, and a bucket created again under the name must not meet its trail.
+fn audit_rows(
+    record: &BlobAuditRecord,
+    audit_id: ulid::Ulid,
+    value: aruna_core::types::Value,
+    bucket_deleted: bool,
+) -> Vec<(String, aruna_core::types::Key, aruna_core::types::Value)> {
+    let audit = delete_audit_key(record.group_id, audit_id).into();
+    let mut writes = vec![(DELETE_AUDIT_KEYSPACE.to_string(), audit, value.clone())];
+    if !bucket_deleted {
+        let trail = trail_key(record, audit_id).into();
+        writes.push((DELETE_TRAIL_KEYSPACE.to_string(), trail, value));
+    }
+    writes
+}
+
+async fn write_purge_audit(
+    ctx: &JobContext,
+    spec: &StoragePurgeSpec,
+    bucket_deleted: bool,
+) -> Result<(), PurgeRunError> {
     let record = purge_audit_record(spec, unix_timestamp_millis());
     let value = record
         .to_bytes()
         .map_err(|error| JobError::retryable(format!("purge audit encode failed: {error}")))?;
-    let audit_id = ctx.job_id.as_ulid();
-    let trail = trail_key(&record, audit_id).into();
-    let value: aruna_core::types::Value = value.into();
+    let writes = audit_rows(&record, ctx.job_id.as_ulid(), value.into(), bucket_deleted);
     match ctx
         .driver
         .storage_handle
         .send_storage_effect(StorageEffect::BatchWrite {
-            writes: vec![
-                (
-                    DELETE_AUDIT_KEYSPACE.to_string(),
-                    delete_audit_key(spec.group_id, audit_id).into(),
-                    value.clone(),
-                ),
-                (DELETE_TRAIL_KEYSPACE.to_string(), trail, value),
-            ],
+            writes,
             txn_id: None,
         })
         .await
@@ -662,5 +674,38 @@ mod pure_tests {
         );
         assert_eq!(bucket.kind, BlobAuditKind::Purge(BlobPurgeKind::Bucket));
         assert!(bucket.key.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn omits_deleted_bucket_trail() {
+        let record = BlobAuditRecord {
+            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]),
+            group_id: ulid::Ulid::from_parts(1, 1),
+            node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+            user_id: Default::default(),
+            kind: BlobAuditKind::Purge(BlobPurgeKind::Bucket),
+            bucket: "b".to_string(),
+            key: String::new(),
+            version_id: None,
+            occurred_at_ms: 1,
+        };
+        let id = ulid::Ulid::from_parts(3, 3);
+        let spaces = |deleted| {
+            let rows = audit_rows(&record, id, vec![1].into(), deleted);
+            rows.into_iter()
+                .map(|(space, ..)| space)
+                .collect::<Vec<_>>()
+        };
+        // The audit always stays; the trail only while the bucket does.
+        assert_eq!(
+            spaces(false),
+            [DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE]
+        );
+        assert_eq!(spaces(true), [DELETE_AUDIT_KEYSPACE]);
     }
 }
