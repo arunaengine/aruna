@@ -1803,15 +1803,72 @@ async fn migrate_page(
 }
 
 /// Ends an aborted rename's move with its last progress; its request stays to show the abort.
+/// Copies an interrupted try left are settled first; while one does not settle, the move
+/// tries again later, at most `MIGRATION_RETRIES` times.
 async fn end_aborted(
     context: &crate::driver::DriverContext,
     bucket: &str,
     mut record: CompressionMigration,
 ) -> Result<Option<Duration>, String> {
+    if !settle_moves(context, bucket, &record).await? && record.retries < MIGRATION_RETRIES {
+        let wait = retry_delay(record.retries);
+        record.retries += 1;
+        store_progress(context, bucket, &record).await?;
+        return Ok(Some(wait));
+    }
     record.retry_at_ms = None;
     record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
     store_progress(context, bucket, &record).await?;
     Ok(None)
+}
+
+/// Runs each version with an outstanding move intent of the bucket's rules once more, which
+/// adopts a copy that reached its new name or drops the intents of one that did not; `false`
+/// while one of them fails.
+async fn settle_moves(
+    context: &crate::driver::DriverContext,
+    bucket: &str,
+    record: &CompressionMigration,
+) -> Result<bool, String> {
+    let Some(routing) = move_routing(context, bucket).await? else {
+        return Ok(true);
+    };
+    let earlier = read_earlier(context, &routing).await?;
+    let mut settled = true;
+    let rules = routing.imports.iter().filter(|rule| rule.bucket == bucket);
+    for rule in rules {
+        let mut after = None;
+        loop {
+            let (rows, next) = crate::jobs::store::iter_prefix_page(
+                &context.storage_handle,
+                IMPORT_INTENT_KEYSPACE,
+                Some(aruna_core::structs::storage::backend_import::object_prefix(
+                    rule.import_id,
+                )),
+                after.take(),
+                RULE_PAGE,
+                None,
+            )
+            .await?;
+            for (_, value) in rows {
+                let intent = WriteIntent::from_bytes(&value).map_err(|error| error.to_string())?;
+                // A move records its source hash before its bytes; an upload's intent waits.
+                if intent.written.is_none() {
+                    continue;
+                }
+                let key = VersionKey::new(bucket, &intent.key, intent.version_id);
+                let operation = MigrateVersionOperation::new(key, record.target, SystemTime::now())
+                    .with_routing(routing.clone())
+                    .with_earlier(earlier.clone());
+                settled &= crate::driver::drive(operation, context).await.is_ok();
+            }
+            match next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+    }
+    Ok(settled)
 }
 
 /// Whether the caller paused or aborted the rename of the move `record`.
