@@ -467,6 +467,15 @@ async fn records_copy_uploads() {
     );
     handler.record_upload(attempt, None).await.unwrap();
     assert_eq!(handler.copy_upload(attempt).await.unwrap(), None);
+    // A settlement by attempt alone finds nothing left to abort.
+    let settle = aruna_core::effects::BlobEffect::SettleCopy {
+        attempt,
+        upload: None,
+    };
+    assert_eq!(
+        handler.execute_effect(settle).await,
+        BlobEvent::UploadAborted
+    );
 }
 
 #[tokio::test]

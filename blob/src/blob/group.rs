@@ -168,7 +168,11 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
             push(&mut ids, &source.backend);
         }
         BlobEffect::StatPlain { backend, .. } => push(&mut ids, backend),
-        BlobEffect::SettleCopy { .. } => {}
+        BlobEffect::SettleCopy { upload, .. } => {
+            if let Some((location, _)) = upload {
+                push(&mut ids, &location.backend);
+            }
+        }
         BlobEffect::StatCopy { location } | BlobEffect::DeletePlain { location, .. } => {
             push(&mut ids, &location.backend)
         }
@@ -691,6 +695,27 @@ mod tests {
         };
 
         assert_eq!(group_ids(&effect), vec![backend_id]);
+        // A copy upload is settled on the storage it was opened on.
+        let location = aruna_core::structs::storage::blob::BackendLocation {
+            backend: BackendRef::Group(backend_id),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: "raw/a".to_string(),
+            ulid: Ulid::from_bytes([9u8; 16]),
+            format: Default::default(),
+            created_by: Default::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 1,
+            hashes: Default::default(),
+        };
+        let settle = BlobEffect::SettleCopy {
+            attempt: Ulid::from_bytes([8u8; 16]),
+            upload: Some((Box::new(location), "upload".to_string())),
+        };
+        assert_eq!(group_ids(&settle), vec![backend_id]);
         assert!(
             group_ids(&BlobEffect::ListHidden {
                 namespace: None,

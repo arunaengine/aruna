@@ -678,6 +678,21 @@ impl BlobHandler {
     // Effects run concurrently on their caller's task; per-operation ordering
     // is preserved by the driver awaiting each effect before the next.
     pub(super) async fn execute_effect(&self, effect: BlobEffect) -> BlobEvent {
+        // A settlement of a recorded upload names its backend only in the record.
+        let effect = match effect {
+            BlobEffect::SettleCopy {
+                attempt,
+                upload: None,
+            } => match self.copy_upload(attempt).await {
+                Ok(Some((location, upload_id))) => BlobEffect::SettleCopy {
+                    attempt,
+                    upload: Some((Box::new(location), upload_id)),
+                },
+                Ok(None) => return BlobEvent::UploadAborted,
+                Err(error) => return BlobEvent::Error(error),
+            },
+            effect => effect,
+        };
         let _hold = match self.hold_backends(&effect) {
             Ok(hold) => hold,
             Err(error) => return BlobEvent::Error(error),
