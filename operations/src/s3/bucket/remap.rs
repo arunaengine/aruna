@@ -92,7 +92,7 @@ async fn head_page(
 }
 
 /// Counts the selected keys the caller may read and that contain `filter`.
-async fn count_selected(
+pub async fn count_selected(
     context: &DriverContext,
     plan: &RemapPlan,
     scope: &RemapScope<'_>,

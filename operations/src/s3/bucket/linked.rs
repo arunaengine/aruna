@@ -351,6 +351,59 @@ impl Operation for BucketJobOperation {
     }
 }
 
+/// The job of a bucket as stored: the running one, else the one started last.
+pub async fn read_bucket_job(
+    context: &DriverContext,
+    bucket: &str,
+) -> Result<Option<BucketJob>, String> {
+    let mut reads = reads(bucket);
+    reads.remove(0);
+    reads.remove(0);
+    let read = StorageEffect::BatchRead {
+        reads,
+        txn_id: None,
+    };
+    let values = match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+        other => return Err(format!("could not read the bucket job: {other:?}")),
+    };
+    let mut values = values.into_iter().map(|(_, value)| value);
+    let mut next = || values.next().flatten();
+    let (linked, migration, rename) = (next(), next(), next());
+    let linked = linked.as_deref().map(LinkedJob::from_bytes).transpose();
+    let linked = linked.map_err(|error| error.to_string())?;
+    let migration = migration.as_deref().map(CompressionMigration::from_bytes);
+    let migration = migration.transpose().map_err(|error| error.to_string())?;
+    let rename = rename.as_deref().map(RenameRequest::from_bytes).transpose();
+    let rename = rename.map_err(|error| error.to_string())?;
+    let rename = match (migration, rename) {
+        (Some(migration), Some(request))
+            if migration.moving && migration.started_at_ms == request.started_at_ms =>
+        {
+            Some((migration, request))
+        }
+        _ => None,
+    };
+    let rename_runs = (rename.as_ref()).is_some_and(|(migration, request)| {
+        migration.finished_at_ms.is_none() && request.aborted_at_ms.is_none()
+    });
+    Ok(match (linked, rename) {
+        (Some(job), _) if job.is_active() => Some(BucketJob::Linked(job)),
+        (_, Some((migration, request))) if rename_runs => {
+            Some(BucketJob::Rename(migration, request))
+        }
+        (Some(job), Some((migration, request))) => {
+            match job.started_at_ms > migration.started_at_ms {
+                true => Some(BucketJob::Linked(job)),
+                false => Some(BucketJob::Rename(migration, request)),
+            }
+        }
+        (Some(job), None) => Some(BucketJob::Linked(job)),
+        (None, Some((migration, request))) => Some(BucketJob::Rename(migration, request)),
+        (None, None) => None,
+    })
+}
+
 /// What one job page did; a waiting page keeps its cursor.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JobStep {

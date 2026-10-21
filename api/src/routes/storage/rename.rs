@@ -98,7 +98,7 @@ fn plan_response(bucket: String, plan: RenamePlan) -> RenameResponse {
     }
 }
 
-fn map_error(error: RenameError) -> ServerError {
+pub(super) fn map_error(error: RenameError) -> ServerError {
     match error {
         RenameError::Invalid(message) => ServerError::BadRequestMessage(message),
         RenameError::Conflict(message) => ServerError::Conflict(message),

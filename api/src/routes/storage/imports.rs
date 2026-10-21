@@ -159,7 +159,7 @@ fn millis(time: SystemTime) -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
-fn map_error(error: ImportRuleError) -> ServerError {
+pub(super) fn map_error(error: ImportRuleError) -> ServerError {
     match error {
         ImportRuleError::Invalid(message) => ServerError::BadRequestMessage(message),
         ImportRuleError::Conflict(message) => ServerError::Conflict(message),
@@ -170,7 +170,7 @@ fn map_error(error: ImportRuleError) -> ServerError {
     }
 }
 
-async fn admin_of_group(
+pub(super) async fn admin_of_group(
     state: &ServerState,
     auth: Option<AuthContext>,
     group_id: &str,
@@ -181,7 +181,7 @@ async fn admin_of_group(
     Ok((group_id, auth))
 }
 
-async fn existing_rule(
+pub(super) async fn existing_rule(
     state: &ServerState,
     group_id: Ulid,
     import_id: &str,
@@ -696,17 +696,33 @@ pub struct RenameFileResponse {
     pub from: String,
     /// Path the file gets under the rule's current pattern.
     pub to: String,
+    /// The caller may write the file's key, so the rename renames it.
+    pub writable: bool,
+}
+
+/// One page of the files a rename renames.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, utoipa::IntoParams)]
+pub struct RenamePageQuery {
+    /// Only keys that contain this text.
+    pub filter: Option<String>,
+    /// Files per page: 1 to 1000, default 100.
+    pub limit: Option<usize>,
+    /// The `next` value of the page before.
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ImportRenamesResponse {
     /// Files of the rule that an earlier pattern named and that a rename would give their
-    /// current name.
+    /// current name, as far as the caller may read their keys.
     pub count: u64,
     /// `false` when the count stopped at its limit; `count` is then a lower bound.
     pub complete: bool,
-    /// The first 100 of them.
+    /// One page of them.
     pub files: Vec<RenameFileResponse>,
+    /// Cursor of the next page; omitted on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
     /// Progress of the last move of the rule's folder on this node; absent before any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<MigrationProgress>,
@@ -730,11 +746,12 @@ key the caller may read are counted and listed.
 - Changing the pattern renames nothing; only `POST` on this path does.
 
 **Limits**
-- One request reads at most 10000 version rows under the folder, passes over at most 200000
-  rows of the bucket, and lists the first 100 files."#,
+- Pages hold 1 to 1000 files, in storage order; `next` resumes after the last key shown and
+  names only keys the caller may read. Totals pass over at most 2,000,000 version rows."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
-        ("import_id" = String, Path, description = "Rule to check, as a 26-character ULID")
+        ("import_id" = String, Path, description = "Rule to check, as a 26-character ULID"),
+        RenamePageQuery
     ),
     responses(
         (
@@ -746,7 +763,8 @@ key the caller may read are counted and listed.
                 "complete": true,
                 "files": [{
                     "from": "instrument/raw/01JA7Q3K2M4N5P6Q7R8S9T0V1W_b.fastq",
-                    "to": "instrument/raw/b.fastq~01JA7Q3K2M4N5P6Q7R8S9T0V1W"
+                    "to": "instrument/raw/b.fastq~01JA7Q3K2M4N5P6Q7R8S9T0V1W",
+                    "writable": true
                 }]
             })
         ),
@@ -761,13 +779,46 @@ pub async fn get_renames(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path((group_id, import_id)): Path<(String, String)>,
+    axum::extract::Query(page): axum::extract::Query<RenamePageQuery>,
 ) -> ServerResult<Json<ImportRenamesResponse>> {
+    use aruna_operations::blob::migration::misplaced::{DEFAULT_PAGE, MAX_PAGE, rename_page};
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let rule = existing_rule(&state, group_id, &import_id).await?;
-    let caller = (&auth, state.get_node_id());
-    let counted = authorized_renames(&state.get_ctx(), caller, &rule, Permission::READ)
-        .await
-        .map_err(map_error)?;
+    let limit = page.limit.unwrap_or(DEFAULT_PAGE);
+    let bad = || ServerError::BadRequestMessage("`after` is not a cursor".to_string());
+    let after = match page.after.as_deref() {
+        Some(after) => {
+            let bytes = URL_SAFE_NO_PAD.decode(after).map_err(|_| bad())?;
+            Some(String::from_utf8(bytes).map_err(|_| bad())?)
+        }
+        None => None,
+    };
+    if !(1..=MAX_PAGE).contains(&limit) {
+        return Err(ServerError::BadRequestMessage(format!(
+            "limit takes 1 to {MAX_PAGE}"
+        )));
+    }
+    let context = state.get_ctx();
+    let access = aruna_operations::groups::imports::discovery::bucket_access(
+        &context,
+        &auth,
+        state.get_node_id(),
+        &rule,
+    )
+    .await
+    .map_err(map_error)?;
+    let readable = |key: &str| access.allows(Some(key), &Permission::READ);
+    let writable = |key: &str| access.allows(Some(key), &Permission::WRITE);
+    let found = rename_page(
+        &context,
+        (&rule.bucket, &rule.key_prefix),
+        (&readable, &writable),
+        (page.filter.as_deref(), after, limit),
+    )
+    .await
+    .map_err(ServerError::InternalError)?;
     let status = drive(
         MigrationStatusOperation::new(rule.bucket.clone()),
         &state.get_ctx(),
@@ -775,13 +826,14 @@ pub async fn get_renames(
     .await
     .map_err(|error| ServerError::InternalError(error.to_string()))?;
     let last = status.filter(|record| record.moving && record.prefix == rule.key_prefix);
-    let files = counted.renames.into_iter();
+    let files = found.entries.into_iter();
     Ok(Json(ImportRenamesResponse {
-        count: counted.renamed,
-        complete: counted.complete,
+        count: found.total,
+        complete: found.complete,
         files: files
-            .map(|(from, to)| RenameFileResponse { from, to })
+            .map(|(from, to, writable)| RenameFileResponse { from, to, writable })
             .collect(),
+        next: found.next.map(|key| URL_SAFE_NO_PAD.encode(key)),
         progress: last.map(Into::into),
     }))
 }
@@ -892,4 +944,4 @@ pub async fn start_renames(
 
 #[cfg(test)]
 #[path = "imports_tests.rs"]
-mod tests;
+pub(crate) mod tests;

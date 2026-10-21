@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 use ulid::Ulid;
 
-async fn register_backend(test: &TestState) -> Ulid {
+pub(crate) async fn register_backend(test: &TestState) -> Ulid {
     let backend_id = Ulid::generate();
     let record = GroupStorage {
         backend_id,
@@ -57,7 +57,11 @@ async fn register_backend(test: &TestState) -> Ulid {
     backend_id
 }
 
-fn request(test: &TestState, backend_id: Ulid, backend_prefix: &str) -> CreateImportRequest {
+pub(crate) fn request(
+    test: &TestState,
+    backend_id: Ulid,
+    backend_prefix: &str,
+) -> CreateImportRequest {
     CreateImportRequest {
         backend_id: backend_id.to_string(),
         backend_prefix: backend_prefix.to_string(),
@@ -220,7 +224,7 @@ async fn manages_rule() {
 }
 
 /// A token of the test realm; its signature is never checked here, as the middleware did that.
-fn bearer(test: &TestState) -> Extension<Option<crate::auth::ValidatedBearer>> {
+pub(crate) fn bearer(test: &TestState) -> Extension<Option<crate::auth::ValidatedBearer>> {
     use aruna_core::structs::identity::auth::TokenClaims;
     let claims = TokenClaims {
         sub: test.auth.user_id.to_string(),
@@ -267,7 +271,13 @@ async fn starts_renames() {
             ..auth
         }))
     };
-    let listed = get_renames(State(test.state.clone()), restricted(), rule()).await;
+    let listed = get_renames(
+        State(test.state.clone()),
+        restricted(),
+        rule(),
+        Default::default(),
+    )
+    .await;
     assert!(matches!(listed, Err(ServerError::Forbidden)));
     let started = start_renames(
         State(test.state.clone()),
@@ -278,9 +288,14 @@ async fn starts_renames() {
     .await;
     assert!(matches!(started, Err(ServerError::Forbidden)));
 
-    let Json(found) = get_renames(State(test.state.clone()), auth(), rule())
-        .await
-        .unwrap();
+    let Json(found) = get_renames(
+        State(test.state.clone()),
+        auth(),
+        rule(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!((found.count, found.files.len()), (0, 0));
     assert!(found.progress.is_none());
     // The rename is a move of the rule's folder, shown as the rule's progress.
@@ -293,9 +308,14 @@ async fn starts_renames() {
             .unwrap();
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(started.prefix, "imported/");
-    let Json(found) = get_renames(State(test.state.clone()), auth(), rule())
-        .await
-        .unwrap();
+    let Json(found) = get_renames(
+        State(test.state.clone()),
+        auth(),
+        rule(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert!(found.progress.is_some());
     // A running rename keeps the pattern its files are read with.
     let body = Json(UpdateImportRequest {
