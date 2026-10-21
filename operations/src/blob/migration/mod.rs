@@ -1463,7 +1463,7 @@ async fn rename_access(
     routing: &RoutingSnapshot,
     bucket: &str,
 ) -> Result<Option<crate::auth::request_authorization::BucketAccess>, String> {
-    use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
+    use crate::auth::request_authorization::BucketAccess;
     let valid = crate::auth::bearer_token::grant_valid(
         &context.storage_handle,
         &request.grant,
@@ -1473,13 +1473,26 @@ async fn rename_access(
         return Ok(None);
     }
     let scope = (request.auth.realm_id, routing.group_id, request.node_id);
-    let access = match BucketAccess::load(context, &request.auth, scope, bucket).await {
-        Ok(access) => access,
-        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => return Ok(None),
-        Err(error) => return Err(error.to_string()),
+    let loaded = BucketAccess::load(context, &request.auth, scope, bucket).await;
+    let Some(access) = granted(loaded)? else {
+        return Ok(None);
     };
     let write = aruna_core::structs::identity::auth::Permission::WRITE;
     Ok(access.allows(None, &write).then_some(access))
+}
+
+/// A denial ends the rename; policy state that cannot be read is an error to retry.
+fn granted<T>(
+    loaded: Result<T, crate::auth::request_authorization::AuthorizeError>,
+) -> Result<Option<T>, String> {
+    use crate::auth::request_authorization::AuthorizeError;
+    use crate::auth::request_policy::PolicyEnforcementError;
+    match loaded {
+        Ok(access) => Ok(Some(access)),
+        Err(AuthorizeError::PermissionDenied)
+        | Err(AuthorizeError::Policy(PolicyEnforcementError::Denied { .. })) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Reads the earlier patterns of the rules a move resolves against.
@@ -1857,6 +1870,24 @@ async fn stage_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_unavailable_policy() {
+        use crate::auth::request_authorization::AuthorizeError;
+        use crate::auth::request_policy::PolicyEnforcementError;
+        let unavailable = PolicyEnforcementError::Unavailable("down".to_string());
+        assert!(granted::<()>(Err(AuthorizeError::Policy(unavailable))).is_err());
+        let denied = PolicyEnforcementError::Denied {
+            name: "p".to_string(),
+            reason: "no".to_string(),
+        };
+        assert_eq!(granted::<()>(Err(AuthorizeError::Policy(denied))), Ok(None));
+        assert_eq!(
+            granted::<()>(Err(AuthorizeError::PermissionDenied)),
+            Ok(None)
+        );
+        assert_eq!(granted(Ok(1)), Ok(Some(1)));
+    }
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
