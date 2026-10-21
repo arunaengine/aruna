@@ -978,6 +978,17 @@ async fn page_intents(
     }
 }
 
+/// `page_intents` for a caller outside the run, such as a preview.
+pub(crate) async fn listed_intents(
+    context: &DriverContext,
+    rule: &BackendImport,
+    objects: &[ExternalObject],
+) -> Result<BTreeMap<String, Vec<(Key, WriteIntent)>>, String> {
+    page_intents(context, rule, objects)
+        .await
+        .map_err(|(ItemError::Item(error) | ItemError::System(error))| error)
+}
+
 /// The path of an intent key: the import id, the path, a zero byte and the version id.
 fn intent_path(key: &[u8]) -> Option<&str> {
     let end = key.len().checked_sub(17)?;

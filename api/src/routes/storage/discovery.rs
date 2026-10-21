@@ -38,7 +38,7 @@ pub struct DiscoveryRuleBody {
     /// File name pattern: `*` any text, `?` one character, `[0-9]` or `[!x]` one of a set,
     /// `{4}` or `{2,8}` after a set or `?` repeats it, `{fna,fa}` either text.
     pub pattern: String,
-    /// Folder below the rule's `key_prefix` for matching files, ending with `/`.
+    /// Folder of the bucket for matching files, ending with `/`.
     pub folder: String,
 }
 
@@ -63,6 +63,9 @@ pub struct PreviewFileResponse {
     /// Bucket key the file gets; omitted for a conflict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Version the file name or an unfinished write names; a run registers the file as it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
     /// `known` (a recorded mapping keeps it), `matched`, `root` or `conflict`.
     pub outcome: String,
     /// The patterns that all match a conflicting file.
@@ -73,7 +76,7 @@ pub struct PreviewFileResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct DiscoveryPreviewResponse {
     pub files: Vec<PreviewFileResponse>,
-    /// Pass as `after` for the next page; omitted on the last page.
+    /// Pass as `after` for the next page; omitted on the last page. It names a listed file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
 }
@@ -177,14 +180,16 @@ pub async fn get_discovery(
 bucket, including request policies. Tokens with path restrictions are refused.
 
 **Behavior**
-- A file without a recorded mapping whose name matches one pattern is imported at `key_prefix` +
-  `folder` + its path below `backend_prefix`, so subfolders stay. A file that matches no pattern
-  is imported at `key_prefix` + its path, as without rules.
+- A file without a recorded mapping or write intent whose name matches one pattern is imported
+  at `folder` + its path below `backend_prefix`, so subfolders stay. A file that matches no
+  pattern is imported at its path below `backend_prefix`, at the bucket root. The rule's
+  `key_prefix` is where its uploads come from; found files never get it.
 - Patterns match the file name only, without its folders: `*` any text, `?` one character,
   `[abc]`, `[0-9]` or `[!x]` one character of a set, `{4}` or `{2,8}` right after a set or `?`
   that many of it, and `{fna,fa}` either text. Every other character is literal. There are no
   regular expressions. Matching ignores the version id that the rule's
-  `write_pattern` or a `~<version id>` tag adds to a name.
+  current or an earlier `write_pattern`, or a `~<version id>` tag, adds to a name. A file
+  whose name a pattern of the rule wrote is registered as that version of its new key.
 - A file that already has a recorded mapping keeps its key; adding or changing rules never moves
   it. Use a rename to move such keys.
 - A run reports a file that matches several patterns as failed and does not import it.
@@ -258,19 +263,26 @@ pub async fn put_discovery(
 bucket, including request policies. Tokens with path restrictions are refused.
 
 **Behavior**
-- Only files whose bucket key the caller may read are listed.
-- `known`: the file has a recorded mapping and keeps its key whatever the rules say.
+- Files are placed as a run places them: a recorded mapping first, then an unfinished write of
+  the rule, then the file name. `version_id` is the version a run registers the file as.
+- Only files whose bucket key the caller may read are listed. A conflict is checked by its
+  key at the bucket root.
+- `known`: a recorded mapping or an unfinished write keeps its key whatever the rules say.
 - `matched`: one pattern matches; `key` is where the file goes.
-- `root`: no pattern matches; the file goes below the rule's own folder.
-- `conflict`: several patterns match; `patterns` names them and a run would not import it.
-  In a backend folder shared with other rules, a new file that no single rule's pattern
-  matches is a conflict with empty `patterns`.
+- `root`: no pattern matches; the file goes to the bucket root.
+- `conflict`: a run would report the file and not import it. `patterns` names the patterns
+  that all match it. Empty `patterns` means the name fits several keys or versions,
+  unfinished writes name different keys, or in a backend folder shared with other rules, no
+  single rule names a new file and the rules would give it different keys.
 - Files in the folders where Aruna stores its own objects are left out, as are files of a
-  shared folder that another rule recorded or alone matches.
+  shared folder that another rule recorded, writes or alone matches. Rules that all give a new
+  file the same root key of one bucket leave it to the oldest of them.
 - Whether a key is already taken is checked by the run, not here.
 
 **Limits**
-- One page holds up to 200 files; pass `next` as `after` for the next one.
+- One page lists up to 200 files; pass `next` as `after` for the next one. `next` names a
+  file this page shows. Pages without any file the caller may read are skipped, up to 2000
+  files in a row; more answer 400.
 - The rules follow the limits of `PUT` on the discovery path."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
@@ -331,6 +343,7 @@ pub async fn preview_rules(
             PreviewFileResponse {
                 path: file.path,
                 key: file.key,
+                version_id: file.version_id.map(|id| id.to_string()),
                 outcome: outcome.to_string(),
                 patterns,
             }

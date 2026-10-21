@@ -2,15 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::shared::{Claim, claim_file, read_shared};
-use super::{ImportRuleError, validate_folder};
+use super::shared::{Claim, claim_file, read_shared, taken_paths};
+use super::{ImportRuleError, read_earlier, validate_folder};
 use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
 use crate::blob::migration::misplaced::{Misplaced, count_misplaced};
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::parse_read;
 use crate::groups::backends::query::GetBackendOperation;
 use crate::groups::fence::{parse_group_record, read_group_record};
-use crate::jobs::backend_import::BlobRequest;
+use crate::jobs::backend_import::{BlobRequest, listed_intents};
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -20,18 +20,20 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, import_key, object_key,
+    BackendImport, ImportedObject, PathIdentity, WriteIntent, import_key, object_key,
 };
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::discovery::{
-    DiscoveryRule, DiscoveryRules, check_patterns, discovered_key,
+    DiscoveryRule, DiscoveryRules, IdentityError, check_patterns, file_identity,
 };
-use aruna_core::types::{Effects, GroupId, TxnId};
+use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use smallvec::smallvec;
 use ulid::Ulid;
 
 /// Files one preview page lists.
 pub const PREVIEW_PAGE: usize = 200;
+/// Listed pages one preview reads past when the caller may see none of their files.
+const HIDDEN_PAGES: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SetState {
@@ -258,14 +260,33 @@ pub async fn authorized_preview(
     start_after: Option<String>,
 ) -> Result<DiscoveryPreview, ImportRuleError> {
     let access = bucket_access(context, auth, node_id, rule).await?;
-    let mut preview = preview_discovery(context, rule, rules, start_after).await?;
-    preview.files.retain(|file| readable(&access, rule, file));
-    Ok(preview)
+    let mut after = start_after;
+    // `next` names only a file the caller sees, so hidden pages are read past here.
+    for _ in 0..HIDDEN_PAGES {
+        let mut preview = preview_discovery(context, rule, rules, after).await?;
+        preview.files.retain(|file| readable(&access, rule, file));
+        if preview.next.is_none() {
+            return Ok(preview);
+        }
+        if let Some(last) = preview.files.last() {
+            preview.next = Some(last.path.clone());
+            return Ok(preview);
+        }
+        after = preview.next;
+    }
+    Err(ImportRuleError::Invalid(
+        "too many files in a row are hidden from the caller".to_string(),
+    ))
 }
 
-/// A conflict has no key; its file is decided by the key the rule's folders give it.
+/// A conflict has no key; its file is decided by its key at the bucket root.
 fn readable(access: &BucketAccess, rule: &BackendImport, file: &PreviewFile) -> bool {
-    let key = file.key.clone().or_else(|| rule.aruna_key(&file.path));
+    let root = || {
+        file.path
+            .strip_prefix(&rule.backend_prefix)
+            .map(str::to_string)
+    };
+    let key = file.key.clone().or_else(root);
     key.is_some_and(|key| access.allows(Some(&key), &Permission::READ))
 }
 
@@ -278,8 +299,8 @@ pub enum FileOutcome {
     Matched,
     /// No pattern matched, so the file stays below the rule's own folder.
     Root,
-    /// Several patterns matched, or no single rule of a shared folder names the file; a run
-    /// reports the file and does not import it.
+    /// Several patterns matched, the name fits several keys or versions, open writes disagree,
+    /// or no single rule of a shared folder names the file; a run reports it and imports nothing.
     Conflict(Vec<String>),
 }
 
@@ -288,13 +309,15 @@ pub struct PreviewFile {
     pub path: String,
     /// The bucket key; `None` for a conflict.
     pub key: Option<String>,
+    /// The version the file name or the write intent names, which a run registers it as.
+    pub version_id: Option<Ulid>,
     pub outcome: FileOutcome,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveryPreview {
     pub files: Vec<PreviewFile>,
-    /// The last listed path, to continue after; `None` on the last page.
+    /// The path to continue after; `None` on the last page.
     pub next: Option<String>,
 }
 
@@ -353,47 +376,96 @@ pub async fn preview_discovery(
         }
     };
     let shared = read_shared(context, rule).await?;
+    let earlier = read_earlier(context, rule.import_id).await?;
+    let intents = listed_intents(context, rule, &objects).await;
+    let intents = intents.map_err(ImportRuleError::Read)?;
+    let paths: Vec<&str> = objects.iter().map(|object| object.key.as_str()).collect();
+    let taken = taken_paths(context, &shared, &paths).await?;
     let mut files = Vec::with_capacity(objects.len());
-    for (object, (_, row)) in objects.into_iter().zip(rows) {
+    for (object, (_, row)) in objects.iter().zip(rows) {
         let row = row
             .map(|row| ImportedObject::from_bytes(&row))
             .transpose()?;
-        let path = object.key;
+        let path = object.key.clone();
+        let names = (rule, earlier.as_slice(), rules);
+        let open = intents.get(&path).map_or(&[][..], Vec::as_slice);
         let file = match row {
-            Some(row) => PreviewFile {
-                key: row.key.or_else(|| rule.aruna_key(&path)),
-                outcome: FileOutcome::Known,
-                path,
-            },
-            // A file of a shared folder that another rule takes is not listed here.
-            None => match claim_file(context, (rule, rules), &shared, &path).await? {
-                Claim::Other => continue,
-                Claim::Conflict => PreviewFile {
-                    key: None,
-                    outcome: FileOutcome::Conflict(Vec::new()),
+            // A literal import whose name encodes a version is recovered as that version.
+            Some(row)
+                if row.key.is_some() || open.is_empty() && !decodes(rule, &earlier, &path) =>
+            {
+                PreviewFile {
+                    key: row.key.or_else(|| rule.aruna_key(&path)),
+                    version_id: None,
+                    outcome: FileOutcome::Known,
                     path,
-                },
-                Claim::Own => match discovered_key(rule, rules, &path) {
-                    None => continue,
-                    Some(Ok(key)) => PreviewFile {
-                        outcome: match discovered_key(rule, &[], &path) {
-                            Some(Ok(root)) if root == key => FileOutcome::Root,
-                            _ => FileOutcome::Matched,
-                        },
-                        key: Some(key),
-                        path,
-                    },
-                    Some(Err(patterns)) => PreviewFile {
-                        key: None,
-                        outcome: FileOutcome::Conflict(patterns),
-                        path,
-                    },
-                },
+                }
+            }
+            // An open write names the file only if all its intents agree.
+            _ if !open.is_empty() => intended(path, open),
+            Some(_) => named(names, path),
+            // A file of a shared folder that another rule takes is not listed here.
+            None => match claim_file(names, &shared, taken.contains(&path), &path) {
+                Claim::Other => continue,
+                Claim::Conflict => unresolved(path, Vec::new()),
+                Claim::Own => named(names, path),
             },
         };
         files.push(file);
     }
     Ok(DiscoveryPreview { files, next })
+}
+
+fn unresolved(path: String, patterns: Vec<String>) -> PreviewFile {
+    PreviewFile {
+        path,
+        key: None,
+        version_id: None,
+        outcome: FileOutcome::Conflict(patterns),
+    }
+}
+
+fn decodes(rule: &BackendImport, earlier: &[String], path: &str) -> bool {
+    rule.decode_any(path, earlier) != PathIdentity::Unmatched
+}
+
+/// The key the open writes of a file name, as a run reads them before the file name.
+fn intended(path: String, open: &[(Key, WriteIntent)]) -> PreviewFile {
+    let mut keys = open.iter().map(|(_, intent)| &intent.key);
+    let first = keys.next().cloned();
+    if !keys.all(|key| Some(key) == first.as_ref()) {
+        return unresolved(path, Vec::new());
+    }
+    let version_id = match open {
+        [(_, intent)] => Some(intent.version_id),
+        _ => None,
+    };
+    PreviewFile {
+        path,
+        key: first,
+        version_id,
+        outcome: FileOutcome::Known,
+    }
+}
+
+/// Where a run puts a file by its name, with the version id the name encodes.
+fn named(
+    (rule, earlier, rules): (&BackendImport, &[String], &[DiscoveryRule]),
+    path: String,
+) -> PreviewFile {
+    match file_identity(rule, earlier, rules, &path) {
+        None | Some(Err(IdentityError::Ambiguous)) => unresolved(path, Vec::new()),
+        Some(Err(IdentityError::Conflict(patterns))) => unresolved(path, patterns),
+        Some(Ok(found)) => PreviewFile {
+            path,
+            key: Some(found.key),
+            version_id: found.version_id,
+            outcome: match found.matched {
+                true => FileOutcome::Matched,
+                false => FileOutcome::Root,
+            },
+        },
+    }
 }
 
 #[cfg(test)]
@@ -438,6 +510,7 @@ mod tests {
         let file = |path: &str, key: Option<&str>| PreviewFile {
             path: path.to_string(),
             key: key.map(str::to_string),
+            version_id: None,
             outcome: FileOutcome::Matched,
         };
         // A file shows only when the caller may read its key, also a conflict without one.
@@ -454,8 +527,6 @@ mod tests {
         let refused = bucket_access(&context, &stranger, node, &rule).await;
         assert!(matches!(refused, Err(ImportRuleError::Forbidden)));
     }
-    use aruna_core::types::Key;
-
     fn storage(event: StorageEvent) -> Event {
         Event::Storage(event)
     }
