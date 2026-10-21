@@ -143,6 +143,11 @@ impl<'a> KeyWalk<'a> {
     }
 }
 
+/// A version with its stored row, and the linked file it reads.
+type Member = (Ulid, Vec<u8>, Ulid);
+/// A version with its stored row.
+type Reader = (Ulid, Vec<u8>);
+
 /// The linked files of `key` with the same content as another of its files, by content.
 async fn duplicates(
     context: &DriverContext,
@@ -151,7 +156,7 @@ async fn duplicates(
     versions: Vec<(Ulid, Vec<u8>)>,
 ) -> Result<Vec<Duplicate>, String> {
     let mut found = Vec::new();
-    let mut groups: BTreeMap<([u8; 32], Vec<u8>), Vec<(Ulid, Vec<u8>, Ulid)>> = BTreeMap::new();
+    let mut groups: BTreeMap<([u8; 32], Vec<u8>), Vec<Member>> = BTreeMap::new();
     for (id, value) in versions {
         let version = BlobVersion::from_bytes(&value).map_err(|error| error.to_string())?;
         let BlobVersionState::Materialized {
@@ -175,7 +180,7 @@ async fn duplicates(
         if files.len() < 2 {
             continue;
         }
-        let mut files: Vec<(BackendLocation, Vec<(Ulid, Vec<u8>)>)> = Vec::new();
+        let mut files: Vec<(BackendLocation, Vec<Reader>)> = Vec::new();
         for (id, value, _) in &members {
             let version = BlobVersion::from_bytes(value).map_err(|error| error.to_string())?;
             let Some(location_key) = version.location_key() else {

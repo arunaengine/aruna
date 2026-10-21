@@ -129,9 +129,8 @@ pub async fn storage_files(
     let mut rules: HashMap<Vec<u8>, Vec<BackendImport>> = HashMap::new();
     for file in &files {
         let backend = file.location.backend.key_bytes();
-        if !rules.contains_key(&backend) {
-            let found = rules_on(context, group_id, &file.location.backend).await?;
-            rules.insert(backend, found);
+        if let std::collections::hash_map::Entry::Vacant(entry) = rules.entry(backend) {
+            entry.insert(rules_on(context, group_id, &file.location.backend).await?);
         }
     }
     for file in &mut files {

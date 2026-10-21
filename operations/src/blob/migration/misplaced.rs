@@ -188,6 +188,9 @@ pub const MAX_PAGE: usize = 1000;
 const TOTAL_ROWS: usize = 2_000_000;
 const PAGE_ROWS: usize = 200_000;
 
+/// A check of a key against the caller's access.
+pub type KeyCheck<'a> = dyn Fn(&str) -> bool + Sync + 'a;
+
 /// One page of the linked files a rename gives their current name, with the totals.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RenamePage {
@@ -205,10 +208,7 @@ pub struct RenamePage {
 pub async fn rename_page(
     context: &DriverContext,
     (bucket, prefix): (&str, &str),
-    (readable, writable): (
-        &(dyn Fn(&str) -> bool + Sync),
-        &(dyn Fn(&str) -> bool + Sync),
-    ),
+    (readable, writable): (&KeyCheck<'_>, &KeyCheck<'_>),
     (filter, after, limit): (Option<&str>, Option<Vec<u8>>, usize),
 ) -> Result<RenamePage, String> {
     let mut page = RenamePage {

@@ -638,7 +638,7 @@ mod tests {
         // A row of another backend version at the path reads other bytes: no pin, but the
         // path stays in use.
         let other = version_key(raw.ulid).to_vec();
-        let value = b"v0".to_vec().into();
+        let value = b"v0".to_vec();
         put(&context, BACKEND_VERSION_KEYSPACE, other.into(), value).await;
         assert_eq!(pinned(&context, &old(), "v1").await.unwrap(), Some(true));
     }

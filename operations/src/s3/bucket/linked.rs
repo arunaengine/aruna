@@ -125,13 +125,16 @@ impl Rows {
 }
 
 /// The rows an action writes and the job it leaves, decided on what the transaction read.
+/// The rows a job change writes and deletes, and the job it leaves.
+type Decided = (Vec<(String, Key, Value)>, Vec<(String, Key)>, BucketJob);
+
 fn decide(
     rows: Rows,
     bucket: &str,
     group_id: GroupId,
     action: &LinkedAction,
     now_ms: u64,
-) -> Result<(Vec<(String, Key, Value)>, Vec<(String, Key)>, BucketJob), LinkedError> {
+) -> Result<Decided, LinkedError> {
     match rows.bucket.as_ref() {
         Some(info) if info.group_id == group_id => {}
         _ => return Err(LinkedError::NotFound),

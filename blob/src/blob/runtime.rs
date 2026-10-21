@@ -928,7 +928,7 @@ impl BlobHandler {
                 resolved,
                 plain,
                 source,
-            } => Box::pin(self.copy_plain(resolved, plain, source)).await,
+            } => Box::pin(self.copy_plain(resolved, plain, *source)).await,
             BlobEffect::StatCopy { location } => Box::pin(self.stat_copy(location)).await,
             BlobEffect::StatPlain { backend, path } => {
                 Box::pin(self.stat_plain(backend, path)).await

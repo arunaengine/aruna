@@ -579,7 +579,7 @@ impl MigrateVersionOperation {
             let copy = smallvec![Effect::Blob(BlobEffect::CopyPlain {
                 resolved,
                 plain,
-                source: old,
+                source: Box::new(old),
             })];
             return self.intent_first(copy, created_by);
         }
@@ -3374,7 +3374,7 @@ mod tests {
             else {
                 panic!("expected the copy to the new file, got {effects:?}")
             };
-            assert_eq!(source, &old);
+            assert_eq!(**source, old);
             // A rename takes its exact new name or nothing.
             assert!(plain.if_not_exists && plain.exact);
             let plain = plain.clone();

@@ -359,7 +359,7 @@ pub enum BlobEffect {
     CopyPlain {
         resolved: ResolvedBackend,
         plain: PlainPath,
-        source: BackendLocation,
+        source: Box<BackendLocation>,
     },
     /// Answers `CopyStat`: whether the backend still has the object of `location`.
     StatCopy {
