@@ -1278,7 +1278,7 @@ async fn register_twin(
     }
 }
 
-/// Version rows of one key one search for the same content reads at most.
+/// Version rows one page of the search for the same content reads.
 const TWIN_SCAN: usize = 1024;
 
 /// A version id of the time `at`.
@@ -1376,15 +1376,25 @@ async fn candidates(
 ) -> Result<Vec<(Key, Value, Ulid, [u8; 32])>, ItemError> {
     let prefix = VersionKey::object_prefix(&rule.bucket, key)
         .map_err(|error| ItemError::Item(error.to_string()))?;
-    let page = super::store::iter_prefix_page(
-        &context.storage_handle,
-        BLOB_VERSIONS_KEYSPACE,
-        Some(prefix.into()),
-        None,
-        TWIN_SCAN,
-        None,
-    );
-    let (rows, _) = page.await.map_err(ItemError::System)?;
+    // Every version is compared, so a miss proves other bytes.
+    let mut rows = Vec::new();
+    let mut after = None;
+    loop {
+        let page = super::store::iter_prefix_page(
+            &context.storage_handle,
+            BLOB_VERSIONS_KEYSPACE,
+            Some(prefix.clone().into()),
+            after.take(),
+            TWIN_SCAN,
+            None,
+        );
+        let (page, next) = page.await.map_err(ItemError::System)?;
+        rows.extend(page);
+        match next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
     let backend = BackendRef::Group(rule.backend_id);
     let mut found = Vec::new();
     for (stored, value) in rows {
@@ -2690,6 +2700,28 @@ mod tests {
                 );
             }
         }
+        // A long history before them is read to its end.
+        let filler = BlobVersion::materialized(
+            [9; 32],
+            BackendRef::Group(Ulid::from_parts(6, 6)),
+            EncodingClass::Raw,
+            std::time::SystemTime::UNIX_EPOCH,
+            Default::default(),
+            None,
+        );
+        let writes = (0..1100)
+            .map(|at| {
+                let key = VersionKey::new("bucket", "in/a", Ulid::from_parts(0, at));
+                let value = filler.to_bytes().unwrap().into();
+                let key = key.to_bytes().unwrap().into();
+                (BLOB_VERSIONS_KEYSPACE.to_string(), key, value)
+            })
+            .collect();
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(write).await;
         let object = ExternalObject {
             key: "raw/a".to_string(),
             size: 4,
