@@ -643,9 +643,14 @@ impl Stage<'_> {
         )];
         let provider = self.batch(read).await?.pop().flatten();
         let provider = provider.map(|provider| String::from_utf8_lossy(&provider).into_owned());
+        let unversioned = provider.is_none();
         let claim = claim_key(&found.keep, &provider.unwrap_or_default()).map_err(error)?;
         let read = vec![(DELETE_CLAIM_KEYSPACE.to_string(), claim)];
         if self.batch(read).await?.pop().flatten().is_some() {
+            return Ok(Unified::Changed);
+        }
+        // Without a backend version the kept file must still hold the bytes it was found with.
+        if unversioned && !self.kept_unchanged().await? {
             return Ok(Unified::Changed);
         }
         // Which copy each version reads now; any change refuses the whole key.
@@ -793,6 +798,48 @@ impl Stage<'_> {
             }
         }
         Ok(false)
+    }
+
+    /// Whether the kept file still has the size and the full ETag its row recorded, as a
+    /// listing of its path shows them now.
+    async fn kept_unchanged(&self) -> Result<bool, String> {
+        let keep = &self.found.keep;
+        let Some(blob) = self.context.blob_handle.as_ref() else {
+            return Ok(false);
+        };
+        let reads = (self.rules.iter())
+            .map(|rule| {
+                let row = object_key(rule.import_id, &keep.backend_path);
+                (IMPORTED_OBJECT_KEYSPACE.to_string(), row)
+            })
+            .collect();
+        let mut recorded = None;
+        for row in self.batch(reads).await?.into_iter().flatten() {
+            let row = ImportedObject::from_bytes(&row).map_err(|error| error.to_string())?;
+            if row.key.as_deref() == Some(self.found.key.as_str()) {
+                recorded = row.etag;
+            }
+        }
+        let Some(recorded) = recorded else {
+            return Ok(false);
+        };
+        let list = aruna_core::effects::BlobEffect::ListExternal {
+            backend: keep.backend.clone(),
+            prefix: keep.backend_path.clone(),
+            start_after: None,
+            limit: 1,
+        };
+        let unquoted = |etag: &str| etag.trim_matches('"').to_string();
+        match blob.send_blob_effect(list).await {
+            Event::Blob(aruna_core::events::BlobEvent::ExternalListed { objects, .. }) => {
+                Ok(objects.first().is_some_and(|object| {
+                    object.key == keep.backend_path
+                        && object.size == keep.blob_size
+                        && object.etag.as_deref().map(unquoted) == Some(unquoted(&recorded))
+                }))
+            }
+            other => Err(format!("could not list the kept file: {other:?}")),
+        }
     }
 
     /// Charges the kept file's new location row, as reclaim debits the released one.

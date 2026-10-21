@@ -752,3 +752,27 @@ async fn s3_purges_named() {
     assert!(!exists(&context, &named).await);
     assert!(exists(&context, "old/b.txt").await);
 }
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_keeps_changed() {
+    // A plain file overwritten after the duplicates were found is not made the kept one, and
+    // the file named by the id stays.
+    let context = setup_pattern("{dir}{id}_{name}").await;
+    let id = Ulid::generate();
+    let named = format!("old/{id}_a.txt");
+    place(&context, &named, b"same bytes").await;
+    place(&context, "old/a.txt", b"same bytes").await;
+    assert_eq!(run_import(&context, 0xC3).await, (2, 0, 0));
+    let page = duplicates(&context).await;
+    let [found] = page.entries.as_slice() else {
+        panic!("expected one key with copies: {page:?}")
+    };
+    place(&context, "old/a.txt", b"other byte").await;
+    let bucket = (BUCKET, context.group_id);
+    let unified = unify(&context.driver, bucket, found, None).await.unwrap();
+    assert_eq!(unified, Unified::Changed);
+    process_cleanup_batch(&context.driver).await.unwrap();
+    assert!(exists(&context, &named).await);
+    assert_eq!(content(&context, "old/a.txt", id).await, b"same bytes");
+}
