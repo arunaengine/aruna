@@ -2088,7 +2088,7 @@ async fn retire_intents(
             continue;
         }
         let import = Ulid::from_bytes(import.try_into().map_err(|_| "bad intent key")?);
-        if !abandon(context, (intent, import), path).await? {
+        if !abandon(context, (key, intent, import), path).await? {
             return Ok(false);
         }
     }
@@ -2129,11 +2129,17 @@ async fn read_path(
     }
 }
 
+/// The cleanup key of the release of an abandoned copy: its intent, a tag and its version.
+fn release_key(intent_row: &[u8], version: &str) -> Vec<u8> {
+    [intent_row, &[1], version.as_bytes()].concat()
+}
+
 /// Queues the release of the file at `path` if it holds the bytes `intent` recorded and has a
-/// backend version; `false` when the storage cannot be asked yet.
+/// backend version, keyed by the intent and that version so a replay queues it once; `false`
+/// when the storage cannot be asked yet.
 async fn abandon(
     context: &crate::driver::DriverContext,
-    (intent, import_id): (&WriteIntent, Ulid),
+    (intent_row, intent, import_id): (&[u8], &WriteIntent, Ulid),
     path: String,
 ) -> Result<bool, String> {
     let Some(blob_handle) = context.blob_handle.as_ref() else {
@@ -2169,6 +2175,7 @@ async fn abandon(
         return Ok(true);
     }
     location.format.layout = StoredLayout::Plain(location.ulid);
+    let key = release_key(intent_row, &version);
     let work = BlobCleanupWork::ReleaseRenamed {
         location,
         import_id,
@@ -2178,7 +2185,7 @@ async fn abandon(
     let value = work.to_bytes().map_err(|error| error.to_string())?;
     let write = StorageEffect::Write {
         key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-        key: Ulid::generate().to_bytes().to_vec().into(),
+        key: key.into(),
         value: value.into(),
         txn_id: None,
     };
@@ -2918,6 +2925,19 @@ mod tests {
             queued,
             Event::Storage(StorageEvent::ReadResult { value: None, .. })
         ));
+    }
+
+    #[test]
+    fn keys_copy_releases() {
+        // A replayed settlement writes the release of one copy version at one key only.
+        let row = intent_key(
+            Ulid::from_parts(2, 2),
+            "raw/a.csv~X",
+            Ulid::from_parts(9, 9),
+        );
+        assert_eq!(release_key(&row, "v1"), release_key(&row, "v1"));
+        assert_ne!(release_key(&row, "v1"), release_key(&row, "v2"));
+        assert_ne!(release_key(&row, "v1"), row.to_vec());
     }
 
     #[tokio::test]
