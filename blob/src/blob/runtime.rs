@@ -932,7 +932,10 @@ impl BlobHandler {
                 source,
             } => Box::pin(self.copy_plain(resolved, plain, *source)).await,
             BlobEffect::StatCopy { location } => Box::pin(self.stat_copy(location)).await,
-            BlobEffect::SettleCopy { attempt } => Box::pin(self.settle_copy(attempt)).await,
+            BlobEffect::SettleCopy { attempt, upload } => {
+                let upload = upload.map(|(location, id)| (*location, id));
+                Box::pin(self.settle_copy(attempt, upload)).await
+            }
             BlobEffect::StatPlain { backend, path } => {
                 Box::pin(self.stat_plain(backend, path)).await
             }

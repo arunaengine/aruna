@@ -361,10 +361,12 @@ pub enum BlobEffect {
         plain: PlainPath,
         source: Box<BackendLocation>,
     },
-    /// Aborts the provider upload a copy `attempt` recorded, if any, and forgets it; answers
-    /// `UploadAborted`. Uploads of other attempts at the path stay.
+    /// Aborts the provider upload a copy `attempt` recorded, or exactly `upload` when given,
+    /// and forgets the record only while it still names that upload; answers `UploadAborted`.
+    /// Uploads of other attempts at the path stay.
     SettleCopy {
         attempt: Ulid,
+        upload: Option<(Box<BackendLocation>, String)>,
     },
     /// Answers `CopyStat`: whether the backend still has the object of `location`.
     StatCopy {

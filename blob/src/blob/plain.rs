@@ -243,19 +243,80 @@ impl BlobHandler {
 
     /// Aborts the provider upload copy `attempt` recorded, if any, and forgets it.
     pub(super) async fn settle_upload(&self, attempt: ulid::Ulid) -> Result<(), BlobError> {
-        let Some((location, upload_id)) = self.copy_upload(attempt).await? else {
+        let Some(upload) = self.copy_upload(attempt).await? else {
             return Ok(());
         };
+        self.settle_exact(attempt, upload).await
+    }
+
+    /// Aborts exactly `upload` and forgets the record of `attempt` only while it still names
+    /// it, in one transaction, so a newer try of the attempt keeps its own record.
+    async fn settle_exact(
+        &self,
+        attempt: ulid::Ulid,
+        (location, upload_id): (BackendLocation, String),
+    ) -> Result<(), BlobError> {
         let native = self.native_upload(&location)?;
         native
             .abort(&self.object_path(&location)?, &upload_id)
             .await?;
-        self.record_upload(attempt, None).await
+        let storage = &self.storage;
+        let failed = |event: Event| BlobError::WriteError(format!("copy upload record: {event:?}"));
+        let started = StorageEffect::StartTransaction { read: false };
+        let txn_id = match storage.send_effect(Effect::Storage(started)).await {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            other => return Err(failed(other)),
+        };
+        let key: aruna_core::types::Key = attempt.to_bytes().to_vec().into();
+        let read = StorageEffect::Read {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: key.clone(),
+            txn_id: Some(txn_id),
+        };
+        let current = match storage.send_effect(Effect::Storage(read)).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            other => return Err(failed(other)),
+        };
+        let same = current
+            .as_deref()
+            .map(BlobCleanupWork::from_bytes)
+            .is_some_and(|work| {
+                matches!(work, Ok(BlobCleanupWork::SettleUpload { upload_id: current, .. })
+                if current == upload_id)
+            });
+        let effect = match same {
+            true => StorageEffect::Delete {
+                key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+                key,
+                txn_id: Some(txn_id),
+            },
+            false => StorageEffect::AbortTransaction { txn_id },
+        };
+        let answer = storage.send_effect(Effect::Storage(effect)).await;
+        if !same {
+            return Ok(());
+        }
+        if !matches!(answer, Event::Storage(StorageEvent::DeleteResult { .. })) {
+            return Err(failed(answer));
+        }
+        let commit = StorageEffect::CommitTransaction { txn_id };
+        match storage.send_effect(Effect::Storage(commit)).await {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+            other => Err(failed(other)),
+        }
     }
 
     /// Answers `SettleCopy`.
-    pub(super) async fn settle_copy(&self, attempt: ulid::Ulid) -> BlobEvent {
-        match self.settle_upload(attempt).await {
+    pub(super) async fn settle_copy(
+        &self,
+        attempt: ulid::Ulid,
+        upload: Option<(BackendLocation, String)>,
+    ) -> BlobEvent {
+        let settled = match upload {
+            Some(upload) => self.settle_exact(attempt, upload).await,
+            None => self.settle_upload(attempt).await,
+        };
+        match settled {
             Ok(()) => BlobEvent::UploadAborted,
             Err(error) => BlobEvent::Error(error),
         }

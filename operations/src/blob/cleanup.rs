@@ -479,7 +479,10 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
             None => RowOutcome::Failed,
         },
         BlobCleanupWork::SettleUpload {
-            attempt, since_ms, ..
+            attempt,
+            location,
+            upload_id,
+            since_ms,
         } => {
             let now = crate::effect_adapters::routing::now_ms();
             // A copy may still be running; only an upload past the grace is its leftover.
@@ -489,7 +492,9 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
             let Some(blob_handle) = context.blob_handle.as_ref() else {
                 return RowOutcome::Failed;
             };
-            let effect = BlobEffect::SettleCopy { attempt };
+            // Exactly the decoded upload; a newer try of the attempt keeps its own.
+            let upload = Some((Box::new(location), upload_id));
+            let effect = BlobEffect::SettleCopy { attempt, upload };
             match blob_handle.send_blob_effect(effect).await {
                 Event::Blob(BlobEvent::UploadAborted) => RowOutcome::Done,
                 event => {

@@ -586,6 +586,7 @@ impl MigrateVersionOperation {
         self.state = MigrateState::SettleCopy;
         smallvec![Effect::Blob(BlobEffect::SettleCopy {
             attempt: self.attempt(),
+            upload: None,
         })]
     }
 
@@ -3929,7 +3930,10 @@ mod tests {
                     let attempt = Ulid::from(u128::from(old.ulid) ^ 1);
                     assert_eq!(
                         effects.as_slice(),
-                        [Effect::Blob(BlobEffect::SettleCopy { attempt })]
+                        [Effect::Blob(BlobEffect::SettleCopy {
+                            attempt,
+                            upload: None
+                        })]
                     );
                     let effects = operation.step(Event::Blob(BlobEvent::UploadAborted));
                     assert!(matches!(
