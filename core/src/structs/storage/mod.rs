@@ -15,6 +15,7 @@ pub mod delete_audit;
 pub mod discovery;
 pub mod encryption;
 pub mod format;
+pub mod glob;
 pub mod group_backend;
 pub mod holders;
 pub mod key_audit;

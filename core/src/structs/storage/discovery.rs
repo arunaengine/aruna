@@ -4,6 +4,7 @@
 
 use crate::errors::ConversionError;
 use crate::structs::storage::backend_import::BackendImport;
+use crate::structs::storage::glob::{check_glob, glob_match, globs_overlap};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -14,7 +15,8 @@ pub const MAX_DISCOVERY_RULES: usize = 32;
 pub const MAX_PATTERN_LEN: usize = 128;
 
 /// Sends an unmapped file whose name matches `pattern` to `folder` below the rule's
-/// `key_prefix`. `*` matches any characters of the name, `?` one; all else is literal.
+/// `key_prefix`. `*` matches any text, `?` one character, `[0-9]` one of a set, `{4}` or
+/// `{2,8}` repeats a set or `?` and `{fna,fa}` either text.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiscoveryRule {
     pub pattern: String,
@@ -66,6 +68,7 @@ pub fn check_patterns(rules: &[DiscoveryRule]) -> Result<(), String> {
                 "pattern `{pattern}` must not hold `/` or control characters"
             ));
         }
+        check_glob(pattern)?;
         if let Some(other) = rules[..index]
             .iter()
             .find(|other| globs_overlap(&other.pattern, pattern))
@@ -77,71 +80,6 @@ pub fn check_patterns(rules: &[DiscoveryRule]) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// Matches the whole name against a pattern of `*`, `?` and literal characters.
-pub fn glob_match(pattern: &str, name: &str) -> bool {
-    let (pattern, name): (Vec<char>, Vec<char>) =
-        (pattern.chars().collect(), name.chars().collect());
-    let (mut p, mut n) = (0, 0);
-    // The last star and the name position it resumes from.
-    let mut star: Option<(usize, usize)> = None;
-    while n < name.len() {
-        match pattern.get(p) {
-            Some('*') => {
-                star = Some((p, n));
-                p += 1;
-            }
-            Some(&c) if c == '?' || c == name[n] => {
-                p += 1;
-                n += 1;
-            }
-            _ => match star {
-                Some((at, from)) => {
-                    p = at + 1;
-                    n = from + 1;
-                    star = Some((at, from + 1));
-                }
-                None => return false,
-            },
-        }
-    }
-    pattern[p..].iter().all(|&c| c == '*')
-}
-
-/// Whether some name matches both patterns, by walking both patterns side by side.
-pub fn globs_overlap(left: &str, right: &str) -> bool {
-    let (a, b): (Vec<char>, Vec<char>) = (left.chars().collect(), right.chars().collect());
-    let width = b.len() + 1;
-    let mut seen = vec![false; (a.len() + 1) * width];
-    let mut stack = vec![(0, 0)];
-    while let Some((i, j)) = stack.pop() {
-        if std::mem::replace(&mut seen[i * width + j], true) {
-            continue;
-        }
-        if i == a.len() && j == b.len() {
-            return true;
-        }
-        let (x, y) = (a.get(i).copied(), b.get(j).copied());
-        if x == Some('*') {
-            stack.push((i + 1, j));
-        }
-        if y == Some('*') {
-            stack.push((i, j + 1));
-        }
-        let (Some(x), Some(y)) = (x, y) else {
-            continue;
-        };
-        // One character both accept; a star stays to accept more.
-        let wild = |c: char| c == '*' || c == '?';
-        if wild(x) || wild(y) || x == y {
-            let next = (i + usize::from(x != '*'), j + usize::from(y != '*'));
-            if next != (i, j) {
-                stack.push(next);
-            }
-        }
-    }
-    false
 }
 
 /// Places a file by its name; overlapping stored rules still give a conflict, never a guess.
@@ -267,9 +205,9 @@ mod tests {
         assert!(!glob_match("s?mple", "smple"));
         assert!(glob_match("a*b*c", "a-b-b-c"));
         assert!(!glob_match("a*b*c", "a-c-b"));
-        // Brackets and dots are literal.
-        assert!(glob_match("[x].txt", "[x].txt"));
-        assert!(!glob_match("[x].txt", "x.txt"));
+        // Dots are literal; brackets make a set.
+        assert!(glob_match("[x].txt", "x.txt"));
+        assert!(!glob_match("[x].txt", "[x].txt"));
     }
 
     #[test]

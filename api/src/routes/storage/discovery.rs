@@ -35,7 +35,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct DiscoveryRuleBody {
-    /// File name pattern: `*` matches any characters, `?` one, all else is literal.
+    /// File name pattern: `*` any text, `?` one character, `[0-9]` or `[!x]` one of a set,
+    /// `{4}` or `{2,8}` after a set or `?` repeats it, `{fna,fa}` either text.
     pub pattern: String,
     /// Folder below the rule's `key_prefix` for matching files, ending with `/`.
     pub folder: String,
@@ -179,8 +180,10 @@ bucket, including request policies. Tokens with path restrictions are refused.
 - A file without a recorded mapping whose name matches one pattern is imported at `key_prefix` +
   `folder` + its path below `backend_prefix`, so subfolders stay. A file that matches no pattern
   is imported at `key_prefix` + its path, as without rules.
-- Patterns match the file name only, without its folders. `*` matches any characters and `?`
-  one; every other character is literal. Matching ignores the version id that the rule's
+- Patterns match the file name only, without its folders: `*` any text, `?` one character,
+  `[abc]`, `[0-9]` or `[!x]` one character of a set, `{4}` or `{2,8}` right after a set or `?`
+  that many of it, and `{fna,fa}` either text. Every other character is literal. There are no
+  regular expressions. Matching ignores the version id that the rule's
   `write_pattern` or a `~<version id>` tag adds to a name.
 - A file that already has a recorded mapping keeps its key; adding or changing rules never moves
   it. Use a rename to move such keys.
@@ -190,6 +193,8 @@ bucket, including request policies. Tokens with path restrictions are refused.
 
 **Limits**
 - At most 32 patterns of 1 to 128 characters, without `/` or control characters.
+- A `{...}` group holds 2 to 8 plain alternatives, and the groups of a pattern spell out at
+  most 32 names. A count is 1 to 64, the smaller number first. Malformed patterns answer 400.
 - Two patterns that can match the same name are refused (400), whatever their order.
 - Each folder is a relative folder ending with `/`."#,
     params(
