@@ -166,7 +166,7 @@ pub struct LinkConflict {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct LinkStatus {
-    /// Files the last finished sync went over; omitted before one.
+    /// Not counted per caller yet; always omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<u64>,
     /// Not counted yet; always omitted.
@@ -709,7 +709,9 @@ pub async fn control_job(
     path = "/data/groups/{group_id}/storage/imports/{import_id}/organize/status",
     tag = "data/storage",
     summary = "Show what the link holds",
-    description = r#"Shows what the last finished sync of the rule found, without reading the storage again: the files it went over and the files it could not take, such as a file two links claim.
+    description = r#"Shows the files the last sync of the rule could not take, such as a file two links claim, without reading the storage again.
+
+A file is shown only when the caller may read every key the rule may give it: its recorded key, its key under the rule's folders and its discovery key.
 
 **Authentication**: as the previews.
 
@@ -721,7 +723,6 @@ pub async fn control_job(
     ),
     responses(
         (status = 200, description = "The link's last sync", body = LinkStatus, example = json!({
-            "files": 300000,
             "conflicts": [{"path": "raw/a.faa.gz", "reason": "another link records the file"}]
         })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
@@ -736,7 +737,8 @@ pub async fn link_status(
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<Json<LinkStatus>> {
     let (rule, _, access) = caller(&state, auth, (&group_id, &import_id)).await?;
-    let run = last_run(&state.get_ctx(), &rule).await.map_err(map_error)?;
+    let context = state.get_ctx();
+    let run = last_run(&context, &rule).await.map_err(map_error)?;
     let Some(run) = run else {
         return Ok(Json(LinkStatus {
             files: None,
@@ -744,32 +746,70 @@ pub async fn link_status(
             conflicts: Vec::new(),
         }));
     };
-    let finished = run.state.is_terminal();
-    let checkpoint = run.checkpoint;
-    let files = checkpoint.imported + checkpoint.skipped + checkpoint.failed;
-    Ok(Json(LinkStatus {
-        files: finished.then_some(files),
-        bytes: None,
-        conflicts: (checkpoint.errors.into_iter())
-            .filter(|failure| shown(&rule, &access, &failure.key))
-            .map(|failure| LinkConflict {
+    let rules = aruna_operations::groups::imports::discovery::read_discovery(
+        &context,
+        rule.group_id,
+        rule.import_id,
+    )
+    .await
+    .map_err(map_error)?;
+    let earlier = aruna_operations::groups::imports::read_earlier(&context, rule.import_id)
+        .await
+        .map_err(map_error)?;
+    let mut conflicts = Vec::new();
+    for failure in run.checkpoint.errors {
+        let keys = file_keys(&context, (&rule, &earlier, &rules), &failure.key).await?;
+        let read = |key: &String| access.allows(Some(key), &Permission::READ);
+        if !keys.is_empty() && keys.iter().all(read) {
+            conflicts.push(LinkConflict {
                 path: failure.key,
                 reason: failure.error,
-            })
-            .collect(),
+            });
+        }
+    }
+    Ok(Json(LinkStatus {
+        files: None,
+        bytes: None,
+        conflicts,
     }))
 }
 
-/// A failed file is shown only when the caller may read every key the rule may give it: its
-/// key under the rule's folders and its key at the bucket root.
-fn shown(rule: &BackendImport, access: &BucketAccess, path: &str) -> bool {
-    let read = |key: &str| access.allows(Some(key), &Permission::READ);
-    let root = path.strip_prefix(&rule.backend_prefix);
-    let mapped = rule.aruna_key(path);
-    match (mapped, root) {
-        (Some(mapped), Some(root)) => read(&mapped) && read(root),
-        _ => false,
+/// Every key the rule may give the file at `path`: the key its row records, the key its
+/// folders give it, and the key discovery gives it. Empty when none is known.
+async fn file_keys(
+    context: &aruna_operations::driver::DriverContext,
+    (rule, earlier, rules): (
+        &BackendImport,
+        &[String],
+        &[aruna_core::structs::storage::discovery::DiscoveryRule],
+    ),
+    path: &str,
+) -> ServerResult<Vec<String>> {
+    use aruna_core::structs::storage::backend_import::{ImportedObject, object_key};
+    use aruna_core::structs::storage::discovery::file_identity;
+    let read = aruna_core::effects::StorageEffect::Read {
+        key_space: aruna_core::keyspaces::IMPORTED_OBJECT_KEYSPACE.to_string(),
+        key: object_key(rule.import_id, path),
+        txn_id: None,
+    };
+    let row = match context.storage_handle.send_storage_effect(read).await {
+        aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::ReadResult {
+            value,
+            ..
+        }) => value,
+        other => return Err(ServerError::InternalError(format!("{other:?}"))),
+    };
+    let row = row.as_deref().map(ImportedObject::from_bytes).transpose();
+    let row = row.map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let mut keys: Vec<String> = row.and_then(|row| row.key).into_iter().collect();
+    keys.extend(rule.aruna_key(path));
+    match file_identity(rule, earlier, rules, path) {
+        Some(Ok(identity)) => keys.push(identity.key),
+        // A file of several patterns or keys names nothing a caller could be shown safely.
+        Some(Err(_)) => return Ok(Vec::new()),
+        None => {}
     }
+    Ok(keys)
 }
 
 #[cfg(test)]

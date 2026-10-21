@@ -230,11 +230,13 @@ async fn hides_unmapped_failures() {
         .await
         .unwrap()
         .unwrap();
-    let scope = (test.auth.realm_id, group, test.state.get_node_id());
-    let access = BucketAccess::load(&context, &test.auth, scope, &test.bucket)
+    // A file under the rule's folder has keys to check; one outside it has none to show.
+    let inside = file_keys(&context, (&rule, &[], &[]), "raw/a.faa.gz")
         .await
         .unwrap();
-    // A failed file is shown by the keys the rule gives it; one outside its folder has none.
-    assert!(shown(&rule, &access, "raw/a.faa.gz"));
-    assert!(!shown(&rule, &access, "elsewhere/a.faa.gz"));
+    assert_eq!(inside, ["a.faa.gz", "a.faa.gz"]);
+    let outside = file_keys(&context, (&rule, &[], &[]), "elsewhere/a")
+        .await
+        .unwrap();
+    assert!(outside.is_empty());
 }
