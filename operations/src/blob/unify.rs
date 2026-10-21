@@ -14,17 +14,19 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE,
     BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    IMPORTED_OBJECT_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE, LINKED_JOB_KEYSPACE, MANAGED_COPY_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, ImportedObject, object_key, version_key,
 };
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BackendRef, BlobCleanupWork, BlobVersion, BlobVersionState, VersionKey,
+    BackendLocation, BackendRef, BlobCleanupWork, BlobVersion, BlobVersionState, ManagedCopyKey,
+    ManagedCopyRecord, VersionKey,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::linked_job::LinkedJob;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::{GroupId, Key, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -168,6 +170,11 @@ async fn duplicates(
             .push((id, value, *location));
     }
     for members in groups.into_values() {
+        // Only content that two files hold needs its location rows read.
+        let files: std::collections::HashSet<_> = members.iter().map(|(.., at)| *at).collect();
+        if files.len() < 2 {
+            continue;
+        }
         let mut files: Vec<(BackendLocation, Vec<(Ulid, Vec<u8>)>)> = Vec::new();
         for (id, value, _) in &members {
             let version = BlobVersion::from_bytes(value).map_err(|error| error.to_string())?;
@@ -280,20 +287,23 @@ pub async fn preview_page(
     Ok(page)
 }
 
-/// Unifies the next keys after `cursor`. A key the caller may not write, or one written after
-/// `started_ms`, keeps its files.
+/// Unifies the next keys after the job's cursor. A key the caller may not write, or one
+/// written after the job started, keeps its files. Each key changes in one transaction with
+/// the job's progress, and only while the job is stored as read, so a paused or aborted job
+/// changes nothing more.
 pub async fn job_page(
     context: &DriverContext,
     (bucket, prefix): (&str, &str),
     access: &BucketAccess,
-    (cursor, started_ms): (Option<String>, u64),
+    job: &LinkedJob,
 ) -> Result<JobStep, String> {
     let routing = move_routing(context, bucket).await?;
+    let mut current = job.clone();
     let mut step = JobStep {
-        cursor: cursor.clone(),
+        cursor: job.cursor.clone(),
         ..JobStep::default()
     };
-    let mut walk = KeyWalk::new(context, bucket, cursor.as_deref());
+    let mut walk = KeyWalk::new(context, bucket, job.cursor.as_deref());
     let mut unified = 0;
     loop {
         if unified == JOB_KEYS || walk.scanned > JOB_SCAN {
@@ -306,34 +316,64 @@ pub async fn job_page(
         if key.starts_with(prefix) {
             let fresh = versions
                 .iter()
-                .all(|(id, _)| id.timestamp_ms() <= started_ms);
+                .all(|(id, _)| id.timestamp_ms() <= job.started_at_ms);
             let found = duplicates(context, routing.as_ref(), (bucket, &key), versions).await?;
             let allowed = access.allows(Some(&key), &Permission::WRITE) && fresh;
             for found in found {
-                match (allowed, routing.as_ref()) {
-                    (true, Some(routing)) => {
-                        match unify(context, bucket, routing.group_id, &found).await? {
-                            true => step.done += 1,
-                            false => step.failed += 1,
-                        }
-                        unified += 1;
+                let Some(routing) = routing.as_ref().filter(|_| allowed) else {
+                    step.skipped += 1;
+                    continue;
+                };
+                // The key's progress is stored with it; the cursor names the key before it.
+                let mut next = current.clone();
+                next.cursor = step.cursor.clone();
+                next.done += 1;
+                (next.skipped, next.failed) =
+                    (next.skipped + step.skipped, next.failed + step.failed);
+                let fence = Some((&current, &next));
+                match unify(context, (bucket, routing.group_id), &found, fence).await? {
+                    Unified::Done => {
+                        (step.skipped, step.failed) = (0, 0);
+                        current = next;
                     }
-                    _ => step.skipped += 1,
+                    Unified::Kept => step.skipped += 1,
+                    Unified::Changed => step.failed += 1,
+                    Unified::Stopped => {
+                        return Ok(JobStep {
+                            cursor: current.cursor.clone(),
+                            ..JobStep::default()
+                        });
+                    }
                 }
+                unified += 1;
             }
         }
         step.cursor = Some(key);
     }
 }
 
+/// What `unify` did with one key's copies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Unified {
+    Done,
+    /// Another key or version records every copy, so the key keeps its files.
+    Kept,
+    /// The versions or the kept file changed meanwhile; nothing changed.
+    Changed,
+    /// The job was paused, aborted or replaced; nothing changed.
+    Stopped,
+}
+
 /// In one transaction that still reads the same versions and kept file, points the versions
-/// at the kept file and queues the release of each copy; `false` when something changed.
+/// of each copy only this key records at the kept file, moves their copy registrations along,
+/// and queues the release of those copies. With `fence`, the bucket's job must still be
+/// stored as its first value and gets its second.
 pub async fn unify(
     context: &DriverContext,
-    bucket: &str,
-    group_id: GroupId,
+    (bucket, group_id): (&str, GroupId),
     found: &Duplicate,
-) -> Result<bool, String> {
+    fence: Option<(&LinkedJob, &LinkedJob)>,
+) -> Result<Unified, String> {
     let rules = rules_on(context, group_id, &found.keep.backend).await?;
     let storage = &context.storage_handle;
     let txn_id = match storage
@@ -343,9 +383,16 @@ pub async fn unify(
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         other => return Err(format!("could not start a transaction: {other:?}")),
     };
-    let result = stage(context, txn_id, (bucket, &rules), found).await;
-    let ready = match result {
-        Ok(ready) => ready,
+    let staged = Stage {
+        context,
+        txn_id,
+        bucket,
+        rules: &rules,
+        found,
+    };
+    let result = staged.run(fence).await;
+    let outcome = match result {
+        Ok(outcome) => outcome,
         Err(error) => {
             storage
                 .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
@@ -353,11 +400,11 @@ pub async fn unify(
             return Err(error);
         }
     };
-    if !ready {
+    if outcome != Unified::Done {
         storage
             .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
             .await;
-        return Ok(false);
+        return Ok(outcome);
     }
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
@@ -367,124 +414,201 @@ pub async fn unify(
         Event::Storage(StorageEvent::Error { error }) if !error.proves_no_commit() => {
             return Err(format!("the unification may not have committed: {error}"));
         }
-        _ => return Ok(false),
+        _ => return Ok(Unified::Changed),
     }
     if let Some(tasks) = context.task_handle.as_ref() {
         use aruna_core::handle::Handle as _;
         tasks.send_effect(schedule_cleanup_effect()).await;
     }
-    Ok(true)
+    Ok(Unified::Done)
 }
 
-/// Reads and writes the rows of `unify` in `txn_id`.
-async fn stage(
-    context: &DriverContext,
+/// The reads and writes of one `unify` transaction.
+struct Stage<'a> {
+    context: &'a DriverContext,
     txn_id: Ulid,
-    (bucket, rules): (&str, &[BackendImport]),
-    found: &Duplicate,
-) -> Result<bool, String> {
-    let keep_key = found
-        .keep
-        .location_key()
-        .map_err(|error| error.to_string())?;
-    let mut reads = vec![(
-        BLOB_LOCATIONS_KEYSPACE.to_string(),
-        Key::from(keep_key.to_bytes()),
-    )];
-    for (id, _) in &found.versions {
-        let version = VersionKey::new(bucket, &found.key, *id);
-        let version = version.to_bytes().map_err(|error| error.to_string())?;
-        reads.push((BLOB_VERSIONS_KEYSPACE.to_string(), version.into()));
-    }
-    for copy in &found.copies {
-        reads.push((BACKEND_VERSION_KEYSPACE.to_string(), version_key(copy.ulid)));
-        for rule in rules {
-            let row = object_key(rule.import_id, &copy.backend_path);
-            reads.push((IMPORTED_OBJECT_KEYSPACE.to_string(), row));
-        }
-    }
-    let read = StorageEffect::BatchRead {
-        reads,
-        txn_id: Some(txn_id),
-    };
-    let values = match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        other => return Err(format!("could not read the copies: {other:?}")),
-    };
-    let mut values = values.into_iter().map(|(_, value)| value);
-    let kept = values.next().flatten();
-    if kept.as_deref() != Some(found.keep.to_bytes().map_err(|e| e.to_string())?.as_slice()) {
-        return Ok(false);
-    }
-    let encoding = found.keep.format.encoding();
-    let mut writes = Vec::new();
-    let mut readers = HashMap::new();
-    for (id, stored) in &found.versions {
-        if values.next().flatten().as_deref() != Some(stored.as_slice()) {
-            return Ok(false);
-        }
-        let mut version = BlobVersion::from_bytes(stored).map_err(|error| error.to_string())?;
-        let BlobVersionState::Materialized { encoding: old, .. } = &mut version.state else {
-            return Ok(false);
+    bucket: &'a str,
+    rules: &'a [BackendImport],
+    found: &'a Duplicate,
+}
+
+impl Stage<'_> {
+    async fn batch(&self, reads: Vec<(String, Key)>) -> Result<Vec<Option<Value>>, String> {
+        let read = StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(self.txn_id),
         };
-        if let EncodingClass::Plain { location } = old {
-            readers.entry(*location).or_insert(*id);
+        match self.context.storage_handle.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                Ok(values.into_iter().map(|(_, value)| value).collect())
+            }
+            other => Err(format!("could not read the copies: {other:?}")),
         }
-        *old = encoding;
-        let key = VersionKey::new(bucket, &found.key, *id);
-        let key = key.to_bytes().map_err(|error| error.to_string())?;
-        let value = version.to_bytes().map_err(|error| error.to_string())?;
-        writes.push((BLOB_VERSIONS_KEYSPACE.to_string(), key.into(), value.into()));
     }
-    for copy in &found.copies {
-        let provider = values.next().flatten();
-        let mut owner = None;
-        for rule in rules {
-            let row = values.next().flatten();
-            let row = row.as_deref().map(ImportedObject::from_bytes).transpose();
-            if let Some(row) = row.map_err(|error| error.to_string())? {
-                owner.get_or_insert((rule.import_id, row.version_id));
+
+    async fn run(&self, fence: Option<(&LinkedJob, &LinkedJob)>) -> Result<Unified, String> {
+        let found = self.found;
+        let error = |error: aruna_core::errors::ConversionError| error.to_string();
+        let mut writes = Vec::new();
+        let name: Key = self.bucket.as_bytes().to_vec().into();
+        if let Some((expected, next)) = fence {
+            let read = vec![(LINKED_JOB_KEYSPACE.to_string(), name.clone())];
+            let stored = self.batch(read).await?.pop().flatten();
+            if stored.as_deref() != Some(expected.to_bytes().map_err(error)?.as_slice()) {
+                return Ok(Unified::Stopped);
+            }
+            let next = next.to_bytes().map_err(error)?;
+            writes.push((LINKED_JOB_KEYSPACE.to_string(), name, next.into()));
+        }
+        let keep_key = found.keep.location_key().map_err(error)?;
+        let mut reads = vec![(
+            BLOB_LOCATIONS_KEYSPACE.to_string(),
+            Key::from(keep_key.to_bytes()),
+        )];
+        for (id, _) in &found.versions {
+            let version = VersionKey::new(self.bucket, &found.key, *id);
+            let version = version.to_bytes().map_err(error)?;
+            reads.push((BLOB_VERSIONS_KEYSPACE.to_string(), version.into()));
+        }
+        for copy in &found.copies {
+            reads.push((BACKEND_VERSION_KEYSPACE.to_string(), version_key(copy.ulid)));
+            for rule in self.rules {
+                let row = object_key(rule.import_id, &copy.backend_path);
+                reads.push((IMPORTED_OBJECT_KEYSPACE.to_string(), row));
             }
         }
-        let Some(provider) = provider else {
-            // Without its backend version the copy cannot be deleted exactly; only its row goes.
-            let location = copy.location_key().map_err(|error| error.to_string())?;
-            let candidate =
-                ReclaimCandidateKey::new(location.backend, location.encoding, location.blake3_hash);
-            let value = ReclaimCandidate {
-                enqueued_at: SystemTime::now(),
-            };
-            let value = value.to_bytes().map_err(|error| error.to_string())?;
-            writes.push((
-                BLOB_RECLAIM_KEYSPACE.to_string(),
-                candidate.to_bytes().into(),
-                value.into(),
-            ));
-            continue;
+        let mut values = self.batch(reads).await?.into_iter();
+        let kept = values.next().flatten();
+        if kept.as_deref() != Some(found.keep.to_bytes().map_err(error)?.as_slice()) {
+            return Ok(Unified::Changed);
+        }
+        // Which copy each version reads now; any change refuses the whole key.
+        let mut readers: HashMap<Ulid, Vec<(Ulid, BlobVersion)>> = HashMap::new();
+        for (id, stored) in &found.versions {
+            if values.next().flatten().as_deref() != Some(stored.as_slice()) {
+                return Ok(Unified::Changed);
+            }
+            let version = BlobVersion::from_bytes(stored).map_err(error)?;
+            if let BlobVersionState::Materialized {
+                encoding: EncodingClass::Plain { location },
+                ..
+            } = &version.state
+            {
+                readers.entry(*location).or_default().push((*id, version));
+            }
+        }
+        let encoding = found.keep.format.encoding();
+        let mut changed = 0;
+        for copy in &found.copies {
+            let provider = values.next().flatten();
+            let mine = readers.remove(&copy.ulid).unwrap_or_default();
+            let mut owner = None;
+            let mut foreign = false;
+            for rule in self.rules {
+                let row = values.next().flatten();
+                let row = row.as_deref().map(ImportedObject::from_bytes).transpose();
+                let Some(row) = row.map_err(error)? else {
+                    continue;
+                };
+                // A row of another key or version makes the file that version's own.
+                let ours = row.key.as_deref().is_none_or(|key| key == found.key)
+                    && mine.iter().any(|(id, _)| *id == row.version_id);
+                match ours {
+                    true => owner = owner.or(Some((rule.import_id, row.version_id))),
+                    false => foreign = true,
+                }
+            }
+            if foreign || mine.is_empty() {
+                continue;
+            }
+            for (id, mut version) in mine {
+                if let BlobVersionState::Materialized { encoding: old, .. } = &mut version.state {
+                    *old = encoding;
+                }
+                let key = VersionKey::new(self.bucket, &found.key, id);
+                writes.extend(self.copies(&key, copy).await?);
+                let value = version.to_bytes().map_err(error)?;
+                let key = key.to_bytes().map_err(error)?;
+                writes.push((BLOB_VERSIONS_KEYSPACE.to_string(), key.into(), value.into()));
+            }
+            writes.push(release(copy, provider, owner)?);
+            changed += 1;
+        }
+        if changed == 0 {
+            return Ok(Unified::Kept);
+        }
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: Some(self.txn_id),
         };
-        let reader = readers.get(&copy.ulid).copied().unwrap_or_default();
-        let (import_id, version_id) = owner.unwrap_or((Ulid::nil(), reader));
-        let work = BlobCleanupWork::ReleaseRenamed {
-            location: copy.clone(),
-            import_id,
-            version_id,
-            version: String::from_utf8(provider.to_vec()).map_err(|error| error.to_string())?,
-        };
-        let value = work.to_bytes().map_err(|error| error.to_string())?;
-        writes.push((
-            BLOB_CLEANUP_KEYSPACE.to_string(),
-            Ulid::generate().to_bytes().to_vec().into(),
-            value.into(),
-        ));
+        match self.context.storage_handle.send_storage_effect(write).await {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(Unified::Done),
+            other => Err(format!("could not write the unification: {other:?}")),
+        }
     }
-    let write = StorageEffect::BatchWrite {
-        writes,
-        txn_id: Some(txn_id),
+
+    /// The copy registrations of `version` that name `copy`, moved to the kept file.
+    async fn copies(
+        &self,
+        version: &VersionKey,
+        copy: &BackendLocation,
+    ) -> Result<Vec<(String, Key, Value)>, String> {
+        let prefix = ManagedCopyKey::version_prefix(version).map_err(|error| error.to_string())?;
+        let page = iter_prefix_page(
+            &self.context.storage_handle,
+            MANAGED_COPY_KEYSPACE,
+            Some(prefix.into()),
+            None,
+            RULE_PAGE,
+            Some(self.txn_id),
+        );
+        let (rows, _) = page.await?;
+        let mut writes = Vec::new();
+        for (key, value) in rows {
+            let record =
+                ManagedCopyRecord::from_bytes(&value).map_err(|error| error.to_string())?;
+            if record.location.same_object(copy) {
+                let record = ManagedCopyRecord {
+                    location: self.found.keep.clone(),
+                    ..record
+                };
+                let value = record.to_bytes().map_err(|error| error.to_string())?;
+                writes.push((MANAGED_COPY_KEYSPACE.to_string(), key, value.into()));
+            }
+        }
+        Ok(writes)
+    }
+}
+
+/// The release of `copy` at its backend version, or without one the drop of its location row,
+/// which leaves the file in place.
+fn release(
+    copy: &BackendLocation,
+    provider: Option<Value>,
+    owner: Option<(Ulid, Ulid)>,
+) -> Result<(String, Key, Value), String> {
+    let error = |error: aruna_core::errors::ConversionError| error.to_string();
+    let Some(provider) = provider else {
+        let location = copy.location_key().map_err(error)?;
+        let candidate =
+            ReclaimCandidateKey::new(location.backend, location.encoding, location.blake3_hash);
+        let value = ReclaimCandidate {
+            enqueued_at: SystemTime::now(),
+        };
+        let value = value.to_bytes().map_err(error)?;
+        let key = candidate.to_bytes().into();
+        return Ok((BLOB_RECLAIM_KEYSPACE.to_string(), key, value.into()));
     };
-    match context.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(true),
-        other => Err(format!("could not write the unification: {other:?}")),
-    }
+    let (import_id, version_id) = owner.unwrap_or((Ulid::nil(), Ulid::nil()));
+    let work = BlobCleanupWork::ReleaseRenamed {
+        location: copy.clone(),
+        import_id,
+        version_id,
+        version: String::from_utf8(provider.to_vec()).map_err(|error| error.to_string())?,
+    };
+    let value = work.to_bytes().map_err(error)?;
+    let key = Ulid::generate().to_bytes().to_vec().into();
+    Ok((BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into()))
 }
 
 /// The group's rules that read or write on `backend`, whose rows may record a copy.

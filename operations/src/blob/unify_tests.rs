@@ -3,12 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
 use crate::blob::release::release_renamed;
-use crate::s3::bucket::rename::tests::{BUCKET, access, group, put, realm, rule, setup};
+use crate::s3::bucket::rename::tests::{BUCKET, access, group, put, realm, rule, setup, store_job};
 use crate::tests::records::node;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer, HashIndex};
 use aruna_core::structs::storage::format::{StoredFormat, StoredLayout};
+use aruna_core::structs::storage::linked_job::LinkedTask;
 
 fn file(path: &str, ulid: Ulid, hash: u8) -> BackendLocation {
     BackendLocation {
@@ -124,10 +125,11 @@ async fn unifies_twin_files() {
         (new.ulid, vec![old.clone()])
     );
 
-    let step = job_page(&context, (BUCKET, ""), &access, (None, u64::MAX))
+    let step = job_page(&context, (BUCKET, ""), &access, &unifying(&context).await)
         .await
         .unwrap();
-    assert_eq!((step.done, step.finished), (1, true));
+    assert!(step.finished);
+    assert_eq!(job_row(&context).await.done, 1);
     let moved = read(
         &context,
         BLOB_VERSIONS_KEYSPACE,
@@ -233,7 +235,7 @@ async fn keeps_shared_copies() {
     )
     .await;
     let access = load(&context).await;
-    job_page(&context, (BUCKET, ""), &access, (None, u64::MAX))
+    job_page(&context, (BUCKET, ""), &access, &unifying(&context).await)
         .await
         .unwrap();
     let kept = release_renamed(
@@ -251,4 +253,125 @@ async fn keeps_shared_copies() {
         old.location_key().unwrap().to_bytes().into(),
     );
     assert!(row.await.unwrap().is_some());
+}
+
+async fn unifying(context: &DriverContext) -> LinkedJob {
+    let task = LinkedTask::Unify {
+        prefix: String::new(),
+    };
+    store_job(context, task, u64::MAX).await
+}
+
+async fn job_row(context: &DriverContext) -> LinkedJob {
+    let key = BUCKET.as_bytes().to_vec().into();
+    let value = read(context, LINKED_JOB_KEYSPACE, key)
+        .await
+        .unwrap()
+        .unwrap();
+    LinkedJob::from_bytes(&value).unwrap()
+}
+
+async fn cleanup_rows(context: &DriverContext) -> usize {
+    let page = iter_prefix_page(
+        &context.storage_handle,
+        BLOB_CLEANUP_KEYSPACE,
+        None,
+        None,
+        10,
+        None,
+    );
+    page.await.unwrap().0.len()
+}
+
+fn first_version() -> Vec<u8> {
+    VersionKey::new(BUCKET, "a.faa.gz", Ulid::from_parts(10, 1))
+        .to_bytes()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn keeps_foreign_rows() {
+    let (_directory, context) = setup().await;
+    let (old, _) = twins(&context, "a.faa.gz", 10).await;
+    // The rule records the old file for another key, so it is that key's file.
+    let foreign = ImportedObject::written(Ulid::from_parts(60, 1), "z".to_string(), 10, None);
+    let path = object_key(rule().import_id, &old.backend_path).to_vec();
+    put(
+        &context,
+        IMPORTED_OBJECT_KEYSPACE,
+        path,
+        foreign.to_bytes().unwrap(),
+    )
+    .await;
+    let access = load(&context).await;
+    let step = job_page(&context, (BUCKET, ""), &access, &unifying(&context).await)
+        .await
+        .unwrap();
+    assert_eq!(step.skipped, 1);
+    assert_eq!(cleanup_rows(&context).await, 0);
+    let version = read(&context, BLOB_VERSIONS_KEYSPACE, first_version().into());
+    let version = BlobVersion::from_bytes(&version.await.unwrap().unwrap()).unwrap();
+    assert_eq!(version.location_key(), old.location_key().ok());
+}
+
+#[tokio::test]
+async fn moves_copy_records() {
+    use aruna_core::structs::storage::blob::ManagedCopyState;
+    let (_directory, context) = setup().await;
+    let (old, new) = twins(&context, "a.faa.gz", 10).await;
+    let version = VersionKey::new(BUCKET, "a.faa.gz", Ulid::from_parts(10, 1));
+    let record = ManagedCopyRecord::new(
+        version,
+        node(4),
+        old,
+        Vec::new(),
+        0,
+        ManagedCopyState::Registered,
+    )
+    .unwrap();
+    let key = record.key().to_bytes().unwrap();
+    put(
+        &context,
+        MANAGED_COPY_KEYSPACE,
+        key.clone(),
+        record.to_bytes().unwrap(),
+    )
+    .await;
+    let access = load(&context).await;
+    job_page(&context, (BUCKET, ""), &access, &unifying(&context).await)
+        .await
+        .unwrap();
+    let moved = read(&context, MANAGED_COPY_KEYSPACE, key.into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ManagedCopyRecord::from_bytes(&moved).unwrap().location, new);
+}
+
+#[tokio::test]
+async fn stops_when_paused() {
+    use aruna_core::structs::storage::linked_job::LinkedState;
+    let (_directory, context) = setup().await;
+    twins(&context, "a.faa.gz", 10).await;
+    let access = load(&context).await;
+    let running = unifying(&context).await;
+    let paused = LinkedJob {
+        state: LinkedState::Paused,
+        ..running.clone()
+    };
+    let key = BUCKET.as_bytes().to_vec();
+    put(
+        &context,
+        LINKED_JOB_KEYSPACE,
+        key,
+        paused.to_bytes().unwrap(),
+    )
+    .await;
+    // A page that read the job before the pause changes nothing.
+    let step = job_page(&context, (BUCKET, ""), &access, &running)
+        .await
+        .unwrap();
+    assert_eq!((step.done, step.finished), (0, false));
+    assert_eq!(cleanup_rows(&context).await, 0);
+    assert_eq!(job_row(&context).await, paused);
 }
