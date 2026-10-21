@@ -17,7 +17,7 @@ use aruna_core::structs::execution::job::{JobError, JobId, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportCheckpoint, BackendImportSpec, ExternalObject, ImportedObject,
-    PathIdentity, WriteIntent, intent_key, object_key, object_prefix, version_key,
+    PathIdentity, WriteIntent, object_key, object_prefix, version_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
@@ -1453,6 +1453,7 @@ impl Operation for BlobRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structs::storage::backend_import::intent_key;
 
     #[test]
     fn mapped_discovery_owned() {
