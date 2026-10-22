@@ -369,7 +369,8 @@ including request policies. Tokens with path restrictions are refused.
   again; opening the preview is not needed to start it.
 
 **Limits**
-- 1 to 1000 entries per page. Totals count at most 2,000,000 keys; `complete` is then false."#,
+- 1 to 1000 entries per page. Totals count at most 20,000 keys; `complete` is then false and
+  `total` is a lower bound."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule"),
         ("import_id" = String, Path, description = "Rule whose bucket is organized")
@@ -495,8 +496,9 @@ pub async fn start_move(
   link or copy reads it any more; others stay. Opening the preview is not needed to start.
 
 **Limits**
-- 1 to 1000 entries per page. Totals count over at most 2,000,000 version rows; `complete` is
-  then false."#,
+- 1 to 1000 entries per page. Totals check at most 5,000 keys; `complete` is then false and
+  `total` and `bytes` are lower bounds. A page checks at most 5,000 keys and then names `next`,
+  even with fewer entries."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule"),
         ("import_id" = String, Path, description = "Rule whose bucket is organized")

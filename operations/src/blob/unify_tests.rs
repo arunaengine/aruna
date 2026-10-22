@@ -433,3 +433,36 @@ async fn skips_deleting_files() {
         .unwrap();
     assert_eq!(unified, Unified::Changed);
 }
+
+#[tokio::test]
+async fn bounds_large_preview() {
+    let (_directory, context) = setup().await;
+    twins(&context, "a.faa.gz", 10).await;
+    // Version rows sort by key length first, so these longer keys follow the twins.
+    for index in 0..PREVIEW_CHECKS {
+        let id = Ulid::from_parts(100, 1);
+        let version = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
+        let key = VersionKey::new(BUCKET, format!("b{index:08}"), id);
+        put(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            key.to_bytes().unwrap(),
+            version.to_bytes().unwrap(),
+        )
+        .await;
+    }
+    let access = load(&context).await;
+    let page = preview_page(&context, (BUCKET, ""), &access, (None, None, 100))
+        .await
+        .unwrap();
+    assert_eq!(
+        (page.keys, page.complete, page.entries.len()),
+        (1, false, 1)
+    );
+    let next = page.next.expect("a bounded page names where it stopped");
+    let rest = preview_page(&context, (BUCKET, ""), &access, (None, Some(next), 100))
+        .await
+        .unwrap();
+    assert!(rest.entries.is_empty());
+    assert_eq!(rest.next, None);
+}

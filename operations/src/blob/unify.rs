@@ -38,6 +38,8 @@ const VERSION_PAGE: usize = 1024;
 const PAGE_SCAN: usize = 200_000;
 const TOTAL_SCAN: usize = 2_000_000;
 const JOB_SCAN: usize = 20_000;
+/// Keys one preview request checks for copies at most, for its totals and again for its page.
+const PREVIEW_CHECKS: usize = 5_000;
 /// Keys with copies one job page unifies at most.
 const JOB_KEYS: usize = 64;
 const RULE_PAGE: usize = 128;
@@ -373,14 +375,16 @@ pub async fn preview_page(
         ..UnifyPage::default()
     };
     let mut walk = KeyWalk::new(context, bucket, None);
+    let mut checked = 0;
     while let Some((key, versions)) = walk.next().await? {
-        if walk.scanned > TOTAL_SCAN {
+        if walk.scanned > TOTAL_SCAN || checked == PREVIEW_CHECKS {
             page.complete = false;
             break;
         }
         if !readable(&key) {
             continue;
         }
+        checked += 1;
         let found = duplicates(context, routing.as_ref(), (bucket, &key), versions).await?;
         page.keys += u64::from(!found.is_empty());
         page.bytes += found.iter().map(Duplicate::freed).sum::<u64>();
@@ -390,9 +394,9 @@ pub async fn preview_page(
         Some((key, None)) => KeyWalk::new(context, bucket, Some(key)),
         None => KeyWalk::new(context, bucket, None),
     };
-    let mut last = None;
+    let (mut last, mut checked) = (None, 0);
     while let Some((key, versions)) = walk.next().await? {
-        if page.entries.len() == limit || walk.scanned > PAGE_SCAN {
+        if page.entries.len() == limit || walk.scanned > PAGE_SCAN || checked == PREVIEW_CHECKS {
             page.next = last;
             if page.next.is_none() {
                 return Err("too many keys in a row are hidden from the caller".to_string());
@@ -406,6 +410,7 @@ pub async fn preview_page(
         if !readable(&key) {
             continue;
         }
+        checked += 1;
         let found = duplicates(context, routing.as_ref(), (bucket, &key), versions).await?;
         let skip = match &after {
             Some((after, Some(shown))) if *after == key => *shown,
