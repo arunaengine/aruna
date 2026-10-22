@@ -5,8 +5,8 @@
 use super::*;
 
 use super::super::preflight::{
-    assemble_preflight_execution, plan_preflight_request, resolve_preflight_targets,
-    verify_preflight_cursor, visible_prefix,
+    assemble_preflight_execution, plan_preflight_request, resolve_all_preflight,
+    resolve_preflight_targets, resolve_preflight_versions, verify_preflight_cursor, visible_prefix,
 };
 
 #[tokio::test]
@@ -337,4 +337,72 @@ async fn preflight_stage_failures() {
         },
     );
     assert!(matches!(denied, Err(MetadataApiError::ServiceUnavailable)));
+}
+
+async fn write_versions(test: &MetadataTest, key: &str, count: u8) {
+    let user = UserId::nil(RealmId::from_bytes([80u8; 32]));
+    let mut rows = Vec::new();
+    for index in 0..count {
+        let version_id = Ulid::from_parts(u64::from(index) + 1, 0);
+        let version = VersionKey::new("genes", key, version_id);
+        let value = BlobVersion::deleted(SystemTime::UNIX_EPOCH, user);
+        rows.push((BLOB_VERSIONS_KEYSPACE, version.to_bytes(), value.to_bytes()));
+        let head = BlobHeadKey::new("genes", key).to_bytes();
+        let pointer = CurrentVersionPointer::new(version_id).to_bytes();
+        rows.push((BLOB_HEAD_KEYSPACE, head, pointer));
+    }
+    for (key_space, key, value) in rows {
+        let event = test
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key: key.expect("key encodes").into(),
+                value: value.expect("value encodes").into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn large_scope_bounded() {
+    let test = metadata_test();
+    for index in 0..130 {
+        write_versions(&test, &format!("big/{index:03}"), 1).await;
+    }
+    let (heads, complete) = resolve_preflight_versions(&test.context, "genes", None)
+        .await
+        .expect("large bucket resolves");
+    assert_eq!((heads.len(), complete), (128, false));
+    let (versions, complete) = resolve_all_preflight(&test.context, "genes", Some("big/"))
+        .await
+        .expect("large prefix resolves");
+    assert_eq!((versions.len(), complete), (128, false));
+    let (versions, complete) = resolve_all_preflight(&test.context, "genes", Some("big/12"))
+        .await
+        .expect("small prefix resolves");
+    assert_eq!((versions.len(), complete), (10, true));
+}
+
+#[tokio::test]
+async fn exact_key_purge() {
+    let test = metadata_test();
+    write_versions(&test, "a", 3).await;
+    write_versions(&test, "solo", 2).await;
+    write_versions(&test, "zeta", 4).await;
+    let (versions, complete) = resolve_all_preflight(&test.context, "genes", Some("solo"))
+        .await
+        .expect("exact key resolves");
+    assert!(complete);
+    assert_eq!(versions.len(), 2);
+    assert!(versions.iter().all(|(key, _)| key.key == "solo"));
+    let (heads, complete) = resolve_preflight_versions(&test.context, "genes", Some("solo"))
+        .await
+        .expect("exact head resolves");
+    assert_eq!((heads.len(), complete), (1, true));
 }
