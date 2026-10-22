@@ -4,9 +4,9 @@
 use super::*;
 use crate::s3::bucket::rename::tests::{BUCKET, group, put, realm, rule, setup};
 use crate::tests::records::node;
-use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::storage::blob::BackendRef;
+use aruna_core::structs::storage::blob::{BackendRef, BlobHeadKey, CurrentVersionPointer};
 use aruna_core::structs::storage::format::{StoredFormat, StoredLayout};
 use std::time::SystemTime;
 
@@ -316,4 +316,26 @@ async fn plans_named_unversioned() {
         .map(|file| (file.version.as_deref(), file.kept.is_some()))
         .collect();
     assert_eq!(planned, [(Some(""), false), (None, true), (None, true)]);
+}
+
+#[tokio::test]
+async fn bounds_scope_totals() {
+    let (_directory, context) = setup().await;
+    for index in 0..=TOTAL_VERSIONS {
+        let (key, id) = (format!("gone/{index:05}"), Ulid::from_parts(index + 1, 1));
+        let version = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
+        let version_key = VersionKey::new(BUCKET, key.clone(), id).to_bytes().unwrap();
+        put(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            version_key,
+            version.to_bytes().unwrap(),
+        )
+        .await;
+        let head = CurrentVersionPointer::new(id).to_bytes().unwrap();
+        let head_key = BlobHeadKey::new(BUCKET, key).to_bytes().unwrap();
+        put(&context, BLOB_HEAD_KEYSPACE, head_key, head).await;
+    }
+    let totals = scope_totals(&context, &scope(), &|_| true).await.unwrap();
+    assert_eq!((totals.versions, totals.complete), (TOTAL_VERSIONS, false));
 }

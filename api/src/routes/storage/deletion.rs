@@ -587,8 +587,8 @@ pub struct DeleteImpact {
 - Keys the caller may not read are neither counted nor listed.
 
 **Limits**
-- 1 to 1000 entries per page. Totals pass over at most 1,000,000 versions, hidden ones
-  included; `complete` is then false. 64 listing pages of only hidden versions answer 409."#,
+- 1 to 1000 entries per page. Totals pass over at most 5,000 versions, hidden ones
+  included; `complete` is then false and the totals are lower bounds. 64 listing pages of only hidden versions answer 409."#,
     params(("bucket" = String, Path, description = "Bucket to inspect")),
     request_body(content = DeleteImpactRequest, example = json!({"kind": "folder", "key": "raw/"})),
     responses(

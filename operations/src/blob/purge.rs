@@ -254,7 +254,7 @@ async fn read_elsewhere(
 }
 
 /// Versions a deletion preview counts at most before its totals become lower bounds.
-const TOTAL_VERSIONS: u64 = 1_000_000;
+const TOTAL_VERSIONS: u64 = 5_000;
 const LIST_PAGE: usize = 1000;
 
 /// What a purge of a scope removes: keys and versions in Aruna, files in linked storage.
