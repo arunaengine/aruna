@@ -373,10 +373,19 @@ impl CreateImportOperation {
         }
     }
 
-    /// Another rule must neither write where this one reads or writes, nor read where it writes.
+    /// Another rule must neither write where this one reads or writes, nor read where it writes,
+    /// unless both write inside the folder they read: each then records its own files there.
     fn shares_folder(&self, rule: &BackendImport) -> bool {
         let (read, write) = (self.input.backend_id, self.write_backend());
         let prefix = self.input.backend_prefix.as_str();
+        let reads_writes = |read: Ulid, prefix: &str, write: Ulid, folder: &str| {
+            read == write && folder.starts_with(prefix)
+        };
+        let own = reads_writes(read, prefix, write, self.write_folder());
+        let other = (rule.backend_id, rule.write_backend());
+        if own && reads_writes(other.0, &rule.backend_prefix, other.1, rule.write_folder()) {
+            return false;
+        }
         (rule.write_backend() == write && folders_overlap(rule.write_folder(), self.write_folder()))
             || (rule.backend_id == write
                 && folders_overlap(&rule.backend_prefix, self.write_folder()))
@@ -1120,6 +1129,7 @@ mod tests {
 
     #[test]
     fn refuses_shared_folder() {
+        // Two rules that read and write one folder share it; each records its own files.
         let (mut operation, _) = after_reads(
             input("raw/x/", "imported/"),
             bucket(Vec::new(), Compression::Off),
@@ -1127,6 +1137,18 @@ mod tests {
         let mut other = operation.record();
         other.key_prefix = "elsewhere/".to_string();
         other.backend_prefix = "raw/".to_string();
+        let effects = scan_page(&mut operation, std::slice::from_ref(&other));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchWrite { .. })]
+        ));
+
+        // A rule that writes elsewhere would leave unrecorded files in the shared folder.
+        other.write_prefix = Some("out/".to_string());
+        let (mut operation, _) = after_reads(
+            input("raw/x/", "imported/"),
+            bucket(Vec::new(), Compression::Off),
+        );
         scan_page(&mut operation, &[other]);
         assert!(matches!(failure(operation), ImportRuleError::Conflict(_)));
 

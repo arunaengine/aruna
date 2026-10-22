@@ -353,6 +353,21 @@ pub enum BlobEffect {
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
+    /// Copies the file at `source`, at its recorded backend version, raw to `plain.path` on
+    /// `resolved` and answers `PlainWritten` with the source's hashes. An S3 storage copies
+    /// inside the provider; other storages stream the bytes through the node and hash them.
+    CopyPlain {
+        resolved: ResolvedBackend,
+        plain: PlainPath,
+        source: Box<BackendLocation>,
+    },
+    /// Aborts the provider upload a copy `attempt` recorded, or exactly `upload` when given,
+    /// and forgets the record only while it still names that upload; answers `UploadAborted`.
+    /// Uploads of other attempts at the path stay.
+    SettleCopy {
+        attempt: Ulid,
+        upload: Option<(Box<BackendLocation>, String)>,
+    },
     /// Answers `CopyStat`: whether the backend still has the object of `location`.
     StatCopy {
         location: BackendLocation,
@@ -361,6 +376,14 @@ pub enum BlobEffect {
     StatPlain {
         backend: BackendRef,
         path: String,
+    },
+    /// Deletes exactly backend `version` of a replaced tenant file at `location`; an empty one
+    /// deletes it only while its size and full ETag equal `location` and `etag`. Answers
+    /// `DeleteFinished`, also for a missing file, else `CleanupUnsupported` and keeps it.
+    DeletePlain {
+        location: BackendLocation,
+        version: String,
+        etag: Option<String>,
     },
     /// Finds or creates `bucket` on a group storage without a bucket and proves that Aruna
     /// may write and delete there; answers `BucketReady`.

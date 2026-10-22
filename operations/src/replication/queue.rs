@@ -324,6 +324,27 @@ pub fn blob_job_key(record: &BlobJobRecord) -> Result<Key, ConversionError> {
     Ok(ByteView::from(key))
 }
 
+/// Key prefixes of the jobs and live obligations queued for `bucket`.
+pub(crate) fn queued_prefixes(
+    bucket: &str,
+) -> Result<[(&'static str, Vec<u8>); 3], ConversionError> {
+    let key = |identity: Vec<u8>| [b"v1".to_vec(), identity].concat();
+    Ok([
+        (
+            REPLICATION_JOB_KEYSPACE,
+            key(postcard::to_allocvec(&(ReplicationMode::Live, bucket))?),
+        ),
+        (
+            REPLICATION_JOB_KEYSPACE,
+            key(postcard::to_allocvec(&(ReplicationMode::OnDemand, bucket))?),
+        ),
+        (
+            REPLICATION_OBLIGATION_KEYSPACE,
+            key(postcard::to_allocvec(&bucket)?),
+        ),
+    ])
+}
+
 fn blob_job_entry(record: &BlobJobRecord) -> Result<(String, Key, ByteView), ConversionError> {
     Ok((
         REPLICATION_JOB_KEYSPACE.to_string(),
@@ -2800,6 +2821,29 @@ mod tests {
             replicate_delete_markers: true,
             mode: ReplicationMode::OnDemand,
         }
+    }
+
+    #[test]
+    fn queued_prefixes_match() {
+        let [live, on_demand, obligations] = queued_prefixes("bucket").unwrap();
+        let job = blob_job_key(&BlobJobRecord::new(on_demand_input(), None, 42)).unwrap();
+        assert!(job.starts_with(&on_demand.1) && !job.starts_with(&live.1));
+        let other = queued_prefixes("bucke").unwrap();
+        assert!(!job.starts_with(&other[1].1));
+        let obligation = LiveObligationRecord {
+            local_node_id: node(1),
+            auth_context: auth_context(),
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            version_id: Ulid::from_parts(1, 1),
+            delete_marker: false,
+            origin: None,
+            upstream_sources: Vec::new(),
+            continuation: None,
+            reference_advance: None,
+        };
+        let key = live_obligation_key(&obligation).unwrap();
+        assert!(key.starts_with(&obligations.1));
     }
 
     async fn read_jobs(storage: &StorageHandle) -> Vec<(Vec<u8>, BlobJobRecord)> {

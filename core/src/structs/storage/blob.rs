@@ -320,6 +320,59 @@ pub enum BlobCleanupWork {
     ReconcileReservation {
         location: BackendLocation,
     },
+    /// A file in a linked folder that a rename replaced, and the import rule whose row names
+    /// it as `version_id`. Its version already names the new file; only the backend `version`
+    /// the rename read is deleted.
+    ReleaseRenamed {
+        location: BackendLocation,
+        import_id: Ulid,
+        version_id: Ulid,
+        version: String,
+    },
+    /// The delete trail of a removed bucket incarnation, or of a whole removed group without
+    /// `bucket`; it goes a page at a time. The audit itself stays.
+    DropTrail {
+        group_id: Ulid,
+        bucket: Option<String>,
+        incarnation: u128,
+    },
+    /// The delete claims and tombstones of a removed import rule's files; they go a page at
+    /// a time.
+    DropClaims {
+        import_id: Ulid,
+    },
+    /// A linked file a purge planned to release; it waits until the purge job has ended,
+    /// whichever way, then goes like a renamed file.
+    ReleasePlanned {
+        job_id: Ulid,
+        location: BackendLocation,
+        import_id: Ulid,
+        version_id: Ulid,
+        version: String,
+    },
+    /// The provider upload of a linked file copy; `since_ms` is its last copied part, and one
+    /// without a part for a grace is aborted, exactly this upload of exactly this attempt.
+    SettleUpload {
+        attempt: Ulid,
+        location: BackendLocation,
+        upload_id: String,
+        since_ms: u64,
+    },
+    /// A version an aborted rename left with move intents; it runs once more until none of
+    /// `intents` stays, and a version that is gone only loses its intents.
+    SettleMove {
+        version: VersionKey,
+        intents: Vec<(
+            Vec<u8>,
+            crate::structs::storage::backend_import::WriteIntent,
+        )>,
+    },
+    /// Rows of `key_space` under `prefix` that belong to something removed; they go a page at
+    /// a time.
+    DropRows {
+        key_space: String,
+        prefix: Vec<u8>,
+    },
 }
 
 /// The record a write's commit would have made the owner of its bytes.
@@ -365,8 +418,15 @@ impl BlobCleanupWork {
         match self {
             Self::DeleteBlob { location }
             | Self::ReconcileWrite { location, .. }
-            | Self::ReconcileReservation { location } => Some(location),
-            Self::RegisterDht { .. } => None,
+            | Self::ReconcileReservation { location }
+            | Self::ReleaseRenamed { location, .. }
+            | Self::ReleasePlanned { location, .. }
+            | Self::SettleUpload { location, .. } => Some(location),
+            Self::RegisterDht { .. }
+            | Self::DropTrail { .. }
+            | Self::DropClaims { .. }
+            | Self::SettleMove { .. }
+            | Self::DropRows { .. } => None,
         }
     }
 }
@@ -685,6 +745,13 @@ pub struct BucketInfo {
     pub placement_policy_generation: u64,
     /// Compression of new writes; each node also re-encodes its own copies to match.
     pub compression: Compression,
+}
+
+/// The incarnation of a bucket from its creation row, which tells one bucket of a name from
+/// a later one; a bucket created before creation rows were kept is incarnation 0.
+pub fn incarnation(creation: Option<&[u8]>) -> u128 {
+    let id = creation.and_then(|value| <[u8; 16]>::try_from(value).ok());
+    id.map_or(0, u128::from_be_bytes)
 }
 
 impl BucketInfo {
@@ -1526,6 +1593,25 @@ mod tests {
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::time::SystemTime;
+
+    #[test]
+    fn keeps_cleanup_tags() {
+        // Postcard writes the variant index first; stored rows keep their meaning only while
+        // new kinds of work are appended.
+        let dht = super::BlobCleanupWork::RegisterDht {
+            blake3: [0; 32],
+            realm_id: RealmId::from_bytes([0; 32]),
+            ttl_ms: 0,
+        };
+        assert_eq!(dht.to_bytes().unwrap()[0], 1);
+        let release = super::BlobCleanupWork::ReleaseRenamed {
+            location: sample_location(BackendRef::node_default()),
+            import_id: Ulid::nil(),
+            version_id: Ulid::nil(),
+            version: String::new(),
+        };
+        assert_eq!(release.to_bytes().unwrap()[0], 4);
+    }
     use ulid::Ulid;
 
     fn pointer(generation: u64, seed: u8) -> CurrentVersionPointer {

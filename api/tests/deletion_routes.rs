@@ -9,9 +9,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use aruna_api::error::ServerError;
 use aruna_api::routes::storage::deletion::{
-    DeletionPreflightRequest, PurgeScopeRequest, SubmitPurgeRequest, deletion_preflight,
-    submit_purge,
+    DeleteImpactRequest, DeletionPreflightRequest, PurgeScopeRequest, SubmitPurgeRequest,
+    delete_preview, deletion_preflight, submit_purge,
 };
 use aruna_api::server::state::ServerState;
 use aruna_core::UserId;
@@ -302,6 +303,8 @@ async fn submission_is_idempotent() {
             prefix: "reads/".to_string(),
         },
         idempotency_key: Some("purge-reads".to_string()),
+        delete_storage_files: false,
+        confirm: None,
     };
     let (status, Json(first)) = submit_purge(
         State(fixture.state.clone()),
@@ -327,4 +330,198 @@ async fn submission_is_idempotent() {
     assert_eq!(status, StatusCode::OK);
     assert!(!replayed.created);
     assert_eq!(replayed.job_id, first.job_id);
+}
+
+#[tokio::test]
+async fn storage_files_confirmed() {
+    let fixture = setup().await;
+    let request = |confirm: Option<&str>| SubmitPurgeRequest {
+        scope: PurgeScopeRequest::Bucket {
+            bucket: "data".to_string(),
+        },
+        idempotency_key: None,
+        delete_storage_files: true,
+        confirm: confirm.map(str::to_string),
+    };
+    let state = || State(fixture.state.clone());
+    let auth = || Extension(Some(fixture.auth.clone()));
+    // The bucket's storage files go only with the bucket name typed back.
+    for confirm in [None, Some("other")] {
+        let refused = submit_purge(state(), auth(), Json(request(confirm))).await;
+        assert!(matches!(refused, Err(ServerError::BadRequestMessage(_))));
+    }
+    // A token limited to some paths may not delete files other keys could read.
+    let mut restricted = fixture.auth.clone();
+    restricted.path_restrictions = Some(Vec::new());
+    let refused = submit_purge(
+        state(),
+        Extension(Some(restricted)),
+        Json(request(Some("data"))),
+    );
+    assert!(matches!(refused.await, Err(ServerError::Forbidden)));
+    let (status, _) = submit_purge(state(), auth(), Json(request(Some("data"))))
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn previews_storage_files() {
+    let fixture = setup().await;
+    let backend = BackendRef::Group(Ulid::from_bytes([20u8; 16]));
+    for (tag, key) in [(30u8, "linked/a.faa.gz"), (31u8, "linked/b.faa.gz")] {
+        let ulid = Ulid::from_bytes([tag; 16]);
+        let location = BackendLocation {
+            backend: backend.clone(),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: format!("raw/{key}"),
+            ulid,
+            format: StoredFormat {
+                layout: aruna_core::structs::storage::format::StoredLayout::Plain(ulid),
+                ..StoredFormat::default()
+            },
+            created_by: fixture.auth.user_id,
+            created_at: UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 100,
+            hashes: HashMap::from([(
+                aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+                vec![tag; 32],
+            )]),
+        };
+        let version = BlobVersion::materialized(
+            [tag; 32],
+            backend.clone(),
+            location.format.encoding(),
+            UNIX_EPOCH,
+            fixture.auth.user_id,
+            None,
+        );
+        let id = Ulid::from_bytes([tag; 16]);
+        let rows = [
+            (
+                BLOB_VERSIONS_KEYSPACE,
+                VersionKey::new("data", key, id).to_bytes().unwrap(),
+                version.to_bytes().unwrap(),
+            ),
+            (
+                BLOB_HEAD_KEYSPACE,
+                BlobHeadKey::new("data", key).to_bytes().unwrap(),
+                CurrentVersionPointer::new(id).to_bytes().unwrap(),
+            ),
+            (
+                BLOB_LOCATIONS_KEYSPACE,
+                location.location_key().unwrap().to_bytes(),
+                location.to_bytes().unwrap(),
+            ),
+        ];
+        for (space, key, value) in rows {
+            write_value(&fixture.state, space, key, value).await;
+        }
+    }
+    let request = |after: Option<String>| DeleteImpactRequest {
+        kind: "folder".to_string(),
+        key: "linked/".to_string(),
+        limit: Some(1),
+        after,
+        filter: None,
+    };
+    let state = || State(fixture.state.clone());
+    let auth = || Extension(Some(fixture.auth.clone()));
+    let bucket = || axum::extract::Path("data".to_string());
+    let Json(first) = delete_preview(state(), auth(), bucket(), Json(request(None)))
+        .await
+        .unwrap();
+    assert_eq!((first.files, first.versions, first.complete), (2, 2, true));
+    assert_eq!((first.storage_files, first.storage_bytes), (2, 200));
+    assert_eq!(first.items.len(), 1);
+    // Without a backend version the file would stay; the preview says so.
+    let file = first.items[0].storage_file.as_ref().unwrap();
+    assert_eq!(file.path, "raw/linked/a.faa.gz");
+    assert!(file.kept.is_some());
+    let Json(second) = delete_preview(state(), auth(), bucket(), Json(request(first.next)))
+        .await
+        .unwrap();
+    assert_eq!(second.items[0].key, "linked/b.faa.gz");
+    assert!(second.next.is_none());
+    // A filter narrows the page; the totals stay for the folder.
+    let filtered = DeleteImpactRequest {
+        filter: Some("b.faa".to_string()),
+        limit: Some(10),
+        ..request(None)
+    };
+    let Json(only) = delete_preview(state(), auth(), bucket(), Json(filtered))
+        .await
+        .unwrap();
+    let keys: Vec<_> = only.items.iter().map(|item| item.key.as_str()).collect();
+    assert_eq!((keys, only.versions), (vec!["linked/b.faa.gz"], 2));
+    // A reader limited to one key sees only that key, in the page and in the totals.
+    let bucket_path = aruna_core::structs::storage::blob::bucket_permission_path(
+        fixture.state.get_realm_id(),
+        Ulid::from_bytes([10u8; 16]),
+        fixture.state.get_node_id(),
+        "data",
+    );
+    let allow = |pattern: String| aruna_core::structs::identity::auth::PathRestriction {
+        pattern,
+        permission: aruna_core::structs::identity::auth::Permission::READ,
+    };
+    let mut limited = fixture.auth.clone();
+    limited.path_restrictions = Some(vec![
+        allow(bucket_path.clone()),
+        allow(format!("{bucket_path}/linked/a.faa.gz")),
+    ]);
+    let whole = DeleteImpactRequest {
+        limit: Some(10),
+        ..request(None)
+    };
+    let Json(seen) = delete_preview(state(), Extension(Some(limited)), bucket(), Json(whole))
+        .await
+        .unwrap();
+    let keys: Vec<_> = seen.items.iter().map(|item| item.key.as_str()).collect();
+    assert_eq!(keys, ["linked/a.faa.gz"]);
+    assert_eq!((seen.versions, seen.storage_files), (1, 1));
+    let bad = DeleteImpactRequest {
+        kind: "everything".to_string(),
+        ..request(None)
+    };
+    let refused = delete_preview(state(), auth(), bucket(), Json(bad)).await;
+    assert!(matches!(refused, Err(ServerError::BadRequest)));
+}
+
+#[tokio::test]
+async fn shows_purge_pause() {
+    use aruna_api::routes::storage::deletion::{control_purge, get_purge};
+    let fixture = setup().await;
+    let request = SubmitPurgeRequest {
+        scope: PurgeScopeRequest::Prefix {
+            bucket: "data".to_string(),
+            prefix: "reads/".to_string(),
+        },
+        idempotency_key: None,
+        delete_storage_files: true,
+        confirm: None,
+    };
+    let state = || State(fixture.state.clone());
+    let auth = || Extension(Some(fixture.auth.clone()));
+    let (_, Json(job)) = submit_purge(state(), auth(), Json(request)).await.unwrap();
+    let path = |action: &str| axum::extract::Path((job.job_id.clone(), action.to_string()));
+    // A restricted token steers no purge of storage files.
+    let mut restricted = fixture.auth.clone();
+    restricted.path_restrictions = Some(Vec::new());
+    let refused = control_purge(state(), Extension(Some(restricted)), path("pause")).await;
+    assert!(matches!(refused, Err(ServerError::Forbidden)));
+    let Json(paused) = control_purge(state(), auth(), path("pause")).await.unwrap();
+    assert_eq!((paused.state.as_str(), paused.paused), ("paused", true));
+    let id = || axum::extract::Path(job.job_id.clone());
+    let Json(shown) = get_purge(state(), auth(), id()).await.unwrap();
+    assert!(shown.paused && shown.delete_storage_files);
+    let Json(resumed) = control_purge(state(), auth(), path("resume"))
+        .await
+        .unwrap();
+    assert!(!resumed.paused);
+    assert_ne!(resumed.state, "paused");
 }

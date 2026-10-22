@@ -52,7 +52,7 @@ pub struct BucketMoveResponse {
     pub bucket: String,
     /// Stored versions under `prefix` that a move would move now.
     pub misplaced: u64,
-    /// `false` when the count stopped at 10000 versions; `misplaced` is then a lower bound.
+    /// `false` when the count stopped at its limit; `misplaced` is then a lower bound.
     pub complete: bool,
     /// The prefix of this node's last move; absent before any move.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,7 +101,8 @@ async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<ulid::U
 - `prefix` limits the count to keys under it, such as the folder of a linked rule.
 
 **Limits**
-- One request reads at most 10000 version rows and one location row for each counted candidate;
+- One request reads at most 10000 version rows under `prefix`, passes over at most 200000
+  rows of the bucket, and reads one location row for each counted candidate;
   `complete` is `false` when it stopped there."#,
     params(
         ("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash"),
@@ -143,7 +144,7 @@ pub async fn get_bucket_move(
     let group_id = bucket_group(&state, &bucket).await?;
     let path = bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), &bucket);
     crate::auth::ensure_permission(&state, &auth, path, Permission::READ).await?;
-    let counted = count_misplaced(&state.get_ctx(), &bucket, &query.prefix)
+    let counted = count_misplaced(&state.get_ctx(), &bucket, &query.prefix, None)
         .await
         .map_err(ServerError::InternalError)?;
     let status = drive(
@@ -178,7 +179,8 @@ pub async fn get_bucket_move(
   keeps files (`retain`).
 - A version is published only if its rules, bucket settings and the version itself did not change
   during the copy; otherwise it stays and counts as skipped.
-- Files in a linked folder stay where they are. Versions already in place are skipped.
+- Files in a linked folder stay where they are, and no file there is deleted. Versions already
+  in place are skipped.
 - A version whose copy cannot be read is recorded as broken, as by a storage check, and skipped.
 - `prefix` limits the move to keys under it. Other keys still get the bucket's compression.
 - Versions that fail are retried in later passes like a compression change. Sending the same
@@ -248,13 +250,27 @@ pub async fn start_bucket_move(
     ))
 }
 
-fn move_refusal(error: StartMoveError) -> ServerError {
+pub(crate) fn move_refusal(error: StartMoveError) -> ServerError {
     match error {
         StartMoveError::NoSuchBucket => ServerError::NotFound,
         StartMoveError::MoveRunning(prefix) => ServerError::Refused(
             StatusCode::CONFLICT,
             "move_running",
             format!("a move of the keys under `{prefix}` is still running; retry when it finishes"),
+        ),
+        StartMoveError::RuleChanged
+        | StartMoveError::Storage(aruna_core::errors::StorageError::TransactionConflict) => {
+            ServerError::Refused(
+                StatusCode::CONFLICT,
+                "rule_changed",
+                "the bucket or its import rule changed while the move started; try again"
+                    .to_string(),
+            )
+        }
+        StartMoveError::JobRunning => ServerError::Refused(
+            StatusCode::CONFLICT,
+            "job_running",
+            "a re-mapping or duplicate cleanup of the bucket runs; retry when it ends".to_string(),
         ),
         StartMoveError::Encrypted => ServerError::Refused(
             StatusCode::CONFLICT,
@@ -268,6 +284,19 @@ fn move_refusal(error: StartMoveError) -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_rule_conflicts() {
+        // A pattern change while a rename starts is a conflict to retry, not a server error.
+        let conflict =
+            StartMoveError::Storage(aruna_core::errors::StorageError::TransactionConflict);
+        for error in [StartMoveError::RuleChanged, conflict] {
+            assert!(matches!(
+                move_refusal(error),
+                ServerError::Refused(StatusCode::CONFLICT, "rule_changed", _)
+            ));
+        }
+    }
 
     #[test]
     fn encrypted_bucket_conflicts() {

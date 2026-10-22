@@ -6,12 +6,15 @@ use std::collections::BTreeSet;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::DELETE_AUDIT_KEYSPACE;
+use aruna_core::keyspaces::{
+    BUCKET_CREATION_KEYSPACE, DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::structs::execution::job::{JobError, JobProgress, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::storage::blob::incarnation;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::delete_audit::{
-    BlobAuditKind, BlobAuditRecord, BlobPurgeKind, delete_audit_key,
+    BlobAuditKind, BlobAuditRecord, BlobPurgeKind, delete_audit_key, trail_key,
 };
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::storage_purge::{
@@ -34,14 +37,29 @@ use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersi
 use crate::s3::purge_fence::{PurgeFenceError, acquire_purge_fence};
 
 const PURGE_BATCH_SIZE: usize = 1_000;
+/// How often a paused purge looks whether it was resumed.
+const PAUSE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
-pub async fn run_storage_purge(ctx: &JobContext, spec: &StoragePurgeSpec) -> JobRunOutcome {
+/// Runs a purge; with `files` it also releases the linked-storage files of the versions.
+pub async fn run_storage_purge(
+    ctx: &JobContext,
+    spec: &StoragePurgeSpec,
+    files: bool,
+) -> JobRunOutcome {
     if let Err(error) =
         acquire_purge_fence(&ctx.driver.storage_handle, ctx.job_id, &spec.scope).await
     {
         return JobRunOutcome::Failed(fence_error(error));
     }
-    match run_fenced_purge(ctx, spec).await {
+    // The planned files wait in the cleanup queue until the job has ended.
+    let outcome = run_fenced_purge(ctx, spec, files).await;
+    if !matches!(outcome, Err(PurgeRunError::Interrupted)) {
+        let unpaused = crate::blob::purge::set_paused(&ctx.driver, ctx.job_id.as_ulid(), false);
+        if let Err(error) = unpaused.await {
+            tracing::warn!(%error, "A purge's pause mark could not be removed");
+        }
+    }
+    match outcome {
         Ok(result) => JobRunOutcome::Succeeded(JobResultPayload::StoragePurge(result)),
         Err(PurgeRunError::Cancelled) => JobRunOutcome::Cancelled,
         Err(PurgeRunError::Interrupted) => JobRunOutcome::Interrupted,
@@ -64,15 +82,26 @@ impl From<JobError> for PurgeRunError {
 async fn run_fenced_purge(
     ctx: &JobContext,
     spec: &StoragePurgeSpec,
+    files: bool,
 ) -> Result<StoragePurgeResult, PurgeRunError> {
     check_stop(ctx)?;
+    // The trail is published only for the bucket incarnation the purge began on.
+    let mut incarnation = None;
     let bucket_exists = match drive(
         GetBucketOperation::new(spec.scope.bucket().to_string()),
         &ctx.driver,
     )
     .await
     {
-        Ok(info) if info.group_id == spec.group_id => true,
+        Ok(info) if info.group_id == spec.group_id => {
+            let storage = &ctx.driver.storage_handle;
+            incarnation = read_incarnation(storage, spec.scope.bucket(), None)
+                .await
+                .map_err(|event| {
+                    JobError::retryable(format!("purge bucket read failed: {event:?}"))
+                })?;
+            true
+        }
         Ok(_) => {
             return Err(JobError::permanent("purge bucket is outside the authorized group").into());
         }
@@ -130,7 +159,7 @@ async fn run_fenced_purge(
 
     if bucket_exists {
         abort_uploads(ctx, spec, &mut checkpoint).await?;
-        delete_versions(ctx, spec, &mut checkpoint).await?;
+        delete_versions(ctx, (spec, files), &mut checkpoint).await?;
         final_relist(ctx, &spec.scope).await?;
     }
 
@@ -162,7 +191,8 @@ async fn run_fenced_purge(
         false
     };
 
-    write_purge_audit(ctx, spec).await?;
+    let incarnation = incarnation.filter(|_| !bucket_deleted);
+    write_purge_audit(ctx, spec, incarnation).await?;
     ctx.progress.set_current(total);
     Ok(StoragePurgeResult {
         scope: spec.scope.clone(),
@@ -193,26 +223,93 @@ fn purge_audit_record(spec: &StoragePurgeSpec, occurred_at_ms: u64) -> BlobAudit
     }
 }
 
+/// The audit row of a purge and its trail row in the bucket incarnation it purged, if that
+/// bucket still stands. A purge that deleted its bucket, or one whose bucket was replaced,
+/// leaves nothing to protect, and a bucket created again must not meet its trail.
+fn audit_rows(
+    record: &BlobAuditRecord,
+    audit_id: ulid::Ulid,
+    value: aruna_core::types::Value,
+    incarnation: Option<u128>,
+) -> Vec<(String, aruna_core::types::Key, aruna_core::types::Value)> {
+    let audit = delete_audit_key(record.group_id, audit_id).into();
+    let mut writes = vec![(DELETE_AUDIT_KEYSPACE.to_string(), audit, value.clone())];
+    if let Some(incarnation) = incarnation {
+        let trail = trail_key(record, incarnation, audit_id).into();
+        writes.push((DELETE_TRAIL_KEYSPACE.to_string(), trail, value));
+    }
+    writes
+}
+
+/// The incarnation of `bucket` while it exists, from its row and its creation row.
+async fn read_incarnation(
+    storage: &aruna_storage::storage::StorageHandle,
+    bucket: &str,
+    txn_id: Option<ulid::Ulid>,
+) -> Result<Option<u128>, Event> {
+    let key: aruna_core::types::Key = bucket.as_bytes().to_vec().into();
+    let read = StorageEffect::BatchRead {
+        reads: vec![
+            (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
+            (BUCKET_CREATION_KEYSPACE.to_string(), key),
+        ],
+        txn_id,
+    };
+    match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::BatchReadResult { values }) if values.len() == 2 => {
+            let (bucket, creation) = (&values[0].1, &values[1].1);
+            let creation = creation.as_ref().map(|value| value.as_ref());
+            Ok(bucket.as_ref().map(|_| incarnation(creation)))
+        }
+        other => Err(other),
+    }
+}
+
 /// Records the completed purge once. The job id is the record id, so a
 /// re-driven job overwrites its own row instead of adding a second one.
-async fn write_purge_audit(ctx: &JobContext, spec: &StoragePurgeSpec) -> Result<(), PurgeRunError> {
+async fn write_purge_audit(
+    ctx: &JobContext,
+    spec: &StoragePurgeSpec,
+    incarnation: Option<u128>,
+) -> Result<(), PurgeRunError> {
     let record = purge_audit_record(spec, unix_timestamp_millis());
     let value = record
         .to_bytes()
         .map_err(|error| JobError::retryable(format!("purge audit encode failed: {error}")))?;
-    match ctx
-        .driver
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: DELETE_AUDIT_KEYSPACE.to_string(),
-            key: delete_audit_key(spec.group_id, ctx.job_id.as_ulid()).into(),
-            value: value.into(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        other => Err(JobError::retryable(format!("purge audit write failed: {other:?}")).into()),
+    let storage = &ctx.driver.storage_handle;
+    let failed = |event: Event| JobError::retryable(format!("purge audit write failed: {event:?}"));
+    let started = StorageEffect::StartTransaction { read: false };
+    let txn_id = match storage.send_storage_effect(started).await {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        other => return Err(failed(other).into()),
+    };
+    // The bucket is read in the transaction, so its removal or replacement meanwhile conflicts.
+    let current = match read_incarnation(storage, spec.scope.bucket(), Some(txn_id)).await {
+        Ok(current) => current,
+        Err(other) => {
+            let abort = StorageEffect::AbortTransaction { txn_id };
+            storage.send_storage_effect(abort).await;
+            return Err(failed(other).into());
+        }
+    };
+    let incarnation = incarnation.filter(|incarnation| current == Some(*incarnation));
+    let writes = audit_rows(&record, ctx.job_id.as_ulid(), value.into(), incarnation);
+    let write = StorageEffect::BatchWrite {
+        writes,
+        txn_id: Some(txn_id),
+    };
+    match storage.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+        other => {
+            let abort = StorageEffect::AbortTransaction { txn_id };
+            storage.send_storage_effect(abort).await;
+            return Err(failed(other).into());
+        }
+    }
+    let commit = StorageEffect::CommitTransaction { txn_id };
+    match storage.send_storage_effect(commit).await {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        other => Err(failed(other).into()),
     }
 }
 
@@ -223,6 +320,7 @@ async fn abort_uploads(
 ) -> Result<(), PurgeRunError> {
     loop {
         check_stop(ctx)?;
+        wait_paused(ctx).await?;
         let page = list_multipart_page(ctx, &spec.scope, PURGE_BATCH_SIZE).await?;
         if page.is_empty() {
             return Ok(());
@@ -264,11 +362,12 @@ async fn abort_uploads(
 
 async fn delete_versions(
     ctx: &JobContext,
-    spec: &StoragePurgeSpec,
+    (spec, files): (&StoragePurgeSpec, bool),
     checkpoint: &mut StoragePurgeCheckpoint,
 ) -> Result<(), PurgeRunError> {
     loop {
         check_stop(ctx)?;
+        wait_paused(ctx).await?;
         let page = list_version_page(ctx, &spec.scope, PURGE_BATCH_SIZE, None, None).await?;
         if page.items.is_empty() {
             return Ok(());
@@ -295,6 +394,10 @@ async fn delete_versions(
         {
             authorize_object(ctx, spec, key).await?;
         }
+        let indexes = match files {
+            true => plan_files(ctx, spec, &entries).await?,
+            false => Vec::new(),
+        };
         let batch_len = entries.len() as u64;
         let outcomes = delete_objects(
             &ctx.driver,
@@ -320,6 +423,7 @@ async fn delete_versions(
                 JobError::retryable(format!("versioned purge delete failed: {error}")).into(),
             );
         }
+        drop_indexes(ctx, indexes).await?;
         checkpoint.batches_completed = checkpoint.batches_completed.saturating_add(1);
         persist_batch(ctx, checkpoint, batch_len).await?;
     }
@@ -576,6 +680,75 @@ async fn persist_progress(ctx: &JobContext) -> Result<(), PurgeRunError> {
     Ok(())
 }
 
+/// Plans the release of the linked-storage files the entries read, before they go. Answers
+/// the key index rows of the second copies among them.
+async fn plan_files(
+    ctx: &JobContext,
+    spec: &StoragePurgeSpec,
+    entries: &[BulkDeleteEntry],
+) -> Result<Vec<aruna_core::types::Key>, PurgeRunError> {
+    let versions: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| Some((entry.key.clone(), entry.version_id?)))
+        .collect();
+    let scope = (spec.scope.bucket(), spec.group_id);
+    let failed = |error: String| JobError::retryable(format!("purge file plan failed: {error}"));
+    let found = crate::blob::purge::storage_files(&ctx.driver, scope, &versions, None)
+        .await
+        .map_err(failed)?;
+    crate::blob::purge::plan_files(&ctx.driver, ctx.job_id.as_ulid(), &found)
+        .await
+        .map_err(failed)?;
+    Ok(found.into_iter().filter_map(|file| file.index).collect())
+}
+
+/// Drops the key index rows of second copies whose versions are gone; their rows and files
+/// go through the planned releases.
+async fn drop_indexes(
+    ctx: &JobContext,
+    indexes: Vec<aruna_core::types::Key>,
+) -> Result<(), PurgeRunError> {
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    let deletes = (indexes.into_iter())
+        .map(|key| (aruna_core::keyspaces::RENAMED_ROW_KEYSPACE.to_string(), key))
+        .collect();
+    let delete = StorageEffect::BatchDelete {
+        deletes,
+        txn_id: None,
+    };
+    match ctx.driver.storage_handle.send_storage_effect(delete).await {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
+        other => {
+            let error = format!("purge could not drop copy indexes: {other:?}");
+            Err(JobError::retryable(error).into())
+        }
+    }
+}
+
+/// Waits while the caller paused the purge; a cancel or a shutdown ends the wait.
+async fn wait_paused(ctx: &JobContext) -> Result<(), PurgeRunError> {
+    loop {
+        let paused = crate::blob::purge::is_paused(&ctx.driver, ctx.job_id.as_ulid()).await;
+        match paused {
+            Ok(false) => return Ok(()),
+            Ok(true) => {}
+            Err(error) => {
+                return Err(
+                    JobError::retryable(format!("purge pause read failed: {error}")).into(),
+                );
+            }
+        }
+        tokio::select! {
+            () = ctx.cancel.cancelled() => {}
+            () = ctx.shutdown.cancelled() => {}
+            () = tokio::time::sleep(PAUSE_POLL) => {}
+        }
+        check_stop(ctx)?;
+    }
+}
+
 fn check_stop(ctx: &JobContext) -> Result<(), PurgeRunError> {
     if ctx.cancel.is_cancelled() {
         Err(PurgeRunError::Cancelled)
@@ -654,5 +827,38 @@ mod pure_tests {
         );
         assert_eq!(bucket.kind, BlobAuditKind::Purge(BlobPurgeKind::Bucket));
         assert!(bucket.key.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn omits_bucket_trail() {
+        let record = BlobAuditRecord {
+            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]),
+            group_id: ulid::Ulid::from_parts(1, 1),
+            node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+            user_id: Default::default(),
+            kind: BlobAuditKind::Purge(BlobPurgeKind::Bucket),
+            bucket: "b".to_string(),
+            key: String::new(),
+            version_id: None,
+            occurred_at_ms: 1,
+        };
+        let id = ulid::Ulid::from_parts(3, 3);
+        let spaces = |incarnation| {
+            let rows = audit_rows(&record, id, vec![1].into(), incarnation);
+            rows.into_iter()
+                .map(|(space, ..)| space)
+                .collect::<Vec<_>>()
+        };
+        // The audit always stays; the trail only while the purged bucket incarnation does.
+        assert_eq!(
+            spaces(Some(7)),
+            [DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE]
+        );
+        assert_eq!(spaces(None), [DELETE_AUDIT_KEYSPACE]);
     }
 }

@@ -121,8 +121,11 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::ListExternal { .. } => (EffectClass::Control, "list_external"),
         BlobEffect::HashExternal { .. } => (EffectClass::Transfer, "hash_external"),
         BlobEffect::WritePlain { .. } => (EffectClass::Transfer, "write_plain"),
+        BlobEffect::CopyPlain { .. } => (EffectClass::Transfer, "copy_plain"),
         BlobEffect::StatPlain { .. } => (EffectClass::Control, "stat_plain"),
+        BlobEffect::DeletePlain { .. } => (EffectClass::Local, "delete_plain"),
         BlobEffect::StatCopy { .. } => (EffectClass::Control, "stat_copy"),
+        BlobEffect::SettleCopy { .. } => (EffectClass::Control, "settle_copy"),
         BlobEffect::EnsureBucket { .. } => (EffectClass::Control, "ensure_bucket"),
         BlobEffect::HeadBucket { .. } => (EffectClass::Control, "head_bucket"),
         BlobEffect::DeleteEmptyBucket { .. } => (EffectClass::Control, "delete_empty_bucket"),
@@ -154,6 +157,9 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::ComposePieces { .. }
             | BlobEffect::ReplicateLeased { .. }
             | BlobEffect::WritePlain { .. }
+            | BlobEffect::CopyPlain { .. }
+            | BlobEffect::SettleCopy { .. }
+            | BlobEffect::DeletePlain { .. }
     )
 }
 
@@ -672,6 +678,21 @@ impl BlobHandler {
     // Effects run concurrently on their caller's task; per-operation ordering
     // is preserved by the driver awaiting each effect before the next.
     pub(super) async fn execute_effect(&self, effect: BlobEffect) -> BlobEvent {
+        // A settlement of a recorded upload names its backend only in the record.
+        let effect = match effect {
+            BlobEffect::SettleCopy {
+                attempt,
+                upload: None,
+            } => match self.copy_upload(attempt).await {
+                Ok(Some((location, upload_id))) => BlobEffect::SettleCopy {
+                    attempt,
+                    upload: Some((Box::new(location), upload_id)),
+                },
+                Ok(None) => return BlobEvent::UploadAborted,
+                Err(error) => return BlobEvent::Error(error),
+            },
+            effect => effect,
+        };
         let _hold = match self.hold_backends(&effect) {
             Ok(hold) => hold,
             Err(error) => return BlobEvent::Error(error),
@@ -920,10 +941,24 @@ impl BlobHandler {
                 created_by,
                 blob,
             } => Box::pin(self.write_plain(resolved, plain, created_by, blob)).await,
+            BlobEffect::CopyPlain {
+                resolved,
+                plain,
+                source,
+            } => Box::pin(self.copy_plain(resolved, plain, *source)).await,
             BlobEffect::StatCopy { location } => Box::pin(self.stat_copy(location)).await,
+            BlobEffect::SettleCopy { attempt, upload } => {
+                let upload = upload.map(|(location, id)| (*location, id));
+                Box::pin(self.settle_copy(attempt, upload)).await
+            }
             BlobEffect::StatPlain { backend, path } => {
                 Box::pin(self.stat_plain(backend, path)).await
             }
+            BlobEffect::DeletePlain {
+                location,
+                version,
+                etag,
+            } => Box::pin(self.delete_plain(location, version, etag)).await,
             BlobEffect::EnsureBucket { backend, bucket } => {
                 Box::pin(self.ensure_bucket(&backend, &bucket)).await
             }

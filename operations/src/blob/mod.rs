@@ -1,4 +1,4 @@
-//! Groups the blob modules for records, copies, cleanup, reclaim and holder refresh.
+//! Groups the blob modules for records, copies, cleanup, reclaim, renames and holder refresh.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -10,5 +10,9 @@ pub mod migration;
 pub mod pending_reclaim;
 pub mod permission_paths;
 pub mod promote;
+pub mod purge;
 pub mod reclaim;
 pub mod records;
+pub mod release;
+pub(crate) mod trail;
+pub mod unify;

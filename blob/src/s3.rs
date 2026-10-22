@@ -235,8 +235,30 @@ impl NativeMultipart {
         source: &NativeMultipart,
         source_path: &str,
     ) -> Result<String, BlobError> {
+        let part = (part_number, None);
+        self.copy_range(path, upload_id, part, (source, source_path, None))
+            .await
+    }
+
+    /// Copies `range` (inclusive), or all, of one provider `version` of a source object into
+    /// one part.
+    pub async fn copy_range(
+        &self,
+        path: &str,
+        upload_id: &str,
+        (part_number, range): (u16, Option<(u64, u64)>),
+        (source, source_path, version): (&NativeMultipart, &str, Option<&str>),
+    ) -> Result<String, BlobError> {
         let key = source.key(source_path);
         let encoded = utf8_percent_encode(&key, COPY_SOURCE);
+        let copy_source = match version {
+            Some(version) => {
+                let version = utf8_percent_encode(version, COPY_SOURCE);
+                format!("{}/{encoded}?versionId={version}", source.bucket)
+            }
+            None => format!("{}/{encoded}", source.bucket),
+        };
+        let range = range.map(|(first, last)| format!("bytes={first}-{last}"));
         let output = self
             .client
             .upload_part_copy()
@@ -244,7 +266,8 @@ impl NativeMultipart {
             .key(self.key(path))
             .upload_id(upload_id)
             .part_number(i32::from(part_number))
-            .copy_source(format!("{}/{encoded}", source.bucket))
+            .copy_source(copy_source)
+            .set_copy_source_range(range)
             .send()
             .boxed()
             .await
@@ -257,14 +280,15 @@ impl NativeMultipart {
     }
 
     /// Assembles the listed parts, in order, under the backend ETags recorded for them, and
-    /// answers the object's version id. `if_not_exists` fails with `PathTaken` on a taken key.
+    /// answers the object's version id and ETag. `if_not_exists` fails with `PathTaken` on a
+    /// taken key.
     pub async fn complete(
         &self,
         path: &str,
         upload_id: &str,
         parts: &[(u16, String)],
         if_not_exists: bool,
-    ) -> Result<Option<String>, BlobError> {
+    ) -> Result<(Option<String>, Option<String>), BlobError> {
         let parts = parts
             .iter()
             .map(|(part_number, etag)| {
@@ -294,7 +318,8 @@ impl NativeMultipart {
                 Some(412) => BlobError::PathTaken,
                 _ => write_error("complete", error),
             })?;
-        Ok(output.version_id().map(str::to_string))
+        let tag = output.e_tag().map(str::to_string);
+        Ok((output.version_id().map(str::to_string), tag))
     }
 
     /// Frees the stored parts of one upload; an upload the backend no longer has is gone already.

@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
@@ -34,6 +35,8 @@ use crate::server::state::ServerState;
 
 const DEFAULT_PREFLIGHT_LIMIT: usize = 1_000;
 const MAX_PREFLIGHT_LIMIT: usize = 1_000;
+/// Listing pages a delete preview reads past while every version in them is hidden.
+const HIDDEN_PAGES: usize = 64;
 
 #[derive(OpenApi)]
 #[openapi()]
@@ -43,6 +46,9 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(StorageDeletionDoc::openapi())
         .routes(routes!(deletion_preflight))
         .routes(routes!(submit_purge))
+        .routes(routes!(delete_preview))
+        .routes(routes!(control_purge))
+        .routes(routes!(get_purge))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -168,6 +174,12 @@ pub struct SubmitPurgeRequest {
     pub scope: PurgeScopeRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Also deletes the linked-storage files of the purged versions.
+    #[serde(default)]
+    pub delete_storage_files: bool,
+    /// The bucket name typed back; required to delete the storage files of a whole bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -395,7 +407,12 @@ pub async fn deletion_preflight(
 - Deletion is permanent and node-local: no version survives it here, copies other nodes hold are
   untouched, and the preflight route reports on it beforehand.
 - An `idempotency_key` makes a retried submission return the retained job instead of queuing a
-  second purge."#,
+  second purge.
+- `delete_storage_files` also deletes the files of the purged versions in linked storage. A file
+  is deleted only at the exact backend version Aruna recorded, only after the versions are gone
+  and on disk, and only while no other key, version, link or copy reads it; such files stay.
+  It needs an unrestricted token, and for a bucket `confirm` set to the bucket name.
+- `POST /data/storage/purge/jobs/{job_id}/{action}` pauses, resumes or aborts the purge."#,
     request_body(
         content = SubmitPurgeRequest,
         description = "The scope to purge plus an optional idempotency key",
@@ -429,9 +446,9 @@ pub async fn deletion_preflight(
                 "status_url": "/api/v1/compute/jobs/01JABCDEF0123456789ABCDEFG"
             })
         ),
-        (status = 400, description = "Invalid scope or idempotency key", body = ErrorResponse),
+        (status = 400, description = "Invalid scope or idempotency key, or `confirm` does not name the bucket", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller may not delete the selected scope permanently", body = ErrorResponse),
+        (status = 403, description = "The caller may not delete the selected scope permanently, or a restricted token asks to delete storage files", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse),
         (status = 409, description = "The idempotency key is retained for a purge of a different scope", body = ErrorResponse)
     ),
@@ -451,19 +468,29 @@ pub async fn submit_purge(
         return Err(ServerError::BadRequest);
     }
     let scope = request.scope.to_core()?;
+    let files = request.delete_storage_files;
+    if files && scope.is_bucket() && request.confirm.as_deref() != Some(scope.bucket()) {
+        return Err(ServerError::BadRequestMessage(
+            "set `confirm` to the bucket name to delete its storage files".to_string(),
+        ));
+    }
     let info = bucket_info(&state, scope.bucket()).await?;
     let path = scope_permission_path(&state, info.group_id, &scope);
-    if !permission_granted(&state, &auth, path, Permission::WRITE).await? {
+    // A token limited to some paths could reach files other keys read through the storage.
+    if (files && auth.path_restrictions.is_some())
+        || !permission_granted(&state, &auth, path, Permission::WRITE).await?
+    {
         return Err(ServerError::Forbidden);
     }
+    let spec = StoragePurgeSpec {
+        scope,
+        group_id: info.group_id,
+        auth_context: auth,
+        node_id: state.get_node_id(),
+    };
     let result = submit_purge_job(
         &state.get_ctx(),
-        StoragePurgeSpec {
-            scope,
-            group_id: info.group_id,
-            auth_context: auth,
-            node_id: state.get_node_id(),
-        },
+        (spec, files),
         state.get_node_id(),
         request.idempotency_key,
         JOB_RETENTION_MS,
@@ -483,6 +510,466 @@ pub async fn submit_purge(
             status_url: urls.status_url,
         }),
     ))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeleteImpactRequest {
+    /// `file`, `folder` or `bucket`.
+    pub kind: String,
+    /// The file key or the folder prefix ending with `/`; empty for a bucket.
+    #[serde(default)]
+    pub key: String,
+    /// Entries per page: 1 to 1000, default 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// The `next` value of the page before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// Only versions of keys that contain this text are listed; the totals stay for the scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StorageFileImpact {
+    pub path: String,
+    pub bytes: u64,
+    /// Why the file stays after the purge; omitted when it is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeleteImpactItem {
+    pub key: String,
+    pub version_id: String,
+    /// Bytes of the version in Aruna; 0 for a delete marker.
+    pub bytes: u64,
+    /// The linked-storage file the version reads, listed with the first version reading it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_file: Option<StorageFileImpact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeleteImpact {
+    /// Keys, versions and their bytes in Aruna.
+    pub files: u64,
+    pub versions: u64,
+    pub bytes: u64,
+    /// Files in linked storage the versions read, and their bytes.
+    pub storage_files: u64,
+    pub storage_bytes: u64,
+    /// Files of this page that would stay, because something else reads them.
+    pub kept_files: u64,
+    /// `false` when the totals stopped at their limit and are lower bounds.
+    pub complete: bool,
+    pub items: Vec<DeleteImpactItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/buckets/{bucket}/storage/delete/preview",
+    tag = "data/storage",
+    summary = "Preview a permanent delete with its storage files",
+    description = r#"Reports what a permanent delete of a file, a folder or the whole bucket removes in Aruna and in linked storage, with one page of the versions and the storage file each reads. Nothing changes.
+
+**Authentication**: realm bearer token with READ on the selected scope.
+
+**Behavior**
+- Totals count every version of the scope on this node, its bytes, and each linked-storage file
+  once. `kept_files` counts the files of this page that would stay because a key outside the
+  scope, another link or a missing exact backend version keeps them.
+- Pages follow key and version order; `next` resumes after the last version passed over and
+  names only keys the caller may read. `filter` lists only keys that contain its text; the
+  totals stay for the whole scope.
+- Keys the caller may not read are neither counted nor listed.
+
+**Limits**
+- 1 to 1000 entries per page. Totals pass over at most 1,000,000 versions, hidden ones
+  included; `complete` is then false. 64 listing pages of only hidden versions answer 409."#,
+    params(("bucket" = String, Path, description = "Bucket to inspect")),
+    request_body(content = DeleteImpactRequest, example = json!({"kind": "folder", "key": "raw/"})),
+    responses(
+        (status = 200, description = "Totals and one page", body = DeleteImpact, example = json!({
+            "files": 2, "versions": 3, "bytes": 3072, "storage_files": 2, "storage_bytes": 2048,
+            "kept_files": 0, "complete": true,
+            "items": [{
+                "key": "raw/a.faa.gz", "version_id": "01JA7Q3K2M4N5P6Q7R8S9T0V1W", "bytes": 1024,
+                "storage_file": {"path": "raw/a.faa.gz~01JA7Q3K2M4N5P6Q7R8S9T0V1W", "bytes": 1024}
+            }]
+        })),
+        (status = 400, description = "Invalid kind, key, limit or cursor", body = ErrorResponse),
+        (status = 409, description = "Too many versions in a row are hidden from the caller", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The caller cannot read the scope", body = ErrorResponse),
+        (status = 404, description = "Bucket not found", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_preview(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    axum::extract::Path(bucket): axum::extract::Path<String>,
+    Json(request): Json<DeleteImpactRequest>,
+) -> ServerResult<Json<DeleteImpact>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let scope = match request.kind.as_str() {
+        "file" => PurgeScopeRequest::File {
+            bucket: bucket.clone(),
+            key: request.key.clone(),
+        },
+        "folder" | "prefix" => PurgeScopeRequest::Prefix {
+            bucket: bucket.clone(),
+            prefix: request.key.clone(),
+        },
+        "bucket" => PurgeScopeRequest::Bucket {
+            bucket: bucket.clone(),
+        },
+        _ => return Err(ServerError::BadRequest),
+    }
+    .to_core()?;
+    let limit = request.limit.unwrap_or(100);
+    if !(1..=MAX_PREFLIGHT_LIMIT).contains(&limit) {
+        return Err(ServerError::BadRequest);
+    }
+    let (key_marker, version_marker) = match request.after.as_deref() {
+        Some(after) => decode_marker(after).map(|(key, id)| (Some(key), Some(id)))?,
+        None => (None, None),
+    };
+    let info = bucket_info(&state, &bucket).await?;
+    let path = scope_permission_path(&state, info.group_id, &scope);
+    if !permission_granted(&state, &auth, path, Permission::READ).await? {
+        return Err(ServerError::Forbidden);
+    }
+    let context = state.get_ctx();
+    // Only keys the caller may read are counted, listed or named by a cursor.
+    let scope_of = (auth.realm_id, info.group_id, state.get_node_id());
+    let access = aruna_operations::auth::request_authorization::BucketAccess::load(
+        &context, &auth, scope_of, &bucket,
+    )
+    .await
+    .map_err(|_| ServerError::Forbidden)?;
+    let readable = |key: &str| access.allows(Some(key), &Permission::READ);
+    let totals = aruna_operations::blob::purge::scope_totals(&context, &scope, &readable)
+        .await
+        .map_err(ServerError::InternalError)?;
+    let (mut items, mut marker) = (Vec::new(), (key_marker, version_marker));
+    let (mut next, mut more) = (None, false);
+    for _ in 0..HIDDEN_PAGES {
+        let page = drive(
+            ListVersionsOperation::new(ListVersionsInput {
+                bucket: bucket.clone(),
+                prefix: scope.list_prefix().map(str::to_string),
+                delimiter: None,
+                key_marker: marker.0.clone(),
+                version_id_marker: marker.1,
+                max_keys: Some(limit - items.len()),
+            }),
+            &context,
+        )
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        let (page, truncated, next_key, next_version) = scoped_version_page(&scope, page);
+        let mut last_seen = None;
+        for item in page {
+            let (ListVersionsItem::Version {
+                key, version_id, ..
+            }
+            | ListVersionsItem::DeleteMarker {
+                key, version_id, ..
+            }) = &item;
+            if readable(key) {
+                last_seen = Some((key.clone(), *version_id));
+                if request
+                    .filter
+                    .as_deref()
+                    .is_none_or(|filter| key.contains(filter))
+                {
+                    items.push(item);
+                }
+            }
+        }
+        more = truncated;
+        if !truncated {
+            next = None;
+            break;
+        }
+        // A cursor names only a version the caller may read.
+        next = last_seen.or(next);
+        if items.len() == limit {
+            break;
+        }
+        marker = (next_key, next_version);
+    }
+    if more && next.is_none() {
+        return Err(ServerError::Conflict(
+            "too many versions in a row are hidden from the caller".to_string(),
+        ));
+    }
+    let versions: Vec<_> = items
+        .iter()
+        .map(|item| match item {
+            ListVersionsItem::Version {
+                key, version_id, ..
+            }
+            | ListVersionsItem::DeleteMarker {
+                key, version_id, ..
+            } => (key.clone(), *version_id),
+        })
+        .collect();
+    let files = aruna_operations::blob::purge::storage_files(
+        &context,
+        (&bucket, info.group_id),
+        &versions,
+        Some(&scope),
+    )
+    .await
+    .map_err(ServerError::InternalError)?;
+    let kept_files = files.iter().filter(|file| file.kept.is_some()).count() as u64;
+    let items = items
+        .into_iter()
+        .map(|item| {
+            let (key, version_id, bytes) = match item {
+                ListVersionsItem::Version {
+                    key,
+                    version_id,
+                    location,
+                    ..
+                } => (
+                    key,
+                    version_id,
+                    location.map_or(0, |location| location.blob_size),
+                ),
+                ListVersionsItem::DeleteMarker {
+                    key, version_id, ..
+                } => (key, version_id, 0),
+            };
+            let file = files
+                .iter()
+                .find(|file| file.key == key && file.version_id == version_id);
+            DeleteImpactItem {
+                storage_file: file.map(|file| StorageFileImpact {
+                    path: file.location.backend_path.clone(),
+                    bytes: file.location.blob_size,
+                    kept: file.kept.clone(),
+                }),
+                key,
+                version_id: version_id.to_string(),
+                bytes,
+            }
+        })
+        .collect();
+    let next = next.map(|(key, id)| encode_marker(&key, id));
+    Ok(Json(DeleteImpact {
+        files: totals.keys,
+        versions: totals.versions,
+        bytes: totals.bytes,
+        storage_files: totals.storage_files,
+        storage_bytes: totals.storage_bytes,
+        kept_files,
+        complete: totals.complete,
+        items,
+        next,
+    }))
+}
+
+/// A page cursor: the key and version id the next page starts after.
+fn encode_marker(key: &str, version_id: Ulid) -> String {
+    use base64::Engine;
+    let raw = format!("{version_id}{key}");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+}
+
+fn decode_marker(cursor: &str) -> ServerResult<(String, Ulid)> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| ServerError::BadRequest)?;
+    let raw = String::from_utf8(bytes).map_err(|_| ServerError::BadRequest)?;
+    let (id, key) = raw.split_at_checked(26).ok_or(ServerError::BadRequest)?;
+    let id = Ulid::from_string(id).map_err(|_| ServerError::BadRequest)?;
+    Ok((key.to_string(), id))
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/storage/purge/jobs/{job_id}/{action}",
+    tag = "data/storage",
+    summary = "Pause, resume or abort a purge",
+    description = r#"Pauses, resumes or aborts a running purge job of this node.
+
+**Authentication**: realm bearer token with WRITE on the purge's scope, as its submission.
+
+**Behavior**
+- `pause` stops the purge between batches and keeps its position; `resume` continues. The
+  answer, and `GET` on the job, show the pause.
+- `abort` ends the purge for good, also a paused one. Versions already deleted stay deleted, and
+  the storage files of those versions are still handed to their release, so nothing is left
+  half-done. The job then shows `cancelled`, and a new purge may start."#,
+    params(
+        ("job_id" = String, Path, description = "The purge job"),
+        ("action" = String, Path, description = "`pause`, `resume` or `abort`")
+    ),
+    responses(
+        (status = 200, description = "The purge after the change", body = PurgeJobResponse, example = json!({
+            "job_id": "01JABCDEF0123456789ABCDEFG", "state": "paused", "paused": true,
+            "delete_storage_files": true
+        })),
+        (status = 400, description = "Invalid job id or unknown action", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The caller may not delete the purge's scope permanently", body = ErrorResponse),
+        (status = 404, description = "No purge job with this id on this node", body = ErrorResponse),
+        (status = 409, description = "The purge already ended", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn control_purge(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    axum::extract::Path((job_id, action)): axum::extract::Path<(String, String)>,
+) -> ServerResult<Json<PurgeJobResponse>> {
+    use aruna_operations::jobs::service::{CancelJobOutcome, cancel_owned_job};
+    let auth = require_realm_auth(&state, auth)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
+    let context = state.get_ctx();
+    let record =
+        aruna_operations::jobs::store::read_job_record(&context.storage_handle, job_id, None)
+            .await
+            .map_err(ServerError::InternalError)?
+            .ok_or(ServerError::NotFound)?;
+    let Some(spec) = record.payload.purge_spec() else {
+        return Err(ServerError::NotFound);
+    };
+    let path = scope_permission_path(&state, spec.group_id, &spec.scope);
+    // As at its submission, a purge of storage files is not steered by a restricted token.
+    let files = matches!(record.payload, JobPayload::StoragePurgeFiles(_));
+    if (files && auth.path_restrictions.is_some())
+        || !permission_granted(&state, &auth, path, Permission::WRITE).await?
+    {
+        return Err(ServerError::Forbidden);
+    }
+    if record.state.is_terminal() {
+        return Err(ServerError::Conflict("the purge already ended".to_string()));
+    }
+    let failed = |error: String| ServerError::InternalError(error);
+    let id = job_id.as_ulid();
+    match action.as_str() {
+        "pause" | "resume" => {
+            let paused = action == "pause";
+            aruna_operations::blob::purge::set_paused(&context, id, paused)
+                .await
+                .map_err(failed)?;
+        }
+        "abort" => {
+            let runtime = state.jobs_runtime();
+            let outcome = cancel_owned_job(&context, &runtime, record.created_by, job_id)
+                .await
+                .map_err(failed)?;
+            // Its planned files wait in the cleanup queue, which releases them once it ended.
+            if let CancelJobOutcome::AlreadyTerminal(_) | CancelJobOutcome::Requested(_) = outcome
+                && purge_ended(&state, job_id).await?
+            {
+                aruna_operations::blob::purge::set_paused(&context, id, false)
+                    .await
+                    .map_err(failed)?;
+            }
+        }
+        _ => return Err(ServerError::BadRequest),
+    }
+    purge_job(&state, job_id).await
+}
+
+/// A purge job as its controls see it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PurgeJobResponse {
+    pub job_id: String,
+    /// The job state, or `paused` while a running purge waits for its resume.
+    pub state: String,
+    /// The caller paused the purge; it resumes with `POST .../resume`.
+    pub paused: bool,
+    /// The purge also deletes the linked-storage files of its versions.
+    pub delete_storage_files: bool,
+}
+
+async fn purge_job(
+    state: &ServerState,
+    job_id: aruna_core::structs::execution::job::JobId,
+) -> ServerResult<Json<PurgeJobResponse>> {
+    let context = state.get_ctx();
+    let record =
+        aruna_operations::jobs::store::read_job_record(&context.storage_handle, job_id, None)
+            .await
+            .map_err(ServerError::InternalError)?
+            .ok_or(ServerError::NotFound)?;
+    let paused = aruna_operations::blob::purge::is_paused(&context, job_id.as_ulid())
+        .await
+        .map_err(ServerError::InternalError)?;
+    let paused = paused && !record.state.is_terminal();
+    Ok(Json(PurgeJobResponse {
+        job_id: job_id.to_string(),
+        state: match paused {
+            true => "paused".to_string(),
+            false => record.state.name().to_string(),
+        },
+        paused,
+        delete_storage_files: matches!(record.payload, JobPayload::StoragePurgeFiles(_)),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/storage/purge/jobs/{job_id}",
+    tag = "data/storage",
+    summary = "Show whether a purge is paused",
+    description = r#"Shows a purge job of this node with its pause: `state` is `paused` while the caller paused a running purge, else the job state. Progress and the result stay on the job status route.
+
+**Authentication**: realm bearer token with READ on the purge's scope."#,
+    params(("job_id" = String, Path, description = "The purge job")),
+    responses(
+        (status = 200, description = "The purge", body = PurgeJobResponse, example = json!({
+            "job_id": "01JABCDEF0123456789ABCDEFG", "state": "running", "paused": false,
+            "delete_storage_files": true
+        })),
+        (status = 400, description = "Invalid job id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The caller cannot read the purge's scope", body = ErrorResponse),
+        (status = 404, description = "No purge job with this id on this node", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_purge(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> ServerResult<Json<PurgeJobResponse>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
+    let storage = &state.get_ctx().storage_handle;
+    let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+        .await
+        .map_err(ServerError::InternalError)?
+        .ok_or(ServerError::NotFound)?;
+    let Some(spec) = record.payload.purge_spec() else {
+        return Err(ServerError::NotFound);
+    };
+    let path = scope_permission_path(&state, spec.group_id, &spec.scope);
+    if !permission_granted(&state, &auth, path, Permission::READ).await? {
+        return Err(ServerError::Forbidden);
+    }
+    purge_job(&state, job_id).await
+}
+
+async fn purge_ended(
+    state: &ServerState,
+    job_id: aruna_core::structs::execution::job::JobId,
+) -> ServerResult<bool> {
+    let storage = &state.get_ctx().storage_handle;
+    let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+        .await
+        .map_err(ServerError::InternalError)?;
+    Ok(record.is_some_and(|record| record.state.is_terminal()))
 }
 
 pub(crate) async fn bucket_info(

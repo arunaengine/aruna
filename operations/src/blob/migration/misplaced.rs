@@ -1,8 +1,9 @@
-//! Counts the versions of a bucket that a storage move would move now.
+//! Counts the versions of a bucket that a storage move would move now, and the linked files
+//! it would rename.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{encrypting, move_routing, place, source_key, stays};
+use super::{encrypting, move_routing, place, read_earlier, renames, source_key, stays};
 use crate::blob::records::blob_location_read;
 use crate::driver::DriverContext;
 use aruna_core::events::{Event, StorageEvent};
@@ -13,28 +14,40 @@ use aruna_core::structs::storage::backend_import::{ImportedObject, object_key};
 use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKey};
 use aruna_core::types::Key;
 
-/// Versions one count reads at most, so a request stays bounded.
+/// Versions under the prefix one count reads at most, so a request stays bounded.
 const COUNT_LIMIT: usize = 10_000;
+/// Version rows of the bucket one count passes over at most, under the prefix or not.
+const SCAN_LIMIT: usize = 200_000;
 const COUNT_PAGE: usize = 256;
+/// Renames one count lists by name; `renamed` counts all of them.
+const RENAME_LIST: usize = 100;
 
 /// Versions under a prefix that are not where the rules place a new write of their key.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Misplaced {
     pub count: u64,
     /// `false` when the count stopped at its limit and more versions exist.
     pub complete: bool,
+    /// Linked files of an earlier pattern among them, which a move gives their current name.
+    pub renamed: u64,
+    /// The first of them, as the old and the new path.
+    pub renames: Vec<(String, String)>,
+    /// Renames of keys the caller may not use; they are neither counted nor listed.
+    pub withheld: u64,
 }
 
 /// Counts what a move of `prefix` would move, with the move's own skips: an encrypted bucket
 /// moves nothing; linked-folder files, unfinished copies and recorded broken versions stay.
+/// With `renaming`, linked files of earlier patterns whose key it allows count as renames.
 pub async fn count_misplaced(
     context: &DriverContext,
     bucket: &str,
     prefix: &str,
+    renaming: Option<&(dyn Fn(&str) -> bool + Sync)>,
 ) -> Result<Misplaced, String> {
     let mut misplaced = Misplaced {
-        count: 0,
         complete: true,
+        ..Misplaced::default()
     };
     if encrypting(context, &bucket.as_bytes().to_vec().into()).await? {
         return Ok(misplaced);
@@ -42,24 +55,34 @@ pub async fn count_misplaced(
     let Some(routing) = move_routing(context, bucket).await? else {
         return Ok(misplaced);
     };
+    // Only a move asked to rename gives linked files their current name.
+    let earlier = match renaming {
+        Some(_) => read_earlier(context, &routing).await?,
+        None => super::Earlier::new(),
+    };
     let scan = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
-    let (mut after, mut seen) = (None::<Key>, 0);
+    let (mut after, mut seen, mut scanned) = (None::<Key>, 0, 0);
     loop {
         let (versions, next) = crate::jobs::store::iter_prefix_page(
             &context.storage_handle,
             BLOB_VERSIONS_KEYSPACE,
             Some(scan.clone().into()),
             after.take(),
-            COUNT_PAGE.min(COUNT_LIMIT - seen),
+            COUNT_PAGE,
             None,
         )
         .await?;
         for (key, value) in versions {
-            seen += 1;
+            if seen >= COUNT_LIMIT || scanned >= SCAN_LIMIT {
+                misplaced.complete = false;
+                return Ok(misplaced);
+            }
+            scanned += 1;
             let version_key = VersionKey::from_bytes(key.as_ref()).map_err(|e| e.to_string())?;
             if !version_key.key.starts_with(prefix) {
                 continue;
             }
+            seen += 1;
             let version = BlobVersion::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
             // A key the rules cannot place now fails its move; it is not counted.
             let Ok((resolved, plain)) = place(&routing, &version_key) else {
@@ -73,8 +96,29 @@ pub async fn count_misplaced(
             if read(context, BROKEN_VERSION_KEYSPACE, key.clone())
                 .await?
                 .is_some()
-                || !moves(context, &source).await?
             {
+                continue;
+            }
+            let Some(location) = read_location(context, &source).await? else {
+                continue;
+            };
+            let renamed = plain
+                .as_ref()
+                .filter(|plain| renames(&routing, &earlier, plain, &location, &version_key));
+            if let Some(plain) = renamed {
+                if !renaming.is_some_and(|allow| allow(&version_key.key)) {
+                    misplaced.withheld += 1;
+                    continue;
+                }
+                misplaced.renamed += 1;
+                if misplaced.renames.len() < RENAME_LIST {
+                    let paths = (location.backend_path.clone(), plain.path.clone());
+                    misplaced.renames.push(paths);
+                }
+                misplaced.count += 1;
+                continue;
+            }
+            if stays(&location, true) {
                 continue;
             }
             // A copy in place with its linked file recorded for this version is done.
@@ -92,11 +136,11 @@ pub async fn count_misplaced(
             misplaced.count += 1;
         }
         match next {
-            Some(_) if seen >= COUNT_LIMIT => {
+            Some(next) if seen < COUNT_LIMIT && scanned < SCAN_LIMIT => after = Some(next),
+            Some(_) => {
                 misplaced.complete = false;
                 return Ok(misplaced);
             }
-            Some(next) => after = Some(next),
             None => return Ok(misplaced),
         }
     }
@@ -118,21 +162,164 @@ async fn read(
     }
 }
 
-/// Whether the copy a version names exists and would leave its place.
-async fn moves(
+/// The copy a version names, if it exists.
+async fn read_location(
     context: &DriverContext,
     key: &aruna_core::structs::storage::blob::BlobLocationKey,
-) -> Result<bool, String> {
+) -> Result<Option<BackendLocation>, String> {
     let aruna_core::effects::Effect::Storage(read) = blob_location_read(key, None) else {
         return Err("unexpected location read".to_string());
     };
     match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => match value {
             Some(value) => BackendLocation::from_bytes(value.as_ref())
-                .map(|location| !stays(&location, true))
+                .map(Some)
                 .map_err(|error| error.to_string()),
-            None => Ok(false),
+            None => Ok(None),
         },
         other => Err(format!("could not read a location: {other:?}")),
     }
+}
+
+/// Entries one rename preview page shows by default and at most.
+pub const DEFAULT_PAGE: usize = 100;
+pub const MAX_PAGE: usize = 1000;
+/// Version rows one rename preview passes over at most, for its totals and for its page.
+const TOTAL_ROWS: usize = 2_000_000;
+const PAGE_ROWS: usize = 200_000;
+
+/// A check of a key against the caller's access.
+pub type KeyCheck<'a> = dyn Fn(&str) -> bool + Sync + 'a;
+
+/// One page of the linked files a rename gives their current name, with the totals.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RenamePage {
+    /// Files the caller may read that a rename renames; a lower bound while `complete` is false.
+    pub total: u64,
+    pub complete: bool,
+    /// The old and the new path, and whether the caller may write the key.
+    pub entries: Vec<(String, String, bool)>,
+    /// The version row after which the next page starts; it names a key the caller may read.
+    pub next: Option<Vec<u8>>,
+}
+
+/// The linked files under `prefix` of `bucket` an asked rename renames, page by page in
+/// version storage order after the row `after`, as far as `readable` allows the key.
+pub async fn rename_page(
+    context: &DriverContext,
+    (bucket, prefix): (&str, &str),
+    (readable, writable): (&KeyCheck<'_>, &KeyCheck<'_>),
+    (filter, after, limit): (Option<&str>, Option<Vec<u8>>, usize),
+) -> Result<RenamePage, String> {
+    let mut page = RenamePage {
+        complete: true,
+        ..RenamePage::default()
+    };
+    if encrypting(context, &bucket.as_bytes().to_vec().into()).await? {
+        return Ok(page);
+    }
+    let Some(routing) = move_routing(context, bucket).await? else {
+        return Ok(page);
+    };
+    let earlier = read_earlier(context, &routing).await?;
+    let shown = |key: &str| {
+        key.starts_with(prefix) && filter.is_none_or(|filter| key.contains(filter)) && readable(key)
+    };
+    let scan = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
+    let (mut start, mut scanned) = (None::<Key>, 0usize);
+    'total: loop {
+        let (rows, next) = crate::jobs::store::iter_prefix_page(
+            &context.storage_handle,
+            BLOB_VERSIONS_KEYSPACE,
+            Some(scan.clone().into()),
+            start.take(),
+            COUNT_PAGE,
+            None,
+        )
+        .await?;
+        for (key, value) in &rows {
+            if scanned == TOTAL_ROWS {
+                page.complete = false;
+                break 'total;
+            }
+            scanned += 1;
+            let version_key = VersionKey::from_bytes(key).map_err(|e| e.to_string())?;
+            if shown(&version_key.key)
+                && renamed(context, (&routing, &earlier), &version_key, value)
+                    .await?
+                    .is_some()
+            {
+                page.total += 1;
+            }
+        }
+        match next {
+            Some(next) => start = Some(next),
+            None => break,
+        }
+    }
+    let (mut start, mut scanned) = (after.map(Key::from), 0usize);
+    let mut last = None;
+    loop {
+        let (rows, next) = crate::jobs::store::iter_prefix_page(
+            &context.storage_handle,
+            BLOB_VERSIONS_KEYSPACE,
+            Some(scan.clone().into()),
+            start.take(),
+            COUNT_PAGE,
+            None,
+        )
+        .await?;
+        for (key, value) in &rows {
+            if page.entries.len() == limit || scanned == PAGE_ROWS {
+                // A cursor names only a row of a key the caller may read.
+                page.next = last;
+                if page.next.is_none() {
+                    return Err("too many keys in a row are hidden from the caller".to_string());
+                }
+                return Ok(page);
+            }
+            scanned += 1;
+            let version_key = VersionKey::from_bytes(key).map_err(|e| e.to_string())?;
+            if readable(&version_key.key) {
+                last = Some(key.to_vec());
+            }
+            if !shown(&version_key.key) {
+                continue;
+            }
+            if let Some((from, to)) =
+                renamed(context, (&routing, &earlier), &version_key, value).await?
+            {
+                page.entries.push((from, to, writable(&version_key.key)));
+            }
+        }
+        match next {
+            Some(next) => start = Some(next),
+            None => return Ok(page),
+        }
+    }
+}
+
+/// The old and new path of the version's linked file, if a rename renames it.
+async fn renamed(
+    context: &DriverContext,
+    (routing, earlier): (
+        &aruna_core::structs::storage::routing::RoutingSnapshot,
+        &super::Earlier,
+    ),
+    version_key: &VersionKey,
+    value: &[u8],
+) -> Result<Option<(String, String)>, String> {
+    let Ok((resolved, Some(plain))) = place(routing, version_key) else {
+        return Ok(None);
+    };
+    let version = BlobVersion::from_bytes(value).map_err(|error| error.to_string())?;
+    let target = (resolved.backend.clone(), resolved.compression.into());
+    let Some(source) = source_key(&version, |_: &_| target.clone(), true) else {
+        return Ok(None);
+    };
+    let Some(location) = read_location(context, &source).await? else {
+        return Ok(None);
+    };
+    let found = renames(routing, earlier, &plain, &location, version_key);
+    Ok(found.then_some((location.backend_path, plain.path)))
 }

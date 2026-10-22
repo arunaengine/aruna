@@ -82,21 +82,60 @@ fn audit_op(version_id: Option<Ulid>) -> DeleteObjectOperation {
         deleted_by: test_user_id(),
     });
     operation.txn_id = Some(Ulid::generate());
+    operation.incarnation = Some(INCARNATION);
     operation
 }
 
+const INCARNATION: u128 = 9;
+
 fn audit_record(effects: &[Effect]) -> aruna_core::structs::storage::delete_audit::BlobAuditRecord {
-    let [
-        Effect::Storage(StorageEffect::Write {
-            key_space, value, ..
-        }),
-    ] = effects
-    else {
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects else {
         panic!("expected one audit write, got {effects:?}")
     };
-    assert_eq!(key_space, DELETE_AUDIT_KEYSPACE);
-    aruna_core::structs::storage::delete_audit::BlobAuditRecord::from_bytes(value.as_ref())
-        .expect("audit record decodes")
+    let [(audit_space, _, value), (trail_space, trail, indexed)] = writes.as_slice() else {
+        panic!("expected the audit row and its trail entry, got {writes:?}")
+    };
+    assert_eq!(audit_space, DELETE_AUDIT_KEYSPACE);
+    // The same record is indexed by its object key in the same transaction.
+    assert_eq!(trail_space, aruna_core::keyspaces::DELETE_TRAIL_KEYSPACE);
+    assert_eq!(value, indexed);
+    let record =
+        aruna_core::structs::storage::delete_audit::BlobAuditRecord::from_bytes(value.as_ref())
+            .expect("audit record decodes");
+    let prefix = aruna_core::structs::storage::delete_audit::delete_prefix(
+        record.group_id,
+        &record.bucket,
+        INCARNATION,
+        &record.key,
+    );
+    assert!(trail.starts_with(&prefix));
+    record
+}
+
+#[test]
+fn reads_audit_bucket() {
+    // Without a known incarnation the creation row is read in the delete transaction first.
+    let mut operation = audit_op(None);
+    operation.version_id = Some(Ulid::generate());
+    operation.incarnation = None;
+    let effects = operation.write_delete_audit();
+    let [
+        Effect::Storage(StorageEffect::Read {
+            key_space, txn_id, ..
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("expected the bucket read, got {effects:?}")
+    };
+    assert_eq!(key_space, aruna_core::keyspaces::BUCKET_CREATION_KEYSPACE);
+    assert_eq!(*txn_id, operation.txn_id);
+    assert_eq!(operation.state, DeleteObjectState::ReadAuditBucket);
+    let value = Some(INCARNATION.to_be_bytes().to_vec().into());
+    let effects = operation.audit_bucket_read(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0].into(),
+        value,
+    }));
+    audit_record(&effects);
 }
 
 #[test]
@@ -252,6 +291,7 @@ fn sized_delete_op() -> DeleteObjectOperation {
         deleted_by: test_user_id(),
     });
     op.txn_id = Some(Ulid::from_bytes([7u8; 16]));
+    op.incarnation = Some(INCARNATION);
     op.target_version = Some(VersionSummary {
         version_id,
         materialized_hash: Some([4u8; 32]),
@@ -300,7 +340,7 @@ fn delete_stages_debit() {
     assert_eq!(op.state, DeleteObjectState::WriteDeleteAudit);
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::Write { .. })]
+        [Effect::Storage(StorageEffect::BatchWrite { .. })]
     ));
 }
 
@@ -315,6 +355,7 @@ fn candidate_op(location: Option<BlobLocationKey>) -> DeleteObjectOperation {
         deleted_by: test_user_id(),
     });
     op.txn_id = Some(Ulid::from_bytes([7u8; 16]));
+    op.incarnation = Some(INCARNATION);
     op.target_location = location;
     op
 }
@@ -360,15 +401,10 @@ fn marker_queues_nothing() {
 
     let effects = op.write_reclaim_candidate();
 
-    let [
-        Effect::Storage(StorageEffect::Write {
-            key_space, txn_id, ..
-        }),
-    ] = effects.as_slice()
-    else {
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice() else {
         panic!("expected the audit write, got {effects:?}")
     };
-    assert_eq!(key_space, DELETE_AUDIT_KEYSPACE);
+    assert_eq!(writes[0].0, DELETE_AUDIT_KEYSPACE);
     assert_eq!(*txn_id, op.txn_id);
 }
 
@@ -1518,4 +1554,27 @@ fn changed_version_kept() {
         [Effect::Storage(StorageEffect::AbortTransaction { .. })]
     ));
     assert_eq!(op.finalize(), Err(DeleteObjectError::VersionChanged));
+}
+
+#[test]
+fn marker_needs_head() {
+    let head = Ulid::from_parts(5, 5);
+    let marked = |current: Ulid| {
+        let mut operation = audit_op(None).with_head(head);
+        operation.state = DeleteObjectState::ReadCurrentLookup;
+        operation.pending_version_id = Some(Ulid::generate());
+        let pointer = CurrentVersionPointer::new(current).to_bytes().unwrap();
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(pointer.into()),
+        }));
+        operation.output
+    };
+    // A head written meanwhile is never covered by the marker.
+    let moved = marked(Ulid::from_parts(6, 6));
+    assert!(matches!(
+        moved,
+        Some(Err(DeleteObjectError::VersionChanged))
+    ));
+    assert!(marked(head).is_none());
 }

@@ -18,8 +18,8 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
-    PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DELETE_TRAIL_KEYSPACE,
+    DHT_KEYSPACE, PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
@@ -88,7 +88,11 @@ fn test_location(created_by: aruna_core::UserId) -> BackendLocation {
     }
 }
 
-fn put_config(realm_id: RealmId, group_id: Ulid, node_id: aruna_core::NodeId) -> PutObjectConfig {
+pub(super) fn put_config(
+    realm_id: RealmId,
+    group_id: Ulid,
+    node_id: aruna_core::NodeId,
+) -> PutObjectConfig {
     PutObjectConfig {
         user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
         group_id,
@@ -1615,6 +1619,255 @@ fn generation_increments() {
     );
 }
 
+#[test]
+fn dedup_keeps_writer() {
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let (first, writer) = (
+        aruna_core::UserId::local(Ulid::generate(), realm_id),
+        aruna_core::UserId::local(Ulid::generate(), realm_id),
+    );
+    let mut op = PutObjectOperation::new(PutObjectConfig {
+        user_id: writer,
+        group_id: Ulid::generate(),
+        realm_id,
+        node_id: iroh::SecretKey::generate().public(),
+        request: PutObjectInput {
+            bucket: "mybucket".to_string(),
+            key: "some-file.txt".to_string(),
+            content_length: None,
+            body: None,
+        },
+        expected_checksums: vec![],
+        checksum_type: None,
+        exists: false,
+        version_source: None,
+        preassigned_version_id: None,
+        quota_ceiling: None,
+        routing: RoutingSnapshot::single(Ulid::generate()),
+    });
+    let with_hash = |created_by| {
+        let mut location = test_location(created_by);
+        location.hashes.insert(
+            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+            [3u8; 32].to_vec(),
+        );
+        location
+    };
+    // The deduplicated location keeps the earlier copy, written by someone else.
+    op.output = Some(Ok(with_hash(first)));
+    op.written_location = Some(with_hash(writer));
+    op.version_id = Some(Ulid::generate());
+    op.state = PutObjectState::WritePathIndex;
+    let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+        key: vec![0].into(),
+    }));
+    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        panic!("expected the version record, got {effects:?}")
+    };
+    let version = BlobVersion::from_bytes(value).unwrap();
+    assert_eq!(version.created_by, writer);
+}
+
+#[test]
+fn history_keeps_head() {
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let mut op = PutObjectOperation::new(PutObjectConfig {
+        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        group_id: Ulid::generate(),
+        realm_id,
+        node_id: iroh::SecretKey::generate().public(),
+        request: PutObjectInput {
+            bucket: "mybucket".to_string(),
+            key: "some-file.txt".to_string(),
+            content_length: None,
+            body: None,
+        },
+        expected_checksums: vec![],
+        checksum_type: None,
+        exists: false,
+        version_source: None,
+        preassigned_version_id: None,
+        quota_ceiling: None,
+        routing: RoutingSnapshot::single(Ulid::generate()),
+    })
+    .keep_head();
+    op.version_id = Some(Ulid::generate());
+    let mut location = test_location(op.config.user_id);
+    location.blob_size = 7;
+    location.hashes.insert(
+        aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+        [3u8; 32].to_vec(),
+    );
+    op.output = Some(Ok(location));
+    op.txn_id = Some(Ulid::generate());
+    let head = CurrentVersionPointer::new_with_generation(Ulid::generate(), 4);
+    op.object_lookup_read(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0].into(),
+        value: Some(head.to_bytes().unwrap().into()),
+    }));
+    let live = BlobVersion::materialized(
+        [9; 32],
+        BackendRef::node_default(),
+        EncodingClass::Raw,
+        std::time::SystemTime::UNIX_EPOCH,
+        op.config.user_id,
+        None,
+    );
+    // The head is not written; the version itself is read inside the transaction.
+    let effects = op.liveness_read(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0].into(),
+        value: Some(live.to_bytes().unwrap().into()),
+    }));
+    let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+        panic!("expected the version read, got {effects:?}")
+    };
+    assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
+    assert_eq!(op.state, PutObjectState::ReadHistory);
+    let effects = op.history_read(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0].into(),
+        value: None,
+    }));
+    let [Effect::Storage(StorageEffect::Write { key_space, .. })] = effects.as_slice() else {
+        panic!("expected the path index, got {effects:?}")
+    };
+    assert_eq!(key_space, PATHS_INDEX_KEYSPACE);
+
+    // No replication obligation, no new live object and the head keeps its charge.
+    op.state = PutObjectState::RegisterManagedCopy;
+    let effects = op.handle_copy_registered(Event::Storage(StorageEvent::WriteResult {
+        key: vec![0].into(),
+    }));
+    let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
+        panic!("expected the counter deltas, got {effects:?}")
+    };
+    let expected = UsageDelta {
+        logical_bytes: 7,
+        ..Default::default()
+    };
+    assert_eq!(deltas[0].1, expected);
+
+    // A version that appeared meanwhile is never overwritten.
+    op.state = PutObjectState::ReadHistory;
+    op.history_read(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0].into(),
+        value: Some(live.to_bytes().unwrap().into()),
+    }));
+    assert!(matches!(
+        op.output,
+        Some(Err(PutObjectError::VersionExists))
+    ));
+}
+
+#[test]
+fn writer_reads_trail() {
+    use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobAuditRecord};
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let writer = || {
+        let mut op = PutObjectOperation::new(PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            group_id,
+            realm_id,
+            node_id: iroh::SecretKey::generate().public(),
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "some-file.txt".to_string(),
+                content_length: None,
+                body: None,
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(Ulid::generate()),
+        });
+        op.version_id = Some(Ulid::generate());
+        op.txn_id = Some(Ulid::generate());
+        op.state = PutObjectState::ReadHistory;
+        // The version is not registered, so the trail is read before the head moves, in the
+        // incarnation the bucket's creation row names.
+        let effects = op.history_read(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0].into(),
+            value: None,
+        }));
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the creation read, got {effects:?}")
+        };
+        assert_eq!(key_space, aruna_core::keyspaces::BUCKET_CREATION_KEYSPACE);
+        let effects = op.trail_read(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0].into(),
+            value: Some(5u128.to_be_bytes().to_vec().into()),
+        }));
+        let [
+            Effect::Storage(StorageEffect::Iter {
+                key_space, start, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the trail read, got {effects:?}")
+        };
+        assert_eq!(key_space, DELETE_TRAIL_KEYSPACE);
+        // Only deletes since the version was created are read.
+        let id = op.version_id.unwrap();
+        let floor = Ulid::from_parts(id.timestamp_ms(), 0).to_bytes();
+        let Some(aruna_core::effects::IterStart::At(at)) = start else {
+            panic!("expected a bounded start, got {start:?}")
+        };
+        assert!(at.ends_with(&floor));
+        op
+    };
+    let page = |values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>| {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        })
+    };
+    // An import registered the version and a user deleted it: it is not published again.
+    let mut op = writer();
+    let record = BlobAuditRecord {
+        realm_id,
+        group_id,
+        node_id: iroh::SecretKey::generate().public(),
+        user_id: op.config.user_id,
+        kind: BlobAuditKind::DeleteVersion,
+        bucket: "mybucket".to_string(),
+        key: "some-file.txt".to_string(),
+        version_id: op.version_id,
+        occurred_at_ms: 1,
+    };
+    op.trail_read(page(vec![(
+        vec![0].into(),
+        record.to_bytes().unwrap().into(),
+    )]));
+    assert!(matches!(
+        op.output,
+        Some(Err(PutObjectError::HistoryDeleted))
+    ));
+    // A clean trail moves the head after both ranges; every purge is read, as a purge is
+    // keyed by its job.
+    let mut op = writer();
+    let effects = op.trail_read(page(Vec::new()));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Iter { start: None, .. })]
+    ));
+    let effects = op.trail_read(page(Vec::new()));
+    let [Effect::Storage(StorageEffect::Write { key_space, .. })] = effects.as_slice() else {
+        panic!("expected the head write, got {effects:?}")
+    };
+    assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
+    // The purges are read in the incarnation the creation row named.
+    let mut op = writer();
+    let effects = op.trail_read(page(Vec::new()));
+    let [Effect::Storage(StorageEffect::Iter { prefix, .. })] = effects.as_slice() else {
+        panic!("expected the purge read, got {effects:?}")
+    };
+    let purges = aruna_core::structs::storage::delete_audit::purge_prefix(group_id, "mybucket", 5);
+    assert_eq!(*prefix, Some(purges.into()));
+}
+
 #[tokio::test]
 pub async fn overwrite_retains_index() {
     let temp_handle = tempdir().unwrap();
@@ -2336,6 +2589,7 @@ async fn plain_owns_copy() {
             path: written.backend_path.clone(),
             same_name: false,
             listed: true,
+            shared: Vec::new(),
         };
         op.version_id = Some(Ulid::generate());
         op.start_plain(target, ResolvedBackend::new(backend.clone(), None));

@@ -43,9 +43,9 @@ use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPoli
 use aruna_core::structs::storage::abe::{AbeError, ObjectEnvelope};
 use aruna_core::structs::storage::backend_import::PlainPath;
 use aruna_core::structs::storage::blob::{
-    ArchiveKey, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend, VersionKey,
-    WriteOwner,
+    ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobHeadKey, BlobLocationKey,
+    BlobVersion, BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend,
+    VersionKey, WriteOwner,
 };
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError};
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
@@ -71,6 +71,8 @@ const PART_PAGE: usize = 256;
 #[derive(Debug, Eq, PartialEq)]
 pub enum CompleteUploadState {
     Init,
+    /// Reads which key the rule recorded at the path of a same-name object.
+    ReadPlainOwner,
     /// Looks at the path of a same-name object before it is composed.
     StatPlain,
     StartMarkTransaction,
@@ -90,6 +92,12 @@ pub enum CompleteUploadState {
     FenceAbe,
     FenceBackend,
     CheckHashLookup,
+    /// Reads the current version and its file, which a re-upload of the same bytes reads too.
+    ReadDedupHead,
+    ReadDedupVersion,
+    ReadDedupLocation,
+    ReadDedupProvider,
+    ReadDedupClaim,
     WriteBlobLocation,
     ReadObjectLookup,
     ReadLivenessVersion,
@@ -103,6 +111,26 @@ pub enum CompleteUploadState {
     DeleteUploadRecords,
     /// Reads the import rule a plain object's import row belongs to.
     ReadImportRule,
+    /// Reads which rules read the composed path, inside the finalize transaction.
+    ReadReaders,
+    /// Records what a plain object will be before its bytes reach the path.
+    WriteIntent,
+    /// Syncs that record to disk before the compose.
+    SyncIntent,
+    /// Deletes that record in the version transaction.
+    RetireIntent,
+    /// Deletes the record of a compose the provider refused before any byte moved.
+    DropIntent,
+    /// Syncs that delete to disk.
+    SyncDroppedIntent,
+    /// Records the hash of the composed bytes in the write intent.
+    WriteEvidence,
+    /// Reads the version an import may have registered already.
+    ReadRegistered,
+    /// Reads the delete trail of an upload no import registered, before its head moves.
+    ReadTrail,
+    /// Drops the location the upload staged for bytes an import registered already.
+    DropStagedLocation,
     WriteCleanupRecords,
     WriteReplicationObligation,
     EnforceQuota,
@@ -184,6 +212,12 @@ pub enum CompleteUploadError {
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("CompleteMultipartUpload failed")]
     CompleteUploadFailed,
+    #[error("the version already exists with other content")]
+    VersionExists,
+    #[error("the version was deleted on purpose")]
+    HistoryDeleted,
+    #[error("the import rule of the folder was removed")]
+    ImportRemoved,
     #[error("operation did not finish")]
     NotFinished,
     #[error(transparent)]
@@ -299,9 +333,28 @@ pub struct CompleteUploadOperation {
     recheck_pending: bool,
     routing: Option<RoutingSnapshot>,
     plain: Option<PlainTarget>,
+    /// The path a same-name object looks at, and whether the file there may be replaced.
+    plain_stat_at: Option<(BackendRef, String)>,
+    plain_owned: bool,
     /// The path composed last and the backend version the compose reported.
     plain_path: Option<PlainPath>,
     plain_version: Option<String>,
+    plain_etag: Option<String>,
+    /// The compose that waits for its intent record.
+    pending_compose: Option<Effects>,
+    /// An import registered this version with the same bytes before the finalize.
+    registered: bool,
+    /// The assembled linked file the version gives up for the current version's identical one.
+    dedup: Option<BackendLocation>,
+    dedup_checked: bool,
+    /// The delete trail read for a listed upload's version before its head moves.
+    trail_scan: Option<crate::s3::object::put::TrailScan>,
+    /// The intent record of the compose in flight.
+    written_intent: Vec<Key>,
+    /// The record or hash write in flight, in one transaction with a read of its rule.
+    fence: Option<crate::s3::object::put::fenced::FencedWrite>,
+    /// The rules that read the composed path, as the finalize transaction reads them.
+    readers: crate::s3::object::put::ReaderScan,
 }
 
 impl CompleteUploadOperation {
@@ -348,8 +401,19 @@ impl CompleteUploadOperation {
             recheck_pending: false,
             routing: None,
             plain: None,
+            plain_stat_at: None,
+            plain_owned: false,
             plain_path: None,
             plain_version: None,
+            plain_etag: None,
+            pending_compose: None,
+            registered: false,
+            dedup: None,
+            dedup_checked: false,
+            trail_scan: None,
+            written_intent: Vec::new(),
+            fence: None,
+            readers: Default::default(),
         }
     }
 
@@ -1091,8 +1155,13 @@ impl CompleteUploadOperation {
     fn handle_blob_composed(&mut self, event: Event) -> Effects {
         let mut location = match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
-            Event::Blob(BlobEvent::PlainWritten { location, version }) => {
+            Event::Blob(BlobEvent::PlainWritten {
+                location,
+                version,
+                etag,
+            }) => {
                 self.plain_version = version;
+                self.plain_etag = etag;
                 location
             }
             Event::Blob(BlobEvent::Error(BlobError::PathTaken)) => return self.plain_taken(),
@@ -1140,7 +1209,13 @@ impl CompleteUploadOperation {
                 ));
             }
         }
+        if let Some(effects) = self.write_evidence() {
+            return effects;
+        }
+        self.start_finalize()
+    }
 
+    fn start_finalize(&mut self) -> Effects {
         self.state = CompleteUploadState::StartFinalizeTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
@@ -1152,6 +1227,7 @@ impl CompleteUploadOperation {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
+        (self.dedup, self.dedup_checked) = (None, false);
         self.state = CompleteUploadState::CheckPurgeFinalize;
         smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
     }
@@ -1316,6 +1392,9 @@ impl CompleteUploadOperation {
     }
 
     fn check_hash_lookup(&mut self) -> Effects {
+        if let Some(effects) = self.read_current() {
+            return effects;
+        }
         let Some(location) = self.composed_location.clone() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
@@ -1473,6 +1552,20 @@ impl CompleteUploadOperation {
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
         let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
+        // An import may register a listed object's version before the finalize commits it; an
+        // upload opened at a provider path stays one after its rule was removed.
+        if self.plain.as_ref().is_some_and(|target| target.listed) || self.plain_upload().is_some()
+        {
+            return self.read_registered(version_id);
+        }
+        self.write_head(existing, version_id)
+    }
+
+    fn write_head(
+        &mut self,
+        existing: Option<&CurrentVersionPointer>,
+        version_id: Ulid,
+    ) -> Effects {
         let pointer = match CurrentVersionPointer::next_for(existing, version_id) {
             Ok(pointer) => pointer,
             Err(err) => return self.schedule_error(err.into()),
@@ -1779,7 +1872,9 @@ impl CompleteUploadOperation {
             self.composed_location.as_ref(),
             self.final_location.as_ref(),
         ) {
-            if composed != chosen {
+            // A linked file that gave way goes only through its exact release.
+            if self.dedup.is_some() {
+            } else if composed != chosen {
                 works.push(BlobCleanupWork::DeleteBlob {
                     location: composed.clone(),
                 });
@@ -1819,9 +1914,15 @@ impl CompleteUploadOperation {
                 BlobCleanupWork::ReconcileWrite { location, .. } => {
                     location.ulid.to_bytes().to_vec().into()
                 }
-                BlobCleanupWork::DeleteBlob { .. } | BlobCleanupWork::RegisterDht { .. } => {
-                    Ulid::generate().to_bytes().to_vec().into()
-                }
+                BlobCleanupWork::DeleteBlob { .. }
+                | BlobCleanupWork::RegisterDht { .. }
+                | BlobCleanupWork::ReleaseRenamed { .. }
+                | BlobCleanupWork::DropTrail { .. }
+                | BlobCleanupWork::DropClaims { .. }
+                | BlobCleanupWork::ReleasePlanned { .. }
+                | BlobCleanupWork::SettleUpload { .. }
+                | BlobCleanupWork::SettleMove { .. }
+                | BlobCleanupWork::DropRows { .. } => Ulid::generate().to_bytes().to_vec().into(),
                 BlobCleanupWork::ReconcileReservation { .. } => {
                     Ulid::generate().to_bytes().to_vec().into()
                 }
@@ -1844,10 +1945,18 @@ impl CompleteUploadOperation {
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
+        if let Some(effects) = self.retire_intent() {
+            return effects;
+        }
         self.write_obligation()
     }
 
     fn write_obligation(&mut self) -> Effects {
+        // A registered version keeps its obligation and charges; only the upload is cleared.
+        if let (true, Some(txn_id)) = (self.registered, self.txn_id) {
+            self.state = CompleteUploadState::CommitFinalizeTransaction;
+            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        }
         let Some(version_id) = self.version_id else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
@@ -2263,6 +2372,7 @@ impl Operation for CompleteUploadOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             CompleteUploadState::Init => self.handle_init(),
+            CompleteUploadState::ReadPlainOwner => self.plain_owner(event),
             CompleteUploadState::StatPlain => self.plain_stat(event),
             CompleteUploadState::StartMarkTransaction => self.mark_started(event),
             CompleteUploadState::CheckPurgeMark => self.mark_fence_checked(event),
@@ -2281,10 +2391,18 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::FenceAbe => self.abe_fenced(event),
             CompleteUploadState::FenceBackend => self.handle_backend_fenced(event),
             CompleteUploadState::CheckHashLookup => self.hash_checked(event),
+            CompleteUploadState::ReadDedupHead
+            | CompleteUploadState::ReadDedupVersion
+            | CompleteUploadState::ReadDedupLocation
+            | CompleteUploadState::ReadDedupProvider
+            | CompleteUploadState::ReadDedupClaim => self.dedup_read(event),
             CompleteUploadState::WriteBlobLocation => self.location_written(event),
             CompleteUploadState::ReadObjectLookup => self.object_lookup_read(event),
             CompleteUploadState::ReadLivenessVersion => self.liveness_read(event),
             CompleteUploadState::WriteBlobHead => self.head_written(event),
+            CompleteUploadState::ReadRegistered => self.registered_read(event),
+            CompleteUploadState::DropStagedLocation => self.staged_dropped(event),
+            CompleteUploadState::ReadTrail => self.trail_read(event),
             CompleteUploadState::WritePathIndex => self.path_index_written(event),
             CompleteUploadState::WriteVersionRecord => self.version_written(event),
             CompleteUploadState::WriteEnvelope => self.envelope_written(event),
@@ -2293,6 +2411,15 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::WriteObjectMetadata => self.metadata_written(event),
             CompleteUploadState::DeleteUploadRecords => self.records_deleted(event),
             CompleteUploadState::ReadImportRule => self.import_rule_read(event),
+            CompleteUploadState::ReadReaders => self.readers_read(event),
+            CompleteUploadState::WriteIntent | CompleteUploadState::SyncIntent => {
+                self.intent_written(event)
+            }
+            CompleteUploadState::RetireIntent => self.intent_retired(event),
+            CompleteUploadState::WriteEvidence => self.evidence_written(event),
+            CompleteUploadState::DropIntent | CompleteUploadState::SyncDroppedIntent => {
+                self.intent_dropped(event)
+            }
             CompleteUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
             CompleteUploadState::WriteReplicationObligation => self.obligation_written(event),
             CompleteUploadState::EnforceQuota => self.handle_enforce_quota(event),
@@ -2464,6 +2591,8 @@ fn composite_digest(algorithm: ChecksumAlgorithm, bytes: &[u8]) -> Vec<u8> {
     }
 }
 
+#[path = "dedup.rs"]
+mod dedup;
 #[path = "plain.rs"]
 mod plain;
 

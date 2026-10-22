@@ -746,8 +746,11 @@ impl BlobHandler {
         if close.is_ok() {
             reservation.mark_settled();
         }
-        let version = match close {
-            Ok(Ok(metadata)) => backend_version(&operator, &metadata),
+        let (version, etag) = match close {
+            Ok(Ok(metadata)) => (
+                backend_version(&operator, &metadata),
+                metadata.etag().map(str::to_string),
+            ),
             Ok(Err(err)) if taken(&err) => return reservation.path_taken().await,
             Ok(Err(err)) => {
                 return reservation
@@ -767,7 +770,11 @@ impl BlobHandler {
         location.blob_size = bytes_written;
         location.hashes = hashes;
         if location.is_external() {
-            return BlobEvent::PlainWritten { location, version };
+            return BlobEvent::PlainWritten {
+                location,
+                version,
+                etag,
+            };
         }
         BlobEvent::WriteFinished { location }
     }
@@ -1563,7 +1570,7 @@ impl BlobHandler {
 
         let mut hasher = Hasher::new();
         let mut ambiguous = false;
-        let mut version = None;
+        let (mut version, mut etag) = (None, None);
         // A timeout drops the writer future mid-poll, which leaves the writer unusable.
         let mut abandoned = false;
         let compose_result: Result<(u64, Option<FrameLayout>), BlobError> = async {
@@ -1633,6 +1640,7 @@ impl BlobHandler {
                     }
                 })?;
             version = backend_version(&operator, &metadata);
+            etag = metadata.etag().map(str::to_string);
             Ok((bytes_written, layout))
         }
         .await;
@@ -1681,7 +1689,11 @@ impl BlobHandler {
             location.format.layout = StoredLayout::Frames(Box::new(layout));
         }
         if location.is_external() {
-            return BlobEvent::PlainWritten { location, version };
+            return BlobEvent::PlainWritten {
+                location,
+                version,
+                etag,
+            };
         }
         BlobEvent::WriteFinished { location }
     }

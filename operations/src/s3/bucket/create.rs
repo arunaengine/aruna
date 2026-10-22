@@ -12,7 +12,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+    BUCKET_CREATION_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::PLAIN_PATTERN;
@@ -242,19 +243,23 @@ impl CreateBucketOperation {
         };
 
         self.state = CreateBucketState::CreateBucket;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.bucket.as_bytes().into(),
-            value: bytes.into(),
+        let key: aruna_core::types::Key = self.bucket.as_bytes().into();
+        // Every creation, a replicated one too, gets a fresh id for its delete trail.
+        let creation = ulid::Ulid::generate().to_bytes().to_vec();
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes: vec![
+                (S3_BUCKET_KEYSPACE.to_string(), key.clone(), bytes.into()),
+                (BUCKET_CREATION_KEYSPACE.to_string(), key, creation.into()),
+            ],
             txn_id: Some(txn_id),
         })]
     }
 
     fn handle_bucket_created(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.emit_error(CreateBucketError::InvalidStateEvent {
                 state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::WriteResult)",
+                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
                 received: event,
             });
         };
@@ -482,9 +487,7 @@ mod mapped_tests {
         operation.step(batch(vec![None, None]));
         operation.step(read(Some(routing())));
         operation.step(read(Some(storage())));
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Key::from(Vec::new()),
-        }));
+        operation.step(written());
         operation.step(written());
         operation.step(written());
         let effects = operation.step(batch(vec![Some(storage()), Some(storage())]));
@@ -583,8 +586,8 @@ mod mapped_tests {
         let effects = operation.step(batch(vec![None, None]));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::Write { key_space, .. })]
-                if key_space == S3_BUCKET_KEYSPACE
+            [Effect::Storage(StorageEffect::BatchWrite { writes, .. })]
+                if writes[0].0 == S3_BUCKET_KEYSPACE
         ));
     }
 }
@@ -676,5 +679,59 @@ mod test {
             result,
             Err(CreateBucketError::BucketAlreadyExists)
         ));
+    }
+
+    #[tokio::test]
+    async fn recreation_gets_incarnation() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        // A replicated recreation carries the same record, creation time included.
+        let bucket_info = BucketInfo {
+            group_id: Ulid::generate(),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+        };
+        let storage = &driver_ctx.storage_handle;
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let create = CreateBucketOperation::new("bucket-a".to_string(), bucket_info.clone());
+            drive(create, &driver_ctx).await.unwrap();
+            let read = StorageEffect::Read {
+                key_space: BUCKET_CREATION_KEYSPACE.to_string(),
+                key: b"bucket-a".to_vec().into(),
+                txn_id: None,
+            };
+            let Event::Storage(StorageEvent::ReadResult { value, .. }) =
+                storage.send_storage_effect(read).await
+            else {
+                panic!("expected the creation row")
+            };
+            let value = value.expect("creation row written");
+            seen.push(aruna_core::structs::storage::blob::incarnation(Some(
+                &value,
+            )));
+            let delete = StorageEffect::Delete {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: b"bucket-a".to_vec().into(),
+                txn_id: None,
+            };
+            storage.send_storage_effect(delete).await;
+        }
+        assert_ne!(seen[0], seen[1]);
+        assert_ne!(seen[0], 0);
     }
 }

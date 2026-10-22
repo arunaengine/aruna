@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::blob::cleanup::schedule_cleanup_effect;
 use crate::blob::managed_copy::{
     CopyRegistration, CopyRequest, ManagedCopyError, register_effect, serve_reads,
     split_serve_reads, validate_registration,
@@ -113,11 +114,41 @@ pub enum PutObjectState {
     ReadAbe,
     FenceAbe,
     WriteEnvelope,
+    /// Reads which key the rule recorded at the path of a same-name write.
+    ReadPlainOwner,
     /// Looks at the path of a same-name write before it is written.
     StatPlain,
     WritePlainRecords,
     /// Reads the import rule that the version's import rows belong to.
     ReadImportRule,
+    /// Records what a write to an import folder will be before its bytes move.
+    WriteIntent,
+    /// Syncs that intent to disk before the bytes move.
+    SyncIntent,
+    /// Reads the version a history write registers, inside the version transaction.
+    ReadHistory,
+    /// Deletes the write intents the committed version makes obsolete.
+    RetireIntents,
+    /// Deletes the intent of a write the provider refused before any byte moved.
+    DropIntent,
+    /// Syncs that delete to disk.
+    SyncDroppedIntent,
+    /// Records the hash of the written bytes in the write intent.
+    WriteEvidence,
+    /// Drops the transaction of a write an import already registered.
+    AbortRegistered,
+    /// Reads the delete trail inside the version transaction.
+    ReadTrail,
+    /// Reads the group's import rules inside the version transaction.
+    ReadRules,
+    /// Reads which rules read a linked write's path, inside the version transaction.
+    ReadReaders,
+    /// Reads the current version and its file, which a re-upload of the same bytes reads too.
+    ReadDedupHead,
+    ReadDedupVersion,
+    ReadDedupLocation,
+    ReadDedupProvider,
+    ReadDedupClaim,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -176,6 +207,10 @@ pub enum PutObjectError {
     HeadChanged,
     #[error("the import rule was removed")]
     ImportRemoved,
+    #[error("the version already exists")]
+    VersionExists,
+    #[error("the version or the current object of its key was deleted and is not restored")]
+    HistoryDeleted,
 }
 
 #[derive(Debug, PartialEq)]
@@ -276,6 +311,21 @@ pub struct PutObjectOperation {
     import_rows: Option<plain::ImportRows>,
     /// Whether the import rule exists, read in the current version transaction.
     rule_exists: Option<bool>,
+    /// Registers the version as history: the head and its generation stay as they are.
+    keep_head: bool,
+    /// The plain write that waits for its intent record.
+    pending_write: Option<Effects>,
+    /// The intent record of the plain write in flight.
+    written_intent: Vec<aruna_core::types::Key>,
+    /// The intent or hash write in flight, in one transaction with a read of its rule.
+    fence: Option<fenced::FencedWrite>,
+    /// The delete trail the version transaction reads before an import registers a version.
+    trail_scan: Option<trail::TrailScan>,
+    rule_scan: Option<sharing::RuleScan>,
+    readers: sharing::ReaderScan,
+    /// The written linked file the version gives up for the current version's identical one.
+    dedup: Option<BackendLocation>,
+    dedup_checked: bool,
 }
 
 impl PutObjectOperation {
@@ -324,6 +374,15 @@ impl PutObjectOperation {
             expected_head: None,
             import_rows: None,
             rule_exists: None,
+            keep_head: false,
+            pending_write: None,
+            written_intent: Vec::new(),
+            fence: None,
+            trail_scan: None,
+            rule_scan: None,
+            readers: sharing::ReaderScan::default(),
+            dedup: None,
+            dedup_checked: false,
         }
     }
 
@@ -360,6 +419,13 @@ impl PutObjectOperation {
     /// Refuses the write with `HeadChanged` unless the key's head is still `head`.
     pub fn with_expected_head(mut self, head: Option<Ulid>) -> Self {
         self.expected_head = Some(head);
+        self
+    }
+
+    /// Registers an older version below the current head, with no replication obligation.
+    /// The head, its generation and the live object count stay as they are.
+    pub fn keep_head(mut self) -> Self {
+        self.keep_head = true;
         self
     }
 
@@ -763,9 +829,14 @@ impl PutObjectOperation {
                 location
             }
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
-            Event::Blob(BlobEvent::PlainWritten { location, version }) => {
+            Event::Blob(BlobEvent::PlainWritten {
+                location,
+                version,
+                etag,
+            }) => {
                 if let Some(plain) = self.plain.as_mut() {
                     plain.version = version;
+                    plain.etag = etag;
                 }
                 location
             }
@@ -780,6 +851,7 @@ impl PutObjectOperation {
                 }
                 return self.cleanup_failed_write(PutObjectError::BlobWriteFailed(error));
             }
+            Event::Blob(BlobEvent::Error(BlobError::PathTaken)) => return self.drop_intent(),
             Event::Blob(BlobEvent::Error(error)) => {
                 return self.cleanup_failed_write(PutObjectError::BlobWriteFailed(error));
             }
@@ -810,7 +882,13 @@ impl PutObjectOperation {
                 ));
             }
         }
+        if let Some(effects) = self.write_evidence() {
+            return effects;
+        }
+        self.start_transaction()
+    }
 
+    fn start_transaction(&mut self) -> Effects {
         self.state = PutObjectState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -941,6 +1019,9 @@ impl PutObjectOperation {
     /// Looks up only the copy on the backend this write resolved to, so
     /// identical content on another backend never overrides the placement.
     fn start_hash_lookup(&mut self) -> Effects {
+        if let Some(effects) = self.read_current() {
+            return effects;
+        }
         self.state = PutObjectState::CheckHashLookup;
         let Some(written_location) = self.get_written_location() else {
             return self.emit_error(PutObjectError::MissingOutput);
@@ -1094,7 +1175,9 @@ impl PutObjectOperation {
         let head = value.and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok());
         self.was_live = head.as_ref().is_some_and(|version| !version.is_deleted());
         let request = &self.config.request;
+        // A history write leaves the head charged as it is.
         self.released_bytes = head
+            .filter(|_| !self.keep_head)
             .and_then(|version| version.offered_size(&request.bucket, &request.key))
             .unwrap_or(0);
         if self.create_only && self.was_live {
@@ -1107,6 +1190,18 @@ impl PutObjectOperation {
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
         let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
+        // An import may register a listed write's version before the write commits it.
+        if self.keep_head || self.listed_write() {
+            return self.read_history(version_id);
+        }
+        self.write_head(existing, version_id)
+    }
+
+    pub(super) fn write_head(
+        &mut self,
+        existing: Option<&CurrentVersionPointer>,
+        version_id: Ulid,
+    ) -> Effects {
         let pointer = match CurrentVersionPointer::next_for(existing, version_id) {
             Ok(pointer) => pointer,
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
@@ -1118,6 +1213,69 @@ impl PutObjectOperation {
 
         self.state = PutObjectState::WriteBlobHead;
         smallvec![effect]
+    }
+
+    /// A concurrent registration of the same version makes this transaction conflict.
+    fn read_history(&mut self, version_id: Ulid) -> Effects {
+        let key = match self.version_key(version_id).to_bytes() {
+            Ok(key) => key.into(),
+            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+        };
+        self.state = PutObjectState::ReadHistory;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn history_read(&mut self, event: Event) -> Effects {
+        let value = match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
+            _ => return self.emit_error(PutObjectError::InvalidOperationState),
+        };
+        let Some(value) = value else {
+            if self.keep_head {
+                return self.write_path_index();
+            }
+            let Some(txn_id) = self.txn_id else {
+                return self.emit_error(PutObjectError::NoTransactionFound);
+            };
+            if self.trail_scan.as_ref().is_none_or(|scan| scan.writer) {
+                return self.writer_trail(txn_id);
+            }
+            let (existing, version_id) = (self.existing_pointer.clone(), self.version_id);
+            let Some(version_id) = version_id else {
+                return self.emit_error(PutObjectError::PutObjectFailed);
+            };
+            return self.write_head(existing.as_ref(), version_id);
+        };
+        // A listed write an import already registered with the same bytes is done: it is not
+        // charged or moved again. Other content under its version id is a conflict.
+        let stored = BlobVersion::from_bytes(value.as_ref()).ok();
+        let hash = stored.as_ref().and_then(|version| version.blob_hash());
+        let written = self.get_output().and_then(|location| location.get_blake3());
+        if self.keep_head || hash.is_none() || hash.map(|hash| &hash[..]) != written {
+            return self.emit_error(PutObjectError::VersionExists);
+        }
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(PutObjectError::NoTransactionFound);
+        };
+        self.state = PutObjectState::AbortRegistered;
+        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    }
+
+    /// The registered version stays as the import committed it.
+    fn registered_aborted(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::TransactionAborted { .. }) => {
+                self.txn_id = None;
+                self.after_commit()
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
+            _ => self.emit_error(PutObjectError::InvalidOperationState),
+        }
     }
 
     fn location_created(&mut self, event: Event) -> Effects {
@@ -1174,6 +1332,10 @@ impl PutObjectOperation {
                 return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
             };
             let version_created_at = UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms());
+            // A deduplicated location keeps its first writer; the version keeps its own.
+            let created_by = self
+                .get_written_location()
+                .map_or(output.created_by, |written| written.created_by);
             let version = BlobVersion::materialized(
                 match blake3_hash.try_into() {
                     Ok(hash) => hash,
@@ -1184,7 +1346,7 @@ impl PutObjectOperation {
                 output.backend.clone(),
                 output.format.encoding(),
                 version_created_at,
-                output.created_by,
+                created_by,
                 self.config.version_source.clone(),
             )
             .with_metadata(self.metadata.clone());
@@ -1283,6 +1445,9 @@ impl PutObjectOperation {
 
     fn handle_copy_registered(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
+            if self.keep_head {
+                return self.charge_usage();
+            }
             self.write_obligation()
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
@@ -1316,51 +1481,58 @@ impl PutObjectOperation {
 
     fn obligation_written(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
-            if let Some(txn_id) = self.txn_id {
-                let Some(location) = self.get_output().cloned() else {
-                    return self.emit_error(PutObjectError::MissingOutput);
-                };
-                let size = i128::from(location.blob_size);
-                let group_delta = UsageDelta {
-                    objects: if self.was_live { 0 } else { 1 },
-                    logical_bytes: size + i128::from(self.envelope_bytes),
-                    referenced_bytes: -i128::from(self.released_bytes),
-                    ..Default::default()
-                };
-                let Some(stored) = StoredDelta::for_location(&location, self.new_blob) else {
-                    return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
-                };
-                self.usage_update = Some(UsageCounterUpdate::with_stored(
-                    self.config.group_id,
-                    group_delta,
-                    stored,
-                ));
-
-                // Enforce the hard quota before counters commit; only a
-                // positive logical delta can breach it, so deletes pass.
-                let charged = location.blob_size.saturating_add(self.envelope_bytes);
-                if let Some(ceiling) = self.config.quota_ceiling
-                    && charged > 0
-                {
-                    let mut gate = QuotaGate::new_for_realm(
-                        ceiling,
-                        charged,
-                        self.config.group_id,
-                        self.config.node_id,
-                        self.config.realm_id,
-                    );
-                    self.state = PutObjectState::EnforceQuota;
-                    let effects = gate.start(txn_id);
-                    self.quota_gate = Some(gate);
-                    effects
-                } else {
-                    self.start_usage_update(txn_id)
-                }
-            } else {
-                self.emit_error(PutObjectError::NoTransactionFound)
-            }
+            self.charge_usage()
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
+        }
+    }
+
+    fn charge_usage(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(PutObjectError::NoTransactionFound);
+        };
+        let Some(location) = self.get_output().cloned() else {
+            return self.emit_error(PutObjectError::MissingOutput);
+        };
+        let size = i128::from(location.blob_size);
+        let group_delta = UsageDelta {
+            objects: if self.was_live || self.keep_head {
+                0
+            } else {
+                1
+            },
+            logical_bytes: size + i128::from(self.envelope_bytes),
+            referenced_bytes: -i128::from(self.released_bytes),
+            ..Default::default()
+        };
+        let Some(stored) = StoredDelta::for_location(&location, self.new_blob) else {
+            return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
+        };
+        self.usage_update = Some(UsageCounterUpdate::with_stored(
+            self.config.group_id,
+            group_delta,
+            stored,
+        ));
+
+        // Enforce the hard quota before counters commit; only a
+        // positive logical delta can breach it, so deletes pass.
+        let charged = location.blob_size.saturating_add(self.envelope_bytes);
+        if let Some(ceiling) = self.config.quota_ceiling
+            && charged > 0
+        {
+            let mut gate = QuotaGate::new_for_realm(
+                ceiling,
+                charged,
+                self.config.group_id,
+                self.config.node_id,
+                self.config.realm_id,
+            );
+            self.state = PutObjectState::EnforceQuota;
+            let effects = gate.start(txn_id);
+            self.quota_gate = Some(gate);
+            effects
+        } else {
+            self.start_usage_update(txn_id)
         }
     }
 
@@ -1501,16 +1673,7 @@ impl PutObjectOperation {
         match event {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                 self.txn_id = None;
-                // The committed records own the blob now, so the rollback must
-                // not still hold it.
-                let release_id = self.written_location.take().map(|location| location.ulid);
-                if let Some(id) = release_id {
-                    self.cleanup.set_release(id);
-                    self.state = PutObjectState::ReleaseReservation;
-                    smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
-                } else {
-                    self.register_blob()
-                }
+                self.after_commit()
             }
             Event::Storage(StorageEvent::Error { error }) => {
                 self.txn_id = None;
@@ -1525,6 +1688,18 @@ impl PutObjectOperation {
                 self.keep_written_blob(error)
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
+        }
+    }
+
+    /// The committed records own the blob now, so the rollback must not still hold it.
+    fn after_commit(&mut self) -> Effects {
+        let release_id = self.written_location.take().map(|location| location.ulid);
+        if let Some(id) = release_id {
+            self.cleanup.set_release(id);
+            self.state = PutObjectState::ReleaseReservation;
+            smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
+        } else {
+            self.register_blob()
         }
     }
 
@@ -1543,6 +1718,14 @@ impl PutObjectOperation {
         self.quota_gate = None;
         self.output = None;
         self.rule_exists = None;
+        if let Some(scan) = self.trail_scan.as_mut() {
+            scan.restart();
+        }
+        if let Some(scan) = self.rule_scan.as_mut() {
+            scan.restart();
+        }
+        self.readers = sharing::ReaderScan::default();
+        (self.dedup, self.dedup_checked) = (None, false);
         self.state = PutObjectState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -1622,7 +1805,10 @@ impl PutObjectOperation {
             smallvec![Effect::Blob(BlobEffect::Delete { location })]
         } else {
             self.state = PutObjectState::Finish;
-            smallvec![schedule_snapshot_publish()]
+            match self.dedup.is_some() {
+                true => smallvec![schedule_snapshot_publish(), schedule_cleanup_effect()],
+                false => smallvec![schedule_snapshot_publish()],
+            }
         }
     }
 
@@ -1799,19 +1985,22 @@ impl Operation for PutObjectOperation {
                 _ => self.emit_error(PutObjectError::InvalidOperationState),
             },
             PutObjectState::WriteBlob => self.handle_write_finished(event),
+            PutObjectState::ReadPlainOwner => self.plain_owner(event),
             PutObjectState::StatPlain => self.plain_stat(event),
-            PutObjectState::WritePlainRecords => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => match self.txn_id {
-                    Some(txn_id) => {
-                        self.state = PutObjectState::CommitTransaction;
-                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                    }
-                    None => self.emit_error(PutObjectError::NoTransactionFound),
-                },
-                Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
-                _ => self.emit_error(PutObjectError::InvalidOperationState),
-            },
+            PutObjectState::WritePlainRecords | PutObjectState::RetireIntents => {
+                self.plain_written(event)
+            }
             PutObjectState::ReadImportRule => self.import_rule_read(event),
+            PutObjectState::WriteIntent | PutObjectState::SyncIntent => self.intent_written(event),
+            PutObjectState::DropIntent | PutObjectState::SyncDroppedIntent => {
+                self.intent_dropped(event)
+            }
+            PutObjectState::ReadTrail => self.trail_read(event),
+            PutObjectState::ReadRules => self.rules_read(event),
+            PutObjectState::ReadReaders => self.readers_read(event),
+            PutObjectState::WriteEvidence => self.evidence_written(event),
+            PutObjectState::AbortRegistered => self.registered_aborted(event),
+            PutObjectState::ReadHistory => self.history_read(event),
             PutObjectState::CleanupFailedWrite => self.write_cleanup_failed(event),
             PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
             PutObjectState::WriteCleanupRow => self.handle_cleanup_row(event),
@@ -1821,6 +2010,11 @@ impl Operation for PutObjectOperation {
             PutObjectState::CheckSealFence => self.seal_fence_checked(event),
             PutObjectState::FenceBackend => self.handle_backend_fenced(event),
             PutObjectState::CheckHashLookup => self.hash_checked(event),
+            PutObjectState::ReadDedupHead
+            | PutObjectState::ReadDedupVersion
+            | PutObjectState::ReadDedupLocation
+            | PutObjectState::ReadDedupProvider
+            | PutObjectState::ReadDedupClaim => self.dedup_read(event),
             PutObjectState::CreateBlobLocation => self.location_created(event),
             PutObjectState::ReadObjectLookup => self.object_lookup_read(event),
             PutObjectState::ReadLivenessVersion => self.liveness_read(event),
@@ -1870,6 +2064,11 @@ impl Operation for PutObjectOperation {
         if let Some(txn_id) = self.txn_id.take() {
             actions.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
         }
+        actions.extend(
+            self.fence
+                .as_mut()
+                .and_then(fenced::FencedWrite::abort_open),
+        );
         actions
     }
 }
@@ -2619,9 +2818,18 @@ mod decision_tests {
     }
 }
 
+mod dedup;
+pub(crate) mod fenced;
 mod plain;
+mod sharing;
+mod trail;
+pub(crate) use sharing::{ReaderScan, RuleScan};
+pub(crate) use trail::{Trail, TrailScan, trail_ranges};
 
-pub(crate) use plain::{PlainRecord, same_name_path, version_row};
+pub(crate) use plain::{
+    PlainRecord, intent_deletes, intent_keys, intent_rows, owner_read, owns_path, same_name_path,
+    version_row,
+};
 
 #[path = "abe.rs"]
 pub(crate) mod abe;

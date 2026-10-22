@@ -17,24 +17,24 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DELETE_AUDIT_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_CREATION_KEYSPACE,
+    DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE, OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CopyOwner, CurrentVersionPointer, VersionKey,
+    CopyOwner, CurrentVersionPointer, VersionKey, incarnation,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::delete_audit::{
-    BlobAuditKind, BlobAuditRecord, delete_audit_key,
+    BlobAuditKind, BlobAuditRecord, delete_audit_key, trail_key,
 };
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::{Effects, GroupId, Key};
+use aruna_core::types::{Effects, GroupId, Key, Value};
 use smallvec::smallvec;
 use std::collections::{HashMap, VecDeque};
 use std::time::SystemTime;
@@ -70,6 +70,8 @@ pub enum DeleteObjectState {
     WriteBlobVersion,
     WriteReplicationObligation,
     UpdateUsage,
+    /// Reads the bucket's creation row for the incarnation its delete trail belongs to.
+    ReadAuditBucket,
     WriteDeleteAudit,
     CommitTransaction,
     Finish,
@@ -195,6 +197,10 @@ pub struct DeleteObjectOperation {
     metadata: HashMap<String, String>,
     /// The record the deleted version must still have inside the delete's transaction.
     expected: Option<BlobVersion>,
+    /// The head a delete marker may only cover while it is still current.
+    expected_head: Option<Ulid>,
+    /// The bucket incarnation the delete is made in, read in its transaction for the trail.
+    incarnation: Option<u128>,
 }
 
 impl DeleteObjectOperation {
@@ -227,7 +233,15 @@ impl DeleteObjectOperation {
             restrictions: None,
             metadata: HashMap::new(),
             expected: None,
+            expected_head: None,
+            incarnation: None,
         }
+    }
+
+    /// Writes the delete marker only while `version_id` is the head, read in its transaction.
+    pub fn with_head(mut self, version_id: Ulid) -> Self {
+        self.expected_head = Some(version_id);
+        self
     }
 
     /// Metadata the delete marker carries. A forwarded sync delete tags the
@@ -482,6 +496,10 @@ impl DeleteObjectOperation {
             Err(err) => return self.emit_error(err.into()),
         };
         self.existing_pointer = existing.clone();
+        let head = existing.as_ref().map(|pointer| pointer.version_id);
+        if self.expected_head.is_some() && head != self.expected_head {
+            return self.emit_error(DeleteObjectError::VersionChanged);
+        }
         let Some(version_id) = self.pending_version_id.take() else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
@@ -879,6 +897,15 @@ impl DeleteObjectOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(DeleteObjectError::NoTransactionFound);
         };
+        // The trail belongs to this incarnation of the bucket, read in the transaction.
+        let Some(incarnation) = self.incarnation else {
+            self.state = DeleteObjectState::ReadAuditBucket;
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: BUCKET_CREATION_KEYSPACE.to_string(),
+                key: self.input.bucket.as_bytes().to_vec().into(),
+                txn_id: Some(txn_id),
+            })];
+        };
         let (kind, version_id) = match self.version_id {
             Some(marker) => (BlobAuditKind::DeleteMarker, Some(marker)),
             None => (BlobAuditKind::DeleteVersion, self.input.version_id),
@@ -898,17 +925,35 @@ impl DeleteObjectOperation {
             Ok(value) => value,
             Err(error) => return self.emit_error(error.into()),
         };
+        let audit_id = Ulid::generate();
+        let value: Value = value.into();
+        let trail = trail_key(&record, incarnation, audit_id).into();
         self.state = DeleteObjectState::WriteDeleteAudit;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: DELETE_AUDIT_KEYSPACE.to_string(),
-            key: delete_audit_key(self.input.group_id, Ulid::generate()).into(),
-            value: value.into(),
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes: vec![
+                (
+                    DELETE_AUDIT_KEYSPACE.to_string(),
+                    delete_audit_key(self.input.group_id, audit_id).into(),
+                    value.clone(),
+                ),
+                (DELETE_TRAIL_KEYSPACE.to_string(), trail, value),
+            ],
             txn_id: Some(txn_id),
         })]
     }
 
+    fn audit_bucket_read(&mut self, event: Event) -> Effects {
+        let value = match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
+            _ => return self.emit_error(DeleteObjectError::InvalidOperationState),
+        };
+        self.incarnation = Some(incarnation(value.as_ref().map(|value| value.as_ref())));
+        self.write_delete_audit()
+    }
+
     fn handle_delete_audit(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
         let Some(txn_id) = self.txn_id else {
@@ -1095,6 +1140,7 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::WriteBlobVersion => self.version_written(event),
             DeleteObjectState::WriteReplicationObligation => self.obligation_written(event),
             DeleteObjectState::UpdateUsage => self.handle_usage_update(event),
+            DeleteObjectState::ReadAuditBucket => self.audit_bucket_read(event),
             DeleteObjectState::WriteDeleteAudit => self.handle_delete_audit(event),
             DeleteObjectState::CommitTransaction => self.handle_transaction_committed(event),
             DeleteObjectState::Finish => smallvec![],

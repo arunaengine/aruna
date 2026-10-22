@@ -61,6 +61,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::bucket::usage::router())
         .merge(storage::compression::router())
         .merge(storage::moves::router())
+        .merge(storage::rename::router())
         .merge(storage::checks::router())
         .merge(storage::encryption::router())
         .merge(storage::abe::router())
@@ -70,6 +71,8 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::deletion::router())
         .merge(storage::group_backends::router())
         .merge(storage::imports::router())
+        .merge(storage::discovery::router())
+        .merge(storage::organize::router())
         .merge(storage::routing::router())
         .merge(sync::router())
         .merge(sync::quarantine::router())
@@ -332,6 +335,22 @@ pub(crate) mod tests {
         ("GET", "/data/groups/{group_id}/storage/routing"),
         ("GET", "/data/groups/{group_id}/storage/imports"),
         ("GET", "/data/groups/{group_id}/storage/imports/{import_id}"),
+        (
+            "GET",
+            "/data/groups/{group_id}/storage/imports/{import_id}/discovery",
+        ),
+        (
+            "GET",
+            "/data/groups/{group_id}/storage/imports/{import_id}/rename",
+        ),
+        (
+            "GET",
+            "/data/groups/{group_id}/storage/imports/{import_id}/organize/job",
+        ),
+        (
+            "GET",
+            "/data/groups/{group_id}/storage/imports/{import_id}/organize/status",
+        ),
         ("GET", "/access/groups/{id}"),
         ("GET", "/access/groups/{id}/data/paths"),
         ("GET", "/access/groups/{id}/service-accounts"),
@@ -445,6 +464,34 @@ pub(crate) mod tests {
             "POST",
             "/data/groups/{group_id}/storage/imports/{import_id}/run",
         ),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/rename",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/discovery/preview",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/organize/move",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/organize/move/preview",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/organize/duplicates",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/organize/duplicates/preview",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/organize/job/{action}",
+        ),
         ("POST", "/access/groups/{id}/leave"),
         ("POST", "/access/groups/{id}/members"),
         ("POST", "/access/groups/{id}/service-accounts"),
@@ -552,6 +599,11 @@ pub(crate) mod tests {
         ("POST", "/data/buckets/{bucket}/storage/encryption/rotate"),
         ("POST", "/data/buckets/{bucket}/storage/encryption/unlock"),
         ("POST", "/data/buckets/{bucket}/storage/move"),
+        ("POST", "/data/buckets/{bucket}/storage/rename"),
+        ("POST", "/data/buckets/{bucket}/storage/delete/preview"),
+        ("POST", "/data/storage/purge/jobs/{job_id}/{action}"),
+        ("GET", "/data/storage/purge/jobs/{job_id}"),
+        ("POST", "/data/buckets/{bucket}/storage/rename/preview"),
         ("POST", "/data/buckets/{bucket}/storage/check"),
         ("POST", "/data/buckets/{bucket}/storage/check/cleanup"),
         (
@@ -567,6 +619,10 @@ pub(crate) mod tests {
         ),
         ("PUT", "/data/groups/{group_id}/storage/routing"),
         ("PUT", "/data/groups/{group_id}/storage/imports/{import_id}"),
+        (
+            "PUT",
+            "/data/groups/{group_id}/storage/imports/{import_id}/discovery",
+        ),
         ("PUT", "/system/realm/federation"),
         ("PUT", "/system/realm/portal-features"),
         ("PUT", "/system/realm/quota"),

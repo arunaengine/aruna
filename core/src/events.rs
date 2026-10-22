@@ -248,10 +248,12 @@ pub enum BlobEvent {
         objects: Vec<crate::structs::storage::backend_import::ExternalObject>,
         next: Option<String>,
     },
-    /// `version` names the bytes read on a backend that keeps versions.
+    /// `version` names the bytes read on a backend that keeps versions; `etag` is the
+    /// backend's ETag of the bytes read, when it reports one.
     ExternalHashed {
         location: BackendLocation,
         version: Option<String>,
+        etag: Option<String>,
     },
     /// Whether a file is at the path, and its version id on a backend that keeps versions.
     PlainStat {
@@ -261,10 +263,12 @@ pub enum BlobEvent {
     CopyStat {
         exists: bool,
     },
-    /// `version` is the backend's id of the bytes written, on a backend that keeps versions.
+    /// `version` is the backend's id of the bytes written, on a backend that keeps versions;
+    /// `etag` is the backend's ETag of them, when it reports one.
     PlainWritten {
         location: BackendLocation,
         version: Option<String>,
+        etag: Option<String>,
     },
     /// The bucket is ready; `created` when Aruna created it.
     BucketReady {

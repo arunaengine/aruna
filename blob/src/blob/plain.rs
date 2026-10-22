@@ -10,10 +10,12 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle as _;
-use aruna_core::keyspaces::BACKEND_VERSION_KEYSPACE;
+use aruna_core::keyspaces::{BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::storage::backend_import::{PlainPath, tagged_path, version_key};
-use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, ResolvedBackend};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobCleanupWork, ResolvedBackend,
+};
 use aruna_core::structs::storage::format::{Compression, StoredFormat, StoredLayout};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -23,19 +25,22 @@ use std::time::SystemTime;
 use tokio::time::timeout;
 
 /// Without conditional writes a stat proves nothing, so a write that must find its path
-/// free goes to its tagged path, chosen before any byte is read.
+/// free goes to its tagged path, chosen before any byte is read; an exact one is refused.
 pub(super) fn conditional(
     operator: &Operator,
     location: &mut BackendLocation,
     plain: &PlainPath,
-) -> bool {
+) -> Result<bool, BlobError> {
     if operator.info().capability().write_with_if_not_exists || !plain.if_not_exists {
-        return plain.if_not_exists;
+        return Ok(plain.if_not_exists);
+    }
+    if plain.exact {
+        return Err(BlobError::ConditionalUnsupported);
     }
     if !plain.path.ends_with(&format!("~{}", plain.ulid)) {
         location.backend_path = tagged_path(&plain.path, plain.ulid);
     }
-    false
+    Ok(false)
 }
 
 impl BlobHandler {
@@ -88,8 +93,336 @@ impl BlobHandler {
         if plain.path.ends_with('/') {
             return self.write_folder(location, operator, blob).await;
         }
-        let conditional = conditional(&operator, &mut location, &plain);
+        let conditional = match conditional(&operator, &mut location, &plain) {
+            Ok(conditional) => conditional,
+            Err(error) => return BlobEvent::Error(error),
+        };
         Box::pin(self.write_tenant(location, operator, blob, conditional)).await
+    }
+
+    /// Copies `source` to `plain.path`: inside the provider where both lie on one S3 storage
+    /// and the source has a recorded version, else through the node.
+    pub(super) async fn copy_plain(
+        &self,
+        resolved: ResolvedBackend,
+        plain: PlainPath,
+        source: BackendLocation,
+    ) -> BlobEvent {
+        // Without a version the node streams the newest bytes; the caller checks their hash.
+        let exact = match self.read_version(&source).await {
+            Ok(version) => version,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let inside = resolved.backend == source.backend && !is_folder(&source);
+        let native = match (inside, exact.as_deref()) {
+            (true, Some(_)) => self.native_for(&source).ok().flatten(),
+            _ => None,
+        };
+        if let Some(native) = native {
+            let copied = self.copy_inside(
+                resolved.clone(),
+                &plain,
+                &source,
+                (&native, exact.as_deref()),
+            );
+            match Box::pin(copied).await {
+                Ok(Some(event)) => return event,
+                Ok(None) => {}
+                Err(error) => return BlobEvent::Error(error),
+            }
+        }
+        match self.read_blob(source.clone()).await {
+            BlobEvent::ReadFinished { blob, .. } => {
+                let created_by = source.created_by;
+                Box::pin(self.write_plain(resolved, plain, created_by, blob)).await
+            }
+            other => other,
+        }
+    }
+
+    /// The provider copies the exact source version in parts of at most `COPY_PART` bytes and
+    /// completes create-only where asked, and the size is checked. `None` asks for a streamed
+    /// copy: the provider refused a part, or a one-part copy's ETag is not the source MD5.
+    async fn copy_inside(
+        &self,
+        resolved: ResolvedBackend,
+        plain: &PlainPath,
+        source: &BackendLocation,
+        (native, version): (&crate::s3::NativeMultipart, Option<&str>),
+    ) -> Result<Option<BlobEvent>, BlobError> {
+        let class = resolved.storage_class.clone();
+        let mut location =
+            self.plain_location(resolved.backend, class, plain, source.created_by)?;
+        let operator = self.operator_from_location(&location)?;
+        let if_not_exists = conditional(&operator, &mut location, plain)?;
+        let target = self.native_upload(&location)?;
+        let (path, source_path) = (self.object_path(&location)?, self.object_path(source)?);
+        // The upload an interrupted try of this copy recorded goes first, and only that one.
+        self.settle_upload(plain.ulid).await?;
+        let size = source.blob_size;
+        let ranges = copy_ranges(size);
+        let upload_id = target.create(&path).await?;
+        // The upload is on disk before any part moves, so a crash leaves it reconcilable.
+        if let Err(error) = self
+            .record_upload(plain.ulid, Some((&location, &upload_id)))
+            .await
+        {
+            let _ = target.abort(&path, &upload_id).await;
+            return Err(error);
+        }
+        let mut parts = Vec::with_capacity(ranges.len());
+        for (index, range) in ranges.iter().enumerate() {
+            let Ok(number) = u16::try_from(index + 1) else {
+                return self.settle(target, (&path, &upload_id), plain.ulid).await;
+            };
+            let from = (native, source_path.as_str(), version);
+            match target
+                .copy_range(&path, &upload_id, (number, *range), from)
+                .await
+            {
+                Ok(etag) => {
+                    parts.push((number, etag));
+                    // Each copied part renews the record, so a copy that progresses is never
+                    // taken for a leftover.
+                    let renewed = self.record_upload(plain.ulid, Some((&location, &upload_id)));
+                    if let Err(error) = renewed.await {
+                        let _ = target.abort(&path, &upload_id).await;
+                        return Err(error);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Provider copy refused; the bytes are streamed");
+                    return self.settle(target, (&path, &upload_id), plain.ulid).await;
+                }
+            }
+        }
+        let md5 = source.hashes.get(aruna_core::structs::checksum::HASH_MD5);
+        if let ([(_, etag)], Some(md5)) = (parts.as_slice(), md5)
+            && etag.trim_matches('"') != hex::encode(md5)
+        {
+            return self.settle(target, (&path, &upload_id), plain.ulid).await;
+        }
+        let completed = target
+            .complete(&path, &upload_id, &parts, if_not_exists)
+            .await;
+        let (written, etag) = match completed {
+            Ok(completed) => completed,
+            Err(error) => {
+                self.settle(target, (&path, &upload_id), plain.ulid).await?;
+                return Err(error);
+            }
+        };
+        self.record_upload(plain.ulid, None).await?;
+        let versioned = operator.info().capability().read_with_version;
+        let written = written.filter(|version| versioned && version != "null");
+        let stat = operator.stat_with(&path);
+        let stat = match written.as_deref() {
+            Some(version) if operator.info().capability().stat_with_version => {
+                stat.version(version)
+            }
+            _ => stat,
+        };
+        let found = timeout(self.io_timeout(), stat.into_future())
+            .await
+            .map_err(|_| BlobError::ReadError("timed out reading the copy".to_string()))?
+            .map_err(|error| BlobError::ReadError(error.to_string()))?;
+        if found.content_length() != size {
+            return Err(BlobError::IntegrityCheckFailed(format!(
+                "the copy holds {} bytes, the source {size}",
+                found.content_length()
+            )));
+        }
+        location.blob_size = size;
+        location.hashes = source.hashes.clone();
+        Ok(Some(BlobEvent::PlainWritten {
+            location,
+            version: written,
+            etag: etag.map(|etag| etag.trim_matches('"').to_string()),
+        }))
+    }
+
+    /// Aborts this copy's own provider upload and forgets it, then asks for a streamed copy. A
+    /// failed abort keeps the record, so a later try aborts it before anything else.
+    async fn settle(
+        &self,
+        target: crate::s3::NativeMultipart,
+        (path, upload_id): (&str, &str),
+        attempt: ulid::Ulid,
+    ) -> Result<Option<BlobEvent>, BlobError> {
+        target.abort(path, upload_id).await?;
+        self.record_upload(attempt, None).await?;
+        Ok(None)
+    }
+
+    /// Aborts the provider upload copy `attempt` recorded, if any, and forgets it.
+    pub(super) async fn settle_upload(&self, attempt: ulid::Ulid) -> Result<(), BlobError> {
+        let Some(upload) = self.copy_upload(attempt).await? else {
+            return Ok(());
+        };
+        self.settle_exact(attempt, upload).await
+    }
+
+    /// Aborts exactly `upload` and forgets the record of `attempt` only while it still names
+    /// it, in one transaction, so a newer try of the attempt keeps its own record.
+    async fn settle_exact(
+        &self,
+        attempt: ulid::Ulid,
+        (location, upload_id): (BackendLocation, String),
+    ) -> Result<(), BlobError> {
+        let native = self.native_upload(&location)?;
+        native
+            .abort(&self.object_path(&location)?, &upload_id)
+            .await?;
+        let storage = &self.storage;
+        let failed = |event: Event| BlobError::WriteError(format!("copy upload record: {event:?}"));
+        let started = StorageEffect::StartTransaction { read: false };
+        let txn_id = match storage.send_effect(Effect::Storage(started)).await {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            other => return Err(failed(other)),
+        };
+        let key: aruna_core::types::Key = attempt.to_bytes().to_vec().into();
+        let read = StorageEffect::Read {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: key.clone(),
+            txn_id: Some(txn_id),
+        };
+        let current = match storage.send_effect(Effect::Storage(read)).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            other => return Err(failed(other)),
+        };
+        let same = current
+            .as_deref()
+            .map(BlobCleanupWork::from_bytes)
+            .is_some_and(|work| {
+                matches!(work, Ok(BlobCleanupWork::SettleUpload { upload_id: current, .. })
+                if current == upload_id)
+            });
+        let effect = match same {
+            true => StorageEffect::Delete {
+                key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+                key,
+                txn_id: Some(txn_id),
+            },
+            false => StorageEffect::AbortTransaction { txn_id },
+        };
+        let answer = storage.send_effect(Effect::Storage(effect)).await;
+        if !same {
+            return Ok(());
+        }
+        if !matches!(answer, Event::Storage(StorageEvent::DeleteResult { .. })) {
+            return Err(failed(answer));
+        }
+        let commit = StorageEffect::CommitTransaction { txn_id };
+        match storage.send_effect(Effect::Storage(commit)).await {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+            other => Err(failed(other)),
+        }
+    }
+
+    /// Answers `SettleCopy`.
+    pub(super) async fn settle_copy(
+        &self,
+        attempt: ulid::Ulid,
+        upload: Option<(BackendLocation, String)>,
+    ) -> BlobEvent {
+        let settled = match upload {
+            Some(upload) => self.settle_exact(attempt, upload).await,
+            None => self.settle_upload(attempt).await,
+        };
+        match settled {
+            Ok(()) => BlobEvent::UploadAborted,
+            Err(error) => BlobEvent::Error(error),
+        }
+    }
+
+    /// The provider upload a copy attempt recorded: its target and upload id.
+    pub(super) async fn copy_upload(
+        &self,
+        attempt: ulid::Ulid,
+    ) -> Result<Option<(BackendLocation, String)>, BlobError> {
+        let read = StorageEffect::Read {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: attempt.to_bytes().to_vec().into(),
+            txn_id: None,
+        };
+        let value = match self.storage.send_effect(Effect::Storage(read)).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            other => {
+                return Err(BlobError::ReadError(format!(
+                    "failed to read the copy upload: {other:?}"
+                )));
+            }
+        };
+        let work = value
+            .as_deref()
+            .map(BlobCleanupWork::from_bytes)
+            .transpose();
+        match work.map_err(BlobError::ConversionError)? {
+            Some(BlobCleanupWork::SettleUpload {
+                location,
+                upload_id,
+                ..
+            }) => Ok(Some((location, upload_id))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Records a copy attempt's provider upload durably as cleanup work, which aborts it if
+    /// the copy never settles, or forgets it with `None`.
+    pub(super) async fn record_upload(
+        &self,
+        attempt: ulid::Ulid,
+        upload: Option<(&BackendLocation, &str)>,
+    ) -> Result<(), BlobError> {
+        let key = attempt.to_bytes().to_vec().into();
+        let space = BLOB_CLEANUP_KEYSPACE.to_string();
+        let effect = match upload {
+            Some((location, upload_id)) => {
+                let since_ms = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as u64);
+                let work = BlobCleanupWork::SettleUpload {
+                    attempt,
+                    location: location.clone(),
+                    upload_id: upload_id.to_string(),
+                    since_ms,
+                };
+                let value = work.to_bytes().map_err(BlobError::ConversionError)?;
+                StorageEffect::Write {
+                    key_space: space,
+                    key,
+                    value: value.into(),
+                    txn_id: None,
+                }
+            }
+            None => StorageEffect::Delete {
+                key_space: space,
+                key,
+                txn_id: None,
+            },
+        };
+        let stored = self.storage.send_effect(Effect::Storage(effect)).await;
+        if !matches!(
+            stored,
+            Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. })
+        ) {
+            return Err(BlobError::WriteError(format!(
+                "failed to record the copy upload: {stored:?}"
+            )));
+        }
+        if upload.is_none() {
+            return Ok(());
+        }
+        let synced = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::SyncAll))
+            .await;
+        match synced {
+            Event::Storage(StorageEvent::SyncAllFinished) => Ok(()),
+            other => Err(BlobError::WriteError(format!(
+                "failed to sync the copy upload: {other:?}"
+            ))),
+        }
     }
 
     /// A key that ends in `/` is an empty folder object at that exact key.
@@ -128,6 +461,7 @@ impl BlobHandler {
             true => BlobEvent::PlainWritten {
                 location,
                 version: None,
+                etag: None,
             },
             false => BlobEvent::WriteFinished { location },
         }
@@ -154,7 +488,10 @@ impl BlobHandler {
         };
         let total = parts.iter().map(|part| part.blob_size).sum();
         let chunk = compose_chunk(&backend_type, total, false);
-        let conditional = conditional(&operator, &mut location, &plain);
+        let conditional = match conditional(&operator, &mut location, &plain) {
+            Ok(conditional) => conditional,
+            Err(error) => return BlobEvent::Error(error),
+        };
         let composed = self.compose_parts(
             location,
             operator,
@@ -231,7 +568,106 @@ impl BlobHandler {
         }
     }
 
-    /// The backend version a write recorded for a tenant path; `None` reads the newest bytes.
+    /// Only an explicit rename deletes a tenant file, after its version names the new one, and
+    /// only the exact backend version it read; a later write at the path stays. An empty
+    /// version deletes a file of an unversioned storage whose size and ETag still match.
+    pub(super) async fn delete_plain(
+        &self,
+        location: BackendLocation,
+        version: String,
+        etag: Option<String>,
+    ) -> BlobEvent {
+        if !location.storage_bucket.is_empty() {
+            return BlobEvent::Error(BlobError::DeleteError("not a plain path".to_string()));
+        }
+        // "null" names whatever the path holds now, so it never selects the bytes to delete.
+        if version == "null" {
+            let reason = "an unversioned path names no exact bytes".to_string();
+            return BlobEvent::Error(BlobError::DeleteError(reason));
+        }
+        let (operator, path) = match self
+            .operator_from_location(&location)
+            .and_then(|operator| Ok((operator, self.object_path(&location)?)))
+        {
+            Ok(found) => found,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        if version.is_empty() {
+            return (self.delete_unversioned(&operator, &path, &location, etag)).await;
+        }
+        if !operator.info().capability().delete_with_version {
+            return BlobEvent::Error(BlobError::CleanupUnsupported);
+        }
+        let delete = operator.delete_with(&path).version(&version);
+        match timeout(self.io_timeout(), delete.into_future()).await {
+            Ok(Ok(())) => BlobEvent::DeleteFinished,
+            Ok(Err(error)) if error.kind() == ErrorKind::NotFound => BlobEvent::DeleteFinished,
+            Ok(Err(error)) => BlobEvent::Error(BlobError::DeleteError(error.to_string())),
+            Err(_) => BlobEvent::Error(BlobError::DeleteError("timed out deleting".into())),
+        }
+    }
+
+    /// Deletes the file at `path` only while its size and full ETag equal the recorded ones;
+    /// without a recorded ETag the file stays.
+    async fn delete_unversioned(
+        &self,
+        operator: &Operator,
+        path: &str,
+        location: &BackendLocation,
+        etag: Option<String>,
+    ) -> BlobEvent {
+        let Some(recorded) = etag else {
+            return BlobEvent::Error(BlobError::CleanupUnsupported);
+        };
+        let metadata = match timeout(self.io_timeout(), operator.stat(path)).await {
+            Ok(Ok(metadata)) => metadata,
+            Ok(Err(error)) if error.kind() == ErrorKind::NotFound => {
+                return BlobEvent::DeleteFinished;
+            }
+            Ok(Err(error)) => return BlobEvent::Error(BlobError::DeleteError(error.to_string())),
+            Err(_) => return BlobEvent::Error(BlobError::DeleteError("timed out reading".into())),
+        };
+        let unquoted = |etag: &str| etag.trim_matches('"').to_string();
+        let same = metadata.etag().map(unquoted) == Some(unquoted(&recorded));
+        if metadata.content_length() != location.blob_size || !same {
+            return BlobEvent::Error(BlobError::CleanupUnsupported);
+        }
+        // The delete itself names the ETag where the storage can; elsewhere a write between
+        // the check and the delete is the accepted remaining risk.
+        let guarded = operator.info().capability().delete_with_if_match;
+        let unsupported = || opendal::Error::new(ErrorKind::Unsupported, "no conditional delete");
+        let delete = match guarded {
+            true => {
+                let delete = operator.delete_with(path).if_match(&recorded);
+                timeout(self.io_timeout(), delete.into_future()).await
+            }
+            false => Ok(Err(unsupported())),
+        };
+        let delete = match delete {
+            Ok(Err(error)) if conditional_unsupported(&error) => {
+                timeout(self.io_timeout(), operator.delete(path)).await
+            }
+            delete => delete,
+        };
+        match delete {
+            Ok(Ok(())) => BlobEvent::DeleteFinished,
+            Ok(Err(error)) if error.kind() == ErrorKind::NotFound => BlobEvent::DeleteFinished,
+            // A failed condition means other bytes, or none, at the path now.
+            Ok(Err(error)) if error.kind() == ErrorKind::ConditionNotMatch => {
+                match timeout(self.io_timeout(), operator.stat(path)).await {
+                    Ok(Err(error)) if error.kind() == ErrorKind::NotFound => {
+                        BlobEvent::DeleteFinished
+                    }
+                    _ => BlobEvent::Error(BlobError::CleanupUnsupported),
+                }
+            }
+            Ok(Err(error)) => BlobEvent::Error(BlobError::DeleteError(error.to_string())),
+            Err(_) => BlobEvent::Error(BlobError::DeleteError("timed out deleting".into())),
+        }
+    }
+
+    /// The backend version a write recorded for a tenant path; `None`, also for an unversioned
+    /// "null" one, reads the newest bytes.
     pub(super) async fn read_version(
         &self,
         location: &BackendLocation,
@@ -248,12 +684,41 @@ impl BlobHandler {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => value
                 .map(|value| String::from_utf8(value.to_vec()))
                 .transpose()
+                .map(|version| version.filter(|version| version != "null"))
                 .map_err(|error| BlobError::ReadError(error.to_string())),
             other => Err(BlobError::ReadError(format!(
                 "failed to read the backend version: {other:?}"
             ))),
         }
     }
+}
+
+/// Whether a storage refused a conditional delete as not implemented, which OpenDAL may also
+/// report as an unexpected 501 answer; a failed condition is never such a refusal.
+fn conditional_unsupported(error: &opendal::Error) -> bool {
+    match error.kind() {
+        ErrorKind::Unsupported => true,
+        ErrorKind::Unexpected => error
+            .message()
+            .starts_with("S3Error { code: \"NotImplemented\""),
+        _ => false,
+    }
+}
+
+/// Bytes one copied part takes at most; the provider limit is 5 GiB.
+const COPY_PART: u64 = 1 << 30;
+
+/// The inclusive byte ranges of a copy; `None` copies an object of one part whole.
+fn copy_ranges(size: u64) -> Vec<Option<(u64, u64)>> {
+    if size <= COPY_PART {
+        return vec![None];
+    }
+    (0..size.div_ceil(COPY_PART))
+        .map(|part| {
+            let first = part * COPY_PART;
+            Some((first, (first + COPY_PART).min(size) - 1))
+        })
+        .collect()
 }
 
 /// A folder object: its key ends in `/` and it holds no bytes.
@@ -267,4 +732,45 @@ pub(super) fn folder_read(location: &BackendLocation) -> Option<BlobEvent> {
         blob: BackendStream::new(futures::stream::empty::<Result<Bytes, BlobError>>()),
         stream_size: 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spots_unsupported_conditions() {
+        let refused = |kind, message| conditional_unsupported(&opendal::Error::new(kind, message));
+        assert!(refused(ErrorKind::Unsupported, "no conditional delete"));
+        assert!(refused(
+            ErrorKind::Unexpected,
+            "S3Error { code: \"NotImplemented\" }"
+        ));
+        assert!(!refused(ErrorKind::ConditionNotMatch, "PreconditionFailed"));
+        assert!(!refused(
+            ErrorKind::Unexpected,
+            "S3Error { code: \"AccessDenied\" }"
+        ));
+        let uri = opendal::Error::new(
+            ErrorKind::Unexpected,
+            "S3Error { code: \"InternalError\", message: \"\" }",
+        )
+        .with_context("uri", "https://s3/b/01M5G_NotImplementedError.py");
+        assert!(!conditional_unsupported(&uri));
+    }
+
+    #[test]
+    fn splits_large_copies() {
+        assert_eq!(copy_ranges(0), vec![None]);
+        assert_eq!(copy_ranges(COPY_PART), vec![None]);
+        let ranges = copy_ranges(2 * COPY_PART + 5);
+        assert_eq!(
+            ranges,
+            vec![
+                Some((0, COPY_PART - 1)),
+                Some((COPY_PART, 2 * COPY_PART - 1)),
+                Some((2 * COPY_PART, 2 * COPY_PART + 4)),
+            ]
+        );
+    }
 }

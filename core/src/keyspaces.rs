@@ -98,6 +98,23 @@ pub const BLOB_RECLAIM_KEYSPACE: &str = "blob_reclaim_candidates";
 pub const COMPRESSION_MIGRATION_KEYSPACE: &str = "compression_migrations";
 /// Buckets whose compression migration is unfinished; the worker scans only these.
 pub const COMPRESSION_QUEUE_KEYSPACE: &str = "compression_migration_queue";
+/// Moves asked to rename linked files of earlier patterns: the start time of the move record
+/// they belong to, keyed by bucket name.
+pub const RENAME_MOVE_KEYSPACE: &str = "compression_migration_renames";
+/// Where an ending storage move stands in handing its intents over, keyed by bucket name.
+pub const MOVE_HANDOVER_KEYSPACE: &str = "compression_migration_handovers";
+/// Where the next pass over the blob cleanup queue starts.
+pub const CLEANUP_CURSOR_KEYSPACE: &str = "blob_cleanup_cursor";
+/// The re-mapping or duplicate cleanup job of each bucket, keyed by bucket name.
+pub const LINKED_JOB_KEYSPACE: &str = "linked_storage_jobs";
+/// Backend versions of linked files a release deletes, claimed before its last checks and kept
+/// as tombstones once deleted; no new reader may name a claimed version.
+pub const DELETE_CLAIM_KEYSPACE: &str = "linked_delete_claims";
+/// The delete claims by the rule whose file they name, keyed by import id and claim key.
+pub const CLAIM_INDEX_KEYSPACE: &str = "linked_delete_claim_rules";
+/// Import rows a key rename moved to a key, keyed by the import id, the key's version prefix
+/// and the row's path; they go with their rule.
+pub const RENAMED_ROW_KEYSPACE: &str = "backend_import_renamed_rows";
 /// Node-local progress of checking a bucket's current versions for copies that cannot serve.
 pub const STORAGE_CHECK_KEYSPACE: &str = "storage_checks";
 /// Buckets whose check is unfinished; the migration worker scans only these.
@@ -172,6 +189,9 @@ pub const BLOB_VERSIONS_KEYSPACE: &str = "blob_versions";
 /// Node-local trail of S3 deletions: delete markers, per-version deletes and
 /// completed purge jobs. Written inside the transaction that performs them.
 pub const DELETE_AUDIT_KEYSPACE: &str = "blob_delete_audit";
+/// The same trail by object key and purges by group, written with each audit row, so the
+/// records about one key read without the rest of the trail.
+pub const DELETE_TRAIL_KEYSPACE: &str = "blob_delete_trail";
 pub const PATHS_INDEX_KEYSPACE: &str = "hash_paths_index";
 pub const USER_ACCESS_KEYSPACE: &str = "user_access";
 pub const ACCESS_OWNER_KEYSPACE: &str = "user_access_owner";
@@ -179,6 +199,8 @@ pub const S3_SESSION_KEYSPACE: &str = "s3_sessions";
 pub const SESSION_OWNER_KEYSPACE: &str = "s3_session_owner";
 pub const SESSION_EXPIRY_KEYSPACE: &str = "s3_session_expiry";
 pub const S3_BUCKET_KEYSPACE: &str = "s3_buckets";
+/// The creation id of each bucket by name, fresh on every creation of the name.
+pub const BUCKET_CREATION_KEYSPACE: &str = "s3_bucket_creations";
 pub const RELATIONSHIP_OUT_KEYSPACE: &str = "sync_relationship_out";
 pub const RELATIONSHIP_IN_KEYSPACE: &str = "sync_relationship_in";
 pub const MIRROR_REPAIR_KEYSPACE: &str = "sync_mirror_repair";
@@ -190,6 +212,9 @@ pub const UPLOAD_PART_KEYSPACE: &str = "s3_multipart_upload_parts";
 pub const PURGE_FENCE_KEYSPACE: &str = "s3_purge_fences";
 /// Durable inventory and batch counters for resumable permanent-purge jobs.
 pub const PURGE_CHECKPOINT_KEYSPACE: &str = "s3_purge_checkpoints";
+/// Linked-storage files a purge releases once its versions are gone, and its pause marker,
+/// keyed by job id.
+pub const PURGE_FILES_KEYSPACE: &str = "s3_purge_files";
 pub const REPLICATION_JOB_KEYSPACE: &str = "blob_replication_jobs";
 pub const REPLICATION_OBLIGATION_KEYSPACE: &str = "blob_live_replication_obligations";
 pub const REFRESH_JOB_KEYSPACE: &str = "reference_metadata_refresh_jobs";
@@ -223,8 +248,14 @@ pub const BACKEND_IMPORT_KEYSPACE: &str = "backend_imports";
 pub const IMPORTED_OBJECT_KEYSPACE: &str = "backend_import_objects";
 /// The backend version id of bytes at a path of a tenant's folders, keyed by location ulid.
 pub const BACKEND_VERSION_KEYSPACE: &str = "backend_versions";
+/// What a write to an import folder will be, recorded before its bytes, keyed like its row.
+pub const IMPORT_INTENT_KEYSPACE: &str = "backend_import_intents";
+/// Earlier write patterns of an import rule that may still name its files, keyed by import id.
+pub const IMPORT_PATTERN_KEYSPACE: &str = "backend_import_patterns";
 /// Removed import rules whose object rows are not all deleted yet, keyed by import id.
 pub const IMPORT_REMOVAL_KEYSPACE: &str = "backend_import_removals";
+/// File name discovery rules of import rules, keyed like the rule.
+pub const IMPORT_DISCOVERY_KEYSPACE: &str = "backend_import_discovery";
 
 /// Device-local registrations of the directories this node offers as read-only
 /// buckets, keyed by bucket name. Never replicated: the root path is the one
@@ -427,6 +458,13 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BLOB_RECLAIM_KEYSPACE,
     COMPRESSION_MIGRATION_KEYSPACE,
     COMPRESSION_QUEUE_KEYSPACE,
+    RENAME_MOVE_KEYSPACE,
+    LINKED_JOB_KEYSPACE,
+    CLEANUP_CURSOR_KEYSPACE,
+    MOVE_HANDOVER_KEYSPACE,
+    DELETE_CLAIM_KEYSPACE,
+    CLAIM_INDEX_KEYSPACE,
+    RENAMED_ROW_KEYSPACE,
     STORAGE_CHECK_KEYSPACE,
     CHECK_QUEUE_KEYSPACE,
     BROKEN_VERSION_KEYSPACE,
@@ -452,6 +490,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BLOB_HEAD_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE,
     DELETE_AUDIT_KEYSPACE,
+    DELETE_TRAIL_KEYSPACE,
     PATHS_INDEX_KEYSPACE,
     USER_ACCESS_KEYSPACE,
     ACCESS_OWNER_KEYSPACE,
@@ -459,6 +498,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SESSION_OWNER_KEYSPACE,
     SESSION_EXPIRY_KEYSPACE,
     S3_BUCKET_KEYSPACE,
+    BUCKET_CREATION_KEYSPACE,
     RELATIONSHIP_OUT_KEYSPACE,
     RELATIONSHIP_IN_KEYSPACE,
     MIRROR_REPAIR_KEYSPACE,
@@ -468,6 +508,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     UPLOAD_PART_KEYSPACE,
     PURGE_FENCE_KEYSPACE,
     PURGE_CHECKPOINT_KEYSPACE,
+    PURGE_FILES_KEYSPACE,
     REPLICATION_JOB_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE,
     REFRESH_JOB_KEYSPACE,
@@ -487,7 +528,10 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BACKEND_IMPORT_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE,
     BACKEND_VERSION_KEYSPACE,
+    IMPORT_INTENT_KEYSPACE,
+    IMPORT_PATTERN_KEYSPACE,
     IMPORT_REMOVAL_KEYSPACE,
+    IMPORT_DISCOVERY_KEYSPACE,
     OFFERED_DIRECTORY_KEYSPACE,
     DEVICE_INTAKE_KEYSPACE,
     REALM_MARKER_KEYSPACE,

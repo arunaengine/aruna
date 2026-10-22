@@ -246,7 +246,9 @@ async fn moves_bucket_copies() {
         .location_key()
         .unwrap();
     route_cold(&context, "data/").await;
-    let counted = count_misplaced(&context.driver, BUCKET, "").await.unwrap();
+    let counted = count_misplaced(&context.driver, BUCKET, "", None)
+        .await
+        .unwrap();
     assert_eq!((counted.count, counted.complete), (71, true));
 
     let start = StartMoveOperation::new(BUCKET.to_string(), context.group_id, "data/".into(), 1);
@@ -274,7 +276,9 @@ async fn moves_bucket_copies() {
         let small = version(&context, key, *version_id).await;
         assert_eq!(content(&context, &small).await, key.as_bytes());
     }
-    let counted = count_misplaced(&context.driver, BUCKET, "").await.unwrap();
+    let counted = count_misplaced(&context.driver, BUCKET, "", None)
+        .await
+        .unwrap();
     assert_eq!(counted.count, 0);
 }
 
@@ -292,4 +296,43 @@ async fn placed_versions_skip() {
     let done = progress(&context).await;
     assert_eq!((done.migrated, done.skipped, done.failed), (0, 1, 0));
     assert_eq!(version(&context, "a.txt", id).await, before);
+}
+
+#[tokio::test]
+async fn settles_gone_versions() {
+    // A move intent of a version that is gone is retired once the storage shows its path
+    // holds nothing to release.
+    use aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE;
+    use aruna_core::structs::storage::backend_import::{WriteIntent, intent_key};
+    use aruna_core::structs::storage::blob::VersionKey;
+    use aruna_operations::blob::migration::settle_move;
+    let context = setup_context().await;
+    let id = Ulid::generate();
+    let intent = WriteIntent {
+        key: "a.csv".to_string(),
+        version_id: id,
+        backend: BackendRef::node_default(),
+        created_by: context.user_id,
+        written: Some([1; 32]),
+        mover: Some(7),
+    };
+    let key = intent_key(Ulid::generate(), "raw/a.csv~X", id).to_vec();
+    let write = aruna_core::effects::StorageEffect::Write {
+        key_space: IMPORT_INTENT_KEYSPACE.to_string(),
+        key: key.clone().into(),
+        value: intent.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    context
+        .driver
+        .storage_handle
+        .send_storage_effect(write)
+        .await;
+    let version = VersionKey::new(BUCKET, "a.csv", id);
+    assert!(
+        settle_move(&context.driver, &version, &[(key.clone(), intent)])
+            .await
+            .unwrap()
+    );
+    assert!(read(&context, IMPORT_INTENT_KEYSPACE, key).await.is_none());
 }

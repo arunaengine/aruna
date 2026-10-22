@@ -124,6 +124,8 @@ pub struct PlainTarget {
     pub same_name: bool,
     /// `path` lies in the folder the rule imports from, so its importer must skip it.
     pub listed: bool,
+    /// Other rules of the group that read `path`; their record of it makes it theirs.
+    pub shared: Vec<Ulid>,
 }
 
 /// Operator-authored all-groups rule from the node's backends file. An unset
@@ -476,12 +478,37 @@ impl RoutingSnapshot {
         imports.any(|rule| rule.bucket == bucket && rule.mapped_bucket().is_some())
     }
 
-    pub fn plain_target(&self, bucket: &str, key: &str, id: Ulid) -> Option<PlainTarget> {
-        let rule = self
-            .imports
+    /// The import rule whose folder holds `key`, the one with the longest prefix.
+    fn import_rule(&self, bucket: &str, key: &str) -> Option<&BackendImport> {
+        self.imports
             .iter()
             .filter(|rule| rule.bucket == bucket && key.starts_with(&rule.key_prefix))
-            .max_by_key(|rule| rule.key_prefix.len())?;
+            .max_by_key(|rule| rule.key_prefix.len())
+    }
+
+    /// The target of a write already placed at `path`, as the rule's current pattern may
+    /// no longer build that path.
+    pub fn saved_target(
+        &self,
+        bucket: &str,
+        key: &str,
+        backend: &BackendRef,
+        path: &str,
+    ) -> Option<PlainTarget> {
+        let rule = self.import_rule(bucket, key)?;
+        Some(PlainTarget {
+            import_id: rule.import_id,
+            backend: backend.clone(),
+            path: path.to_string(),
+            same_name: rule.same_name(),
+            listed: *backend == BackendRef::Group(rule.backend_id)
+                && path.starts_with(&rule.backend_prefix),
+            shared: self.readers(rule.import_id, backend, path),
+        })
+    }
+
+    pub fn plain_target(&self, bucket: &str, key: &str, id: Ulid) -> Option<PlainTarget> {
+        let rule = self.import_rule(bucket, key)?;
         if self.compression != Compression::Off {
             tracing::warn!(
                 import_id = %rule.import_id,
@@ -501,8 +528,23 @@ impl RoutingSnapshot {
             backend: BackendRef::Group(backend),
             same_name: rule.same_name() && !path.ends_with('/'),
             listed: backend == rule.backend_id && path.starts_with(&rule.backend_prefix),
+            shared: self.readers(rule.import_id, &BackendRef::Group(backend), &path),
             path,
         })
+    }
+
+    /// The other rules that import `path` from `backend`.
+    pub fn readers(&self, import_id: Ulid, backend: &BackendRef, path: &str) -> Vec<Ulid> {
+        let reads = |rule: &&BackendImport| {
+            rule.import_id != import_id
+                && *backend == BackendRef::Group(rule.backend_id)
+                && path.starts_with(&rule.backend_prefix)
+        };
+        self.imports
+            .iter()
+            .filter(reads)
+            .map(|rule| rule.import_id)
+            .collect()
     }
 }
 
@@ -1239,7 +1281,7 @@ mod tests {
         let mut snapshot = snapshot();
         snapshot.imports = vec![rule.clone()];
         let found = snapshot.plain_target("b", "in/a.csv", id).unwrap();
-        assert_eq!(found.path, format!("raw/{id}_a.csv"));
+        assert_eq!(found.path, format!("raw/a.csv~{id}"));
         assert_eq!(found.backend, BackendRef::Group(source));
         assert!(found.listed && !found.same_name);
         assert_eq!(snapshot.plain_target("b", "out/a.csv", id), None);

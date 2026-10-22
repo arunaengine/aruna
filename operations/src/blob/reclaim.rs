@@ -373,7 +373,8 @@ pub async fn backend_status(
         let Ok(
             BlobCleanupWork::DeleteBlob { location }
             | BlobCleanupWork::ReconcileWrite { location, .. }
-            | BlobCleanupWork::ReconcileReservation { location },
+            | BlobCleanupWork::ReconcileReservation { location }
+            | BlobCleanupWork::ReleaseRenamed { location, .. },
         ) = BlobCleanupWork::from_bytes(value.as_ref())
         else {
             continue;
@@ -445,9 +446,18 @@ pub struct ReclaimBlobOperation {
     next_alias_page: Option<Key>,
     usage_update: Option<UsageCounterUpdate>,
     output: Option<Result<ReclaimVerdict, ReclaimBlobError>>,
+    /// Frees the copy whatever the strategy and without a queued candidate.
+    forced: bool,
 }
 
 impl ReclaimBlobOperation {
+    /// Frees a renamed file's old location: the rename replaced it, so no strategy keeps it.
+    /// The transaction still proves that no version or archive reads it.
+    pub fn forced(mut self) -> Self {
+        self.forced = true;
+        self
+    }
+
     pub fn new(key: ReclaimCandidateKey, enqueued_at: SystemTime, sweep_time: SystemTime) -> Self {
         Self {
             key,
@@ -459,6 +469,7 @@ impl ReclaimBlobOperation {
             next_alias_page: None,
             usage_update: None,
             output: None,
+            forced: false,
         }
     }
 
@@ -520,12 +531,16 @@ impl ReclaimBlobOperation {
 
     fn handle_candidate(&mut self, event: Event) -> Effects {
         let candidate = match parse_read(event, ReclaimCandidate::from_bytes) {
-            Ok(Some(candidate)) => candidate,
-            Ok(None) => return self.drop_candidate(ReclaimVerdict::Dropped),
+            Ok(candidate) => candidate,
             Err(error) => return self.fail(error.into()),
         };
-        if candidate.enqueued_at != self.enqueued_at {
-            return self.finish_not_due();
+        match candidate {
+            _ if self.forced => {}
+            None => return self.drop_candidate(ReclaimVerdict::Dropped),
+            Some(candidate) if candidate.enqueued_at != self.enqueued_at => {
+                return self.finish_not_due();
+            }
+            Some(_) => {}
         }
         match self.key.backend {
             BackendRef::Group(backend_id) => {
@@ -549,6 +564,9 @@ impl ReclaimBlobOperation {
             Ok(None) => return self.drop_candidate(ReclaimVerdict::Dropped),
             Err(error) => return self.fail(error.into()),
         };
+        if self.forced {
+            return self.read_location();
+        }
         let Some(after) = record.cleanup.grace() else {
             return self.drop_candidate(ReclaimVerdict::Dropped);
         };
@@ -1684,6 +1702,37 @@ mod tests {
         };
         assert_eq!(deletes.len(), 1);
         assert_eq!(deletes[0].0, BLOB_RECLAIM_KEYSPACE);
+    }
+
+    #[test]
+    fn forced_ignores_retain() {
+        // A renamed file's old location goes under retain too, also without a queued candidate.
+        let backend_id = Ulid::from_bytes([8u8; 16]);
+        let key = ReclaimCandidateKey::new(BackendRef::Group(backend_id), EncodingClass::Raw, HASH);
+        let mut operation = reclaim_op(key).forced();
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([9u8; 16]),
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: operation.key.to_bytes().into(),
+            value: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == STORAGE_BACKEND_KEYSPACE
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(group_record(backend_id, CleanupStrategy::Retain).into()),
+        }));
+        // The location is read next, so the alias scan still decides.
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == BLOB_LOCATIONS_KEYSPACE
+        ));
     }
 
     #[test]

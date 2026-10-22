@@ -2,17 +2,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE,
-    S3_BUCKET_KEYSPACE, TRANSITION_KEYSPACE,
+    LINKED_JOB_KEYSPACE, RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE, TRANSITION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::backend_import::{RenameRequest, TokenGrant};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
+use aruna_core::structs::storage::linked_job::LinkedJob;
 use aruna_core::structs::storage::transition::EncryptionTransition;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -34,6 +38,10 @@ pub enum StartMoveError {
     MoveRunning(String),
     #[error("the storage move did not finish")]
     NotFinished,
+    #[error("the import rule changed since its files were checked")]
+    RuleChanged,
+    #[error("a re-mapping or duplicate cleanup of the bucket runs")]
+    JobRunning,
     #[error("unexpected event: {0:?}")]
     Unexpected(Box<Event>),
 }
@@ -126,6 +134,11 @@ pub struct StartMoveOperation {
     group_id: GroupId,
     prefix: String,
     now_ms: u64,
+    /// Also gives linked files of earlier patterns their current name, for this caller.
+    renaming: Option<(AuthContext, NodeId, TokenGrant)>,
+    /// Values read when the caller's access to the renamed files was checked; the move
+    /// starts only while they are unchanged.
+    guards: Vec<(String, Key, Option<Value>)>,
     state: StartMoveState,
     txn_id: Option<TxnId>,
     output: Option<Result<CompressionMigration, StartMoveError>>,
@@ -138,10 +151,25 @@ impl StartMoveOperation {
             group_id,
             prefix,
             now_ms,
+            renaming: None,
+            guards: Vec::new(),
             state: StartMoveState::Init,
             txn_id: None,
             output: None,
         }
+    }
+
+    /// Asks the move to rename linked files of earlier patterns, each only while `auth` may
+    /// write its key; an ordinary move never renames.
+    pub fn renaming(mut self, (auth, node_id): (AuthContext, NodeId), grant: TokenGrant) -> Self {
+        self.renaming = Some((auth, node_id, grant));
+        self
+    }
+
+    /// Starts only while `guards` are stored as they were read.
+    pub fn with_guards(mut self, guards: Vec<(String, Key, Option<Value>)>) -> Self {
+        self.guards = guards;
+        self
     }
 
     fn fail(&mut self, error: StartMoveError) -> Effects {
@@ -150,7 +178,19 @@ impl StartMoveOperation {
         self.abort()
     }
 
-    fn write(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn write(&mut self, mut values: Vec<(Key, Option<Value>)>) -> Effects {
+        let seen = values.split_off(values.len().saturating_sub(self.guards.len()));
+        let expected = self.guards.iter().map(|(.., value)| value);
+        if seen.len() != self.guards.len() || !seen.iter().map(|(_, value)| value).eq(expected) {
+            return self.fail(StartMoveError::RuleChanged);
+        }
+        // A re-mapping or duplicate cleanup of the bucket holds it until it ends.
+        let linked = values.pop().and_then(|(_, value)| value);
+        match linked.as_deref().map(LinkedJob::from_bytes).transpose() {
+            Ok(Some(job)) if job.is_active() => return self.fail(StartMoveError::JobRunning),
+            Ok(_) => {}
+            Err(error) => return self.fail(error.into()),
+        }
         match self.rows(values) {
             Ok(writes) => {
                 self.state = StartMoveState::Write;
@@ -183,7 +223,20 @@ impl StartMoveOperation {
             stored.as_deref(),
         )?;
         let record = move_record(stored, info.compression, &self.prefix, self.now_ms)?;
-        let writes = move_rows(&self.bucket, &record)?;
+        let mut writes = move_rows(&self.bucket, &record)?;
+        if let Some((auth, node_id, grant)) = self.renaming.clone() {
+            let request = RenameRequest {
+                started_at_ms: record.started_at_ms,
+                auth,
+                node_id,
+                grant,
+                paused: false,
+                aborted_at_ms: None,
+            };
+            let key: Key = self.bucket.as_bytes().to_vec().into();
+            let value = request.to_bytes()?.into();
+            writes.push((RENAME_MOVE_KEYSPACE.to_string(), key, value));
+        }
         self.output = Some(Ok(record));
         Ok(writes)
     }
@@ -211,8 +264,16 @@ impl Operation for StartMoveOperation {
             ) => {
                 self.txn_id = Some(txn_id);
                 self.state = StartMoveState::Read;
+                let guards = self
+                    .guards
+                    .iter()
+                    .map(|(space, key, _)| (space.clone(), key.clone()));
+                let mut reads = move_reads(&self.bucket);
+                let key = self.bucket.as_bytes().to_vec().into();
+                reads.push((LINKED_JOB_KEYSPACE.to_string(), key));
+                reads.extend(guards);
                 smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: move_reads(&self.bucket),
+                    reads,
                     txn_id: Some(txn_id),
                 })]
             }
@@ -262,6 +323,29 @@ impl Operation for StartMoveOperation {
 mod tests {
     use super::*;
 
+    fn asker() -> AuthContext {
+        AuthContext {
+            user_id: Default::default(),
+            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]),
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    fn grant() -> TokenGrant {
+        TokenGrant {
+            token_hash: "hash".to_string(),
+            issuer: asker().realm_id,
+            issued_at_secs: 1,
+            expires_at_secs: 2,
+            via: None,
+        }
+    }
+
+    fn node() -> NodeId {
+        iroh::SecretKey::from_bytes(&[3; 32]).public()
+    }
+
     fn running(prefix: &str) -> CompressionMigration {
         let mut record = CompressionMigration::new(Compression::Off, 1);
         (record.moving, record.prefix) = (true, prefix.to_string());
@@ -294,6 +378,75 @@ mod tests {
         let compression = Some(CompressionMigration::new(Compression::Off, 1));
         let fresh = move_record(compression, Compression::Off, "x/", 9).unwrap();
         assert!(fresh.moving && fresh.prefix == "x/");
+    }
+
+    #[test]
+    fn records_asked_rename() {
+        // Only a move started to rename writes the request, bound to its record.
+        let group_id = ulid::Ulid::from_parts(1, 1);
+        let info = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+        };
+        for renaming in [false, true] {
+            let mut operation = StartMoveOperation::new("b".into(), group_id, "in/".into(), 7);
+            if renaming {
+                operation = operation.renaming((asker(), node()), grant());
+            }
+            let info = Some(info.to_bytes().unwrap().into());
+            let values = vec![(Key::from(vec![]), info), (vec![].into(), None)];
+            let values = [values, vec![(vec![].into(), None), (vec![].into(), None)]].concat();
+            let writes = operation.rows(values).unwrap();
+            let asked = writes
+                .iter()
+                .find(|(space, ..)| space == RENAME_MOVE_KEYSPACE);
+            // The request names the caller, whose access the move checks for each file.
+            let asked = asked.map(|(_, _, value)| RenameRequest::from_bytes(value).unwrap());
+            let expected = RenameRequest {
+                started_at_ms: 7,
+                auth: asker(),
+                node_id: node(),
+                grant: grant(),
+                paused: false,
+                aborted_at_ms: None,
+            };
+            assert_eq!(asked, renaming.then_some(expected));
+        }
+    }
+
+    #[test]
+    fn refuses_changed_rule() {
+        // The rename starts only while the rule reads as it did when its files were checked.
+        let group_id = ulid::Ulid::from_parts(1, 1);
+        let guard = (
+            "rules".to_string(),
+            Key::from(vec![1]),
+            Some(Value::from(vec![2])),
+        );
+        let mut operation = StartMoveOperation::new("b".into(), group_id, "in/".into(), 7)
+            .renaming((asker(), node()), grant())
+            .with_guards(vec![guard]);
+        operation.start();
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from(1),
+        }));
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+            panic!("expected the reads, got {effects:?}")
+        };
+        assert_eq!(reads.last().map(|(space, _)| space.as_str()), Some("rules"));
+        let mut values: Vec<(Key, Option<Value>)> = vec![(vec![].into(), None); 5];
+        values.push((vec![1].into(), Some(vec![3].into())));
+        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        assert!(matches!(
+            operation.output,
+            Some(Err(StartMoveError::RuleChanged))
+        ));
     }
 
     #[test]

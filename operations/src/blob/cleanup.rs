@@ -10,8 +10,8 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, COPY_OWNER_KEYSPACE, PENDING_LOCATION_KEYSPACE,
-    STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, CLEANUP_CURSOR_KEYSPACE, COPY_OWNER_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
@@ -28,6 +28,7 @@ use aruna_core::types::Key;
 use tracing::{error, warn};
 use ulid::Ulid;
 
+use crate::blob::release::release_renamed;
 use crate::driver::{DriverContext, drive, now_ms};
 use crate::groups::backends::{backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
@@ -95,6 +96,58 @@ impl PendingCleanup {
     }
 }
 
+/// How long a recorded copy upload may go without a copied part before the cleanup takes it
+/// for a leftover; each part renews it.
+const SETTLE_GRACE_MS: u64 = 60 * 60 * 1000;
+
+/// Drops a page of `key_space` rows under `prefix`; `true` once none is left.
+async fn drop_rows(
+    context: &DriverContext,
+    key_space: &str,
+    prefix: Vec<u8>,
+) -> Result<bool, String> {
+    let page = iter_prefix_page(
+        &context.storage_handle,
+        key_space,
+        Some(prefix.into()),
+        None,
+        CLEANUP_PAGE_SIZE,
+        None,
+    );
+    let (rows, _) = page.await?;
+    if rows.is_empty() {
+        return Ok(true);
+    }
+    let deletes = rows
+        .into_iter()
+        .map(|(key, _)| (key_space.to_string(), key))
+        .collect();
+    let effect = StorageEffect::BatchDelete {
+        deletes,
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(false),
+        other => Err(format!("could not drop rows: {other:?}")),
+    }
+}
+
+/// Whether the purge job `job_id` has ended, or is gone; `None` while unreadable.
+async fn purge_ended(context: &DriverContext, job_id: Ulid) -> Option<bool> {
+    let job_id = aruna_core::structs::execution::job::JobId::try_from_bytes(job_id.to_bytes());
+    let Ok(job_id) = job_id else {
+        return Some(true);
+    };
+    let record = crate::jobs::store::read_job_record(&context.storage_handle, job_id, None);
+    match record.await {
+        Ok(record) => Some(record.is_none_or(|record| record.is_settled())),
+        Err(error) => {
+            warn!(%error, "A purge job could not be read");
+            None
+        }
+    }
+}
+
 fn cleanup_row_key(work: &BlobCleanupWork) -> Key {
     match work {
         BlobCleanupWork::ReconcileWrite { location, .. } => {
@@ -102,9 +155,14 @@ fn cleanup_row_key(work: &BlobCleanupWork) -> Key {
         }
         BlobCleanupWork::DeleteBlob { .. }
         | BlobCleanupWork::RegisterDht { .. }
-        | BlobCleanupWork::ReconcileReservation { .. } => {
-            Ulid::generate().to_bytes().to_vec().into()
-        }
+        | BlobCleanupWork::ReconcileReservation { .. }
+        | BlobCleanupWork::ReleaseRenamed { .. }
+        | BlobCleanupWork::DropTrail { .. }
+        | BlobCleanupWork::DropClaims { .. }
+        | BlobCleanupWork::ReleasePlanned { .. }
+        | BlobCleanupWork::SettleUpload { .. }
+        | BlobCleanupWork::SettleMove { .. }
+        | BlobCleanupWork::DropRows { .. } => Ulid::generate().to_bytes().to_vec().into(),
     }
 }
 
@@ -137,7 +195,14 @@ pub struct BlobCleanupOutcome {
     pub dropped: usize,
     /// Rows that must stay queued without being failures, such as a live upload's target.
     pub kept: usize,
+    /// The pass stopped at its row limit; the next one continues after it.
+    pub more: bool,
 }
+
+/// Rows one drain pass looks at, at most; the next pass continues after the last one.
+const PASS_ROWS: usize = 4096;
+/// Where the next drain pass starts.
+const CURSOR_KEY: &[u8] = b"cursor";
 
 /// What one drain pass did with a row.
 enum RowOutcome {
@@ -160,7 +225,8 @@ impl From<bool> for RowOutcome {
 // rows behind them, deleting each page's completed rows before the next fetch.
 pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanupOutcome, String> {
     let mut outcome = BlobCleanupOutcome::default();
-    let mut start_after = None;
+    let mut start_after = read_cursor(context).await?;
+    let mut seen = 0usize;
 
     loop {
         let (values, next) = iter_prefix_page(
@@ -174,6 +240,8 @@ pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanu
         .await?;
 
         let mut done: Vec<(String, Key)> = Vec::new();
+        let last = values.last().map(|(key, _)| key.clone());
+        seen += values.len();
         for (key, value) in values {
             // A row nobody can decode would wedge the drain forever.
             let work = match BlobCleanupWork::from_bytes(&value) {
@@ -208,9 +276,51 @@ pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanu
         delete_cleanup_rows(context, done).await?;
 
         let Some(next) = next else {
+            store_cursor(context, None).await?;
             return Ok(outcome);
         };
+        // A bounded pass keeps its place, so every row gets its turn over the passes.
+        if seen >= PASS_ROWS {
+            store_cursor(context, last).await?;
+            outcome.more = true;
+            return Ok(outcome);
+        }
         start_after = Some(next);
+    }
+}
+
+async fn read_cursor(context: &DriverContext) -> Result<Option<Key>, String> {
+    let read = StorageEffect::Read {
+        key_space: CLEANUP_CURSOR_KEYSPACE.to_string(),
+        key: CURSOR_KEY.to_vec().into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+        other => Err(format!("could not read the cleanup cursor: {other:?}")),
+    }
+}
+
+async fn store_cursor(context: &DriverContext, cursor: Option<Key>) -> Result<(), String> {
+    let key: Key = CURSOR_KEY.to_vec().into();
+    let effect = match cursor {
+        Some(value) => StorageEffect::Write {
+            key_space: CLEANUP_CURSOR_KEYSPACE.to_string(),
+            key,
+            value,
+            txn_id: None,
+        },
+        None => StorageEffect::Delete {
+            key_space: CLEANUP_CURSOR_KEYSPACE.to_string(),
+            key,
+            txn_id: None,
+        },
+    };
+    match context.storage_handle.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
+            Ok(())
+        }
+        other => Err(format!("could not store the cleanup cursor: {other:?}")),
     }
 }
 
@@ -400,6 +510,95 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
             realm_id,
             ttl_ms,
         } => register_dht(context, blake3, realm_id, ttl_ms).await.into(),
+        BlobCleanupWork::ReleaseRenamed {
+            location,
+            import_id,
+            version_id,
+            version,
+        } => release_renamed(context, location, import_id, version_id, version)
+            .await
+            .into(),
+        BlobCleanupWork::ReleasePlanned {
+            job_id,
+            location,
+            import_id,
+            version_id,
+            version,
+        } => match purge_ended(context, job_id).await {
+            Some(true) => release_renamed(context, location, import_id, version_id, version)
+                .await
+                .into(),
+            Some(false) => RowOutcome::Kept,
+            None => RowOutcome::Failed,
+        },
+        BlobCleanupWork::SettleUpload {
+            attempt,
+            location,
+            upload_id,
+            since_ms,
+        } => {
+            let now = crate::effect_adapters::routing::now_ms();
+            // A copy may still be running; only an upload past the grace is its leftover.
+            if now < since_ms.saturating_add(SETTLE_GRACE_MS) {
+                return RowOutcome::Kept;
+            }
+            let Some(blob_handle) = context.blob_handle.as_ref() else {
+                return RowOutcome::Failed;
+            };
+            // Exactly the decoded upload; a newer try of the attempt keeps its own.
+            let upload = Some((Box::new(location), upload_id));
+            let effect = BlobEffect::SettleCopy { attempt, upload };
+            // The settlement removes the record itself, and only while it is unchanged.
+            match blob_handle.send_blob_effect(effect).await {
+                Event::Blob(BlobEvent::UploadAborted) => RowOutcome::Kept,
+                event => {
+                    warn!(?event, "A copy upload could not be settled");
+                    RowOutcome::Failed
+                }
+            }
+        }
+        BlobCleanupWork::SettleMove { version, intents } => {
+            match crate::blob::migration::settle_move(context, &version, &intents).await {
+                Ok(true) => RowOutcome::Done,
+                Ok(false) => RowOutcome::Kept,
+                Err(error) => {
+                    warn!(%error, "A rename's move could not be settled");
+                    RowOutcome::Failed
+                }
+            }
+        }
+        BlobCleanupWork::DropRows { key_space, prefix } => {
+            match drop_rows(context, &key_space, prefix).await {
+                Ok(true) => RowOutcome::Done,
+                Ok(false) => RowOutcome::Kept,
+                Err(error) => {
+                    warn!(%error, "Rows of a removed rule could not be dropped");
+                    RowOutcome::Failed
+                }
+            }
+        }
+        BlobCleanupWork::DropClaims { import_id } => {
+            match crate::blob::release::drop_claims(context, import_id).await {
+                Some(true) => RowOutcome::Done,
+                Some(false) => RowOutcome::Kept,
+                None => RowOutcome::Failed,
+            }
+        }
+        BlobCleanupWork::DropTrail {
+            group_id,
+            bucket,
+            incarnation,
+        } => {
+            match crate::blob::trail::drop_trail(context, group_id, bucket.as_deref(), incarnation)
+                .await
+            {
+                Ok(()) => RowOutcome::Done,
+                Err(error) => {
+                    warn!(%error, "Delete trail of a removed bucket could not be dropped");
+                    RowOutcome::Failed
+                }
+            }
+        }
     }
 }
 
@@ -794,6 +993,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn releases_renamed_once() {
+        use aruna_core::keyspaces::IMPORTED_OBJECT_KEYSPACE;
+        use aruna_core::structs::storage::backend_import::{ImportedObject, object_key};
+        let (_dir, storage, context) = setup_context();
+        let BlobCleanupWork::DeleteBlob { mut location } =
+            BlobCleanupWork::from_bytes(&delete_work()).unwrap()
+        else {
+            unreachable!()
+        };
+        (location.storage_bucket, location.backend_path) = (String::new(), "raw/a".to_string());
+        let (import_id, version_id) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
+        let work = |version_id| BlobCleanupWork::ReleaseRenamed {
+            location: location.clone(),
+            import_id,
+            version_id,
+            version: "v1".to_string(),
+        };
+        let row = ImportedObject::written(version_id, "in/a".to_string(), 0, None);
+        let event = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
+                key: object_key(import_id, "raw/a"),
+                value: row.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        // The file of this version waits for a blob handle; its row stays until the delete.
+        write_rows(&storage, vec![work(version_id).to_bytes().unwrap()]).await;
+        let outcome = process_cleanup_batch(&context).await.unwrap();
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(remaining_rows(&storage).await, 1);
+
+        // A path that another version took keeps its file, and the release ends.
+        let (_dir, storage, context) = setup_context();
+        let event = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: IMPORTED_OBJECT_KEYSPACE.to_string(),
+                key: object_key(import_id, "raw/a"),
+                value: row.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        let other = work(Ulid::from_parts(3, 3)).to_bytes().unwrap();
+        write_rows(&storage, vec![other]).await;
+        let outcome = process_cleanup_batch(&context).await.unwrap();
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(remaining_rows(&storage).await, 0);
+    }
+
+    #[tokio::test]
     async fn drops_poison_rows() {
         // An undecodable row must be deleted, and the rows after it still run.
         let (_dir, storage, context) = setup_context();
@@ -931,6 +1189,89 @@ mod tests {
             assert_eq!(outcome.failed, 0);
             assert_eq!(remaining_rows(&storage).await, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn bounds_each_pass() {
+        // A long queue is worked in bounded passes that continue where the last one stopped.
+        let (_dir, storage, context) = setup_context();
+        let writes = (0..super::PASS_ROWS + 10)
+            .map(|index| {
+                let key = (index as u32).to_be_bytes().to_vec().into();
+                (BLOB_CLEANUP_KEYSPACE.to_string(), key, vec![0xff].into())
+            })
+            .collect();
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        storage.send_storage_effect(write).await;
+        let first = process_cleanup_batch(&context).await.unwrap();
+        assert!(first.more);
+        assert!(first.dropped >= super::PASS_ROWS);
+        let second = process_cleanup_batch(&context).await.unwrap();
+        assert!(!second.more);
+        assert_eq!(first.dropped + second.dropped, super::PASS_ROWS + 10);
+    }
+
+    #[tokio::test]
+    async fn waits_before_settling() {
+        // A recorded copy upload is left alone during its grace, so a copy that still runs
+        // keeps it; one past the grace is aborted through the blob storage.
+        let (_dir, _storage, context) = setup_context();
+        let BlobCleanupWork::DeleteBlob { location } =
+            BlobCleanupWork::from_bytes(&delete_work()).unwrap()
+        else {
+            panic!("expected a delete row")
+        };
+        let settle = |since_ms| BlobCleanupWork::SettleUpload {
+            attempt: Ulid::from_parts(4, 4),
+            location: location.clone(),
+            upload_id: "upload".to_string(),
+            since_ms,
+        };
+        let now = crate::effect_adapters::routing::now_ms();
+        let fresh = super::run_cleanup_work(&context, settle(now)).await;
+        assert!(matches!(fresh, super::RowOutcome::Kept));
+        // This context has no blob storage, so the abort cannot run and the row stays.
+        let stale = super::run_cleanup_work(&context, settle(0)).await;
+        assert!(matches!(stale, super::RowOutcome::Failed));
+    }
+
+    #[tokio::test]
+    async fn drops_prefix_rows() {
+        // A removed rule's rows go page by page; rows of other prefixes stay.
+        use aruna_core::keyspaces::RENAMED_ROW_KEYSPACE;
+        let (_dir, storage, context) = setup_context();
+        for key in [
+            b"rule-a/1".to_vec(),
+            b"rule-a/2".to_vec(),
+            b"rule-b/1".to_vec(),
+        ] {
+            let write = StorageEffect::Write {
+                key_space: RENAMED_ROW_KEYSPACE.to_string(),
+                key: key.into(),
+                value: Vec::new().into(),
+                txn_id: None,
+            };
+            storage.send_storage_effect(write).await;
+        }
+        let work = || BlobCleanupWork::DropRows {
+            key_space: RENAMED_ROW_KEYSPACE.to_string(),
+            prefix: b"rule-a/".to_vec(),
+        };
+        assert!(matches!(
+            super::run_cleanup_work(&context, work()).await,
+            super::RowOutcome::Kept
+        ));
+        assert!(matches!(
+            super::run_cleanup_work(&context, work()).await,
+            super::RowOutcome::Done
+        ));
+        let (left, _) = iter_prefix_page(&storage, RENAMED_ROW_KEYSPACE, None, None, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(left.len(), 1);
     }
 
     #[tokio::test]
