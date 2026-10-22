@@ -8,10 +8,12 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, BACKEND_INDEX_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BACKEND_INDEX_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE,
+    STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::storage::backend_import::BackendImport;
+use aruna_core::structs::storage::discovery::DiscoveryRules;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, GroupStorageRouting, RoutingError, RoutingTarget, validate_tenant_target,
@@ -35,6 +37,7 @@ enum LoadInputsState {
     ReadDefault,
     ScanBackends,
     ScanImports,
+    ScanMappings,
     Finish,
     Error,
 }
@@ -83,6 +86,18 @@ impl GroupInputsOperation {
         self.state = LoadInputsState::ScanImports;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            prefix: Some(self.group_id.to_bytes().to_vec().into()),
+            start: start_after.map(IterStart::After),
+            limit: BACKEND_PAGE_SIZE,
+            txn_id: None,
+        })]
+    }
+
+    /// The discovery rules are keyed like their import rules, so one group prefix holds them.
+    fn scan_mappings(&mut self, start_after: Option<Key>) -> Effects {
+        self.state = LoadInputsState::ScanMappings;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: IMPORT_DISCOVERY_KEYSPACE.to_string(),
             prefix: Some(self.group_id.to_bytes().to_vec().into()),
             start: start_after.map(IterStart::After),
             limit: BACKEND_PAGE_SIZE,
@@ -151,12 +166,36 @@ impl Operation for GroupInputsOperation {
                     if let Some(start_after) = next_start_after {
                         return self.scan_imports(Some(start_after));
                     }
-                    self.state = LoadInputsState::Finish;
-                    self.output = Some(Ok(std::mem::take(&mut self.inputs)));
-                    smallvec![]
+                    self.scan_mappings(None)
                 }
                 Err(error) => self.fail(error.into()),
             },
+            LoadInputsState::ScanMappings => {
+                let Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) = event
+                else {
+                    return self.fail(RecordReadError::Unexpected.into());
+                };
+                for (key, value) in values {
+                    let id = key.get(16..32).and_then(|id| <[u8; 16]>::try_from(id).ok());
+                    let rules = DiscoveryRules::from_bytes(&value);
+                    match (id, rules) {
+                        (Some(id), Ok(rules)) => {
+                            self.inputs.mappings.insert(Ulid::from_bytes(id), rules.rules);
+                        }
+                        (None, _) => return self.fail(RecordReadError::Unexpected.into()),
+                        (_, Err(error)) => return self.fail(RecordReadError::from(error).into()),
+                    }
+                }
+                if let Some(start_after) = next_start_after {
+                    return self.scan_mappings(Some(start_after));
+                }
+                self.state = LoadInputsState::Finish;
+                self.output = Some(Ok(std::mem::take(&mut self.inputs)));
+                smallvec![]
+            }
             LoadInputsState::Finish | LoadInputsState::Error => {
                 self.fail(RecordReadError::Unexpected.into())
             }

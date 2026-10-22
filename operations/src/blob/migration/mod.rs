@@ -1478,7 +1478,9 @@ pub fn renames(
         return false;
     };
     let patterns = earlier.get(&rule.import_id).map_or(&[][..], Vec::as_slice);
-    let target = rule.rename_target(patterns, &location.backend_path, &key.key, key.version_id);
+    // A mapped key names its file by the storage side of the mapping.
+    let named = routing.storage_key(rule, &key.key);
+    let target = rule.rename_target(patterns, &location.backend_path, &named, key.version_id);
     location.is_external()
         && !location.staging
         && !location.partial

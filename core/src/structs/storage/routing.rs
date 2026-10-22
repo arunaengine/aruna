@@ -7,6 +7,7 @@ use crate::errors::ConversionError;
 use crate::structs::storage::backend_import::BackendImport;
 use crate::structs::storage::blob::{BackendRef, ResolvedBackend};
 use crate::structs::storage::cleanup::CleanupStrategy;
+use crate::structs::storage::discovery::{DiscoveryRule, storage_path};
 use crate::structs::storage::format::Compression;
 use crate::structs::storage::group_backend::reserved_path;
 use crate::types::GroupId;
@@ -108,6 +109,8 @@ pub struct GroupRoutingInputs {
     pub imports: Vec<BackendImport>,
     /// The folders Aruna keeps its own objects in on each enabled group backend.
     pub containers: BTreeMap<Ulid, Vec<String>>,
+    /// The two-way mapping rules of each import rule, by import id.
+    pub mappings: BTreeMap<Ulid, Vec<DiscoveryRule>>,
 }
 
 /// Why a write to a bucket linked whole to a provider bucket is refused.
@@ -419,6 +422,7 @@ pub struct RoutingSnapshot {
     pub compression: Compression,
     pub imports: Vec<BackendImport>,
     pub containers: BTreeMap<Ulid, Vec<String>>,
+    pub mappings: BTreeMap<Ulid, Vec<DiscoveryRule>>,
 }
 
 impl RoutingSnapshot {
@@ -432,6 +436,7 @@ impl RoutingSnapshot {
             compression: Compression::Off,
             imports: Vec::new(),
             containers: BTreeMap::new(),
+            mappings: BTreeMap::new(),
         }
     }
 
@@ -467,6 +472,7 @@ impl RoutingSnapshot {
         self.catalog = self.catalog.with_group_backends(inputs.backend_ids);
         self.imports = inputs.imports;
         self.containers = inputs.containers;
+        self.mappings = inputs.mappings;
         self
     }
 
@@ -507,6 +513,18 @@ impl RoutingSnapshot {
         })
     }
 
+    /// The key whose plain path under `rule` is the storage path of `key`, after the rule's
+    /// two-way mapping rules.
+    pub fn storage_key(&self, rule: &BackendImport, key: &str) -> String {
+        let (Some(rest), Some(rules)) = (
+            key.strip_prefix(&rule.key_prefix),
+            self.mappings.get(&rule.import_id),
+        ) else {
+            return key.to_string();
+        };
+        format!("{}{}", rule.key_prefix, storage_path(rules, rest))
+    }
+
     pub fn plain_target(&self, bucket: &str, key: &str, id: Ulid) -> Option<PlainTarget> {
         let rule = self.import_rule(bucket, key)?;
         if self.compression != Compression::Off {
@@ -517,7 +535,7 @@ impl RoutingSnapshot {
             );
             return None;
         }
-        let path = rule.plain_path(key, id)?;
+        let path = rule.plain_path(&self.storage_key(rule, key), id)?;
         let backend = rule.write_backend();
         let folders = self.containers.get(&backend).map_or(&[][..], Vec::as_slice);
         if reserved_path(folders, &path) {
