@@ -171,12 +171,15 @@ impl Operation for GroupInputsOperation {
                 Err(error) => self.fail(error.into()),
             },
             LoadInputsState::ScanMappings => {
-                let Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) = event
-                else {
-                    return self.fail(RecordReadError::Unexpected.into());
+                let (values, next_start_after) = match event {
+                    Event::Storage(StorageEvent::IterResult {
+                        values,
+                        next_start_after,
+                    }) => (values, next_start_after),
+                    Event::Storage(StorageEvent::Error { error }) => {
+                        return self.fail(RecordReadError::Storage(error).into());
+                    }
+                    _ => return self.fail(RecordReadError::Unexpected.into()),
                 };
                 for (key, value) in values {
                     let id = key.get(16..32).and_then(|id| <[u8; 16]>::try_from(id).ok());
