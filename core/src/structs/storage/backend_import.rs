@@ -76,14 +76,14 @@ impl BackendImport {
             || (self.write_backend() == backend_id && names(self.write_folder()))
     }
 
-    /// The provider bucket this rule links whole to its whole bucket, with names without `{id}`.
+    /// The provider bucket this rule links whole to its whole bucket, with plain keys.
     pub fn mapped_bucket(&self) -> Option<&str> {
         let bucket = path_bucket(&self.backend_prefix)?;
         (self.key_prefix.is_empty()
             && self.backend_prefix.len() == bucket.len() + 1
             && self.write_backend() == self.backend_id
             && self.write_folder() == self.backend_prefix
-            && self.same_name())
+            && self.write_pattern == PLAIN_PATTERN)
         .then_some(bucket)
     }
 

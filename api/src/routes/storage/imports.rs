@@ -512,10 +512,11 @@ pub async fn get_import(
 
 **Limits**
 - `write_pattern` must contain `{name}` and give a relative path.
-- A rule that links a whole top folder of its storage to a whole bucket with a pattern
-  without `{id}` is a 1:1 link: its bucket cannot be compressed or encrypted, takes no
-  replicated copies and ends the link when it is deleted. A switch to such a pattern is refused
-  with 409 while the bucket is compressed or encrypted."#,
+- A rule that links a whole top folder of its storage to a whole bucket with the pattern
+  `{dir}{name}` is a 1:1 link: its bucket cannot be compressed or encrypted, takes no
+  replicated copies and ends the link when it is deleted. A switch to `{dir}{name}` is refused
+  with 409 while the bucket is compressed or encrypted.
+- A `<folder>/{name}` discovery rule needs a pattern with `{dir}` (400)."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
         ("import_id" = String, Path, description = "Rule to change, as a 26-character ULID")
