@@ -9,11 +9,11 @@ use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::BackendImport;
-use aruna_core::structs::storage::blob::BackendRef;
+use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::group_backend::{
     BUCKET_PREFIX, BUCKET_STATE, BUCKET_TEMPLATE, DEFAULT_BUCKET, GroupStorage, LAYOUT_BUCKET,
     template_bucket, valid_bucket,
@@ -25,6 +25,8 @@ use std::time::SystemTime;
 use ulid::Ulid;
 
 const SCAN_PAGE: usize = 256;
+/// Bucket rows an own-bucket default without a shared bucket checks at most.
+const BUCKET_SCAN: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DefaultState {
@@ -35,6 +37,7 @@ enum DefaultState {
     Start,
     Verify,
     Scan,
+    ScanBuckets,
     Write,
     Commit,
     Finish,
@@ -52,6 +55,7 @@ pub struct PutDefaultOperation {
     updated_by: UserId,
     updated_at: SystemTime,
     imports: Vec<BackendImport>,
+    scanned_buckets: usize,
     /// The bucket the record gets, and whether Aruna created it.
     checked: Option<(String, Option<bool>)>,
     /// The storage record as the write transaction read it.
@@ -77,6 +81,7 @@ impl PutDefaultOperation {
             updated_by,
             updated_at,
             imports: Vec::new(),
+            scanned_buckets: 0,
             checked: None,
             verified: None,
             state: DefaultState::Init,
@@ -222,10 +227,53 @@ impl PutDefaultOperation {
         if !record.splits() && self.checked.is_some() {
             return self.fail(PutGroupError::Unexpected("Verify"));
         }
+        let own_only = record.splits() && self.checked.is_none();
         self.verified = Some(record);
-        match self.checked.is_some() {
-            true => self.scan(None),
-            false => self.write(),
+        match (self.checked.is_some(), own_only) {
+            (true, _) => self.scan(None),
+            (false, true) => self.scan_buckets(None),
+            (false, false) => self.write(),
+        }
+    }
+
+    /// Without a shared bucket the group's buckets need their own provider bucket, since the
+    /// default would be their storage too. The scan of this node's buckets is bounded.
+    fn scan_buckets(&mut self, start_after: Option<Key>) -> Effects {
+        self.state = DefaultState::ScanBuckets;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            prefix: None,
+            start: start_after.map(IterStart::After),
+            limit: SCAN_PAGE,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn buckets_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+        self.scanned_buckets += values.len();
+        for (key, value) in values {
+            let info = match BucketInfo::from_bytes(&value) {
+                Ok(info) => info,
+                Err(error) => return self.fail(error.into()),
+            };
+            let name = String::from_utf8_lossy(&key);
+            let linked = self
+                .imports
+                .iter()
+                .any(|rule| rule.bucket == name && rule.key_prefix.is_empty());
+            if info.group_id == self.group_id && !linked {
+                return self.fail(PutGroupError::Conflict(format!(
+                    "Bucket `{name}` has no own provider bucket and would lose its storage. \
+                     Name a shared bucket too."
+                )));
+            }
+        }
+        match next {
+            Some(_) if self.scanned_buckets >= BUCKET_SCAN => self.fail(PutGroupError::Conflict(
+                "Too many buckets to check. Name a shared bucket too.".to_string(),
+            )),
+            Some(next) => self.scan_buckets(Some(next)),
+            None => self.write(),
         }
     }
 
@@ -362,6 +410,13 @@ impl Operation for PutDefaultOperation {
                 )]
             }
             (DefaultState::Verify, event) => self.verify(event),
+            (
+                DefaultState::ScanBuckets,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => self.buckets_scanned(values, next_start_after),
             (
                 DefaultState::Scan,
                 Event::Storage(StorageEvent::IterResult {
@@ -682,12 +737,49 @@ mod tests {
         // Own provider buckets work on a new storage without a shared bucket.
         let record = storage(&[("endpoint", "https://s3.lab")]);
         let template = Some("aruna-{bucket}");
-        let (mut operation, effects) = read_with((None, template), record.clone(), Vec::new());
+        let bucket = |group_id: Ulid| {
+            let info = BucketInfo {
+                group_id,
+                created_at: SystemTime::UNIX_EPOCH,
+                created_by: UserId::default(),
+                cors_configuration: None,
+                storage_routing: Vec::new(),
+                placement_policies: Vec::new(),
+                placement_policy_generation: 0,
+                compression: Default::default(),
+            };
+            info.to_bytes().unwrap().into()
+        };
+        let rows = |names: &[(&str, Ulid)]| {
+            let values = names
+                .iter()
+                .map(|(name, group_id)| (name.as_bytes().to_vec().into(), bucket(*group_id)))
+                .collect();
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after: None,
+            })
+        };
+        // A bucket of the group without its own provider bucket would lose its storage.
+        let imports = vec![linked("seq/")];
+        let (mut operation, _) = read_with((None, template), record.clone(), imports.clone());
+        let effects = verified(&mut operation, &record, TxnId::from(8));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, .. })] if key_space == S3_BUCKET_KEYSPACE
+        ));
+        operation.step(rows(&[("old", group()), ("seq", group())]));
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutGroupError::Conflict(_))
+        ));
+        let (mut operation, effects) = read_with((None, template), record.clone(), imports);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::StartTransaction { .. })]
         ));
-        let effects = verified(&mut operation, &record, TxnId::from(7));
+        verified(&mut operation, &record, TxnId::from(7));
+        let effects = operation.step(rows(&[("other", Ulid::nil()), ("seq", group())]));
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected one write, got {effects:?}");
         };
