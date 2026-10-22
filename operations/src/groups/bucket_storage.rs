@@ -4,13 +4,12 @@
 
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::query::GetBackendOperation;
-use crate::groups::imports::list_imports;
-use crate::groups::storage_routing::GroupRoutingOperation;
+use crate::effect_adapters::routing::node_routing;
+use crate::groups::storage_routing::GroupInputsOperation;
 use crate::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
-use aruna_core::structs::storage::backend_import::BackendImport;
-use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
+use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::group_backend::{GroupStorage, path_bucket};
-use aruna_core::structs::storage::routing::RoutingTarget;
+use aruna_core::structs::storage::routing::{RoutingSnapshot, resolve_backend};
 use aruna_core::types::GroupId;
 use std::collections::HashMap;
 use ulid::Ulid;
@@ -30,7 +29,8 @@ pub struct BucketStorage {
     pub write_pattern: Option<String>,
 }
 
-/// One page of the group's buckets with their storage, and the cursor of the next page.
+/// One page of the group's buckets with their storage, and the cursor of the next page. The
+/// group's routing inputs load once, as for one upload; each bucket resolves like an upload.
 pub async fn list_bucket_storage(
     context: &DriverContext,
     group_id: GroupId,
@@ -45,100 +45,92 @@ pub async fn list_bucket_storage(
     let page = drive(ListBucketsOperation::new(input), context)
         .await
         .map_err(|error| error.to_string())?;
-    let imports = list_imports(context, group_id)
+    let inputs = drive(GroupInputsOperation::new(group_id), context)
         .await
         .map_err(|error| error.to_string())?;
-    let routing = drive(GroupRoutingOperation::new(group_id), context)
-        .await
-        .map_err(|error| error.to_string())?;
-    let default = routing.and_then(|routing| routing.default_target);
+    let base = node_routing(context).snapshot(group_id).with_group_inputs(inputs);
     let mut storages = HashMap::new();
     let mut found = Vec::with_capacity(page.buckets.len());
     for (bucket, info) in page.buckets {
-        let target = bucket_target(&info).or(default.as_ref());
-        let backend = match target {
-            Some(RoutingTarget::Backend(BackendRef::Group(id))) => Some(*id),
-            _ => None,
-        };
-        for id in imports.iter().map(|rule| rule.backend_id).chain(backend) {
-            if let std::collections::hash_map::Entry::Vacant(entry) = storages.entry(id) {
-                let record = drive(GetBackendOperation::new(id), context).await;
-                let record = record.map_err(|error| error.to_string())?;
-                entry.insert(record.filter(|record| record.group_id == group_id));
-            }
+        let snapshot = base
+            .clone()
+            .with_bucket_rules(info.storage_routing)
+            .with_compression(info.compression);
+        let destination = destination(&snapshot, &bucket);
+        if let Some(id) = destination.backend_id
+            && let std::collections::hash_map::Entry::Vacant(entry) = storages.entry(id)
+        {
+            let record = drive(GetBackendOperation::new(id), context).await;
+            let record = record.map_err(|error| error.to_string())?;
+            entry.insert(record.filter(|record| record.group_id == group_id));
         }
-        found.push(resolve(&bucket, (&imports, target), &storages));
+        found.push(named(destination, &storages));
     }
     Ok((found, page.continuation_token))
 }
 
-/// The bucket's own rule for all of its keys, if it has one.
-fn bucket_target(info: &BucketInfo) -> Option<&RoutingTarget> {
-    let rules = info.storage_routing.iter();
-    rules
-        .filter(|rule| rule.key_prefix.is_empty() && !rule.exact)
-        .map(|rule| &rule.target)
-        .next()
-}
-
-/// A whole-bucket link first, else the bucket's or the group's target.
-fn resolve(
-    bucket: &str,
-    (imports, target): (&[BackendImport], Option<&RoutingTarget>),
-    storages: &HashMap<Ulid, Option<GroupStorage>>,
-) -> BucketStorage {
-    let storage = |id: &Ulid| storages.get(id).and_then(Option::as_ref);
-    let link = imports
-        .iter()
-        .find(|rule| rule.bucket == bucket && rule.key_prefix.is_empty());
+/// Where uploads of `bucket` go: a whole-bucket link's write folder, else the backend an
+/// upload resolves to.
+fn destination(snapshot: &RoutingSnapshot, bucket: &str) -> BucketStorage {
+    let link = (snapshot.imports.iter()).find(|rule| rule.bucket == bucket && rule.key_prefix.is_empty());
     if let Some(rule) = link {
-        let provider = match storage(&rule.backend_id) {
-            Some(record) if record.splits() => path_bucket(&rule.backend_prefix),
-            Some(record) => record.container(),
-            None => None,
-        };
         return BucketStorage {
             bucket: bucket.to_string(),
-            backend_id: Some(rule.backend_id),
-            provider_bucket: provider.map(str::to_string),
-            folder: Some(rule.backend_prefix.clone()),
-            shared: false,
+            backend_id: Some(rule.write_backend()),
+            folder: Some(rule.write_folder().to_string()),
             import_id: Some(rule.import_id),
             write_pattern: Some(rule.write_pattern.clone()),
-        };
-    }
-    let Some(RoutingTarget::Backend(BackendRef::Group(id))) = target else {
-        return BucketStorage {
-            bucket: bucket.to_string(),
             ..BucketStorage::default()
         };
-    };
-    let provider = storage(id).and_then(|record| match record.splits() {
-        true => record.default_bucket(),
-        false => record.container(),
-    });
+    }
+    let backend = resolve_backend(snapshot, bucket, "").map(|resolved| resolved.backend);
     BucketStorage {
         bucket: bucket.to_string(),
-        backend_id: Some(*id),
-        provider_bucket: provider.map(str::to_string),
-        shared: true,
+        backend_id: match backend {
+            Ok(BackendRef::Group(id)) => Some(id),
+            _ => None,
+        },
+        shared: matches!(backend, Ok(BackendRef::Group(_))),
         ..BucketStorage::default()
     }
+}
+
+/// Adds the S3 bucket or container the files go to, where the storage record tells it.
+fn named(
+    mut found: BucketStorage,
+    storages: &HashMap<Ulid, Option<GroupStorage>>,
+) -> BucketStorage {
+    let record = found
+        .backend_id
+        .and_then(|id| storages.get(&id))
+        .and_then(Option::as_ref);
+    found.provider_bucket = record
+        .and_then(|record| match (record.splits(), found.folder.as_deref()) {
+            (true, Some(folder)) => path_bucket(folder),
+            (true, None) => record.default_bucket(),
+            (false, _) => record.container(),
+        })
+        .map(str::to_string);
+    found
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::storage::backend_import::PLAIN_PATTERN;
+    use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN};
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::group_backend::GroupBackendKind;
+    use aruna_core::structs::storage::routing::{
+        BackendCatalog, GroupRoutingInputs, RoutingTarget, StorageRoutingRule,
+    };
     use std::time::SystemTime;
 
     const BACKEND: Ulid = Ulid::from_parts(2, 2);
+    const WRITES: Ulid = Ulid::from_parts(4, 4);
 
-    fn storage() -> GroupStorage {
+    fn storage(id: Ulid) -> GroupStorage {
         GroupStorage {
-            backend_id: BACKEND,
+            backend_id: id,
             group_id: Ulid::from_parts(1, 1),
             name: "spire".to_string(),
             kind: GroupBackendKind::S3,
@@ -165,38 +157,41 @@ mod tests {
             updated_at: SystemTime::UNIX_EPOCH,
             last_job: None,
             last_started_ms: None,
-            write_backend_id: None,
-            write_prefix: None,
+            write_backend_id: Some(WRITES),
+            write_prefix: Some("out/".to_string()),
             write_pattern: PLAIN_PATTERN.to_string(),
         }
     }
 
     #[test]
-    fn resolves_bucket_storage() {
-        let storages = HashMap::from([(BACKEND, Some(storage()))]);
-        let imports = [link("genes", "genes/", ""), link("lab", "raw/", "in/")];
-        let group = RoutingTarget::Backend(BackendRef::Group(BACKEND));
-        let found = resolve("genes", (&imports, Some(&group)), &storages);
+    fn shows_write_destinations() {
+        let storages = HashMap::from([(WRITES, Some(storage(WRITES)))]);
+        let catalog = BackendCatalog::new("default").with_backend("default", None);
+        let inputs = GroupRoutingInputs {
+            default_target: Some(RoutingTarget::Backend(BackendRef::Group(WRITES))),
+            backend_ids: [BACKEND, WRITES].into(),
+            imports: vec![link("genes", "genes/", ""), link("lab", "raw/", "in/")],
+            ..GroupRoutingInputs::default()
+        };
+        let snapshot = RoutingSnapshot::new(Ulid::from_parts(1, 1), catalog).with_group_inputs(inputs);
+        // A redirected link shows where its uploads go, not where it reads.
+        let found = named(destination(&snapshot, "genes"), &storages);
         assert_eq!(
-            (
-                found.provider_bucket.as_deref(),
-                found.import_id,
-                found.shared
-            ),
-            (Some("genes"), Some(Ulid::from_parts(3, 3)), false)
+            (found.backend_id, found.folder.as_deref(), found.provider_bucket.as_deref()),
+            (Some(WRITES), Some("out/"), Some("out"))
         );
-        // A folder link is no whole-bucket link: the bucket uses the shared bucket.
-        let found = resolve("lab", (&imports, Some(&group)), &storages);
+        assert_eq!(found.import_id, Some(Ulid::from_parts(3, 3)));
+        // A bucket rule naming a class this node lacks falls back to the group storage.
+        let rule = StorageRoutingRule {
+            key_prefix: String::new(),
+            exact: false,
+            target: RoutingTarget::Class("cold".to_string()),
+        };
+        let lab = snapshot.with_bucket_rules(vec![rule]);
+        let found = named(destination(&lab, "lab"), &storages);
         assert_eq!(
-            (
-                found.provider_bucket.as_deref(),
-                found.import_id,
-                found.shared
-            ),
-            (Some("aruna-spire"), None, true)
+            (found.backend_id, found.shared, found.provider_bucket.as_deref()),
+            (Some(WRITES), true, Some("aruna-spire"))
         );
-        let class = RoutingTarget::Class("cold".to_string());
-        let found = resolve("scratch", (&imports, Some(&class)), &storages);
-        assert_eq!((found.backend_id, found.shared), (None, false));
     }
 }
