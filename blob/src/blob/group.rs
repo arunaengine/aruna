@@ -11,8 +11,8 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
 use aruna_core::structs::storage::group_backend::{
-    BUCKET_DELETE, BUCKET_PREFIX, BUCKET_STATE, GroupStorage, GroupStorageSecret, LAYOUT_BUCKET,
-    PROBE_PREFIX,
+    BUCKET_DELETE, BUCKET_PREFIX, BUCKET_STATE, BUCKET_TEMPLATE, GroupStorage, GroupStorageSecret,
+    LAYOUT_BUCKET, PROBE_PREFIX,
 };
 use aruna_core::types::Key;
 use opendal::ErrorKind;
@@ -38,7 +38,7 @@ pub(super) fn group_entry(
     service_config.retain(|key, _| {
         !key.starts_with(BUCKET_STATE)
             && !key.starts_with(LAYOUT_BUCKET)
-            && ![BUCKET_PREFIX, BUCKET_DELETE].contains(&key.as_str())
+            && ![BUCKET_PREFIX, BUCKET_TEMPLATE, BUCKET_DELETE].contains(&key.as_str())
     });
     service_config.extend(secret.secret_config.clone());
     let root = service_config.remove("root").unwrap_or_default();

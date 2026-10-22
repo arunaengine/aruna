@@ -137,7 +137,11 @@ target names content identities directly and checks no storage permission.
 - Local mode reports realm coverage as incomplete; distributed mode fans out to realm nodes and
   reports per-node index freshness, failed partitions and stable cursor pagination.
 - Restricted referencing documents are represented only by `hidden_references_exist`; their count
-  and identity are never returned."#,
+  and identity are never returned.
+
+**Limits**
+- A `bucket_prefix` target resolves at most 128 versions, reading only the keys under the
+  prefix. A larger scope reports `target_resolution_complete` and `complete` as false."#,
     request_body(content = PreflightBody,
         example = json!({
             "target": {

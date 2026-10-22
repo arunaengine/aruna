@@ -7,6 +7,7 @@ use crate::errors::ConversionError;
 use crate::structs::storage::backend_import::BackendImport;
 use crate::structs::storage::blob::{BackendRef, ResolvedBackend};
 use crate::structs::storage::cleanup::CleanupStrategy;
+use crate::structs::storage::discovery::{DiscoveryRule, storage_path};
 use crate::structs::storage::format::Compression;
 use crate::structs::storage::group_backend::reserved_path;
 use crate::types::GroupId;
@@ -108,6 +109,8 @@ pub struct GroupRoutingInputs {
     pub imports: Vec<BackendImport>,
     /// The folders Aruna keeps its own objects in on each enabled group backend.
     pub containers: BTreeMap<Ulid, Vec<String>>,
+    /// The two-way mapping rules of each import rule, by import id.
+    pub mappings: BTreeMap<Ulid, Vec<DiscoveryRule>>,
 }
 
 /// Why a write to a bucket linked whole to a provider bucket is refused.
@@ -126,6 +129,8 @@ pub struct PlainTarget {
     pub listed: bool,
     /// Other rules of the group that read `path`; their record of it makes it theirs.
     pub shared: Vec<Ulid>,
+    /// A mapping rule gave the path, so another key's file may hold it without a record.
+    pub mapped: bool,
 }
 
 /// Operator-authored all-groups rule from the node's backends file. An unset
@@ -419,6 +424,7 @@ pub struct RoutingSnapshot {
     pub compression: Compression,
     pub imports: Vec<BackendImport>,
     pub containers: BTreeMap<Ulid, Vec<String>>,
+    pub mappings: BTreeMap<Ulid, Vec<DiscoveryRule>>,
 }
 
 impl RoutingSnapshot {
@@ -432,6 +438,7 @@ impl RoutingSnapshot {
             compression: Compression::Off,
             imports: Vec::new(),
             containers: BTreeMap::new(),
+            mappings: BTreeMap::new(),
         }
     }
 
@@ -467,6 +474,7 @@ impl RoutingSnapshot {
         self.catalog = self.catalog.with_group_backends(inputs.backend_ids);
         self.imports = inputs.imports;
         self.containers = inputs.containers;
+        self.mappings = inputs.mappings;
         self
     }
 
@@ -504,7 +512,20 @@ impl RoutingSnapshot {
             listed: *backend == BackendRef::Group(rule.backend_id)
                 && path.starts_with(&rule.backend_prefix),
             shared: self.readers(rule.import_id, backend, path),
+            mapped: self.storage_key(rule, key) != key,
         })
+    }
+
+    /// The key whose plain path under `rule` is the storage path of `key`, after the rule's
+    /// two-way mapping rules.
+    pub fn storage_key(&self, rule: &BackendImport, key: &str) -> String {
+        let (Some(rest), Some(rules)) = (
+            key.strip_prefix(&rule.key_prefix),
+            self.mappings.get(&rule.import_id),
+        ) else {
+            return key.to_string();
+        };
+        format!("{}{}", rule.key_prefix, storage_path(rules, rest))
     }
 
     pub fn plain_target(&self, bucket: &str, key: &str, id: Ulid) -> Option<PlainTarget> {
@@ -517,7 +538,8 @@ impl RoutingSnapshot {
             );
             return None;
         }
-        let path = rule.plain_path(key, id)?;
+        let stored = self.storage_key(rule, key);
+        let path = rule.plain_path(&stored, id)?;
         let backend = rule.write_backend();
         let folders = self.containers.get(&backend).map_or(&[][..], Vec::as_slice);
         if reserved_path(folders, &path) {
@@ -529,6 +551,7 @@ impl RoutingSnapshot {
             same_name: rule.same_name() && !path.ends_with('/'),
             listed: backend == rule.backend_id && path.starts_with(&rule.backend_prefix),
             shared: self.readers(rule.import_id, &BackendRef::Group(backend), &path),
+            mapped: stored != key,
             path,
         })
     }
@@ -1283,7 +1306,17 @@ mod tests {
         let found = snapshot.plain_target("b", "in/a.csv", id).unwrap();
         assert_eq!(found.path, format!("raw/a.csv~{id}"));
         assert_eq!(found.backend, BackendRef::Group(source));
-        assert!(found.listed && !found.same_name);
+        assert!(found.listed && !found.same_name && !found.mapped);
+        // A mapped key writes at its storage path, which only a record proves its own.
+        let mut mapped = snapshot.clone();
+        let rules = vec![crate::structs::storage::discovery::DiscoveryRule {
+            pattern: "lars/{name}".to_string(),
+            folder: "foobar/".to_string(),
+        }];
+        mapped.mappings.insert(rule.import_id, rules);
+        let found = mapped.plain_target("b", "in/foobar/sub/a.csv", id).unwrap();
+        assert_eq!(found.path, format!("raw/lars/sub/a.csv~{id}"));
+        assert!(found.mapped);
         assert_eq!(snapshot.plain_target("b", "out/a.csv", id), None);
         assert_eq!(snapshot.plain_target("other", "in/a.csv", id), None);
 

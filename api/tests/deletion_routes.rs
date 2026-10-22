@@ -493,6 +493,55 @@ async fn previews_storage_files() {
 }
 
 #[tokio::test]
+async fn bounds_filtered_preview() {
+    let fixture = setup().await;
+    let mut writes = Vec::new();
+    for index in 0..=10_000u64 {
+        let (key, id) = (format!("many/{index:05}"), Ulid::from_parts(index + 1, 1));
+        let version = BlobVersion::deleted(UNIX_EPOCH, fixture.auth.user_id);
+        let version_key = VersionKey::new("data", key.clone(), id).to_bytes().unwrap();
+        let head_key = BlobHeadKey::new("data", key).to_bytes().unwrap();
+        let head = CurrentVersionPointer::new(id).to_bytes().unwrap();
+        writes.push((
+            BLOB_VERSIONS_KEYSPACE.to_string(),
+            version_key.into(),
+            version.to_bytes().unwrap().into(),
+        ));
+        writes.push((BLOB_HEAD_KEYSPACE.to_string(), head_key.into(), head.into()));
+    }
+    let event = fixture
+        .state
+        .get_ctx()
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+    ));
+    let request = DeleteImpactRequest {
+        kind: "folder".to_string(),
+        key: "many/".to_string(),
+        limit: Some(1000),
+        after: None,
+        filter: Some("absent".to_string()),
+    };
+    let Json(page) = delete_preview(
+        State(fixture.state.clone()),
+        Extension(Some(fixture.auth.clone())),
+        axum::extract::Path("data".to_string()),
+        Json(request),
+    )
+    .await
+    .unwrap();
+    assert!(page.items.is_empty() && !page.complete);
+    assert!(page.next.is_some());
+}
+
+#[tokio::test]
 async fn shows_purge_pause() {
     use aruna_api::routes::storage::deletion::{control_purge, get_purge};
     let fixture = setup().await;

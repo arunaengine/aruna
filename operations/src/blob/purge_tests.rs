@@ -4,9 +4,9 @@
 use super::*;
 use crate::s3::bucket::rename::tests::{BUCKET, group, put, realm, rule, setup};
 use crate::tests::records::node;
-use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::storage::blob::BackendRef;
+use aruna_core::structs::storage::blob::{BackendRef, BlobHeadKey, CurrentVersionPointer};
 use aruna_core::structs::storage::format::{StoredFormat, StoredLayout};
 use std::time::SystemTime;
 
@@ -316,4 +316,81 @@ async fn plans_named_unversioned() {
         .map(|file| (file.version.as_deref(), file.kept.is_some()))
         .collect();
     assert_eq!(planned, [(Some(""), false), (None, true), (None, true)]);
+}
+
+#[tokio::test]
+async fn bounds_scope_totals() {
+    let (_directory, context) = setup().await;
+    for index in 0..=TOTAL_VERSIONS {
+        let (key, id) = (format!("gone/{index:05}"), Ulid::from_parts(index + 1, 1));
+        let version = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
+        let version_key = VersionKey::new(BUCKET, key.clone(), id).to_bytes().unwrap();
+        put(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            version_key,
+            version.to_bytes().unwrap(),
+        )
+        .await;
+        let head = CurrentVersionPointer::new(id).to_bytes().unwrap();
+        let head_key = BlobHeadKey::new(BUCKET, key).to_bytes().unwrap();
+        put(&context, BLOB_HEAD_KEYSPACE, head_key, head).await;
+    }
+    let totals = scope_totals(&context, &scope(), &|_| true).await.unwrap();
+    assert_eq!((totals.versions, totals.complete), (TOTAL_VERSIONS, false));
+}
+
+#[tokio::test]
+async fn bounds_alias_checks() {
+    let (_directory, context) = setup().await;
+    let id = Ulid::from_parts(10, 1);
+    let free = file("raw/gone/a", Ulid::from_parts(20, 1));
+    store(&context, ("gone/a", id), &free, Some("p1")).await;
+    record(&context, rule().import_id, "raw/gone/a", ("gone/a", id)).await;
+    // A second file with the same content finds the budget spent and reads no alias.
+    let other = Ulid::from_parts(11, 1);
+    let second = file("raw/gone/b", Ulid::from_parts(21, 1));
+    store(&context, ("gone/b", other), &second, Some("p2")).await;
+    record(&context, rule().import_id, "raw/gone/b", ("gone/b", other)).await;
+    for index in 0..ALIAS_BUDGET as u64 {
+        let key = format!("elsewhere/{index:05}");
+        let alias = Ulid::from_parts(100 + index, 1);
+        let index = HashIndex::new([3; 32], alias, realm(), group(), node(4), BUCKET, &key);
+        put(
+            &context,
+            PATHS_INDEX_KEYSPACE,
+            index.to_bytes().unwrap(),
+            Vec::new(),
+        )
+        .await;
+    }
+    let versions = [("gone/a".to_string(), id), ("gone/b".to_string(), other)];
+    let found = storage_files(&context, (BUCKET, group()), &versions, Some(&scope()))
+        .await
+        .unwrap();
+    let kept: Vec<_> = found.iter().map(|file| file.kept.as_deref()).collect();
+    assert_eq!(kept, [Some(UNCHECKED_READERS); 2]);
+}
+
+#[tokio::test]
+async fn bounds_long_histories() {
+    let (_directory, context) = setup().await;
+    let version = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
+    let count = TOTAL_VERSIONS + LIST_PAGE as u64 + 1;
+    let last = Ulid::from_parts(count, 1);
+    for index in 0..count {
+        let key = VersionKey::new(BUCKET, "gone/big", Ulid::from_parts(index + 1, 1));
+        put(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            key.to_bytes().unwrap(),
+            version.to_bytes().unwrap(),
+        )
+        .await;
+    }
+    let head = CurrentVersionPointer::new(last).to_bytes().unwrap();
+    let head_key = BlobHeadKey::new(BUCKET, "gone/big").to_bytes().unwrap();
+    put(&context, BLOB_HEAD_KEYSPACE, head_key, head).await;
+    let totals = scope_totals(&context, &scope(), &|_| true).await.unwrap();
+    assert!(!totals.complete);
 }

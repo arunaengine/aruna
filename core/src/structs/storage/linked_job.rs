@@ -47,6 +47,12 @@ impl RemapPlan {
     /// The folders below `from` and the file name of a selected key; `None` when not selected.
     fn split<'a>(&self, key: &'a str) -> Option<(&'a str, &'a str)> {
         let rest = key.strip_prefix(&self.from)?;
+        // A key already below the template's own folder was moved there before.
+        let fixed = self.template.split('{').next().unwrap_or_default();
+        let target = &fixed[..fixed.rfind('/').map_or(0, |slash| slash + 1)];
+        if target.len() > self.from.len() && key.starts_with(target) {
+            return None;
+        }
         let (dir, name) = match rest.rfind('/') {
             Some(at) => rest.split_at(at + 1),
             None => ("", rest),
@@ -182,6 +188,26 @@ mod tests {
             Some("proteins/x/y/a.faa.gz")
         );
         assert_eq!(plan.target("other/a.faa.gz"), None);
+    }
+
+    #[test]
+    fn skips_moved_keys() {
+        // A mapping's Apply moves root keys once; keys in its folder stay where they are.
+        let plan = plan("", "proteins/{dir}{name}", true);
+        assert_eq!(
+            plan.target("a/b.faa.gz").as_deref(),
+            Some("proteins/a/b.faa.gz")
+        );
+        assert_eq!(plan.target("proteins/b.faa.gz"), None);
+        let same = plan_in("raw/", "raw/{name}.old");
+        assert_eq!(
+            same.target("raw/b.faa.gz").as_deref(),
+            Some("raw/b.faa.gz.old")
+        );
+    }
+
+    fn plan_in(from: &str, template: &str) -> RemapPlan {
+        plan(from, template, false)
     }
 
     #[test]

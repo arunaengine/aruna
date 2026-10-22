@@ -9,7 +9,7 @@ use crate::routes::storage::moves::{BucketMoveStarted, move_refusal};
 use crate::routes::storage::routing::ensure_group_admin;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
+use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::bearer_token::token_grant;
@@ -69,7 +69,7 @@ pub struct CreateImportRequest {
     #[serde(default)]
     pub write_prefix: Option<String>,
     /// Path of a new upload below the write folder with `{dir}`, `{name}` and `{id}`;
-    /// omitted uses `{dir}{name}~{id}`.
+    /// omitted uses `{dir}{name}`.
     #[serde(default)]
     pub write_pattern: Option<String>,
     /// Also moves the bucket's stored files under `key_prefix` to the write folder.
@@ -363,7 +363,7 @@ pub async fn create_import(
             write_prefix: request.write_prefix,
             write_pattern: request
                 .write_pattern
-                .unwrap_or_else(|| DEFAULT_PATTERN.to_string()),
+                .unwrap_or_else(|| PLAIN_PATTERN.to_string()),
             now: SystemTime::now(),
             move_existing: request.move_existing,
         }),
@@ -512,8 +512,13 @@ pub async fn get_import(
 
 **Limits**
 - `write_pattern` must contain `{name}` and give a relative path.
-- A rule that links a whole provider bucket of a storage without a fixed bucket keeps
-  `{dir}{name}`, and no rule turns into one."#,
+- A rule that links a whole top folder of its storage to a whole bucket with the pattern
+  `{dir}{name}` is a 1:1 link: its bucket cannot be compressed or encrypted, takes no
+  replicated copies and ends the link when it is deleted. A switch to `{dir}{name}` is refused
+  with 409 while the bucket is compressed or encrypted.
+- A 1:1 link keeps `{dir}{name}` (409) while its storage has no shared bucket, since a
+  compressed or encrypted bucket would then have nowhere to write.
+- A `<folder>/{name}` discovery rule needs a pattern with `{dir}` (400)."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
         ("import_id" = String, Path, description = "Rule to change, as a 26-character ULID")
@@ -546,7 +551,7 @@ pub async fn get_import(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
-        (status = 409, description = "The group is being deleted, or a run or move has not finished", body = ErrorResponse)
+        (status = 409, description = "The group is being deleted, a run or move has not finished, or a compressed or encrypted bucket would become a 1:1 link", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -583,6 +588,10 @@ pub async fn update_import(
 **Authentication**: realm bearer token with WRITE on the group's admin path.
 
 **Behavior**
+- A link ends only with its bucket: while the rule's bucket holds any object version, the
+  removal is refused with 409. Deleting the bucket ends a 1:1 link; empty the bucket for others.
+- A 1:1 link whose storage has no shared bucket is the bucket's only storage, so its removal is
+  refused with 409 while the bucket exists.
 - A running import stops before its next page.
 - The bucket routing rule the import added stays, so later writes keep going to the backend.
 - Objects added to the backend afterwards are no longer imported."#,
@@ -596,7 +605,7 @@ pub async fn update_import(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
-        (status = 409, description = "The group is being deleted", body = ErrorResponse)
+        (status = 409, description = "The bucket still holds files or has no other storage, or the group is being deleted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -747,7 +756,9 @@ key the caller may read are counted and listed.
 
 **Limits**
 - Pages hold 1 to 1000 files, in storage order; `next` resumes after the last version passed
-  over and names only keys the caller may read. Totals pass over at most 2,000,000 version rows."#,
+  over and names only keys the caller may read. Totals and a page each pass over at most 10,000
+  version rows and check at most 5,000, also with a filter; `complete` is then false and
+  `count` is a lower bound."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
         ("import_id" = String, Path, description = "Rule to check, as a 26-character ULID"),

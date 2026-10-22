@@ -367,9 +367,14 @@ including request policies. Tokens with path restrictions are refused.
   bucket, such as a running import.
 - Pages are in key order and stay stable while nothing changes. The move itself checks every key
   again; opening the preview is not needed to start it.
+- A key already below the target's own folder, the fixed part of `target` before its first
+  placeholder, is not selected when that folder lies outside `from`; so a mapping's Apply moves
+  each key once.
 
 **Limits**
-- 1 to 1000 entries per page. Totals count at most 2,000,000 keys; `complete` is then false."#,
+- 1 to 1000 entries per page. Totals count at most 10,000 keys; `complete` is then false and
+  `total` is a lower bound. A page passes over at most 10,000 keys, also with a filter, and then
+  names `next`, even with fewer entries."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule"),
         ("import_id" = String, Path, description = "Rule whose bucket is organized")
@@ -495,8 +500,10 @@ pub async fn start_move(
   link or copy reads it any more; others stay. Opening the preview is not needed to start.
 
 **Limits**
-- 1 to 1000 entries per page. Totals count over at most 2,000,000 version rows; `complete` is
-  then false."#,
+- 1 to 1000 entries per page. Totals pass over at most 10,000 version rows and check at most
+  5,000 keys, also with a filter; `complete` is then false and `total` and `bytes` are lower
+  bounds. A page has the same bounds and then names `next`, even with fewer entries. A key with
+  more than 10,000 versions is skipped and `complete` is false."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule"),
         ("import_id" = String, Path, description = "Rule whose bucket is organized")

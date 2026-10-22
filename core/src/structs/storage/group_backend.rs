@@ -69,8 +69,12 @@ pub const BUCKET_DELETING: &str = "deleting";
 /// own files may still live there.
 pub const LAYOUT_BUCKET: &str = "layout:";
 
-/// Public config key a tenant sets: each new bucket gets the provider bucket `<prefix><name>`.
+/// Former public config key: each new bucket got the provider bucket `<prefix><name>`.
 pub const BUCKET_PREFIX: &str = "bucket_prefix";
+
+/// Public config key Aruna sets from the group default: each new bucket gets its own provider
+/// bucket, this template with `{bucket}` and `{group}` filled in.
+pub const BUCKET_TEMPLATE: &str = "bucket_template";
 
 /// Public config key a tenant sets: `keep` or `delete_empty`, for the provider bucket of a
 /// deleted bucket.
@@ -84,6 +88,13 @@ pub fn path_bucket(path: &str) -> Option<&str> {
     path.split_once('/')
         .map(|(bucket, _)| bucket)
         .filter(|bucket| !bucket.is_empty())
+}
+
+/// The provider bucket of a new bucket: `template` with `{bucket}` and the lowercase `{group}`.
+pub fn template_bucket(template: &str, bucket: &str, group: &str) -> String {
+    template
+        .replace("{bucket}", bucket)
+        .replace("{group}", &group.to_lowercase())
 }
 
 /// S3 bucket naming: 3 to 63 lowercase letters, digits, dots and hyphens, starting and
@@ -180,10 +191,13 @@ impl GroupStorage {
         self.public_config.get(DEFAULT_BUCKET).map(String::as_str)
     }
 
-    /// The prefix of the provider bucket each new bucket gets, on a storage without a bucket.
-    pub fn bucket_prefix(&self) -> Option<&str> {
-        let prefix = self.public_config.get(BUCKET_PREFIX).map(String::as_str);
-        prefix.filter(|_| self.splits())
+    /// The template of the provider bucket each new bucket gets, on a storage without a bucket.
+    /// A former `bucket_prefix` reads as `<prefix>{bucket}`.
+    pub fn bucket_template(&self) -> Option<String> {
+        let template = self.public_config.get(BUCKET_TEMPLATE).cloned();
+        let former = self.public_config.get(BUCKET_PREFIX);
+        let template = template.or_else(|| former.map(|prefix| format!("{prefix}{{bucket}}")));
+        template.filter(|_| self.splits())
     }
 
     /// Whether a deleted bucket also deletes its empty provider bucket, when Aruna created it.
@@ -203,7 +217,7 @@ impl GroupStorage {
         self.public_config
             .iter()
             .filter(|(key, _)| {
-                key.as_str() == DEFAULT_BUCKET
+                [DEFAULT_BUCKET, BUCKET_TEMPLATE, BUCKET_PREFIX].contains(&key.as_str())
                     || key.starts_with(BUCKET_STATE)
                     || key.starts_with(LAYOUT_BUCKET)
             })

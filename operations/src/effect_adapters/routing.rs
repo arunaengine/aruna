@@ -55,7 +55,9 @@ impl RoutingInputsError {
         let read = match self {
             Self::GroupInputs(GroupInputsError::Read(read)) => read,
             Self::BucketRules(read) | Self::BackendUsage(read) | Self::NodeSubject(read) => read,
-            Self::GroupInputs(GroupInputsError::Incomplete) => return None,
+            Self::GroupInputs(GroupInputsError::Incomplete | GroupInputsError::TooManyRules(_)) => {
+                return None;
+            }
         };
         match read {
             RecordReadError::Storage(error) => Some(error),

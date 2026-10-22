@@ -14,13 +14,21 @@ pub const MAX_DISCOVERY_RULES: usize = 32;
 /// Characters one pattern may hold, which bounds every match and overlap check.
 pub const MAX_PATTERN_LEN: usize = 128;
 
-/// Sends an unmapped file whose name matches `pattern` to `folder` of the bucket. `*` matches
-/// any text, `?` one character, `[0-9]` one of a set, `{4}` or `{2,8}` repeats a set or `?`
-/// and `{fna,fa}` either text.
+/// Sends an unmapped file whose name matches the glob `pattern` (`*`, `?`, `[0-9]`, `{2,8}`,
+/// `{fna,fa}`) to `folder` of the bucket; `lars/{name}` takes the files below that storage
+/// folder instead. Uploads below `folder` go back the same way.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiscoveryRule {
     pub pattern: String,
     pub folder: String,
+}
+
+impl DiscoveryRule {
+    /// The storage folder of a `<folder>/{name}` pattern; `None` for a file name pattern.
+    pub fn storage_folder(&self) -> Option<&str> {
+        let folder = self.pattern.strip_suffix("{name}")?;
+        folder.ends_with('/').then_some(folder)
+    }
 }
 
 /// The discovery rules of one import rule, keyed like the rule itself.
@@ -63,6 +71,17 @@ pub fn check_patterns(rules: &[DiscoveryRule]) -> Result<(), String> {
         if pattern.is_empty() || pattern.chars().count() > MAX_PATTERN_LEN {
             return Err(format!("a pattern needs 1 to {MAX_PATTERN_LEN} characters"));
         }
+        if let Some(folder) = rule.storage_folder() {
+            check_folder(folder)?;
+            let nested = rules[..index]
+                .iter()
+                .filter_map(DiscoveryRule::storage_folder)
+                .find(|other| other.starts_with(folder) || folder.starts_with(other));
+            if let Some(other) = nested {
+                return Err(format!("storage folders `{other}` and `{folder}` overlap"));
+            }
+            continue;
+        }
         if pattern.contains('/') || pattern.chars().any(char::is_control) {
             return Err(format!(
                 "pattern `{pattern}` must not hold `/` or control characters"
@@ -71,6 +90,7 @@ pub fn check_patterns(rules: &[DiscoveryRule]) -> Result<(), String> {
         check_glob(pattern)?;
         if let Some(other) = rules[..index]
             .iter()
+            .filter(|other| other.storage_folder().is_none())
             .find(|other| globs_overlap(&other.pattern, pattern))
         {
             return Err(format!(
@@ -82,11 +102,26 @@ pub fn check_patterns(rules: &[DiscoveryRule]) -> Result<(), String> {
     Ok(())
 }
 
+/// A storage folder of a `<folder>/{name}` pattern: relative, ending with `/`, without
+/// `.` or `..` parts, braces or glob characters.
+fn check_folder(folder: &str) -> Result<(), String> {
+    let parts_ok = folder[..folder.len() - 1]
+        .split('/')
+        .all(|part| !part.is_empty() && part != "." && part != ".." && part.trim() == part);
+    let plain = !folder.contains(['{', '}', '*', '?', '[', ']']);
+    match parts_ok && plain && !folder.chars().any(char::is_control) {
+        true => Ok(()),
+        false => Err(format!(
+            "`{folder}{{name}}` needs a relative storage folder before {{name}}"
+        )),
+    }
+}
+
 /// Places a file by its name; overlapping stored rules still give a conflict, never a guess.
 pub fn place(rules: &[DiscoveryRule], name: &str) -> Placement {
     let matched: Vec<&DiscoveryRule> = rules
         .iter()
-        .filter(|rule| glob_match(&rule.pattern, name))
+        .filter(|rule| rule.storage_folder().is_none() && glob_match(&rule.pattern, name))
         .collect();
     match matched.as_slice() {
         [] => Placement::Root,
@@ -141,6 +176,18 @@ pub fn file_identity(
             None,
         ),
     };
+    // A storage folder pattern takes its files before any file name pattern.
+    let folder = rules.iter().find_map(|rule| {
+        let rest = path.strip_prefix(rule.storage_folder()?)?;
+        Some(format!("{}{rest}", rule.folder))
+    });
+    if let Some(key) = folder {
+        return Some(Ok(FileIdentity {
+            key,
+            version_id,
+            matched: true,
+        }));
+    }
     Some(match place(rules, &name) {
         Placement::Root => Ok(FileIdentity {
             key: path,
@@ -154,6 +201,33 @@ pub fn file_identity(
         }),
         Placement::Conflict(patterns) => Err(IdentityError::Conflict(patterns)),
     })
+}
+
+/// A storage folder pattern needs a write pattern with `{dir}`, which keeps the storage folder.
+pub fn check_naming(rules: &[DiscoveryRule], write_pattern: &str) -> Result<(), String> {
+    let folders = rules.iter().any(|rule| rule.storage_folder().is_some());
+    match folders && !write_pattern.contains("{dir}") {
+        true => Err("a `<folder>/{name}` mapping needs a naming with `{dir}`".to_string()),
+        false => Ok(()),
+    }
+}
+
+/// Where an upload to `path`, relative to the rule's `key_prefix`, goes below the rule's
+/// folder: a storage folder pattern swaps its Aruna folder for the storage folder, and a file
+/// name pattern drops its Aruna folder when the name matches. Other paths stay.
+pub fn storage_path(rules: &[DiscoveryRule], path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    for rule in rules {
+        let Some(rest) = path.strip_prefix(&rule.folder) else {
+            continue;
+        };
+        match rule.storage_folder() {
+            Some(folder) => return format!("{folder}{rest}"),
+            None if !rest.is_empty() && glob_match(&rule.pattern, name) => return rest.to_string(),
+            None => {}
+        }
+    }
+    path.to_string()
 }
 
 /// The file name patterns see: without the version id that the rule's current or an earlier
@@ -388,5 +462,28 @@ mod tests {
             format!("~{id}")
         );
         assert_eq!(listed_name(&plain, &[], "a~b"), "a~b");
+    }
+    #[test]
+    fn maps_both_ways() {
+        let rules = [rule("*.faa", "proteins/"), rule("lars/{name}", "foobar/")];
+        // Uploads below an Aruna folder go to the storage path; other paths stay.
+        assert_eq!(storage_path(&rules, "proteins/a/x.faa"), "a/x.faa");
+        assert_eq!(
+            storage_path(&rules, "proteins/readme.txt"),
+            "proteins/readme.txt"
+        );
+        assert_eq!(storage_path(&rules, "foobar/sub/x"), "lars/sub/x");
+        assert_eq!(storage_path(&rules, "other/x.faa"), "other/x.faa");
+        // Files found in storage come back to the same Aruna paths.
+        let found = |path: &str| {
+            let backend_key = format!("raw/{path}");
+            file_identity(&import("{dir}{name}~{id}"), &[], &rules, &backend_key)
+                .unwrap()
+                .unwrap()
+                .key
+        };
+        assert_eq!(found("a/x.faa"), "proteins/a/x.faa");
+        assert_eq!(found("lars/sub/x.faa"), "foobar/sub/x.faa");
+        assert_eq!(found("other/y.txt"), "other/y.txt");
     }
 }

@@ -9,13 +9,14 @@ use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::BackendImport;
-use aruna_core::structs::storage::blob::BackendRef;
+use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::group_backend::{
-    BUCKET_STATE, DEFAULT_BUCKET, GroupStorage, LAYOUT_BUCKET, valid_bucket,
+    BUCKET_PREFIX, BUCKET_STATE, BUCKET_TEMPLATE, DEFAULT_BUCKET, GroupStorage, LAYOUT_BUCKET,
+    template_bucket, valid_bucket,
 };
 use aruna_core::structs::storage::routing::{GroupStorageRouting, RoutingError, RoutingTarget};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -24,6 +25,8 @@ use std::time::SystemTime;
 use ulid::Ulid;
 
 const SCAN_PAGE: usize = 256;
+/// Bucket rows an own-bucket default without a shared bucket checks at most.
+const BUCKET_SCAN: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DefaultState {
@@ -34,6 +37,7 @@ enum DefaultState {
     Start,
     Verify,
     Scan,
+    ScanBuckets,
     Write,
     Commit,
     Finish,
@@ -46,9 +50,12 @@ pub struct PutDefaultOperation {
     group_id: GroupId,
     backend_id: Ulid,
     bucket: Option<String>,
+    /// The new `bucket_template`; empty clears it, `None` keeps the stored one.
+    template: Option<String>,
     updated_by: UserId,
     updated_at: SystemTime,
     imports: Vec<BackendImport>,
+    scanned_buckets: usize,
     /// The bucket the record gets, and whether Aruna created it.
     checked: Option<(String, Option<bool>)>,
     /// The storage record as the write transaction read it.
@@ -70,15 +77,23 @@ impl PutDefaultOperation {
             group_id,
             backend_id,
             bucket,
+            template: None,
             updated_by,
             updated_at,
             imports: Vec::new(),
+            scanned_buckets: 0,
             checked: None,
             verified: None,
             state: DefaultState::Init,
             txn_id: None,
             output: None,
         }
+    }
+
+    /// Gives each new bucket its own provider bucket from `template`, or clears it when empty.
+    pub fn with_template(mut self, template: Option<String>) -> Self {
+        self.template = template;
+        self
     }
 
     fn fail(&mut self, error: PutGroupError) -> Effects {
@@ -103,17 +118,31 @@ impl PutDefaultOperation {
     fn choose(&mut self, record: &GroupStorage) -> Result<Option<String>, PutGroupError> {
         let invalid = |reason: &str| Err(PutGroupError::Invalid(reason.to_string()));
         if !record.splits() {
-            return match self.bucket {
-                Some(_) => invalid("This storage has a fixed bucket."),
-                None => Ok(None),
+            return match (&self.bucket, &self.template) {
+                (Some(_), _) | (_, Some(_)) => invalid("This storage has a fixed bucket."),
+                (None, None) => Ok(None),
             };
         }
+        let sample = |template: &str| template_bucket(template, "data", "group");
+        if let Some(template) = self.template.as_deref().filter(|t| !t.is_empty())
+            && (!template.contains("{bucket}") || !valid_bucket(&sample(template)))
+        {
+            return invalid(
+                "A bucket template needs {bucket} and gives S3 bucket names, like aruna-{bucket}.",
+            );
+        }
+        let owned = self.template.as_deref().is_some_and(|t| !t.is_empty());
         let Some(bucket) = self
             .bucket
             .clone()
             .or(record.default_bucket().map(str::to_string))
         else {
-            return invalid("Name a bucket for the default rule.");
+            // Each new bucket gets its own provider bucket, so no shared bucket is needed.
+            let kept = self.template.is_none() && record.bucket_template().is_some();
+            return match owned || kept {
+                true => Ok(None),
+                false => invalid("Name a bucket for the default rule."),
+            };
         };
         if !valid_bucket(&bucket) {
             return invalid(
@@ -195,13 +224,55 @@ impl PutDefaultOperation {
             Ok(record) => record,
             Err(error) => return self.fail(error),
         };
-        if record.splits() != self.checked.is_some() {
+        if !record.splits() && self.checked.is_some() {
             return self.fail(PutGroupError::Unexpected("Verify"));
         }
+        let own_only = record.splits() && self.checked.is_none();
         self.verified = Some(record);
-        match self.checked.is_some() {
-            true => self.scan(None),
-            false => self.write(),
+        match (self.checked.is_some(), own_only) {
+            (true, _) => self.scan(None),
+            (false, true) => self.scan_buckets(None),
+            (false, false) => self.write(),
+        }
+    }
+
+    /// Without a shared bucket the group's buckets need their own provider bucket, since the
+    /// default would be their storage too. The scan of this node's buckets is bounded.
+    fn scan_buckets(&mut self, start_after: Option<Key>) -> Effects {
+        self.state = DefaultState::ScanBuckets;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            prefix: None,
+            start: start_after.map(IterStart::After),
+            limit: SCAN_PAGE,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn buckets_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+        self.scanned_buckets += values.len();
+        for (key, value) in values {
+            let info = match BucketInfo::from_bytes(&value) {
+                Ok(info) => info,
+                Err(error) => return self.fail(error.into()),
+            };
+            let name = String::from_utf8_lossy(&key);
+            // Only a 1:1 link keeps plain files, which never need the shared bucket.
+            let linked = (self.imports.iter())
+                .any(|rule| rule.bucket == name && rule.mapped_bucket().is_some());
+            if info.group_id == self.group_id && !linked {
+                return self.fail(PutGroupError::Conflict(format!(
+                    "Bucket `{name}` has no own provider bucket and would lose its storage. \
+                     Name a shared bucket too."
+                )));
+            }
+        }
+        match next {
+            Some(_) if self.scanned_buckets >= BUCKET_SCAN => self.fail(PutGroupError::Conflict(
+                "Too many buckets to check. Name a shared bucket too.".to_string(),
+            )),
+            Some(next) => self.scan_buckets(Some(next)),
+            None => self.write(),
         }
     }
 
@@ -253,6 +324,7 @@ impl PutDefaultOperation {
             )],
             Err(error) => return self.fail(error.into()),
         };
+        let template = self.template.clone().filter(|_| record.splits());
         if let Some((bucket, created)) = self.checked.clone() {
             let config = &mut record.public_config;
             config.insert(DEFAULT_BUCKET.to_string(), bucket.clone());
@@ -262,6 +334,16 @@ impl PutDefaultOperation {
                 let state = if created { "created" } else { "found" };
                 config.insert(format!("{BUCKET_STATE}{bucket}"), state.to_string());
             }
+        }
+        if let Some(template) = template {
+            let config = &mut record.public_config;
+            config.remove(BUCKET_PREFIX);
+            match template.is_empty() {
+                true => config.remove(BUCKET_TEMPLATE),
+                false => config.insert(BUCKET_TEMPLATE.to_string(), template),
+            };
+        }
+        if self.checked.is_some() || self.template.is_some() {
             record.updated_at = self.updated_at;
             match record_writes(&record) {
                 Ok(records) => writes.extend(records),
@@ -327,6 +409,13 @@ impl Operation for PutDefaultOperation {
                 )]
             }
             (DefaultState::Verify, event) => self.verify(event),
+            (
+                DefaultState::ScanBuckets,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => self.buckets_scanned(values, next_start_after),
             (
                 DefaultState::Scan,
                 Event::Storage(StorageEvent::IterResult {
@@ -427,13 +516,22 @@ mod tests {
         record: GroupStorage,
         imports: Vec<BackendImport>,
     ) -> (PutDefaultOperation, Effects) {
+        read_with((bucket, None), record, imports)
+    }
+
+    fn read_with(
+        (bucket, template): (Option<&str>, Option<&str>),
+        record: GroupStorage,
+        imports: Vec<BackendImport>,
+    ) -> (PutDefaultOperation, Effects) {
         let mut operation = PutDefaultOperation::new(
             group(),
             backend(),
             bucket.map(str::to_string),
             UserId::default(),
             SystemTime::UNIX_EPOCH,
-        );
+        )
+        .with_template(template.map(str::to_string));
         operation.start();
         let inputs = GroupRoutingInputs {
             backend_ids: BTreeSet::from([backend()]),
@@ -578,6 +676,124 @@ mod tests {
                 Err(PutGroupError::Invalid(_))
             ));
         }
+    }
+
+    #[test]
+    fn stores_bucket_template() {
+        // The template replaces a former prefix; the shared bucket stays.
+        let record = storage(&[
+            ("endpoint", "https://s3.lab"),
+            ("default_bucket", "lab-default"),
+            ("bucket_prefix", "lab-"),
+        ]);
+        let template = Some("aruna-{group}-{bucket}");
+        let (mut operation, effects) = read_with((None, template), record.clone(), Vec::new());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+        verified(&mut operation, &record, TxnId::from(5));
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one write, got {effects:?}");
+        };
+        let stored = GroupStorage::from_bytes(&writes[1].2).unwrap();
+        assert_eq!(stored.bucket_template().as_deref(), template);
+        assert_eq!(stored.default_bucket(), Some("lab-default"));
+        assert!(!stored.public_config.contains_key("bucket_prefix"));
+
+        // An empty template clears it; a bad one is refused before anything is written.
+        let (mut operation, _) = read_with((None, Some("")), stored.clone(), Vec::new());
+        verified(&mut operation, &stored, TxnId::from(6));
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one write, got {effects:?}");
+        };
+        assert_eq!(
+            GroupStorage::from_bytes(&writes[1].2)
+                .unwrap()
+                .bucket_template(),
+            None
+        );
+        for bad in ["aruna-data", "Aruna_{bucket}"] {
+            let (operation, effects) = read_with((None, Some(bad)), stored.clone(), Vec::new());
+            assert!(effects.is_empty(), "{effects:?}");
+            assert!(matches!(
+                operation.finalize(),
+                Err(PutGroupError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn skips_shared_bucket() {
+        // Own provider buckets work on a new storage without a shared bucket.
+        let record = storage(&[("endpoint", "https://s3.lab")]);
+        let template = Some("aruna-{bucket}");
+        let bucket = |group_id: Ulid| {
+            let info = BucketInfo {
+                group_id,
+                created_at: SystemTime::UNIX_EPOCH,
+                created_by: UserId::default(),
+                cors_configuration: None,
+                storage_routing: Vec::new(),
+                placement_policies: Vec::new(),
+                placement_policy_generation: 0,
+                compression: Default::default(),
+            };
+            info.to_bytes().unwrap().into()
+        };
+        let rows = |names: &[(&str, Ulid)]| {
+            let values = names
+                .iter()
+                .map(|(name, group_id)| (name.as_bytes().to_vec().into(), bucket(*group_id)))
+                .collect();
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after: None,
+            })
+        };
+        // A bucket of the group without its own provider bucket would lose its storage.
+        let mut seq = linked("seq/");
+        seq.write_pattern = aruna_core::structs::storage::backend_import::PLAIN_PATTERN.to_string();
+        let imports = vec![seq];
+        let (mut operation, _) = read_with((None, template), record.clone(), imports.clone());
+        let effects = verified(&mut operation, &record, TxnId::from(8));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, .. })] if key_space == S3_BUCKET_KEYSPACE
+        ));
+        operation.step(rows(&[("old", group()), ("seq", group())]));
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutGroupError::Conflict(_))
+        ));
+        let (mut operation, effects) = read_with((None, template), record.clone(), imports);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+        verified(&mut operation, &record, TxnId::from(7));
+        let effects = operation.step(rows(&[("other", Ulid::nil()), ("seq", group())]));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one write, got {effects:?}");
+        };
+        let stored = GroupStorage::from_bytes(&writes[1].2).unwrap();
+        assert_eq!(stored.bucket_template().as_deref(), template);
+        assert_eq!(stored.default_bucket(), None);
+        // Clearing the template then needs a shared bucket.
+        let (operation, effects) = read_with((None, Some("")), stored, Vec::new());
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutGroupError::Invalid(_))
+        ));
     }
 
     #[test]

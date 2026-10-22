@@ -9,9 +9,10 @@ use crate::groups::fence::{parse_group_record, read_group_record};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, BLOB_CLEANUP_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE,
-    IMPORT_INTENT_KEYSPACE, IMPORT_PATTERN_KEYSPACE, IMPORT_REMOVAL_KEYSPACE,
-    IMPORTED_OBJECT_KEYSPACE, RENAMED_ROW_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    IMPORT_DISCOVERY_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORT_PATTERN_KEYSPACE,
+    IMPORT_REMOVAL_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, RENAMED_ROW_KEYSPACE, S3_BUCKET_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{
@@ -25,11 +26,21 @@ use ulid::Ulid;
 
 const DELETE_PAGE: usize = 512;
 
+/// Why the 1:1 link of a bucket whose storage has no shared bucket stays.
+pub const ONLY_STORAGE: &str =
+    "the bucket has no other storage, as its storage has no shared bucket; delete the bucket";
+
+/// Why a link of a bucket that still holds files stays.
+pub const LINKED_FILES: &str =
+    "the bucket still holds files; delete or empty the bucket to end the link";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RemoveState {
     Init,
     Start,
     Read,
+    CheckStorage,
+    Check,
     Delete,
     Mark,
     Commit,
@@ -234,6 +245,23 @@ impl RemoveImportOperation {
 }
 
 impl RemoveImportOperation {
+    /// A link ends with its bucket: one version row is enough to refuse.
+    fn check_files(&mut self) -> Effects {
+        let bucket = self.bucket.clone().unwrap_or_default();
+        let prefix = match VersionKey::bucket_prefix(&bucket) {
+            Ok(prefix) => prefix,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = RemoveState::Check;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: None,
+            limit: 1,
+            txn_id: self.txn_id,
+        })]
+    }
+
     /// A deleted bucket leaves the record; one that still holds objects is `created` again.
     fn settle(&mut self, value: Option<Value>) -> Effects {
         let Some(cleanup) = self.cleanup.as_ref() else {
@@ -312,26 +340,73 @@ impl Operation for RemoveImportOperation {
                     txn_id
                 )]
             }
-            (RemoveState::Read, Some(group_id), event) => match parse_group_record(event) {
+            (RemoveState::Read, Some(_), event) => match parse_group_record(event) {
                 Ok(Some(rule)) => {
-                    match BackendImport::from_bytes(&rule) {
-                        Ok(rule) => self.bucket = Some(rule.bucket),
+                    let rule = match BackendImport::from_bytes(&rule) {
+                        Ok(rule) => rule,
                         Err(error) => return self.fail(error.into()),
+                    };
+                    self.bucket = Some(rule.bucket.clone());
+                    if rule.mapped_bucket().is_none() {
+                        return self.check_files();
                     }
-                    self.state = RemoveState::Delete;
-                    let key = import_key(group_id, self.import_id);
-                    // The discovery rules go with the rule.
-                    let deletes = [BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE]
-                        .map(|key_space| (key_space.to_string(), key.clone()))
-                        .to_vec();
-                    smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                        deletes,
+                    // A 1:1 link may be the only storage its bucket has.
+                    self.state = RemoveState::CheckStorage;
+                    smallvec![Effect::Storage(StorageEffect::BatchRead {
+                        reads: vec![
+                            (
+                                STORAGE_BACKEND_KEYSPACE.to_string(),
+                                backend_key(rule.backend_id)
+                            ),
+                            (
+                                S3_BUCKET_KEYSPACE.to_string(),
+                                rule.bucket.as_bytes().to_vec().into(),
+                            ),
+                        ],
                         txn_id: self.txn_id,
                     })]
                 }
                 Ok(None) => self.fail(ImportRuleError::NotFound),
                 Err(error) => self.fail(error.into()),
             },
+            (
+                RemoveState::CheckStorage,
+                Some(_),
+                Event::Storage(StorageEvent::BatchReadResult { values }),
+            ) => {
+                let mut values = values.into_iter().map(|(_, value)| value);
+                let (storage, bucket) = (values.next().flatten(), values.next().flatten());
+                let storage = storage.as_deref().map(GroupStorage::from_bytes).transpose();
+                let storage = match storage {
+                    Ok(storage) => storage,
+                    Err(error) => return self.fail(error.into()),
+                };
+                let shared = storage
+                    .is_none_or(|storage| !storage.splits() || storage.default_bucket().is_some());
+                if bucket.is_some() && !shared {
+                    return self.fail(ImportRuleError::Conflict(ONLY_STORAGE.to_string()));
+                }
+                self.check_files()
+            }
+            (
+                RemoveState::Check,
+                Some(group_id),
+                Event::Storage(StorageEvent::IterResult { values, .. }),
+            ) => {
+                if !values.is_empty() {
+                    return self.fail(ImportRuleError::Conflict(LINKED_FILES.to_string()));
+                }
+                self.state = RemoveState::Delete;
+                let key = import_key(group_id, self.import_id);
+                // The discovery rules go with the rule.
+                let deletes = [BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE]
+                    .map(|key_space| (key_space.to_string(), key.clone()))
+                    .to_vec();
+                smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                    deletes,
+                    txn_id: self.txn_id,
+                })]
+            }
             (RemoveState::Delete, _, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
                 self.state = RemoveState::Mark;
                 let mark = RemovalMark {
@@ -540,6 +615,81 @@ mod tests {
     }
 
     #[test]
+    fn keeps_filled_link() {
+        let mut operation =
+            RemoveImportOperation::new(Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
+        let rule = crate::s3::bucket::rename::tests::rule();
+        operation.start();
+        operation.step(storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from(7),
+        }));
+        operation.step(storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Key::from(Vec::new()), Some(rule.to_bytes().unwrap().into())),
+                (Key::from(Vec::new()), None),
+            ],
+        }));
+        let effects = operation.step(storage(StorageEvent::IterResult {
+            values: vec![(Key::from(vec![1]), Value::from(vec![1]))],
+            next_start_after: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert_eq!(
+            operation.finalize(),
+            Err(ImportRuleError::Conflict(LINKED_FILES.to_string()))
+        );
+    }
+
+    #[test]
+    fn keeps_only_storage() {
+        // A 1:1 link on a storage without a shared bucket is all the bucket has.
+        let mut rule = crate::s3::bucket::rename::tests::rule();
+        rule.backend_prefix = "lab/".to_string();
+        rule.write_pattern =
+            aruna_core::structs::storage::backend_import::PLAIN_PATTERN.to_string();
+        assert!(rule.mapped_bucket().is_some());
+        let record = GroupStorage {
+            backend_id: rule.backend_id,
+            group_id: rule.group_id,
+            name: "lab".to_string(),
+            kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
+            public_config: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            disabled: false,
+            cleanup: Default::default(),
+        };
+        let mut operation = RemoveImportOperation::new(rule.group_id, rule.import_id);
+        operation.start();
+        operation.step(storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from(7),
+        }));
+        operation.step(storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Key::from(Vec::new()), Some(rule.to_bytes().unwrap().into())),
+                (Key::from(Vec::new()), None),
+            ],
+        }));
+        operation.step(storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    Key::from(Vec::new()),
+                    Some(record.to_bytes().unwrap().into()),
+                ),
+                (Key::from(Vec::new()), Some(Value::from(vec![1]))),
+            ],
+        }));
+        assert_eq!(
+            operation.finalize(),
+            Err(ImportRuleError::Conflict(ONLY_STORAGE.to_string()))
+        );
+    }
+
+    #[test]
     fn marks_removed_rule() {
         let (group_id, import_id) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
         let mut operation = RemoveImportOperation::new(group_id, import_id);
@@ -552,6 +702,15 @@ mod tests {
                 (Key::from(Vec::new()), Some(rule.to_bytes().unwrap().into())),
                 (Key::from(Vec::new()), None),
             ],
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, limit: 1, .. })]
+                if key_space == BLOB_VERSIONS_KEYSPACE
+        ));
+        let effects = operation.step(storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
         }));
         let [
             Effect::Storage(StorageEffect::BatchDelete {

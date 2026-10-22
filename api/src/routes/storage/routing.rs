@@ -2,13 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{parse_group_id, require_realm_auth};
+use crate::auth::{parse_group_id, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BackendRef, bucket_permission_path};
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule, target_warnings};
 use aruna_operations::driver::{drive, node_routing};
+use aruna_operations::groups::backends::query::GetBackendOperation;
 use aruna_operations::groups::default_rule::PutDefaultOperation;
 use aruna_operations::groups::storage_routing::{
     GroupInputsOperation, GroupRoutingOperation, PutGroupError, PutGroupOperation,
@@ -36,6 +37,40 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(StorageRoutingDoc::openapi())
         .routes(routes!(get_bucket_routing, put_bucket_routing))
         .routes(routes!(get_group_routing, put_group_routing))
+        .routes(routes!(list_group_buckets))
+}
+
+/// Listing pages one bucket listing reads past while every bucket in them is hidden.
+const HIDDEN_PAGES: usize = 8;
+
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
+pub struct BucketPageQuery {
+    /// Buckets per page, 1 to 500; 200 when omitted.
+    pub limit: Option<usize>,
+    /// The `next` of the previous page.
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct BucketStorageResponse {
+    pub bucket: String,
+    /// The group storage; `null` is Aruna storage on this node.
+    pub backend_id: Option<String>,
+    /// The S3 bucket or container the files go to, where known.
+    pub provider_bucket: Option<String>,
+    /// The storage folder of a whole-bucket link.
+    pub folder: Option<String>,
+    /// Aruna names the files in the storage's shared bucket or container.
+    pub shared: bool,
+    /// The rule that links the whole bucket.
+    pub import_id: Option<String>,
+    pub write_pattern: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct BucketStoragePage {
+    pub buckets: Vec<BucketStorageResponse>,
+    pub next: Option<String>,
 }
 
 /// A rule target names either a group storage backend or a storage class, and
@@ -83,6 +118,10 @@ pub struct GroupRoutingRequest {
     /// created first. Omitted keeps the storage's stored default bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
+    /// Gives each new bucket its own provider bucket, like `aruna-{group}-{bucket}`, on a
+    /// target storage without a fixed bucket. Empty clears it; omitted keeps the stored one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -90,7 +129,32 @@ pub struct GroupRoutingResponse {
     pub group_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_target: Option<RoutingTargetRequest>,
+    /// The shared bucket of the target storage, if it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    /// The provider bucket template of the target storage for new buckets, if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_template: Option<String>,
     pub warnings: Vec<String>,
+}
+
+/// The shared bucket and the bucket template of a group storage target.
+async fn target_naming(
+    state: &ServerState,
+    group_id: Ulid,
+    target: Option<&RoutingTarget>,
+) -> ServerResult<(Option<String>, Option<String>)> {
+    let Some(RoutingTarget::Backend(BackendRef::Group(backend_id))) = target else {
+        return Ok((None, None));
+    };
+    let record = drive(GetBackendOperation::new(*backend_id), &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let record = record.filter(|record| record.group_id == group_id);
+    Ok(record.map_or((None, None), |record| {
+        let bucket = record.default_bucket().map(str::to_string);
+        (bucket, record.bucket_template())
+    }))
 }
 
 impl TryFrom<RoutingTargetRequest> for RoutingTarget {
@@ -457,9 +521,12 @@ pub async fn get_group_routing(
 
     let target = record.and_then(|record| record.default_target);
     let warnings = warnings_for(&state, group_id, target.iter()).await;
+    let (bucket, bucket_template) = target_naming(&state, group_id, target.as_ref()).await?;
     Ok(Json(GroupRoutingResponse {
         group_id: group_id.to_string(),
         default_target: target.map(Into::into),
+        bucket,
+        bucket_template,
         warnings,
     }))
 }
@@ -484,6 +551,14 @@ pub async fn get_group_routing(
 - A group storage without a fixed bucket takes Aruna's own layout in `bucket`. The bucket is found or
   created and tested with a write and a delete before anything is stored; the storage then lists it
   as `default_bucket` in its `public_config`. A later request without `bucket` keeps that bucket.
+- `bucket_template`, like `aruna-{group}-{bucket}`, gives each bucket created later its own
+  provider bucket on that storage, linked whole with the naming `{dir}{name}`; `{group}` is the
+  group's name in lowercase. Existing buckets stay where they are. An empty template clears it;
+  without it the storage keeps its stored template. With a template no shared `bucket` is
+  needed, as long as every bucket the group already has on this node has its own provider
+  bucket; else 409, since those buckets would have no storage left. The storage record keeps it as `bucket_template`, and both responses return it with
+  the shared `bucket`. A template that gives no valid S3 bucket name for a new bucket, or a
+  provider bucket another link uses, refuses the bucket's creation.
 - Clearing the target, or naming a class, returns new uploads to Aruna storage; files already on
   the group's storage stay there.
 
@@ -493,7 +568,9 @@ pub async fn get_group_routing(
   operator's node backend.
 - A `class` must be a valid storage class name.
 - `bucket` is only accepted with a `backend_id` of a storage without a fixed bucket. It follows the
-  S3 naming rules and must not be a bucket a linked folder of that storage uses."#,
+  S3 naming rules and must not be a bucket a linked folder of that storage uses.
+- `bucket_template` is only accepted like `bucket`. It must contain `{bucket}` and give S3 bucket
+  names."#,
     params(("group_id" = String, Path, description = "Group id as a 26-character ULID")),
     request_body(
         content = GroupRoutingRequest,
@@ -518,7 +595,7 @@ pub async fn get_group_routing(
         (status = 400, description = "The path segment is not a valid group ULID, the target is invalid or names a backend the group does not own, or the bucket is invalid or cannot be used", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
-        (status = 409, description = "A linked folder uses the bucket, or the group is being deleted", body = ErrorResponse)
+        (status = 409, description = "A linked folder uses the bucket, a bucket of the group would have no storage without a shared bucket, or the group is being deleted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -538,18 +615,20 @@ pub async fn put_group_routing(
         .transpose()?;
 
     let now = SystemTime::now();
+    let naming = request.bucket.is_some() || request.bucket_template.is_some();
     let record = match (target, request.bucket) {
         (Some(RoutingTarget::Backend(BackendRef::Group(backend_id))), bucket) => {
             let operation =
-                PutDefaultOperation::new(group_id, backend_id, bucket, auth.user_id, now);
+                PutDefaultOperation::new(group_id, backend_id, bucket, auth.user_id, now)
+                    .with_template(request.bucket_template);
             drive(operation, &state.get_ctx()).await
         }
-        (_, Some(_)) => {
+        _ if naming => {
             return Err(ServerError::BadRequestMessage(
-                "A bucket needs one of the group's storages as target.".to_string(),
+                "A bucket or template needs one of the group's storages as target.".to_string(),
             ));
         }
-        (target, None) => {
+        (target, _) => {
             let operation = PutGroupOperation::new(group_id, target, auth.user_id, now);
             drive(operation, &state.get_ctx()).await
         }
@@ -558,11 +637,124 @@ pub async fn put_group_routing(
 
     let target = record.default_target;
     let warnings = warnings_for(&state, group_id, target.iter()).await;
+    let (bucket, bucket_template) = target_naming(&state, group_id, target.as_ref()).await?;
     Ok(Json(GroupRoutingResponse {
         group_id: group_id.to_string(),
         default_target: target.map(Into::into),
+        bucket,
+        bucket_template,
         warnings,
     }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/groups/{group_id}/storage/buckets",
+    tag = "data/storage",
+    summary = "List a group's buckets with their storage",
+    description = r#"Lists one page of the group's buckets on this node in name order, each with the storage its new uploads go to.
+
+**Authentication**: realm bearer token with WRITE on that group's admin path.
+
+**Behavior**
+- A bucket linked whole by a backend import names that rule in `import_id`, its storage folder in
+  `folder` and its S3 bucket in `provider_bucket`.
+- Else the bucket's own rule for all its keys, then the group default, decides: a group storage
+  stores the files in its shared bucket or container (`shared`), and `backend_id` `null` means
+  Aruna storage on this node.
+- Rules for single folders of a bucket are not shown, nor buckets the caller may not read; `next`
+  names only a returned bucket. 8 listing pages of only hidden buckets answer 409.
+
+**Limits**
+- 1 to 500 buckets per page, 200 by default; pass `next` as `after` for the next page.
+- A group with more than 10,000 links and mapping rules is refused rather than listed in part.
+- An encrypted or compressed bucket shows the storage its uploads use, not its link."#,
+    params(
+        ("group_id" = String, Path, description = "Group id as a 26-character ULID"),
+        BucketPageQuery
+    ),
+    responses(
+        (status = 200, description = "One page of buckets", body = BucketStoragePage, example = json!({
+            "buckets": [{
+                "bucket": "genes", "backend_id": "01JBCKND0123456789ABCDEFGH",
+                "provider_bucket": "genes", "folder": "genes/", "shared": false,
+                "import_id": "01JMPRT0123456789ABCDEFGHJ", "write_pattern": "{dir}{name}"
+            }],
+            "next": null
+        })),
+        (status = 400, description = "Invalid group id or limit", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
+        (status = 409, description = "Too many buckets in a row are hidden from the caller", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_group_buckets(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+    axum::extract::Query(page): axum::extract::Query<BucketPageQuery>,
+) -> ServerResult<Json<BucketStoragePage>> {
+    use aruna_operations::groups::bucket_storage::list_bucket_storage;
+    use aruna_operations::s3::bucket::list::bucket_cursor;
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&group_id)?;
+    ensure_group_admin(&state, &auth, group_id).await?;
+    let limit = page.limit.unwrap_or(200);
+    if !(1..=500).contains(&limit) {
+        return Err(ServerError::BadRequestMessage(
+            "limit takes 1 to 500".to_string(),
+        ));
+    }
+    let id = |id: Option<Ulid>| id.map(|id| id.to_string());
+    // Buckets the caller may not read are left out, and `next` names only a returned bucket.
+    let (mut readable, mut after, mut more) = (Vec::new(), page.after, false);
+    for _ in 0..HIDDEN_PAGES {
+        let wanted = (after.take(), limit - readable.len());
+        let (buckets, token) = list_bucket_storage(&state.get_ctx(), group_id, wanted)
+            .await
+            .map_err(ServerError::InternalError)?;
+        for found in buckets {
+            let path = bucket_permission_path(
+                state.get_realm_id(),
+                group_id,
+                state.get_node_id(),
+                &found.bucket,
+            );
+            if permission_granted(&state, &auth, path, Permission::READ).await? {
+                readable.push(found);
+            }
+        }
+        (more, after) = (token.is_some(), token);
+        if !more || readable.len() == limit {
+            break;
+        }
+    }
+    if more && readable.is_empty() {
+        return Err(ServerError::Conflict(
+            "too many buckets in a row are hidden from the caller".to_string(),
+        ));
+    }
+    let next = match (more, readable.last()) {
+        (true, Some(last)) => Some(
+            bucket_cursor(&last.bucket)
+                .map_err(|error| ServerError::InternalError(error.to_string()))?,
+        ),
+        _ => None,
+    };
+    let buckets = readable
+        .into_iter()
+        .map(|found| BucketStorageResponse {
+            bucket: found.bucket,
+            backend_id: id(found.backend_id),
+            provider_bucket: found.provider_bucket,
+            folder: found.folder,
+            shared: found.shared,
+            import_id: id(found.import_id),
+            write_pattern: found.write_pattern,
+        })
+        .collect();
+    Ok(Json(BucketStoragePage { buckets, next }))
 }
 
 #[cfg(test)]

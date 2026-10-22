@@ -8,10 +8,12 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, BACKEND_INDEX_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BACKEND_INDEX_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE,
+    STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::storage::backend_import::BackendImport;
+use aruna_core::structs::storage::discovery::DiscoveryRules;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, GroupStorageRouting, RoutingError, RoutingTarget, validate_tenant_target,
@@ -35,6 +37,7 @@ enum LoadInputsState {
     ReadDefault,
     ScanBackends,
     ScanImports,
+    ScanMappings,
     Finish,
     Error,
 }
@@ -45,6 +48,8 @@ pub enum GroupInputsError {
     Read(#[from] RecordReadError),
     #[error("group routing inputs never completed")]
     Incomplete,
+    #[error("the group has more than {0} links to read at once")]
+    TooManyRules(usize),
 }
 
 /// Loads one group's routing inputs: its default write target and the ids of
@@ -55,6 +60,9 @@ pub struct GroupInputsOperation {
     group_id: GroupId,
     state: LoadInputsState,
     inputs: GroupRoutingInputs,
+    /// Links and mapping rows read at most; more fail instead of being cut.
+    cap: usize,
+    read_rules: usize,
     output: Option<Result<GroupRoutingInputs, GroupInputsError>>,
 }
 
@@ -64,8 +72,21 @@ impl GroupInputsOperation {
             group_id,
             state: LoadInputsState::Init,
             inputs: GroupRoutingInputs::default(),
+            cap: usize::MAX,
+            read_rules: 0,
             output: None,
         }
+    }
+
+    /// Fails with `TooManyRules` instead of reading more than `cap` links or mapping rows.
+    pub fn capped(mut self, cap: usize) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    fn count_rules(&mut self, rows: usize) -> bool {
+        self.read_rules += rows;
+        self.read_rules > self.cap
     }
 
     fn scan_backends(&mut self, start_after: Option<Key>) -> Effects {
@@ -83,6 +104,18 @@ impl GroupInputsOperation {
         self.state = LoadInputsState::ScanImports;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            prefix: Some(self.group_id.to_bytes().to_vec().into()),
+            start: start_after.map(IterStart::After),
+            limit: BACKEND_PAGE_SIZE,
+            txn_id: None,
+        })]
+    }
+
+    /// The discovery rules are keyed like their import rules, so one group prefix holds them.
+    fn scan_mappings(&mut self, start_after: Option<Key>) -> Effects {
+        self.state = LoadInputsState::ScanMappings;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: IMPORT_DISCOVERY_KEYSPACE.to_string(),
             prefix: Some(self.group_id.to_bytes().to_vec().into()),
             start: start_after.map(IterStart::After),
             limit: BACKEND_PAGE_SIZE,
@@ -142,6 +175,9 @@ impl Operation for GroupInputsOperation {
             // A rule whose write backend is disabled or gone keeps Aruna's own layout.
             LoadInputsState::ScanImports => match parse_iter(event, BackendImport::from_bytes) {
                 Ok((rules, next_start_after)) => {
+                    if self.count_rules(rules.len()) {
+                        return self.fail(GroupInputsError::TooManyRules(self.cap));
+                    }
                     let backends = &self.inputs.backend_ids;
                     let usable = rules
                         .into_iter()
@@ -151,12 +187,44 @@ impl Operation for GroupInputsOperation {
                     if let Some(start_after) = next_start_after {
                         return self.scan_imports(Some(start_after));
                     }
-                    self.state = LoadInputsState::Finish;
-                    self.output = Some(Ok(std::mem::take(&mut self.inputs)));
-                    smallvec![]
+                    self.scan_mappings(None)
                 }
                 Err(error) => self.fail(error.into()),
             },
+            LoadInputsState::ScanMappings => {
+                let (values, next_start_after) = match event {
+                    Event::Storage(StorageEvent::IterResult {
+                        values,
+                        next_start_after,
+                    }) => (values, next_start_after),
+                    Event::Storage(StorageEvent::Error { error }) => {
+                        return self.fail(RecordReadError::Storage(error).into());
+                    }
+                    _ => return self.fail(RecordReadError::Unexpected.into()),
+                };
+                if self.count_rules(values.len()) {
+                    return self.fail(GroupInputsError::TooManyRules(self.cap));
+                }
+                for (key, value) in values {
+                    let id = key.get(16..32).and_then(|id| <[u8; 16]>::try_from(id).ok());
+                    let rules = DiscoveryRules::from_bytes(&value);
+                    match (id, rules) {
+                        (Some(id), Ok(rules)) => {
+                            self.inputs
+                                .mappings
+                                .insert(Ulid::from_bytes(id), rules.rules);
+                        }
+                        (None, _) => return self.fail(RecordReadError::Unexpected.into()),
+                        (_, Err(error)) => return self.fail(RecordReadError::from(error).into()),
+                    }
+                }
+                if let Some(start_after) = next_start_after {
+                    return self.scan_mappings(Some(start_after));
+                }
+                self.state = LoadInputsState::Finish;
+                self.output = Some(Ok(std::mem::take(&mut self.inputs)));
+                smallvec![]
+            }
             LoadInputsState::Finish | LoadInputsState::Error => {
                 self.fail(RecordReadError::Unexpected.into())
             }
@@ -477,7 +545,8 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
-        BACKEND_IMPORT_KEYSPACE, BACKEND_INDEX_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+        BACKEND_IMPORT_KEYSPACE, BACKEND_INDEX_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE,
+        STORAGE_ROUTING_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::backend_import::BackendImport;
@@ -704,15 +773,31 @@ mod pure_tests {
             write_pattern: "{dir}{id}_{name}".to_string(),
         };
         let (kept, dropped) = (rule(8, mine), rule(9, disabled));
-        operation.step(Event::Storage(StorageEvent::IterResult {
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
             values: [&kept, &dropped]
                 .into_iter()
                 .map(|rule| (rule.key(), rule.to_bytes().unwrap().into()))
                 .collect(),
             next_start_after: None,
         }));
+        // The mapping rules of the group's links load last, keyed like the links.
+        let [Effect::Storage(StorageEffect::Iter { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the mapping scan, got {effects:?}")
+        };
+        assert_eq!(key_space, IMPORT_DISCOVERY_KEYSPACE);
+        let mapping = aruna_core::structs::storage::discovery::DiscoveryRules {
+            rules: vec![aruna_core::structs::storage::discovery::DiscoveryRule {
+                pattern: "lars/{name}".to_string(),
+                folder: "foobar/".to_string(),
+            }],
+        };
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(kept.key(), mapping.to_bytes().unwrap().into())],
+            next_start_after: None,
+        }));
 
         let inputs = operation.finalize().unwrap();
+        assert_eq!(inputs.mappings.get(&kept.import_id), Some(&mapping.rules));
         assert_eq!(
             inputs.default_target,
             Some(RoutingTarget::Class("cold".to_string()))

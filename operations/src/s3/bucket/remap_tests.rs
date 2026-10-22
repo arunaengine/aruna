@@ -244,3 +244,23 @@ async fn resumes_after_cursor() {
     let (late, job) = step(&context, &plan(), &scope).await;
     assert_eq!((late.skipped, job.done), (1, 0));
 }
+
+#[tokio::test]
+async fn bounds_large_totals() {
+    let (_directory, context) = setup().await;
+    many(&context, TOTAL_SCAN).await;
+    let access = load(&context).await;
+    let scope = scope(&access);
+    let page = preview_page(&context, &plan(), &scope, (None, None, DEFAULT_PAGE))
+        .await
+        .unwrap();
+    assert_eq!((page.total, page.complete), (TOTAL_SCAN as u64, false));
+    assert_eq!(page.entries.len(), DEFAULT_PAGE);
+    assert!(page.next.is_some());
+    // A filter that matches nothing still stops at the key bound and names where.
+    let page = preview_page(&context, &plan(), &scope, (Some("absent"), None, 100))
+        .await
+        .unwrap();
+    assert_eq!((page.total, page.complete), (0, false));
+    assert!(page.entries.is_empty() && page.next.is_some());
+}

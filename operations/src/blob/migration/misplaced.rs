@@ -185,8 +185,10 @@ async fn read_location(
 pub const DEFAULT_PAGE: usize = 100;
 pub const MAX_PAGE: usize = 1000;
 /// Version rows one rename preview passes over at most, for its totals and for its page.
-const TOTAL_ROWS: usize = 2_000_000;
-const PAGE_ROWS: usize = 200_000;
+const TOTAL_ROWS: usize = 10_000;
+const PAGE_ROWS: usize = 10_000;
+/// Versions one rename preview checks at most, for its totals and again for its page.
+const PAGE_CHECKS: usize = 5_000;
 
 /// A check of a key against the caller's access.
 pub type KeyCheck<'a> = dyn Fn(&str) -> bool + Sync + 'a;
@@ -226,7 +228,7 @@ pub async fn rename_page(
         key.starts_with(prefix) && filter.is_none_or(|filter| key.contains(filter)) && readable(key)
     };
     let scan = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
-    let (mut start, mut scanned) = (None::<Key>, 0usize);
+    let (mut start, mut scanned, mut checked) = (None::<Key>, 0usize, 0usize);
     'total: loop {
         let (rows, next) = crate::jobs::store::iter_prefix_page(
             &context.storage_handle,
@@ -244,10 +246,17 @@ pub async fn rename_page(
             }
             scanned += 1;
             let version_key = VersionKey::from_bytes(key).map_err(|e| e.to_string())?;
-            if shown(&version_key.key)
-                && renamed(context, (&routing, &earlier), &version_key, value)
-                    .await?
-                    .is_some()
+            if !shown(&version_key.key) {
+                continue;
+            }
+            if checked == PAGE_CHECKS {
+                page.complete = false;
+                break 'total;
+            }
+            checked += 1;
+            if renamed(context, (&routing, &earlier), &version_key, value)
+                .await?
+                .is_some()
             {
                 page.total += 1;
             }
@@ -257,7 +266,7 @@ pub async fn rename_page(
             None => break,
         }
     }
-    let (mut start, mut scanned) = (after.map(Key::from), 0usize);
+    let (mut start, mut scanned, mut checked) = (after.map(Key::from), 0usize, 0usize);
     let mut last = None;
     loop {
         let (rows, next) = crate::jobs::store::iter_prefix_page(
@@ -270,7 +279,7 @@ pub async fn rename_page(
         )
         .await?;
         for (key, value) in &rows {
-            if page.entries.len() == limit || scanned == PAGE_ROWS {
+            if page.entries.len() == limit || scanned == PAGE_ROWS || checked == PAGE_CHECKS {
                 // A cursor names only a row of a key the caller may read.
                 page.next = last;
                 if page.next.is_none() {
@@ -286,6 +295,7 @@ pub async fn rename_page(
             if !shown(&version_key.key) {
                 continue;
             }
+            checked += 1;
             if let Some((from, to)) =
                 renamed(context, (&routing, &earlier), &version_key, value).await?
             {
@@ -322,4 +332,55 @@ async fn renamed(
     };
     let found = renames(routing, earlier, &plain, &location, version_key);
     Ok(found.then_some((location.backend_path, plain.path)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::s3::bucket::rename::tests::{BUCKET, put, setup};
+    use std::time::SystemTime;
+    use ulid::Ulid;
+
+    #[tokio::test]
+    async fn bounds_rename_preview() {
+        let (_directory, context) = setup().await;
+        for index in 0..=PAGE_ROWS {
+            let id = Ulid::from_parts(10, 1);
+            let version = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
+            let key = VersionKey::new(BUCKET, format!("k{index:05}"), id);
+            put(
+                &context,
+                BLOB_VERSIONS_KEYSPACE,
+                key.to_bytes().unwrap(),
+                version.to_bytes().unwrap(),
+            )
+            .await;
+        }
+        let all = |_: &str| true;
+        let page = rename_page(&context, (BUCKET, ""), (&all, &all), (None, None, 100))
+            .await
+            .unwrap();
+        assert_eq!((page.total, page.complete), (0, false));
+        let (mut after, mut pages) = (page.next, 1);
+        while let Some(next) = after {
+            let rest = rename_page(
+                &context,
+                (BUCKET, ""),
+                (&all, &all),
+                (None, Some(next), 100),
+            )
+            .await
+            .unwrap();
+            assert!(rest.entries.is_empty());
+            (after, pages) = (rest.next, pages + 1);
+        }
+        assert_eq!(pages, 3);
+        // A filter that matches nothing still stops at the row bound and names where.
+        let filtered = (Some("absent"), None, 100);
+        let page = rename_page(&context, (BUCKET, ""), (&all, &all), filtered)
+            .await
+            .unwrap();
+        assert_eq!((page.total, page.complete), (0, false));
+        assert!(page.next.is_some());
+    }
 }

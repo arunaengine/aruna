@@ -190,14 +190,23 @@ bucket, including request policies. Tokens with path restrictions are refused.
   regular expressions. Matching ignores the version id that the rule's
   current or an earlier `write_pattern`, or a `~<version id>` tag, adds to a name. A file
   whose name a pattern of the rule wrote is registered as that version of its new key.
+- A `pattern` of the form `<storage folder>/{name}`, like `lars/{name}`, takes every file below
+  that storage folder to `folder` + its path below the storage folder; it wins over file name
+  patterns.
+- The rules work both ways: an upload below `folder` is written at the storage path: below the
+  storage folder of a `<storage folder>/{name}` pattern, or without `folder` when its file name
+  matches a file name pattern of that `folder`. Other uploads keep their path. The rule's
+  `write_pattern` names the file after that.
 - A file that already has a recorded mapping keeps its key; adding or changing rules never moves
-  it. Use a rename to move such keys.
+  it. Use a move (`organize/move`) or a rename to move such keys.
 - A run reports a file that matches several patterns as failed and does not import it.
 - A file whose new key already holds another object is reported as failed and not imported.
 - The rules apply to the pages a run lists after the change. An empty list removes all rules.
 
 **Limits**
-- At most 32 patterns of 1 to 128 characters, without `/` or control characters.
+- At most 32 patterns of 1 to 128 characters, without control characters; only a
+  `<storage folder>/{name}` pattern holds `/`. Storage folders must not overlap, and the
+  `folder` of such a pattern must not overlap any other rule's `folder`.
 - A `{...}` group holds 2 to 8 plain alternatives, and the groups of a pattern spell out at
   most 32 names. A count is 1 to 64, the smaller number first. Malformed patterns answer 400.
 - Two patterns that can match the same name are refused (400), whatever their order.

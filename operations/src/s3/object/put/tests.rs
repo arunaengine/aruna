@@ -2590,6 +2590,7 @@ async fn plain_owns_copy() {
             same_name: false,
             listed: true,
             shared: Vec::new(),
+            mapped: false,
         };
         op.version_id = Some(Ulid::generate());
         op.start_plain(target, ResolvedBackend::new(backend.clone(), None));

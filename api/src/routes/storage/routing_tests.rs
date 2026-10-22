@@ -105,6 +105,7 @@ async fn group_default_roundtrip() {
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
             bucket: None,
+            bucket_template: None,
             default_target: Some(RoutingTargetRequest {
                 backend_id: None,
                 class: Some("cold".to_string()),
@@ -127,6 +128,7 @@ async fn group_default_roundtrip() {
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
             bucket: None,
+            bucket_template: None,
             default_target: None,
         }),
     )
@@ -145,6 +147,7 @@ async fn rejects_invalid_class() {
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
             bucket: None,
+            bucket_template: None,
             default_target: Some(RoutingTargetRequest {
                 backend_id: None,
                 class: Some("NOT VALID".to_string()),
@@ -167,6 +170,7 @@ async fn bucket_needs_storage() {
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
             bucket: Some("lab-default".to_string()),
+            bucket_template: None,
             default_target: Some(RoutingTargetRequest {
                 backend_id: None,
                 class: Some("cold".to_string()),
@@ -175,6 +179,23 @@ async fn bucket_needs_storage() {
     )
     .await;
 
+    assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
+
+    // A bucket template too.
+    let result = put_group_routing(
+        State(test.state.clone()),
+        Extension(Some(test.auth.clone())),
+        Path(test.group_id.to_string()),
+        Json(GroupRoutingRequest {
+            bucket: None,
+            bucket_template: Some("aruna-{bucket}".to_string()),
+            default_target: Some(RoutingTargetRequest {
+                backend_id: None,
+                class: Some("cold".to_string()),
+            }),
+        }),
+    )
+    .await;
     assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
 }
 
@@ -218,4 +239,41 @@ fn openapi_lists_routes() {
             .get("warnings")
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn lists_readable_buckets() {
+    let test = setup_state().await;
+    let list = |auth: AuthContext| {
+        list_group_buckets(
+            State(test.state.clone()),
+            Extension(Some(auth)),
+            Path(test.group_id.to_string()),
+            axum::extract::Query(BucketPageQuery {
+                limit: Some(1),
+                after: None,
+            }),
+        )
+    };
+    let Json(page) = list(test.auth.clone()).await.unwrap();
+    let names: Vec<_> = page
+        .buckets
+        .iter()
+        .map(|found| found.bucket.as_str())
+        .collect();
+    assert_eq!(names, [test.bucket.as_str()]);
+    // A token for the admin path alone sees no bucket it may not read.
+    let mut admin_only = test.auth.clone();
+    admin_only.path_restrictions =
+        Some(vec![aruna_core::structs::identity::auth::PathRestriction {
+            pattern: format!(
+                "/{}/g/{}/admin/**",
+                test.state.get_realm_id(),
+                test.group_id
+            ),
+            permission: Permission::WRITE,
+        }]);
+    let Json(page) = list(admin_only).await.unwrap();
+    // The cursor never names a bucket the caller may not see.
+    assert!(page.buckets.is_empty() && page.next.is_none());
 }

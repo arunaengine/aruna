@@ -433,3 +433,74 @@ async fn skips_deleting_files() {
         .unwrap();
     assert_eq!(unified, Unified::Changed);
 }
+
+#[tokio::test]
+async fn bounds_large_preview() {
+    let (_directory, context) = setup().await;
+    twins(&context, "a.faa.gz", 10).await;
+    // Version rows sort by key length first, so these longer keys follow the twins.
+    for index in 0..PAGE_SCAN {
+        let id = Ulid::from_parts(100, 1);
+        let version = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
+        let key = VersionKey::new(BUCKET, format!("b{index:08}"), id);
+        put(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            key.to_bytes().unwrap(),
+            version.to_bytes().unwrap(),
+        )
+        .await;
+    }
+    let access = load(&context).await;
+    let page = preview_page(&context, (BUCKET, ""), &access, (None, None, 100))
+        .await
+        .unwrap();
+    assert_eq!(
+        (page.keys, page.complete, page.entries.len()),
+        (1, false, 1)
+    );
+    let (mut after, mut pages) = (page.next, 1);
+    while let Some(next) = after {
+        let rest = preview_page(&context, (BUCKET, ""), &access, (None, Some(next), 100))
+            .await
+            .unwrap();
+        assert!(rest.entries.is_empty());
+        (after, pages) = (rest.next, pages + 1);
+    }
+    assert_eq!(pages, 3);
+    // A filter that matches nothing still stops at the row bound and names where.
+    let filtered = (Some("absent"), None, 100);
+    let page = preview_page(&context, (BUCKET, ""), &access, filtered)
+        .await
+        .unwrap();
+    assert_eq!(
+        (page.keys, page.complete, page.entries.len()),
+        (0, false, 0)
+    );
+    assert!(page.next.is_some());
+}
+
+#[tokio::test]
+async fn skips_huge_keys() {
+    let (_directory, context) = setup().await;
+    twins(&context, "a.faa.gz", 10).await;
+    let version = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
+    for index in 0..=PAGE_SCAN as u64 {
+        let key = VersionKey::new(BUCKET, "long.faa.gz", Ulid::from_parts(100 + index, 1));
+        let (key, value) = (key.to_bytes().unwrap(), version.to_bytes().unwrap());
+        put(&context, BLOB_VERSIONS_KEYSPACE, key, value).await;
+    }
+    let access = load(&context).await;
+    let page = preview_page(&context, (BUCKET, ""), &access, (None, None, 100))
+        .await
+        .unwrap();
+    let keys: Vec<_> = page
+        .entries
+        .iter()
+        .map(|entry| entry.key.as_str())
+        .collect();
+    assert_eq!(
+        (keys, page.keys, page.complete),
+        (vec!["a.faa.gz"], 1, false)
+    );
+}
