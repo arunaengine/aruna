@@ -10,8 +10,8 @@ use crate::jobs::store::decode_job_record;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_IMPORT_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, IMPORT_PATTERN_KEYSPACE, JOB_KEYSPACE,
-    STORAGE_BACKEND_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
+    IMPORT_PATTERN_KEYSPACE, JOB_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::job_record_key;
@@ -19,7 +19,9 @@ use aruna_core::structs::storage::backend_import::{
     BackendImport, import_key, object_prefix, read_patterns, retire_pattern, valid_pattern,
     write_patterns,
 };
-use aruna_core::structs::storage::format::CompressionMigration;
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::encryption::BucketEncryption;
+use aruna_core::structs::storage::format::{Compression, CompressionMigration};
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -117,6 +119,14 @@ impl ChangeImportOperation {
                 STORAGE_BACKEND_KEYSPACE.to_string(),
                 backend_key(record.backend_id),
             ),
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                record.bucket.as_bytes().to_vec().into(),
+            ),
+            (
+                BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                record.bucket.as_bytes().to_vec().into(),
+            ),
         ];
         if let Some(last_job) = record.last_job {
             reads.push((JOB_KEYSPACE.to_string(), job_record_key(last_job)));
@@ -137,19 +147,31 @@ impl ChangeImportOperation {
         };
         let mut values = values.into_iter().map(|(_, value)| value);
         let (moving, earlier) = (values.next().flatten(), values.next().flatten());
-        let (storage, run) = (values.next().flatten(), values.next().flatten());
-        let splits = match storage.as_deref().map(GroupStorage::from_bytes).transpose() {
-            Ok(Some(storage)) => storage.splits(),
+        let (storage, bucket) = (values.next().flatten(), values.next().flatten());
+        let (encryption, run) = (values.next().flatten(), values.next().flatten());
+        match storage.as_deref().map(GroupStorage::from_bytes).transpose() {
+            Ok(Some(_)) => {}
             Ok(None) => return self.fail(ImportRuleError::NotFound),
             Err(error) => return self.fail(error.into()),
-        };
-        // A linked provider bucket keeps its plain names, and no rule becomes one.
+        }
+        // A rule that becomes a 1:1 link needs a bucket that stores plain files.
         let mut old_rule = record.clone();
         old_rule.write_pattern = old.clone();
-        if splits && record.mapped_bucket() != old_rule.mapped_bucket() {
-            return self.fail(ImportRuleError::Invalid(
-                "a linked provider bucket keeps the plain pattern".to_string(),
-            ));
+        if record.mapped_bucket().is_some() && old_rule.mapped_bucket().is_none() {
+            let info = bucket.as_deref().map(BucketInfo::from_bytes).transpose();
+            let settings = BucketEncryption::from_row(encryption.as_deref());
+            match (info, settings) {
+                (Ok(info), Ok(settings))
+                    if settings.is_encrypted()
+                        || info
+                            .as_ref()
+                            .is_some_and(|info| info.compression != Compression::Off) =>
+                {
+                    return self.fail(ImportRuleError::Conflict(super::MAPPED_REASON.to_string()));
+                }
+                (Ok(_), Ok(_)) => {}
+                (Err(error), _) | (_, Err(error)) => return self.fail(error.into()),
+            }
         }
         let moving = moving.as_deref().map(CompressionMigration::from_bytes);
         match moving.transpose() {
@@ -463,13 +485,14 @@ mod tests {
         moving: Option<CompressionMigration>,
         run: Option<Value>,
     ) -> Effects {
-        check_on(operation, effects, moving, storage(true), run)
+        check_on(operation, effects, (moving, None), storage(true), run)
     }
 
+    /// Like `check`, with the bucket record that the switch to a 1:1 link reads.
     fn check_on(
         operation: &mut ChangeImportOperation,
         effects: &Effects,
-        moving: Option<CompressionMigration>,
+        (moving, bucket): (Option<CompressionMigration>, Option<Value>),
         storage: Value,
         run: Option<Value>,
     ) -> Effects {
@@ -481,13 +504,15 @@ mod tests {
             COMPRESSION_MIGRATION_KEYSPACE,
             IMPORT_PATTERN_KEYSPACE,
             STORAGE_BACKEND_KEYSPACE,
+            S3_BUCKET_KEYSPACE,
+            BUCKET_ENCRYPTION_KEYSPACE,
         ];
         if run.is_some() {
             expected.push(JOB_KEYSPACE);
         }
         assert_eq!(spaces, expected);
         let moving = moving.map(|record| record.to_bytes().unwrap().into());
-        let answers = [moving, None, Some(storage), run];
+        let answers = [moving, None, Some(storage), bucket, None, run];
         let values = reads
             .iter()
             .zip(answers)
@@ -578,27 +603,43 @@ mod tests {
             operation.finalize(),
             Err(ImportRuleError::Invalid(_))
         ));
+    }
 
-        // A linked provider bucket keeps plain names, and no rule turns into one.
+    #[test]
+    fn switches_whole_links() {
+        // A whole-bucket link may switch its naming; one without `{id}` is a 1:1 link.
         let mut linked = rule(PLAIN_PATTERN, None);
         linked.backend_prefix = "lab/".to_string();
         linked.key_prefix = String::new();
         assert!(linked.mapped_bucket().is_some());
         let mut whole = linked.clone();
         whole.write_pattern = DEFAULT_PATTERN.to_string();
-        for (stored, pattern) in [(&linked, DEFAULT_PATTERN), (&whole, PLAIN_PATTERN)] {
+        assert!(whole.mapped_bucket().is_none());
+        for (stored, pattern) in [(&linked, DEFAULT_PATTERN), (&whole, "{dir}raw/{name}")] {
             let (mut operation, effects) = read(stored, Some(pattern));
-            check(&mut operation, &effects, None, None);
-            assert!(matches!(
-                operation.finalize(),
-                Err(ImportRuleError::Invalid(_))
-            ));
-            // On a storage with a fixed bucket the same rule is an ordinary folder link.
-            let (mut operation, effects) = read(stored, Some(pattern));
-            let effects = check_on(&mut operation, &effects, None, storage(false), None);
+            let effects = check(&mut operation, &effects, None, None);
             assert_eq!(written(&effects).write_pattern, pattern);
         }
-        let (_, effects) = read(&linked, Some(PLAIN_PATTERN));
-        written(&effects);
+        // A compressed bucket cannot become a 1:1 link.
+        let info = BucketInfo {
+            group_id: Ulid::from_parts(3, 3),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Zstd { level: 3 },
+        };
+        let bucket = Some(info.to_bytes().unwrap().into());
+        let (mut operation, effects) = read(&whole, Some(PLAIN_PATTERN));
+        let effects = check_on(
+            &mut operation,
+            &effects,
+            (None, bucket),
+            storage(true),
+            None,
+        );
+        conflict(operation, &effects);
     }
 }

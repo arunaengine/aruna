@@ -9,7 +9,7 @@ use crate::routes::storage::moves::{BucketMoveStarted, move_refusal};
 use crate::routes::storage::routing::ensure_group_admin;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
+use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::bearer_token::token_grant;
@@ -69,7 +69,7 @@ pub struct CreateImportRequest {
     #[serde(default)]
     pub write_prefix: Option<String>,
     /// Path of a new upload below the write folder with `{dir}`, `{name}` and `{id}`;
-    /// omitted uses `{dir}{name}~{id}`.
+    /// omitted uses `{dir}{name}`.
     #[serde(default)]
     pub write_pattern: Option<String>,
     /// Also moves the bucket's stored files under `key_prefix` to the write folder.
@@ -363,7 +363,7 @@ pub async fn create_import(
             write_prefix: request.write_prefix,
             write_pattern: request
                 .write_pattern
-                .unwrap_or_else(|| DEFAULT_PATTERN.to_string()),
+                .unwrap_or_else(|| PLAIN_PATTERN.to_string()),
             now: SystemTime::now(),
             move_existing: request.move_existing,
         }),
@@ -512,8 +512,10 @@ pub async fn get_import(
 
 **Limits**
 - `write_pattern` must contain `{name}` and give a relative path.
-- A rule that links a whole provider bucket of a storage without a fixed bucket keeps
-  `{dir}{name}`, and no rule turns into one."#,
+- A rule that links a whole top folder of its storage to a whole bucket with a pattern
+  without `{id}` is a 1:1 link: its bucket cannot be compressed or encrypted, takes no
+  replicated copies and ends the link when it is deleted. A switch to such a pattern is refused
+  with 409 while the bucket is compressed or encrypted."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
         ("import_id" = String, Path, description = "Rule to change, as a 26-character ULID")
@@ -546,7 +548,7 @@ pub async fn get_import(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
-        (status = 409, description = "The group is being deleted, or a run or move has not finished", body = ErrorResponse)
+        (status = 409, description = "The group is being deleted, a run or move has not finished, or a compressed or encrypted bucket would become a 1:1 link", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
