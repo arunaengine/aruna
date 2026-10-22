@@ -37,6 +37,37 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(StorageRoutingDoc::openapi())
         .routes(routes!(get_bucket_routing, put_bucket_routing))
         .routes(routes!(get_group_routing, put_group_routing))
+        .routes(routes!(list_group_buckets))
+}
+
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
+pub struct BucketPageQuery {
+    /// Buckets per page, 1 to 500; 200 when omitted.
+    pub limit: Option<usize>,
+    /// The `next` of the previous page.
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct BucketStorageResponse {
+    pub bucket: String,
+    /// The group storage; `null` is Aruna storage on this node.
+    pub backend_id: Option<String>,
+    /// The S3 bucket or container the files go to, where known.
+    pub provider_bucket: Option<String>,
+    /// The storage folder of a whole-bucket link.
+    pub folder: Option<String>,
+    /// Aruna names the files in the storage's shared bucket or container.
+    pub shared: bool,
+    /// The rule that links the whole bucket.
+    pub import_id: Option<String>,
+    pub write_pattern: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct BucketStoragePage {
+    pub buckets: Vec<BucketStorageResponse>,
+    pub next: Option<String>,
 }
 
 /// A rule target names either a group storage backend or a storage class, and
@@ -608,6 +639,79 @@ pub async fn put_group_routing(
         bucket_template,
         warnings,
     }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/groups/{group_id}/storage/buckets",
+    tag = "data/storage",
+    summary = "List a group's buckets with their storage",
+    description = r#"Lists one page of the group's buckets on this node in name order, each with the storage its new uploads go to.
+
+**Authentication**: realm bearer token with WRITE on that group's admin path.
+
+**Behavior**
+- A bucket linked whole by a backend import names that rule in `import_id`, its storage folder in
+  `folder` and its S3 bucket in `provider_bucket`.
+- Else the bucket's own rule for all its keys, then the group default, decides: a group storage
+  stores the files in its shared bucket or container (`shared`), and `backend_id` `null` means
+  Aruna storage on this node.
+- Rules for single folders of a bucket are not shown.
+
+**Limits**
+- 1 to 500 buckets per page, 200 by default; pass `next` as `after` for the next page."#,
+    params(
+        ("group_id" = String, Path, description = "Group id as a 26-character ULID"),
+        BucketPageQuery
+    ),
+    responses(
+        (status = 200, description = "One page of buckets", body = BucketStoragePage, example = json!({
+            "buckets": [{
+                "bucket": "genes", "backend_id": "01JBCKND0123456789ABCDEFGH",
+                "provider_bucket": "genes", "folder": "genes/", "shared": false,
+                "import_id": "01JMPRT0123456789ABCDEFGHJ", "write_pattern": "{dir}{name}"
+            }],
+            "next": null
+        })),
+        (status = 400, description = "Invalid group id or limit", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_group_buckets(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+    axum::extract::Query(page): axum::extract::Query<BucketPageQuery>,
+) -> ServerResult<Json<BucketStoragePage>> {
+    use aruna_operations::groups::bucket_storage::list_bucket_storage;
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&group_id)?;
+    ensure_group_admin(&state, &auth, group_id).await?;
+    let limit = page.limit.unwrap_or(200);
+    if !(1..=500).contains(&limit) {
+        return Err(ServerError::BadRequestMessage(
+            "limit takes 1 to 500".to_string(),
+        ));
+    }
+    let (buckets, next) = list_bucket_storage(&state.get_ctx(), group_id, (page.after, limit))
+        .await
+        .map_err(ServerError::InternalError)?;
+    let id = |id: Option<Ulid>| id.map(|id| id.to_string());
+    let buckets = buckets
+        .into_iter()
+        .map(|found| BucketStorageResponse {
+            bucket: found.bucket,
+            backend_id: id(found.backend_id),
+            provider_bucket: found.provider_bucket,
+            folder: found.folder,
+            shared: found.shared,
+            import_id: id(found.import_id),
+            write_pattern: found.write_pattern,
+        })
+        .collect();
+    Ok(Json(BucketStoragePage { buckets, next }))
 }
 
 #[cfg(test)]
