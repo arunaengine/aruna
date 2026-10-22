@@ -12,13 +12,14 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BUCKET_CREATION_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    BUCKET_CREATION_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
     STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::storage::backend_import::PLAIN_PATTERN;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
-use aruna_core::structs::storage::group_backend::GroupStorage;
+use aruna_core::structs::storage::group_backend::{GroupStorage, template_bucket};
 use aruna_core::structs::storage::routing::{GroupStorageRouting, RoutingTarget};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, Value};
@@ -100,8 +101,8 @@ impl CreateBucketOperation {
         }
     }
 
-    /// Links a new bucket to the provider bucket `<bucket_prefix><bucket>` when the group
-    /// default storage sets a `bucket_prefix`.
+    /// Links a new bucket to its own provider bucket when the group default storage sets a
+    /// `bucket_template`.
     pub fn mapped(mut self) -> Self {
         self.mapped = true;
         self
@@ -190,7 +191,17 @@ impl CreateBucketOperation {
         match routing.map(|routing| routing.and_then(|routing| routing.default_target)) {
             Ok(Some(RoutingTarget::Backend(BackendRef::Group(backend_id)))) => {
                 self.state = CreateBucketState::ReadStorage;
-                self.read(STORAGE_BACKEND_KEYSPACE, backend_key(backend_id))
+                let group = self.bucket_info.group_id.to_bytes().to_vec().into();
+                smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads: vec![
+                        (
+                            STORAGE_BACKEND_KEYSPACE.to_string(),
+                            backend_key(backend_id)
+                        ),
+                        (GROUP_KEYSPACE.to_string(), group),
+                    ],
+                    txn_id: self.txn_id,
+                })]
             }
             Ok(_) => self.write_bucket(),
             Err(error) => self.emit_error(error),
@@ -198,27 +209,36 @@ impl CreateBucketOperation {
     }
 
     fn storage_read(&mut self, event: Event) -> Effects {
-        let storage = self.read_value(event).and_then(|value| {
-            let storage = value.map(|value| GroupStorage::from_bytes(&value));
-            Ok(storage.transpose()?)
-        });
-        let storage = match storage {
-            Ok(storage) => storage,
-            Err(error) => return self.emit_error(error),
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.emit_error(CreateBucketError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                received: event,
+            });
+        };
+        let mut values = values.into_iter().map(|(_, value)| value);
+        let (storage, group) = (values.next().flatten(), values.next().flatten());
+        let storage = storage.map(|value| GroupStorage::from_bytes(&value));
+        let group = group.map(|value| Group::from_bytes(&value));
+        let (storage, group) = match (storage.transpose(), group.transpose()) {
+            (Ok(storage), Ok(group)) => (storage, group),
+            (Err(error), _) | (_, Err(error)) => return self.emit_error(error.into()),
         };
         let (Some(storage), Some(txn_id)) = (storage, self.txn_id) else {
             return self.write_bucket();
         };
-        if let (Some(prefix), false, true) = (
-            storage.bucket_prefix(),
+        let name = group.map(|group| group.display_name).unwrap_or_default();
+        if let (Some(template), false, true) = (
+            storage.bucket_template(),
             storage.disabled,
             storage.group_id == self.bucket_info.group_id,
         ) {
+            let provider = template_bucket(&template, &self.bucket, &name);
             let input = CreateImportInput {
                 group_id: storage.group_id,
                 created_by: self.bucket_info.created_by,
                 backend_id: storage.backend_id,
-                backend_prefix: format!("{prefix}{}/", self.bucket),
+                backend_prefix: format!("{provider}/"),
                 bucket: self.bucket.clone(),
                 key_prefix: String::new(),
                 schedule: None,
@@ -425,11 +445,13 @@ mod mapped_tests {
         }
     }
 
+    /// A storage without a bucket; a former `bucket_prefix` still names the provider bucket.
     fn storage() -> Value {
-        let public = [
-            ("endpoint", "https://s3.example.test"),
-            ("bucket_prefix", "team-a-"),
-        ];
+        storage_with(("bucket_prefix", "team-a-"))
+    }
+
+    fn storage_with(naming: (&str, &str)) -> Value {
+        let public = [("endpoint", "https://s3.example.test"), naming];
         let record = GroupStorage {
             backend_id: BACKEND,
             group_id: GROUP,
@@ -479,18 +501,33 @@ mod mapped_tests {
         })
     }
 
+    fn group() -> Value {
+        let group = Group {
+            display_name: "Spire".to_string(),
+            group_id: GROUP,
+            realm_id: aruna_core::structs::identity::realm::RealmId([1u8; 32]),
+            roles: Default::default(),
+            owner: UserId::default(),
+        };
+        postcard::to_allocvec(&group).unwrap().into()
+    }
+
     /// Runs a mapped create up to the ensure of the provider bucket.
     fn until_ensure(txn_id: TxnId) -> (CreateBucketOperation, Effects) {
+        until_ensure_on(txn_id, storage())
+    }
+
+    fn until_ensure_on(txn_id: TxnId, storage: Value) -> (CreateBucketOperation, Effects) {
         let mut operation = CreateBucketOperation::new("x".to_string(), info()).mapped();
         operation.start();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(batch(vec![None, None]));
         operation.step(read(Some(routing())));
-        operation.step(read(Some(storage())));
+        operation.step(batch(vec![Some(storage.clone()), Some(group())]));
         operation.step(written());
         operation.step(written());
         operation.step(written());
-        let effects = operation.step(batch(vec![Some(storage()), Some(storage())]));
+        let effects = operation.step(batch(vec![Some(storage.clone()), Some(storage)]));
         (operation, effects)
     }
 
@@ -556,6 +593,19 @@ mod mapped_tests {
             txn_id,
         }));
         assert_eq!(operation.finalize(), Ok(info()));
+    }
+
+    #[test]
+    fn fills_bucket_template() {
+        let storage = storage_with(("bucket_template", "aruna-{group}-{bucket}"));
+        let (_, effects) = until_ensure_on(TxnId::default(), storage);
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::EnsureBucket {
+                backend: BackendRef::Group(BACKEND),
+                bucket: "aruna-spire-x".to_string(),
+            })]
+        );
     }
 
     #[test]

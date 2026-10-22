@@ -456,9 +456,15 @@ mod pure_tests {
         let (group_id, backend_id) = (Ulid::from_bytes([1u8; 16]), Ulid::from_bytes([9u8; 16]));
         let mut stored = existing(group_id, backend_id);
         stored.public_config.remove("bucket");
-        stored
-            .public_config
-            .insert(DEFAULT_BUCKET.to_string(), "aruna-lab".to_string());
+        for (key, value) in [
+            (DEFAULT_BUCKET, "aruna-lab"),
+            ("bucket_template", "aruna-{bucket}"),
+            ("bucket_prefix", "lab-"),
+        ] {
+            stored
+                .public_config
+                .insert(key.to_string(), value.to_string());
+        }
         let mut change = input(group_id);
         change.public_config.remove("bucket");
         change.secret_config.clear();
@@ -495,6 +501,15 @@ mod pure_tests {
         let record = operation.finalize().unwrap();
         assert_eq!(record.name, "updated");
         assert_eq!(record.default_bucket(), Some("aruna-lab"));
+        let config = &record.public_config;
+        assert_eq!(
+            config.get("bucket_template").map(String::as_str),
+            Some("aruna-{bucket}")
+        );
+        assert_eq!(
+            config.get("bucket_prefix").map(String::as_str),
+            Some("lab-")
+        );
     }
 
     #[test]

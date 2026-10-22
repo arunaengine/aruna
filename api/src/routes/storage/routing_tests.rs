@@ -105,6 +105,7 @@ async fn group_default_roundtrip() {
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
             bucket: None,
+            bucket_template: None,
             default_target: Some(RoutingTargetRequest {
                 backend_id: None,
                 class: Some("cold".to_string()),
@@ -127,6 +128,7 @@ async fn group_default_roundtrip() {
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
             bucket: None,
+            bucket_template: None,
             default_target: None,
         }),
     )
@@ -145,6 +147,7 @@ async fn rejects_invalid_class() {
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
             bucket: None,
+            bucket_template: None,
             default_target: Some(RoutingTargetRequest {
                 backend_id: None,
                 class: Some("NOT VALID".to_string()),
@@ -167,6 +170,7 @@ async fn bucket_needs_storage() {
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
             bucket: Some("lab-default".to_string()),
+            bucket_template: None,
             default_target: Some(RoutingTargetRequest {
                 backend_id: None,
                 class: Some("cold".to_string()),
@@ -175,6 +179,23 @@ async fn bucket_needs_storage() {
     )
     .await;
 
+    assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
+
+    // A bucket template too.
+    let result = put_group_routing(
+        State(test.state.clone()),
+        Extension(Some(test.auth.clone())),
+        Path(test.group_id.to_string()),
+        Json(GroupRoutingRequest {
+            bucket: None,
+            bucket_template: Some("aruna-{bucket}".to_string()),
+            default_target: Some(RoutingTargetRequest {
+                backend_id: None,
+                class: Some("cold".to_string()),
+            }),
+        }),
+    )
+    .await;
     assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
 }
 

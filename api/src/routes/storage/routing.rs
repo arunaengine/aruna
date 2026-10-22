@@ -9,6 +9,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BackendRef, bucket_permission_path};
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule, target_warnings};
 use aruna_operations::driver::{drive, node_routing};
+use aruna_operations::groups::backends::query::GetBackendOperation;
 use aruna_operations::groups::default_rule::PutDefaultOperation;
 use aruna_operations::groups::storage_routing::{
     GroupInputsOperation, GroupRoutingOperation, PutGroupError, PutGroupOperation,
@@ -83,6 +84,10 @@ pub struct GroupRoutingRequest {
     /// created first. Omitted keeps the storage's stored default bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
+    /// Gives each new bucket its own provider bucket, like `aruna-{group}-{bucket}`, on a
+    /// target storage without a fixed bucket. Empty clears it; omitted keeps the stored one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -90,7 +95,32 @@ pub struct GroupRoutingResponse {
     pub group_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_target: Option<RoutingTargetRequest>,
+    /// The shared bucket of the target storage, if it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    /// The provider bucket template of the target storage for new buckets, if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_template: Option<String>,
     pub warnings: Vec<String>,
+}
+
+/// The shared bucket and the bucket template of a group storage target.
+async fn target_naming(
+    state: &ServerState,
+    group_id: Ulid,
+    target: Option<&RoutingTarget>,
+) -> ServerResult<(Option<String>, Option<String>)> {
+    let Some(RoutingTarget::Backend(BackendRef::Group(backend_id))) = target else {
+        return Ok((None, None));
+    };
+    let record = drive(GetBackendOperation::new(*backend_id), &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let record = record.filter(|record| record.group_id == group_id);
+    Ok(record.map_or((None, None), |record| {
+        let bucket = record.default_bucket().map(str::to_string);
+        (bucket, record.bucket_template())
+    }))
 }
 
 impl TryFrom<RoutingTargetRequest> for RoutingTarget {
@@ -457,9 +487,12 @@ pub async fn get_group_routing(
 
     let target = record.and_then(|record| record.default_target);
     let warnings = warnings_for(&state, group_id, target.iter()).await;
+    let (bucket, bucket_template) = target_naming(&state, group_id, target.as_ref()).await?;
     Ok(Json(GroupRoutingResponse {
         group_id: group_id.to_string(),
         default_target: target.map(Into::into),
+        bucket,
+        bucket_template,
         warnings,
     }))
 }
@@ -484,6 +517,11 @@ pub async fn get_group_routing(
 - A group storage without a fixed bucket takes Aruna's own layout in `bucket`. The bucket is found or
   created and tested with a write and a delete before anything is stored; the storage then lists it
   as `default_bucket` in its `public_config`. A later request without `bucket` keeps that bucket.
+- `bucket_template`, like `aruna-{group}-{bucket}`, gives each bucket created later its own
+  provider bucket on that storage, linked whole with the naming `{dir}{name}`; `{group}` is the
+  group's name in lowercase. Existing buckets stay where they are. An empty template clears it;
+  without it the storage keeps its stored template. The storage record keeps it as
+  `bucket_template`, and both responses return it with the shared `bucket`.
 - Clearing the target, or naming a class, returns new uploads to Aruna storage; files already on
   the group's storage stay there.
 
@@ -493,7 +531,9 @@ pub async fn get_group_routing(
   operator's node backend.
 - A `class` must be a valid storage class name.
 - `bucket` is only accepted with a `backend_id` of a storage without a fixed bucket. It follows the
-  S3 naming rules and must not be a bucket a linked folder of that storage uses."#,
+  S3 naming rules and must not be a bucket a linked folder of that storage uses.
+- `bucket_template` is only accepted like `bucket`. It must contain `{bucket}` and give S3 bucket
+  names."#,
     params(("group_id" = String, Path, description = "Group id as a 26-character ULID")),
     request_body(
         content = GroupRoutingRequest,
@@ -538,18 +578,20 @@ pub async fn put_group_routing(
         .transpose()?;
 
     let now = SystemTime::now();
+    let naming = request.bucket.is_some() || request.bucket_template.is_some();
     let record = match (target, request.bucket) {
         (Some(RoutingTarget::Backend(BackendRef::Group(backend_id))), bucket) => {
             let operation =
-                PutDefaultOperation::new(group_id, backend_id, bucket, auth.user_id, now);
+                PutDefaultOperation::new(group_id, backend_id, bucket, auth.user_id, now)
+                    .with_template(request.bucket_template);
             drive(operation, &state.get_ctx()).await
         }
-        (_, Some(_)) => {
+        _ if naming => {
             return Err(ServerError::BadRequestMessage(
-                "A bucket needs one of the group's storages as target.".to_string(),
+                "A bucket or template needs one of the group's storages as target.".to_string(),
             ));
         }
-        (target, None) => {
+        (target, _) => {
             let operation = PutGroupOperation::new(group_id, target, auth.user_id, now);
             drive(operation, &state.get_ctx()).await
         }
@@ -558,9 +600,12 @@ pub async fn put_group_routing(
 
     let target = record.default_target;
     let warnings = warnings_for(&state, group_id, target.iter()).await;
+    let (bucket, bucket_template) = target_naming(&state, group_id, target.as_ref()).await?;
     Ok(Json(GroupRoutingResponse {
         group_id: group_id.to_string(),
         default_target: target.map(Into::into),
+        bucket,
+        bucket_template,
         warnings,
     }))
 }

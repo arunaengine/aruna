@@ -15,7 +15,8 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::group_backend::{
-    BUCKET_STATE, DEFAULT_BUCKET, GroupStorage, LAYOUT_BUCKET, valid_bucket,
+    BUCKET_PREFIX, BUCKET_STATE, BUCKET_TEMPLATE, DEFAULT_BUCKET, GroupStorage, LAYOUT_BUCKET,
+    template_bucket, valid_bucket,
 };
 use aruna_core::structs::storage::routing::{GroupStorageRouting, RoutingError, RoutingTarget};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -46,6 +47,8 @@ pub struct PutDefaultOperation {
     group_id: GroupId,
     backend_id: Ulid,
     bucket: Option<String>,
+    /// The new `bucket_template`; empty clears it, `None` keeps the stored one.
+    template: Option<String>,
     updated_by: UserId,
     updated_at: SystemTime,
     imports: Vec<BackendImport>,
@@ -70,6 +73,7 @@ impl PutDefaultOperation {
             group_id,
             backend_id,
             bucket,
+            template: None,
             updated_by,
             updated_at,
             imports: Vec::new(),
@@ -79,6 +83,12 @@ impl PutDefaultOperation {
             txn_id: None,
             output: None,
         }
+    }
+
+    /// Gives each new bucket its own provider bucket from `template`, or clears it when empty.
+    pub fn with_template(mut self, template: Option<String>) -> Self {
+        self.template = template;
+        self
     }
 
     fn fail(&mut self, error: PutGroupError) -> Effects {
@@ -103,10 +113,18 @@ impl PutDefaultOperation {
     fn choose(&mut self, record: &GroupStorage) -> Result<Option<String>, PutGroupError> {
         let invalid = |reason: &str| Err(PutGroupError::Invalid(reason.to_string()));
         if !record.splits() {
-            return match self.bucket {
-                Some(_) => invalid("This storage has a fixed bucket."),
-                None => Ok(None),
+            return match (&self.bucket, &self.template) {
+                (Some(_), _) | (_, Some(_)) => invalid("This storage has a fixed bucket."),
+                (None, None) => Ok(None),
             };
+        }
+        let sample = |template: &str| template_bucket(template, "data", "group");
+        if let Some(template) = self.template.as_deref().filter(|t| !t.is_empty())
+            && (!template.contains("{bucket}") || !valid_bucket(&sample(template)))
+        {
+            return invalid(
+                "A bucket template needs {bucket} and gives S3 bucket names, like aruna-{bucket}.",
+            );
         }
         let Some(bucket) = self
             .bucket
@@ -261,6 +279,13 @@ impl PutDefaultOperation {
             if let Some(created) = created {
                 let state = if created { "created" } else { "found" };
                 config.insert(format!("{BUCKET_STATE}{bucket}"), state.to_string());
+            }
+            if let Some(template) = self.template.clone() {
+                config.remove(BUCKET_PREFIX);
+                match template.is_empty() {
+                    true => config.remove(BUCKET_TEMPLATE),
+                    false => config.insert(BUCKET_TEMPLATE.to_string(), template),
+                };
             }
             record.updated_at = self.updated_at;
             match record_writes(&record) {
@@ -427,13 +452,22 @@ mod tests {
         record: GroupStorage,
         imports: Vec<BackendImport>,
     ) -> (PutDefaultOperation, Effects) {
+        read_with((bucket, None), record, imports)
+    }
+
+    fn read_with(
+        (bucket, template): (Option<&str>, Option<&str>),
+        record: GroupStorage,
+        imports: Vec<BackendImport>,
+    ) -> (PutDefaultOperation, Effects) {
         let mut operation = PutDefaultOperation::new(
             group(),
             backend(),
             bucket.map(str::to_string),
             UserId::default(),
             SystemTime::UNIX_EPOCH,
-        );
+        )
+        .with_template(template.map(str::to_string));
         operation.start();
         let inputs = GroupRoutingInputs {
             backend_ids: BTreeSet::from([backend()]),
@@ -572,6 +606,59 @@ mod tests {
             (Some("x-y-z"), fixed),
         ] {
             let (operation, effects) = read(bucket, record, Vec::new());
+            assert!(effects.is_empty(), "{effects:?}");
+            assert!(matches!(
+                operation.finalize(),
+                Err(PutGroupError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn stores_bucket_template() {
+        // The template replaces a former prefix; the shared bucket stays.
+        let record = storage(&[
+            ("endpoint", "https://s3.lab"),
+            ("default_bucket", "lab-default"),
+            ("bucket_prefix", "lab-"),
+        ]);
+        let template = Some("aruna-{group}-{bucket}");
+        let (mut operation, effects) = read_with((None, template), record.clone(), Vec::new());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+        verified(&mut operation, &record, TxnId::from(5));
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one write, got {effects:?}");
+        };
+        let stored = GroupStorage::from_bytes(&writes[1].2).unwrap();
+        assert_eq!(stored.bucket_template().as_deref(), template);
+        assert_eq!(stored.default_bucket(), Some("lab-default"));
+        assert!(!stored.public_config.contains_key("bucket_prefix"));
+
+        // An empty template clears it; a bad one is refused before anything is written.
+        let (mut operation, _) = read_with((None, Some("")), stored.clone(), Vec::new());
+        verified(&mut operation, &stored, TxnId::from(6));
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one write, got {effects:?}");
+        };
+        assert_eq!(
+            GroupStorage::from_bytes(&writes[1].2)
+                .unwrap()
+                .bucket_template(),
+            None
+        );
+        for bad in ["aruna-data", "Aruna_{bucket}"] {
+            let (operation, effects) = read_with((None, Some(bad)), stored.clone(), Vec::new());
             assert!(effects.is_empty(), "{effects:?}");
             assert!(matches!(
                 operation.finalize(),
