@@ -40,6 +40,9 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(list_group_buckets))
 }
 
+/// Listing pages one bucket listing reads past while every bucket in them is hidden.
+const HIDDEN_PAGES: usize = 8;
+
 #[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
 pub struct BucketPageQuery {
     /// Buckets per page, 1 to 500; 200 when omitted.
@@ -659,8 +662,8 @@ pub async fn put_group_routing(
 - Else the bucket's own rule for all its keys, then the group default, decides: a group storage
   stores the files in its shared bucket or container (`shared`), and `backend_id` `null` means
   Aruna storage on this node.
-- Rules for single folders of a bucket are not shown, nor buckets the caller may not read; a page
-  may then hold fewer buckets than `limit` and still name `next`.
+- Rules for single folders of a bucket are not shown, nor buckets the caller may not read; `next`
+  names only a returned bucket. 8 listing pages of only hidden buckets answer 409.
 
 **Limits**
 - 1 to 500 buckets per page, 200 by default; pass `next` as `after` for the next page."#,
@@ -679,7 +682,8 @@ pub async fn put_group_routing(
         })),
         (status = 400, description = "Invalid group id or limit", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse)
+        (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
+        (status = 409, description = "Too many buckets in a row are hidden from the caller", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -690,6 +694,7 @@ pub async fn list_group_buckets(
     axum::extract::Query(page): axum::extract::Query<BucketPageQuery>,
 ) -> ServerResult<Json<BucketStoragePage>> {
     use aruna_operations::groups::bucket_storage::list_bucket_storage;
+    use aruna_operations::s3::bucket::list::bucket_cursor;
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_group_admin(&state, &auth, group_id).await?;
@@ -699,23 +704,42 @@ pub async fn list_group_buckets(
             "limit takes 1 to 500".to_string(),
         ));
     }
-    let (buckets, next) = list_bucket_storage(&state.get_ctx(), group_id, (page.after, limit))
-        .await
-        .map_err(ServerError::InternalError)?;
     let id = |id: Option<Ulid>| id.map(|id| id.to_string());
-    // A bucket the caller may not read is left out; `next` still follows the whole page.
-    let mut readable = Vec::with_capacity(buckets.len());
-    for found in buckets {
-        let path = bucket_permission_path(
-            state.get_realm_id(),
-            group_id,
-            state.get_node_id(),
-            &found.bucket,
-        );
-        if permission_granted(&state, &auth, path, Permission::READ).await? {
-            readable.push(found);
+    // Buckets the caller may not read are left out, and `next` names only a returned bucket.
+    let (mut readable, mut after, mut more) = (Vec::new(), page.after, false);
+    for _ in 0..HIDDEN_PAGES {
+        let wanted = (after.take(), limit - readable.len());
+        let (buckets, token) = list_bucket_storage(&state.get_ctx(), group_id, wanted)
+            .await
+            .map_err(ServerError::InternalError)?;
+        for found in buckets {
+            let path = bucket_permission_path(
+                state.get_realm_id(),
+                group_id,
+                state.get_node_id(),
+                &found.bucket,
+            );
+            if permission_granted(&state, &auth, path, Permission::READ).await? {
+                readable.push(found);
+            }
+        }
+        (more, after) = (token.is_some(), token);
+        if !more || readable.len() == limit {
+            break;
         }
     }
+    if more && readable.is_empty() {
+        return Err(ServerError::Conflict(
+            "too many buckets in a row are hidden from the caller".to_string(),
+        ));
+    }
+    let next = match (more, readable.last()) {
+        (true, Some(last)) => Some(
+            bucket_cursor(&last.bucket)
+                .map_err(|error| ServerError::InternalError(error.to_string()))?,
+        ),
+        _ => None,
+    };
     let buckets = readable
         .into_iter()
         .map(|found| BucketStorageResponse {

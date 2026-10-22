@@ -200,6 +200,11 @@ impl ListBucketsOperation {
     }
 }
 
+/// The continuation token that resumes a listing right after `bucket`.
+pub fn bucket_cursor(bucket: &str) -> Result<String, ConversionError> {
+    encode_cursor(&Key::from(bucket.as_bytes().to_vec()))
+}
+
 fn encode_cursor(key: &Key) -> Result<String, ConversionError> {
     let bytes = postcard::to_allocvec(&key.to_vec())?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))

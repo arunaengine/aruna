@@ -267,5 +267,6 @@ async fn lists_readable_buckets() {
         },
     ]);
     let Json(page) = list(admin_only).await.unwrap();
-    assert!(page.buckets.is_empty());
+    // The cursor never names a bucket the caller may not see.
+    assert!(page.buckets.is_empty() && page.next.is_none());
 }
