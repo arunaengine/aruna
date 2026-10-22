@@ -257,4 +257,10 @@ async fn bounds_large_totals() {
     assert_eq!((page.total, page.complete), (TOTAL_SCAN as u64, false));
     assert_eq!(page.entries.len(), DEFAULT_PAGE);
     assert!(page.next.is_some());
+    // A filter that matches nothing still stops at the key bound and names where.
+    let page = preview_page(&context, &plan(), &scope, (Some("absent"), None, 100))
+        .await
+        .unwrap();
+    assert_eq!((page.total, page.complete), (0, false));
+    assert!(page.entries.is_empty() && page.next.is_some());
 }

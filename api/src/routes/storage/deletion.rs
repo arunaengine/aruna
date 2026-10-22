@@ -37,6 +37,8 @@ const DEFAULT_PREFLIGHT_LIMIT: usize = 1_000;
 const MAX_PREFLIGHT_LIMIT: usize = 1_000;
 /// Listing pages a delete preview reads past while every version in them is hidden.
 const HIDDEN_PAGES: usize = 64;
+/// Versions one delete preview page passes over at most, hidden or filtered out ones included.
+const PAGE_VERSIONS: usize = 10_000;
 
 #[derive(OpenApi)]
 #[openapi()]
@@ -588,7 +590,9 @@ pub struct DeleteImpact {
 
 **Limits**
 - 1 to 1000 entries per page. Totals pass over at most 5,000 versions, hidden ones
-  included; `complete` is then false and the totals are lower bounds. 64 listing pages of only hidden versions answer 409."#,
+  included; `complete` is then false and the totals are lower bounds. A page passes over at most
+  10,000 versions, also with a filter, and then names `next`. 64 listing pages of only hidden
+  versions answer 409."#,
     params(("bucket" = String, Path, description = "Bucket to inspect")),
     request_body(content = DeleteImpactRequest, example = json!({"kind": "folder", "key": "raw/"})),
     responses(
@@ -656,7 +660,7 @@ pub async fn delete_preview(
         .await
         .map_err(ServerError::InternalError)?;
     let (mut items, mut marker) = (Vec::new(), (key_marker, version_marker));
-    let (mut next, mut more) = (None, false);
+    let (mut next, mut more, mut passed) = (None, false, 0);
     for _ in 0..HIDDEN_PAGES {
         let page = drive(
             ListVersionsOperation::new(ListVersionsInput {
@@ -672,6 +676,7 @@ pub async fn delete_preview(
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
         let (page, truncated, next_key, next_version) = scoped_version_page(&scope, page);
+        passed += page.len();
         let mut last_seen = None;
         for item in page {
             let (ListVersionsItem::Version {
@@ -698,7 +703,7 @@ pub async fn delete_preview(
         }
         // A cursor names only a version the caller may read.
         next = last_seen.or(next);
-        if items.len() == limit {
+        if items.len() == limit || passed >= PAGE_VERSIONS {
             break;
         }
         marker = (next_key, next_version);

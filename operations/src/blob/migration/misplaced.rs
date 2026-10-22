@@ -185,8 +185,8 @@ async fn read_location(
 pub const DEFAULT_PAGE: usize = 100;
 pub const MAX_PAGE: usize = 1000;
 /// Version rows one rename preview passes over at most, for its totals and for its page.
-const TOTAL_ROWS: usize = 2_000_000;
-const PAGE_ROWS: usize = 200_000;
+const TOTAL_ROWS: usize = 10_000;
+const PAGE_ROWS: usize = 10_000;
 /// Versions one rename preview checks at most, for its totals and again for its page.
 const PAGE_CHECKS: usize = 5_000;
 
@@ -344,7 +344,7 @@ mod tests {
     #[tokio::test]
     async fn bounds_rename_preview() {
         let (_directory, context) = setup().await;
-        for index in 0..=PAGE_CHECKS {
+        for index in 0..=PAGE_ROWS {
             let id = Ulid::from_parts(10, 1);
             let version = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
             let key = VersionKey::new(BUCKET, format!("k{index:05}"), id);
@@ -361,15 +361,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((page.total, page.complete), (0, false));
-        let next = page.next.expect("a bounded page names where it stopped");
-        let rest = rename_page(
-            &context,
-            (BUCKET, ""),
-            (&all, &all),
-            (None, Some(next), 100),
-        )
-        .await
-        .unwrap();
-        assert_eq!((rest.entries.len(), rest.next), (0, None));
+        let (mut after, mut pages) = (page.next, 1);
+        while let Some(next) = after {
+            let rest = rename_page(
+                &context,
+                (BUCKET, ""),
+                (&all, &all),
+                (None, Some(next), 100),
+            )
+            .await
+            .unwrap();
+            assert!(rest.entries.is_empty());
+            (after, pages) = (rest.next, pages + 1);
+        }
+        assert_eq!(pages, 3);
+        // A filter that matches nothing still stops at the row bound and names where.
+        let filtered = (Some("absent"), None, 100);
+        let page = rename_page(&context, (BUCKET, ""), (&all, &all), filtered)
+            .await
+            .unwrap();
+        assert_eq!((page.total, page.complete), (0, false));
+        assert!(page.next.is_some());
     }
 }

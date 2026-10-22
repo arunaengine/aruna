@@ -439,7 +439,7 @@ async fn bounds_large_preview() {
     let (_directory, context) = setup().await;
     twins(&context, "a.faa.gz", 10).await;
     // Version rows sort by key length first, so these longer keys follow the twins.
-    for index in 0..PREVIEW_CHECKS {
+    for index in 0..PAGE_SCAN {
         let id = Ulid::from_parts(100, 1);
         let version = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
         let key = VersionKey::new(BUCKET, format!("b{index:08}"), id);
@@ -459,10 +459,23 @@ async fn bounds_large_preview() {
         (page.keys, page.complete, page.entries.len()),
         (1, false, 1)
     );
-    let next = page.next.expect("a bounded page names where it stopped");
-    let rest = preview_page(&context, (BUCKET, ""), &access, (None, Some(next), 100))
+    let (mut after, mut pages) = (page.next, 1);
+    while let Some(next) = after {
+        let rest = preview_page(&context, (BUCKET, ""), &access, (None, Some(next), 100))
+            .await
+            .unwrap();
+        assert!(rest.entries.is_empty());
+        (after, pages) = (rest.next, pages + 1);
+    }
+    assert_eq!(pages, 3);
+    // A filter that matches nothing still stops at the row bound and names where.
+    let filtered = (Some("absent"), None, 100);
+    let page = preview_page(&context, (BUCKET, ""), &access, filtered)
         .await
         .unwrap();
-    assert!(rest.entries.is_empty());
-    assert_eq!(rest.next, None);
+    assert_eq!(
+        (page.keys, page.complete, page.entries.len()),
+        (0, false, 0)
+    );
+    assert!(page.next.is_some());
 }

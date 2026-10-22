@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 pub const DEFAULT_PAGE: usize = 100;
 pub const MAX_PAGE: usize = 1000;
 /// Bucket keys one preview request passes over at most, for its page and for its totals.
-const PAGE_SCAN: usize = 200_000;
-const TOTAL_SCAN: usize = 20_000;
+const PAGE_SCAN: usize = 10_000;
+const TOTAL_SCAN: usize = 10_000;
 /// Keys one job page re-maps at most, and bucket keys it passes over at most.
 const JOB_KEYS: usize = 256;
 const JOB_SCAN: usize = 20_000;

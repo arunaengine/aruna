@@ -35,8 +35,8 @@ use ulid::Ulid;
 
 /// Version rows one storage read returns, and one preview or job page passes over at most.
 const VERSION_PAGE: usize = 1024;
-const PAGE_SCAN: usize = 200_000;
-const TOTAL_SCAN: usize = 2_000_000;
+const PAGE_SCAN: usize = 10_000;
+const TOTAL_SCAN: usize = 10_000;
 const JOB_SCAN: usize = 20_000;
 /// Keys one preview request checks for copies at most, for its totals and again for its page.
 const PREVIEW_CHECKS: usize = 5_000;
