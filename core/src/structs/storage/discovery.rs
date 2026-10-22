@@ -14,10 +14,9 @@ pub const MAX_DISCOVERY_RULES: usize = 32;
 /// Characters one pattern may hold, which bounds every match and overlap check.
 pub const MAX_PATTERN_LEN: usize = 128;
 
-/// Sends an unmapped file whose name matches `pattern` to `folder` of the bucket. `*` matches
-/// any text, `?` one character, `[0-9]` one of a set, `{4}` or `{2,8}` repeats a set or `?`
-/// and `{fna,fa}` either text. A `pattern` like `lars/{name}` takes the files below that
-/// storage folder instead. Uploads below `folder` go back the same way.
+/// Sends an unmapped file whose name matches the glob `pattern` (`*`, `?`, `[0-9]`, `{2,8}`,
+/// `{fna,fa}`) to `folder` of the bucket; `lars/{name}` takes the files below that storage
+/// folder instead. Uploads below `folder` go back the same way.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiscoveryRule {
     pub pattern: String,
@@ -469,7 +468,10 @@ mod tests {
         let rules = [rule("*.faa", "proteins/"), rule("lars/{name}", "foobar/")];
         // Uploads below an Aruna folder go to the storage path; other paths stay.
         assert_eq!(storage_path(&rules, "proteins/a/x.faa"), "a/x.faa");
-        assert_eq!(storage_path(&rules, "proteins/readme.txt"), "proteins/readme.txt");
+        assert_eq!(
+            storage_path(&rules, "proteins/readme.txt"),
+            "proteins/readme.txt"
+        );
         assert_eq!(storage_path(&rules, "foobar/sub/x"), "lars/sub/x");
         assert_eq!(storage_path(&rules, "other/x.faa"), "other/x.faa");
         // Files found in storage come back to the same Aruna paths.
@@ -484,5 +486,4 @@ mod tests {
         assert_eq!(found("lars/sub/x.faa"), "foobar/sub/x.faa");
         assert_eq!(found("other/y.txt"), "other/y.txt");
     }
-
 }

@@ -732,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn needs_no_shared_bucket() {
+    fn skips_shared_bucket() {
         // Own provider buckets work on a new storage without a shared bucket.
         let record = storage(&[("endpoint", "https://s3.lab")]);
         let template = Some("aruna-{bucket}");

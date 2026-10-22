@@ -11,7 +11,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
-    IMPORT_DISCOVERY_KEYSPACE, IMPORT_PATTERN_KEYSPACE, JOB_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    IMPORT_DISCOVERY_KEYSPACE, IMPORT_PATTERN_KEYSPACE, JOB_KEYSPACE, S3_BUCKET_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::job_record_key;
@@ -152,7 +153,10 @@ impl ChangeImportOperation {
         let (storage, bucket) = (values.next().flatten(), values.next().flatten());
         let (encryption, mappings) = (values.next().flatten(), values.next().flatten());
         let run = values.next().flatten();
-        let mappings = mappings.as_deref().map(DiscoveryRules::from_bytes).transpose();
+        let mappings = mappings
+            .as_deref()
+            .map(DiscoveryRules::from_bytes)
+            .transpose();
         match mappings.map(|rules| rules.unwrap_or_default()) {
             Ok(rules) => {
                 if let Err(reason) = check_naming(&rules.rules, &record.write_pattern) {
@@ -684,7 +688,13 @@ mod tests {
         };
         let mappings = Some(mappings.to_bytes().unwrap().into());
         let (mut operation, effects) = read(&linked, Some("{name}~{id}"));
-        check_on(&mut operation, &effects, (None, None, mappings), storage(true), None);
+        check_on(
+            &mut operation,
+            &effects,
+            (None, None, mappings),
+            storage(true),
+            None,
+        );
         assert!(matches!(
             operation.finalize(),
             Err(ImportRuleError::Invalid(_))

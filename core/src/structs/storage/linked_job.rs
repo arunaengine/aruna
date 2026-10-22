@@ -194,10 +194,16 @@ mod tests {
     fn skips_moved_keys() {
         // A mapping's Apply moves root keys once; keys in its folder stay where they are.
         let plan = plan("", "proteins/{dir}{name}", true);
-        assert_eq!(plan.target("a/b.faa.gz").as_deref(), Some("proteins/a/b.faa.gz"));
+        assert_eq!(
+            plan.target("a/b.faa.gz").as_deref(),
+            Some("proteins/a/b.faa.gz")
+        );
         assert_eq!(plan.target("proteins/b.faa.gz"), None);
         let same = plan_in("raw/", "raw/{name}.old");
-        assert_eq!(same.target("raw/b.faa.gz").as_deref(), Some("raw/b.faa.gz.old"));
+        assert_eq!(
+            same.target("raw/b.faa.gz").as_deref(),
+            Some("raw/b.faa.gz.old")
+        );
     }
 
     fn plan_in(from: &str, template: &str) -> RemapPlan {

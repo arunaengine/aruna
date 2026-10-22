@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::{DriverContext, drive};
-use crate::groups::backends::query::GetBackendOperation;
 use crate::effect_adapters::routing::node_routing;
+use crate::groups::backends::query::GetBackendOperation;
 use crate::groups::storage_routing::GroupInputsOperation;
 use crate::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
 use aruna_core::effects::StorageEffect;
@@ -58,7 +58,9 @@ pub async fn list_bucket_storage(
         .await
         .map_err(|error| error.to_string())?;
     let encrypted = encrypted_buckets(context, &page.buckets).await?;
-    let mut snapshot = node_routing(context).snapshot(group_id).with_group_inputs(inputs);
+    let mut snapshot = node_routing(context)
+        .snapshot(group_id)
+        .with_group_inputs(inputs);
     let mut storages = HashMap::new();
     let mut found = Vec::with_capacity(page.buckets.len());
     for ((bucket, info), encrypted) in page.buckets.into_iter().zip(encrypted) {
@@ -114,8 +116,8 @@ async fn encrypted_buckets(
 /// Where uploads of `bucket` go: a whole-bucket link's write folder, else the backend an
 /// upload resolves to. Encoded uploads keep Aruna's layout and skip the link.
 fn destination(snapshot: &RoutingSnapshot, bucket: &str, encoded: bool) -> BucketStorage {
-    let link = (snapshot.imports.iter())
-        .find(|rule| rule.bucket == bucket && rule.key_prefix.is_empty());
+    let link =
+        (snapshot.imports.iter()).find(|rule| rule.bucket == bucket && rule.key_prefix.is_empty());
     if let Some(rule) = link.filter(|_| !encoded) {
         return BucketStorage {
             bucket: bucket.to_string(),
@@ -218,11 +220,16 @@ mod tests {
             imports: vec![link("genes", "genes/", ""), link("lab", "raw/", "in/")],
             ..GroupRoutingInputs::default()
         };
-        let snapshot = RoutingSnapshot::new(Ulid::from_parts(1, 1), catalog).with_group_inputs(inputs);
+        let snapshot =
+            RoutingSnapshot::new(Ulid::from_parts(1, 1), catalog).with_group_inputs(inputs);
         // A redirected link shows where its uploads go, not where it reads.
         let found = named(destination(&snapshot, "genes", false), &storages);
         assert_eq!(
-            (found.backend_id, found.folder.as_deref(), found.provider_bucket.as_deref()),
+            (
+                found.backend_id,
+                found.folder.as_deref(),
+                found.provider_bucket.as_deref()
+            ),
             (Some(WRITES), Some("out/"), Some("out"))
         );
         assert_eq!(found.import_id, Some(Ulid::from_parts(3, 3)));
@@ -241,7 +248,11 @@ mod tests {
         let lab = snapshot.with_bucket_rules(vec![rule]);
         let found = named(destination(&lab, "lab", false), &storages);
         assert_eq!(
-            (found.backend_id, found.shared, found.provider_bucket.as_deref()),
+            (
+                found.backend_id,
+                found.shared,
+                found.provider_bucket.as_deref()
+            ),
             (Some(WRITES), true, Some("aruna-spire"))
         );
     }

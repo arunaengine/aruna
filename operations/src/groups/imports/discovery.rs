@@ -696,7 +696,10 @@ mod tests {
         let both = [rule("*.faa", "proteins/"), rule("lars/{name}", "foobar/")];
         assert!(check_rules(&both).is_ok());
         for bad in [
-            vec![rule("lars/{name}", "foobar/"), rule("lars/sub/{name}", "other/")],
+            vec![
+                rule("lars/{name}", "foobar/"),
+                rule("lars/sub/{name}", "other/"),
+            ],
             vec![rule("lars/{name}", "proteins/"), rule("*.faa", "proteins/")],
             vec![rule("../{name}", "foobar/")],
             vec![rule("la*/{name}", "foobar/")],

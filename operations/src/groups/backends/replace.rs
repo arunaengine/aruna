@@ -460,7 +460,7 @@ mod pure_tests {
     }
 
     #[test]
-    fn keeps_keys_and_config() {
+    fn keeps_stored_keys() {
         // A change of name and public fields without keys keeps the stored keys and the
         // config Aruna manages.
         use aruna_core::structs::storage::group_backend::{DEFAULT_BUCKET, GroupStorageSecret};

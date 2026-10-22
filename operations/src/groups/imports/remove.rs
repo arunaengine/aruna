@@ -11,8 +11,8 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     IMPORT_DISCOVERY_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORT_PATTERN_KEYSPACE,
-    IMPORT_REMOVAL_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, RENAMED_ROW_KEYSPACE,
-    S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    IMPORT_REMOVAL_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, RENAMED_ROW_KEYSPACE, S3_BUCKET_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{
@@ -354,7 +354,10 @@ impl Operation for RemoveImportOperation {
                     self.state = RemoveState::CheckStorage;
                     smallvec![Effect::Storage(StorageEffect::BatchRead {
                         reads: vec![
-                            (STORAGE_BACKEND_KEYSPACE.to_string(), backend_key(rule.backend_id)),
+                            (
+                                STORAGE_BACKEND_KEYSPACE.to_string(),
+                                backend_key(rule.backend_id)
+                            ),
                             (
                                 S3_BUCKET_KEYSPACE.to_string(),
                                 rule.bucket.as_bytes().to_vec().into(),
@@ -645,7 +648,8 @@ mod tests {
         // A 1:1 link on a storage without a shared bucket is all the bucket has.
         let mut rule = crate::s3::bucket::rename::tests::rule();
         rule.backend_prefix = "lab/".to_string();
-        rule.write_pattern = aruna_core::structs::storage::backend_import::PLAIN_PATTERN.to_string();
+        rule.write_pattern =
+            aruna_core::structs::storage::backend_import::PLAIN_PATTERN.to_string();
         assert!(rule.mapped_bucket().is_some());
         let record = GroupStorage {
             backend_id: rule.backend_id,
@@ -661,7 +665,9 @@ mod tests {
         };
         let mut operation = RemoveImportOperation::new(rule.group_id, rule.import_id);
         operation.start();
-        operation.step(storage(StorageEvent::TransactionStarted { txn_id: TxnId::from(7) }));
+        operation.step(storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from(7),
+        }));
         operation.step(storage(StorageEvent::BatchReadResult {
             values: vec![
                 (Key::from(Vec::new()), Some(rule.to_bytes().unwrap().into())),
@@ -670,7 +676,10 @@ mod tests {
         }));
         operation.step(storage(StorageEvent::BatchReadResult {
             values: vec![
-                (Key::from(Vec::new()), Some(record.to_bytes().unwrap().into())),
+                (
+                    Key::from(Vec::new()),
+                    Some(record.to_bytes().unwrap().into()),
+                ),
                 (Key::from(Vec::new()), Some(Value::from(vec![1]))),
             ],
         }));

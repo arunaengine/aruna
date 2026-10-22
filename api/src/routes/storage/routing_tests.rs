@@ -256,16 +256,23 @@ async fn lists_readable_buckets() {
         )
     };
     let Json(page) = list(test.auth.clone()).await.unwrap();
-    let names: Vec<_> = page.buckets.iter().map(|found| found.bucket.as_str()).collect();
+    let names: Vec<_> = page
+        .buckets
+        .iter()
+        .map(|found| found.bucket.as_str())
+        .collect();
     assert_eq!(names, [test.bucket.as_str()]);
     // A token for the admin path alone sees no bucket it may not read.
     let mut admin_only = test.auth.clone();
-    admin_only.path_restrictions = Some(vec![
-        aruna_core::structs::identity::auth::PathRestriction {
-            pattern: format!("/{}/g/{}/admin/**", test.state.get_realm_id(), test.group_id),
+    admin_only.path_restrictions =
+        Some(vec![aruna_core::structs::identity::auth::PathRestriction {
+            pattern: format!(
+                "/{}/g/{}/admin/**",
+                test.state.get_realm_id(),
+                test.group_id
+            ),
             permission: Permission::WRITE,
-        },
-    ]);
+        }]);
     let Json(page) = list(admin_only).await.unwrap();
     // The cursor never names a bucket the caller may not see.
     assert!(page.buckets.is_empty() && page.next.is_none());

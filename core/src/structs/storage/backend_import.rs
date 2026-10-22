@@ -84,7 +84,7 @@ impl BackendImport {
             && self.write_backend() == self.backend_id
             && self.write_folder() == self.backend_prefix
             && self.write_pattern == PLAIN_PATTERN)
-        .then_some(bucket)
+            .then_some(bucket)
     }
 
     /// Without `{id}` a write replaces the file of the same name.
