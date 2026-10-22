@@ -747,7 +747,8 @@ key the caller may read are counted and listed.
 
 **Limits**
 - Pages hold 1 to 1000 files, in storage order; `next` resumes after the last version passed
-  over and names only keys the caller may read. Totals pass over at most 2,000,000 version rows."#,
+  over and names only keys the caller may read. Totals and a page each check at most 5,000
+  versions; `complete` is then false and `count` is a lower bound."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
         ("import_id" = String, Path, description = "Rule to check, as a 26-character ULID"),
