@@ -25,7 +25,7 @@ use aruna_core::structs::storage::backend_import::{
 };
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::discovery::{
-    DiscoveryRule, DiscoveryRules, IdentityError, check_patterns, file_identity,
+    DiscoveryRule, DiscoveryRules, IdentityError, check_naming, check_patterns, file_identity,
 };
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -77,8 +77,14 @@ impl SetDiscoveryOperation {
     }
 
     fn write(&mut self, rule: Option<aruna_core::types::Value>) -> Effects {
-        if rule.is_none() {
+        let Some(rule) = rule else {
             return self.fail(ImportRuleError::NotFound);
+        };
+        let pattern = BackendImport::from_bytes(&rule).map(|rule| rule.write_pattern);
+        match pattern.map(|pattern| check_naming(&self.rules, &pattern)) {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => return self.fail(ImportRuleError::Invalid(reason)),
+            Err(error) => return self.fail(error.into()),
         }
         let key = import_key(self.group_id, self.import_id);
         let effect = match self.rules.is_empty() {
@@ -718,8 +724,24 @@ mod tests {
     }
 
     #[test]
+    fn needs_dir_naming() {
+        // A storage folder mapping would lose its folder under a naming without `{dir}`.
+        let folders = vec![DiscoveryRule {
+            pattern: "lars/{name}".to_string(),
+            folder: "foobar/".to_string(),
+        }];
+        let mut rule = import_rule();
+        rule.write_pattern = "{name}~{id}".to_string();
+        let (operation, _) = written(folders, Some(rule.to_bytes().unwrap()));
+        assert!(matches!(
+            operation.finalize(),
+            Err(ImportRuleError::Invalid(_))
+        ));
+    }
+
+    #[test]
     fn stores_with_rule() {
-        let (mut operation, effects) = written(rules(), Some(vec![1]));
+        let (mut operation, effects) = written(rules(), Some(import_rule().to_bytes().unwrap()));
         let [
             Effect::Storage(StorageEffect::Write {
                 key_space,
@@ -743,7 +765,7 @@ mod tests {
         assert_eq!(operation.finalize(), Ok(rules()));
 
         // A delete answer does not count for a write.
-        let (mut wrong, _) = written(rules(), Some(vec![1]));
+        let (mut wrong, _) = written(rules(), Some(import_rule().to_bytes().unwrap()));
         wrong.step(storage(StorageEvent::DeleteResult {
             key: Vec::new().into(),
         }));
@@ -753,7 +775,7 @@ mod tests {
         ));
 
         // No rules delete the row.
-        let (_, effects) = written(Vec::new(), Some(vec![1]));
+        let (_, effects) = written(Vec::new(), Some(import_rule().to_bytes().unwrap()));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Delete { key_space, .. })]

@@ -204,6 +204,15 @@ pub fn file_identity(
     })
 }
 
+/// A storage folder pattern needs a write pattern with `{dir}`, which keeps the storage folder.
+pub fn check_naming(rules: &[DiscoveryRule], write_pattern: &str) -> Result<(), String> {
+    let folders = rules.iter().any(|rule| rule.storage_folder().is_some());
+    match folders && !write_pattern.contains("{dir}") {
+        true => Err("a `<folder>/{name}` mapping needs a naming with `{dir}`".to_string()),
+        false => Ok(()),
+    }
+}
+
 /// Where an upload to `path`, relative to the rule's `key_prefix`, goes below the rule's
 /// folder: a storage folder pattern swaps its Aruna folder for the storage folder, and a file
 /// name pattern drops its Aruna folder when the name matches. Other paths stay.
