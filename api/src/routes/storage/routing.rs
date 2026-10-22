@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{parse_group_id, require_realm_auth};
+use crate::auth::{parse_group_id, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -659,7 +659,8 @@ pub async fn put_group_routing(
 - Else the bucket's own rule for all its keys, then the group default, decides: a group storage
   stores the files in its shared bucket or container (`shared`), and `backend_id` `null` means
   Aruna storage on this node.
-- Rules for single folders of a bucket are not shown.
+- Rules for single folders of a bucket are not shown, nor buckets the caller may not read; a page
+  may then hold fewer buckets than `limit` and still name `next`.
 
 **Limits**
 - 1 to 500 buckets per page, 200 by default; pass `next` as `after` for the next page."#,
@@ -702,7 +703,20 @@ pub async fn list_group_buckets(
         .await
         .map_err(ServerError::InternalError)?;
     let id = |id: Option<Ulid>| id.map(|id| id.to_string());
-    let buckets = buckets
+    // A bucket the caller may not read is left out; `next` still follows the whole page.
+    let mut readable = Vec::with_capacity(buckets.len());
+    for found in buckets {
+        let path = bucket_permission_path(
+            state.get_realm_id(),
+            group_id,
+            state.get_node_id(),
+            &found.bucket,
+        );
+        if permission_granted(&state, &auth, path, Permission::READ).await? {
+            readable.push(found);
+        }
+    }
+    let buckets = readable
         .into_iter()
         .map(|found| BucketStorageResponse {
             bucket: found.bucket,
