@@ -367,6 +367,9 @@ including request policies. Tokens with path restrictions are refused.
   bucket, such as a running import.
 - Pages are in key order and stay stable while nothing changes. The move itself checks every key
   again; opening the preview is not needed to start it.
+- A key already below the target's own folder, the fixed part of `target` before its first
+  placeholder, is not selected when that folder lies outside `from`; so a mapping's Apply moves
+  each key once.
 
 **Limits**
 - 1 to 1000 entries per page. Totals count at most 10,000 keys; `complete` is then false and
