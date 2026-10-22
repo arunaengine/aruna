@@ -22,6 +22,7 @@ use super::{
 
 use super::read::ensure_permission;
 use crate::metadata::search_cursor::tie_order;
+use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
 
 pub(super) async fn resolve_preflight_targets(
     context: &DriverContext,
@@ -204,7 +205,18 @@ pub(super) async fn resolve_preflight_versions(
     bucket: &str,
     prefix: Option<&str>,
 ) -> Result<(Vec<(VersionKey, BlobVersion)>, bool), MetadataApiError> {
-    let (heads, more) = scan_preflight_heads(context, bucket, prefix).await?;
+    let prefix_key = match prefix {
+        Some(prefix) => BlobHeadKey::object_prefix(bucket, prefix),
+        None => BlobHeadKey::bucket_prefix(bucket),
+    }
+    .map_err(|_| MetadataApiError::BadRequest)?;
+    let (heads, more) = scan_preflight_rows(
+        context,
+        BLOB_HEAD_KEYSPACE,
+        prefix_key.into(),
+        MAX_TARGET_VERSIONS,
+    )
+    .await?;
     let mut versions = Vec::with_capacity(heads.len());
     for (key, value) in heads {
         let head = BlobHeadKey::from_bytes(key.as_ref())
@@ -231,27 +243,32 @@ pub(super) async fn resolve_preflight_versions(
     Ok((versions, !more))
 }
 
-/// Resolves at most `MAX_TARGET_VERSIONS` versions of the keys under the prefix.
-/// Keys come from heads like the purge listing, so only rows in the scope are read.
+/// Resolves at most `MAX_TARGET_VERSIONS` versions under the prefix, also those without a head.
+/// Version rows sort by key length first, so each key length is one range of rows.
 pub(super) async fn resolve_all_preflight(
     context: &DriverContext,
     bucket: &str,
     key_prefix: Option<&str>,
 ) -> Result<(Vec<(VersionKey, BlobVersion)>, bool), MetadataApiError> {
-    let (heads, mut more) = scan_preflight_heads(context, bucket, key_prefix).await?;
+    let bucket_rows =
+        VersionKey::bucket_prefix(bucket).map_err(|_| MetadataApiError::BadRequest)?;
+    let ranges = match key_prefix {
+        None => vec![bucket_rows],
+        Some(prefix) => (prefix.len()..=MAX_KEY_LEN)
+            .map(|length| {
+                let mut range = bucket_rows.clone();
+                range.extend(postcard::to_allocvec(&length)?);
+                range.extend(prefix.as_bytes());
+                Ok(range)
+            })
+            .collect::<Result<Vec<_>, postcard::Error>>()
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?,
+    };
     let mut versions = Vec::new();
-    for (key, _) in heads {
+    for range in ranges {
         let remaining = MAX_TARGET_VERSIONS - versions.len();
-        if remaining == 0 {
-            more = true;
-            break;
-        }
-        let head = BlobHeadKey::from_bytes(key.as_ref())
-            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-        let prefix = VersionKey::object_prefix(bucket, &head.key)
-            .map_err(|_| MetadataApiError::BadRequest)?;
-        let (rows, cut) =
-            scan_preflight_rows(context, BLOB_VERSIONS_KEYSPACE, prefix.into(), remaining).await?;
+        let (rows, more) =
+            scan_preflight_rows(context, BLOB_VERSIONS_KEYSPACE, range.into(), remaining).await?;
         for (key, value) in rows {
             let version_key = VersionKey::from_bytes(key.as_ref())
                 .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
@@ -259,31 +276,11 @@ pub(super) async fn resolve_all_preflight(
                 .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
             versions.push((version_key, version));
         }
-        if cut {
-            more = true;
-            break;
+        if more {
+            return Ok((versions, false));
         }
     }
-    Ok((versions, !more))
-}
-
-async fn scan_preflight_heads(
-    context: &DriverContext,
-    bucket: &str,
-    prefix: Option<&str>,
-) -> Result<(Vec<(Key, Value)>, bool), MetadataApiError> {
-    let prefix_key = match prefix {
-        Some(prefix) => BlobHeadKey::object_prefix(bucket, prefix),
-        None => BlobHeadKey::bucket_prefix(bucket),
-    }
-    .map_err(|_| MetadataApiError::BadRequest)?;
-    scan_preflight_rows(
-        context,
-        BLOB_HEAD_KEYSPACE,
-        prefix_key.into(),
-        MAX_TARGET_VERSIONS,
-    )
-    .await
+    Ok((versions, true))
 }
 
 /// Reads at most `limit` rows under the prefix; true reports that more rows exist.

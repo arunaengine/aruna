@@ -339,7 +339,7 @@ async fn preflight_stage_failures() {
     assert!(matches!(denied, Err(MetadataApiError::ServiceUnavailable)));
 }
 
-async fn write_versions(test: &MetadataTest, key: &str, count: u8) {
+async fn write_versions(test: &MetadataTest, key: &str, count: u8, head: bool) {
     let user = UserId::nil(RealmId::from_bytes([80u8; 32]));
     let mut rows = Vec::new();
     for index in 0..count {
@@ -347,9 +347,11 @@ async fn write_versions(test: &MetadataTest, key: &str, count: u8) {
         let version = VersionKey::new("genes", key, version_id);
         let value = BlobVersion::deleted(SystemTime::UNIX_EPOCH, user);
         rows.push((BLOB_VERSIONS_KEYSPACE, version.to_bytes(), value.to_bytes()));
-        let head = BlobHeadKey::new("genes", key).to_bytes();
-        let pointer = CurrentVersionPointer::new(version_id).to_bytes();
-        rows.push((BLOB_HEAD_KEYSPACE, head, pointer));
+        if head {
+            let head = BlobHeadKey::new("genes", key).to_bytes();
+            let pointer = CurrentVersionPointer::new(version_id).to_bytes();
+            rows.push((BLOB_HEAD_KEYSPACE, head, pointer));
+        }
     }
     for (key_space, key, value) in rows {
         let event = test
@@ -373,7 +375,7 @@ async fn write_versions(test: &MetadataTest, key: &str, count: u8) {
 async fn large_scope_bounded() {
     let test = metadata_test();
     for index in 0..130 {
-        write_versions(&test, &format!("big/{index:03}"), 1).await;
+        write_versions(&test, &format!("big/{index:03}"), 1, true).await;
     }
     let (heads, complete) = resolve_preflight_versions(&test.context, "genes", None)
         .await
@@ -392,9 +394,9 @@ async fn large_scope_bounded() {
 #[tokio::test]
 async fn exact_key_purge() {
     let test = metadata_test();
-    write_versions(&test, "a", 3).await;
-    write_versions(&test, "solo", 2).await;
-    write_versions(&test, "zeta", 4).await;
+    write_versions(&test, "a", 3, true).await;
+    write_versions(&test, "solo", 2, true).await;
+    write_versions(&test, "zeta", 4, true).await;
     let (versions, complete) = resolve_all_preflight(&test.context, "genes", Some("solo"))
         .await
         .expect("exact key resolves");
@@ -405,4 +407,27 @@ async fn exact_key_purge() {
         .await
         .expect("exact head resolves");
     assert_eq!((heads.len(), complete), (1, true));
+}
+
+#[tokio::test]
+async fn headless_versions_purge() {
+    let test = metadata_test();
+    write_versions(&test, "dir/a", 2, true).await;
+    write_versions(&test, "dir/bb", 1, false).await;
+    write_versions(&test, "dirt", 1, false).await;
+    let (versions, complete) = resolve_all_preflight(&test.context, "genes", Some("dir/"))
+        .await
+        .expect("prefix resolves");
+    let mut keys: Vec<_> = versions.iter().map(|(key, _)| key.key.as_str()).collect();
+    keys.sort();
+    assert!(complete);
+    assert_eq!(keys, ["dir/a", "dir/a", "dir/bb"]);
+    let (versions, complete) = resolve_all_preflight(&test.context, "genes", Some("dir/bb"))
+        .await
+        .expect("headless key resolves");
+    assert_eq!((versions.len(), complete), (1, true));
+    let (versions, complete) = resolve_all_preflight(&test.context, "genes", None)
+        .await
+        .expect("bucket resolves");
+    assert_eq!((versions.len(), complete), (4, true));
 }
