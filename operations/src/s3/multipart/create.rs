@@ -271,7 +271,8 @@ impl CreateMultipartOperation {
                 smallvec![read]
             }
             None => {
-                self.plain_owned = !target.mapped;
+                // As at completion, only a record proves the path the upload's own.
+                self.plain_owned = false;
                 self.stat_plain()
             }
         }
@@ -1408,6 +1409,10 @@ mod pure_tests {
 
     /// An import rule writing `archive/` keys of `bucket` to `raw/` with `pattern`.
     fn plain_create(pattern: &str) -> (CreateMultipartOperation, Effects) {
+        plain_create_at(pattern, None)
+    }
+
+    fn plain_create_at(pattern: &str, folder: Option<&str>) -> (CreateMultipartOperation, Effects) {
         let backend_id = Ulid::from_bytes([5u8; 16]);
         let rule = aruna_core::structs::storage::backend_import::BackendImport {
             import_id: Ulid::from_bytes([4u8; 16]),
@@ -1423,7 +1428,7 @@ mod pure_tests {
             last_job: None,
             last_started_ms: None,
             write_backend_id: None,
-            write_prefix: None,
+            write_prefix: folder.map(str::to_string),
             write_pattern: pattern.to_string(),
         };
         let snapshot = snapshot().with_group_inputs(GroupRoutingInputs {
@@ -1506,6 +1511,25 @@ mod pure_tests {
             assert_eq!(plain.path, expected);
             assert_eq!(plain.if_not_exists, if_not_exists);
         }
+    }
+
+    #[test]
+    fn tags_unrecorded_path() {
+        // A separate write folder has no record to prove the file there the upload's own.
+        let (mut operation, effects) = plain_create_at("{dir}{name}", Some("out/"));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "out/one"
+            ),
+            "expected the path stat, got {effects:?}"
+        );
+        let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+            exists: true,
+            version: Some("v1".to_string()),
+        }));
+        let plain = opened_plain(&effects);
+        assert_eq!(plain.path, tagged_path("out/one", plain.ulid));
     }
 
     #[test]
