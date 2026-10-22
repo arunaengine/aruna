@@ -43,6 +43,8 @@ pub struct ReplaceBackendOperation {
     secret: Option<GroupStorageSecret>,
     /// The stored record while its secret is read for a change without keys.
     existing: Option<GroupStorage>,
+    /// A change without keys never writes the vault, so a rotation meanwhile stays.
+    keep_secret: bool,
     txn_id: Option<TxnId>,
     state: ReplaceState,
     output: Option<Result<GroupStorage, CreateBackendError>>,
@@ -56,6 +58,7 @@ impl ReplaceBackendOperation {
             record: None,
             secret: None,
             existing: None,
+            keep_secret: false,
             txn_id: None,
             state: ReplaceState::Init,
             output: None,
@@ -82,6 +85,7 @@ impl ReplaceBackendOperation {
         };
         // A change without keys keeps the stored ones.
         if self.input.secret_config.is_empty() {
+            self.keep_secret = true;
             self.existing = Some(existing);
             self.state = ReplaceState::ReadSecret;
             let entry = GroupStorageSecret::vault_entry(self.backend_id);
@@ -231,6 +235,13 @@ impl ReplaceBackendOperation {
             }
         }
 
+        if self.keep_secret {
+            let Some(txn_id) = self.txn_id else {
+                return self.fail(CreateBackendError::Failed);
+            };
+            self.state = ReplaceState::CommitTransaction;
+            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        }
         let Some(secret) = self.secret.as_ref() else {
             return self.fail(CreateBackendError::Failed);
         };
@@ -497,7 +508,25 @@ mod pure_tests {
             panic!("expected one probe, got {effects:?}")
         };
         assert_eq!(probed.secret_config, secret.secret_config);
-        commit_update(&mut operation, stored);
+        operation.step(Event::Blob(BlobEvent::GroupBackendChecked));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from(7),
+        }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(stored.to_bytes().unwrap().into()),
+        }));
+        // The stored keys are only read: the record commits without a vault write.
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: TxnId::from(7),
+        }));
         let record = operation.finalize().unwrap();
         assert_eq!(record.name, "updated");
         assert_eq!(record.default_bucket(), Some("aruna-lab"));
