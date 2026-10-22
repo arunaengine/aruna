@@ -347,6 +347,11 @@ async fn bounds_alias_checks() {
     let free = file("raw/gone/a", Ulid::from_parts(20, 1));
     store(&context, ("gone/a", id), &free, Some("p1")).await;
     record(&context, rule().import_id, "raw/gone/a", ("gone/a", id)).await;
+    // A second file with the same content finds the budget spent and reads no alias.
+    let other = Ulid::from_parts(11, 1);
+    let second = file("raw/gone/b", Ulid::from_parts(21, 1));
+    store(&context, ("gone/b", other), &second, Some("p2")).await;
+    record(&context, rule().import_id, "raw/gone/b", ("gone/b", other)).await;
     for index in 0..ALIAS_BUDGET as u64 {
         let key = format!("elsewhere/{index:05}");
         let alias = Ulid::from_parts(100 + index, 1);
@@ -359,11 +364,12 @@ async fn bounds_alias_checks() {
         )
         .await;
     }
-    let versions = [("gone/a".to_string(), id)];
+    let versions = [("gone/a".to_string(), id), ("gone/b".to_string(), other)];
     let found = storage_files(&context, (BUCKET, group()), &versions, Some(&scope()))
         .await
         .unwrap();
-    assert_eq!(found[0].kept.as_deref(), Some(UNCHECKED_READERS));
+    let kept: Vec<_> = found.iter().map(|file| file.kept.as_deref()).collect();
+    assert_eq!(kept, [Some(UNCHECKED_READERS); 2]);
 }
 
 #[tokio::test]

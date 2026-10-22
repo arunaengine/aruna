@@ -231,7 +231,11 @@ async fn read_elsewhere(
     let wanted = location.location_key().map_err(|error| error.to_string())?;
     let mut start = None;
     loop {
-        let effect = iter_hash_page(&wanted.blake3_hash, start.take(), None, ALIAS_PAGE);
+        if *budget == 0 {
+            return Ok(None);
+        }
+        let page = ALIAS_PAGE.min(*budget);
+        let effect = iter_hash_page(&wanted.blake3_hash, start.take(), None, page);
         let Effect::Storage(effect) = effect.map_err(|error| error.to_string())? else {
             return Err("not a storage effect".to_string());
         };
@@ -243,10 +247,7 @@ async fn read_elsewhere(
             other => return Err(format!("could not read hash aliases: {other:?}")),
         };
         for (key, _) in aliases {
-            if *budget == 0 {
-                return Ok(None);
-            }
-            *budget -= 1;
+            *budget = budget.saturating_sub(1);
             let alias = HashIndex::from_bytes(&key).map_err(|error| error.to_string())?;
             if scope.matches_key(&alias.bucket, &alias.key) {
                 continue;
