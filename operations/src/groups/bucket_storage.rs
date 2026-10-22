@@ -7,7 +7,12 @@ use crate::groups::backends::query::GetBackendOperation;
 use crate::effect_adapters::routing::node_routing;
 use crate::groups::storage_routing::GroupInputsOperation;
 use crate::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
-use aruna_core::structs::storage::blob::BackendRef;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
+use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
+use aruna_core::structs::storage::encryption::BucketEncryption;
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::group_backend::{GroupStorage, path_bucket};
 use aruna_core::structs::storage::routing::{RoutingSnapshot, resolve_backend};
 use aruna_core::types::GroupId;
@@ -29,6 +34,9 @@ pub struct BucketStorage {
     pub write_pattern: Option<String>,
 }
 
+/// Links and mapping rows of a group the listing reads at most.
+const LINK_CAP: usize = 10_000;
+
 /// One page of the group's buckets with their storage, and the cursor of the next page. The
 /// group's routing inputs load once, as for one upload; each bucket resolves like an upload.
 pub async fn list_bucket_storage(
@@ -45,18 +53,19 @@ pub async fn list_bucket_storage(
     let page = drive(ListBucketsOperation::new(input), context)
         .await
         .map_err(|error| error.to_string())?;
-    let inputs = drive(GroupInputsOperation::new(group_id), context)
+    let inputs = GroupInputsOperation::new(group_id).capped(LINK_CAP);
+    let inputs = drive(inputs, context)
         .await
         .map_err(|error| error.to_string())?;
-    let base = node_routing(context).snapshot(group_id).with_group_inputs(inputs);
+    let encrypted = encrypted_buckets(context, &page.buckets).await?;
+    let mut snapshot = node_routing(context).snapshot(group_id).with_group_inputs(inputs);
     let mut storages = HashMap::new();
     let mut found = Vec::with_capacity(page.buckets.len());
-    for (bucket, info) in page.buckets {
-        let snapshot = base
-            .clone()
-            .with_bucket_rules(info.storage_routing)
-            .with_compression(info.compression);
-        let destination = destination(&snapshot, &bucket);
+    for ((bucket, info), encrypted) in page.buckets.into_iter().zip(encrypted) {
+        snapshot.bucket_rules = info.storage_routing;
+        snapshot.compression = info.compression;
+        let encoded = encrypted || info.compression != Compression::Off;
+        let destination = destination(&snapshot, &bucket, encoded);
         if let Some(id) = destination.backend_id
             && let std::collections::hash_map::Entry::Vacant(entry) = storages.entry(id)
         {
@@ -69,11 +78,45 @@ pub async fn list_bucket_storage(
     Ok((found, page.continuation_token))
 }
 
+/// Whether each bucket of the page encrypts its new uploads.
+async fn encrypted_buckets(
+    context: &DriverContext,
+    buckets: &[(String, BucketInfo)],
+) -> Result<Vec<bool>, String> {
+    if buckets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reads = (buckets.iter())
+        .map(|(bucket, _)| {
+            let key = bucket.as_bytes().to_vec().into();
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key)
+        })
+        .collect();
+    let read = StorageEffect::BatchRead {
+        reads,
+        txn_id: None,
+    };
+    let Event::Storage(StorageEvent::BatchReadResult { values }) =
+        context.storage_handle.send_storage_effect(read).await
+    else {
+        return Err("could not read the encryption of the buckets".to_string());
+    };
+    values
+        .into_iter()
+        .map(|(_, row)| {
+            let settings = BucketEncryption::from_row(row.as_deref());
+            settings.map(|settings| settings.is_encrypted())
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())
+}
+
 /// Where uploads of `bucket` go: a whole-bucket link's write folder, else the backend an
-/// upload resolves to.
-fn destination(snapshot: &RoutingSnapshot, bucket: &str) -> BucketStorage {
-    let link = (snapshot.imports.iter()).find(|rule| rule.bucket == bucket && rule.key_prefix.is_empty());
-    if let Some(rule) = link {
+/// upload resolves to. Encoded uploads keep Aruna's layout and skip the link.
+fn destination(snapshot: &RoutingSnapshot, bucket: &str, encoded: bool) -> BucketStorage {
+    let link = (snapshot.imports.iter())
+        .find(|rule| rule.bucket == bucket && rule.key_prefix.is_empty());
+    if let Some(rule) = link.filter(|_| !encoded) {
         return BucketStorage {
             bucket: bucket.to_string(),
             backend_id: Some(rule.write_backend()),
@@ -91,6 +134,8 @@ fn destination(snapshot: &RoutingSnapshot, bucket: &str) -> BucketStorage {
             _ => None,
         },
         shared: matches!(backend, Ok(BackendRef::Group(_))),
+        import_id: link.map(|rule| rule.import_id),
+        write_pattern: link.map(|rule| rule.write_pattern.clone()),
         ..BucketStorage::default()
     }
 }
@@ -175,12 +220,18 @@ mod tests {
         };
         let snapshot = RoutingSnapshot::new(Ulid::from_parts(1, 1), catalog).with_group_inputs(inputs);
         // A redirected link shows where its uploads go, not where it reads.
-        let found = named(destination(&snapshot, "genes"), &storages);
+        let found = named(destination(&snapshot, "genes", false), &storages);
         assert_eq!(
             (found.backend_id, found.folder.as_deref(), found.provider_bucket.as_deref()),
             (Some(WRITES), Some("out/"), Some("out"))
         );
         assert_eq!(found.import_id, Some(Ulid::from_parts(3, 3)));
+        // An encoded bucket writes Aruna's layout to the shared bucket, not to its link.
+        let found = named(destination(&snapshot, "genes", true), &storages);
+        assert_eq!(
+            (found.folder, found.shared, found.provider_bucket.as_deref()),
+            (None, true, Some("aruna-spire"))
+        );
         // A bucket rule naming a class this node lacks falls back to the group storage.
         let rule = StorageRoutingRule {
             key_prefix: String::new(),
@@ -188,7 +239,7 @@ mod tests {
             target: RoutingTarget::Class("cold".to_string()),
         };
         let lab = snapshot.with_bucket_rules(vec![rule]);
-        let found = named(destination(&lab, "lab"), &storages);
+        let found = named(destination(&lab, "lab", false), &storages);
         assert_eq!(
             (found.backend_id, found.shared, found.provider_bucket.as_deref()),
             (Some(WRITES), true, Some("aruna-spire"))

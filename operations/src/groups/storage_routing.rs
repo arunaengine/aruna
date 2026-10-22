@@ -48,6 +48,8 @@ pub enum GroupInputsError {
     Read(#[from] RecordReadError),
     #[error("group routing inputs never completed")]
     Incomplete,
+    #[error("the group has more than {0} links to read at once")]
+    TooManyRules(usize),
 }
 
 /// Loads one group's routing inputs: its default write target and the ids of
@@ -58,6 +60,9 @@ pub struct GroupInputsOperation {
     group_id: GroupId,
     state: LoadInputsState,
     inputs: GroupRoutingInputs,
+    /// Links and mapping rows read at most; more fail instead of being cut.
+    cap: usize,
+    read_rules: usize,
     output: Option<Result<GroupRoutingInputs, GroupInputsError>>,
 }
 
@@ -67,8 +72,21 @@ impl GroupInputsOperation {
             group_id,
             state: LoadInputsState::Init,
             inputs: GroupRoutingInputs::default(),
+            cap: usize::MAX,
+            read_rules: 0,
             output: None,
         }
+    }
+
+    /// Fails with `TooManyRules` instead of reading more than `cap` links or mapping rows.
+    pub fn capped(mut self, cap: usize) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    fn count_rules(&mut self, rows: usize) -> bool {
+        self.read_rules += rows;
+        self.read_rules > self.cap
     }
 
     fn scan_backends(&mut self, start_after: Option<Key>) -> Effects {
@@ -157,6 +175,9 @@ impl Operation for GroupInputsOperation {
             // A rule whose write backend is disabled or gone keeps Aruna's own layout.
             LoadInputsState::ScanImports => match parse_iter(event, BackendImport::from_bytes) {
                 Ok((rules, next_start_after)) => {
+                    if self.count_rules(rules.len()) {
+                        return self.fail(GroupInputsError::TooManyRules(self.cap));
+                    }
                     let backends = &self.inputs.backend_ids;
                     let usable = rules
                         .into_iter()
@@ -181,6 +202,9 @@ impl Operation for GroupInputsOperation {
                     }
                     _ => return self.fail(RecordReadError::Unexpected.into()),
                 };
+                if self.count_rules(values.len()) {
+                    return self.fail(GroupInputsError::TooManyRules(self.cap));
+                }
                 for (key, value) in values {
                     let id = key.get(16..32).and_then(|id| <[u8; 16]>::try_from(id).ok());
                     let rules = DiscoveryRules::from_bytes(&value);
