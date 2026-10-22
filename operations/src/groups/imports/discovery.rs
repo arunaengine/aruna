@@ -118,6 +118,20 @@ pub fn check_rules(rules: &[DiscoveryRule]) -> Result<(), ImportRuleError> {
         }
         validate_folder("folder", &rule.folder)?;
     }
+    // An upload below the Aruna folder of a storage folder pattern must have one storage path.
+    for (index, rule) in rules.iter().enumerate() {
+        let nested = rules.iter().enumerate().find(|(other, them)| {
+            *other != index
+                && rule.storage_folder().is_some()
+                && super::folders_overlap(&rule.folder, &them.folder)
+        });
+        if let Some((_, them)) = nested {
+            return Err(ImportRuleError::Invalid(format!(
+                "the folders `{}` and `{}` overlap",
+                rule.folder, them.folder
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -665,6 +679,24 @@ mod tests {
             operation.finalize(),
             Err(ImportRuleError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn checks_folder_patterns() {
+        let rule = |pattern: &str, folder: &str| DiscoveryRule {
+            pattern: pattern.to_string(),
+            folder: folder.to_string(),
+        };
+        let both = [rule("*.faa", "proteins/"), rule("lars/{name}", "foobar/")];
+        assert!(check_rules(&both).is_ok());
+        for bad in [
+            vec![rule("lars/{name}", "foobar/"), rule("lars/sub/{name}", "other/")],
+            vec![rule("lars/{name}", "proteins/"), rule("*.faa", "proteins/")],
+            vec![rule("../{name}", "foobar/")],
+            vec![rule("la*/{name}", "foobar/")],
+        ] {
+            assert!(check_rules(&bad).is_err(), "{bad:?}");
+        }
     }
 
     /// Runs the operation up to its write, answering the rule read with `rule`.
