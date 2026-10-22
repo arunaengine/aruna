@@ -551,8 +551,10 @@ pub async fn get_group_routing(
 - `bucket_template`, like `aruna-{group}-{bucket}`, gives each bucket created later its own
   provider bucket on that storage, linked whole with the naming `{dir}{name}`; `{group}` is the
   group's name in lowercase. Existing buckets stay where they are. An empty template clears it;
-  without it the storage keeps its stored template. The storage record keeps it as
-  `bucket_template`, and both responses return it with the shared `bucket`.
+  without it the storage keeps its stored template. With a template no shared `bucket` is
+  needed. The storage record keeps it as `bucket_template`, and both responses return it with
+  the shared `bucket`. A template that gives no valid S3 bucket name for a new bucket, or a
+  provider bucket another link uses, refuses the bucket's creation.
 - Clearing the target, or naming a class, returns new uploads to Aruna storage; files already on
   the group's storage stay there.
 
