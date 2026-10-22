@@ -161,14 +161,21 @@ impl ChangeImportOperation {
             }
             Err(error) => return self.fail(error.into()),
         }
-        match storage.as_deref().map(GroupStorage::from_bytes).transpose() {
-            Ok(Some(_)) => {}
+        let storage = match storage.as_deref().map(GroupStorage::from_bytes).transpose() {
+            Ok(Some(storage)) => storage,
             Ok(None) => return self.fail(ImportRuleError::NotFound),
             Err(error) => return self.fail(error.into()),
-        }
+        };
         // A rule that becomes a 1:1 link needs a bucket that stores plain files.
         let mut old_rule = record.clone();
         old_rule.write_pattern = old.clone();
+        // Without a shared bucket, encoded writes of an ordinary link would have nowhere to go.
+        let shared = !storage.splits() || storage.default_bucket().is_some();
+        if old_rule.mapped_bucket().is_some() && record.mapped_bucket().is_none() && !shared {
+            return self.fail(ImportRuleError::Conflict(
+                "Its storage has no shared bucket, so this link keeps {dir}{name}.".to_string(),
+            ));
+        }
         if record.mapped_bucket().is_some() && old_rule.mapped_bucket().is_none() {
             let info = bucket.as_deref().map(BucketInfo::from_bytes).transpose();
             let settings = BucketEncryption::from_row(encryption.as_deref());
@@ -490,6 +497,13 @@ mod tests {
         storage.to_bytes().unwrap().into()
     }
 
+    /// A storage without a fixed bucket that has a shared bucket.
+    fn storage_with_bucket() -> Value {
+        let mut record = GroupStorage::from_bytes(&storage(true)).unwrap();
+        (record.public_config).insert("default_bucket".to_string(), "lab-shared".to_string());
+        record.to_bytes().unwrap().into()
+    }
+
     /// Answers the checks of a pattern change with a move record, the storage and the last run.
     fn check(
         operation: &mut ChangeImportOperation,
@@ -628,11 +642,17 @@ mod tests {
         let mut whole = linked.clone();
         whole.write_pattern = DEFAULT_PATTERN.to_string();
         assert!(whole.mapped_bucket().is_none());
+        let shared = storage_with_bucket();
         for (stored, pattern) in [(&linked, DEFAULT_PATTERN), (&whole, "{dir}raw/{name}")] {
             let (mut operation, effects) = read(stored, Some(pattern));
-            let effects = check(&mut operation, &effects, None, None);
+            let checks = (None, None, None);
+            let effects = check_on(&mut operation, &effects, checks, shared.clone(), None);
             assert_eq!(written(&effects).write_pattern, pattern);
         }
+        // Without a shared bucket on its storage a 1:1 link keeps its naming.
+        let (mut operation, effects) = read(&linked, Some(DEFAULT_PATTERN));
+        let effects = check(&mut operation, &effects, None, None);
+        conflict(operation, &effects);
         // A compressed bucket cannot become a 1:1 link.
         let info = BucketInfo {
             group_id: Ulid::from_parts(3, 3),

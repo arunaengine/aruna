@@ -516,6 +516,8 @@ pub async fn get_import(
   `{dir}{name}` is a 1:1 link: its bucket cannot be compressed or encrypted, takes no
   replicated copies and ends the link when it is deleted. A switch to `{dir}{name}` is refused
   with 409 while the bucket is compressed or encrypted.
+- A 1:1 link keeps `{dir}{name}` (409) while its storage has no shared bucket, since a
+  compressed or encrypted bucket would then have nowhere to write.
 - A `<folder>/{name}` discovery rule needs a pattern with `{dir}` (400)."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),

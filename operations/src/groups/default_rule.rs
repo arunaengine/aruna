@@ -257,10 +257,9 @@ impl PutDefaultOperation {
                 Err(error) => return self.fail(error.into()),
             };
             let name = String::from_utf8_lossy(&key);
-            let linked = self
-                .imports
-                .iter()
-                .any(|rule| rule.bucket == name && rule.key_prefix.is_empty());
+            // Only a 1:1 link keeps plain files, which never need the shared bucket.
+            let linked = (self.imports.iter())
+                .any(|rule| rule.bucket == name && rule.mapped_bucket().is_some());
             if info.group_id == self.group_id && !linked {
                 return self.fail(PutGroupError::Conflict(format!(
                     "Bucket `{name}` has no own provider bucket and would lose its storage. \
@@ -761,7 +760,9 @@ mod tests {
             })
         };
         // A bucket of the group without its own provider bucket would lose its storage.
-        let imports = vec![linked("seq/")];
+        let mut seq = linked("seq/");
+        seq.write_pattern = aruna_core::structs::storage::backend_import::PLAIN_PATTERN.to_string();
+        let imports = vec![seq];
         let (mut operation, _) = read_with((None, template), record.clone(), imports.clone());
         let effects = verified(&mut operation, &record, TxnId::from(8));
         assert!(matches!(
