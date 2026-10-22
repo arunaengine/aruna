@@ -12,14 +12,15 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BUCKET_CREATION_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
-    STORAGE_ROUTING_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BUCKET_CREATION_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::group::Group;
+use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::backend_import::PLAIN_PATTERN;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
-use aruna_core::structs::storage::group_backend::{GroupStorage, template_bucket};
+use aruna_core::structs::storage::group_backend::{GroupStorage, template_bucket, valid_bucket};
 use aruna_core::structs::storage::routing::{GroupStorageRouting, RoutingTarget};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, Value};
@@ -33,6 +34,7 @@ pub enum CreateBucketState {
     CheckExists,
     ReadRouting,
     ReadStorage,
+    ScanLinks,
     CreateBucket,
     UpdateUsage,
     Link,
@@ -84,8 +86,13 @@ pub struct CreateBucketOperation {
     /// Looks for a provider bucket to link; only user creates opt in, never mirrors.
     mapped: bool,
     link: Option<CreateImportOperation>,
+    /// The group storage and provider bucket of the automatic link.
+    provider: Option<(ulid::Ulid, String)>,
     output: Option<Result<BucketInfo, CreateBucketError>>,
 }
+
+/// Rules one scan page of the automatic link check reads.
+const LINK_PAGE: usize = 256;
 
 impl CreateBucketOperation {
     pub fn new(bucket: String, bucket_info: BucketInfo) -> Self {
@@ -97,6 +104,7 @@ impl CreateBucketOperation {
             usage_update: None,
             mapped: false,
             link: None,
+            provider: None,
             output: None,
         }
     }
@@ -234,6 +242,13 @@ impl CreateBucketOperation {
             storage.group_id == self.bucket_info.group_id,
         ) {
             let provider = template_bucket(&template, &self.bucket, &name);
+            // The whole name must be one S3 bucket; a group name with `/` or `_` is refused.
+            if !valid_bucket(&provider) {
+                let reason = format!("the bucket template gives `{provider}`, no S3 bucket name");
+                return self.emit_error(CreateBucketError::ProviderBucket(
+                    ImportRuleError::Invalid(reason),
+                ));
+            }
             let input = CreateImportInput {
                 group_id: storage.group_id,
                 created_by: self.bucket_info.created_by,
@@ -249,8 +264,58 @@ impl CreateBucketOperation {
                 move_existing: false,
             };
             self.link = Some(CreateImportOperation::within(input, txn_id));
+            self.provider = Some((storage.backend_id, provider));
+            return self.scan_links(None);
         }
         self.write_bucket()
+    }
+
+    /// Reads the group's rules, so no automatic link takes a provider bucket a rule uses.
+    fn scan_links(&mut self, start: Option<aruna_core::types::Key>) -> Effects {
+        self.state = CreateBucketState::ScanLinks;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            prefix: Some(self.bucket_info.group_id.to_bytes().to_vec().into()),
+            start: start.map(aruna_core::effects::IterStart::After),
+            limit: LINK_PAGE,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn links_scanned(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return self.emit_error(CreateBucketError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::IterResult)",
+                received: event,
+            });
+        };
+        let Some((backend_id, provider)) = self.provider.clone() else {
+            return self.emit_error(CreateBucketError::CreateBucketFailed);
+        };
+        for (_, value) in values {
+            match BackendImport::from_bytes(&value) {
+                Ok(rule) if rule.uses_bucket(backend_id, &provider) => {
+                    let reason = format!(
+                        "provider bucket `{provider}` is linked to `{}`",
+                        rule.bucket
+                    );
+                    return self.emit_error(CreateBucketError::ProviderBucket(
+                        ImportRuleError::Conflict(reason),
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => return self.emit_error(error.into()),
+            }
+        }
+        match next_start_after {
+            Some(next) => self.scan_links(Some(next)),
+            None => self.write_bucket(),
+        }
     }
 
     fn write_bucket(&mut self) -> Effects {
@@ -373,6 +438,7 @@ impl Operation for CreateBucketOperation {
             CreateBucketState::CheckExists => self.handle_bucket_checked(event),
             CreateBucketState::ReadRouting => self.routing_read(event),
             CreateBucketState::ReadStorage => self.storage_read(event),
+            CreateBucketState::ScanLinks => self.links_scanned(event),
             CreateBucketState::CreateBucket => self.handle_bucket_created(event),
             CreateBucketState::UpdateUsage => self.handle_usage_update(event),
             CreateBucketState::Link => match self.link.as_mut() {
@@ -524,6 +590,10 @@ mod mapped_tests {
         operation.step(batch(vec![None, None]));
         operation.step(read(Some(routing())));
         operation.step(batch(vec![Some(storage.clone()), Some(group())]));
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
         operation.step(written());
         operation.step(written());
         operation.step(written());
@@ -606,6 +676,66 @@ mod mapped_tests {
                 bucket: "aruna-spire-x".to_string(),
             })]
         );
+    }
+
+    #[test]
+    fn refuses_bad_providers() {
+        // A group name that breaks the bucket name is refused, not split into a folder.
+        let template = storage_with(("bucket_template", "aruna-{group}-{bucket}"));
+        let mut odd = Group::from_bytes(&group()).unwrap();
+        odd.display_name = "lab/sub".to_string();
+        let mut operation = CreateBucketOperation::new("x".to_string(), info()).mapped();
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        operation.step(batch(vec![None, None]));
+        operation.step(read(Some(routing())));
+        let odd = postcard::to_allocvec(&odd).unwrap().into();
+        operation.step(batch(vec![Some(template.clone()), Some(odd)]));
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateBucketError::ProviderBucket(ImportRuleError::Invalid(
+                _
+            )))
+        ));
+
+        // A provider bucket another rule uses is never linked again.
+        let mut operation = CreateBucketOperation::new("x".to_string(), info()).mapped();
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        operation.step(batch(vec![None, None]));
+        operation.step(read(Some(routing())));
+        operation.step(batch(vec![Some(template), Some(group())]));
+        let rule = BackendImport {
+            import_id: Ulid::from_parts(5, 5),
+            group_id: GROUP,
+            backend_id: BACKEND,
+            backend_prefix: "aruna-spire-x/".to_string(),
+            bucket: "other".to_string(),
+            key_prefix: String::new(),
+            schedule: None,
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: PLAIN_PATTERN.to_string(),
+        };
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(rule.key(), rule.to_bytes().unwrap().into())],
+            next_start_after: None,
+        }));
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateBucketError::ProviderBucket(
+                ImportRuleError::Conflict(_)
+            ))
+        ));
     }
 
     #[test]
