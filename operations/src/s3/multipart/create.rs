@@ -271,7 +271,7 @@ impl CreateMultipartOperation {
                 smallvec![read]
             }
             None => {
-                self.plain_owned = true;
+                self.plain_owned = !target.mapped;
                 self.stat_plain()
             }
         }

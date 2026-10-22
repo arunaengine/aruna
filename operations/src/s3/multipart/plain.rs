@@ -70,7 +70,7 @@ impl CompleteUploadOperation {
                 smallvec![read]
             }
             None => {
-                self.plain_owned = at.is_some_and(|plain| !plain.listed);
+                self.plain_owned = at.is_some_and(|plain| !plain.listed && !plain.mapped);
                 self.stat_plain()
             }
         }

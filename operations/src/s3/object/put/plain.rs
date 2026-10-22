@@ -72,7 +72,8 @@ impl PutObjectOperation {
         let (same_name, path) = (target.same_name, target.path.clone());
         let owner = owner_read(&target);
         self.plain = Some(PlainWrite {
-            owned: owner.is_none(),
+            // Only a record proves a mapped path the key's own.
+            owned: owner.is_none() && !target.mapped,
             target,
             resolved,
             version: None,

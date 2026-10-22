@@ -129,6 +129,8 @@ pub struct PlainTarget {
     pub listed: bool,
     /// Other rules of the group that read `path`; their record of it makes it theirs.
     pub shared: Vec<Ulid>,
+    /// A mapping rule gave the path, so another key's file may hold it without a record.
+    pub mapped: bool,
 }
 
 /// Operator-authored all-groups rule from the node's backends file. An unset
@@ -510,6 +512,7 @@ impl RoutingSnapshot {
             listed: *backend == BackendRef::Group(rule.backend_id)
                 && path.starts_with(&rule.backend_prefix),
             shared: self.readers(rule.import_id, backend, path),
+            mapped: self.storage_key(rule, key) != key,
         })
     }
 
@@ -535,7 +538,8 @@ impl RoutingSnapshot {
             );
             return None;
         }
-        let path = rule.plain_path(&self.storage_key(rule, key), id)?;
+        let stored = self.storage_key(rule, key);
+        let path = rule.plain_path(&stored, id)?;
         let backend = rule.write_backend();
         let folders = self.containers.get(&backend).map_or(&[][..], Vec::as_slice);
         if reserved_path(folders, &path) {
@@ -547,6 +551,7 @@ impl RoutingSnapshot {
             same_name: rule.same_name() && !path.ends_with('/'),
             listed: backend == rule.backend_id && path.starts_with(&rule.backend_prefix),
             shared: self.readers(rule.import_id, &BackendRef::Group(backend), &path),
+            mapped: stored != key,
             path,
         })
     }
@@ -1301,7 +1306,17 @@ mod tests {
         let found = snapshot.plain_target("b", "in/a.csv", id).unwrap();
         assert_eq!(found.path, format!("raw/a.csv~{id}"));
         assert_eq!(found.backend, BackendRef::Group(source));
-        assert!(found.listed && !found.same_name);
+        assert!(found.listed && !found.same_name && !found.mapped);
+        // A mapped key writes at its storage path, which only a record proves its own.
+        let mut mapped = snapshot.clone();
+        let rules = vec![crate::structs::storage::discovery::DiscoveryRule {
+            pattern: "lars/{name}".to_string(),
+            folder: "foobar/".to_string(),
+        }];
+        mapped.mappings.insert(rule.import_id, rules);
+        let found = mapped.plain_target("b", "in/foobar/sub/a.csv", id).unwrap();
+        assert_eq!(found.path, format!("raw/lars/sub/a.csv~{id}"));
+        assert!(found.mapped);
         assert_eq!(snapshot.plain_target("b", "out/a.csv", id), None);
         assert_eq!(snapshot.plain_target("other", "in/a.csv", id), None);
 
