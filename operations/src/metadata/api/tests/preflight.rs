@@ -415,13 +415,16 @@ async fn headless_versions_purge() {
     write_versions(&test, "dir/a", 2, true).await;
     write_versions(&test, "dir/bb", 1, false).await;
     write_versions(&test, "dirt", 1, false).await;
+    let long = format!("dir/{}", "x".repeat(1100));
+    write_versions(&test, &long, 1, false).await;
+    write_versions(&test, &format!("other/{}", "x".repeat(1100)), 1, false).await;
     let (versions, complete) = resolve_all_preflight(&test.context, "genes", Some("dir/"))
         .await
         .expect("prefix resolves");
     let mut keys: Vec<_> = versions.iter().map(|(key, _)| key.key.as_str()).collect();
     keys.sort();
     assert!(complete);
-    assert_eq!(keys, ["dir/a", "dir/a", "dir/bb"]);
+    assert_eq!(keys, ["dir/a", "dir/a", "dir/bb", long.as_str()]);
     let (versions, complete) = resolve_all_preflight(&test.context, "genes", Some("dir/bb"))
         .await
         .expect("headless key resolves");
@@ -429,5 +432,5 @@ async fn headless_versions_purge() {
     let (versions, complete) = resolve_all_preflight(&test.context, "genes", None)
         .await
         .expect("bucket resolves");
-    assert_eq!((versions.len(), complete), (4, true));
+    assert_eq!((versions.len(), complete), (6, true));
 }

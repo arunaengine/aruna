@@ -213,7 +213,7 @@ pub(super) async fn resolve_preflight_versions(
     let (heads, more) = scan_preflight_rows(
         context,
         BLOB_HEAD_KEYSPACE,
-        prefix_key.into(),
+        (prefix_key.into(), None),
         MAX_TARGET_VERSIONS,
     )
     .await?;
@@ -244,7 +244,7 @@ pub(super) async fn resolve_preflight_versions(
 }
 
 /// Resolves at most `MAX_TARGET_VERSIONS` versions under the prefix, also those without a head.
-/// Version rows sort by key length first, so each key length is one range of rows.
+/// Version rows sort by key length first, so each key length below `MAX_KEY_LEN` is one range of rows.
 pub(super) async fn resolve_all_preflight(
     context: &DriverContext,
     bucket: &str,
@@ -253,8 +253,8 @@ pub(super) async fn resolve_all_preflight(
     let bucket_rows =
         VersionKey::bucket_prefix(bucket).map_err(|_| MetadataApiError::BadRequest)?;
     let ranges = match key_prefix {
-        None => vec![bucket_rows],
-        Some(prefix) => (prefix.len()..=MAX_KEY_LEN)
+        None => vec![bucket_rows.clone()],
+        Some(prefix) => (prefix.len()..MAX_KEY_LEN)
             .map(|length| {
                 let mut range = bucket_rows.clone();
                 range.extend(postcard::to_allocvec(&length)?);
@@ -267,14 +267,38 @@ pub(super) async fn resolve_all_preflight(
     let mut versions = Vec::new();
     for range in ranges {
         let remaining = MAX_TARGET_VERSIONS - versions.len();
+        let range = (range.into(), None);
         let (rows, more) =
-            scan_preflight_rows(context, BLOB_VERSIONS_KEYSPACE, range.into(), remaining).await?;
+            scan_preflight_rows(context, BLOB_VERSIONS_KEYSPACE, range, remaining).await?;
         for (key, value) in rows {
-            let version_key = VersionKey::from_bytes(key.as_ref())
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-            let version = BlobVersion::from_bytes(value.as_ref())
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-            versions.push((version_key, version));
+            versions.push(decode_version(&key, &value)?);
+        }
+        if more {
+            return Ok((versions, false));
+        }
+    }
+    let Some(prefix) = key_prefix else {
+        return Ok((versions, true));
+    };
+    // Keys of `MAX_KEY_LEN` bytes and more have a length varint whose second byte is 8 or more.
+    let mut budget = LONG_KEY_ROWS;
+    for lead in 0x80u8..=0xFF {
+        let mut range = bucket_rows.clone();
+        range.push(lead);
+        let from = [range.as_slice(), &[8]].concat();
+        let range = (range.into(), Some(from.into()));
+        let (rows, more) =
+            scan_preflight_rows(context, BLOB_VERSIONS_KEYSPACE, range, budget).await?;
+        budget -= rows.len();
+        for (key, value) in rows {
+            let found = decode_version(&key, &value)?;
+            if !found.0.key.starts_with(prefix) {
+                continue;
+            }
+            if versions.len() == MAX_TARGET_VERSIONS {
+                return Ok((versions, false));
+            }
+            versions.push(found);
         }
         if more {
             return Ok((versions, false));
@@ -283,14 +307,22 @@ pub(super) async fn resolve_all_preflight(
     Ok((versions, true))
 }
 
-/// Reads at most `limit` rows under the prefix; true reports that more rows exist.
+fn decode_version(key: &Key, value: &Value) -> Result<(VersionKey, BlobVersion), MetadataApiError> {
+    let version_key = VersionKey::from_bytes(key.as_ref())
+        .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+    let version = BlobVersion::from_bytes(value.as_ref())
+        .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+    Ok((version_key, version))
+}
+
+/// Reads at most `limit` rows under the prefix from `from` on; true reports that more rows exist.
 pub(super) async fn scan_preflight_rows(
     context: &DriverContext,
     key_space: &str,
-    prefix: Key,
+    (prefix, from): (Key, Option<Key>),
     limit: usize,
 ) -> Result<(Vec<(Key, Value)>, bool), MetadataApiError> {
-    let mut start_after = None;
+    let mut start = from.map(IterStart::At);
     let mut rows = Vec::new();
     loop {
         let event = context
@@ -298,7 +330,7 @@ pub(super) async fn scan_preflight_rows(
             .send_storage_effect(StorageEffect::Iter {
                 key_space: key_space.to_string(),
                 prefix: Some(prefix.clone()),
-                start: start_after.take().map(IterStart::After),
+                start: start.take(),
                 limit: PREFLIGHT_PAGE_SIZE.min(limit + 1 - rows.len()),
                 txn_id: None,
             })
@@ -314,7 +346,7 @@ pub(super) async fn scan_preflight_rows(
                     return Ok((rows, true));
                 }
                 match next_start_after {
-                    Some(next) => start_after = Some(next),
+                    Some(next) => start = Some(IterStart::After(next)),
                     None => break,
                 }
             }
@@ -696,6 +728,9 @@ pub(crate) async fn discover_realm_nodes(
 const MAX_TARGET_VERSIONS: usize = 128;
 
 const PREFLIGHT_PAGE_SIZE: usize = 128;
+
+/// Version rows of keys of `MAX_KEY_LEN` bytes and more one purge preflight reads at most.
+const LONG_KEY_ROWS: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub enum ReferenceTarget {
