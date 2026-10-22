@@ -666,7 +666,9 @@ pub async fn put_group_routing(
   names only a returned bucket. 8 listing pages of only hidden buckets answer 409.
 
 **Limits**
-- 1 to 500 buckets per page, 200 by default; pass `next` as `after` for the next page."#,
+- 1 to 500 buckets per page, 200 by default; pass `next` as `after` for the next page.
+- A group with more than 10,000 links and mapping rules is refused rather than listed in part.
+- An encrypted or compressed bucket shows the storage its uploads use, not its link."#,
     params(
         ("group_id" = String, Path, description = "Group id as a 26-character ULID"),
         BucketPageQuery
