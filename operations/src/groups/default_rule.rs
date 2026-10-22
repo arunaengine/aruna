@@ -126,12 +126,18 @@ impl PutDefaultOperation {
                 "A bucket template needs {bucket} and gives S3 bucket names, like aruna-{bucket}.",
             );
         }
+        let owned = self.template.as_deref().is_some_and(|t| !t.is_empty());
         let Some(bucket) = self
             .bucket
             .clone()
             .or(record.default_bucket().map(str::to_string))
         else {
-            return invalid("Name a bucket for the default rule.");
+            // Each new bucket gets its own provider bucket, so no shared bucket is needed.
+            let kept = self.template.is_none() && record.bucket_template().is_some();
+            return match owned || kept {
+                true => Ok(None),
+                false => invalid("Name a bucket for the default rule."),
+            };
         };
         if !valid_bucket(&bucket) {
             return invalid(
@@ -213,7 +219,7 @@ impl PutDefaultOperation {
             Ok(record) => record,
             Err(error) => return self.fail(error),
         };
-        if record.splits() != self.checked.is_some() {
+        if !record.splits() && self.checked.is_some() {
             return self.fail(PutGroupError::Unexpected("Verify"));
         }
         self.verified = Some(record);
@@ -271,6 +277,7 @@ impl PutDefaultOperation {
             )],
             Err(error) => return self.fail(error.into()),
         };
+        let template = self.template.clone().filter(|_| record.splits());
         if let Some((bucket, created)) = self.checked.clone() {
             let config = &mut record.public_config;
             config.insert(DEFAULT_BUCKET.to_string(), bucket.clone());
@@ -280,13 +287,16 @@ impl PutDefaultOperation {
                 let state = if created { "created" } else { "found" };
                 config.insert(format!("{BUCKET_STATE}{bucket}"), state.to_string());
             }
-            if let Some(template) = self.template.clone() {
-                config.remove(BUCKET_PREFIX);
-                match template.is_empty() {
-                    true => config.remove(BUCKET_TEMPLATE),
-                    false => config.insert(BUCKET_TEMPLATE.to_string(), template),
-                };
-            }
+        }
+        if let Some(template) = template {
+            let config = &mut record.public_config;
+            config.remove(BUCKET_PREFIX);
+            match template.is_empty() {
+                true => config.remove(BUCKET_TEMPLATE),
+                false => config.insert(BUCKET_TEMPLATE.to_string(), template),
+            };
+        }
+        if self.checked.is_some() || self.template.is_some() {
             record.updated_at = self.updated_at;
             match record_writes(&record) {
                 Ok(records) => writes.extend(records),
@@ -665,6 +675,32 @@ mod tests {
                 Err(PutGroupError::Invalid(_))
             ));
         }
+    }
+
+    #[test]
+    fn needs_no_shared_bucket() {
+        // Own provider buckets work on a new storage without a shared bucket.
+        let record = storage(&[("endpoint", "https://s3.lab")]);
+        let template = Some("aruna-{bucket}");
+        let (mut operation, effects) = read_with((None, template), record.clone(), Vec::new());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+        let effects = verified(&mut operation, &record, TxnId::from(7));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one write, got {effects:?}");
+        };
+        let stored = GroupStorage::from_bytes(&writes[1].2).unwrap();
+        assert_eq!(stored.bucket_template().as_deref(), template);
+        assert_eq!(stored.default_bucket(), None);
+        // Clearing the template then needs a shared bucket.
+        let (operation, effects) = read_with((None, Some("")), stored, Vec::new());
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutGroupError::Invalid(_))
+        ));
     }
 
     #[test]
