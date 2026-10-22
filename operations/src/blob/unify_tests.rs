@@ -479,3 +479,28 @@ async fn bounds_large_preview() {
     );
     assert!(page.next.is_some());
 }
+
+#[tokio::test]
+async fn skips_huge_keys() {
+    let (_directory, context) = setup().await;
+    twins(&context, "a.faa.gz", 10).await;
+    let version = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
+    for index in 0..=PAGE_SCAN as u64 {
+        let key = VersionKey::new(BUCKET, "long.faa.gz", Ulid::from_parts(100 + index, 1));
+        let (key, value) = (key.to_bytes().unwrap(), version.to_bytes().unwrap());
+        put(&context, BLOB_VERSIONS_KEYSPACE, key, value).await;
+    }
+    let access = load(&context).await;
+    let page = preview_page(&context, (BUCKET, ""), &access, (None, None, 100))
+        .await
+        .unwrap();
+    let keys: Vec<_> = page
+        .entries
+        .iter()
+        .map(|entry| entry.key.as_str())
+        .collect();
+    assert_eq!(
+        (keys, page.keys, page.complete),
+        (vec!["a.faa.gz"], 1, false)
+    );
+}

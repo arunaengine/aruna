@@ -15,7 +15,7 @@ use aruna_operations::jobs::service::submit_purge_job;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
 use aruna_operations::s3::object::versions::{
-    ListVersionsInput, ListVersionsItem, ListVersionsOperation,
+    ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
 };
 use aruna_operations::sync::sync_relationship::{
     ListRelationshipsOperation, SyncRelationshipDirection,
@@ -592,7 +592,9 @@ pub struct DeleteImpact {
 - 1 to 1000 entries per page. Totals pass over at most 5,000 versions, hidden ones
   included; `complete` is then false and the totals are lower bounds. A page passes over at most
   10,000 versions, also with a filter, and then names `next`. 64 listing pages of only hidden
-  versions answer 409."#,
+  versions answer 409. A page checks at most 10,000 hash aliases for other readers of its files;
+  a file left unchecked counts as kept and `complete` is false. A key with more versions than
+  these bounds ends the totals and the page with `complete` false."#,
     params(("bucket" = String, Path, description = "Bucket to inspect")),
     request_body(content = DeleteImpactRequest, example = json!({"kind": "folder", "key": "raw/"})),
     responses(
@@ -660,21 +662,30 @@ pub async fn delete_preview(
         .await
         .map_err(ServerError::InternalError)?;
     let (mut items, mut marker) = (Vec::new(), (key_marker, version_marker));
-    let (mut next, mut more, mut passed) = (None, false, 0);
+    let (mut next, mut more, mut passed, mut cut) = (None, false, 0, false);
     for _ in 0..HIDDEN_PAGES {
-        let page = drive(
-            ListVersionsOperation::new(ListVersionsInput {
-                bucket: bucket.clone(),
-                prefix: scope.list_prefix().map(str::to_string),
-                delimiter: None,
-                key_marker: marker.0.clone(),
-                version_id_marker: marker.1,
-                max_keys: Some(limit - items.len()),
-            }),
+        let listing = ListVersionsOperation::new(ListVersionsInput {
+            bucket: bucket.clone(),
+            prefix: scope.list_prefix().map(str::to_string),
+            delimiter: None,
+            key_marker: marker.0.clone(),
+            version_id_marker: marker.1,
+            max_keys: Some(limit - items.len()),
+        });
+        let page = match drive(
+            listing.with_row_budget(PAGE_VERSIONS - passed + limit),
             &context,
         )
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        {
+            Ok(page) => page,
+            // A key with more versions than the page may read ends the page incomplete.
+            Err(ListVersionsError::TooManyVersions) => {
+                (cut, more) = (true, false);
+                break;
+            }
+            Err(error) => return Err(ServerError::InternalError(error.to_string())),
+        };
         let (page, truncated, next_key, next_version) = scoped_version_page(&scope, page);
         passed += page.len();
         let mut last_seen = None;
@@ -733,6 +744,10 @@ pub async fn delete_preview(
     .await
     .map_err(ServerError::InternalError)?;
     let kept_files = files.iter().filter(|file| file.kept.is_some()).count() as u64;
+    let unchecked = aruna_operations::blob::purge::UNCHECKED_READERS;
+    let unchecked = files
+        .iter()
+        .any(|file| file.kept.as_deref() == Some(unchecked));
     let items = items
         .into_iter()
         .map(|item| {
@@ -774,7 +789,7 @@ pub async fn delete_preview(
         storage_files: totals.storage_files,
         storage_bytes: totals.storage_bytes,
         kept_files,
-        complete: totals.complete,
+        complete: totals.complete && !unchecked && !cut,
         items,
         next,
     }))

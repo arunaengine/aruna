@@ -84,6 +84,8 @@ pub enum ListVersionsError {
     ListVersionsFailed,
     #[error("operation did not finish")]
     NotFinished,
+    #[error("a key holds more versions than this listing may read")]
+    TooManyVersions,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -154,6 +156,9 @@ pub struct ListVersionsOperation {
     pending_heads: VecDeque<(String, Ulid)>,
     current_key: Option<(String, Ulid)>,
     version_scan_limit: usize,
+    /// Version rows the listing reads at most; `None` reads every version.
+    row_budget: Option<usize>,
+    rows_read: usize,
     version_scan_cursor: Option<Key>,
     version_window: VecDeque<(Ulid, BlobVersion)>,
     current_pending: Vec<PendingItem>,
@@ -186,6 +191,8 @@ impl ListVersionsOperation {
             pending_heads: VecDeque::new(),
             current_key: None,
             version_scan_limit: VERSION_SCAN_LIMIT,
+            row_budget: None,
+            rows_read: 0,
             version_scan_cursor: None,
             version_window: VecDeque::new(),
             current_pending: Vec::new(),
@@ -196,6 +203,12 @@ impl ListVersionsOperation {
             next_version_marker: None,
             output: None,
         }
+    }
+
+    /// Fails with `TooManyVersions` instead of reading more than `budget` version rows.
+    pub fn with_row_budget(mut self, budget: usize) -> Self {
+        self.row_budget = Some(budget);
+        self
     }
 
     #[cfg(test)]
@@ -435,7 +448,11 @@ impl ListVersionsOperation {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
             start,
-            limit: self.version_scan_limit,
+            limit: match self.row_budget {
+                Some(budget) =>
+                    (budget.saturating_sub(self.rows_read) + 1).min(self.version_scan_limit),
+                None => self.version_scan_limit,
+            },
             txn_id: self.txn_id,
         })]
     }
@@ -456,6 +473,13 @@ impl ListVersionsOperation {
         let Some((key, head_version_id)) = self.current_key.clone() else {
             return self.emit_error(ListVersionsError::ListVersionsFailed);
         };
+        self.rows_read += values.len();
+        if self
+            .row_budget
+            .is_some_and(|budget| self.rows_read > budget)
+        {
+            return self.emit_error(ListVersionsError::TooManyVersions);
+        }
 
         for (version_key, value) in values {
             let version_key = match VersionKey::from_bytes(version_key.as_ref()) {

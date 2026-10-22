@@ -24,6 +24,11 @@ use std::collections::HashMap;
 use ulid::Ulid;
 
 const ALIAS_PAGE: usize = 256;
+/// Hash aliases one preview checks at most for other readers of its files.
+const ALIAS_BUDGET: usize = 10_000;
+
+/// Why a previewed file may stay when its other readers were not all checked.
+pub const UNCHECKED_READERS: &str = "the preview could not check every other reader of the file";
 
 /// One linked-storage file of a purged version.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -159,6 +164,7 @@ pub async fn storage_files(
             entry.insert(rules_on(context, group_id, &file.location.backend).await?);
         }
     }
+    let mut budget = ALIAS_BUDGET;
     for file in &mut files {
         let rules = &rules[&file.location.backend.key_bytes()];
         let mut reads = vec![(
@@ -201,21 +207,27 @@ pub async fn storage_files(
             Some("the storage keeps no exact version of the file".to_string())
         } else if owners.len() > usize::from(own.is_some()) {
             Some("another link records the file".to_string())
-        } else if read_elsewhere(context, &file.location, scope).await? {
-            Some("a version outside the deleted scope reads the file".to_string())
         } else {
-            None
+            match read_elsewhere(context, &file.location, scope, &mut budget).await? {
+                Some(true) => {
+                    Some("a version outside the deleted scope reads the file".to_string())
+                }
+                Some(false) => None,
+                None => Some(UNCHECKED_READERS.to_string()),
+            }
         };
     }
     Ok(files)
 }
 
-/// Whether a version of a key outside `scope` reads the file of `location`.
+/// Whether a version of a key outside `scope` reads the file of `location`; `None` once the
+/// aliases of `budget` ran out first.
 async fn read_elsewhere(
     context: &DriverContext,
     location: &BackendLocation,
     scope: &StoragePurgeScope,
-) -> Result<bool, String> {
+    budget: &mut usize,
+) -> Result<Option<bool>, String> {
     let wanted = location.location_key().map_err(|error| error.to_string())?;
     let mut start = None;
     loop {
@@ -231,6 +243,10 @@ async fn read_elsewhere(
             other => return Err(format!("could not read hash aliases: {other:?}")),
         };
         for (key, _) in aliases {
+            if *budget == 0 {
+                return Ok(None);
+            }
+            *budget -= 1;
             let alias = HashIndex::from_bytes(&key).map_err(|error| error.to_string())?;
             if scope.matches_key(&alias.bucket, &alias.key) {
                 continue;
@@ -243,12 +259,12 @@ async fn read_elsewhere(
             };
             let version = BlobVersion::from_bytes(&value).map_err(|error| error.to_string())?;
             if version.location_key() == Some(wanted.clone()) {
-                return Ok(true);
+                return Ok(Some(true));
             }
         }
         match next {
             Some(next) => start = Some(next),
-            None => return Ok(false),
+            None => return Ok(Some(false)),
         }
     }
 }
@@ -276,7 +292,9 @@ pub async fn scope_totals(
     scope: &StoragePurgeScope,
     readable: &(dyn Fn(&str) -> bool + Sync),
 ) -> Result<ScopeTotals, String> {
-    use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
+    use crate::s3::object::versions::{
+        ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
+    };
     let mut totals = ScopeTotals::default();
     let mut seen = std::collections::HashSet::new();
     let (mut key_marker, mut version_marker) = (None, None);
@@ -295,9 +313,15 @@ pub async fn scope_totals(
             version_id_marker: version_marker.take(),
             max_keys: Some(LIST_PAGE),
         };
-        let page = crate::driver::drive(ListVersionsOperation::new(input), context)
-            .await
-            .map_err(|error| error.to_string())?;
+        // A listing may read one key past its page to tell whether more follow.
+        let budget = (TOTAL_VERSIONS - scanned.min(TOTAL_VERSIONS)) as usize + LIST_PAGE;
+        let listing = ListVersionsOperation::new(input).with_row_budget(budget);
+        let page = match crate::driver::drive(listing, context).await {
+            Ok(page) => page,
+            // A key with more versions than the budget leaves the totals as lower bounds.
+            Err(ListVersionsError::TooManyVersions) => return Ok(totals),
+            Err(error) => return Err(error.to_string()),
+        };
         for item in &page.items {
             let (key, id, location) = match item {
                 ListVersionsItem::Version {

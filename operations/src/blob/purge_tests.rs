@@ -339,3 +339,52 @@ async fn bounds_scope_totals() {
     let totals = scope_totals(&context, &scope(), &|_| true).await.unwrap();
     assert_eq!((totals.versions, totals.complete), (TOTAL_VERSIONS, false));
 }
+
+#[tokio::test]
+async fn bounds_alias_checks() {
+    let (_directory, context) = setup().await;
+    let id = Ulid::from_parts(10, 1);
+    let free = file("raw/gone/a", Ulid::from_parts(20, 1));
+    store(&context, ("gone/a", id), &free, Some("p1")).await;
+    record(&context, rule().import_id, "raw/gone/a", ("gone/a", id)).await;
+    for index in 0..ALIAS_BUDGET as u64 {
+        let key = format!("elsewhere/{index:05}");
+        let alias = Ulid::from_parts(100 + index, 1);
+        let index = HashIndex::new([3; 32], alias, realm(), group(), node(4), BUCKET, &key);
+        put(
+            &context,
+            PATHS_INDEX_KEYSPACE,
+            index.to_bytes().unwrap(),
+            Vec::new(),
+        )
+        .await;
+    }
+    let versions = [("gone/a".to_string(), id)];
+    let found = storage_files(&context, (BUCKET, group()), &versions, Some(&scope()))
+        .await
+        .unwrap();
+    assert_eq!(found[0].kept.as_deref(), Some(UNCHECKED_READERS));
+}
+
+#[tokio::test]
+async fn bounds_long_histories() {
+    let (_directory, context) = setup().await;
+    let version = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
+    let count = TOTAL_VERSIONS + LIST_PAGE as u64 + 1;
+    let last = Ulid::from_parts(count, 1);
+    for index in 0..count {
+        let key = VersionKey::new(BUCKET, "gone/big", Ulid::from_parts(index + 1, 1));
+        put(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            key.to_bytes().unwrap(),
+            version.to_bytes().unwrap(),
+        )
+        .await;
+    }
+    let head = CurrentVersionPointer::new(last).to_bytes().unwrap();
+    let head_key = BlobHeadKey::new(BUCKET, "gone/big").to_bytes().unwrap();
+    put(&context, BLOB_HEAD_KEYSPACE, head_key, head).await;
+    let totals = scope_totals(&context, &scope(), &|_| true).await.unwrap();
+    assert!(!totals.complete);
+}

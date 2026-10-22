@@ -87,6 +87,9 @@ pub(crate) struct KeyWalk<'a> {
     rows: std::collections::VecDeque<(Key, Value)>,
     end: bool,
     pub(crate) scanned: usize,
+    /// Versions one key yields at most; a key with more is skipped and marks `cut`.
+    limit: usize,
+    pub(crate) cut: bool,
 }
 
 impl<'a> KeyWalk<'a> {
@@ -105,7 +108,15 @@ impl<'a> KeyWalk<'a> {
             rows: Default::default(),
             end: false,
             scanned: 0,
+            limit: usize::MAX,
+            cut: false,
         }
+    }
+
+    /// Reads at most `limit` versions of one key before skipping the rest of it.
+    pub(crate) fn capped(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
     }
 
     /// Starts at the first version of `key`.
@@ -136,6 +147,7 @@ impl<'a> KeyWalk<'a> {
     pub(crate) async fn next(&mut self) -> Result<Option<(String, Vec<(Ulid, Vec<u8>)>)>, String> {
         let mut key = None::<String>;
         let mut versions = Vec::new();
+        self.cut = false;
         loop {
             if self.rows.is_empty() {
                 if self.end {
@@ -148,6 +160,15 @@ impl<'a> KeyWalk<'a> {
             let version = VersionKey::from_bytes(raw).map_err(|error| error.to_string())?;
             match key.as_deref() {
                 Some(current) if current != version.key => return Ok(key.map(|k| (k, versions))),
+                Some(current) if versions.len() == self.limit => {
+                    // Every version of the key sorts before its prefix followed by these bytes.
+                    let mut after = VersionKey::object_prefix(self.bucket, current)
+                        .map_err(|error| error.to_string())?;
+                    after.extend([u8::MAX; 32]);
+                    (self.start, self.end, self.cut) = (Some(after.into()), false, true);
+                    self.rows.clear();
+                    return Ok(key.map(|k| (k, versions)));
+                }
                 Some(_) => {}
                 None => key = Some(version.key.clone()),
             }
@@ -374,14 +395,17 @@ pub async fn preview_page(
         complete: true,
         ..UnifyPage::default()
     };
-    let mut walk = KeyWalk::new(context, bucket, None);
+    let mut walk = KeyWalk::new(context, bucket, None).capped(PAGE_SCAN);
     let mut checked = 0;
     while let Some((key, versions)) = walk.next().await? {
         if walk.scanned > TOTAL_SCAN || checked == PREVIEW_CHECKS {
             page.complete = false;
             break;
         }
-        if !readable(&key) {
+        if walk.cut {
+            page.complete = false;
+        }
+        if !readable(&key) || walk.cut {
             continue;
         }
         checked += 1;
@@ -389,11 +413,12 @@ pub async fn preview_page(
         page.keys += u64::from(!found.is_empty());
         page.bytes += found.iter().map(Duplicate::freed).sum::<u64>();
     }
-    let mut walk = match &after {
+    let walk = match &after {
         Some((key, Some(_))) => KeyWalk::from_key(context, bucket, key),
         Some((key, None)) => KeyWalk::new(context, bucket, Some(key)),
         None => KeyWalk::new(context, bucket, None),
     };
+    let mut walk = walk.capped(PAGE_SCAN);
     let (mut last, mut checked) = (None, 0);
     while let Some((key, versions)) = walk.next().await? {
         if page.entries.len() == limit || walk.scanned > PAGE_SCAN || checked == PREVIEW_CHECKS {
@@ -407,7 +432,11 @@ pub async fn preview_page(
         if visible(&key) {
             last = Some((key.clone(), None));
         }
-        if !readable(&key) {
+        // A key with more versions than a page reads is skipped and leaves the page incomplete.
+        if walk.cut {
+            page.complete = false;
+        }
+        if !readable(&key) || walk.cut {
             continue;
         }
         checked += 1;

@@ -499,7 +499,8 @@ pub async fn start_move(
 **Limits**
 - 1 to 1000 entries per page. Totals pass over at most 10,000 version rows and check at most
   5,000 keys, also with a filter; `complete` is then false and `total` and `bytes` are lower
-  bounds. A page has the same bounds and then names `next`, even with fewer entries."#,
+  bounds. A page has the same bounds and then names `next`, even with fewer entries. A key with
+  more than 10,000 versions is skipped and `complete` is false."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule"),
         ("import_id" = String, Path, description = "Rule whose bucket is organized")
