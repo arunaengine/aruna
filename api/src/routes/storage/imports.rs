@@ -590,6 +590,8 @@ pub async fn update_import(
 **Behavior**
 - A link ends only with its bucket: while the rule's bucket holds any object version, the
   removal is refused with 409. Deleting the bucket ends a 1:1 link; empty the bucket for others.
+- A 1:1 link whose storage has no shared bucket is the bucket's only storage, so its removal is
+  refused with 409 while the bucket exists.
 - A running import stops before its next page.
 - The bucket routing rule the import added stays, so later writes keep going to the backend.
 - Objects added to the backend afterwards are no longer imported."#,
@@ -603,7 +605,7 @@ pub async fn update_import(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
-        (status = 409, description = "The bucket still holds files, or the group is being deleted", body = ErrorResponse)
+        (status = 409, description = "The bucket still holds files or has no other storage, or the group is being deleted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
