@@ -70,7 +70,8 @@ impl CompleteUploadOperation {
                 smallvec![read]
             }
             None => {
-                self.plain_owned = at.is_some_and(|plain| !plain.listed && !plain.mapped);
+                // The rules may have changed since the upload began, so nothing proves an owner.
+                self.plain_owned = false;
                 self.stat_plain()
             }
         }
@@ -1206,6 +1207,31 @@ mod tests {
         };
         assert_eq!(plain.path, format!("raw/object~{id}"));
         assert!(plain.if_not_exists);
+    }
+
+    #[test]
+    fn proves_unlisted_owner() {
+        // The rules may change during an upload, so a path without a record is never replaced.
+        let mut operation = operation("{dir}{name}");
+        if let Some(target) = operation.plain.as_mut() {
+            target.listed = false;
+        }
+        operation.compose_blob();
+        let id = operation.version_id.unwrap();
+        let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+            exists: true,
+            version: Some("v0".to_string()),
+        }));
+        let effects = past_intent(&mut operation, effects);
+        let [
+            Effect::Blob(BlobEffect::Compose {
+                plain: Some(plain), ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected a plain compose, got {effects:?}")
+        };
+        assert_eq!(plain.path, format!("raw/object~{id}"));
     }
 
     /// An upload whose provider upload opened at `raw/object` as version `id`, a path the
