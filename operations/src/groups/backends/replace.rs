@@ -5,6 +5,7 @@
 use super::create::{CreateBackendError, CreateBackendInput};
 use super::validation::{check_identity, validate_backend_input};
 use super::{backend_key, parse_read, record_writes};
+use crate::storage_read::StorageReadError;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
@@ -19,6 +20,7 @@ use ulid::Ulid;
 enum ReplaceState {
     Init,
     ReadRecord,
+    ReadSecret,
     Probe,
     StartTransaction,
     VerifyRecord,
@@ -39,6 +41,8 @@ pub struct ReplaceBackendOperation {
     backend_id: Ulid,
     record: Option<GroupStorage>,
     secret: Option<GroupStorageSecret>,
+    /// The stored record while its secret is read for a change without keys.
+    existing: Option<GroupStorage>,
     txn_id: Option<TxnId>,
     state: ReplaceState,
     output: Option<Result<GroupStorage, CreateBackendError>>,
@@ -51,6 +55,7 @@ impl ReplaceBackendOperation {
             backend_id,
             record: None,
             secret: None,
+            existing: None,
             txn_id: None,
             state: ReplaceState::Init,
             output: None,
@@ -75,7 +80,33 @@ impl ReplaceBackendOperation {
             Ok(_) => return self.fail(CreateBackendError::NotFound),
             Err(error) => return self.fail(CreateBackendError::Read(error)),
         };
+        // A change without keys keeps the stored ones.
+        if self.input.secret_config.is_empty() {
+            self.existing = Some(existing);
+            self.state = ReplaceState::ReadSecret;
+            let entry = GroupStorageSecret::vault_entry(self.backend_id);
+            return smallvec![crate::node_vault::read_secret(entry, None)];
+        }
+        self.prepare(existing)
+    }
 
+    fn handle_secret(&mut self, event: Event) -> Effects {
+        let entry = GroupStorageSecret::vault_entry(self.backend_id);
+        let secret = crate::node_vault::parse_secret(event, entry, GroupStorageSecret::from_bytes);
+        let secret = match secret {
+            Ok(Some(secret)) => secret,
+            Ok(None) => return self.fail(CreateBackendError::NotFound),
+            Err(StorageReadError::Storage(error)) => return self.fail(error.into()),
+            Err(StorageReadError::Conversion(error)) => return self.fail(error.into()),
+        };
+        let Some(existing) = self.existing.take() else {
+            return self.fail(CreateBackendError::Failed);
+        };
+        self.input.secret_config = secret.secret_config;
+        self.prepare(existing)
+    }
+
+    fn prepare(&mut self, existing: GroupStorage) -> Effects {
         let normalized = match validate_backend_input(
             &self.input.name,
             self.input.kind,
@@ -288,6 +319,7 @@ impl Operation for ReplaceBackendOperation {
         match self.state {
             ReplaceState::Init => self.start(),
             ReplaceState::ReadRecord => self.handle_existing(event),
+            ReplaceState::ReadSecret => self.handle_secret(event),
             ReplaceState::Probe => self.handle_probe(event),
             ReplaceState::StartTransaction => self.handle_txn_started(event),
             ReplaceState::VerifyRecord => self.handle_verified(event),
@@ -414,6 +446,55 @@ mod pure_tests {
             txn_id: TxnId::from(7),
         }));
         effects
+    }
+
+    #[test]
+    fn keeps_keys_and_config() {
+        // A change of name and public fields without keys keeps the stored keys and the
+        // config Aruna manages.
+        use aruna_core::structs::storage::group_backend::{DEFAULT_BUCKET, GroupStorageSecret};
+        let (group_id, backend_id) = (Ulid::from_bytes([1u8; 16]), Ulid::from_bytes([9u8; 16]));
+        let mut stored = existing(group_id, backend_id);
+        stored.public_config.remove("bucket");
+        stored
+            .public_config
+            .insert(DEFAULT_BUCKET.to_string(), "aruna-lab".to_string());
+        let mut change = input(group_id);
+        change.public_config.remove("bucket");
+        change.secret_config.clear();
+        let mut operation = ReplaceBackendOperation::new(backend_id, change);
+        operation.start();
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(stored.to_bytes().unwrap().into()),
+        }));
+        let entry = GroupStorageSecret::vault_entry(backend_id);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::VaultRead { entry: read, txn_id: None })] if *read == entry
+        ));
+        let secret = GroupStorageSecret {
+            backend_id,
+            secret_config: HashMap::from([
+                ("access_key_id".to_string(), "old-id".to_string()),
+                ("secret_access_key".to_string(), "old-key".to_string()),
+            ]),
+            updated_at: SystemTime::UNIX_EPOCH,
+        };
+        let effects = operation.step(Event::Storage(StorageEvent::VaultResult {
+            entry,
+            secret: Some(secret.to_secret().unwrap()),
+        }));
+        let [Effect::Blob(BlobEffect::CheckGroupBackend { secret: probed, .. })] =
+            effects.as_slice()
+        else {
+            panic!("expected one probe, got {effects:?}")
+        };
+        assert_eq!(probed.secret_config, secret.secret_config);
+        commit_update(&mut operation, stored);
+        let record = operation.finalize().unwrap();
+        assert_eq!(record.name, "updated");
+        assert_eq!(record.default_bucket(), Some("aruna-lab"));
     }
 
     #[test]

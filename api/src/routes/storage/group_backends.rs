@@ -477,13 +477,16 @@ pub async fn get_group_backend(
     path = "/data/groups/{group_id}/storage/backends/{backend_id}",
     tag = "data/storage",
     summary = "Replace a storage backend registration",
-    description = r#"Replaces a backend record whole, credentials included, after proving the new credentials.
+    description = r#"Replaces a backend record whole after proving its credentials.
 
 **Authentication**: realm bearer token with WRITE on the group's admin path.
 
 **Behavior**
-- Every field must be sent again, credentials included: nothing is carried over from the stored
-  record, and an omitted `cleanup` falls back to `retain` instead of keeping the stored policy.
+- Every field must be sent again: an omitted `cleanup` falls back to `retain` instead of keeping
+  the stored policy. An empty or omitted `secret_config` keeps the stored credentials, so a
+  name, region or path-style change needs no keys.
+- The entries Aruna manages in `public_config` stay, such as `default_bucket`,
+  `bucket_template` and the `bucket:` and `layout:` entries.
 - The `disabled` flag is preserved, and a disabled backend still accepts the call, so a leaked
   credential can be rotated without opening the backend for writes first.
 - The new credentials are proved with the same sentinel probe as registration, and a failed probe
