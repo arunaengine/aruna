@@ -210,7 +210,9 @@ impl Operation for GroupInputsOperation {
                     let rules = DiscoveryRules::from_bytes(&value);
                     match (id, rules) {
                         (Some(id), Ok(rules)) => {
-                            self.inputs.mappings.insert(Ulid::from_bytes(id), rules.rules);
+                            self.inputs
+                                .mappings
+                                .insert(Ulid::from_bytes(id), rules.rules);
                         }
                         (None, _) => return self.fail(RecordReadError::Unexpected.into()),
                         (_, Err(error)) => return self.fail(RecordReadError::from(error).into()),
@@ -543,7 +545,8 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
-        BACKEND_IMPORT_KEYSPACE, BACKEND_INDEX_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
+        BACKEND_IMPORT_KEYSPACE, BACKEND_INDEX_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE,
+        STORAGE_ROUTING_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::backend_import::BackendImport;
@@ -770,15 +773,31 @@ mod pure_tests {
             write_pattern: "{dir}{id}_{name}".to_string(),
         };
         let (kept, dropped) = (rule(8, mine), rule(9, disabled));
-        operation.step(Event::Storage(StorageEvent::IterResult {
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
             values: [&kept, &dropped]
                 .into_iter()
                 .map(|rule| (rule.key(), rule.to_bytes().unwrap().into()))
                 .collect(),
             next_start_after: None,
         }));
+        // The mapping rules of the group's links load last, keyed like the links.
+        let [Effect::Storage(StorageEffect::Iter { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the mapping scan, got {effects:?}")
+        };
+        assert_eq!(key_space, IMPORT_DISCOVERY_KEYSPACE);
+        let mapping = aruna_core::structs::storage::discovery::DiscoveryRules {
+            rules: vec![aruna_core::structs::storage::discovery::DiscoveryRule {
+                pattern: "lars/{name}".to_string(),
+                folder: "foobar/".to_string(),
+            }],
+        };
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(kept.key(), mapping.to_bytes().unwrap().into())],
+            next_start_after: None,
+        }));
 
         let inputs = operation.finalize().unwrap();
+        assert_eq!(inputs.mappings.get(&kept.import_id), Some(&mapping.rules));
         assert_eq!(
             inputs.default_target,
             Some(RoutingTarget::Class("cold".to_string()))

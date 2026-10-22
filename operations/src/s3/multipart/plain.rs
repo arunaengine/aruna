@@ -1213,25 +1213,23 @@ mod tests {
     fn proves_unlisted_owner() {
         // The rules may change during an upload, so a path without a record is never replaced.
         let mut operation = operation("{dir}{name}");
-        if let Some(target) = operation.plain.as_mut() {
-            target.listed = false;
-        }
-        operation.compose_blob();
+        let routing = operation.routing.as_mut().expect("the upload's routing");
+        routing.imports[0].write_prefix = Some("out/".to_string());
+        let effects = operation.compose_blob();
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "out/object"
+            ),
+            "expected the path stat, got {effects:?}"
+        );
         let id = operation.version_id.unwrap();
-        let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+        operation.step(Event::Blob(BlobEvent::PlainStat {
             exists: true,
             version: Some("v0".to_string()),
         }));
-        let effects = past_intent(&mut operation, effects);
-        let [
-            Effect::Blob(BlobEffect::Compose {
-                plain: Some(plain), ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected a plain compose, got {effects:?}")
-        };
-        assert_eq!(plain.path, format!("raw/object~{id}"));
+        let plain = operation.plain_path.as_ref().expect("the compose path");
+        assert_eq!(plain.path, format!("out/object~{id}"));
     }
 
     /// An upload whose provider upload opened at `raw/object` as version `id`, a path the

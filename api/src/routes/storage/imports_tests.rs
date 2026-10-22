@@ -361,7 +361,7 @@ async fn routes_new_uploads() {
     let result = create_import(State(test.state.clone()), auth(), group(), Json(other)).await;
     assert!(matches!(result, Err(ServerError::Conflict(_))));
 
-    // Defaults stay unset and the pattern names a unique file per version.
+    // Defaults stay unset and the pattern keeps the name, adding the id only when it is taken.
     let mut plain = request(&test, backend_id, "elsewhere/");
     plain.key_prefix = "plain/".to_string();
     let (_, Json(created)) = create_import(State(test.state.clone()), auth(), group(), Json(plain))
@@ -369,5 +369,5 @@ async fn routes_new_uploads() {
         .unwrap();
     assert_eq!(created.write_backend_id, None);
     assert_eq!(created.write_prefix, None);
-    assert_eq!(created.write_pattern, "{dir}{name}~{id}");
+    assert_eq!(created.write_pattern, "{dir}{name}");
 }
