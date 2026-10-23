@@ -505,6 +505,41 @@ fn filters_tasks() {
     );
 }
 
+// A versioned ARN names the realm node and the exact version a local run copies.
+#[test]
+fn maps_arn_input() {
+    let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+    let node = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+    let version = Ulid::from_bytes([9u8; 16]);
+    let arn = VersionedObjectArn::new(
+        RealmId::from_bytes([3u8; 32]),
+        node,
+        "src",
+        "reads/r1.fastq",
+        version,
+    )
+    .unwrap();
+    task.inputs[0].url = Some(arn.to_string());
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Local).unwrap();
+    assert_eq!(spec.inputs[0].source_node_id, Some(node));
+    assert_eq!(
+        spec.inputs[0].source,
+        InputSource::S3 {
+            bucket: "src".to_string(),
+            key: "reads/r1.fastq".to_string(),
+            version_id: Some(version.to_string()),
+        }
+    );
+
+    task.inputs[0].url = Some(format!("arn:aruna:{}", "not-an-arn"));
+    assert_eq!(
+        map_execution_spec(&task, None, ExecutionTarget::Local)
+            .unwrap_err()
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
 #[test]
 fn rejects_duplicate_inputs() {
     let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
