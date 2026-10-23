@@ -178,7 +178,14 @@ pub async fn active_job(
         return Err("could not read the jobs of the bucket".to_string());
     };
     let values = values.into_iter().map(|(_, value)| value).collect();
-    let rows = Rows::parse(values).map_err(|error| error.to_string())?;
+    let rows = match Rows::parse(values) {
+        Ok(rows) => rows,
+        // A job row that cannot be read hides the bucket's job, never the whole listing.
+        Err(error) => {
+            tracing::warn!(bucket, %error, "A job row of the bucket cannot be read");
+            return Ok(None);
+        }
+    };
     if let Some(job) = rows.active() {
         return Ok(Some(job));
     }
@@ -336,5 +343,21 @@ mod tests {
             ..check
         });
         assert_eq!(rows.active(), None);
+    }
+
+    #[tokio::test]
+    async fn hides_unreadable_job() {
+        // A job row that cannot be read, such as one of an older layout, hides only that job.
+        let temp = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let context = crate::tests::s3::test_context(storage.clone());
+        let write = StorageEffect::Write {
+            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
+            key: b"b".to_vec().into(),
+            value: vec![0xff; 3].into(),
+            txn_id: None,
+        };
+        storage.send_storage_effect(write).await;
+        assert_eq!(active_job(&context, "b", &[]).await, Ok(None));
     }
 }
