@@ -708,33 +708,10 @@ fn collapse_stars(pattern: &str) -> String {
     collapsed
 }
 
-/// POSIX 12.13 has no brace alternation, so `{` and `}` stay literal file name
-/// characters instead of expanding into alternates the caller never declared.
-fn escape_braces(pattern: &str) -> String {
-    let mut escaped = String::with_capacity(pattern.len());
-    let (mut skip, mut class) = (false, false);
-    for character in pattern.chars() {
-        match character {
-            _ if skip => skip = false,
-            '\\' => skip = true,
-            '[' if !class => class = true,
-            ']' if class => class = false,
-            '{' | '}' if !class => {
-                escaped.push('[');
-                escaped.push(character);
-                escaped.push(']');
-                continue;
-            }
-            _ => {}
-        }
-        escaped.push(character);
-    }
-    escaped
-}
-
+/// Brace alternatives such as `*.{bam,bai}` expand as in Nextflow's Java globs.
 fn build_glob(pattern: &str) -> Result<Glob, String> {
     // `literal_separator` keeps `*` and `?` inside one path component, as POSIX requires.
-    GlobBuilder::new(&escape_braces(&collapse_stars(pattern)))
+    GlobBuilder::new(&collapse_stars(pattern))
         .literal_separator(true)
         .build()
         .map_err(|error| error.to_string())
@@ -751,8 +728,8 @@ pub fn directory_pattern(path: &str) -> String {
     format!("{}/*", globset::escape(path))
 }
 
-/// Deepest wildcard-free ancestor of a pattern, which is the directory a backend
-/// enumerates. A wildcard-free path yields itself.
+/// Deepest ancestor of a pattern free of wildcards and braces, which is the directory
+/// a backend enumerates. A path without either yields itself.
 pub fn literal_prefix(pattern: &str) -> Result<PathBuf, String> {
     let normalized = normalize_container_path(pattern)?;
     let mut prefix = PathBuf::from("/");
@@ -760,7 +737,8 @@ pub fn literal_prefix(pattern: &str) -> Result<PathBuf, String> {
         let Component::Normal(part) = component else {
             continue;
         };
-        if part.to_string_lossy().contains(WILDCARDS) {
+        let name = part.to_string_lossy();
+        if name.contains(WILDCARDS) || name.contains('{') {
             break;
         }
         prefix.push(part);
@@ -1012,23 +990,29 @@ mod tests {
     }
 
     #[test]
-    fn braces_stay_literal() {
-        // Brace alternation is undeclared, so `{a,b}` names one directory.
-        let glob = output_glob("/out/{a,b}/x.txt").unwrap();
-        assert!(glob.is_match("/out/{a,b}/x.txt"));
-        assert!(!glob.is_match("/out/a/x.txt"));
-        assert!(!glob.is_match("/out/b/x.txt"));
-        assert!(!has_wildcard("/out/{a,b}/x.txt"));
+    fn expands_brace_alternatives() {
+        // Nextflow sends Java globs, so `*.{bam,bai}` selects both suffixes.
+        let glob = output_glob("/out/*.{bam,bai}").unwrap();
+        assert!(glob.is_match("/out/a.bam"));
+        assert!(glob.is_match("/out/a.bai"));
+        assert!(!glob.is_match("/out/a.sam"));
+        assert!(!glob.is_match("/out/a.{bam,bai}"));
+        let glob = output_glob("/out/{a,b}/*.txt").unwrap();
+        assert!(glob.is_match("/out/a/x.txt"));
+        assert!(!glob.is_match("/out/c/x.txt"));
+        // Enumeration starts above the brace, so `{a,b}` is never created as a directory.
         assert_eq!(
-            literal_prefix("/out/{a,b}/x.txt").unwrap(),
-            Path::new("/out/{a,b}/x.txt")
+            literal_prefix("/out/{a,b}/*.txt").unwrap(),
+            Path::new("/out")
         );
 
-        let matcher = OutputMatcher::new(["/out/{a,b}.csv", "/out/[ab]{x}.txt"]).unwrap();
+        // Without a wildcard the path is one literal file, braces included.
+        assert!(!has_wildcard("/out/{a,b}.csv"));
+        let matcher = OutputMatcher::new(["/out/{a,b}.csv", "/out/[ab]{x,y}.txt"]).unwrap();
         assert!(matcher.is_match("/out/{a,b}.csv"));
         assert!(!matcher.is_match("/out/a.csv"));
-        assert!(matcher.is_match("/out/a{x}.txt"));
-        assert!(!matcher.is_match("/out/ax.txt"));
+        assert!(matcher.is_match("/out/ay.txt"));
+        assert!(!matcher.is_match("/out/a{x,y}.txt"));
     }
 
     #[test]

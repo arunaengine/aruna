@@ -177,7 +177,8 @@ pub struct TesOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// Absolute container path, optionally with POSIX (IEEE Std 1003.1-2017,
-    /// 12.13) wildcards `*`, `?`, and `[...]` selecting several files.
+    /// 12.13) wildcards `*`, `?`, and `[...]` selecting several files. Within such
+    /// a pattern, brace alternatives like `*.{bam,bai}` select each listed form.
     #[serde(default)]
     pub path: String,
     /// Literal ancestor stripped from every matched path before it is appended
@@ -578,6 +579,8 @@ naming a different one; a bearer token requires that tag.
   stripped from each match before it is appended to the destination url. Such outputs may share
   one url. A pattern that matches a directory captures every file below it, and a staged input it
   matches is never captured. A `DIRECTORY` output captures every file below its path under its url.
+  Within a pattern, brace alternatives such as `*.{bam,bai}` select each listed form, as in
+  Nextflow.
 - Unsupported: directory inputs, inline input content, wildcards in an input path, volumes,
   executor stdin/stdout/stderr redirection and resource zones."#,
     request_body(
