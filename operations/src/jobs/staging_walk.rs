@@ -19,11 +19,13 @@ use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
+use tracing::warn;
 
-use super::executor::JobContext;
+use super::executor::{JobContext, JobRunOutcome};
 use super::staging::{
     ItemFailure, load_live_bucket, persist_rows, queue_key, stage_item, sync_progress,
 };
+use super::store::{batch_delete, iter_prefix_page, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
@@ -37,6 +39,93 @@ use crate::staging::page_rows::MAX_ERROR_SAMPLE;
 const STAGING_PAGE_SIZE: usize = 500;
 /// Snapshot pages copy every file before their checkpoint, so they stay smaller.
 const SNAPSHOT_PAGE_SIZE: usize = 100;
+
+/// Queue rows one cleanup pass deletes.
+const QUEUE_CLEANUP_PAGE: usize = 256;
+
+/// Starts the next listing: the next queued directory, else the next spec prefix.
+/// `Ok(false)` once nothing is left to list.
+pub(super) async fn start_walk(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    checkpoint: &mut StagingJobCheckpoint,
+) -> Result<bool, String> {
+    if checkpoint.queue_head < checkpoint.queue_tail {
+        let row = queue_key(ctx.job_id, checkpoint.queue_head);
+        match read_state::<StagingJobDirectory>(
+            &ctx.driver.storage_handle,
+            STAGING_QUEUE_KEYSPACE,
+            row,
+            "staging queue read",
+        )
+        .await?
+        {
+            Some(directory) => {
+                checkpoint.walk = Some(StagingWalk {
+                    source_path: directory.source_path,
+                    target_prefix: directory.target_prefix,
+                    cursor: None,
+                    queue_row: Some(checkpoint.queue_head),
+                });
+            }
+            None => checkpoint.queue_head += 1,
+        }
+        return Ok(true);
+    }
+    let Some(prefix) = usize::try_from(checkpoint.prefixes_done)
+        .ok()
+        .and_then(|done| spec.prefixes.get(done))
+    else {
+        return Ok(false);
+    };
+    checkpoint.walk = Some(StagingWalk {
+        source_path: directory_list_path(&prefix.source_prefix),
+        target_prefix: prefix.target_prefix.clone(),
+        cursor: None,
+        queue_row: None,
+    });
+    checkpoint.prefixes_done += 1;
+    Ok(true)
+}
+
+/// Deletes the job's queue rows page by page; rows left by a failed pass are retried by the
+/// next run and do not change the outcome.
+pub(super) async fn clear_queue(ctx: &JobContext) {
+    let storage = &ctx.driver.storage_handle;
+    let prefix = ByteView::from(ctx.job_id.to_bytes().to_vec());
+    loop {
+        let rows = iter_prefix_page(
+            storage,
+            STAGING_QUEUE_KEYSPACE,
+            Some(prefix.clone()),
+            None,
+            QUEUE_CLEANUP_PAGE,
+            None,
+        )
+        .await;
+        let rows = match rows {
+            Ok((rows, _)) if !rows.is_empty() => rows,
+            Ok(_) => return,
+            Err(error) => {
+                warn!(job_id = %ctx.job_id, error = %error, "Staging queue cleanup failed");
+                return;
+            }
+        };
+        let deletes = rows
+            .into_iter()
+            .map(|(key, _)| (STAGING_QUEUE_KEYSPACE.to_string(), key))
+            .collect();
+        if let Err(error) = batch_delete(storage, deletes, None).await {
+            warn!(job_id = %ctx.job_id, error = %error, "Staging queue cleanup failed");
+            return;
+        }
+    }
+}
+
+pub(super) async fn finish_failed(ctx: &JobContext, outcome: JobRunOutcome) -> JobRunOutcome {
+    clear_queue(ctx).await;
+    outcome
+}
 
 pub(super) fn item_phase(spec: &StagingJobSpec) -> StagingJobPhase {
     match spec.strategy {
