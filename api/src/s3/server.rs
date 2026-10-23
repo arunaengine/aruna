@@ -1803,11 +1803,15 @@ mod tests {
         .await
         .expect("forced cleanup must await the connection child");
 
-        let mut buf = [0u8; 1];
-        let closed =
-            tokio::time::timeout(std::time::Duration::from_secs(1), socket.read(&mut buf)).await;
+        // The child may have answered the request before the abort; it must then close.
+        let mut buf = Vec::new();
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            socket.read_to_end(&mut buf),
+        )
+        .await;
         assert!(
-            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            closed.is_ok(),
             "the connection child must have released the client, got {closed:?}"
         );
     }
