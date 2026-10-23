@@ -328,6 +328,51 @@ async fn park(context: &Arc<DriverContext>, upload: &SyncUpload, reason: String,
     .await;
 }
 
+/// Makes every backed-off upload due now and re-arms retryable failures, for an explicit
+/// owner-requested sync. A running pull keeps its polls.
+pub(crate) async fn requeue_uploads(context: &Arc<DriverContext>, now_ms: u64) {
+    let mut cursor: Option<Key> = None;
+    loop {
+        let Some((uploads, next)) = read_page(context, cursor).await else {
+            return;
+        };
+        for upload in uploads {
+            if let Some(state) = requeued(&upload.state, now_ms) {
+                store_state(context, &upload, state, true).await;
+            }
+        }
+        match next {
+            Some(next) => cursor = Some(next),
+            None => return,
+        }
+    }
+}
+
+/// The state an explicit sync gives one upload: a backed-off one is due now with its
+/// attempts kept, a retryable failure starts over, and anything else stays.
+fn requeued(state: &UploadState, now_ms: u64) -> Option<UploadState> {
+    match state {
+        UploadState::Pending {
+            due_at_ms,
+            attempts,
+            last_error,
+        } if *due_at_ms > now_ms => Some(UploadState::Pending {
+            due_at_ms: now_ms,
+            attempts: *attempts,
+            last_error: last_error.clone(),
+        }),
+        UploadState::Failed {
+            reason,
+            retryable: true,
+        } => Some(UploadState::Pending {
+            due_at_ms: now_ms,
+            attempts: 0,
+            last_error: Some(reason.clone()),
+        }),
+        _ => None,
+    }
+}
+
 /// Writes one upload row under a new state. `guarded` refuses the write when
 /// the stored row no longer carries the state this pass read.
 async fn store_state(
@@ -454,6 +499,7 @@ mod tests {
 
     use super::{
         ForwardOutcome, QueueDrain, SyncUpload, UploadDrain, UploadState, drain_sync_outbox,
+        requeued,
     };
     use crate::device::drain::DrainOutcome;
     use crate::device::sync::folders::store_folder;
@@ -611,5 +657,45 @@ mod tests {
             ForwardOutcome::Settled
         );
         assert_eq!(stored(&context, &newer).await.state, newer.state);
+    }
+
+    #[test]
+    fn requeues_on_request() {
+        // An explicit sync runs backed-off and retryable uploads now, nothing else.
+        let backed_off = UploadState::Pending {
+            due_at_ms: 50,
+            attempts: 3,
+            last_error: Some("unreachable".to_string()),
+        };
+        assert_eq!(
+            requeued(&backed_off, 10),
+            Some(UploadState::Pending {
+                due_at_ms: 10,
+                attempts: 3,
+                last_error: Some("unreachable".to_string()),
+            })
+        );
+        let retryable = UploadState::Failed {
+            reason: "unreachable".to_string(),
+            retryable: true,
+        };
+        assert!(matches!(
+            requeued(&retryable, 10),
+            Some(UploadState::Pending {
+                due_at_ms: 10,
+                attempts: 0,
+                ..
+            })
+        ));
+        let refused = UploadState::Failed {
+            reason: "Forbidden".to_string(),
+            retryable: false,
+        };
+        assert_eq!(requeued(&refused, 10), None);
+        let running = UploadState::Transferring {
+            attempts: 1,
+            bytes_done: 5,
+        };
+        assert_eq!(requeued(&running, 10), None);
     }
 }
