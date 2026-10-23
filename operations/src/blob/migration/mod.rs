@@ -3152,7 +3152,7 @@ mod tests {
         let mut stored = record;
         for index in 0..3 {
             let after = migrate_page(&context, "b", stored, Duration::ZERO).await;
-            assert_eq!(after.unwrap(), Some(Duration::ZERO).filter(|_| index < 2));
+            assert_eq!(after.unwrap(), (index < 2).then_some(Duration::ZERO));
             stored = read_progress(&context, &key).await.unwrap().unwrap();
             assert_eq!(stored.skipped, index + 1);
             assert_eq!(stored.cursor, Some(row(index).to_bytes().unwrap()));
